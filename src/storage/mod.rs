@@ -1,6 +1,18 @@
 mod repository;
 
-#[allow(dead_code)] // Scanner jobs build these values after evaluating local metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataAutoMatchPolicy {
+    UseLibrarySetting,
+    Enabled,
+    Disabled,
+}
+
+impl MetadataAutoMatchPolicy {
+    pub(crate) const fn allows_scraper_lookup(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
 pub(crate) struct NewItemMetadataCompletenessResult<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) capability: &'a str,
@@ -16,7 +28,14 @@ pub(crate) struct NewItemMetadataCompletenessCheck<'a> {
     pub(crate) input_fingerprint: &'a [u8],
 }
 
-#[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MetadataFillMissingRequest {
+    pub(crate) item_id: String,
+    pub(crate) input_fingerprint: Option<Vec<u8>>,
+    pub(crate) capabilities_json: String,
+    pub(crate) automatic_retry_count: i64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ItemMetadataCompletenessCommit {
     pub(crate) updated_count: usize,
@@ -39,21 +58,21 @@ pub(crate) use repository::{
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
     EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
     ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata, LibrarySettingsUpdate,
-    MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, ManifestDeltaBatchCommit,
+    LocalNfoDefaultsRepair, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, ManifestDeltaBatchCommit,
     ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult, ManifestExistingFileUpdate,
-    ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage, MediaMetadataUpdate,
-    MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataImageAttemptUpdate,
-    MetadataImageUnavailable, MigrationMediaIdentityLookup, MigrationPersonIdentityLookup,
-    NewAccessToken, NewAuditEvent, NewChapterDetectionJob, NewChapterDetectionJobItem,
-    NewCollection, NewDanmakuMatchJob, NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing,
-    NewEmbyMigrationJob, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewLibrary,
-    NewLibraryRoot, NewMediaChapterMarker, NewMediaItem, NewMediaSource, NewMetadataCandidate,
-    NewMovieFile, NewNotificationDestination, NewNotificationEvent, NewPersonCredit,
-    NewPlaybackEvent, NewScanLocalMetadataBatch, NewScanManifest, NewScanManifestDelta,
-    NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestFilesystemEntry,
-    NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
-    NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile,
-    NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
+    ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage,
+    MediaInfoChapterUpdate, MediaMetadataUpdate, MediaProbeUpdate, MediaStreamUpdate,
+    MetadataCapabilityResult, MetadataImageAttemptUpdate, MetadataImageUnavailable,
+    MigrationMediaIdentityLookup, MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent,
+    NewChapterDetectionJob, NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob,
+    NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing, NewEmbyMigrationJob, NewEpisodeFile,
+    NewFilesystemEntry, NewHierarchyItem, NewLibrary, NewLibraryRoot, NewMediaChapterMarker,
+    NewMediaItem, NewMediaSource, NewMetadataCandidate, NewMovieFile, NewNotificationDestination,
+    NewNotificationEvent, NewPersonCredit, NewPlaybackEvent, NewScanLocalMetadataBatch,
+    NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
+    NewScanManifestFilesystemEntry, NewScanManifestIndexedFile, NewScanManifestPositiveIndex,
+    NewScanManifestRoot, NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
+    NewScanManifestUnresolvedFile, NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
     PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReconciliationBatchCommit,
     ReconciliationBatchCommitResult, ResumeItemsQuery, SelectedMetadataUpdate,
     StoredAccessTokenDevice, StoredActivityEvent, StoredCanonicalPerson,
@@ -70,22 +89,24 @@ pub(crate) use repository::{
     StoredItemSourceLocator, StoredJobActivityItem, StoredLibrary, StoredLibraryCoverJob,
     StoredLibraryIdentity, StoredLibraryPoster, StoredLibraryRoot, StoredLibraryScraper,
     StoredMediaChapter, StoredMediaItem, StoredMediaItemKind, StoredMediaMerge,
-    StoredMediaMetadata, StoredMediaSourcePath, StoredMetadataCandidate,
-    StoredMetadataCapabilityAttempt, StoredMetadataImageAttempt, StoredMetadataReidentifyItem,
-    StoredMetadataReidentifyJob, StoredMigrationMediaIdentity, StoredMigrationPersonIdentity,
-    StoredMovieIdentity, StoredNotificationDelivery, StoredNotificationDestination,
-    StoredPersonCredit, StoredPersonIdentityMove, StoredPersonIndexRebuildJob,
-    StoredPersonMatchCandidate, StoredPlaybackHistoryEvent, StoredPlaybackSession,
-    StoredPlaybackSource, StoredReconciliationScanEntry, StoredScanJob, StoredScanJobCounts,
+    StoredMediaMetadata, StoredMediaSourcePath, StoredMediaWritebackContext,
+    StoredMetadataCandidate, StoredMetadataCapabilityAttempt, StoredMetadataImageAttempt,
+    StoredMetadataReidentifyItem, StoredMetadataReidentifyJob, StoredMigrationMediaIdentity,
+    StoredMigrationPersonIdentity, StoredMovieIdentity, StoredNotificationDelivery,
+    StoredNotificationDestination, StoredPersonCredit, StoredPersonIdentityMove,
+    StoredPersonIndexRebuildJob, StoredPersonMatchCandidate, StoredPlaybackHistoryEvent,
+    StoredPlaybackSession, StoredPlaybackSource, StoredReconciliationScanEntry, StoredScanJob,
+    StoredScanJobCounts, StoredScanJobMetadataPage, StoredScanJobMetadataSources,
     StoredScanJobPath, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
     StoredScanLocalMetadataSource, StoredScanManifest, StoredScanManifestDelta,
     StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
     StoredScanManifestFilesystemBaseline, StoredScanManifestPostprocessingRoot,
-    StoredScanManifestRemovalCandidate, StoredScheduledTaskConfig, StoredScheduledTaskPlan,
-    StoredScheduledTaskPlanLibrary, StoredSeriesMetadataSource, StoredStrmMediaSource,
-    StoredStrmProbeJob, StoredSubtitleStream, StoredThumbnailScraperRetry, StoredThumbnailSource,
-    StoredUser, StoredUserItemState, StoredWebPlaybackSession, StoredWebSession,
-    StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
+    StoredScanManifestPostprocessingState, StoredScanManifestRemovalCandidate,
+    StoredScheduledTaskConfig, StoredScheduledTaskPlan, StoredScheduledTaskPlanLibrary,
+    StoredSeriesMetadataSource, StoredStrmMediaSource, StoredStrmProbeJob, StoredSubtitleStream,
+    StoredThumbnailScraperRetry, StoredThumbnailSource, StoredUser, StoredUserItemState,
+    StoredWebPlaybackSession, StoredWebSession, StoredWebSessionSummary,
+    UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
     WebPlaybackTranscodingDetails, is_lite_manifest_discovery, movie_parent_folder_identity,
     recommendation_batch_key_at,
 };

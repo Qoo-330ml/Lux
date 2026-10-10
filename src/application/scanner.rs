@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
-        admin_events::{AdminEventHub, AdminEventScope, UserEventHub},
+        admin_events::{AdminEventHub, UserEventHub},
         candidates::MetadataSelectionService,
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
@@ -32,7 +32,7 @@ use crate::{
             MediaKind, clean_title, has_multi_part_marker, has_source_variant_marker,
             parse_media_name, parse_media_name_with_variant_suffix,
         },
-        metadata::MetadataEnricher,
+        metadata::{MetadataEnricher, ScanLocalMetadataNfoBatch},
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
         probe::MediaProbeService,
@@ -51,7 +51,7 @@ use crate::{
     storage::{
         Database, FilesystemEntryMove, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
         ManifestDeltaBatchCommit, ManifestDiscoveryCommitResult, ManifestPostprocessingTargetPage,
-        NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewItemMetadataCompletenessCheck,
+        MetadataAutoMatchPolicy, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
         NewItemMetadataCompletenessResult, NewMediaItem, NewMediaSource, NewMovieFile,
         NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
         NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
@@ -59,7 +59,7 @@ use crate::{
         ReconciliationBatchCommit, StorageError, StoredEpisodeIdentityCandidate,
         StoredFilesystemEntry, StoredLibraryRoot, StoredReconciliationScanEntry, StoredScanJob,
         StoredScanJobPath, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
-        is_lite_manifest_discovery, movie_parent_folder_identity,
+        StoredScanLocalMetadataSource, is_lite_manifest_discovery, movie_parent_folder_identity,
     },
 };
 
@@ -86,6 +86,8 @@ use manifest::*;
 
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
+const LOCAL_METADATA_COMPLETION_FALLBACK: Duration = Duration::from_secs(5);
+const LOCAL_METADATA_JOB_REFRESH_FALLBACK: Duration = Duration::from_secs(5);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
 const LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_SCAN_LOCK_RETRY_DELAYS_MS: [u64; 3] = [250, 750, 1_500];
@@ -95,6 +97,12 @@ const MAX_SCAN_LOCAL_METADATA_SOURCE_IDS: usize = 256;
 const SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
 const SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE: usize = 512;
 const MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT: usize = 4;
+const SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS: [u64; 6] = [10, 20, 40, 80, 160, 250];
+
+fn scan_lock_database_wait_backoff(retry_number: usize) -> Duration {
+    let delay_index = retry_number.min(SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS.len() - 1);
+    Duration::from_millis(SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS[delay_index])
+}
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -2740,17 +2748,30 @@ impl LibraryScanner {
             return Ok(report);
         }
 
-        let existing_item = self
-            .database
-            .find_media_item(
-                library_id_text,
-                &parsed_name.sort_title,
-                parsed_name.production_year.map(i64::from),
-            )
-            .await?;
-        let (item_id, created_item) = if let Some(item) = existing_item {
-            self.database.restore_media_item(&item.id).await?;
-            (item.id, false)
+        // NFO or online metadata can replace the parsed title and year. The exact
+        // sibling base's indexed item remains the identity anchor for this version.
+        let base_item_id = match inferred_suffix {
+            Some(suffix) => {
+                self.find_inferred_movie_variant_base_item(&root.id, root_path, path, suffix)
+                    .await?
+            }
+            None => None,
+        };
+        let existing_item_id = match base_item_id {
+            Some(item_id) => Some(item_id),
+            None => self
+                .database
+                .find_media_item(
+                    library_id_text,
+                    &parsed_name.sort_title,
+                    parsed_name.production_year.map(i64::from),
+                )
+                .await?
+                .map(|item| item.id),
+        };
+        let (item_id, created_item) = if let Some(item_id) = existing_item_id {
+            self.database.restore_media_item(&item_id).await?;
+            (item_id, false)
         } else {
             let item_id = ItemId::new().to_string();
             self.database
@@ -2870,6 +2891,40 @@ impl LibraryScanner {
         report.created_items = if created_item { 1 } else { 0 };
         Ok(report)
     }
+
+    async fn find_inferred_movie_variant_base_item(
+        &self,
+        library_root_id: &str,
+        root_path: &Path,
+        path: &Path,
+        suffix: &str,
+    ) -> Result<Option<String>, ScannerError> {
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        let Some(base) = stem.strip_suffix(&format!("-{suffix}")) else {
+            return Ok(None);
+        };
+        let Some(directory) = path.parent() else {
+            return Ok(None);
+        };
+        let relative_paths = movie_variant_extensions(path)
+            .into_iter()
+            .map(|extension| {
+                let sibling = directory.join(format!("{base}.{extension}"));
+                sibling
+                    .strip_prefix(root_path)
+                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or(ScannerError::NonUtf8Path)
+            })
+            .collect::<Result<Vec<_>, ScannerError>>()?;
+        Ok(self
+            .database
+            .find_movie_item_for_filesystem_paths(library_root_id, &relative_paths)
+            .await?)
+    }
 }
 
 #[derive(Clone)]
@@ -2879,6 +2934,7 @@ pub struct ScanJobService {
     admin_events: AdminEventHub,
     user_events: UserEventHub,
     scan_lock: Arc<Semaphore>,
+    full_scan_queue: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
@@ -2894,6 +2950,7 @@ pub struct ScanJobService {
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     scan_run_registry: Arc<Mutex<ScanRunRegistry>>,
     metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    local_metadata_image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     local_metadata_outbox_worker_started: Arc<AtomicBool>,
     local_metadata_outbox_notify: Arc<Notify>,
     lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
@@ -2904,6 +2961,19 @@ struct LocalMetadataWorkerHandle {
     task: JoinHandle<()>,
     job_id: String,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    #[cfg(test)]
+    idle_page_receiver: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+fn notify_local_metadata_images_waiter(
+    notifications: &Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    scan_job_id: &str,
+) {
+    if let Ok(registry) = notifications.lock()
+        && let Some(notify) = registry.get(scan_job_id)
+    {
+        notify.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -2916,6 +2986,7 @@ struct ActiveScanJobRun {
 struct ScanRunRegistry {
     active_runs: HashMap<String, ActiveScanJobRun>,
     deleting_libraries: HashMap<String, usize>,
+    run_finished: Arc<Notify>,
 }
 
 struct ScanJobRunGuard {
@@ -2925,22 +2996,28 @@ struct ScanJobRunGuard {
 
 impl Drop for ScanJobRunGuard {
     fn drop(&mut self) {
-        let mut registry = match self.registry.lock() {
-            Ok(registry) => registry,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let remove_job = if let Some(active_run) = registry.active_runs.get_mut(&self.job_id) {
-            if active_run.run_count > 1 {
-                active_run.run_count -= 1;
-                false
+        let (remove_job, run_finished) = {
+            let mut registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let remove_job = if let Some(active_run) = registry.active_runs.get_mut(&self.job_id) {
+                if active_run.run_count > 1 {
+                    active_run.run_count -= 1;
+                    false
+                } else {
+                    true
+                }
             } else {
-                true
+                false
+            };
+            if remove_job {
+                registry.active_runs.remove(&self.job_id);
             }
-        } else {
-            false
+            (remove_job, Arc::clone(&registry.run_finished))
         };
         if remove_job {
-            registry.active_runs.remove(&self.job_id);
+            run_finished.notify_waiters();
         }
     }
 }
@@ -2987,7 +3064,12 @@ async fn process_scan_local_metadata_batch(
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     batch: StoredScanLocalMetadataBatch,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<(
+    String,
+    String,
+    Vec<StoredScanLocalMetadataSource>,
+    Vec<String>,
+)> {
     let batch_id = batch.id.clone();
     let scan_job_id = batch.job_id.clone();
     let source_ids = match serde_json::from_str::<Vec<String>>(&batch.source_refs_json) {
@@ -3008,24 +3090,46 @@ async fn process_scan_local_metadata_batch(
             return None;
         }
     };
+    let non_retryable_item_ids =
+        match serde_json::from_str::<Vec<String>>(&batch.non_retryable_item_ids_json) {
+            Ok(item_ids)
+                if item_ids.len() <= MAX_SCAN_LOCAL_METADATA_SOURCE_IDS
+                    && item_ids.iter().all(|item_id| !item_id.trim().is_empty())
+                    && item_ids.iter().collect::<HashSet<_>>().len() == item_ids.len() =>
+            {
+                item_ids
+            }
+            _ => {
+                fail_scan_local_metadata_batch(database, &batch_id, "invalid NFO exclusion list")
+                    .await;
+                return None;
+            }
+        };
 
-    let result = match enricher
-        .index_scan_local_metadata_batch_images(&source_ids)
-        .await
-    {
-        Ok(report) if !report.failed_item_ids.is_empty() => Err(format!(
-            "{} local image item(s) failed",
-            report.failed_item_ids.len()
-        )),
-        Ok(_) => match database
-            .mark_scan_local_metadata_images_complete(&batch_id)
+    let result = if batch.images_completed_at.is_some() {
+        database
+            .list_scan_local_metadata_sources(&source_ids)
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        match enricher
+            .index_scan_local_metadata_batch_images(&source_ids)
             .await
         {
-            Ok(true) => Ok(()),
-            Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+            Ok(batch) if !batch.report.failed_item_ids.is_empty() => Err(format!(
+                "{} local image item(s) failed",
+                batch.report.failed_item_ids.len()
+            )),
+            Ok(batch) => match database
+                .mark_scan_local_metadata_images_complete(&batch_id)
+                .await
+            {
+                Ok(true) => Ok(batch.sources),
+                Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+                Err(error) => Err(error.to_string()),
+            },
             Err(error) => Err(error.to_string()),
-        },
-        Err(error) => Err(error.to_string()),
+        }
     };
     if let Some(home) = home {
         home.invalidate();
@@ -3033,7 +3137,12 @@ async fn process_scan_local_metadata_batch(
     user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => Some((batch_id, scan_job_id, source_ids)),
+        Ok(source_snapshot) => Some((
+            batch_id,
+            scan_job_id,
+            source_snapshot,
+            non_retryable_item_ids,
+        )),
         Err(error) => {
             tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
             fail_scan_local_metadata_batch(database, &batch_id, &error).await;
@@ -3048,35 +3157,49 @@ async fn finish_scan_local_metadata_batch(
     context: LocalMetadataCompletionContext<'_>,
     batch_id: &str,
     scan_job_id: &str,
-    source_ids: &[String],
+    source_snapshot: Vec<StoredScanLocalMetadataSource>,
+    existing_non_retryable_item_ids: &[String],
 ) {
-    let result = enricher
-        .enrich_scan_local_metadata_batch_nfo(source_ids)
+    let mut non_retryable_item_ids = existing_non_retryable_item_ids.to_vec();
+    let result = match enricher
+        .enrich_scan_local_metadata_batch_nfo(source_snapshot, &non_retryable_item_ids)
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|report| {
-            if report.failed_item_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} local NFO item(s) failed",
-                    report.failed_item_ids.len()
-                ))
+    {
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        }) => {
+            for item_id in &report.non_retryable_failed_item_ids {
+                if !non_retryable_item_ids.contains(item_id) {
+                    non_retryable_item_ids.push(item_id.clone());
+                }
             }
-        });
-    let result = match result {
-        Ok(()) => {
-            complete_local_metadata_completeness(
-                database,
-                context.metadata_selection,
-                context.metadata_reidentify,
-                Some(scan_job_id),
-                source_ids,
-                context.user_events,
-            )
-            .await
+            let retryable_failed_item_count = report.retryable_failed_item_count();
+            if retryable_failed_item_count > 0 {
+                Err(format!(
+                    "{retryable_failed_item_count} local NFO item(s) failed"
+                ))
+            } else {
+                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
+                    format!(
+                        "{} non-retryable local NFO item(s) failed",
+                        non_retryable_item_ids.len()
+                    )
+                });
+                complete_local_metadata_completeness(
+                    database,
+                    context.metadata_selection,
+                    context.metadata_reidentify,
+                    LocalMetadataCompletenessTrigger::ScanJob(scan_job_id),
+                    &source_identities,
+                    &non_retryable_item_ids,
+                    context.user_events,
+                )
+                .await
+                .map(|()| issue)
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
         home.invalidate();
@@ -3084,22 +3207,36 @@ async fn finish_scan_local_metadata_batch(
     context.user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => match database.complete_scan_local_metadata_batch(batch_id).await {
+        Ok(issue) => match database
+            .complete_scan_local_metadata_batch_with_outcome(
+                batch_id,
+                issue.as_deref(),
+                &non_retryable_item_ids,
+            )
+            .await
+        {
             Ok(true) => {}
             Ok(false) => tracing::debug!(batch_id, "local metadata batch was already terminal"),
             Err(error) => {
                 tracing::warn!(batch_id, %error, "local metadata batch completion could not be saved");
-                fail_scan_local_metadata_batch(
+                fail_scan_local_metadata_batch_with_non_retryable_item_ids(
                     database,
                     batch_id,
                     "local metadata completion failed",
+                    &non_retryable_item_ids,
                 )
                 .await;
             }
         },
         Err(error) => {
             tracing::warn!(batch_id, %error, "local NFO batch failed and will be retried");
-            fail_scan_local_metadata_batch(database, batch_id, &error).await;
+            fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+                database,
+                batch_id,
+                &error,
+                &non_retryable_item_ids,
+            )
+            .await;
         }
     }
 }
@@ -3120,12 +3257,38 @@ async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, err
     }
 }
 
+async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+    database: &Database,
+    batch_id: &str,
+    error: &str,
+    non_retryable_item_ids: &[String],
+) {
+    let retry_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
+        .unwrap_or(i64::MAX);
+    if let Err(storage_error) = database
+        .fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+            batch_id,
+            error,
+            non_retryable_item_ids,
+            Some(retry_at),
+        )
+        .await
+    {
+        tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
+    }
+}
+
 async fn process_scan_local_metadata_backfill_images(
     enricher: &MetadataEnricher,
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     page: &StoredScanLocalMetadataBackfillPage,
-) -> Result<(), String> {
+) -> Result<Vec<StoredScanLocalMetadataSource>, String> {
     let result = enricher
         .index_scan_local_metadata_batch_images(&page.entry_ids)
         .await;
@@ -3133,14 +3296,14 @@ async fn process_scan_local_metadata_backfill_images(
         home.invalidate();
     }
     user_events.publish_home_coalesced().await;
-    let report = result.map_err(|error| error.to_string())?;
-    if !report.failed_item_ids.is_empty() {
+    let batch = result.map_err(|error| error.to_string())?;
+    if !batch.report.failed_item_ids.is_empty() {
         return Err(format!(
             "{} local image item(s) failed",
-            report.failed_item_ids.len()
+            batch.report.failed_item_ids.len()
         ));
     }
-    Ok(())
+    Ok(batch.sources)
 }
 
 async fn finish_scan_local_metadata_backfill_page(
@@ -3148,34 +3311,48 @@ async fn finish_scan_local_metadata_backfill_page(
     enricher: &MetadataEnricher,
     context: LocalMetadataCompletionContext<'_>,
     page: StoredScanLocalMetadataBackfillPage,
+    source_snapshot: Vec<StoredScanLocalMetadataSource>,
 ) {
-    let result = enricher
-        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids)
+    let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
+    let result = match enricher
+        .enrich_scan_local_metadata_batch_nfo(source_snapshot, &page.non_retryable_item_ids)
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|report| {
-            if report.failed_item_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} local NFO item(s) failed",
-                    report.failed_item_ids.len()
-                ))
+    {
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        }) => {
+            for item_id in &report.non_retryable_failed_item_ids {
+                if !non_retryable_item_ids.contains(item_id) {
+                    non_retryable_item_ids.push(item_id.clone());
+                }
             }
-        });
-    let result = match result {
-        Ok(()) => {
-            complete_local_metadata_completeness(
-                database,
-                context.metadata_selection,
-                context.metadata_reidentify,
-                None,
-                &page.entry_ids,
-                context.user_events,
-            )
-            .await
+            let retryable_failed_item_count = report.retryable_failed_item_count();
+            if retryable_failed_item_count > 0 {
+                Err(format!(
+                    "{retryable_failed_item_count} local NFO item(s) failed"
+                ))
+            } else {
+                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
+                    format!(
+                        "{} non-retryable local NFO item(s) failed",
+                        non_retryable_item_ids.len()
+                    )
+                });
+                complete_local_metadata_completeness(
+                    database,
+                    context.metadata_selection,
+                    context.metadata_reidentify,
+                    LocalMetadataCompletenessTrigger::LibrarySetting,
+                    &source_identities,
+                    &non_retryable_item_ids,
+                    context.user_events,
+                )
+                .await
+                .map(|()| issue)
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
         home.invalidate();
@@ -3183,8 +3360,8 @@ async fn finish_scan_local_metadata_backfill_page(
     context.user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => match database
-            .complete_scan_local_metadata_backfill_page(&page)
+        Ok(issue) => match database
+            .complete_scan_local_metadata_backfill_page_with_optional_issue(&page, issue.as_deref())
             .await
         {
             Ok(true) => {}
@@ -3202,6 +3379,7 @@ async fn finish_scan_local_metadata_backfill_page(
                     database,
                     &page,
                     "local metadata backfill completion failed",
+                    &non_retryable_item_ids,
                 )
                 .await;
             }
@@ -3212,7 +3390,13 @@ async fn finish_scan_local_metadata_backfill_page(
                 %error,
                 "local metadata backfill NFO failed and will be retried"
             );
-            fail_scan_local_metadata_backfill_page(database, &page, &error).await;
+            fail_scan_local_metadata_backfill_page(
+                database,
+                &page,
+                &error,
+                &non_retryable_item_ids,
+            )
+            .await;
         }
     }
 }
@@ -3221,6 +3405,7 @@ async fn fail_scan_local_metadata_backfill_page(
     database: &Database,
     page: &StoredScanLocalMetadataBackfillPage,
     error: &str,
+    non_retryable_item_ids: &[String],
 ) {
     let retry_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3230,7 +3415,12 @@ async fn fail_scan_local_metadata_backfill_page(
         .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
         .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
-        .fail_scan_local_metadata_backfill_page(page, error, Some(retry_at))
+        .fail_scan_local_metadata_backfill_page_with_exclusions(
+            page,
+            error,
+            non_retryable_item_ids,
+            Some(retry_at),
+        )
         .await
     {
         tracing::warn!(
@@ -3241,80 +3431,107 @@ async fn fail_scan_local_metadata_backfill_page(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalMetadataCompletenessTrigger<'a> {
+    ScanJob(&'a str),
+    ScanJobPolicy(MetadataAutoMatchPolicy),
+    LibrarySetting,
+}
+
+fn metadata_auto_match_policy_for_scan_job(job: Option<&StoredScanJob>) -> MetadataAutoMatchPolicy {
+    metadata_auto_match_policy_for_scan_job_snapshot(
+        job.map(|job| job.job_type.as_str()),
+        job.is_some_and(|job| job.auto_metadata_match),
+    )
+}
+
+fn metadata_auto_match_policy_for_scan_job_snapshot(
+    job_type: Option<&str>,
+    auto_metadata_match: bool,
+) -> MetadataAutoMatchPolicy {
+    match job_type {
+        Some("INCREMENTAL_SCAN") => {
+            if auto_metadata_match {
+                MetadataAutoMatchPolicy::Enabled
+            } else {
+                MetadataAutoMatchPolicy::Disabled
+            }
+        }
+        Some(_) => MetadataAutoMatchPolicy::UseLibrarySetting,
+        None => MetadataAutoMatchPolicy::Disabled,
+    }
+}
+
+async fn resolve_local_metadata_auto_match_policy(
+    database: &Database,
+    trigger: LocalMetadataCompletenessTrigger<'_>,
+) -> Result<MetadataAutoMatchPolicy, String> {
+    match trigger {
+        LocalMetadataCompletenessTrigger::LibrarySetting => {
+            Ok(MetadataAutoMatchPolicy::UseLibrarySetting)
+        }
+        LocalMetadataCompletenessTrigger::ScanJobPolicy(policy) => Ok(policy),
+        LocalMetadataCompletenessTrigger::ScanJob(scan_job_id) => {
+            let job = database
+                .find_scan_job(scan_job_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(metadata_auto_match_policy_for_scan_job(job.as_ref()))
+        }
+    }
+}
+
 type PendingLocalMetadataCompletenessCheck = (String, String, Vec<u8>, bool, bool);
 
-const METADATA_FILL_MISSING_AUTO_BATCH_LIMIT: usize = 100;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScraperAvailabilityPreflight {
+    Available,
+    Unavailable,
+    Failed,
+}
 
-fn local_metadata_completeness_commit_batches<'a>(
-    results: &[NewItemMetadataCompletenessResult<'a>],
-    eligible_item_ids: &[String],
-) -> Vec<(Vec<NewItemMetadataCompletenessResult<'a>>, Vec<String>)> {
-    if results.is_empty() && eligible_item_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let eligible_chunks = eligible_item_ids
-        .chunks(METADATA_FILL_MISSING_AUTO_BATCH_LIMIT)
-        .map(<[String]>::to_vec)
-        .collect::<Vec<_>>();
-    let batch_count = eligible_chunks.len().max(1);
-    let mut batches = (0..batch_count)
-        .map(|index| {
-            (
-                Vec::new(),
-                eligible_chunks.get(index).cloned().unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut batch_by_item_id = HashMap::with_capacity(eligible_item_ids.len());
-    for (batch_index, item_ids) in eligible_chunks.iter().enumerate() {
-        for item_id in item_ids {
-            batch_by_item_id.insert(item_id.as_str(), batch_index);
+impl ScraperAvailabilityPreflight {
+    fn from_check_result(result: Result<Option<bool>, ()>) -> Self {
+        match result {
+            Ok(Some(true)) => Self::Available,
+            Ok(Some(false)) | Ok(None) => Self::Unavailable,
+            Err(()) => Self::Failed,
         }
     }
 
-    for result in results {
-        let batch_index = batch_by_item_id.get(result.item_id).copied().unwrap_or(0);
-        batches[batch_index]
-            .0
-            .push(NewItemMetadataCompletenessResult {
-                item_id: result.item_id,
-                capability: result.capability,
-                input_fingerprint: result.input_fingerprint,
-                is_missing: result.is_missing,
-                checked_at: result.checked_at,
-            });
+    const fn allows_fill_missing(self) -> bool {
+        matches!(self, Self::Available | Self::Failed)
     }
-
-    batches
 }
 
 async fn complete_local_metadata_completeness(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
     metadata_reidentify: Option<&MetadataReidentifyService>,
-    scan_job_id: Option<&str>,
-    filesystem_entry_ids: &[String],
+    trigger: LocalMetadataCompletenessTrigger<'_>,
+    source_identities: &[(String, String)],
+    excluded_item_ids: &[String],
     user_events: &UserEventHub,
 ) -> Result<(), String> {
     if selection.is_none() {
         return Ok(());
     }
-    let sources = database
-        .list_scan_local_metadata_sources(filesystem_entry_ids)
+    let source_identities = source_identities
+        .iter()
+        .filter(|(item_id, _)| !excluded_item_ids.iter().any(|excluded| excluded == item_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut item_ids = database
+        .list_current_scan_local_metadata_item_ids(&source_identities)
         .await
         .map_err(|error| error.to_string())?;
-    let mut item_ids = sources
-        .into_iter()
-        .map(|source| source.item_id)
-        .collect::<Vec<_>>();
     item_ids.sort_unstable();
     item_ids.dedup();
     complete_local_metadata_completeness_for_item_ids(
         database,
         selection,
         metadata_reidentify,
-        scan_job_id,
+        trigger,
         &item_ids,
         user_events,
     )
@@ -3325,88 +3542,113 @@ async fn complete_local_metadata_completeness_for_item_ids(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
     metadata_reidentify: Option<&MetadataReidentifyService>,
-    scan_job_id: Option<&str>,
+    trigger: LocalMetadataCompletenessTrigger<'_>,
     item_ids: &[String],
     user_events: &UserEventHub,
 ) -> Result<(), String> {
     let Some(selection) = selection else {
         return Ok(());
     };
-    let auto_match_policy_override = if let Some(scan_job_id) = scan_job_id {
-        match database
-            .find_scan_job(scan_job_id)
-            .await
-            .map_err(|error| error.to_string())?
+    let auto_match_policy = resolve_local_metadata_auto_match_policy(database, trigger).await?;
+    let metadata_by_item = database
+        .list_active_media_item_metadata_with_libraries(item_ids)
+        .await
+        .map_err(|error| error.to_string())?;
+    let plan_inputs = item_ids
+        .iter()
+        .filter_map(|item_id| {
+            metadata_by_item
+                .get(item_id)
+                .map(|(_, current)| (item_id.as_str(), current))
+        })
+        .collect::<Vec<_>>();
+    let plans_by_item = selection
+        .local_metadata_completeness_plans(&plan_inputs)
+        .await
+        .map_err(|error| error.to_string())?;
+    let scraper_check_item_ids =
+        if auto_match_policy.allows_scraper_lookup() && metadata_reidentify.is_some() {
+            item_ids
+                .iter()
+                .filter(|item_id| {
+                    plans_by_item
+                        .get(*item_id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|plan| plan.has_requestable_capability)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+    let (scraper_availability_by_item, scraper_availability_error) =
+        if let Some(metadata_reidentify) = metadata_reidentify
+            && !scraper_check_item_ids.is_empty()
         {
-            Some(job) if job.job_type == "INCREMENTAL_SCAN" => Some(job.auto_metadata_match),
-            Some(_) => None,
-            None => Some(false),
-        }
-    } else {
-        None
-    };
+            match metadata_reidentify
+                .has_selected_scrapers_for_items(&scraper_check_item_ids)
+                .await
+            {
+                Ok(available) => (available, None),
+                Err(error) => (HashMap::new(), Some(error.to_string())),
+            }
+        } else {
+            (HashMap::new(), None)
+        };
     let mut checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> =
         BTreeMap::new();
     for item_id in item_ids {
-        let current = database
-            .find_media_item_metadata(item_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(current) = current else {
+        let Some((library_id, _current)) = metadata_by_item.get(item_id) else {
             continue;
         };
-        let library_id = database
-            .find_item_library_id(item_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(library_id) = library_id else {
-            continue;
-        };
-        let plan = selection
-            .local_metadata_completeness_plan(item_id, &current)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(plan) = plan else {
+        let Some(plan) = plans_by_item.get(item_id).and_then(Option::as_ref) else {
             continue;
         };
         let eligible_for_fill_missing = if plan.has_requestable_capability
-            && auto_match_policy_override != Some(false)
+            && auto_match_policy.allows_scraper_lookup()
         {
-            if let Some(metadata_reidentify) = metadata_reidentify {
-                match metadata_reidentify
-                    .has_selected_scraper_for_item(item_id)
-                    .await
-                {
-                    Ok(available) => available,
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %item_id,
-                            %error,
-                            "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                        );
-                        false
+            if metadata_reidentify.is_some() {
+                let availability = scraper_availability_by_item.get(item_id);
+                let preflight_result = if let Some(error) = scraper_availability_error.as_deref() {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        error,
+                        "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                    );
+                    Err(())
+                } else {
+                    match availability {
+                        Some(Ok(available)) => Ok(Some(*available)),
+                        None => Ok(None),
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                item_id = %item_id,
+                                %error,
+                                "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                            );
+                            Err(())
+                        }
                     }
-                }
+                };
+                let preflight = ScraperAvailabilityPreflight::from_check_result(preflight_result);
+                // The metadata worker can persist SCRAPER_UNAVAILABLE and apply its bounded retry.
+                preflight.allows_fill_missing()
             } else {
                 false
             }
         } else {
             false
         };
-        let checks = checks_by_library.entry(library_id).or_default();
-        checks.extend(
-            plan.capabilities
-                .into_iter()
-                .map(|(capability, is_missing)| {
-                    (
-                        item_id.clone(),
-                        capability,
-                        plan.input_fingerprint.clone(),
-                        is_missing,
-                        eligible_for_fill_missing,
-                    )
-                }),
-        );
+        let checks = checks_by_library.entry(library_id.clone()).or_default();
+        checks.extend(plan.capabilities.iter().map(|(capability, is_missing)| {
+            (
+                item_id.clone(),
+                capability.clone(),
+                plan.input_fingerprint.clone(),
+                *is_missing,
+                eligible_for_fill_missing,
+            )
+        }));
     }
 
     let checked_at = SystemTime::now()
@@ -3414,37 +3656,12 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         });
+    let mut scheduled_job_ids = Vec::new();
     for (library_id, checks) in checks_by_library {
         for check_batch in checks.chunks(SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE) {
-            let requests = check_batch
+            let results = check_batch
                 .iter()
-                .map(
-                    |(item_id, capability, fingerprint, _, _)| NewItemMetadataCompletenessCheck {
-                        item_id,
-                        capability,
-                        input_fingerprint: fingerprint,
-                    },
-                )
-                .collect::<Vec<_>>();
-            let claimed_indices = database
-                .prepare_and_claim_item_metadata_completeness_checks(&requests)
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut metadata_fill_missing = check_batch
-                .iter()
-                .filter(|(_, _, _, _, eligible)| *eligible)
-                .map(|(item_id, _, _, _, _)| item_id.clone())
-                .collect::<Vec<_>>();
-            metadata_fill_missing.sort_unstable();
-            metadata_fill_missing.dedup();
-            if claimed_indices.is_empty() && metadata_fill_missing.is_empty() {
-                continue;
-            }
-            let results = claimed_indices
-                .iter()
-                .map(|index| {
-                    let (item_id, capability, input_fingerprint, is_missing, _) =
-                        &check_batch[*index];
+                .map(|(item_id, capability, input_fingerprint, is_missing, _)| {
                     NewItemMetadataCompletenessResult {
                         item_id,
                         capability,
@@ -3454,50 +3671,59 @@ async fn complete_local_metadata_completeness_for_item_ids(
                     }
                 })
                 .collect::<Vec<_>>();
-            let commit_batches =
-                local_metadata_completeness_commit_batches(&results, &metadata_fill_missing);
-            for (batch_results, eligible_chunk) in commit_batches {
-                let completion = database
-                    .complete_local_metadata_and_enqueue_fill_missing_with_policy(
-                        &library_id,
-                        &batch_results,
-                        &eligible_chunk,
-                        auto_match_policy_override,
-                    )
-                    .await;
-                let completion = match completion {
-                    Ok(completion) => completion,
-                    Err(error) => {
-                        for index in &claimed_indices {
-                            let (item_id, capability, input_fingerprint, _, _) =
-                                &check_batch[*index];
-                            if let Err(fail_error) = database
-                                .fail_item_metadata_completeness_check(
-                                    item_id,
-                                    capability,
-                                    input_fingerprint,
-                                    None,
-                                    "local completeness result could not be persisted",
-                                )
-                                .await
-                            {
-                                tracing::warn!(%fail_error, "failed to release a local completeness claim");
-                            }
-                        }
-                        return Err(error.to_string());
-                    }
-                };
-                for job_id in completion.scheduled_job_ids {
-                    let Some(metadata_reidentify) = metadata_reidentify.cloned() else {
-                        continue;
-                    };
-                    let user_events = user_events.clone();
-                    tokio::spawn(async move {
-                        metadata_reidentify.run(&job_id).await;
-                        user_events.publish_home_coalesced().await;
-                    });
+            let mut fill_missing_candidate_item_ids = check_batch
+                .iter()
+                .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
+                .map(|(item_id, _, _, _, _)| item_id.clone())
+                .collect::<Vec<_>>();
+            fill_missing_candidate_item_ids.sort_unstable();
+            fill_missing_candidate_item_ids.dedup();
+            let completion = database
+                .complete_local_metadata_completeness_batch_with_policy(
+                    &library_id,
+                    &results,
+                    &fill_missing_candidate_item_ids,
+                    auto_match_policy,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            scheduled_job_ids.extend(
+                completion
+                    .scheduled_job_ids
+                    .into_iter()
+                    .map(|job_id| (library_id.clone(), job_id)),
+            );
+        }
+    }
+    if let Some(metadata_reidentify) = metadata_reidentify.cloned()
+        && !scheduled_job_ids.is_empty()
+    {
+        let mut completions = Vec::with_capacity(scheduled_job_ids.len());
+        for (library_id, job_id) in scheduled_job_ids {
+            match metadata_reidentify
+                .enqueue_fill_missing_job_id(&job_id)
+                .await
+            {
+                Ok(Some(completion)) => completions.push(completion),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        library_id,
+                        job_id,
+                        %error,
+                        "local metadata completeness job could not be dispatched"
+                    );
                 }
             }
+        }
+        if !completions.is_empty() {
+            let user_events = user_events.clone();
+            tokio::spawn(async move {
+                for completion in completions {
+                    let _ = completion.await;
+                    user_events.publish_home_coalesced().await;
+                }
+            });
         }
     }
     Ok(())
@@ -3510,6 +3736,13 @@ pub struct IncrementalScanChange {
     pub kind: ChangeKind,
 }
 
+/// What a local metadata refresh request queued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalMetadataRefreshAccepted {
+    pub directories: usize,
+    pub entries: usize,
+}
+
 impl ScanJobService {
     pub fn new(database: Database) -> Self {
         let log_store = database.log_store();
@@ -3519,6 +3752,7 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             user_events: UserEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
+            full_scan_queue: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
             people: None,
@@ -3540,6 +3774,7 @@ impl ScanJobService {
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
             scan_run_registry: Arc::new(Mutex::new(ScanRunRegistry::default())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
+            local_metadata_image_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_metadata_outbox_worker_started: Arc::new(AtomicBool::new(false)),
             local_metadata_outbox_notify: Arc::new(Notify::new()),
             lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
@@ -3668,6 +3903,35 @@ impl ScanJobService {
             Err(poisoned) => poisoned.into_inner(),
         };
         registry.active_runs.contains_key(job_id)
+    }
+
+    async fn wait_for_scan_job_runs_to_finish(&self, job_ids: &[String]) {
+        loop {
+            let run_finished = {
+                let registry = match self.scan_run_registry.lock() {
+                    Ok(registry) => registry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                Arc::clone(&registry.run_finished)
+            };
+            let notified = run_finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let has_active_runs = {
+                let registry = match self.scan_run_registry.lock() {
+                    Ok(registry) => registry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                job_ids
+                    .iter()
+                    .any(|job_id| registry.active_runs.contains_key(job_id))
+            };
+            if !has_active_runs {
+                return;
+            }
+            notified.await;
+        }
     }
 
     async fn ensure_lite_manifest_discovery_session(
@@ -3843,17 +4107,12 @@ impl ScanJobService {
                 self.cancel_running_job(&job_id).await?;
             }
         }
-        let wait_for_active_runs = async {
-            while active_job_ids
-                .iter()
-                .any(|job_id| self.scan_job_run_is_active(job_id))
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        if tokio::time::timeout(LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT, wait_for_active_runs)
-            .await
-            .is_err()
+        if tokio::time::timeout(
+            LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT,
+            self.wait_for_scan_job_runs_to_finish(&active_job_ids),
+        )
+        .await
+        .is_err()
         {
             return Err(ScanJobError::LibraryDeletionScanTimeout);
         }
@@ -3871,6 +4130,9 @@ impl ScanJobService {
                 completed: true,
             });
         };
+        self.database
+            .cancel_scan_local_metadata_batches(job_id)
+            .await?;
         self.database
             .finish_scan_manifest(job_id, "CANCELLED")
             .await?;
@@ -3932,7 +4194,7 @@ impl ScanJobService {
         self.database
             .update_scan_job_activity(job_id, current_item.as_deref(), scan_phase)
             .await?;
-        self.admin_events.publish(AdminEventScope::Jobs);
+        self.admin_events.publish_jobs_progress();
         Ok(())
     }
 
@@ -3991,6 +4253,154 @@ impl ScanJobService {
         )
         .await;
         self.get_job(&job.id).await
+    }
+
+    /// Re-runs local metadata indexing (NFO and images) for the media files below exact
+    /// directories of a library root, without walking the rest of the root.
+    ///
+    /// This fills the gap between a path scan, which only looks at files whose fingerprint
+    /// changed, and a library backfill, which walks every file of the root: after an external
+    /// tool writes or repairs sidecars (a scraper publishing a poster, a rebuilt item that lost
+    /// its images) nothing about the video files changes, so only this refreshes them.
+    /// Work runs in the background; the returned counts describe what was queued.
+    pub async fn start_local_metadata_refresh(
+        &self,
+        library_id: LibraryId,
+        library_root_id: Option<&str>,
+        directories: &[String],
+    ) -> Result<LocalMetadataRefreshAccepted, ScanJobError> {
+        const MAX_DIRECTORIES: usize = 2_000;
+        const MAX_ENTRIES: i64 = 20_000;
+        if directories.is_empty() {
+            return Err(ScanJobError::NoChanges);
+        }
+        if directories.len() > MAX_DIRECTORIES {
+            return Err(ScanJobError::Scanner(ScannerError::InvalidRelativePath(
+                format!("at most {MAX_DIRECTORIES} directories per request"),
+            )));
+        }
+        let library_id = library_id.to_string();
+        let Some(library) = self.database.find_library(&library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let roots = self.database.list_library_roots(&library_id).await?;
+        let root = match library_root_id {
+            Some(root_id) => roots
+                .into_iter()
+                .find(|root| root.id == root_id)
+                .ok_or_else(|| {
+                    ScanJobError::Scanner(ScannerError::InvalidRootId(root_id.to_owned()))
+                })?,
+            None => {
+                let mut roots = roots.into_iter();
+                let Some(root) = roots.next() else {
+                    return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                        "library has no configured roots".to_owned(),
+                    )));
+                };
+                if roots.next().is_some() {
+                    return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                        "library has multiple roots; rootId is required".to_owned(),
+                    )));
+                }
+                root
+            }
+        };
+        let mut normalized = Vec::with_capacity(directories.len());
+        for directory in directories {
+            let directory = normalize_incremental_path(directory)?;
+            let directory = directory.trim_end_matches('/').to_owned();
+            if !directory.is_empty() && !normalized.contains(&directory) {
+                normalized.push(directory);
+            }
+        }
+        let entry_ids = self
+            .database
+            .list_media_source_entry_ids_under_directories(&root.id, &normalized, MAX_ENTRIES)
+            .await?;
+        let accepted = LocalMetadataRefreshAccepted {
+            directories: normalized.len(),
+            entries: entry_ids.len(),
+        };
+        if entry_ids.is_empty() {
+            return Ok(accepted);
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.run_local_metadata_refresh(entry_ids).await;
+        });
+        Ok(accepted)
+    }
+
+    async fn run_local_metadata_refresh(&self, entry_ids: Vec<String>) {
+        // One refresh at a time: it is cheap per entry, but a burst of notifications must not
+        // compete with scans for the database.
+        static REFRESH_LOCK: OnceLock<Semaphore> = OnceLock::new();
+        let Ok(_permit) = REFRESH_LOCK
+            .get_or_init(|| Semaphore::new(1))
+            .acquire()
+            .await
+        else {
+            return;
+        };
+        let enricher = MetadataEnricher::new(self.database.clone())
+            .with_resource_metrics(self.resources.clone());
+        let enricher = match self.local_nfo.clone() {
+            Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+            None => enricher,
+        };
+        let mut failed_items = 0_usize;
+        for chunk in entry_ids.chunks(64) {
+            let source_snapshot = match enricher.index_scan_local_metadata_batch_images(chunk).await
+            {
+                Ok(batch) => batch.sources,
+                Err(error) => {
+                    tracing::warn!(%error, "local metadata refresh could not index images");
+                    failed_items += 1;
+                    continue;
+                }
+            };
+            match enricher
+                .enrich_scan_local_metadata_batch_nfo(source_snapshot, &[])
+                .await
+            {
+                Ok(ScanLocalMetadataNfoBatch {
+                    report,
+                    source_identities,
+                }) => {
+                    failed_items += report.failed_item_ids.len();
+                    if let Err(error) = complete_local_metadata_completeness(
+                        &self.database,
+                        self.metadata_selection.as_ref(),
+                        self.metadata_reidentify.as_ref(),
+                        LocalMetadataCompletenessTrigger::LibrarySetting,
+                        &source_identities,
+                        &report.non_retryable_failed_item_ids,
+                        &self.user_events,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "local metadata refresh could not update completeness");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "local metadata refresh could not read NFOs");
+                    failed_items += 1;
+                }
+            }
+        }
+        tracing::info!(
+            entries = entry_ids.len(),
+            failed_items,
+            "local metadata refresh finished"
+        );
+        if let Some(home) = &self.home {
+            home.invalidate();
+        }
+        self.user_events.publish_home_coalesced().await;
     }
 
     pub async fn create_path_scan_job(
@@ -4806,27 +5216,29 @@ impl ScanJobService {
                     } else {
                         None
                     };
-                    let variant_identity_is_current =
-                        match inferred_suffix.as_deref().and_then(|suffix| {
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .and_then(|name| {
-                                    parse_movie_filename_with_variant_suffix(name, suffix)
-                                })
-                        }) {
-                            Some(parsed) => {
+                    let variant_identity_is_current = match inferred_suffix.as_deref() {
+                        Some(suffix) => {
+                            let base_item_id = self
+                                .scanner
+                                .find_inferred_movie_variant_base_item(
+                                    &root.id, &root_path, &path, suffix,
+                                )
+                                .await?;
+                            if let Some(base_item_id) = base_item_id {
                                 self.database
                                     .scan_manifest_movie_variant_identity_is_current(
                                         &root.id,
                                         &observation.relative_path,
-                                        &parsed.sort_title,
-                                        parsed.production_year.map(i64::from),
-                                        parsed.edition_name.as_deref(),
+                                        &base_item_id,
+                                        Some(suffix),
                                     )
                                     .await?
+                            } else {
+                                false
                             }
-                            None => false,
-                        };
+                        }
+                        None => false,
+                    };
                     if inferred_suffix.is_none() || variant_identity_is_current {
                         seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
                             filesystem_entry_id: baseline.id.clone(),
@@ -8427,17 +8839,17 @@ impl ScanJobService {
         &self,
         job_id: &str,
     ) -> Result<(), ScanJobError> {
-        let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? else {
+        let Some(manifest) = self
+            .database
+            .get_scan_manifest_postprocessing_state_by_job(job_id)
+            .await?
+        else {
             return Ok(());
         };
         if !matches!(manifest.workflow_version, 2 | 3) || manifest.discovery_format_version != 3 {
             return Ok(());
         }
-        for root in self
-            .database
-            .list_scan_manifest_postprocessing_roots(&manifest.id)
-            .await?
-        {
+        for root in manifest.roots {
             if !root.has_positive_rows {
                 continue;
             }
@@ -8453,7 +8865,10 @@ impl ScanJobService {
                 });
             if !root_matches {
                 self.database
-                    .mark_scan_manifest_root_unavailable(&manifest.id, &root.library_root_id)
+                    .mark_scan_manifest_root_unavailable(
+                        &manifest.manifest_id,
+                        &root.library_root_id,
+                    )
                     .await?;
                 self.record_event(
                     job_id,
@@ -8920,9 +9335,11 @@ impl ScanJobService {
         let metadata_reidentify = self.metadata_reidentify.clone();
         let home = self.home.clone();
         let user_events = self.user_events.clone();
+        let resources = self.resources.clone();
         let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
+        let image_notifications = Arc::clone(&self.local_metadata_image_notifications);
         tokio::spawn(async move {
-            let enricher = MetadataEnricher::new(database.clone());
+            let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources);
             let enricher = match local_nfo {
                 Some(local_nfo) => enricher.with_nfo_store(local_nfo),
                 None => enricher,
@@ -8937,16 +9354,21 @@ impl ScanJobService {
                 }
                 match database.claim_next_scan_local_metadata_batch().await {
                     Ok(Some(batch)) => {
-                        if let Some((batch_id, scan_job_id, source_ids)) =
-                            process_scan_local_metadata_batch(
-                                &database,
-                                &enricher,
-                                home.as_ref(),
-                                &user_events,
-                                batch,
-                            )
-                            .await
+                        if let Some((
+                            batch_id,
+                            scan_job_id,
+                            source_snapshot,
+                            non_retryable_item_ids,
+                        )) = process_scan_local_metadata_batch(
+                            &database,
+                            &enricher,
+                            home.as_ref(),
+                            &user_events,
+                            batch,
+                        )
+                        .await
                         {
+                            notify_local_metadata_images_waiter(&image_notifications, &scan_job_id);
                             let database = database.clone();
                             let enricher = enricher.clone();
                             let metadata_selection = metadata_selection.clone();
@@ -8966,7 +9388,8 @@ impl ScanJobService {
                                     context,
                                     &batch_id,
                                     &scan_job_id,
-                                    &source_ids,
+                                    source_snapshot,
+                                    &non_retryable_item_ids,
                                 )
                                 .await;
                                 batch_id
@@ -8989,7 +9412,7 @@ impl ScanJobService {
                                 )
                                 .await
                                 {
-                                    Ok(()) => {
+                                    Ok(source_snapshot) => {
                                         let database = database.clone();
                                         let enricher = enricher.clone();
                                         let metadata_selection = metadata_selection.clone();
@@ -9005,7 +9428,11 @@ impl ScanJobService {
                                                 user_events: &user_events,
                                             };
                                             finish_scan_local_metadata_backfill_page(
-                                                &database, &enricher, context, page,
+                                                &database,
+                                                &enricher,
+                                                context,
+                                                page,
+                                                source_snapshot,
                                             )
                                             .await;
                                             library_root_id
@@ -9018,7 +9445,10 @@ impl ScanJobService {
                                             "local metadata backfill image stage failed and will be retried"
                                         );
                                         fail_scan_local_metadata_backfill_page(
-                                            &database, &page, &error,
+                                            &database,
+                                            &page,
+                                            &error,
+                                            &[],
                                         )
                                         .await;
                                     }
@@ -9064,6 +9494,8 @@ impl ScanJobService {
 
     fn start_local_metadata_worker(&self, scan_job_id: &str) -> LocalMetadataWorkerHandle {
         let (stop, mut stop_receiver) = watch::channel(false);
+        #[cfg(test)]
+        let (idle_page_sender, idle_page_receiver) = tokio::sync::mpsc::unbounded_channel();
         let database = self.database.clone();
         let people = self.people.clone();
         let local_nfo = self.local_nfo.clone();
@@ -9071,6 +9503,7 @@ impl ScanJobService {
         let metadata_reidentify = self.metadata_reidentify.clone();
         let home = self.home.clone();
         let user_events = self.user_events.clone();
+        let resources = self.resources.clone();
         let target_root_validator = self.clone();
         let scan_job_id = scan_job_id.to_owned();
         let notifications = Arc::clone(&self.metadata_notifications);
@@ -9080,7 +9513,7 @@ impl ScanJobService {
         }
         let worker_job_id = scan_job_id.clone();
         let task = tokio::spawn(async move {
-            let enricher = MetadataEnricher::new(database.clone());
+            let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources);
             let enricher = match people {
                 Some(people) => enricher.with_people(people),
                 None => enricher,
@@ -9090,49 +9523,57 @@ impl ScanJobService {
                 None => enricher,
             };
 
+            let mut loaded_lifecycle = false;
             loop {
                 if *stop_receiver.borrow() {
                     return;
                 }
-                let notified = notify.notified();
-                let job = match database.find_scan_job(&worker_job_id).await {
-                    Ok(Some(job)) => job,
-                    Ok(None) => return,
+                let page = match database
+                    .load_scan_job_metadata_page(
+                        &worker_job_id,
+                        i64::try_from(LOCAL_METADATA_BATCH_SIZE).unwrap_or(i64::MAX),
+                    )
+                    .await
+                {
+                    Ok(page) => {
+                        loaded_lifecycle = true;
+                        page
+                    }
                     Err(error) => {
                         tracing::warn!(
                             scan_job_id = %worker_job_id,
                             %error,
-                            "local metadata worker could not load scan job; retrying"
+                            "local metadata worker could not load job lifecycle and target page"
                         );
+                        let fallback = if loaded_lifecycle {
+                            LOCAL_METADATA_JOB_REFRESH_FALLBACK
+                        } else {
+                            LOCAL_METADATA_IDLE_FALLBACK
+                        };
                         tokio::select! {
                             changed = stop_receiver.changed() => {
                                 if changed.is_err() || *stop_receiver.borrow() {
                                     return;
                                 }
                             }
-                            _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                            _ = notify.notified() => {}
+                            _ = tokio::time::sleep(fallback) => {}
                         }
                         continue;
                     }
                 };
-                if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
+                let Some(job_status) = page.job_status.as_deref() else {
+                    return;
+                };
+                if matches!(job_status, "FAILED" | "CANCELLED") {
                     return;
                 }
-                let pending = match database
-                    .has_pending_scan_job_metadata_targets(&worker_job_id)
-                    .await
-                {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        tracing::warn!(
-                            scan_job_id = %worker_job_id,
-                            %error,
-                            "local metadata worker could not check pending targets"
-                        );
-                        false
-                    }
-                };
-                if pending {
+                let is_incremental_scan = page.job_type.as_deref() == Some("INCREMENTAL_SCAN");
+                let completeness_policy = metadata_auto_match_policy_for_scan_job_snapshot(
+                    page.job_type.as_deref(),
+                    page.auto_metadata_match,
+                );
+                if page.has_pending {
                     if let Err(error) = target_root_validator
                         .verify_manifest_postprocessing_target_roots(&worker_job_id)
                         .await
@@ -9159,18 +9600,20 @@ impl ScanJobService {
                         continue;
                     }
                     match enricher
-                        .enrich_scan_job_targets(&worker_job_id, LOCAL_METADATA_BATCH_SIZE)
+                        .enrich_scan_job_metadata_page(&worker_job_id, page)
                         .await
                     {
                         Ok(report) if report.items_processed > 0 => {
-                            if job.job_type == "INCREMENTAL_SCAN"
+                            if is_incremental_scan
                                 && !report.locally_enriched_item_ids.is_empty()
                                 && let Err(error) =
                                     complete_local_metadata_completeness_for_item_ids(
                                         &database,
                                         metadata_selection.as_ref(),
                                         metadata_reidentify.as_ref(),
-                                        Some(&worker_job_id),
+                                        LocalMetadataCompletenessTrigger::ScanJobPolicy(
+                                            completeness_policy,
+                                        ),
                                         &report.locally_enriched_item_ids,
                                         &user_events,
                                     )
@@ -9232,6 +9675,9 @@ impl ScanJobService {
                     }
                     continue;
                 }
+                #[cfg(test)]
+                let _ = idle_page_sender.send(());
+                let notified = notify.notified();
                 tokio::select! {
                     changed = stop_receiver.changed() => {
                         if changed.is_err() || *stop_receiver.borrow() {
@@ -9239,7 +9685,7 @@ impl ScanJobService {
                         }
                     }
                     _ = notified => {}
-                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_JOB_REFRESH_FALLBACK) => {}
                 }
             }
         });
@@ -9248,6 +9694,8 @@ impl ScanJobService {
             task,
             job_id: scan_job_id,
             notifications,
+            #[cfg(test)]
+            idle_page_receiver,
         }
     }
 
@@ -9265,32 +9713,53 @@ impl ScanJobService {
             .lock()
             .ok()
             .and_then(|registry| registry.get(scan_job_id).cloned());
-        while self
-            .database
-            .has_pending_scan_job_metadata_targets(scan_job_id)
-            .await?
-        {
-            let cancellation = self.cancellation_flag(scan_job_id);
-            if self
-                .cancellation_requested(scan_job_id, false, &cancellation)
-                .await?
-            {
+        loop {
+            let notified = notify.as_ref().map(|notify| notify.notified());
+            tokio::pin!(notified);
+            if let Some(notified) = notified.as_mut().as_pin_mut() {
+                notified.enable();
+            }
+
+            let (has_pending_targets, job_missing_or_cancelled) = self
+                .database
+                .local_metadata_completion_wait_state(scan_job_id)
+                .await?;
+            if !has_pending_targets {
                 break;
             }
-            if let Some(notify) = &notify {
-                let notified = notify.notified();
+            let cancellation = self.cancellation_flag(scan_job_id);
+            if job_missing_or_cancelled {
+                cancellation.store(true, Ordering::Release);
+                break;
+            }
+            if cancellation.load(Ordering::Acquire) {
+                break;
+            }
+
+            if let Some(notified) = notified.as_mut().as_pin_mut() {
                 tokio::select! {
                     _ = notified => {}
-                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_COMPLETION_FALLBACK) => {}
                 }
             } else {
-                tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+                tokio::time::sleep(LOCAL_METADATA_COMPLETION_FALLBACK).await;
             }
         }
         Ok(())
     }
 
     async fn wait_for_local_metadata_images(&self, scan_job_id: &str) -> Result<(), ScanJobError> {
+        let notify =
+            self.local_metadata_image_notifications
+                .lock()
+                .ok()
+                .map(|mut notifications| {
+                    Arc::clone(
+                        notifications
+                            .entry(scan_job_id.to_owned())
+                            .or_insert_with(|| Arc::new(Notify::new())),
+                    )
+                });
         while self
             .database
             .has_pending_scan_local_metadata_images(scan_job_id)
@@ -9303,7 +9772,17 @@ impl ScanJobService {
             {
                 break;
             }
-            tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+            if let Some(notify) = &notify {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                }
+            } else {
+                tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+            }
+        }
+        if let Ok(mut notifications) = self.local_metadata_image_notifications.lock() {
+            notifications.remove(scan_job_id);
         }
         Ok(())
     }
@@ -9378,6 +9857,16 @@ impl ScanJobService {
         let Some(_run_guard) = self.track_scan_job_run(job_id, &job.library_id) else {
             self.cancel_running_job(job_id).await?;
             return Ok(());
+        };
+        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
+            Some(
+                Arc::clone(&self.full_scan_queue)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ScanJobError::ScanLockClosed)?,
+            )
+        } else {
+            None
         };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(
@@ -9668,6 +10157,7 @@ impl ScanJobService {
                 {
                     tracing::warn!(job_id, %error, "completed scan manifest payload cleanup failed");
                 }
+                self.database.spawn_removed_media_item_purge();
                 if completed_job.auto_metadata_match && !uses_local_metadata_outbox {
                     if let Some(metadata) = metadata {
                         self.schedule_online_metadata_after_scan(job_id, metadata)
@@ -9741,6 +10231,7 @@ impl ScanJobService {
         &self,
         job_id: &str,
     ) -> Result<OwnedSemaphorePermit, ScanJobError> {
+        let mut database_wait_retry = 0_usize;
         loop {
             let job = self.database.find_scan_job(job_id).await?;
             let Some(job) = job else {
@@ -9752,7 +10243,8 @@ impl ScanJobService {
                     .has_unready_manifest_target_materialization_for_library(&job.library_id)
                     .await?
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(scan_lock_database_wait_backoff(database_wait_retry)).await;
+                database_wait_retry = database_wait_retry.saturating_add(1);
                 continue;
             }
             let is_postprocessing_target_materializer = job.job_type == "RECONCILE_LIBRARY"
@@ -9779,7 +10271,8 @@ impl ScanJobService {
                 false
             };
             if is_full_scan && has_incremental {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(scan_lock_database_wait_backoff(database_wait_retry)).await;
+                database_wait_retry = database_wait_retry.saturating_add(1);
                 continue;
             }
 
@@ -9799,7 +10292,8 @@ impl ScanJobService {
                 return Ok(permit);
             }
             drop(permit);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(scan_lock_database_wait_backoff(database_wait_retry)).await;
+            database_wait_retry = database_wait_retry.saturating_add(1);
         }
     }
 
@@ -9971,10 +10465,22 @@ impl ScanJobService {
                 return;
             }
         };
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            metadata.run(&job_id).await;
-        });
+        if let Err(error) = metadata.enqueue_fill_missing_job(&job).await {
+            tracing::warn!(
+                scan_job_id,
+                %error,
+                "scan completed but automatic metadata matching could not be dispatched"
+            );
+            self.record_event(
+                scan_job_id,
+                "ERROR",
+                "METADATA_AUTO_MATCH_QUEUE_FAILED",
+                "自动元数据匹配任务创建失败",
+                "{}",
+            )
+            .await;
+            return;
+        }
         let details = format!(
             r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
             job.total_count, job.id
@@ -10050,11 +10556,23 @@ impl ScanJobService {
                     continue;
                 }
             };
-            let job_id = job.id.clone();
-            let worker = metadata.clone();
-            tokio::spawn(async move {
-                worker.run(&job_id).await;
-            });
+            if let Err(error) = metadata.enqueue_fill_missing_job(&job).await {
+                tracing::warn!(
+                    scan_job_id,
+                    item_count = item_ids.len(),
+                    %error,
+                    "incremental scan completed but automatic metadata matching could not be dispatched"
+                );
+                self.record_event(
+                    scan_job_id,
+                    "ERROR",
+                    "METADATA_AUTO_MATCH_QUEUE_FAILED",
+                    "自动元数据匹配任务创建失败",
+                    "{}",
+                )
+                .await;
+                continue;
+            }
             let details = format!(
                 r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
                 job.total_count, job.id
@@ -10147,7 +10665,8 @@ impl ScanJobService {
         if self.database.find_library(&job.library_id).await?.is_none() {
             return Ok(());
         }
-        let enricher = MetadataEnricher::new(self.database.clone());
+        let enricher = MetadataEnricher::new(self.database.clone())
+            .with_resource_metrics(self.resources.clone());
         let enricher = match self.people.clone() {
             Some(people) => enricher.with_people(people),
             None => enricher,
@@ -10346,6 +10865,7 @@ impl ScanJobService {
             return Ok(());
         }
         self.database.request_scan_job_cancel(job_id).await?;
+        self.notify_local_metadata_worker(job_id);
         self.record_event(job_id, "INFO", "CANCEL_REQUESTED", "已请求取消任务", "{}")
             .await;
         Ok(())
@@ -10460,7 +10980,11 @@ impl ScanJobService {
                 "failed to persist scan job log event"
             );
         }
-        self.admin_events.publish(AdminEventScope::Jobs);
+        if event_code == "DISCOVERY_PROGRESS" {
+            self.admin_events.publish_jobs_progress();
+        } else {
+            self.admin_events.publish_jobs_now();
+        }
     }
 }
 
@@ -11634,15 +12158,7 @@ where
     let filename = path.file_name()?.to_str()?;
     let candidates = trailing_hyphen_variant_candidates(filename)?;
     let directory = path.parent()?;
-    let mut extensions = Vec::with_capacity(7);
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-        extensions.push(extension.to_owned());
-    }
-    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
-        if !extensions.iter().any(|existing| existing == extension) {
-            extensions.push(extension.to_owned());
-        }
-    }
+    let extensions = movie_variant_extensions(path);
     let mut matched_suffixes = HashSet::new();
     for (base, suffix) in candidates.iter().rev() {
         for extension in &extensions {
@@ -11661,6 +12177,19 @@ where
     } else {
         None
     }
+}
+
+fn movie_variant_extensions(path: &Path) -> Vec<String> {
+    let mut extensions = Vec::with_capacity(7);
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        extensions.push(extension.to_owned());
+    }
+    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
+        if !extensions.iter().any(|existing| existing == extension) {
+            extensions.push(extension.to_owned());
+        }
+    }
+    extensions
 }
 
 fn is_supported_movie_file(path: &Path) -> bool {
@@ -11859,18 +12388,23 @@ mod tests {
     };
 
     use super::{
-        LibraryScanner, MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, MAX_STRM_TARGET_BYTES, ManifestDirectoryReader,
-        ManifestFilenameInput, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
-        MixedClassification, MixedClassificationCache, MixedManifestClassification,
-        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
-        PreparedManifestFilename, ScanJobService, ScannerError, classify_manifest_removal_outcomes,
-        classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
-        infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
-        manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
-        merge_movie_provider_ids, normalize_incremental_path, parse_episode_filename,
+        LOCAL_METADATA_COMPLETION_FALLBACK, LOCAL_METADATA_JOB_REFRESH_FALLBACK, LibraryScanner,
+        LocalMetadataCompletenessTrigger, MANIFEST_DISCOVERY_BATCH_SIZE,
+        MANIFEST_STREAMED_ENTRY_BATCH_SIZE, MANIFEST_STREAMED_INDEX_BATCH_SIZE,
+        MAX_STRM_TARGET_BYTES, ManifestDirectoryReader, ManifestFilenameInput,
+        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
+        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
+        ScanJobService, ScannerError, ScraperAvailabilityPreflight,
+        classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
+        infer_sibling_movie_variant_suffix, infer_sibling_movie_variant_suffix_with_probe,
+        is_lite_manifest_discovery, manifest_file_observation_matches,
+        manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
+        metadata_auto_match_policy_for_scan_job, metadata_auto_match_policy_for_scan_job_snapshot,
+        normalize_incremental_path, notify_local_metadata_images_waiter, parse_episode_filename,
         parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
-        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
+        scan_lock_database_wait_backoff, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
@@ -11879,7 +12413,7 @@ mod tests {
         ScraperMetadata, ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest,
         ScraperSearchResponse, ScraperTrailersResponse,
     };
-    use crate::storage::NewItemMetadataCompletenessResult;
+    use crate::storage::{MetadataAutoMatchPolicy, StoredScanJob};
     use tokio::sync::{Notify, Semaphore};
 
     #[derive(Clone)]
@@ -11888,139 +12422,16 @@ mod tests {
         release_search: Arc<Semaphore>,
     }
 
-    fn assert_local_metadata_results_are_partitioned_once(
-        batches: &[(Vec<NewItemMetadataCompletenessResult<'_>>, Vec<String>)],
-        results: &[NewItemMetadataCompletenessResult<'_>],
-        eligible_item_ids: &[String],
-    ) {
-        let committed_result_count = batches
-            .iter()
-            .map(|(batch_results, _)| batch_results.len())
-            .sum::<usize>();
-        assert_eq!(committed_result_count, results.len());
-
-        let mut scheduled_item_occurrences = HashMap::<&str, usize>::new();
-        for (_, item_ids) in batches {
-            for item_id in item_ids {
-                *scheduled_item_occurrences
-                    .entry(item_id.as_str())
-                    .or_default() += 1;
-            }
-        }
-        assert_eq!(scheduled_item_occurrences.len(), eligible_item_ids.len());
-        assert!(
-            eligible_item_ids
-                .iter()
-                .all(|item_id| { scheduled_item_occurrences.get(item_id.as_str()) == Some(&1) })
-        );
-
-        let mut result_occurrences = HashMap::<(&str, &str), usize>::new();
-        for (batch_results, _) in batches {
-            for result in batch_results {
-                *result_occurrences
-                    .entry((result.item_id, result.capability))
-                    .or_default() += 1;
-            }
-        }
-        assert!(result_occurrences.values().all(|count| *count == 1));
-    }
-
     #[test]
-    fn local_metadata_completeness_commit_batches_write_512_results_once() {
-        let eligible_item_ids = (0..256)
-            .map(|index| format!("item-{index:03}"))
-            .collect::<Vec<_>>();
-        let input_fingerprint = b"local-completeness-input-v1";
-        let results = eligible_item_ids
-            .iter()
-            .flat_map(|item_id| {
-                ["POSTER", "METADATA"].map(|capability| NewItemMetadataCompletenessResult {
-                    item_id,
-                    capability,
-                    input_fingerprint,
-                    is_missing: true,
-                    checked_at: 1,
-                })
-            })
-            .collect::<Vec<_>>();
-        let batches =
-            super::local_metadata_completeness_commit_batches(&results, &eligible_item_ids);
-
-        assert_eq!(batches.len(), 3);
-        assert_eq!(
-            batches
-                .iter()
-                .map(|(_, item_ids)| item_ids.len())
-                .collect::<Vec<_>>(),
-            [100, 100, 56]
-        );
-        assert!(batches.iter().all(|(_, item_ids)| item_ids.len() <= 100));
-        assert_eq!(results.len(), 512);
-        assert_local_metadata_results_are_partitioned_once(&batches, &results, &eligible_item_ids);
-        assert_eq!(results.len() * batches.len(), 1_536);
-    }
-
-    #[test]
-    fn local_metadata_completeness_commit_batches_keep_ready_and_ineligible_results() {
-        let mut eligible_item_ids = (0..201)
-            .map(|index| format!("item-{index:03}"))
-            .collect::<Vec<_>>();
-        let previously_ready_missing_item_id = "ready-without-new-claim".to_owned();
-        eligible_item_ids.push(previously_ready_missing_item_id.clone());
-        let input_fingerprint = b"local-completeness-input-v1";
-        let mut results = eligible_item_ids[..100]
-            .iter()
-            .chain(eligible_item_ids[200..201].iter())
-            .flat_map(|item_id| {
-                ["POSTER", "METADATA"].map(|capability| NewItemMetadataCompletenessResult {
-                    item_id,
-                    capability,
-                    input_fingerprint,
-                    is_missing: true,
-                    checked_at: 1,
-                })
-            })
-            .collect::<Vec<_>>();
-        results.push(NewItemMetadataCompletenessResult {
-            item_id: "not-eligible",
-            capability: "METADATA",
-            input_fingerprint,
-            is_missing: true,
-            checked_at: 1,
-        });
-
-        let batches =
-            super::local_metadata_completeness_commit_batches(&results, &eligible_item_ids);
-
-        assert_eq!(batches.len(), 3);
-        assert_eq!(
-            batches
-                .iter()
-                .map(|(_, item_ids)| item_ids.len())
-                .collect::<Vec<_>>(),
-            [100, 100, 2]
-        );
-        assert!(batches[1].0.is_empty());
-        assert!(batches[2].1.contains(&previously_ready_missing_item_id));
+    fn scraper_preflight_failure_enters_bounded_fill_missing_retry() {
+        assert!(ScraperAvailabilityPreflight::from_check_result(Err(())).allows_fill_missing());
         assert!(
-            !batches[2]
-                .0
-                .iter()
-                .any(|result| result.item_id == previously_ready_missing_item_id)
+            ScraperAvailabilityPreflight::from_check_result(Ok(Some(true))).allows_fill_missing()
         );
         assert!(
-            batches[0]
-                .0
-                .iter()
-                .any(|result| result.item_id == "not-eligible")
+            !ScraperAvailabilityPreflight::from_check_result(Ok(Some(false))).allows_fill_missing()
         );
-        assert_local_metadata_results_are_partitioned_once(&batches, &results, &eligible_item_ids);
-
-        let result_only_batches =
-            super::local_metadata_completeness_commit_batches(&results[results.len() - 1..], &[]);
-        assert_eq!(result_only_batches.len(), 1);
-        assert_eq!(result_only_batches[0].0.len(), 1);
-        assert!(result_only_batches[0].1.is_empty());
+        assert!(!ScraperAvailabilityPreflight::from_check_result(Ok(None)).allows_fill_missing());
     }
 
     fn unsupported_scraper_call<T: Send + 'static>(
@@ -12103,6 +12514,131 @@ mod tests {
         assert_eq!(configured_scan_concurrency(None, None, 16), 16);
     }
 
+    fn stored_scan_job(job_type: &str, auto_metadata_match: bool) -> StoredScanJob {
+        StoredScanJob {
+            id: "scan-job".to_owned(),
+            library_id: "library".to_owned(),
+            job_type: job_type.to_owned(),
+            status: "RUNNING".to_owned(),
+            generation: "generation".to_owned(),
+            cursor: None,
+            processed_count: 0,
+            total_count: 0,
+            cancel_requested: false,
+            error: None,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            discovery_completed: false,
+            auto_metadata_match,
+            current_item: None,
+            scan_phase: "INDEXING".to_owned(),
+        }
+    }
+
+    #[test]
+    fn metadata_completeness_policy_is_explicit_for_scan_triggers() {
+        let incremental_disabled = stored_scan_job("INCREMENTAL_SCAN", false);
+        let incremental_enabled = stored_scan_job("INCREMENTAL_SCAN", true);
+        let full_scan = stored_scan_job("RECONCILE_LIBRARY", false);
+
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(Some(&incremental_disabled)),
+            MetadataAutoMatchPolicy::Disabled
+        );
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(Some(&incremental_enabled)),
+            MetadataAutoMatchPolicy::Enabled
+        );
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(Some(&full_scan)),
+            MetadataAutoMatchPolicy::UseLibrarySetting
+        );
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(None),
+            MetadataAutoMatchPolicy::Disabled
+        );
+        assert!(!MetadataAutoMatchPolicy::Disabled.allows_scraper_lookup());
+        assert!(MetadataAutoMatchPolicy::UseLibrarySetting.allows_scraper_lookup());
+        assert!(MetadataAutoMatchPolicy::Enabled.allows_scraper_lookup());
+    }
+
+    #[tokio::test]
+    async fn library_setting_trigger_preserves_library_completeness_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+
+        let policy = resolve_local_metadata_auto_match_policy(
+            &database,
+            LocalMetadataCompletenessTrigger::LibrarySetting,
+        )
+        .await?;
+
+        assert_eq!(policy, MetadataAutoMatchPolicy::UseLibrarySetting);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_scan_completeness_policy_does_not_reload_its_metadata_page_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "incremental-completeness-page-policy";
+        sqlx::query(
+            "INSERT INTO scan_jobs (
+                 id, library_id, job_type, status, generation, auto_metadata_match
+             ) VALUES (?, ?, 'INCREMENTAL_SCAN', 'RUNNING', 'generation', 1)",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let page = database.load_scan_job_metadata_page(job_id, 8).await?;
+        assert_eq!(database.query_count(), 1);
+        assert!(page.auto_metadata_match);
+        database.reset_query_count();
+
+        let policy = resolve_local_metadata_auto_match_policy(
+            &database,
+            LocalMetadataCompletenessTrigger::ScanJobPolicy(
+                metadata_auto_match_policy_for_scan_job_snapshot(
+                    page.job_type.as_deref(),
+                    page.auto_metadata_match,
+                ),
+            ),
+        )
+        .await?;
+
+        assert_eq!(policy, MetadataAutoMatchPolicy::Enabled);
+        assert_eq!(
+            database.query_count(),
+            0,
+            "completeness policy should reuse scan-job values returned with its metadata page"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn library_deletion_waits_for_terminal_active_run_and_fences_new_runs()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -12159,9 +12695,26 @@ mod tests {
         );
 
         drop(active_run);
-        let _deletion_guard = preparation.await??;
+        let _deletion_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), preparation).await??;
         libraries.delete_library(library.id).await?;
         Ok(())
+    }
+
+    #[test]
+    fn scan_lock_database_wait_backoff_starts_at_ten_ms_and_caps_at_250_ms() {
+        let delays = (0..=6)
+            .map(scan_lock_database_wait_backoff)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            delays,
+            [10, 20, 40, 80, 160, 250, 250].map(std::time::Duration::from_millis)
+        );
+        assert_eq!(
+            scan_lock_database_wait_backoff(usize::MAX),
+            std::time::Duration::from_millis(250)
+        );
     }
 
     #[test]
@@ -12920,6 +13473,483 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_metadata_image_waiter_wakes_when_batch_images_complete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&media_root).await?;
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?
+            .root;
+        let job_id = "image-waiter-job";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches
+             (id, job_id, library_root_id, batch_sequence, source_refs_json, source_count, status)
+             VALUES ('image-waiter-batch', ?, ?, 0, '[\"source\"]', 1, 'RUNNING')",
+        )
+        .bind(job_id)
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let waiter_jobs = jobs.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_jobs.wait_for_local_metadata_images(job_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "the image batch is still pending");
+
+        assert!(
+            database
+                .mark_scan_local_metadata_images_complete("image-waiter-batch")
+                .await?
+        );
+        notify_local_metadata_images_waiter(
+            &jobs.local_metadata_image_notifications,
+            "image-waiter-job",
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
+            .await
+            .expect("image waiter should wake before the fallback")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_completion_waiter_uses_notification_before_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "local-metadata-completion-waiter";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets
+             (job_id, target_type, target_id, item_id, change_kind, metadata_state)
+             VALUES (?, 'ITEM', 'item-1', 'item-1', 'NEW', 'PENDING')",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let notify = Arc::new(Notify::new());
+        jobs.metadata_notifications
+            .lock()
+            .map_err(|_| "metadata notification registry poisoned")?
+            .insert(job_id.to_owned(), Arc::clone(&notify));
+        let waiter_jobs = jobs.clone();
+        let waiter = tokio::spawn(async move { waiter_jobs.wait_for_local_metadata(job_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sqlx::query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'item-1'",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+        notify.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
+            .await
+            .expect("completion notification should beat the fallback")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_completion_waiter_wakes_when_scan_is_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "local-metadata-cancelled-waiter";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets
+             (job_id, target_type, target_id, item_id, change_kind, metadata_state)
+             VALUES (?, 'ITEM', 'item-1', 'item-1', 'NEW', 'PENDING')",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let notify = Arc::new(Notify::new());
+        jobs.metadata_notifications
+            .lock()
+            .map_err(|_| "metadata notification registry poisoned")?
+            .insert(job_id.to_owned(), Arc::clone(&notify));
+        let waiter_jobs = jobs.clone();
+        let waiter_job_id = job_id.to_owned();
+        let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let result = waiter_jobs.wait_for_local_metadata(&waiter_job_id).await;
+            let _ = completed_sender.send(());
+            result
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        jobs.cancel(job_id).await?;
+        let woke_before_fallback =
+            tokio::time::timeout(std::time::Duration::from_millis(250), completed_receiver)
+                .await
+                .is_ok();
+        if !woke_before_fallback {
+            notify.notify_waiters();
+        }
+        waiter.await??;
+        assert!(
+            woke_before_fallback,
+            "same-process cancellation should wake the waiter without the 5-second fallback"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_metadata_completion_waiter_keeps_five_second_fallback() {
+        assert_eq!(
+            LOCAL_METADATA_COMPLETION_FALLBACK,
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_metadata_worker_does_not_reload_scan_job_after_notification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "local-metadata-idle-worker";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        database.reset_query_count();
+        let mut worker = Some(jobs.start_local_metadata_worker(job_id));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            worker
+                .as_mut()
+                .expect("worker handle should be available")
+                .idle_page_receiver
+                .recv(),
+        )
+        .await?
+        .expect("worker should finish its startup page before waiting");
+        assert_eq!(
+            database.query_count(),
+            1,
+            "worker startup should load job lifecycle with its first metadata page"
+        );
+        database.reset_query_count();
+        jobs.notify_local_metadata_worker(job_id);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            worker
+                .as_mut()
+                .expect("worker handle should be available")
+                .idle_page_receiver
+                .recv(),
+        )
+        .await?
+        .expect("notification should trigger one lifecycle page read");
+        let notification_queries = database.query_count();
+        ScanJobService::stop_local_metadata_worker(&mut worker).await;
+        assert_eq!(notification_queries, 1);
+        sqlx::query("UPDATE scan_jobs SET status = 'FAILED' WHERE id = ?")
+            .bind(job_id)
+            .execute(database.pool())
+            .await?;
+
+        for (terminal_job_id, terminal_status) in [
+            ("local-metadata-failed-worker", "FAILED"),
+            ("local-metadata-cancelled-worker", "CANCELLED"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+                 VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+            )
+            .bind(terminal_job_id)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+
+            database.reset_query_count();
+            let mut terminal_worker = Some(jobs.start_local_metadata_worker(terminal_job_id));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                terminal_worker
+                    .as_mut()
+                    .expect("worker handle should be available")
+                    .idle_page_receiver
+                    .recv(),
+            )
+            .await?
+            .expect("worker should finish its startup page before waiting");
+            assert_eq!(database.query_count(), 1);
+
+            sqlx::query("UPDATE scan_jobs SET status = ? WHERE id = ?")
+                .bind(terminal_status)
+                .bind(terminal_job_id)
+                .execute(database.pool())
+                .await?;
+            database.reset_query_count();
+            jobs.notify_local_metadata_worker(terminal_job_id);
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                while !terminal_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.task.is_finished())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(database.query_count(), 1);
+            ScanJobService::stop_local_metadata_worker(&mut terminal_worker).await;
+        }
+
+        database.reset_query_count();
+        let mut missing_worker =
+            Some(jobs.start_local_metadata_worker("local-metadata-missing-worker"));
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while !missing_worker
+                .as_ref()
+                .is_some_and(|worker| worker.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(database.query_count(), 1);
+        ScanJobService::stop_local_metadata_worker(&mut missing_worker).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_worker_defers_targets_when_manifest_root_identity_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&media_root).await?;
+        tokio::fs::write(media_root.join("Movie.mkv"), b"movie").await?;
+        tokio::fs::write(
+            media_root.join("Movie.nfo"),
+            "<movie><title>Must Not Be Read</title></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?
+            .root;
+        let jobs = ScanJobService::new(database.clone());
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let manifest_id: String =
+            sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        sqlx::query(
+            "INSERT INTO scan_manifest_roots (
+                 manifest_id, library_root_id, state, postprocessing_target_stage
+             ) VALUES (?, ?, 'COMPLETE', 'NEW')
+             ON CONFLICT(manifest_id, library_root_id) DO UPDATE SET
+                 state = 'COMPLETE', postprocessing_target_stage = 'NEW'",
+        )
+        .bind(&manifest_id)
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at, device, inode
+             ) VALUES (?, ?, '', 1, 'DIRECTORY', 0, 1, 0, 0)
+             ON CONFLICT(manifest_id, library_root_id, relative_path, observation_sequence)
+             DO UPDATE SET device = 0, inode = 0",
+        )
+        .bind(&manifest_id)
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let item_id = "manifest-root-mismatch-item";
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Original title', 'original title', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, last_seen_change_kind
+             ) VALUES ('manifest-root-mismatch-entry', ?, 'Movie.mkv', 'FILE',
+                       5, 1, ?, 'NEW')",
+        )
+        .bind(root.id.to_string())
+        .bind(&job.generation)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, is_default
+             ) VALUES ('manifest-root-mismatch-source', ?, 'LOCAL_FILE',
+                       'manifest-root-mismatch-entry', 1)",
+        )
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'PENDING')",
+        )
+        .bind(&job.id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+
+        let mut worker = Some(jobs.start_local_metadata_worker(&job.id));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let target_state: String = sqlx::query_scalar(
+                    "SELECT metadata_state FROM scan_job_targets
+                     WHERE job_id = ? AND item_id = ?",
+                )
+                .bind(&job.id)
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+                if target_state == "FAILED" {
+                    break Ok::<(), sqlx::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        ScanJobService::stop_local_metadata_worker(&mut worker).await;
+
+        let title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(title, "Original title");
+        let root_available: i64 =
+            sqlx::query_scalar("SELECT is_available FROM library_roots WHERE id = ?")
+                .bind(root.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(root_available, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn local_metadata_worker_job_state_fallback_is_five_seconds() {
+        assert_eq!(
+            LOCAL_METADATA_JOB_REFRESH_FALLBACK,
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
     async fn local_metadata_worker_persists_capability_missing()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::{
@@ -13144,6 +14174,175 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stage 23 synthetic automatic online queue measurement; requires LUX_PERF_MEDIA_ROOT"]
+    async fn stage23_online_fill_missing_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                candidates::MetadataSelectionService, images::ImageWriteService,
+                libraries::LibraryService, nfo::LocalNfoMetadataStore,
+                reidentify::MetadataReidentifyService,
+            },
+            config::{Config, DatabaseConfiguration, PostgresConnection},
+            library::LibraryKind,
+            storage::Database,
+        };
+        use std::time::{Duration, Instant};
+        let count: usize = std::env::var("LUX_PERF_FILE_COUNT")?.parse()?;
+        let root = std::path::PathBuf::from(std::env::var("LUX_PERF_MEDIA_ROOT")?);
+        let backend = std::env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".into());
+        let configuration = match backend.as_str() {
+            "sqlite" => DatabaseConfiguration::Sqlite,
+            "postgres" => {
+                let name = std::env::var("POSTGRES_TEST_DATABASE")?;
+                if !name.starts_with("s23_") {
+                    return Err("benchmark requires an s23_ disposable database".into());
+                }
+                DatabaseConfiguration::Postgres(PostgresConnection {
+                    host: "127.0.0.1".into(),
+                    port: std::env::var("POSTGRES_TEST_PORT")?.parse()?,
+                    database: name,
+                    username: std::env::var("POSTGRES_TEST_USER")?,
+                    password: std::env::var("POSTGRES_TEST_PASSWORD")?,
+                    ssl_mode: "disable".into(),
+                })
+            }
+            _ => return Err("unsupported benchmark database backend".into()),
+        };
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:0".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect_with_configuration(&config, &configuration).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Online fixture", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 fixture")?)
+            .await?;
+        let provider = GateSearchScraper {
+            search_started: Arc::new(Notify::new()),
+            release_search: Arc::new(Semaphore::new(0)),
+        };
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir.clone(),
+        );
+        let metadata = MetadataReidentifyService::with_selection(
+            database.clone(),
+            ScraperProvider::from_adapter(provider.clone()),
+            Some(selection.clone()),
+        );
+        let jobs = ScanJobService::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+            .with_metadata_selection(selection)
+            .with_metadata_reidentify(metadata);
+        jobs.start_local_metadata_outbox_worker().await?;
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let started = Instant::now();
+        let scan_jobs = jobs.clone();
+        let job_id = job.id.clone();
+        let scan = tokio::spawn(async move {
+            scan_jobs.run_to_completion(&job_id, 500, None).await?;
+            Ok::<_, super::ScanJobError>(started.elapsed().as_nanos())
+        });
+        tokio::time::timeout(Duration::from_secs(600), provider.search_started.notified()).await?;
+        let first_provider_request_ns = started.elapsed().as_nanos();
+        let scan_complete_ns = tokio::time::timeout(Duration::from_secs(600), scan).await???;
+        let bind = if backend == "postgres" { "$1" } else { "?" };
+        let local_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status <> 'COMPLETED' OR images_completed_at IS NULL THEN 1 ELSE 0 END), 0) FROM scan_local_metadata_batches WHERE job_id = {bind}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let local_complete_ns = loop {
+            let (batches, unfinished): (i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(local_query.clone()))
+                    .bind(&job.id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if batches > 0 && unfinished == 0 {
+                break started.elapsed().as_nanos();
+            }
+            if Instant::now() > deadline {
+                return Err("local queue timed out while provider was blocked".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let queue_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status IN ('QUEUED', 'RUNNING') THEN 1 ELSE 0 END), 0), COALESCE(MAX(total_count), 0) FROM metadata_reidentify_jobs WHERE library_id = {bind} AND mode = 'FILL_MISSING'"
+        );
+        let (jobs_before_release, active_before_release, max_items_before_release): (
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(sqlx::AssertSqlSafe(queue_query.clone()))
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+        assert!(
+            jobs_before_release > 0 && active_before_release > 0,
+            "the provider gate must leave real online jobs active"
+        );
+        let release_ns = started.elapsed().as_nanos();
+        // Title fallback may issue several searches per item. After the gate
+        // opens, keep every synthetic search unblocked until the queue drains.
+        provider
+            .release_search
+            .add_permits(Semaphore::MAX_PERMITS / 2);
+        let item_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN item.status = 'COMPLETED' AND item.error = 'LOW_CONFIDENCE' AND item.automatic_retry_count = 0 AND item.automatic_retry_after IS NULL THEN 1 ELSE 0 END), 0) FROM metadata_reidentify_job_items item JOIN metadata_reidentify_jobs job ON job.id = item.job_id WHERE job.library_id = {bind} AND job.mode = 'FILL_MISSING'"
+        );
+        let mut peak_jobs = active_before_release;
+        let (online_complete_ns, job_count, item_count) = loop {
+            let (job_count, active, max_items): (i64, i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(queue_query.clone()))
+                    .bind(library.id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            let (items, successful): (i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(item_query.clone()))
+                    .bind(library.id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            peak_jobs = peak_jobs.max(active);
+            assert!(max_items <= 100 && max_items_before_release <= 100);
+            assert!(
+                items <= count as i64,
+                "duplicate automatic work in synthetic fixture"
+            );
+            if items == count as i64 && successful == items && active == 0 {
+                break (started.elapsed().as_nanos(), job_count, items);
+            }
+            if Instant::now() > deadline {
+                return Err(format!("online drain timed out: jobs={job_count}, active={active}, items={items}, lowConfidence={successful}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(scan_complete_ns < release_ns && local_complete_ns < release_ns);
+        println!(
+            "STAGE23 ONLINE RESULT {}",
+            serde_json::json!({
+                "commit": crate::COMMIT, "architecture": std::env::consts::ARCH,
+                "databaseBackend": backend, "fileCount": count,
+                "firstProviderRequestMs": first_provider_request_ns / 1_000_000,
+                "scanJobCompletionMs": scan_complete_ns / 1_000_000,
+                "localQueueCompleteMs": local_complete_ns / 1_000_000,
+                "providerGateReleasedMs": release_ns / 1_000_000,
+                "onlineQueueCompleteMs": online_complete_ns / 1_000_000,
+                "onlineDrainAfterProviderReleaseMs": (online_complete_ns - release_ns) / 1_000_000,
+                "onlineFillMissingJobCount": job_count, "onlineItemCount": item_count,
+                "maxObservedActiveJobs": peak_jobs, "maxItemsPerJobBound": 100,
+                "scanAndLocalQueueCompletedWhileProviderBlocked": true,
+                "providerMode": "synthetic empty search; held until scan and local queue complete",
+                "timingNote": "providerGateReleasedMs includes intentional gate hold; onlineDrainAfterProviderReleaseMs measures scheduling/storage drain with an immediate empty provider, not real network latency",
+            })
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -13265,6 +14464,31 @@ mod tests {
             }
         })
         .await??;
+        let fill_item: (String, Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT status, error, automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ?",
+        )
+        .bind(&fill_job.0)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            fill_item.0, "COMPLETED",
+            "fill-missing result: {fill_item:?}"
+        );
+        assert_eq!(
+            fill_item.1.as_deref(),
+            Some("LOW_CONFIDENCE"),
+            "an empty provider search is a no-candidate result, not provider unavailability"
+        );
+        assert_eq!(
+            fill_item.2, 0,
+            "no-candidate results do not consume retry budget"
+        );
+        assert_eq!(
+            fill_item.3, None,
+            "no-candidate results do not enter cooldown"
+        );
         let home_event = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             user_events_receiver.recv(),
@@ -13406,6 +14630,89 @@ mod tests {
             "an opted-in incremental job keeps its creation-time policy snapshot"
         );
 
+        let first_fill_missing_job_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM metadata_reidentify_jobs
+             WHERE mode = 'FILL_MISSING' AND library_id = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                        .bind(&first_fill_missing_job_id)
+                        .fetch_one(database.pool())
+                        .await?;
+                if !matches!(status.as_str(), "QUEUED" | "RUNNING") {
+                    return Ok::<(), sqlx::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        sqlx::query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE',
+                 automatic_retry_count = 0, automatic_retry_after = NULL
+             WHERE job_id = ?",
+        )
+        .bind(&first_fill_missing_job_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE server_settings SET value = CAST(unixepoch() - 1 AS TEXT)
+             WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET status = 'DEFERRED', error = 'DEFERRED_PROVIDER_UNAVAILABLE',
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(&first_fill_missing_job_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        tokio::fs::write(
+            movie_dir.join("Incremental.Policy.Movie.2024.mkv"),
+            b"changed movie",
+        )
+        .await?;
+        let retry_scan_job = jobs
+            .enqueue_incremental_changes(
+                library.id,
+                vec![super::IncrementalScanChange {
+                    root_id: root.root.id.to_string(),
+                    relative_path: "Incremental Policy Movie (2024)".to_owned(),
+                    kind: crate::application::watch::ChangeKind::Modify,
+                }],
+            )
+            .await?;
+        jobs.run_to_completion_with_metadata(&retry_scan_job.id, 100, None, Some(metadata.clone()))
+            .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs
+                 WHERE mode = 'FILL_MISSING' AND library_id = ?",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await?,
+            2,
+            "a later automatic scan must retry a due provider failure when completeness is still READY"
+        );
+        sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+
         let opted_out_movie_dir = media_root.join("Opted Out Policy Movie (2024)");
         tokio::fs::create_dir_all(&opted_out_movie_dir).await?;
         tokio::fs::write(
@@ -13467,8 +14774,8 @@ mod tests {
             .bind(&library_id)
             .fetch_one(database.pool())
             .await?,
-            1,
-            "a saved incremental opt-out is respected even when the live library switch is enabled"
+            2,
+            "a saved incremental opt-out does not add another job after a due retry"
         );
         Ok(())
     }

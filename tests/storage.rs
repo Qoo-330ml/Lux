@@ -9,6 +9,16 @@ use luxd::{
     storage::Database,
 };
 
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct FillRequestSnapshotRow {
+    item_id: String,
+    status: String,
+    request_fingerprint: Option<Vec<u8>>,
+    request_capabilities_json: String,
+    claimed_request_fingerprint: Option<Vec<u8>>,
+    claimed_request_capabilities_json: String,
+}
+
 #[test]
 fn migration_versions_are_unique_per_backend() -> Result<(), Box<dyn std::error::Error>> {
     for directory in ["migrations", "migrations-postgres"] {
@@ -44,6 +54,226 @@ fn migration_versions_are_unique_per_backend() -> Result<(), Box<dyn std::error:
             "{directory} has duplicate migration versions: {duplicates:?}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn postgres_migration_0158_preserves_legacy_media_chapters_version() {
+    let legacy = include_str!("../migrations-postgres/0158_media_info_chapters.sql");
+    let additive = include_str!(
+        "../migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql"
+    );
+
+    assert!(legacy.contains("CREATE TABLE media_info_chapters"));
+    assert!(additive.contains("non_retryable_item_ids_json"));
+}
+
+#[test]
+fn person_index_relation_checksum_migration_is_nullable_on_both_backends() {
+    let sqlite = include_str!("../migrations/0166_person_index_relation_checksum.sql");
+    let postgres = include_str!("../migrations-postgres/0166_person_index_relation_checksum.sql");
+
+    for migration in [sqlite, postgres] {
+        let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized
+                .contains("ALTER TABLE person_index_item_state ADD COLUMN relation_checksum TEXT;")
+        );
+        assert!(!normalized.contains("relation_checksum TEXT NOT NULL"));
+    }
+}
+
+#[test]
+fn metadata_migrations_preserve_historical_version_sequence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    for directory in ["migrations", "migrations-postgres"] {
+        let migrations = repository.join(directory);
+        for name in [
+            "0158_media_info_chapters.sql",
+            "0160_scan_local_metadata_backfill_non_retryable_items.sql",
+            "0161_reconcile_cancelled_metadata_job_items.sql",
+            "0162_filesystem_entry_directory_prefix_index.sql",
+            "0163_scan_job_failed_count_index.sql",
+            "0164_metadata_fill_request_snapshots.sql",
+            "0165_metadata_fill_missing_retry_backoff.sql",
+            "0166_person_index_relation_checksum.sql",
+        ] {
+            assert!(
+                migrations.join(name).is_file(),
+                "{directory} must preserve the historical migration sequence at {name}"
+            );
+        }
+
+        let chapters = fs::read_to_string(migrations.join("0158_media_info_chapters.sql"))?;
+        let backfill = fs::read_to_string(
+            migrations.join("0160_scan_local_metadata_backfill_non_retryable_items.sql"),
+        )?;
+        assert!(chapters.contains("CREATE TABLE media_info_chapters"));
+        assert!(backfill.contains("non_retryable_item_ids_json"));
+    }
+
+    let sqlite_retry = fs::read_to_string(
+        repository.join("migrations/0165_metadata_fill_missing_retry_backoff.sql"),
+    )?;
+    let postgres_retry = fs::read_to_string(
+        repository.join("migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql"),
+    )?;
+    for migration in [&sqlite_retry, &postgres_retry] {
+        assert!(migration.contains("automatic_retry_count"));
+        assert!(migration.contains("automatic_retry_after"));
+        assert!(migration.contains("automatic_retry_consumed"));
+        assert!(migration.contains("metadata_fill_missing_legacy_retry_after"));
+        assert!(migration.contains("+ 300"));
+        assert!(!migration.contains("UPDATE metadata_reidentify_job_items"));
+    }
+    assert!(!postgres_retry.contains("unixepoch()"));
+    assert!(postgres_retry.contains("EXTRACT(EPOCH FROM CURRENT_TIMESTAMP"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_person_index_relation_checksum_migration_preserves_existing_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migration_dir = temp_dir.path().join("migrations-v165");
+    fs::create_dir(&migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 165 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration name")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("person-index-upgrade.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('relation-library', 'Relation', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('relation-item', 'relation-library', 'MOVIE', 'Relation', 'relation', 'LOCAL_CONFIRMED')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO person_index_item_state (
+             item_id, source_fingerprint, relation_schema_version, updated_at
+         ) VALUES ('relation-item', 'nfo-fingerprint', 7, 123456789)",
+    )
+    .execute(&pool)
+    .await?;
+    let checksum_before_migration: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('person_index_item_state')
+         WHERE name = 'relation_checksum'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(checksum_before_migration, 0);
+
+    fs::copy(
+        source_dir.join("0166_person_index_relation_checksum.sql"),
+        migration_dir.join("0166_person_index_relation_checksum.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+
+    let preserved_state: (Option<String>, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT source_fingerprint, relation_schema_version, updated_at, relation_checksum
+         FROM person_index_item_state WHERE item_id = 'relation-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        preserved_state,
+        (Some("nfo-fingerprint".to_owned()), 7, 123456789, None)
+    );
+    let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(schema_version, 166);
+    pool.close().await;
+
+    let empty_database_path = temp_dir.path().join("person-index-empty.db");
+    let empty_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&empty_database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(source_dir)
+        .await?
+        .run(&empty_pool)
+        .await?;
+    let empty_database_has_checksum: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('person_index_item_state')
+         WHERE name = 'relation_checksum'",
+    )
+    .fetch_one(&empty_pool)
+    .await?;
+    assert_eq!(empty_database_has_checksum, 1);
+    empty_pool.close().await;
+    Ok(())
+}
+
+#[test]
+fn metadata_migrations_keep_deployed_checksums() -> Result<(), Box<dyn std::error::Error>> {
+    for (path, checksum) in [
+        (
+            "migrations/0158_media_info_chapters.sql",
+            "7f467f8bcf880efea58d07fdd434f3e4bcf0e64671effa68f03c21d359c2460cbc5996ca6ce7cb21ba729e82c62df4ce",
+        ),
+        (
+            "migrations-postgres/0158_media_info_chapters.sql",
+            "765fd88f82535e66cca0b46bb746f66ca30ecdd75f30886e89b8650d3a9c477ac3b19881f88e11053fda953665f8d969",
+        ),
+        (
+            "migrations/0160_scan_local_metadata_backfill_non_retryable_items.sql",
+            "3522909b3fa8daaab26a6acf1fb43bde5f6a79359b670a7dd19b9a406c949976305ae9f691133e9127b702fc8619b786",
+        ),
+        (
+            "migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql",
+            "3522909b3fa8daaab26a6acf1fb43bde5f6a79359b670a7dd19b9a406c949976305ae9f691133e9127b702fc8619b786",
+        ),
+    ] {
+        let migration = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))?;
+        assert_eq!(
+            format!("{:x}", Sha384::digest(migration.as_bytes())),
+            checksum
+        );
+    }
+
     Ok(())
 }
 
@@ -269,6 +499,105 @@ async fn sqlite_fts_columnsize_upgrade_preserves_existing_search_fields()
     Ok(())
 }
 
+#[tokio::test]
+async fn sqlite_media_search_rowid_map_upgrade_preserves_existing_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?;
+        if version.is_some_and(|version| version <= 166) {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration filename")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("fts-rowid-map-upgrade.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('fts-map-library', 'FTS', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, original_title,
+             identification_status
+         ) VALUES (
+             'fts-map-existing-item', 'fts-map-library', 'MOVIE', 'Visible Movie',
+             'Canonical Sort Key', 'Original Feature', 'LOCAL_CONFIRMED'
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('fts-map-existing-alias', 'fts-map-existing-item', 'Search Alias', 'search alias')",
+    )
+    .execute(&pool)
+    .await?;
+    let original_rowid: i64 = sqlx::query_scalar(
+        "SELECT rowid FROM media_search WHERE item_id = 'fts-map-existing-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    fs::copy(
+        source_dir.join("0167_index_media_search_row_ids.sql"),
+        migration_dir.join("0167_index_media_search_row_ids.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+
+    let mapped_row: (i64, String) = sqlx::query_as(
+        "SELECT map.fts_rowid, media_search.item_id
+         FROM media_search_map map
+         JOIN media_search ON media_search.rowid = map.fts_rowid
+         WHERE map.item_id = 'fts-map-existing-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        mapped_row,
+        (original_rowid, "fts-map-existing-item".to_owned())
+    );
+    for term in ["Visible", "Canonical", "Original", "Alias"] {
+        let matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_search
+             WHERE media_search MATCH ? AND item_id = 'fts-map-existing-item'",
+        )
+        .bind(term)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(matches, 1, "search field {term:?} was not preserved");
+    }
+    pool.close().await;
+    Ok(())
+}
+
 #[test]
 fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     let migration =
@@ -453,7 +782,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -473,8 +802,299 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 157);
+    assert_eq!(second_database.schema_version().await?, 168);
     second_database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_fill_request_snapshot_migration_preserves_queued_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir(&config_dir)?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migration_dir = temp_dir.path().join("migrations-v163");
+    fs::create_dir(&migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 163 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing name")?),
+            )?;
+        }
+    }
+
+    let database_path = config_dir.join("lux.db");
+    let old_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&old_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('snapshot-library', 'Snapshot', 'MOVIE')",
+    )
+    .execute(&old_pool)
+    .await?;
+    for (item_id, title) in [
+        ("snapshot-pending", "Pending"),
+        ("snapshot-completed", "Completed"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, 'snapshot-library', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(title)
+        .bind(title.to_ascii_lowercase())
+        .execute(&old_pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs (
+             id, status, processed_count, total_count, mode, library_id, job_scope
+         ) VALUES ('snapshot-job', 'QUEUED', 1, 2, 'FILL_MISSING', 'snapshot-library', 'ITEMS')",
+    )
+    .execute(&old_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+         VALUES ('snapshot-job', 'snapshot-pending', 'PENDING'),
+                ('snapshot-job', 'snapshot-completed', 'COMPLETED')",
+    )
+    .execute(&old_pool)
+    .await?;
+    old_pool.close().await;
+
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 168);
+    let job_state: (String, i64, i64) = sqlx::query_as(
+        "SELECT status, processed_count, total_count
+         FROM metadata_reidentify_jobs WHERE id = 'snapshot-job'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(job_state, ("QUEUED".to_owned(), 1, 2));
+    let item_snapshots: Vec<FillRequestSnapshotRow> = sqlx::query_as(
+        "SELECT item_id, status, request_fingerprint, request_capabilities_json,
+                    claimed_request_fingerprint, claimed_request_capabilities_json
+             FROM metadata_reidentify_job_items WHERE job_id = 'snapshot-job'
+             ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        item_snapshots,
+        vec![
+            FillRequestSnapshotRow {
+                item_id: "snapshot-completed".to_owned(),
+                status: "COMPLETED".to_owned(),
+                request_fingerprint: None,
+                request_capabilities_json: "[]".to_owned(),
+                claimed_request_fingerprint: None,
+                claimed_request_capabilities_json: "[]".to_owned(),
+            },
+            FillRequestSnapshotRow {
+                item_id: "snapshot-pending".to_owned(),
+                status: "PENDING".to_owned(),
+                request_fingerprint: None,
+                request_capabilities_json: "[]".to_owned(),
+                claimed_request_fingerprint: None,
+                claimed_request_capabilities_json: "[]".to_owned(),
+            },
+        ]
+    );
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir(&config_dir)?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migration_dir = temp_dir.path().join("migrations-v164");
+    fs::create_dir(&migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 164 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing name")?),
+            )?;
+        }
+    }
+
+    let database_path = config_dir.join("lux.db");
+    let old_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&old_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('retry-library', 'Retry', 'MOVIE')",
+    )
+    .execute(&old_pool)
+    .await?;
+    for item_id in ["retry-automatic", "retry-other-error", "retry-no-snapshot"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, 'retry-library', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(&old_pool)
+        .await?;
+    }
+    for (job_id, item_id) in [
+        ("retry-automatic-job", "retry-automatic"),
+        ("retry-other-error-job", "retry-other-error"),
+        ("retry-no-snapshot-job", "retry-no-snapshot"),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (
+                 id, status, processed_count, total_count, mode, library_id, job_scope
+             ) VALUES (?, 'DEFERRED', 1, 1, 'FILL_MISSING', 'retry-library', 'ITEMS')",
+        )
+        .bind(job_id)
+        .execute(&old_pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_job_items (
+                 job_id, item_id, status, error, request_fingerprint,
+                 request_capabilities_json
+             ) VALUES (?, ?, 'FAILED', ?, ?, '[]')",
+        )
+        .bind(job_id)
+        .bind(item_id)
+        .bind(if item_id == "retry-other-error" {
+            "ITEM_NOT_FOUND"
+        } else {
+            "SCRAPER_UNAVAILABLE"
+        })
+        .bind((item_id != "retry-no-snapshot").then_some(b"retry-fingerprint".as_slice()))
+        .execute(&old_pool)
+        .await?;
+    }
+    sqlx::query("CREATE TABLE migration_retry_item_updates (count INTEGER NOT NULL)")
+        .execute(&old_pool)
+        .await?;
+    sqlx::query("INSERT INTO migration_retry_item_updates (count) VALUES (0)")
+        .execute(&old_pool)
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER count_legacy_retry_item_updates
+         AFTER UPDATE ON metadata_reidentify_job_items
+         BEGIN
+             UPDATE migration_retry_item_updates SET count = count + 1;
+         END",
+    )
+    .execute(&old_pool)
+    .await?;
+    old_pool.close().await;
+
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 168);
+    let jobs: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
+                items.automatic_retry_count, items.automatic_retry_consumed
+         FROM metadata_reidentify_jobs jobs
+         JOIN metadata_reidentify_job_items items ON items.job_id = jobs.id
+         ORDER BY jobs.id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        jobs.iter()
+            .map(
+                |(id, status, processed, total, retry_count, retry_consumed)| {
+                    (
+                        id.as_str(),
+                        status.as_str(),
+                        *processed,
+                        *total,
+                        *retry_count,
+                        *retry_consumed,
+                    )
+                }
+            )
+            .collect::<Vec<_>>(),
+        vec![
+            ("retry-automatic-job", "DEFERRED", 1, 1, 0, 0),
+            ("retry-no-snapshot-job", "DEFERRED", 1, 1, 0, 0),
+            ("retry-other-error-job", "DEFERRED", 1, 1, 0, 0),
+        ]
+    );
+    let retry_deadlines: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT item_id, automatic_retry_after - unixepoch()
+         FROM metadata_reidentify_job_items ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(retry_deadlines.len(), 3);
+    assert!(
+        retry_deadlines
+            .iter()
+            .all(|(_, seconds_until_retry)| seconds_until_retry.is_none())
+    );
+    let item_update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM migration_retry_item_updates")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        item_update_count, 0,
+        "0165 must not rewrite historical job items"
+    );
+    let legacy_retry_cooldown: i64 = sqlx::query_scalar(
+        "SELECT CAST(value AS INTEGER) - unixepoch() FROM server_settings
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!((299..=300).contains(&legacy_retry_cooldown));
+    database.close().await;
     Ok(())
 }
 
@@ -549,7 +1169,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 157);
+    assert_eq!(schema_version, 168);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -910,7 +1530,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 157);
+    assert_eq!(schema_version, 168);
     database.close().await;
     Ok(())
 }
@@ -1258,7 +1878,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
 
     database.close().await;
     Ok(())
@@ -1952,7 +2572,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
     Ok(())
 }
 
@@ -2124,7 +2744,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
     Ok(())
 }
 
@@ -2211,7 +2831,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
     database.close().await;
     Ok(())
 }
@@ -2342,7 +2962,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -2524,7 +3144,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 157);
+    assert_eq!(database.schema_version().await?, 168);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

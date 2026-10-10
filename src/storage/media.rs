@@ -122,6 +122,7 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         series_scraper_id.as_deref(),
     );
     StoredMediaMetadata {
+        library_id: row.get("library_id"),
         item_type: row.get("item_type"),
         title: row.get("title"),
         original_title: row.get("original_title"),
@@ -139,6 +140,7 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         provenance_json: row.get("metadata_provenance_json"),
         locked_fields_json: row.get("locked_fields_json"),
         nfo_metadata_json: row.get("nfo_metadata_json"),
+        metadata_fingerprint: row.get("metadata_fingerprint"),
         series_item_id: row.get("series_id"),
         series_title: row.get("series_title"),
         series_production_year: row.get("series_production_year"),
@@ -253,6 +255,51 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_item_media_strategy_settings_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, (Option<String>, Option<String>)>, StorageError> {
+        let mut strategies = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT media_items.id AS item_id,
+                        libraries.media_strategy_json AS library_strategy,
+                        server_settings.value AS global_strategy
+                 FROM media_items
+                 JOIN libraries
+                   ON libraries.id = media_items.library_id AND libraries.is_enabled = 1
+                 LEFT JOIN server_settings ON server_settings.key = 'media_strategy'
+                 WHERE media_items.id IN ({placeholders})
+                   AND media_items.removed_at IS NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                strategies.insert(
+                    row.get("item_id"),
+                    (row.get("library_strategy"), row.get("global_strategy")),
+                );
+            }
+        }
+        Ok(strategies)
     }
 
     pub(crate) async fn find_folder_scan_path(
@@ -487,55 +534,57 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_item_scraper_id(
+    pub(crate) async fn list_item_scraper_configurations_by_ids(
         &self,
-        item_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let value = self
-            .query_scalar::<String>(
-                "SELECT COALESCE(l.scraper_id, '')
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.id = ? AND mi.removed_at IS NULL",
-            )
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(value.filter(|value| !value.trim().is_empty()))
-    }
-
-    pub(crate) async fn find_item_scrapers(
-        &self,
-        item_id: &str,
-    ) -> Result<Vec<StoredLibraryScraper>, StorageError> {
-        self.query(
-            "SELECT ls.scraper_id, ls.position, ls.role
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             JOIN library_scrapers ls ON ls.library_id = l.id
-             WHERE mi.id = ? AND mi.removed_at IS NULL
-             ORDER BY ls.position",
-        )
-        .bind(item_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredLibraryScraper {
-                    scraper_id: row.get("scraper_id"),
-                    position: row.get("position"),
-                    role: row.get("role"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        item_ids: &[String],
+    ) -> Result<HashMap<String, (Vec<StoredLibraryScraper>, Option<String>)>, StorageError> {
+        let mut configurations = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, l.scraper_id AS legacy_scraper_id,
+                        ls.scraper_id AS selected_scraper_id, ls.position, ls.role
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN library_scrapers ls ON ls.library_id = l.id
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
+                 ORDER BY mi.id, ls.position"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
+                let legacy_scraper_id = row
+                    .get::<Option<String>, _>("legacy_scraper_id")
+                    .filter(|value| !value.trim().is_empty());
+                let entry = configurations
+                    .entry(item_id)
+                    .or_insert_with(|| (Vec::new(), legacy_scraper_id.clone()));
+                if let Some(scraper_id) = row.get::<Option<String>, _>("selected_scraper_id") {
+                    entry.0.push(StoredLibraryScraper {
+                        scraper_id,
+                        position: row.get::<Option<i64>, _>("position").unwrap_or_default(),
+                        role: row.get::<Option<String>, _>("role").unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        Ok(configurations)
     }
 
     pub(crate) async fn insert_filesystem_entry(
@@ -1128,16 +1177,20 @@ impl Database {
             "INSERT INTO media_sources (
                  id, item_id, source_kind, filesystem_entry_id, container, size,
                  external_url, strm_target_kind, is_default, probe_status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING')",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                 CASE WHEN EXISTS (
+                     SELECT 1 FROM media_sources WHERE item_id = ? AND is_default = 1
+                 ) THEN 0 ELSE 1 END, 'PENDING')",
         )
         .bind(&file.source_id)
-        .bind(item_id)
+        .bind(&item_id)
         .bind(&file.source_kind)
         .bind(&file.filesystem_entry_id)
         .bind(&file.container)
         .bind(file.size)
         .bind(file.external_url.as_deref())
         .bind(file.strm_target_kind.as_deref())
+        .bind(&item_id)
         .execute(&mut **transaction)
         .await
         .map(|_| ())
@@ -2846,44 +2899,89 @@ impl Database {
             })
     }
 
-    pub(crate) async fn movie_metadata_identity_conflicts(
+    pub(crate) async fn movie_metadata_identity_conflict(
         &self,
         item_id: &str,
         sort_title: &str,
         production_year: i64,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar::<i64>(
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                 FROM media_items current_item
-                 JOIN media_items conflicting_item
-                   ON conflicting_item.library_id = current_item.library_id
-                  AND conflicting_item.id <> current_item.id
-                  AND conflicting_item.item_type = 'MOVIE'
-                  AND conflicting_item.sort_title = ?
-                  AND conflicting_item.production_year = ?
-                  AND conflicting_item.removed_at IS NULL
-                  AND conflicting_item.has_available_source = 1
-                  AND (
-                      current_item.parent_id IS NULL
-                      OR conflicting_item.parent_id IS NULL
-                      OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
-                  )
-                 WHERE current_item.id = ?
-                   AND current_item.item_type = 'MOVIE'
-                   AND current_item.removed_at IS NULL
-             ) THEN 1 ELSE 0 END",
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar::<String>(
+            "SELECT conflicting_item.id
+             FROM media_items current_item
+             JOIN media_items conflicting_item
+               ON conflicting_item.library_id = current_item.library_id
+              AND conflicting_item.id <> current_item.id
+              AND conflicting_item.item_type = 'MOVIE'
+              AND conflicting_item.sort_title = ?
+              AND conflicting_item.production_year = ?
+              AND conflicting_item.removed_at IS NULL
+              AND conflicting_item.has_available_source = 1
+              AND (
+                  current_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+              )
+             WHERE current_item.id = ?
+               AND current_item.item_type = 'MOVIE'
+               AND current_item.removed_at IS NULL
+             ORDER BY conflicting_item.id
+             LIMIT 1",
         )
         .bind(sort_title)
         .bind(production_year)
         .bind(item_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map(|value| value != 0)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn movie_metadata_pending_identity_conflict(
+        &self,
+        item_id: &str,
+        pending_item_ids: &[String],
+    ) -> Result<Option<String>, StorageError> {
+        if pending_item_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = std::iter::repeat_n("?", pending_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT conflicting_item.id
+             FROM media_items current_item
+             JOIN media_items conflicting_item
+               ON conflicting_item.library_id = current_item.library_id
+              AND conflicting_item.id <> current_item.id
+              AND conflicting_item.id IN ({placeholders})
+              AND conflicting_item.item_type = 'MOVIE'
+              AND conflicting_item.removed_at IS NULL
+              AND conflicting_item.has_available_source = 1
+              AND (
+                  current_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+              )
+             WHERE current_item.id = ?
+               AND current_item.item_type = 'MOVIE'
+               AND current_item.removed_at IS NULL
+             ORDER BY conflicting_item.id
+             LIMIT 1"
+        );
+        let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+        for pending_item_id in pending_item_ids {
+            statement = statement.bind(pending_item_id);
+        }
+        statement
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn find_media_item_by_identity(
@@ -3071,24 +3169,6 @@ impl Database {
         Ok(metadata.remove(item_id))
     }
 
-    pub(crate) async fn find_movie_nfo_auxiliary_fields(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<(String, i64)>, StorageError> {
-        self.query(
-            "SELECT sort_title, added_at FROM media_items
-             WHERE id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| row.map(|row| (row.get("sort_title"), row.get("added_at"))))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn list_media_item_metadata_by_ids(
         &self,
         item_ids: &[String],
@@ -3102,12 +3182,13 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT mi.id AS item_id, mi.item_type, mi.title, mi.original_title, mi.overview,
+                "SELECT mi.id AS item_id, mi.library_id AS library_id, mi.item_type, mi.title, mi.original_title, mi.overview,
                         mi.production_year, mi.premiere_date, mi.last_air_date, mi.status,
                         mi.original_language, mi.rating, mi.provider_ids_json,
                         mi.metadata_scraper_id, mi.identification_status,
                         mi.metadata_provenance_json, mi.locked_fields_json,
-                        mi.nfo_metadata_json, mi.series_id, mi.season_number, mi.episode_number,
+                        mi.nfo_metadata_json, mi.metadata_fingerprint, mi.series_id,
+                        mi.season_number, mi.episode_number,
                         series.title AS series_title,
                         series.production_year AS series_production_year,
                         series.provider_ids_json AS series_provider_ids_json,
@@ -3133,6 +3214,59 @@ impl Database {
             for row in rows {
                 let item_id = row.get::<String, _>("item_id");
                 metadata.insert(item_id, stored_media_metadata(row));
+            }
+        }
+        Ok(metadata)
+    }
+
+    pub(crate) async fn list_active_media_item_metadata_with_libraries(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, (String, StoredMediaMetadata)>, StorageError> {
+        let mut metadata = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.library_id AS library_id,
+                        mi.item_type, mi.title, mi.original_title, mi.overview,
+                        mi.production_year, mi.premiere_date, mi.last_air_date, mi.status,
+                        mi.original_language, mi.rating, mi.provider_ids_json,
+                        mi.metadata_scraper_id, mi.identification_status,
+                        mi.metadata_provenance_json, mi.locked_fields_json,
+                        mi.nfo_metadata_json, mi.metadata_fingerprint, mi.series_id,
+                        mi.season_number, mi.episode_number,
+                        series.title AS series_title,
+                        series.production_year AS series_production_year,
+                        series.provider_ids_json AS series_provider_ids_json,
+                        series.metadata_scraper_id AS series_metadata_scraper_id,
+                        libraries.scraper_id AS scraper_id
+                 FROM media_items mi
+                 JOIN libraries
+                   ON libraries.id = mi.library_id AND libraries.is_enabled = 1
+                 LEFT JOIN media_items series ON series.id = mi.series_id
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
+                let library_id = row.get::<String, _>("library_id");
+                metadata.insert(item_id, (library_id, stored_media_metadata(row)));
             }
         }
         Ok(metadata)

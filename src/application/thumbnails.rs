@@ -62,6 +62,12 @@ pub struct ThumbnailService {
     ffmpeg_permits: Arc<Semaphore>,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ScraperFirstRetryState {
+    pub(crate) applicable: bool,
+    pub(crate) images_missing: bool,
+}
+
 impl ThumbnailService {
     pub fn new(database: Database) -> Self {
         Self::with_runner(database, PathBuf::from("ffmpeg"), Duration::from_secs(30))
@@ -228,21 +234,28 @@ impl ThumbnailService {
         Ok(report)
     }
 
-    pub(crate) async fn scraper_first_retry_is_applicable(
+    pub(crate) async fn scraper_first_retry_state(
         &self,
         item_id: &str,
-    ) -> Result<bool, ThumbnailError> {
+    ) -> Result<ScraperFirstRetryState, ThumbnailError> {
         let Some(source) = self.database.find_local_thumbnail_source(item_id).await? else {
-            return Ok(false);
+            return Ok(ScraperFirstRetryState::default());
         };
         if source.scraper_id.is_none() || is_strm_path(&source.relative_path) {
-            return Ok(false);
+            return Ok(ScraperFirstRetryState::default());
         }
         let global_strategy = self.database.media_strategy_settings().await?;
-        Ok(ThumbnailScrapingMode::from_strategy_json(
+        if ThumbnailScrapingMode::from_strategy_json(
             source.library_media_strategy_json.as_deref(),
             global_strategy.as_deref(),
-        ) == ThumbnailScrapingMode::ScraperFirst)
+        ) != ThumbnailScrapingMode::ScraperFirst
+        {
+            return Ok(ScraperFirstRetryState::default());
+        }
+        Ok(ScraperFirstRetryState {
+            applicable: true,
+            images_missing: self.images_missing_for_source(item_id, &source).await?,
+        })
     }
 
     pub(crate) async fn scraper_first_images_missing(
@@ -252,7 +265,15 @@ impl ThumbnailService {
         let Some(source) = self.database.find_local_thumbnail_source(item_id).await? else {
             return Ok(false);
         };
-        let (_source_path, _target_path, root_path) = resolve_media_paths(&source).await?;
+        self.images_missing_for_source(item_id, &source).await
+    }
+
+    async fn images_missing_for_source(
+        &self,
+        item_id: &str,
+        source: &StoredThumbnailSource,
+    ) -> Result<bool, ThumbnailError> {
+        let (_source_path, _target_path, root_path) = resolve_media_paths(source).await?;
         let indexed_images = self.database.list_item_images(item_id).await?;
         for image_type in ["POSTER", "THUMB"] {
             if matches!(
@@ -1047,5 +1068,61 @@ impl From<StorageError> for ThumbnailError {
 impl From<ThumbnailFileError> for ThumbnailError {
     fn from(_: ThumbnailFileError) -> Self {
         Self::ImageAvailabilityUnavailable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThumbnailService;
+    use crate::{
+        application::{libraries::LibraryService, scanner::LibraryScanner},
+        config::Config,
+        library::LibraryKind,
+        storage::Database,
+    };
+
+    #[tokio::test]
+    async fn scraper_first_retry_state_reuses_local_source_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library_with_scraper(
+                "Retry thumbnails",
+                LibraryKind::Movie,
+                false,
+                Some("org.lux.tmdb"),
+                false,
+            )
+            .await?;
+        let root = temp_dir.path().join("Movies");
+        let movie_dir = root.join("Retry Source (2024)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Retry.Source.2024.mkv"), b"video").await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+
+        database.reset_query_count();
+        let state = ThumbnailService::new(database.clone())
+            .scraper_first_retry_state(&item_id)
+            .await?;
+
+        assert!(state.applicable);
+        assert!(state.images_missing);
+        assert_eq!(database.query_count(), 3);
+        Ok(())
     }
 }

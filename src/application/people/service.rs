@@ -1,12 +1,15 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     fmt::Write as _,
     io::Cursor,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{
@@ -21,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::AsyncWriteExt,
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, OnceCell, Semaphore},
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -93,6 +96,28 @@ const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "taglines",
     "aliases",
 ];
+const MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES: usize = 4096;
+const LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY: usize = 4;
+
+#[derive(Clone, Default)]
+pub(crate) struct LocalActorRelationPageCache {
+    relevant_item_ids: Arc<HashSet<String>>,
+    legacy_item_ids: Arc<OnceCell<Result<LegacyItemDirectorySnapshot, String>>>,
+}
+
+impl LocalActorRelationPageCache {
+    pub(crate) fn new(item_ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            relevant_item_ids: Arc::new(item_ids.into_iter().collect()),
+            legacy_item_ids: Arc::new(OnceCell::new()),
+        }
+    }
+}
+
+struct LegacyItemDirectorySnapshot {
+    item_ids: HashSet<String>,
+    complete: bool,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -339,6 +364,73 @@ pub struct ActorPersistReport {
     pub pending_assets: Vec<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct DeferredNfoActorCredits {
+    pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
+    flush_lock: Arc<AsyncMutex<()>>,
+    manifest_restore_pending: Arc<AsyncMutex<bool>>,
+    person_asset_results: Arc<AsyncMutex<HashMap<String, Arc<OnceCell<PersonAssetResult>>>>>,
+    person_asset_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    person_asset_test_probe: Option<LocalNfoPersonAssetConcurrencyProbe>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LocalNfoPersonAssetConcurrencyProbe {
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<Semaphore>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl LocalNfoPersonAssetConcurrencyProbe {
+    async fn hold_after_permit(&self) {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        let _ = self.started.send(());
+        if let Ok(permit) = self.release.acquire().await {
+            drop(permit);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Default for DeferredNfoActorCredits {
+    fn default() -> Self {
+        Self {
+            pending: Arc::default(),
+            flush_lock: Arc::new(AsyncMutex::new(())),
+            manifest_restore_pending: Arc::default(),
+            person_asset_results: Arc::default(),
+            person_asset_permits: Arc::new(Semaphore::new(
+                LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY,
+            )),
+            #[cfg(test)]
+            person_asset_test_probe: None,
+        }
+    }
+}
+
+pub(super) struct PersonManifestWriteOptions<'a> {
+    pub metadata: Option<&'a PersonMetadata>,
+    pub deferred_restore_pending: Option<&'a DeferredNfoActorCredits>,
+}
+
+#[derive(Clone)]
+struct PendingNfoActorCredits {
+    item_id: String,
+    credits: Vec<NewPersonCredit>,
+    source_fingerprint: Option<String>,
+    relation_checksum: String,
+}
+
+pub(crate) struct NfoActorCreditsFlushFailure {
+    pub item_ids: Vec<String>,
+    pub error: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonMatchCandidateView {
@@ -404,9 +496,25 @@ struct PersonDecisionOperation {
     checksum: String,
 }
 
+#[derive(Clone, Default)]
 struct PersonAssetResult {
     image_file: Option<String>,
     pending_assets: Vec<String>,
+}
+
+impl PersonAssetResult {
+    fn failed() -> Self {
+        Self {
+            image_file: None,
+            pending_assets: vec![
+                PENDING_PERSON_DIRECTORY.to_owned(),
+                PENDING_PERSON_NFO.to_owned(),
+                PENDING_PERSON_MANIFEST.to_owned(),
+                PENDING_PROFILE_IMAGE.to_owned(),
+                PENDING_PERSON_INDEX.to_owned(),
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -509,6 +617,8 @@ pub struct PeopleService {
     client: Client,
     database: Option<Database>,
     rebuild_lock: Arc<AsyncMutex<()>>,
+    person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    relation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     rebuild_coordinator: PersonIndexRebuildCoordinator,
 }
 
@@ -570,6 +680,31 @@ impl PeopleService {
         Ok(())
     }
 
+    async fn ensure_person_manifest_restore_pending(
+        &self,
+        deferred: Option<&DeferredNfoActorCredits>,
+    ) -> Result<(), PeopleError> {
+        if let Some(deferred) = deferred {
+            let mut marked = deferred.manifest_restore_pending.lock().await;
+            if !*marked {
+                self.mark_person_manifest_restore_pending().await?;
+                *marked = true;
+            }
+            Ok(())
+        } else {
+            self.mark_person_manifest_restore_pending().await
+        }
+    }
+
+    pub(super) async fn relation_lock_for(&self, relation_path: &Path) -> Arc<AsyncMutex<()>> {
+        let key = relation_path.to_string_lossy().into_owned();
+        let mut locks = self.relation_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
         let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
             Ok(builder) => match builder.build() {
@@ -583,6 +718,8 @@ impl PeopleService {
             client,
             database: None,
             rebuild_lock: Arc::new(AsyncMutex::new(())),
+            person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            relation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
@@ -601,6 +738,86 @@ impl PeopleService {
         Ok(read_relation(&legacy_path).await?.is_some())
     }
 
+    pub(crate) async fn item_actor_relation_exists_with_page_cache(
+        &self,
+        item_id: &str,
+        cache: &LocalActorRelationPageCache,
+    ) -> Result<(bool, bool), PeopleError> {
+        let new_path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        if read_relation(&new_path).await?.is_some() {
+            return Ok((true, false));
+        }
+
+        let mut loaded = false;
+        let legacy_item_ids = cache
+            .legacy_item_ids
+            .get_or_init(|| async {
+                loaded = true;
+                self.read_legacy_item_relation_ids(&cache.relevant_item_ids)
+                    .await
+            })
+            .await;
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        match legacy_item_ids {
+            Ok(snapshot) if snapshot.item_ids.contains(item_id) => {
+                Ok((read_relation(&legacy_path).await?.is_some(), loaded))
+            }
+            Ok(snapshot) if snapshot.complete => Ok((false, loaded)),
+            Ok(_) => Ok((read_relation(&legacy_path).await?.is_some(), loaded)),
+            Err(_directory_error) => Ok((read_relation(&legacy_path).await?.is_some(), loaded)),
+        }
+    }
+
+    async fn read_legacy_item_relation_ids(
+        &self,
+        relevant_item_ids: &HashSet<String>,
+    ) -> Result<LegacyItemDirectorySnapshot, String> {
+        let directory = self.legacy_people_dir().join(LEGACY_ITEMS_DIR);
+        let mut entries = match fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LegacyItemDirectorySnapshot {
+                    item_ids: HashSet::new(),
+                    complete: true,
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut item_ids = HashSet::new();
+        let mut entry_count = 0;
+        let mut complete = true;
+        loop {
+            if entry_count >= MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES {
+                complete = false;
+                break;
+            }
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => return Err(error.to_string()),
+            };
+            entry_count += 1;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(item_id) = name.strip_suffix(".json") {
+                if relevant_item_ids.contains(item_id) {
+                    item_ids.insert(item_id.to_owned());
+                    if item_ids.len() == relevant_item_ids.len() {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(LegacyItemDirectorySnapshot { item_ids, complete })
+    }
+
     pub async fn item_actor_relation_is_current(
         &self,
         item_id: &str,
@@ -609,28 +826,63 @@ impl PeopleService {
         let path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
-        let Some(relation) = read_relation(&path).await? else {
+        let Some(relation_bytes) = read_people_file(&path).await? else {
             return Ok(false);
         };
-        Ok(relation
+        let relation_checksum = relation_snapshot_checksum(&relation_bytes);
+        let relation = parse_relation(&relation_bytes)?;
+        let relation_is_current = relation
             .source_fingerprint
             .as_deref()
             .and_then(decode_fingerprint)
-            .is_some_and(|stored| stored == source_fingerprint))
+            .is_some_and(|stored| stored == source_fingerprint);
+        if !relation_is_current {
+            return Ok(false);
+        }
+        if let Some(database) = &self.database {
+            return database
+                .person_index_item_state_matches_snapshot(
+                    item_id,
+                    relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()));
+        }
+        Ok(true)
     }
 
-    pub async fn nfo_relation_snapshot_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
+    pub async fn nfo_relation_snapshot_is_current(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, PeopleError> {
         let path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
-        let Some(relation) = read_relation(&path).await? else {
+        let Some(relation_bytes) = read_people_file(&path).await? else {
             return Ok(false);
         };
-        Ok(relation
+        let relation_checksum = relation_snapshot_checksum(&relation_bytes);
+        let relation = parse_relation(&relation_bytes)?;
+        let source_fingerprint = relation
             .source_fingerprint
             .as_deref()
             .and_then(decode_fingerprint)
-            .is_some_and(|fingerprint| fingerprint.len() == 32))
+            .filter(|fingerprint| fingerprint.len() == 32);
+        let Some(source_fingerprint) = source_fingerprint else {
+            return Ok(false);
+        };
+        if let Some(database) = &self.database {
+            return database
+                .person_index_item_state_matches_snapshot(
+                    item_id,
+                    relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()));
+        }
+        Ok(source_fingerprint.len() == 32)
     }
 
     pub async fn list_item_actors(&self, item_id: &str) -> Result<Vec<ActorView>, PeopleError> {
@@ -821,16 +1073,26 @@ fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet, HashSet},
+        path::Path,
+        sync::Arc,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
     use super::{
-        ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError,
-        PeopleService, PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest,
-        PersonMetadata,
+        ActorCredit, DeferredNfoActorCredits, LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY,
+        LocalActorRelationPageCache, LocalNfoPersonAssetConcurrencyProbe,
+        MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_INDEX, PENDING_PERSON_MANIFEST,
+        PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService,
+        PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions,
+        PersonMetadata, PersonMetadataUpdate, relation_snapshot_checksum,
+        write_atomically_if_changed,
     };
     use crate::application::metadata_paths::{
-        canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
-        people_index_path_for_provider,
+        canonical_person_directory, library_item_directory, lux_person_directory, metadata_root,
+        people_directory, people_index_path, people_index_path_for_provider,
     };
     use crate::{
         application::libraries::LibraryService, config::Config, library::LibraryKind,
@@ -846,6 +1108,32 @@ mod tests {
         0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
+    async fn assert_relation_checksum_matches_file(
+        database: &Database,
+        config_dir: &Path,
+        item_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let relation_bytes =
+            tokio::fs::read(library_item_directory(config_dir, item_id)?.join("people.json"))
+                .await?;
+        let expected_checksum = Sha256::digest(&relation_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let stored_checksum: Option<String> = sqlx::query_scalar(
+            "SELECT relation_checksum FROM person_index_item_state WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            stored_checksum.as_deref(),
+            Some(expected_checksum.as_str()),
+            "the index state must checksum the exact bytes written to people.json for {item_id}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn person_index_rebuild_requests_coalesce_while_a_run_is_active() {
         let coordinator = PersonIndexRebuildCoordinator::default();
@@ -855,6 +1143,173 @@ mod tests {
         assert!(coordinator.finish().await);
         assert!(!coordinator.finish().await);
         assert!(coordinator.begin().await);
+    }
+
+    #[tokio::test]
+    async fn atomic_person_asset_write_skips_identical_content_and_replaces_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profile.bin");
+        assert!(write_atomically_if_changed(&path, b"first").await?);
+        let first_inode = tokio::fs::metadata(&path).await?.ino();
+        assert!(!write_atomically_if_changed(&path, b"first").await?);
+        assert_eq!(tokio::fs::metadata(&path).await?.ino(), first_inode);
+        assert_eq!(tokio::fs::metadata(&path).await?.mode() & 0o777, 0o600);
+
+        assert!(write_atomically_if_changed(&path, b"second").await?);
+        assert_eq!(tokio::fs::read(&path).await?, b"second");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn atomic_person_asset_write_rejects_symlink_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("target.bin");
+        let symlink = directory.path().join("profile.bin");
+        let non_file = directory.path().join("profile-directory");
+        tokio::fs::write(&target, b"target").await?;
+        tokio::fs::symlink(&target, &symlink).await?;
+        tokio::fs::create_dir(&non_file).await?;
+
+        let error = write_atomically_if_changed(&symlink, b"replacement")
+            .await
+            .expect_err("symlink targets must remain rejected");
+        assert!(matches!(error, PeopleError::Symlink(_)));
+        let error = write_atomically_if_changed(&non_file, b"replacement")
+            .await
+            .expect_err("non-file targets must remain rejected");
+        assert!(matches!(error, PeopleError::Serialization(_)));
+        assert_eq!(tokio::fs::read(target).await?, b"target");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_actor_relation_page_cache_lists_legacy_items_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let legacy_items = directory.path().join("people/items");
+        tokio::fs::create_dir_all(&legacy_items).await?;
+        tokio::fs::write(legacy_items.join("episode-1.json"), b"[]").await?;
+        tokio::fs::write(legacy_items.join("episode-2.json"), b"[]").await?;
+
+        let service = PeopleService::new(directory.path().to_owned());
+        let cache = LocalActorRelationPageCache::new(
+            ["episode-1", "episode-2", "episode-3"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let (first, second, missing) = tokio::join!(
+            service.item_actor_relation_exists_with_page_cache("episode-1", &cache),
+            service.item_actor_relation_exists_with_page_cache("episode-2", &cache),
+            service.item_actor_relation_exists_with_page_cache("episode-3", &cache),
+        );
+        let (first_exists, first_loaded) = first?;
+        let (second_exists, second_loaded) = second?;
+        let (missing_exists, missing_loaded) = missing?;
+
+        assert!(first_exists);
+        assert!(second_exists);
+        assert!(!missing_exists);
+        assert_eq!(
+            [first_loaded, second_loaded, missing_loaded]
+                .into_iter()
+                .filter(|loaded| *loaded)
+                .count(),
+            1,
+            "a page should enumerate its legacy relation directory only once"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_actor_relation_page_cache_falls_back_when_legacy_directory_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let legacy_people = directory.path().join("people");
+        tokio::fs::create_dir_all(&legacy_people).await?;
+        tokio::fs::write(legacy_people.join("items"), b"not a directory").await?;
+
+        let service = PeopleService::new(directory.path().to_owned());
+        let cache = LocalActorRelationPageCache::new(["episode-1".to_owned()]);
+        let result = service
+            .item_actor_relation_exists_with_page_cache("episode-1", &cache)
+            .await;
+
+        assert!(matches!(result, Err(PeopleError::Io { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_actor_relation_page_cache_falls_back_after_legacy_entry_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let legacy_items = directory.path().join("people/items");
+        tokio::fs::create_dir_all(&legacy_items).await?;
+        let entries_path = legacy_items.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for index in 0..=MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES {
+                std::fs::write(entries_path.join(format!("unrelated-{index}.json")), b"[]")?;
+            }
+            Ok(())
+        })
+        .await??;
+
+        let service = PeopleService::new(directory.path().to_owned());
+        let relevant_item_ids = HashSet::from(["episode-target".to_owned()]);
+        let snapshot = service
+            .read_legacy_item_relation_ids(&relevant_item_ids)
+            .await?;
+        assert!(
+            !snapshot.complete,
+            "the directory scan must stop at its cap"
+        );
+        assert!(!snapshot.item_ids.contains("episode-target"));
+
+        tokio::fs::write(legacy_items.join("episode-target.json"), b"[]").await?;
+        let cache = LocalActorRelationPageCache::new(["episode-target".to_owned()]);
+        assert!(
+            cache.legacy_item_ids.set(Ok(snapshot)).is_ok(),
+            "the fixture snapshot should initialize the page cache"
+        );
+        let (exists, _) = service
+            .item_actor_relation_exists_with_page_cache("episode-target", &cache)
+            .await?;
+
+        assert!(
+            exists,
+            "an incomplete snapshot must fall back to the legacy path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn person_asset_locks_are_sharded_by_person() {
+        let service = PeopleService::new(
+            tempfile::tempdir()
+                .expect("temporary directory")
+                .path()
+                .to_owned(),
+        );
+        let first = {
+            let mut locks = service.person_asset_locks.lock().await;
+            locks
+                .entry("lux-000001".to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let second = {
+            let mut locks = service.person_asset_locks.lock().await;
+            locks
+                .entry("lux-000002".to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        assert!(!Arc::ptr_eq(&first, &second));
+        let _first_guard = first.lock().await;
+        assert!(second.try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -1906,6 +2361,8 @@ mod tests {
     #[tokio::test]
     async fn uploaded_profile_image_is_written_in_person_directory()
     -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
         let config = tempfile::tempdir()?;
         let service = PeopleService::new(config.path().to_owned());
         service
@@ -1927,6 +2384,24 @@ mod tests {
             index["imagePath"]
                 .as_str()
                 .is_some_and(|path| path.ends_with("/folder.png"))
+        );
+
+        let image_inode = tokio::fs::metadata(&person_image).await?.ino();
+        let index_path = people_index_path_for_provider(config.path(), "tmdb", "9")?;
+        let index_inode = tokio::fs::metadata(&index_path).await?.ino();
+        let legacy_index_path =
+            crate::application::metadata_paths::people_index_path(config.path(), "9")?;
+        let legacy_index_inode = tokio::fs::metadata(&legacy_index_path).await?.ino();
+
+        service
+            .update_person_image("9", "演员甲", Some("tmdb"), Some("image/png"), PNG_1X1)
+            .await?;
+
+        assert_eq!(tokio::fs::metadata(&person_image).await?.ino(), image_inode);
+        assert_eq!(tokio::fs::metadata(&index_path).await?.ino(), index_inode);
+        assert_eq!(
+            tokio::fs::metadata(&legacy_index_path).await?.ino(),
+            legacy_index_inode
         );
         Ok(())
     }
@@ -2241,6 +2716,1215 @@ mod tests {
                 .await?,
         )?;
         assert_eq!(relation["generation"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nfo_relation_current_requires_matching_persisted_credit_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind("item-1")
+        .bind(library.id.to_string())
+        .bind("测试电影")
+        .bind("测试电影")
+        .execute(database.pool())
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let source_fingerprint = [1_u8; 32];
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
+
+        let enriched_actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: Some(PersonMetadata {
+                biography: Some("在线补全的人物简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+        };
+        service
+            .update_item_actor_metadata("item-1", "tmdb", &[enriched_actor])
+            .await?;
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
+
+        service
+            .update_person_metadata(
+                &[library.id.to_string()],
+                "9",
+                PersonMetadataUpdate {
+                    name: "演员甲".to_owned(),
+                    biography: Some("人物资料更新后的简介".to_owned()),
+                    ..PersonMetadataUpdate::default()
+                },
+            )
+            .await?;
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
+
+        assert!(
+            service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?
+        );
+        assert!(service.nfo_relation_snapshot_is_current("item-1").await?);
+
+        sqlx::query(
+            "UPDATE person_index_item_state SET relation_checksum = NULL WHERE item_id = ?",
+        )
+        .bind("item-1")
+        .execute(database.pool())
+        .await?;
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?,
+            "legacy checksum-free index state must be rebuilt"
+        );
+        assert!(!service.nfo_relation_snapshot_is_current("item-1").await?);
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert!(service.nfo_relation_snapshot_is_current("item-1").await?);
+
+        let relation_path =
+            library_item_directory(&config.config_dir, "item-1")?.join("people.json");
+        let relation_bytes = tokio::fs::read(&relation_path).await?;
+        let changed_bytes = [relation_bytes.as_slice(), b"\n"].concat();
+        tokio::fs::write(&relation_path, changed_bytes).await?;
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?,
+            "changed relation bytes must be stale even when the source fingerprint is unchanged"
+        );
+        assert!(
+            !service.nfo_relation_snapshot_is_current("item-1").await?,
+            "NFO relation reuse must compare the persisted relation checksum"
+        );
+        tokio::fs::write(&relation_path, &relation_bytes).await?;
+        assert!(service.nfo_relation_snapshot_is_current("item-1").await?);
+
+        database.clear_person_credits("item-1").await?;
+
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?,
+            "relation file alone must not hide a missing credit-index revision"
+        );
+
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert!(
+            service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?
+        );
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relation_rebuild_does_not_skip_changed_bytes_with_same_source_fingerprint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind("item-rebuild")
+        .bind(library.id.to_string())
+        .bind("测试电影")
+        .bind("测试电影")
+        .execute(database.pool())
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let source_fingerprint = [1_u8, 2, 3];
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        service
+            .persist_nfo_item_actors("item-rebuild", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        service.rebuild_person_credit_index().await?;
+
+        let relation_path =
+            library_item_directory(&config.config_dir, "item-rebuild")?.join("people.json");
+        let relation_bytes = tokio::fs::read(&relation_path).await?;
+        let mut relation: serde_json::Value = serde_json::from_slice(&relation_bytes)?;
+        relation["actors"][0]["name"] = serde_json::Value::String("演员乙".to_owned());
+        tokio::fs::write(&relation_path, serde_json::to_vec_pretty(&relation)?).await?;
+
+        sqlx::query("UPDATE person_index_item_state SET updated_at = 1 WHERE item_id = ?")
+            .bind("item-rebuild")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "UPDATE person_index_rebuild_jobs
+             SET status = 'QUEUED', cursor_id = NULL, processed_count = 1,
+                 total_count = 1, cancel_requested = 0, run_token = NULL
+             WHERE library_id = ?",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        assert_eq!(service.rebuild_person_credit_index().await?, 1);
+        let updated_at: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM person_index_item_state WHERE item_id = ?")
+                .bind("item-rebuild")
+                .fetch_one(database.pool())
+                .await?;
+        assert!(
+            updated_at > 1,
+            "changed snapshot bytes must trigger rebuilding"
+        );
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-rebuild")
+            .await?;
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_page_coalesces_duplicate_person_asset_persistence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let deferred = DeferredNfoActorCredits::default();
+        let actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+
+        assert_eq!(
+            service
+                .persist_nfo_item_actors_deferred(
+                    "item-a",
+                    "tmdb",
+                    std::slice::from_ref(&actor),
+                    &[1, 2, 3],
+                    &deferred,
+                )
+                .await?
+                .stored_count,
+            1
+        );
+
+        let first_relation: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(library_item_directory(config.path(), "item-a")?.join("people.json"))
+                .await?,
+        )?;
+        let person_key = first_relation["actors"][0]["personKey"]
+            .as_str()
+            .ok_or("missing resolved person key")?;
+        let person_nfo = canonical_person_directory(config.path(), person_key)?.join("person.nfo");
+        let first_inode = tokio::fs::metadata(&person_nfo).await?.ino();
+
+        assert_eq!(
+            service
+                .persist_nfo_item_actors_deferred(
+                    "item-b",
+                    "tmdb",
+                    std::slice::from_ref(&actor),
+                    &[4, 5, 6],
+                    &deferred,
+                )
+                .await?
+                .stored_count,
+            1
+        );
+        assert_eq!(
+            tokio::fs::metadata(&person_nfo).await?.ino(),
+            first_inode,
+            "the same page should persist duplicate person assets only once"
+        );
+
+        for item_id in ["item-a", "item-b"] {
+            let relation_path = library_item_directory(config.path(), item_id)?.join("people.json");
+            let relation: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+            assert_eq!(relation["actors"].as_array().map(Vec::len), Some(1));
+        }
+
+        let changed_actor = ActorCredit {
+            person: Some(PersonMetadata {
+                biography: Some("新增人物简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+            ..actor.clone()
+        };
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-c",
+                "tmdb",
+                &[changed_actor],
+                &[7, 8, 9],
+                &deferred,
+            )
+            .await?;
+        let updated_metadata = tokio::fs::metadata(&person_nfo).await?;
+        assert_ne!(updated_metadata.ino(), first_inode);
+        assert!(
+            tokio::fs::read_to_string(&person_nfo)
+                .await?
+                .contains("<biography>新增人物简介</biography>")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let canonical_person = database
+            .resolve_or_create_canonical_person(
+                "演员甲",
+                "aaa",
+                "10",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"test"}"#,
+            )
+            .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let deferred = DeferredNfoActorCredits::default();
+        let actor = ActorCredit {
+            id: "10".to_owned(),
+            provider: Some("aaa".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "9".to_owned(),
+            }],
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-identity-first",
+                "tmdb",
+                std::slice::from_ref(&actor),
+                &[1],
+                &deferred,
+            )
+            .await?;
+        let renamed_actor = ActorCredit {
+            name: "演员甲更名".to_owned(),
+            ..actor.clone()
+        };
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-name-changed",
+                "tmdb",
+                std::slice::from_ref(&renamed_actor),
+                &[2],
+                &deferred,
+            )
+            .await?;
+        let renamed_person_dir = lux_person_directory(
+            &config.config_dir,
+            &renamed_actor.name,
+            &canonical_person.id,
+        )?;
+        let person_nfo = renamed_person_dir.join(PERSON_NFO);
+        assert!(
+            tokio::fs::read_to_string(&person_nfo)
+                .await?
+                .contains("<name>演员甲更名</name>"),
+            "a changed person name must persist assets in the renamed person directory"
+        );
+        let first_nfo_inode = tokio::fs::metadata(&person_nfo).await?.ino();
+
+        let actor_with_new_identity = ActorCredit {
+            identities: vec![
+                PersonIdentity {
+                    provider: "tmdb".to_owned(),
+                    id: "9".to_owned(),
+                },
+                PersonIdentity {
+                    provider: "zeta".to_owned(),
+                    id: "99".to_owned(),
+                },
+            ],
+            ..renamed_actor
+        };
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-identity-second",
+                "tmdb",
+                &[actor_with_new_identity],
+                &[2],
+                &deferred,
+            )
+            .await?;
+
+        let relation: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(
+                library_item_directory(&config.config_dir, "item-identity-second")?
+                    .join("people.json"),
+            )
+            .await?,
+        )?;
+        assert_eq!(
+            relation["actors"][0]["personKey"], canonical_person.id,
+            "the additional identity must resolve to the same canonical person"
+        );
+        assert_ne!(
+            tokio::fs::metadata(&person_nfo).await?.ino(),
+            first_nfo_inode
+        );
+        assert!(
+            tokio::fs::read_to_string(person_nfo)
+                .await?
+                .contains("<uniqueid type=\"zeta\">99</uniqueid>"),
+            "a changed identity set must not reuse the prior page asset result"
+        );
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_person_asset_batch_isolates_failures_between_people()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let deferred = DeferredNfoActorCredits::default();
+        let profiles = config.path().join("people/profiles");
+        tokio::fs::create_dir_all(&profiles).await?;
+        tokio::fs::write(profiles.join("9.png"), PNG_1X1).await?;
+        tokio::fs::write(profiles.join("11.png"), PNG_1X1).await?;
+
+        let indexed_profile = Path::new("people/assets/provider-seed.png");
+        let indexed_profile_path = metadata_root(config.path()).join(indexed_profile);
+        tokio::fs::create_dir_all(
+            indexed_profile_path
+                .parent()
+                .ok_or("indexed profile path has no parent")?,
+        )
+        .await?;
+        tokio::fs::write(&indexed_profile_path, PNG_1X1).await?;
+        let readable_provider_index = people_index_path_for_provider(config.path(), "aaa", "10")?;
+        tokio::fs::create_dir_all(
+            readable_provider_index
+                .parent()
+                .ok_or("readable provider index path has no parent")?,
+        )
+        .await?;
+        tokio::fs::write(
+            &readable_provider_index,
+            serde_json::to_vec(&serde_json::json!({
+                "imagePath": indexed_profile.to_string_lossy(),
+            }))?,
+        )
+        .await?;
+        let broken_index = people_index_path_for_provider(config.path(), "tmdb", "10")?;
+        tokio::fs::create_dir_all(
+            broken_index
+                .parent()
+                .ok_or("provider index path has no parent")?,
+        )
+        .await?;
+        let index_target = config.path().join("index-target.json");
+        tokio::fs::write(&index_target, b"{}").await?;
+        tokio::fs::symlink(index_target, &broken_index).await?;
+
+        let actors =
+            [("9", "演员甲"), ("10", "演员乙"), ("11", "演员丙")].map(|(id, name)| ActorCredit {
+                id: id.to_owned(),
+                provider: None,
+                identities: if id == "10" {
+                    vec![
+                        PersonIdentity {
+                            provider: "aaa".to_owned(),
+                            id: id.to_owned(),
+                        },
+                        PersonIdentity {
+                            provider: "tmdb".to_owned(),
+                            id: id.to_owned(),
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                },
+                name: name.to_owned(),
+                character: None,
+                order: None,
+                profile_url: None,
+                person: None,
+            });
+
+        let report = service
+            .persist_nfo_item_actors_deferred("item-assets", "tmdb", &actors, &[1, 2, 3], &deferred)
+            .await?;
+        assert_eq!(report.stored_count, 3);
+        assert!(report.pending_assets.iter().any(|item_id| item_id == "10"));
+
+        let relation_path =
+            library_item_directory(config.path(), "item-assets")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+        let stored_actors = relation["actors"].as_array().ok_or("missing actors")?;
+        assert_eq!(stored_actors.len(), 3);
+        for name in ["演员甲", "演员丙"] {
+            let actor = stored_actors
+                .iter()
+                .find(|actor| actor["name"] == name)
+                .ok_or("missing successfully persisted actor")?;
+            let person_key = actor["personKey"].as_str().ok_or("missing person key")?;
+            assert!(
+                canonical_person_directory(config.path(), person_key)?
+                    .join("person.nfo")
+                    .exists()
+            );
+        }
+        let failed_actor = stored_actors
+            .iter()
+            .find(|actor| actor["name"] == "演员乙")
+            .ok_or("missing isolated failed actor")?;
+        assert!(
+            failed_actor["pendingAssets"]
+                .as_array()
+                .is_some_and(|pending| pending.iter().any(|asset| asset == PENDING_PERSON_INDEX))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_person_assets_keep_page_concurrency_at_four()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PERSON_COUNT: usize = 8;
+        const EXPECTED_CONCURRENCY: usize = LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let mut deferred = DeferredNfoActorCredits::default();
+        let (started, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        deferred.person_asset_test_probe = Some(LocalNfoPersonAssetConcurrencyProbe {
+            started,
+            release: Arc::clone(&release),
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..PERSON_COUNT {
+            let service = service.clone();
+            let deferred = deferred.clone();
+            let item_id = format!("item-concurrency-{index}");
+            let actor = ActorCredit {
+                id: (index + 1).to_string(),
+                provider: None,
+                identities: Vec::new(),
+                name: format!("演员{index}"),
+                character: None,
+                order: None,
+                profile_url: None,
+                person: None,
+            };
+            tasks.spawn(async move {
+                service
+                    .persist_nfo_item_actors_deferred(
+                        &item_id,
+                        "tmdb",
+                        &[actor],
+                        &[index as u8],
+                        &deferred,
+                    )
+                    .await
+            });
+        }
+
+        for _ in 0..EXPECTED_CONCURRENCY {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), started_receiver.recv(),)
+                    .await?,
+                Some(()),
+                "expected each available page permit to admit one person asset task"
+            );
+        }
+        assert_eq!(active.load(Ordering::SeqCst), EXPECTED_CONCURRENCY);
+        assert!(
+            deferred.person_asset_permits.try_acquire().is_err(),
+            "all page permits should remain held while the admitted tasks are blocked"
+        );
+
+        release.add_permits(PERSON_COUNT);
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result??.stored_count, 1);
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(max_active.load(Ordering::SeqCst), EXPECTED_CONCURRENCY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_person_nfo_and_provider_index_skip_unchanged_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: None,
+            profile_url: None,
+            person: None,
+        };
+
+        service
+            .persist_nfo_item_actors("item-first", "tmdb", std::slice::from_ref(&actor), &[1])
+            .await?;
+        let first_relation: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(
+                library_item_directory(config.path(), "item-first")?.join("people.json"),
+            )
+            .await?,
+        )?;
+        let person_key = first_relation["actors"][0]["personKey"]
+            .as_str()
+            .ok_or("missing resolved person key")?;
+        let person_dir = canonical_person_directory(config.path(), person_key)?;
+        let person_nfo = person_dir.join("person.nfo");
+        let first_nfo_inode = tokio::fs::metadata(&person_nfo).await?.ino();
+        tokio::fs::write(person_dir.join("folder.png"), PNG_1X1).await?;
+
+        service
+            .persist_nfo_item_actors("item-second", "tmdb", std::slice::from_ref(&actor), &[2])
+            .await?;
+        assert_eq!(
+            tokio::fs::metadata(&person_nfo).await?.ino(),
+            first_nfo_inode,
+            "an unchanged person NFO must not be atomically replaced"
+        );
+
+        let provider_index = people_index_path_for_provider(config.path(), "tmdb", "9")?;
+        let first_index_inode = tokio::fs::metadata(&provider_index).await?.ino();
+        service
+            .persist_nfo_item_actors("item-third", "tmdb", &[actor], &[3])
+            .await?;
+        assert_eq!(
+            tokio::fs::metadata(provider_index).await?.ino(),
+            first_index_inode,
+            "an unchanged provider index must not be atomically replaced"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_lux_person_canonical_index_skips_unchanged_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let person_key = "lux-000001";
+        let person_dir = lux_person_directory(config.path(), "演员甲", person_key)?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        tokio::fs::write(person_dir.join("folder.png"), PNG_1X1).await?;
+
+        let actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: None,
+            profile_url: None,
+            person: None,
+        };
+        let identities = [PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "9".to_owned(),
+        }];
+        let index_path = people_index_path(config.path(), person_key)?;
+
+        service
+            .persist_person_assets(&actor, "tmdb", "9", Some(person_key), &identities)
+            .await;
+        let first_index_inode = tokio::fs::metadata(&index_path).await?.ino();
+        service
+            .persist_person_assets(&actor, "tmdb", "9", Some(person_key), &identities)
+            .await;
+        assert_eq!(
+            tokio::fs::metadata(&index_path).await?.ino(),
+            first_index_inode,
+            "an unchanged canonical person index must not be atomically replaced"
+        );
+
+        let nfo_path = person_dir.join(PERSON_NFO);
+        let first_nfo_inode = tokio::fs::metadata(&nfo_path).await?.ino();
+        let updated_actor = ActorCredit {
+            person: Some(PersonMetadata {
+                biography: Some("新增人物简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+            ..actor
+        };
+        service
+            .persist_person_assets(&updated_actor, "tmdb", "9", Some(person_key), &identities)
+            .await;
+        assert_ne!(tokio::fs::metadata(&nfo_path).await?.ino(), first_nfo_inode);
+        assert!(
+            tokio::fs::read_to_string(nfo_path)
+                .await?
+                .contains("<biography>新增人物简介</biography>")
+        );
+        assert_eq!(
+            tokio::fs::metadata(index_path).await?.ino(),
+            first_index_inode,
+            "metadata-only changes must leave unchanged canonical index bytes in place"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_nfo_actor_credits_become_current_after_batch_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        for item_id in ["item-a", "item-b"] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let fingerprint_a = [1_u8, 2, 3];
+        let fingerprint_b = [4_u8, 5, 6];
+        let deferred_credits = DeferredNfoActorCredits::default();
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-a",
+                "tmdb",
+                &actors,
+                &fingerprint_a,
+                &deferred_credits,
+            )
+            .await?;
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-b",
+                "tmdb",
+                &actors,
+                &fingerprint_b,
+                &deferred_credits,
+            )
+            .await?;
+
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-a", &fingerprint_a)
+                .await?
+        );
+        assert!(
+            library_item_directory(config.config_dir.as_path(), "item-a")?
+                .join("people.json")
+                .exists()
+        );
+
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty()
+        );
+
+        assert!(
+            service
+                .item_actor_relation_is_current("item-a", &fingerprint_a)
+                .await?
+        );
+        assert!(
+            service
+                .item_actor_relation_is_current("item-b", &fingerprint_b)
+                .await?
+        );
+        for item_id in ["item-a", "item-b"] {
+            assert_relation_checksum_matches_file(&database, &config.config_dir, item_id).await?;
+        }
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_relation_credit_failure_preserves_snapshot_for_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-retry', ?, 'MOVIE', 'Retry', 'Retry', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actors = [ActorCredit {
+            id: "actor-9".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "actor-9".to_owned(),
+            }],
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let source_fingerprint = [7_u8, 8, 9];
+        let deferred_credits = DeferredNfoActorCredits::default();
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-retry",
+                "tmdb",
+                &actors,
+                &source_fingerprint,
+                &deferred_credits,
+            )
+            .await?;
+
+        sqlx::query(
+            "CREATE TRIGGER reject_relation_credit_state
+             BEFORE INSERT ON person_index_item_state
+             WHEN NEW.item_id = 'item-retry'
+             BEGIN SELECT RAISE(ABORT, 'injected relation state failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let failures = service
+            .flush_deferred_nfo_actor_credits(&deferred_credits)
+            .await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].item_ids, ["item-retry"]);
+        let failed_credit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-retry'")
+                .fetch_one(database.pool())
+                .await?;
+        let failed_state_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_index_item_state WHERE item_id = 'item-retry'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            failed_credit_count, 0,
+            "the failed DB chunk must roll back credits"
+        );
+        assert_eq!(
+            failed_state_count, 0,
+            "the failed DB chunk must roll back relation revision state"
+        );
+
+        let relation_path =
+            library_item_directory(&config.config_dir, "item-retry")?.join("people.json");
+        assert!(
+            relation_path.exists(),
+            "the relation snapshot survives DB failure"
+        );
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-retry", &source_fingerprint)
+                .await?,
+            "the checksum mismatch must make the partially persisted revision stale"
+        );
+
+        sqlx::query("DROP TRIGGER reject_relation_credit_state")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty(),
+            "the same deferred snapshot should be retryable after the storage fault clears"
+        );
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty(),
+            "a repeated flush after success should be an idempotent no-op"
+        );
+        assert!(
+            service
+                .item_actor_relation_is_current("item-retry", &source_fingerprint)
+                .await?
+        );
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-retry").await?;
+
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-retry",
+                "tmdb",
+                &actors,
+                &source_fingerprint,
+                &deferred_credits,
+            )
+            .await?;
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty(),
+            "replaying the same relation update should remain idempotent"
+        );
+        let credit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-retry'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(credit_count, 1);
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-retry").await?;
+
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_relation_credit_failure_recovers_from_snapshot_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-restart-recovery', ?, 'MOVIE', 'Restart', 'Restart', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actors = [ActorCredit {
+            id: "actor-restart".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "actor-restart".to_owned(),
+            }],
+            name: "演员乙".to_owned(),
+            character: Some("角色乙".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let source_fingerprint = [17_u8; 32];
+        let deferred_credits = DeferredNfoActorCredits::default();
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-restart-recovery",
+                "tmdb",
+                &actors,
+                &source_fingerprint,
+                &deferred_credits,
+            )
+            .await?;
+
+        sqlx::query(
+            "CREATE TRIGGER reject_restart_relation_credit_state
+             BEFORE INSERT ON person_index_item_state
+             WHEN NEW.item_id = 'item-restart-recovery'
+             BEGIN SELECT RAISE(ABORT, 'injected relation state failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let failures = service
+            .flush_deferred_nfo_actor_credits(&deferred_credits)
+            .await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].item_ids, ["item-restart-recovery"]);
+
+        let relation_path = library_item_directory(&config.config_dir, "item-restart-recovery")?
+            .join("people.json");
+        let relation_bytes = tokio::fs::read(&relation_path).await?;
+        let relation_checksum = relation_snapshot_checksum(&relation_bytes);
+        assert!(
+            !service
+                .nfo_relation_snapshot_is_current("item-restart-recovery")
+                .await?,
+            "the durable relation snapshot must remain stale until its credit/index transaction commits"
+        );
+
+        // Lose the page-local retry queue and all service state as a process restart would.
+        drop(deferred_credits);
+        drop(service);
+        database.close().await;
+
+        let restarted_database = Database::connect(&config).await?;
+        sqlx::query("DROP TRIGGER reject_restart_relation_credit_state")
+            .execute(restarted_database.pool())
+            .await?;
+        let restarted_relation_bytes = tokio::fs::read(&relation_path).await?;
+        assert_eq!(
+            relation_snapshot_checksum(&restarted_relation_bytes),
+            relation_checksum,
+            "the recovery snapshot must survive the service and database restart"
+        );
+        let restarted_service =
+            PeopleService::new(config.config_dir.clone()).with_database(restarted_database.clone());
+        assert!(
+            !restarted_service
+                .nfo_relation_snapshot_is_current("item-restart-recovery")
+                .await?,
+            "a new service instance must detect the persisted snapshot/index mismatch"
+        );
+
+        assert_eq!(restarted_service.rebuild_person_credit_index().await?, 1);
+        assert!(
+            restarted_service
+                .nfo_relation_snapshot_is_current("item-restart-recovery")
+                .await?,
+            "the existing person index rebuild must reconcile the durable snapshot"
+        );
+        let stored_checksum: String = sqlx::query_scalar(
+            "SELECT relation_checksum FROM person_index_item_state
+             WHERE item_id = 'item-restart-recovery'",
+        )
+        .fetch_one(restarted_database.pool())
+        .await?;
+        assert_eq!(stored_checksum, relation_checksum);
+        let credit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-restart-recovery'",
+        )
+        .fetch_one(restarted_database.pool())
+        .await?;
+        assert_eq!(credit_count, 1);
+
+        restarted_database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_nfo_person_manifests_share_one_restore_pending_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let deferred_credits = DeferredNfoActorCredits::default();
+        let identities_a = [PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "person-a".to_owned(),
+        }];
+        let identities_b = [PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "person-b".to_owned(),
+        }];
+        let person_dir_a = lux_person_directory(&config.config_dir, "演员甲", "lux-000001")?;
+        let person_dir_b = lux_person_directory(&config.config_dir, "演员乙", "lux-000002")?;
+        let actor_a = ActorCredit {
+            id: "person-a".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: identities_a.to_vec(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let actor_b = ActorCredit {
+            id: "person-b".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: identities_b.to_vec(),
+            name: "演员乙".to_owned(),
+            character: None,
+            order: Some(1),
+            profile_url: None,
+            person: None,
+        };
+
+        database.reset_query_count();
+        let (result_a, result_b) = tokio::join!(
+            service.persist_person_assets_with_deferred_manifest(
+                &actor_a,
+                "tmdb",
+                "person-a",
+                Some("lux-000001"),
+                &identities_a,
+                Some(&deferred_credits),
+            ),
+            service.persist_person_assets_with_deferred_manifest(
+                &actor_b,
+                "tmdb",
+                "person-b",
+                Some("lux-000002"),
+                &identities_b,
+                Some(&deferred_credits),
+            )
+        );
+        assert!(
+            !result_a
+                .pending_assets
+                .iter()
+                .any(|asset| asset == PENDING_PERSON_MANIFEST)
+        );
+        assert!(
+            !result_b
+                .pending_assets
+                .iter()
+                .any(|asset| asset == PENDING_PERSON_MANIFEST)
+        );
+
+        assert_eq!(database.query_count(), 1);
+        assert!(person_dir_a.join(PERSON_MANIFEST).is_file());
+        assert!(person_dir_b.join(PERSON_MANIFEST).is_file());
+        let manifest_a: PersonManifest =
+            serde_json::from_slice(&tokio::fs::read(person_dir_a.join(PERSON_MANIFEST)).await?)?;
+        let manifest_b: PersonManifest =
+            serde_json::from_slice(&tokio::fs::read(person_dir_b.join(PERSON_MANIFEST)).await?)?;
+        assert_eq!(manifest_a.identities, identities_a);
+        assert_eq!(manifest_b.identities, identities_b);
+        assert!(!manifest_a.checksum.is_empty());
+        assert!(!manifest_b.checksum.is_empty());
+
+        database.reset_query_count();
+        service
+            .persist_person_manifest(
+                &person_dir_a,
+                "lux-000001",
+                "演员甲",
+                "tmdb",
+                &identities_a,
+                PersonManifestWriteOptions {
+                    metadata: None,
+                    deferred_restore_pending: Some(&DeferredNfoActorCredits::default()),
+                },
+            )
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "unchanged manifest checksums must not mark restore pending"
+        );
+
+        database.close().await;
         Ok(())
     }
 

@@ -52,13 +52,14 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 `LUX_DB_MAX_CONNECTIONS` 为当前 Lux 进程覆盖两种后端的连接数，允许范围为 1-100；SQLite
 增加连接不会突破单写者限制，NAS 上应结合前台 p95、写锁和内存观察后再调整。
 
-本地文件索引默认使用 16 路 worker。Docker 镜像和 Compose 默认注入
-`LUX_SCAN_CONCURRENCY=8`、`LUX_PROBE_CONCURRENCY=8` 和 `LUX_FFMPEG_CONCURRENCY=2`。
+本地文件索引默认使用 4 路 worker，在线元数据刮削默认使用 4 路 worker；`FILL_MISSING` 的进程级上限也是 4。
+Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8` 和
+`LUX_FFMPEG_CONCURRENCY=2`。
 `LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime
 使用的 OS 线程总数；媒体技术信息探测和缩略图生成是独立阶段，分别由
 `LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 限制。需要限制硬件占用时，应同时设置这三个变量。
-非容器部署未设置扫描环境变量时，新建媒体库默认 16 路，已有媒体库仍可在管理 API 中用
-`scanConcurrency` 单独覆盖；实际并发仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+非容器部署未设置扫描环境变量时，新建媒体库默认 4 路，已有媒体库仍可在管理 API 中用
+`scanConcurrency` 单独覆盖；扫库和刮削的实际并发仍会根据 CPU、内存、前台延迟和存储延迟自动降级，SQLite 入库保持单写者。
 
 ## 快速开始
 
@@ -72,8 +73,8 @@ services:
     image: pdzhou/lux:latest
     container_name: lux
     environment:
-      # Indexing, ffprobe, and ffmpeg defaults are 8, 8, and 2.
-      LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-8}
+      # Indexing, ffprobe, and ffmpeg defaults are 4, 8, and 2.
+      LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-4}
       LUX_PROBE_CONCURRENCY: ${LUX_PROBE_CONCURRENCY:-8}
       LUX_FFMPEG_CONCURRENCY: ${LUX_FFMPEG_CONCURRENCY:-2}
     ports:
@@ -92,7 +93,7 @@ LUX_PROBE_CONCURRENCY=8
 LUX_FFMPEG_CONCURRENCY=2
 ```
 
-`LUX_SCAN_CONCURRENCY` 支持范围为 `1-1024`；`LUX_PROBE_CONCURRENCY` 支持范围为 `1-512`；`LUX_FFMPEG_CONCURRENCY` 支持范围为 `1-4`。Compose 未设置时索引、探测和 ffmpeg 分别默认使用 8、8、2 路。实际后台 worker 数仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+`LUX_SCAN_CONCURRENCY` 支持范围为 `1-1024`；`LUX_PROBE_CONCURRENCY` 支持范围为 `1-512`；`LUX_FFMPEG_CONCURRENCY` 支持范围为 `1-4`。Compose 未设置时索引、探测和 ffmpeg 分别默认使用 4、8、2 路。在线元数据刮削默认使用 4 路 worker；实际后台 worker 数仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
 
 修改 Compose 中的并发值后请执行 `docker compose up -d --force-recreate lux`；单纯重启旧容器不会更新环境变量。
 

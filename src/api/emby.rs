@@ -86,6 +86,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Items/Root", get(emby_items_root))
         .route("/Search/Hints", get(emby_search_hints))
         .route(
+            "/Items/SyncMediaInfo",
+            post(emby_sync_media_info).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
             "/Items/{item_id}",
             get(emby_item)
                 .head(emby_item)

@@ -30,6 +30,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - 登录失败按来源和用户名限流；失败响应不区分用户不存在、密码错误或暂时封锁。
 - `GET /api/v1/auth/me`：读取当前 Web session，返回用户和权限。
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
+- `PATCH /api/v1/auth/password`：需要当前 Web session 和 `X-CSRF-Token`，不接受用户级客户端令牌。请求体为 `{ "currentPassword": "旧密码", "newPassword": "新密码" }`；当前密码验证成功后写入新的 Argon2id 哈希，成功返回 204，当前密码错误返回 `401 INVALID_CREDENTIALS`。
 
 `lux_session` 为 `HttpOnly; Secure; SameSite=Lax; Path=/`，数据库只保存其 SHA-256 哈希。`lux_csrf` 不设置 HttpOnly，供同源 Web 客户端读取并通过 `X-CSRF-Token` header 发送；数据库保存 CSRF 哈希。session 有效期为 30 天，注销后立即失效。
 
@@ -64,6 +65,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：将媒体库加入或移出普通用户的显式访问范围。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF；没有任何显式允许项时，用户默认可访问全部已启用媒体库，有显式允许项时仅能访问这些媒体库。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
 - `POST /api/v1/admin/libraries/{libraryId}/scan-path`：管理员按媒体库根目录下的相对路径创建局部 `INCREMENTAL_SCAN`。请求体为 `{ "rootId": "<libraryRootId>", "path": "Movies/NewMovie", "recursive": true }`；单根媒体库可省略 `rootId`，多根媒体库必须提供。`path` 必须是非空的库内相对路径，不接受 `.`, `..`、绝对路径、反斜杠穿越或 Windows 盘符；当前 `recursive` 必须为 `true`。接口只入队路径并返回 202，不在 HTTP 请求中扫描目录。
+- `POST /api/v1/admin/libraries/{libraryId}/refresh-local-metadata`：管理员对库内**精确目录**重新索引本地 NFO 与图片，不扫描整个根目录。用于外部工具（刮削器、Immortal 等）在视频文件未变化时写入或修复了旁车文件的场景：局部扫描只处理指纹变化的文件，全库回填要遍历根目录所有文件，两者都不适用。请求体为 `{ "rootId": "<libraryRootId>", "paths": ["Movies/NewMovie"] }`；单根媒体库可省略 `rootId`。`paths` 为库内相对目录（至少 1 个、最多 2000 个，规则同 `scan-path`），目录下任意深度的视频/STRM 文件都会被重新索引（单次最多 20000 个条目）。接口返回 202 和 `{ "scope": "LOCAL_METADATA", "directories": n, "entries": m }`，实际工作在后台串行执行；路径无效或列表为空返回 422。
 - `POST /api/v1/admin/libraries/{libraryId}/reconcile`：按当前库配置创建并异步执行一次调和扫描；已停用或不存在的媒体库返回 404。
 - `POST /api/v1/admin/jobs/{jobId}/cancel`：请求取消扫描任务，返回 202。
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
@@ -96,9 +98,11 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - 弹幕插件 `org.lux.danmaku` 的配置通过通用 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存；除 `providerBaseUrl` 外还支持 `concurrency`（0-64，默认 2；0 表示不设插件级限制）和 `overwrite`（默认 `false`，勾选后每次运行覆盖已有同名 XML）；`providerBaseUrl` 只在插件配置响应中以脱敏值展示，主设置页不再保存弹幕配置。
 - `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求百度、Google 和 Cloudflare 三个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。具体 provider 的连通性由其插件自身的健康状态负责。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、连接池当前快照（`database.pool.maxConnections`、`size`、`idle`、`inUse`、`saturated`）、配置目录实际写入能力、ffprobe、媒体库根路径和后台任务计数；同时返回 `runtime.seconds`、`resources.cpu`、`resources.memory` 和 `resources.mediaStorage`。具体 metadata provider 不在主程序健康响应中探测，插件状态请通过插件管理接口查看。CPU/内存只读取 Lux 容器 cgroup，`mediaStorage` 只读取容器内 `/media` 挂载点的文件系统容量；不回退到宿主机整体资源，不返回本地配置路径或密钥。CPU 返回 `usageCores`、`capacityCores` 和按该容量归一化到 0-100 的 `usagePercent`；有 cgroup 配额时容量为配额核数，没有配额时容量为进程可见的 CPU 核数。`limitCores` 保留为实际 cgroup 配额字段，没有配额时为 `null`。指标不可用时 `available` 为 `false`，数值字段为 `null`。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
-- `GET /api/v1/admin/database-diagnostics`：读取临时数据库体检状态；`WAITING`、`RUNNING`、`READY`、`FAILED` 表示状态。已有数据库配置的 Lux 启动约 5 分钟后开始只读检查，目标在启动 10 分钟内完成；仍在运行时继续采集，单次最长 15 分钟后超时。报告只存进程内存，服务重启后重新生成。PostgreSQL 返回数据库及表/索引大小、估算行数、dead tuple 和 vacuum/analyze 统计；SQLite 返回文件/WAL/page/freelist 以及 `dbstat` 可用时的表/索引页大小。估算和不可用项目会在报告中注明。
+- `GET /api/v1/admin/database-diagnostics`：读取临时数据库体检状态；`WAITING`、`RUNNING`、`READY`、`FAILED` 表示状态。已有数据库配置的 Lux 启动约 5 分钟后开始只读检查，目标在启动 10 分钟内完成；仍在运行时继续采集，单次最长 15 分钟后超时。报告只存进程内存，服务重启后重新生成。PostgreSQL 返回数据库及表/索引大小、估算行数、dead tuple 和 vacuum/analyze 统计；SQLite 返回文件/WAL/page/freelist 以及 `dbstat` 可用时的表/索引页大小。PostgreSQL 另包含 `queryStatistics`：`AVAILABLE` 时列出当前数据库累计执行时间最高的 20 条 statement 的 `queryId`、调用数、总/均值/最大执行时间、行数及 shared block hit/read；报告不含 SQL 文本或参数。未预加载、未安装 extension、权限不足或查询超时会返回明确状态和空列表；SQLite 为 `NOT_APPLICABLE`。
 - `POST /api/v1/admin/database-diagnostics/run`：立即开始首次体检或重新采集；采集中重复请求返回 409。重新采集时上一份报告保持可下载，直至新报告成功替换。手动启动先于启动延迟任务时，延迟任务会跳过。
 - `GET /api/v1/admin/database-diagnostics/export`：下载最新可用 JSON 报告；首次体检未就绪时返回 409。状态、启动和导出接口接受共享管理员 `X-Lux-Api-Key` 请求头或管理员 session；使用 session 发起 POST 时还需 CSRF。该临时功能通过终端/API 调用，不在 Web 设置页展示。报告不含行数据、媒体路径或数据库连接信息。
+
+PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_preload_libraries` 中加入 `pg_stat_statements` 并重启 PostgreSQL，再在 Lux 使用的数据库执行 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;`。Lux 只读取已启用的统计，不会修改 PostgreSQL 配置或创建 extension。统计累计值受 `pg_stat_statements_reset()` 影响，报告不返回原始 SQL。
 - `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`stats`（已启用媒体库中未移除的 `movieCount`、`seriesCount`，以及未禁用用户的 `userCount`）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。近期登录/播放活动来自配置目录文件日志；用户名称与媒体标题只从当前数据库记录补全，已删除目标显示为空。剧集目标额外返回可空的 `targetSeriesTitle`、`targetSeasonNumber` 和 `targetSeriesSeasonCount`，供管理台按剧名、（多季时）季号、集名展示。正在播放数据只返回安全的媒体/轨道摘要、可空的 `remoteIp` 客户端来源 IP，以及可空的 `remoteIpLocation`（`location`、`district`、`street`、`isp`）。归属地只读取进程内缓存；首次遇到公网 IP 时由后台异步查询 Hiofd，失败或未完成时为 `null`，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
 - `GET /api/v1/admin/events`：管理员 Web session 的 SSE 失效通知流，不要求 CSRF。响应为 `text/event-stream`、禁止缓存并关闭反向代理缓冲；首帧为 `event: ready` 与 `{"version":1}`，变更帧为 `event: invalidate` 与 `{"scope":"dashboard|jobs|libraries|plugins|users|metadata|settings|all"}`，每 15 秒发送注释心跳。广播丢帧时发送 `all`，客户端应重新读取所有管理员查询；流不传输业务数据或敏感信息。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计和近期活动事件，与 `/api/v1/admin/audit` 兼容；只读 `/config/logs/` 活动 JSONL 与保留归档，按创建时间和 ID 倒序分页，支持 `page`、`pageSize`。LUX-316 启动迁移完成后不再查询数据库日志表。

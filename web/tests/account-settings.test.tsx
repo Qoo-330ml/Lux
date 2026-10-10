@@ -56,6 +56,7 @@ describe("account settings", () => {
   beforeEach(() => {
     localStorage.clear();
     document.documentElement.removeAttribute("data-lux-theme");
+    document.documentElement.removeAttribute("data-lux-accent");
     vi.spyOn(api, "libraries").mockResolvedValue({
       libraries: [
         { id: "movies", name: "电影", kind: "MOVIE" },
@@ -88,6 +89,17 @@ describe("account settings", () => {
 
     expect(readAccountSettings("user-a").theme).toBe("light");
     expect(readAccountSettings("user-b").theme).toBe("dark");
+  });
+
+  it("defaults to silver when no valid accent preference is saved", () => {
+    expect(readAccountSettings(user.id).accentColor).toBe("silver");
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({ accentColor: "unknown" }));
+    expect(readAccountSettings(user.id).accentColor).toBe("silver");
+  });
+
+  it.each(["silver", "berry", "ocean", "amber", "mint"])("keeps the saved %s accent preference", (accentColor) => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({ accentColor }));
+    expect(readAccountSettings(user.id).accentColor).toBe(accentColor);
   });
 
   it("switches the favicon to match the selected theme", () => {
@@ -124,6 +136,21 @@ describe("account settings", () => {
 
     expect(document.documentElement.dataset.luxAccent).toBe("ocean");
     expect(JSON.parse(localStorage.getItem(accountSettingsStorageKey(user.id)) ?? "{}")).toMatchObject({ accentColor: "ocean" });
+
+    const silverOption = container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 银灰"]');
+    expect(silverOption).not.toBeNull();
+    await act(async () => { silverOption?.click(); });
+    expect(silverOption?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.documentElement.dataset.luxAccent).toBe("silver");
+    expect(JSON.parse(localStorage.getItem(accountSettingsStorageKey(user.id)) ?? "{}")).toMatchObject({ accentColor: "silver" });
+
+    await act(async () => {
+      const lightOption = Array.from(container.querySelectorAll<HTMLButtonElement>(".lux-theme-options button"))
+        .find((button) => button.textContent === "浅色");
+      lightOption?.click();
+    });
+    expect(document.documentElement.dataset.luxTheme).toBe("light");
+    expect(readAccountSettings(user.id)).toMatchObject({ theme: "light", accentColor: "silver" });
   });
 
   it("renders the current account settings sections", async () => {
@@ -150,6 +177,53 @@ describe("account settings", () => {
     expect(container.textContent).toContain("账户");
     expect(container.querySelector("#appearance .lux-setting-divider")).toBeNull();
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
+  });
+
+  it("submits the self-service password change and clears the form after success", async () => {
+    const updatePassword = vi.spyOn(api, "updatePassword").mockResolvedValue();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const currentPassword = container.querySelector<HTMLInputElement>('input[autocomplete="current-password"]');
+    const newPassword = container.querySelectorAll<HTMLInputElement>('input[autocomplete="new-password"]');
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    await act(async () => {
+      setValue?.call(currentPassword, "old password");
+      currentPassword?.dispatchEvent(new Event("input", { bubbles: true }));
+      currentPassword?.dispatchEvent(new Event("change", { bubbles: true }));
+      setValue?.call(newPassword[0], "new password");
+      newPassword[0]?.dispatchEvent(new Event("input", { bubbles: true }));
+      newPassword[0]?.dispatchEvent(new Event("change", { bubbles: true }));
+      setValue?.call(newPassword[1], "new password");
+      newPassword[1]?.dispatchEvent(new Event("input", { bubbles: true }));
+      newPassword[1]?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".lux-password-panel button[type='submit']")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(updatePassword).toHaveBeenCalledWith({
+      currentPassword: "old password",
+      newPassword: "new password",
+    });
+    expect(currentPassword?.value).toBe("");
+    expect(newPassword[0]?.value).toBe("");
+    expect(newPassword[1]?.value).toBe("");
+    expect(container.textContent).toContain("密码已修改");
   });
 
   it("defaults to the administrator library order and lets a user turn it off", async () => {

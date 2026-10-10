@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Check,
   ChevronDown,
   ChevronUp,
   GripVertical,
@@ -48,12 +49,15 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [avatarReading, setAvatarReading] = useState(false);
   const [avatarPreparing, setAvatarPreparing] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
-  const [accountNotice, setAccountNotice] = useState<string | null>(null);
+  const [passwordNotice, setPasswordNotice] = useState<string | null>(null);
   const [libraryOrderNotice, setLibraryOrderNotice] = useState<string | null>(null);
   const legacyLibraryOrderMigrationAttempted = useRef(false);
   const [playedPercent, setPlayedPercent] = useState("95");
   const [playedPercentNotice, setPlayedPercentNotice] = useState<string | null>(null);
   const [profileName, setProfileName] = useState(user.displayName || user.usernameNormalized);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
 
   useEffect(() => {
     if (playbackSettings.data) setPlayedPercent(String(playbackSettings.data.playedPercent));
@@ -87,7 +91,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const logout = useMutation({
     mutationFn: () => api.logout(),
     onSuccess: () => {
-      queryClient.removeQueries({ queryKey: queryKeys.me });
+      queryClient.clear();
       navigate("/login", { replace: true });
     },
   });
@@ -145,6 +149,17 @@ export function AccountPage({ user }: { user: LuxUser }) {
     onError: (error) => setLibraryOrderNotice(error instanceof Error ? `媒体库顺序设置失败：${error.message}` : "媒体库顺序设置失败，请重试。"),
   });
 
+  const changePassword = useMutation({
+    mutationFn: () => api.updatePassword({ currentPassword, newPassword }),
+    onSuccess: () => {
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setPasswordNotice("密码已修改");
+    },
+    onError: (error) => setPasswordNotice(error instanceof Error ? `密码修改失败：${error.message}` : "密码修改失败，请重试。"),
+  });
+
   useEffect(() => {
     if (
       legacyLibraryOrderMigrationAttempted.current
@@ -186,6 +201,20 @@ export function AccountPage({ user }: { user: LuxUser }) {
     next.splice(targetIndex, 0, moved);
     persistLibraryOrder(next);
     setDraggedLibraryId(null);
+  };
+
+  const submitPasswordChange = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setPasswordNotice(null);
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      setPasswordNotice("请填写完整的密码");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordNotice("两次输入的新密码不一致");
+      return;
+    }
+    changePassword.mutate();
   };
 
   const selectAvatar = (file: File | undefined) => {
@@ -314,6 +343,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                 <p>用于按钮、进度和选中状态的界面色彩。</p>
               </div>
               <div className="lux-accent-options" role="group" aria-label="界面强调色">
+                <AccentOption color="silver" label="银灰" selected={settings.accentColor === "silver"} onSelect={() => updateSettings({ accentColor: "silver" })} />
                 <AccentOption color="berry" label="莓果" selected={settings.accentColor === "berry"} onSelect={() => updateSettings({ accentColor: "berry" })} />
                 <AccentOption color="ocean" label="海蓝" selected={settings.accentColor === "ocean"} onSelect={() => updateSettings({ accentColor: "ocean" })} />
                 <AccentOption color="amber" label="琥珀" selected={settings.accentColor === "amber"} onSelect={() => updateSettings({ accentColor: "amber" })} />
@@ -521,16 +551,16 @@ export function AccountPage({ user }: { user: LuxUser }) {
               <label className="lux-setting-field"><span>显示名称</span><input value={profileName} onChange={(event) => setProfileName(event.target.value)} /></label>
               <label className="lux-setting-field"><span>账号</span><input value={user.usernameNormalized} readOnly /></label>
             </div>
-            <form className="lux-password-panel" onSubmit={(event) => { event.preventDefault(); setAccountNotice("账户资料和密码修改需要服务端账户接口，当前先保留设置入口。"); }}>
+            <form className="lux-password-panel" onSubmit={submitPasswordChange}>
               <input className="lux-visually-hidden" type="text" value={user.usernameNormalized} readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" />
               <div className="lux-setting-block-heading"><div><strong>修改密码</strong><p>使用一个没有在其他服务重复使用的新密码。</p></div><ShieldCheck size={18} aria-hidden="true" /></div>
               <div className="lux-setting-form-grid lux-password-grid">
-                <label className="lux-setting-field"><span>当前密码</span><input type="password" autoComplete="current-password" placeholder="输入当前密码" /></label>
-                <label className="lux-setting-field"><span>新密码</span><input type="password" autoComplete="new-password" placeholder="输入新密码" /></label>
-                <label className="lux-setting-field"><span>确认新密码</span><input type="password" autoComplete="new-password" placeholder="再次输入新密码" /></label>
+                <label className="lux-setting-field"><span>当前密码</span><input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" placeholder="输入当前密码" required /></label>
+                <label className="lux-setting-field"><span>新密码</span><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" placeholder="输入新密码" required /></label>
+                <label className="lux-setting-field"><span>确认新密码</span><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="再次输入新密码" required /></label>
               </div>
-              <button className="lux-button lux-button-compact lux-button-secondary" type="submit">修改密码</button>
-              {accountNotice ? <p className="lux-account-notice" role="status">{accountNotice}</p> : null}
+              <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={changePassword.isPending}>{changePassword.isPending ? "保存中…" : "修改密码"}</button>
+              {passwordNotice ? <p className="lux-account-notice" role="status">{passwordNotice}</p> : null}
             </form>
           </SettingsSection>
 
@@ -565,6 +595,7 @@ function AccentOption({ color, label, selected, onSelect }: { color: string; lab
     <button className={`lux-accent-option is-${color}${selected ? " is-selected" : ""}`} type="button" aria-label={`选择强调色 ${label}`} aria-pressed={selected} onClick={onSelect}>
       <span className="lux-accent-swatch" aria-hidden="true" />
       <span>{label}</span>
+      {selected ? <Check size={12} aria-hidden="true" /> : null}
     </button>
   );
 }

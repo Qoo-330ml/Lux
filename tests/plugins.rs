@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -166,6 +168,65 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+async fn seed_emby_route_plugin(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info");
+    let binary_dir = plugin_dir.join("binaries");
+    tokio::fs::create_dir_all(&binary_dir).await?;
+    let binary = binary_dir.join("plugin");
+    tokio::fs::write(
+        &binary,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)","method".*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/^{"id":"[^"]*","method":"\([^"]*\)","params".*/\1/p')
+  case "$method" in
+    plugin.hello) printf '{"id":"%s","result":{"id":"org.lux.strm-media-info","name":"strm媒体信息提取","apiVersion":1,"capabilities":["media.probe","emby.route"],"supportedItemTypes":[]}}\n' "$id" ;;
+    plugin.health) printf '{"id":"%s","result":{"available":true,"configured":true}}\n' "$id" ;;
+    emby.sync_media_info)
+      if printf '%s' "$line" | grep -Eq '"(x-emby-token|x-media-browser-token|authorization|cookie|api_key|apikey)"'; then
+        status=418
+      else
+        status=400
+      fi
+      printf '{"id":"%s","result":{"statusCode":%s,"headers":{},"bodyBase64":""}}\n' "$id" "$status" ;;
+    plugin.shutdown) printf '{"id":"%s","result":{"accepted":true}}\n' "$id" ;;
+    *) printf '{"id":"%s","error":{"code":"PLUGIN_INVALID_REQUEST","message":"unsupported method"}}\n' "$id" ;;
+  esac
+done
+"#,
+    )
+    .await?;
+    #[cfg(unix)]
+    {
+        let mut permissions = tokio::fs::metadata(&binary).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&binary, permissions).await?;
+    }
+    tokio::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.strm-media-info",
+            "name": "strm媒体信息提取",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "media_probe",
+            "category": "MEDIA",
+            "capabilities": ["media.probe", "emby.route"],
+            "embyRoutes": [{
+                "method": "POST",
+                "path": "/Items/SyncMediaInfo",
+                "rpcMethod": "emby.sync_media_info"
+            }],
+            "permissions": {"network": [], "filesystem": []},
+            "files": []
+        }))?,
+    )
+    .await?;
+    Ok(())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
@@ -203,6 +264,28 @@ async fn admin_session(
     let session = cookie_value(login.headers(), "lux_session");
     let csrf = cookie_value(login.headers(), "lux_csrf");
     Ok((format!("lux_session={session}; lux_csrf={csrf}"), csrf))
+}
+
+async fn emby_admin_token(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "admin",
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response
+        .json::<Value>()
+        .await?
+        .get("AccessToken")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "missing Emby admin token".into())
 }
 
 fn plugin_by_id<'a>(body: &'a Value, plugin_id: &str) -> &'a Value {
@@ -876,6 +959,94 @@ async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
         response.json::<Value>().await?["error"]["code"],
         "PLUGIN_UNAVAILABLE"
     );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_route_plugin_is_only_exposed_when_installed_and_enabled()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    seed_emby_route_plugin(&config_dir).await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+    let emby_token = emby_admin_token(&client, &base_url).await?;
+
+    async fn call_sync_media_info(
+        client: &reqwest::Client,
+        base_url: &str,
+        prefix: &str,
+        emby_token: &str,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        client
+            .post(format!(
+                "{base_url}{prefix}/Items/SyncMediaInfo?api_key=leak-check&Path=%2Fprobe.strm"
+            ))
+            .header("X-Emby-Token", emby_token)
+            .header("Authorization", format!("Bearer {emby_token}"))
+            .header("Cookie", "session=leak-check")
+            .header("X-Emby-Client", "MediaTidy")
+            .body("{}")
+            .send()
+            .await
+    }
+
+    for prefix in ["", "/emby"] {
+        let response = call_sync_media_info(&client, &base_url, prefix, &emby_token).await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{prefix}"
+        );
+    }
+
+    let installed = client
+        .post(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/install"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+
+    for prefix in ["", "/emby"] {
+        let response = call_sync_media_info(&client, &base_url, prefix, &emby_token).await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{prefix}"
+        );
+    }
+
+    let disabled = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/enabled"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({"enabled": false}))
+        .send()
+        .await?;
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+
+    for prefix in ["", "/emby"] {
+        let response = call_sync_media_info(&client, &base_url, prefix, &emby_token).await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{prefix}"
+        );
+    }
 
     server.abort();
     Ok(())

@@ -1,13 +1,14 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     io::Cursor,
     path::{Path, PathBuf},
+    sync::Arc,
     time::UNIX_EPOCH,
 };
 
 use quick_xml::{
-    Writer,
+    Decoder, Writer,
     escape::{escape, unescape},
     events::{BytesEnd, BytesStart, BytesText, Event},
     reader::Reader,
@@ -18,18 +19,103 @@ use time::OffsetDateTime;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    sync::{Mutex, OnceCell},
 };
 use uuid::Uuid;
 
 use crate::application::metadata::{
     MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
-    nfo_fingerprint, parse_nfo, series_directory,
+    nfo_fingerprint, nfo_fingerprint_from_stamp, parse_nfo, series_directory,
 };
 use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
-use crate::storage::{Database, MediaMetadataUpdate, StorageError};
+use crate::storage::{
+    Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath, StoredMediaWritebackContext,
+};
+
+#[derive(Clone, Default)]
+pub(crate) struct LocalNfoProjectionCache {
+    entries: Arc<Mutex<HashMap<PathBuf, Arc<OnceCell<CachedNfoProjectionResult>>>>>,
+}
+
+type CachedNfoProjectionResult = Result<Option<LocalNfoProjection>, CachedNfoProjectionError>;
+
+#[derive(Clone)]
+enum CachedNfoProjectionError {
+    Io {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    Parse(CachedNfoParseError),
+    Other(String),
+}
+
+#[derive(Clone)]
+enum CachedNfoParseError {
+    TooLarge,
+    TooManyEvents,
+    FieldTooLarge,
+    DocTypeNotAllowed,
+    Unbalanced,
+    Xml(String),
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl CachedNfoProjectionError {
+    fn from_write_error(error: NfoWriteError) -> Self {
+        match error {
+            NfoWriteError::Io { path, source } => Self::Io {
+                path,
+                kind: source.kind(),
+                message: source.to_string(),
+            },
+            NfoWriteError::Nfo(error) => Self::Parse(match error {
+                NfoError::TooLarge => CachedNfoParseError::TooLarge,
+                NfoError::TooManyEvents => CachedNfoParseError::TooManyEvents,
+                NfoError::FieldTooLarge => CachedNfoParseError::FieldTooLarge,
+                NfoError::DocTypeNotAllowed => CachedNfoParseError::DocTypeNotAllowed,
+                NfoError::Unbalanced => CachedNfoParseError::Unbalanced,
+                NfoError::Xml(message) => CachedNfoParseError::Xml(message),
+                NfoError::Io(source) => CachedNfoParseError::Io {
+                    kind: source.kind(),
+                    message: source.to_string(),
+                },
+            }),
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn into_write_error(self) -> NfoWriteError {
+        match self {
+            Self::Io {
+                path,
+                kind,
+                message,
+            } => NfoWriteError::Io {
+                path,
+                source: std::io::Error::new(kind, message),
+            },
+            Self::Parse(error) => NfoWriteError::Nfo(match error {
+                CachedNfoParseError::TooLarge => NfoError::TooLarge,
+                CachedNfoParseError::TooManyEvents => NfoError::TooManyEvents,
+                CachedNfoParseError::FieldTooLarge => NfoError::FieldTooLarge,
+                CachedNfoParseError::DocTypeNotAllowed => NfoError::DocTypeNotAllowed,
+                CachedNfoParseError::Unbalanced => NfoError::Unbalanced,
+                CachedNfoParseError::Xml(message) => NfoError::Xml(message),
+                CachedNfoParseError::Io { kind, message } => {
+                    NfoError::Io(std::io::Error::new(kind, message))
+                }
+            }),
+            Self::Other(message) => NfoWriteError::InvalidMetadata(message),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalNfoCredit {
@@ -109,6 +195,7 @@ pub struct MovieNfoMetadata {
 
 const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
+const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 1;
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_MOVIE_NFO_STREAMS: usize = 128;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
@@ -122,12 +209,28 @@ const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
 /// Background enrichment uses this entry point so base metadata, rich detail
 /// fields, and actor relations always come from the same source revision.
 pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, NfoError> {
+    parse_local_nfo_projection_inner(bytes, false).map(|(projection, _)| projection)
+}
+
+pub(crate) fn parse_local_nfo_projection_with_semantic_fingerprint(
+    bytes: &[u8],
+) -> Result<(LocalNfoProjection, Vec<u8>), NfoError> {
+    parse_local_nfo_projection_inner(bytes, true)
+}
+
+fn parse_local_nfo_projection_inner(
+    bytes: &[u8],
+    include_semantic_fingerprint: bool,
+) -> Result<(LocalNfoProjection, Vec<u8>), NfoError> {
     if bytes.len() > MAX_LOCAL_NFO_BYTES {
         return Err(NfoError::TooLarge);
     }
 
     let mut reader = Reader::from_reader(Cursor::new(bytes));
-    reader.config_mut().trim_text(true);
+    // Keep the established projection trimming behavior for callers that do
+    // not need a semantic fingerprint. The semantic path reads full text and
+    // applies the old trimming only to the metadata projection below.
+    reader.config_mut().trim_text(!include_semantic_fingerprint);
     let mut buffer = Vec::new();
     let mut projection = LocalNfoProjection::default();
     let mut active_direct = None;
@@ -136,6 +239,7 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
     let mut current_actor = None;
     let mut depth = 0_usize;
     let mut event_count = 0_usize;
+    let mut semantic_tokens = include_semantic_fingerprint.then(Vec::new);
 
     loop {
         event_count = event_count.saturating_add(1);
@@ -150,6 +254,9 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 break;
             }
             Ok(Event::Start(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    tokens.push(NfoSemanticToken::start(&event, reader.decoder())?);
+                }
                 depth = depth.saturating_add(1);
                 if depth == 2 && event.name().as_ref() == b"actor" {
                     actor_depth = Some(depth);
@@ -171,6 +278,16 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                     .map_err(|error| NfoError::Xml(error.to_string()))?;
                 let value =
                     unescape(decoded.as_ref()).map_err(|error| NfoError::Xml(error.to_string()))?;
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let content = event
+                        .xml10_content()
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    let semantic_value = unescape(content.as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    if depth != 0 || !is_xml_whitespace(&semantic_value) {
+                        push_nfo_semantic_text(tokens, semantic_value.as_ref());
+                    }
+                }
                 append_projection_text(
                     depth,
                     actor_depth,
@@ -183,6 +300,12 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 let value = event
                     .decode()
                     .map_err(|error| NfoError::Xml(error.to_string()))?;
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let content = event
+                        .xml10_content()
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    push_nfo_semantic_text(tokens, content.as_ref());
+                }
                 append_projection_text(
                     depth,
                     actor_depth,
@@ -192,6 +315,15 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 )?;
             }
             Ok(Event::End(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let name = reader
+                        .decoder()
+                        .decode(event.name().as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .into_owned()
+                        .into_bytes();
+                    tokens.push(NfoSemanticToken::End(name));
+                }
                 if actor_depth == Some(depth) && event.name().as_ref() == b"actor" {
                     if let Some(actor) = current_actor.take() {
                         push_parsed_actor(&mut projection.actors, actor);
@@ -219,15 +351,294 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 }
                 depth -= 1;
             }
-            Ok(Event::Empty(_)) => {}
+            Ok(Event::Empty(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let decoder = reader.decoder();
+                    tokens.push(NfoSemanticToken::start(&event, decoder)?);
+                    let name = decoder
+                        .decode(event.name().as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .into_owned()
+                        .into_bytes();
+                    tokens.push(NfoSemanticToken::End(name));
+                }
+            }
+            Ok(Event::PI(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let decoder = reader.decoder();
+                    let target = decoder
+                        .decode(event.target())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .into_owned()
+                        .into_bytes();
+                    let content = decoder
+                        .decode(event.content())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    let content = normalize_xml_10_line_endings(content.as_ref()).into_bytes();
+                    tokens.push(NfoSemanticToken::ProcessingInstruction { target, content });
+                }
+            }
             Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
+            Ok(Event::GeneralRef(event)) => {
+                let value = match event
+                    .resolve_char_ref()
+                    .map_err(|error| NfoError::Xml(error.to_string()))?
+                {
+                    Some(character) => include_semantic_fingerprint.then(|| character.to_string()),
+                    None => {
+                        let name = event
+                            .decode()
+                            .map_err(|error| NfoError::Xml(error.to_string()))?;
+                        let value = match name.as_ref() {
+                            "amp" => "&",
+                            "lt" => "<",
+                            "gt" => ">",
+                            "apos" => "'",
+                            "quot" => "\"",
+                            _ => {
+                                return Err(NfoError::Xml(format!(
+                                    "undeclared entity reference: &{name};"
+                                )));
+                            }
+                        };
+                        include_semantic_fingerprint.then(|| value.to_owned())
+                    }
+                };
+                if let Some(value) = value {
+                    if let Some(tokens) = semantic_tokens.as_mut() {
+                        push_nfo_semantic_text(tokens, &value);
+                    }
+                    append_projection_text(
+                        depth,
+                        actor_depth,
+                        active_direct.as_mut(),
+                        active_actor.as_mut(),
+                        &value,
+                    )?;
+                }
+            }
             Ok(_) => {}
             Err(error) => return Err(NfoError::Xml(error.to_string())),
         }
         buffer.clear();
     }
 
-    Ok(projection)
+    let semantic_fingerprint = semantic_tokens
+        .as_deref()
+        .map(nfo_semantic_fingerprint_from_tokens)
+        .unwrap_or_default();
+    Ok((projection, semantic_fingerprint))
+}
+
+#[derive(Clone, Debug)]
+enum NfoSemanticToken {
+    Start {
+        name: Vec<u8>,
+        attributes: Vec<(Vec<u8>, String)>,
+        preserve_whitespace: Option<bool>,
+    },
+    End(Vec<u8>),
+    Text(String),
+    ProcessingInstruction {
+        target: Vec<u8>,
+        content: Vec<u8>,
+    },
+}
+
+impl NfoSemanticToken {
+    fn start(event: &BytesStart<'_>, decoder: Decoder) -> Result<Self, NfoError> {
+        let mut attributes = event
+            .attributes()
+            .with_checks(true)
+            .map(|attribute| {
+                let attribute = attribute.map_err(|error| NfoError::Xml(error.to_string()))?;
+                // XML 1.0 normalizes literal attribute whitespace before
+                // resolving references. Doing this after unescaping would
+                // incorrectly equate a literal newline (normalized to a
+                // space) with `&#xA;` (which remains a newline).
+                let raw_value = decoder
+                    .decode(&attribute.value)
+                    .map_err(|error| NfoError::Xml(error.to_string()))?;
+                let normalized_value = normalize_xml_attribute_whitespace(raw_value.as_ref());
+                let value = unescape(&normalized_value)
+                    .map_err(|error| NfoError::Xml(error.to_string()))?
+                    .into_owned();
+                let name = decoder
+                    .decode(attribute.key.as_ref())
+                    .map_err(|error| NfoError::Xml(error.to_string()))?
+                    .into_owned()
+                    .into_bytes();
+                Ok((name, value))
+            })
+            .collect::<Result<Vec<_>, NfoError>>()?;
+        attributes.sort_by(|left, right| left.0.cmp(&right.0));
+        let preserve_whitespace = attributes
+            .iter()
+            .find(|(name, _)| name.as_slice() == b"xml:space")
+            .and_then(|(_, value)| match value.as_str() {
+                "preserve" => Some(true),
+                "default" => Some(false),
+                _ => None,
+            });
+        let name = decoder
+            .decode(event.name().as_ref())
+            .map_err(|error| NfoError::Xml(error.to_string()))?
+            .into_owned()
+            .into_bytes();
+        Ok(Self::Start {
+            name,
+            attributes,
+            preserve_whitespace,
+        })
+    }
+}
+
+fn normalize_xml_attribute_whitespace(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                normalized.push(' ');
+            }
+            '\n' | '\t' => normalized.push(' '),
+            character => normalized.push(character),
+        }
+    }
+    normalized
+}
+
+fn normalize_xml_10_line_endings(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
+fn push_nfo_semantic_text(tokens: &mut Vec<NfoSemanticToken>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(NfoSemanticToken::Text(previous)) = tokens.last_mut() {
+        previous.push_str(text);
+    } else {
+        tokens.push(NfoSemanticToken::Text(text.to_owned()));
+    }
+}
+
+#[derive(Default)]
+struct NfoSemanticElementState {
+    token_index: usize,
+    has_child_element: bool,
+    has_non_whitespace_text: bool,
+    preserve_whitespace: bool,
+}
+
+fn nfo_semantic_fingerprint_from_tokens(tokens: &[NfoSemanticToken]) -> Vec<u8> {
+    let mut element_only_whitespace = vec![false; tokens.len()];
+    let mut stack = Vec::<NfoSemanticElementState>::new();
+    let mut inherited_preserve_whitespace = Vec::<bool>::new();
+    for (token_index, token) in tokens.iter().enumerate() {
+        match token {
+            NfoSemanticToken::Start {
+                preserve_whitespace,
+                ..
+            } => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.has_child_element = true;
+                }
+                let inherited = inherited_preserve_whitespace
+                    .last()
+                    .copied()
+                    .unwrap_or(false);
+                let preserve_whitespace = preserve_whitespace.unwrap_or(inherited);
+                stack.push(NfoSemanticElementState {
+                    token_index,
+                    preserve_whitespace,
+                    ..NfoSemanticElementState::default()
+                });
+                inherited_preserve_whitespace.push(preserve_whitespace);
+            }
+            NfoSemanticToken::Text(text) => {
+                if let Some(element) = stack.last_mut() {
+                    element.has_non_whitespace_text |= !is_xml_whitespace(text);
+                }
+            }
+            NfoSemanticToken::ProcessingInstruction { .. } => {}
+            NfoSemanticToken::End(_) => {
+                if let Some(element) = stack.pop() {
+                    inherited_preserve_whitespace.pop();
+                    element_only_whitespace[element.token_index] = element.has_child_element
+                        && !element.has_non_whitespace_text
+                        && !element.preserve_whitespace;
+                }
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-NFO-SEMANTIC-2\0");
+    let mut skip_whitespace_stack = Vec::<bool>::new();
+    for (token_index, token) in tokens.iter().enumerate() {
+        match token {
+            NfoSemanticToken::Start {
+                name, attributes, ..
+            } => {
+                hasher.update(*b"S");
+                hash_nfo_semantic_bytes(&mut hasher, name);
+                hasher.update((attributes.len() as u64).to_be_bytes());
+                for (name, value) in attributes {
+                    hash_nfo_semantic_bytes(&mut hasher, name);
+                    hash_nfo_semantic_bytes(&mut hasher, value.as_bytes());
+                }
+                skip_whitespace_stack.push(element_only_whitespace[token_index]);
+            }
+            NfoSemanticToken::End(name) => {
+                hasher.update(*b"E");
+                hash_nfo_semantic_bytes(&mut hasher, name);
+                skip_whitespace_stack.pop();
+            }
+            NfoSemanticToken::Text(text) => {
+                if skip_whitespace_stack.last().copied().unwrap_or(false) && is_xml_whitespace(text)
+                {
+                    continue;
+                }
+                hasher.update(*b"T");
+                hash_nfo_semantic_bytes(&mut hasher, text.as_bytes());
+            }
+            NfoSemanticToken::ProcessingInstruction { target, content } => {
+                hasher.update(*b"P");
+                hash_nfo_semantic_bytes(&mut hasher, target);
+                hash_nfo_semantic_bytes(&mut hasher, content);
+            }
+        }
+    }
+    hasher.finalize().to_vec()
+}
+
+fn hash_nfo_semantic_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn is_xml_whitespace(value: &str) -> bool {
+    value.chars().all(is_xml_whitespace_character)
+}
+
+fn is_xml_whitespace_character(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
 /// Reads the direct `<actor>` nodes used by Emby/Kodi local NFO files.
@@ -664,6 +1075,71 @@ pub struct LocalNfoMetadataStore {
     database: Database,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalNfoCacheEnvelope {
+    schema_version: u8,
+    semantic_fingerprint: Option<Vec<u8>>,
+    relation_fingerprint: Option<Vec<u8>>,
+    details: LocalNfoDetails,
+}
+
+struct DecodedLocalNfoCache {
+    details: LocalNfoDetails,
+    semantic_fingerprint: Option<Vec<u8>>,
+    relation_fingerprint: Option<Vec<u8>>,
+}
+
+fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, String> {
+    let value =
+        serde_json::from_str::<serde_json::Value>(json).map_err(|error| error.to_string())?;
+    if value.get("schemaVersion").is_some() {
+        let envelope = serde_json::from_value::<LocalNfoCacheEnvelope>(value)
+            .map_err(|error| error.to_string())?;
+        if envelope.schema_version != LOCAL_NFO_CACHE_SCHEMA_VERSION {
+            return Err("unsupported local NFO cache schema version".to_owned());
+        }
+        let semantic_fingerprint = envelope
+            .semantic_fingerprint
+            .filter(|fingerprint| valid_nfo_content_fingerprint(fingerprint));
+        let relation_fingerprint = envelope
+            .relation_fingerprint
+            .filter(|fingerprint| valid_nfo_content_fingerprint(fingerprint));
+        return Ok(DecodedLocalNfoCache {
+            details: envelope.details,
+            semantic_fingerprint,
+            relation_fingerprint,
+        });
+    }
+    serde_json::from_value(value)
+        .map(|details| DecodedLocalNfoCache {
+            details,
+            semantic_fingerprint: None,
+            relation_fingerprint: None,
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn local_nfo_details_from_cache_json(json: &str) -> Option<LocalNfoDetails> {
+    decode_local_nfo_cache(json)
+        .ok()
+        .map(|decoded| decoded.details)
+}
+
+fn encode_local_nfo_cache(
+    details: &LocalNfoDetails,
+    semantic_fingerprint: Option<&[u8]>,
+    relation_fingerprint: Option<&[u8]>,
+) -> Result<String, LocalNfoMetadataStoreError> {
+    serde_json::to_string(&LocalNfoCacheEnvelope {
+        schema_version: LOCAL_NFO_CACHE_SCHEMA_VERSION,
+        semantic_fingerprint: semantic_fingerprint.map(<[u8]>::to_vec),
+        relation_fingerprint: relation_fingerprint.map(<[u8]>::to_vec),
+        details: details.clone(),
+    })
+    .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalNfoMetadataState {
     pub has_snapshot: bool,
@@ -683,6 +1159,24 @@ impl LocalNfoMetadataStore {
     ) -> Result<(), LocalNfoMetadataStoreError> {
         let json = serde_json::to_string(details)
             .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))?;
+        if json.len() > MAX_LOCAL_NFO_BYTES {
+            return Err(LocalNfoMetadataStoreError::TooLarge);
+        }
+        self.database
+            .update_media_item_nfo_metadata(item_id, Some(&json), Some(source_fingerprint))
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)
+    }
+
+    pub(crate) async fn write_item_with_semantic_fingerprint(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+        semantic_fingerprint: Option<&[u8]>,
+        relation_fingerprint: Option<&[u8]>,
+        details: &LocalNfoDetails,
+    ) -> Result<(), LocalNfoMetadataStoreError> {
+        let json = encode_local_nfo_cache(details, semantic_fingerprint, relation_fingerprint)?;
         if json.len() > MAX_LOCAL_NFO_BYTES {
             return Err(LocalNfoMetadataStoreError::TooLarge);
         }
@@ -715,8 +1209,8 @@ impl LocalNfoMetadataStore {
                 .map_err(LocalNfoMetadataStoreError::Storage)?;
             return Ok(None);
         }
-        match serde_json::from_str(&json) {
-            Ok(details) => Ok(Some(details)),
+        match decode_local_nfo_cache(&json) {
+            Ok(decoded) => Ok(Some(decoded.details)),
             Err(error) => {
                 tracing::warn!(
                     item_id,
@@ -777,6 +1271,59 @@ impl LocalNfoMetadataStore {
             return Ok(None);
         }
         self.read_item(item_id).await
+    }
+
+    pub(crate) async fn read_item_if_usable_with_fingerprint(
+        &self,
+        item_id: &str,
+    ) -> Result<
+        Option<(LocalNfoDetails, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>,
+        LocalNfoMetadataStoreError,
+    > {
+        let Some((json, source_fingerprint)) = self
+            .database
+            .media_item_nfo_metadata_snapshot(item_id)
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)?
+        else {
+            return Ok(None);
+        };
+        if json.len() > MAX_LOCAL_NFO_BYTES {
+            tracing::warn!(
+                item_id,
+                "derived local NFO cache is too large; clearing it for rebuild"
+            );
+            self.database
+                .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                .await
+                .map_err(LocalNfoMetadataStoreError::Storage)?;
+            return Ok(None);
+        }
+        let Some(source_fingerprint) =
+            source_fingerprint.filter(|value| valid_nfo_content_fingerprint(value))
+        else {
+            return Ok(None);
+        };
+        match decode_local_nfo_cache(&json) {
+            Ok(decoded) => Ok(Some((
+                decoded.details,
+                source_fingerprint,
+                decoded.semantic_fingerprint,
+                decoded.relation_fingerprint,
+            ))),
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    error = %error,
+                    "derived local NFO cache is malformed; clearing it for rebuild"
+                );
+                self.database
+                    .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                    .await
+                    .map_err(LocalNfoMetadataStoreError::Storage)?;
+                Ok(None)
+            }
+        }
     }
 
     pub async fn exists(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
@@ -1283,7 +1830,115 @@ fn rewrite_rich_nfo(
         }
         buffer.clear();
     }
-    Ok(writer.into_inner())
+    let rewritten = writer.into_inner();
+    if !original.is_empty()
+        && nfo_writeback_projection_fingerprint(original)?
+            == nfo_writeback_projection_fingerprint(&rewritten)?
+    {
+        return Ok(original.to_vec());
+    }
+    Ok(rewritten)
+}
+
+fn nfo_writeback_projection_fingerprint(bytes: &[u8]) -> Result<Vec<u8>, NfoWriteError> {
+    let projection = parse_local_nfo_projection(bytes)
+        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+    let root = nfo_root_tag(bytes)?;
+    let images = nfo_image_projection(bytes)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-NFO-SEMANTIC-1\0");
+    hasher.update(format!("{root:?}|{projection:?}|{images:?}").as_bytes());
+    Ok(hasher.finalize().to_vec())
+}
+
+fn nfo_root_tag(bytes: &[u8]) -> Result<String, NfoWriteError> {
+    let mut reader = Reader::from_reader(bytes);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event)) => {
+                return String::from_utf8(event.name().as_ref().to_vec())
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()));
+            }
+            Ok(Event::Eof) => {
+                return Err(NfoWriteError::InvalidXml(
+                    "NFO document does not contain a root element".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+}
+
+fn nfo_image_projection(bytes: &[u8]) -> Result<Vec<(String, String, String)>, NfoWriteError> {
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut active: Option<(usize, String, String, String)> = None;
+    let mut images = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                depth = depth.saturating_add(1);
+                let tag = event.name();
+                let tag = tag.as_ref();
+                if (depth == 2 && tag == b"thumb") || (depth == 3 && tag == b"thumb") {
+                    let kind = if depth == 3 { "fanart" } else { "thumb" };
+                    let aspect = attribute_value_bytes(&event, b"aspect")?.unwrap_or_default();
+                    active = Some((depth, kind.to_owned(), aspect, String::new()));
+                }
+            }
+            Ok(Event::Text(event)) if active.as_ref().is_some_and(|item| item.0 == depth) => {
+                if let Some(item) = active.as_mut() {
+                    let decoded = event
+                        .decode()
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    item.3.push_str(
+                        &unescape(decoded.as_ref())
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?,
+                    );
+                }
+            }
+            Ok(Event::End(_event)) => {
+                if active.as_ref().is_some_and(|item| item.0 == depth) {
+                    if let Some((_, kind, aspect, value)) = active.take() {
+                        if !value.trim().is_empty() {
+                            images.push((kind, aspect, value.trim().to_owned()));
+                        }
+                    }
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+    images.sort();
+    Ok(images)
+}
+
+fn attribute_value_bytes(
+    event: &BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<String>, NfoWriteError> {
+    for attribute in event.attributes().with_checks(false) {
+        let attribute = attribute.map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+        if attribute.key.as_ref() == name {
+            return attribute
+                .unescape_value()
+                .map(|value| Some(value.into_owned()))
+                .map_err(|error| NfoWriteError::InvalidXml(error.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn rich_root_tag(tag: &[u8]) -> bool {
@@ -2154,10 +2809,61 @@ impl NfoWriteService {
         item_id: &str,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
         let target = self.item_nfo_target(item_id).await?;
+        self.read_item_projection_at_target(&target).await
+    }
+
+    pub(crate) async fn read_item_projection_with_writeback_context_cached(
+        &self,
+        season_number: Option<i64>,
+        context: &StoredMediaWritebackContext,
+        cache: &LocalNfoProjectionCache,
+    ) -> Result<(Option<LocalNfoProjection>, bool), NfoWriteError> {
+        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
+        let target = self
+            .item_nfo_target_from_source(&context.item_type, season_number, source)
+            .await?;
+        let cell = {
+            let mut entries = cache.entries.lock().await;
+            entries
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let mut loaded = false;
+        let projection = cell
+            .get_or_init(|| async {
+                loaded = true;
+                self.read_item_projection_at_target(&target)
+                    .await
+                    .map_err(CachedNfoProjectionError::from_write_error)
+            })
+            .await;
+        let projection = projection
+            .clone()
+            .map_err(CachedNfoProjectionError::into_write_error)?;
+        Ok((projection, loaded))
+    }
+
+    pub(crate) async fn read_item_projection_with_writeback_context(
+        &self,
+        season_number: Option<i64>,
+        context: &crate::storage::StoredMediaWritebackContext,
+    ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
+        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
+        let target = self
+            .item_nfo_target_from_source(&context.item_type, season_number, source)
+            .await?;
+        self.read_item_projection_at_target(&target).await
+    }
+
+    async fn read_item_projection_at_target(
+        &self,
+        target: &Path,
+    ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
         let bytes = match fs::read(&target).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(io_error(&target, error)),
+            Err(error) => return Err(io_error(target, error)),
         };
         parse_local_nfo_projection(&bytes)
             .map(Some)
@@ -2179,8 +2885,19 @@ impl NfoWriteService {
         item_id: &str,
         patch: &MovieNfoMetadata,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        let target = self.item_nfo_target(item_id).await?;
-        let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
+        let Some((item_type, season_number, sort_title, added_at, source)) = self
+            .database
+            .find_movie_nfo_writeback_context(item_id)
+            .await?
+        else {
+            return Err(NfoWriteError::ItemNotFound);
+        };
+        let source = source.ok_or(NfoWriteError::ItemNotFound)?;
+        let target = self
+            .item_nfo_target_from_source(&item_type, season_number, &source)
+            .await?;
+        let sort_title = non_empty(sort_title.as_deref()).map(str::to_owned);
+        let date_added = added_at.and_then(nfo_date_added);
         let write = write_nfo_atomically_with_rewriter(
             &target,
             |original| {
@@ -2203,17 +2920,17 @@ impl NfoWriteService {
         source_id: &str,
         probe: &MediaProbeResult,
     ) -> Result<bool, NfoWriteError> {
-        let Some(kind) = self.database.find_media_item_kind(item_id).await? else {
-            return Ok(false);
-        };
-        if kind.item_type != "MOVIE" {
-            return Ok(false);
-        }
-        let Some(writeback_source) = self
+        let Some((item_type, _, sort_title, added_at, writeback_source)) = self
             .database
-            .find_metadata_writeback_source_path(item_id)
+            .find_movie_nfo_writeback_context(item_id)
             .await?
         else {
+            return Ok(false);
+        };
+        if item_type != "MOVIE" {
+            return Ok(false);
+        }
+        let Some(writeback_source) = writeback_source else {
             return Ok(false);
         };
         let is_strm = Path::new(&writeback_source.relative_path)
@@ -2223,8 +2940,11 @@ impl NfoWriteService {
         if writeback_source.source_id != source_id || is_strm {
             return Ok(false);
         }
-        let target = self.item_nfo_target(item_id).await?;
-        let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
+        let target = self
+            .item_nfo_target_from_source("MOVIE", None, &writeback_source)
+            .await?;
+        let sort_title = non_empty(sort_title.as_deref()).map(str::to_owned);
+        let date_added = added_at.and_then(nfo_date_added);
         let write = write_nfo_atomically_with_rewriter(
             &target,
             |original| {
@@ -2240,23 +2960,6 @@ impl NfoWriteService {
         .await?;
         self.finish_item_write(item_id, target, write).await?;
         Ok(true)
-    }
-
-    async fn movie_nfo_auxiliary_fields(
-        &self,
-        item_id: &str,
-    ) -> Result<(Option<String>, Option<String>), NfoWriteError> {
-        let Some((sort_title, added_at)) = self
-            .database
-            .find_movie_nfo_auxiliary_fields(item_id)
-            .await?
-        else {
-            return Ok((None, None));
-        };
-        Ok((
-            non_empty(Some(sort_title.as_str())).map(str::to_owned),
-            nfo_date_added(added_at),
-        ))
     }
 
     pub async fn write_item_series_nfo(
@@ -2280,24 +2983,39 @@ impl NfoWriteService {
         target: PathBuf,
         write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        self.mirror_item_nfo_if_enabled(item_id, &target).await?;
+        let NfoFileWrite {
+            content_fingerprint,
+            content,
+            changed,
+            file_fingerprint,
+        } = write;
+        if !changed {
+            let fingerprint = match file_fingerprint {
+                Some(fingerprint) => fingerprint,
+                None => nfo_fingerprint(&target)
+                    .await
+                    .map_err(|error| io_error(&target, error))?,
+            };
+            return Ok(NfoWriteReport {
+                path: target,
+                fingerprint,
+                content_fingerprint,
+                changed,
+            });
+        }
+        self.mirror_item_nfo_if_enabled(item_id, &target, &content)
+            .await?;
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
         self.database
-            .invalidate_media_item_nfo_metadata_if_source_changed(
-                item_id,
-                &write.content_fingerprint,
-            )
-            .await?;
-        self.database
-            .mark_media_item_metadata_checked(item_id, &fingerprint)
+            .sync_media_item_nfo_state(item_id, &content_fingerprint, &fingerprint)
             .await?;
         Ok(NfoWriteReport {
             path: target,
             fingerprint,
-            content_fingerprint: write.content_fingerprint,
-            changed: write.changed,
+            content_fingerprint,
+            changed,
         })
     }
 
@@ -2305,6 +3023,7 @@ impl NfoWriteService {
         &self,
         item_id: &str,
         source: &Path,
+        content: &[u8],
     ) -> Result<(), NfoWriteError> {
         let Some(config_dir) = self.config_dir.as_deref() else {
             return Ok(());
@@ -2333,10 +3052,7 @@ impl NfoWriteService {
             .file_name()
             .ok_or_else(|| NfoWriteError::PathOutsideRoot(source.to_owned()))?;
         let target = canonical_directory.join(file_name);
-        let bytes = fs::read(source)
-            .await
-            .map_err(|error| io_error(source, error))?;
-        write_nfo_atomically_with_rewriter(&target, |_| Ok(bytes.clone()), None).await?;
+        write_nfo_atomically_with_rewriter(&target, |_| Ok(content.to_owned()), None).await?;
         Ok(())
     }
 
@@ -2360,6 +3076,16 @@ impl NfoWriteService {
             _ => None,
         }
         .ok_or(NfoWriteError::ItemNotFound)?;
+        self.item_nfo_target_from_source(&kind.item_type, kind.season_number, &source)
+            .await
+    }
+
+    async fn item_nfo_target_from_source(
+        &self,
+        item_type: &str,
+        season_number: Option<i64>,
+        source: &StoredMediaSourcePath,
+    ) -> Result<PathBuf, NfoWriteError> {
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| io_error(Path::new(&source.root_path), error))?;
@@ -2379,7 +3105,7 @@ impl NfoWriteService {
         if !directory.starts_with(&root) {
             return Err(NfoWriteError::PathOutsideRoot(directory));
         }
-        let target = match kind.item_type.as_str() {
+        let target = match item_type {
             "MOVIE" => find_nfo_path(&media_path)
                 .await
                 .unwrap_or_else(|| directory.join("movie.nfo")),
@@ -2396,7 +3122,7 @@ impl NfoWriteService {
                 }
                 series_dir.join("tvshow.nfo")
             }
-            "SEASON" => find_season_nfo_target(&directory, kind.season_number).await,
+            "SEASON" => find_season_nfo_target(&directory, season_number).await,
             _ => return Err(NfoWriteError::ItemNotFound),
         };
         let target_parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -2533,6 +3259,7 @@ impl MetadataWriteService {
                 premiere_date: None,
                 rating: None,
                 rating_source: None,
+                provider_ids_json: None,
                 metadata_fingerprint: &report.fingerprint,
                 provenance_json: &provenance_json,
                 locked_fields_json: &locked_fields_json,
@@ -2578,7 +3305,9 @@ pub struct NfoWriteReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NfoFileWrite {
     content_fingerprint: Vec<u8>,
+    content: Vec<u8>,
     changed: bool,
+    file_fingerprint: Option<Vec<u8>>,
 }
 
 async fn write_nfo_atomically_with_hook(
@@ -2611,6 +3340,8 @@ where
         return Err(NfoWriteError::SymlinkTarget(target.to_owned()));
     }
     let before = file_stamp(target).await?;
+    let file_fingerprint =
+        before.map(|stamp| nfo_fingerprint_from_stamp(target, stamp.size, stamp.modified_at));
     let original = match fs::read(target).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -2619,12 +3350,15 @@ where
     let rewritten = rewrite(&original)?;
     let write = NfoFileWrite {
         content_fingerprint: nfo_content_fingerprint(&rewritten),
+        content: rewritten.clone(),
         changed: rewritten != original,
+        file_fingerprint,
     };
     if !write.changed {
         return Ok(write);
     }
     let temporary = parent.join(format!(".lux-{}.nfo.tmp", Uuid::now_v7()));
+    crate::application::internal_write::register(&temporary);
     let result = async {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2656,6 +3390,7 @@ where
         if !unchanged {
             return Err(NfoWriteError::ConcurrentModification(target.to_owned()));
         }
+        crate::application::internal_write::register(target);
         fs::rename(&temporary, target)
             .await
             .map_err(|source| io_error(target, source))?;
@@ -2666,6 +3401,14 @@ where
             .sync_all()
             .await
             .map_err(|source| io_error(parent, source))?;
+        crate::application::internal_write::finalize(
+            target,
+            crate::application::internal_write::file_stamp(target)
+                .await
+                .ok()
+                .flatten(),
+            &rewritten,
+        );
         Ok(())
     }
     .await;
@@ -2921,6 +3664,687 @@ struct ActiveField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        application::{libraries::LibraryService, scanner::LibraryScanner},
+        config::Config,
+        library::LibraryKind,
+    };
+
+    #[test]
+    fn local_nfo_cache_decodes_legacy_details_and_versioned_semantic_state() {
+        let details = LocalNfoDetails::default();
+        let legacy = serde_json::to_string(&details).expect("legacy cache json");
+        let legacy_cache = decode_local_nfo_cache(&legacy).expect("legacy cache");
+        assert_eq!(legacy_cache.details, details);
+        assert_eq!(legacy_cache.semantic_fingerprint, None);
+        assert_eq!(legacy_cache.relation_fingerprint, None);
+
+        let fingerprint = [7_u8; 32];
+        let versioned = encode_local_nfo_cache(&details, Some(&fingerprint), Some(&fingerprint))
+            .expect("versioned cache json");
+        let versioned_cache = decode_local_nfo_cache(&versioned).expect("versioned cache");
+        assert_eq!(versioned_cache.details, details);
+        assert_eq!(
+            versioned_cache.semantic_fingerprint.as_deref(),
+            Some(fingerprint.as_slice())
+        );
+        assert_eq!(
+            versioned_cache.relation_fingerprint.as_deref(),
+            Some(fingerprint.as_slice())
+        );
+    }
+
+    #[test]
+    fn local_nfo_semantic_fingerprint_ignores_lexical_changes_and_keeps_unknown_xml() {
+        let original = br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">preserved</extension><empty/></movie>"#;
+        let equivalent = br#"<?xml version="1.0"?>
+<movie>
+  <!-- ignored editor comment -->
+  <title><![CDATA[Title & text]]></title>
+  <actor tmdbid='9' sortorder='0'><name>Actor</name></actor>
+  <extension key='x'>preserved</extension><empty></empty>
+</movie>"#;
+        let (original_projection, original_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(original).expect("original NFO");
+        let (equivalent_projection, equivalent_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(equivalent)
+                .expect("equivalent NFO");
+        assert_eq!(original_fingerprint, equivalent_fingerprint);
+        assert_eq!(original_projection, equivalent_projection);
+        let (_, ordinary_fingerprint) =
+            parse_local_nfo_projection_inner(original, false).expect("ordinary projection mode");
+        assert!(ordinary_fingerprint.is_empty());
+
+        let bare_root = b"<movie><extension/></movie>";
+        let root_with_misc_whitespace = b" \n<movie><extension/></movie>\r\n ";
+        let (_, bare_root_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(bare_root).expect("bare root");
+        let (_, root_whitespace_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(root_with_misc_whitespace)
+                .expect("root surrounding whitespace");
+        assert_eq!(bare_root_fingerprint, root_whitespace_fingerprint);
+
+        let pi_crlf = b"<movie><?app data='first\r\nsecond'?></movie>";
+        let pi_lf = b"<movie><?app data='first\nsecond'?></movie>";
+        let pi_other_target = b"<movie><?other data='first\nsecond'?></movie>";
+        let (_, pi_crlf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(pi_crlf)
+                .expect("CRLF processing instruction");
+        let (_, pi_lf_fingerprint) = parse_local_nfo_projection_with_semantic_fingerprint(pi_lf)
+            .expect("LF processing instruction");
+        let (_, pi_other_target_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(pi_other_target)
+                .expect("different processing-instruction target");
+        assert_eq!(pi_crlf_fingerprint, pi_lf_fingerprint);
+        assert_ne!(pi_lf_fingerprint, pi_other_target_fingerprint);
+
+        let lf_content = b"<movie><extension>first\nsecond</extension></movie>";
+        let crlf_content = b"<movie><extension>first\r\nsecond</extension></movie>";
+        let (_, lf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(lf_content).expect("LF content");
+        let (_, crlf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(crlf_content)
+                .expect("CRLF content");
+        assert_eq!(lf_fingerprint, crlf_fingerprint);
+        let referenced_lf_content = b"<movie><extension>first&#xA;second</extension></movie>";
+        let (_, referenced_lf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(referenced_lf_content)
+                .expect("character-reference LF content");
+        assert_eq!(lf_fingerprint, referenced_lf_fingerprint);
+
+        let mixed_one_space = b"<movie><extension>left <child/> right</extension></movie>";
+        let mixed_two_spaces = b"<movie><extension>left  <child/> right</extension></movie>";
+        let (_, mixed_one_space_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(mixed_one_space)
+                .expect("one mixed-content space");
+        let (_, mixed_two_spaces_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(mixed_two_spaces)
+                .expect("two mixed-content spaces");
+        assert_ne!(mixed_one_space_fingerprint, mixed_two_spaces_fingerprint);
+
+        let whitespace_cdata = b"<movie><extension><![CDATA[ \n  ]]><child/></extension></movie>";
+        let whitespace_text = b"<movie><extension> \n  <child/></extension></movie>";
+        let (_, whitespace_cdata_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(whitespace_cdata)
+                .expect("CDATA formatting whitespace");
+        let (_, whitespace_text_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(whitespace_text)
+                .expect("text formatting whitespace");
+        assert_eq!(whitespace_cdata_fingerprint, whitespace_text_fingerprint);
+
+        let preserved_cdata =
+            b"<movie xml:space=\"preserve\"><extension><![CDATA[ \n  ]]><child/></extension></movie>";
+        let preserved_text =
+            b"<movie xml:space=\"preserve\"><extension> \n  <child/></extension></movie>";
+        let (_, preserved_cdata_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_cdata)
+                .expect("preserved CDATA whitespace");
+        let (_, preserved_text_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_text)
+                .expect("preserved text whitespace");
+        assert_eq!(preserved_cdata_fingerprint, preserved_text_fingerprint);
+
+        let preserved_one_space =
+            b"<movie xml:space=\"preserve\"><extension> <child/></extension></movie>";
+        let preserved_two_spaces =
+            b"<movie xml:space=\"preserve\"><extension>  <child/></extension></movie>";
+        let (_, preserved_one_space_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_one_space)
+                .expect("one preserved space");
+        let (_, preserved_two_spaces_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_two_spaces)
+                .expect("two preserved spaces");
+        assert_ne!(
+            preserved_one_space_fingerprint,
+            preserved_two_spaces_fingerprint
+        );
+
+        let default_one_space = b"<movie><extension> <child/></extension></movie>";
+        let default_two_spaces = b"<movie><extension>  <child/></extension></movie>";
+        let (_, default_one_space_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(default_one_space)
+                .expect("one element-only formatting space");
+        let (_, default_two_spaces_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(default_two_spaces)
+                .expect("two element-only formatting spaces");
+        assert_eq!(
+            default_one_space_fingerprint,
+            default_two_spaces_fingerprint
+        );
+        let reset_preserve = b"<movie xml:space=\"preserve\"><extension xml:space=\"default\"> <child/></extension></movie>";
+        let reset_default = b"<movie xml:space=\"preserve\"><extension xml:space=\"default\">  <child/></extension></movie>";
+        let (_, reset_preserve_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(reset_preserve)
+                .expect("nested xml:space default");
+        let (_, reset_default_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(reset_default)
+                .expect("nested xml:space default formatting");
+        assert_eq!(reset_preserve_fingerprint, reset_default_fingerprint);
+
+        let attribute_lf = b"<movie><extension value=\"line\nbreak\"/></movie>";
+        let attribute_crlf = b"<movie><extension value=\"line\r\nbreak\"/></movie>";
+        let attribute_char_ref = b"<movie><extension value=\"line&#xA;break\"/></movie>";
+        let (_, attribute_lf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_lf)
+                .expect("literal LF attribute");
+        let (_, attribute_crlf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_crlf)
+                .expect("literal CRLF attribute");
+        let (_, attribute_char_ref_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_char_ref)
+                .expect("character-reference LF attribute");
+        assert_eq!(attribute_lf_fingerprint, attribute_crlf_fingerprint);
+        assert_ne!(attribute_lf_fingerprint, attribute_char_ref_fingerprint);
+
+        let attribute_literal_tab = b"<movie><extension value=\"left\tright\"/></movie>";
+        let attribute_char_ref_tab = b"<movie><extension value=\"left&#x9;right\"/></movie>";
+        let (_, attribute_literal_tab_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_literal_tab)
+                .expect("literal TAB attribute");
+        let (_, attribute_char_ref_tab_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_char_ref_tab)
+                .expect("character-reference TAB attribute");
+        assert_ne!(
+            attribute_literal_tab_fingerprint,
+            attribute_char_ref_tab_fingerprint
+        );
+
+        let equivalent_attribute_refs = b"<movie><extension value=\"A&amp;B&#10;C\"/></movie>";
+        let equivalent_numeric_attribute_refs =
+            b"<movie><extension value=\"A&#38;B&#xA;C\"/></movie>";
+        let (_, equivalent_attribute_ref_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(equivalent_attribute_refs)
+                .expect("named attribute references");
+        let (_, equivalent_numeric_attribute_ref_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(equivalent_numeric_attribute_refs)
+                .expect("numeric attribute references");
+        assert_eq!(
+            equivalent_attribute_ref_fingerprint,
+            equivalent_numeric_attribute_ref_fingerprint
+        );
+
+        let duplicate_attribute = b"<movie><extension key=\"x\" key=\"y\"/></movie>";
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(duplicate_attribute),
+            Err(NfoError::Xml(_))
+        ));
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(
+                b"<!DOCTYPE movie [<!ENTITY secret 'value'>]><movie><extension>&secret;</extension></movie>"
+            ),
+            Err(NfoError::DocTypeNotAllowed)
+        ));
+        let escaped_unknown_name = b"<movie><extension>&amp;missing;</extension></movie>";
+        let cdata_unknown_name = b"<movie><extension><![CDATA[&missing;]]></extension></movie>";
+        let (_, escaped_unknown_name_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(escaped_unknown_name)
+                .expect("escaped literal entity-like text");
+        let (_, cdata_unknown_name_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(cdata_unknown_name)
+                .expect("CDATA literal entity-like text");
+        assert_eq!(
+            escaped_unknown_name_fingerprint,
+            cdata_unknown_name_fingerprint
+        );
+        let undeclared_entity = b"<movie><extension>&missing;</extension></movie>";
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(undeclared_entity),
+            Err(NfoError::Xml(_))
+        ));
+        assert!(matches!(
+            parse_local_nfo_projection(undeclared_entity),
+            Err(NfoError::Xml(_))
+        ));
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(b"<movie><extension></movie>"),
+            Err(NfoError::Xml(_))
+        ));
+
+        let projection_source = b"<movie><title>  Lead <emphasis>ignored</emphasis> tail  </title><plot>  Intro <b>omitted</b> outro  </plot></movie>";
+        let established_projection =
+            parse_local_nfo_projection(projection_source).expect("established projection");
+        let (semantic_projection, _) =
+            parse_local_nfo_projection_with_semantic_fingerprint(projection_source)
+                .expect("semantic projection");
+        // The cache-enabled path keeps untrimmed XML text events so character
+        // references and CDATA map to the same field value. The projection-only
+        // path retains its historical per-event trimming behavior.
+        assert_eq!(
+            established_projection.metadata.title.as_deref(),
+            Some("Leadtail")
+        );
+        assert_eq!(
+            semantic_projection.metadata.title.as_deref(),
+            Some("Lead  tail")
+        );
+        assert_eq!(
+            established_projection.metadata.overview.as_deref(),
+            Some("Introoutro")
+        );
+        assert_eq!(
+            semantic_projection.metadata.overview.as_deref(),
+            Some("Intro  outro")
+        );
+
+        for changed in [
+            br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="y">preserved</extension><empty/></movie>"#.as_slice(),
+            br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">changed</extension><empty/></movie>"#.as_slice(),
+            br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">preserved<child/></extension><empty/></movie>"#.as_slice(),
+            br#"<movie><title>Changed &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">preserved</extension><empty/></movie>"#.as_slice(),
+        ] {
+            let (_, changed_fingerprint) =
+                parse_local_nfo_projection_with_semantic_fingerprint(changed)
+                    .expect("changed NFO");
+            assert_ne!(original_fingerprint, changed_fingerprint);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_episode_nfo_projection_is_cached_per_page_and_keeps_errors_typed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("media");
+        let show = root.join("Show");
+        fs::create_dir_all(&show).await?;
+        fs::write(show.join("S01E01.mkv"), b"one").await?;
+        fs::write(show.join("S01E02.mkv"), b"two").await?;
+        fs::write(
+            show.join("episode.nfo"),
+            b"<episodedetails><title>Shared episode metadata</title></episodedetails>",
+        )
+        .await?;
+        let other_show = root.join("Other");
+        fs::create_dir_all(&other_show).await?;
+        fs::write(other_show.join("S01E01.mkv"), b"other").await?;
+        fs::write(
+            other_show.join("episode.nfo"),
+            b"<episodedetails><title>Independent episode metadata</title></episodedetails>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let service = NfoWriteService::new(database);
+        let root_path = root.to_string_lossy().into_owned();
+        let request = |item_id: &str, filename: &str| {
+            (
+                item_id.to_owned(),
+                Some(1),
+                StoredMediaWritebackContext {
+                    item_type: "EPISODE".to_owned(),
+                    source: Some(StoredMediaSourcePath {
+                        source_id: format!("source-{item_id}"),
+                        item_id: item_id.to_owned(),
+                        probe_status: "DONE".to_owned(),
+                        root_path: root_path.clone(),
+                        relative_path: format!("Show/{filename}"),
+                    }),
+                },
+            )
+        };
+
+        let (_, season_a, context_a) = request("episode-1", "S01E01.mkv");
+        let (_, season_b, context_b) = request("episode-2", "S01E02.mkv");
+        let cache = LocalNfoProjectionCache::default();
+        let (first, second) = tokio::join!(
+            service
+                .read_item_projection_with_writeback_context_cached(season_a, &context_a, &cache,),
+            service
+                .read_item_projection_with_writeback_context_cached(season_b, &context_b, &cache,),
+        );
+        let (projection_a, loaded_a) = first?;
+        let (projection_b, loaded_b) = second?;
+        let projection_a = projection_a.ok_or("shared episode sidecar was not found")?;
+        let projection_b = projection_b.ok_or("shared episode sidecar was not found")?;
+        assert_eq!(
+            projection_a.metadata.title.as_deref(),
+            Some("Shared episode metadata")
+        );
+        assert_eq!(
+            projection_b.metadata.title.as_deref(),
+            Some("Shared episode metadata")
+        );
+        assert_ne!(loaded_a, loaded_b, "shared sidecar should be loaded once");
+
+        let (_, _, context_other) = request("episode-other", "../Other/S01E01.mkv");
+        let (other_projection, loaded_other) = service
+            .read_item_projection_with_writeback_context_cached(Some(1), &context_other, &cache)
+            .await?;
+        assert!(
+            loaded_other,
+            "a different canonical sidecar gets its own initializer"
+        );
+        assert_eq!(
+            other_projection.and_then(|projection| projection.metadata.title),
+            Some("Independent episode metadata".to_owned())
+        );
+
+        fs::write(
+            show.join("episode.nfo"),
+            b"<episodedetails><title>Updated page metadata</title></episodedetails>",
+        )
+        .await?;
+        let next_page_cache = LocalNfoProjectionCache::default();
+        let (next_a, next_b) = tokio::join!(
+            service.read_item_projection_with_writeback_context_cached(
+                season_a,
+                &context_a,
+                &next_page_cache,
+            ),
+            service.read_item_projection_with_writeback_context_cached(
+                season_b,
+                &context_b,
+                &next_page_cache,
+            ),
+        );
+        for result in [next_a, next_b] {
+            let (projection, _) = result?;
+            assert_eq!(
+                projection.and_then(|projection| projection.metadata.title),
+                Some("Updated page metadata".to_owned())
+            );
+        }
+
+        fs::write(show.join("episode.nfo"), b"<episodedetails><title>Broken").await?;
+        let error_cache = LocalNfoProjectionCache::default();
+        let (error_a, error_b) = tokio::join!(
+            service.read_item_projection_with_writeback_context_cached(
+                season_a,
+                &context_a,
+                &error_cache,
+            ),
+            service.read_item_projection_with_writeback_context_cached(
+                season_b,
+                &context_b,
+                &error_cache,
+            ),
+        );
+        assert!(matches!(error_a, Err(NfoWriteError::Nfo(_))));
+        assert!(matches!(error_b, Err(NfoWriteError::Nfo(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_op_nfo_write_reuses_the_file_stamp_fingerprint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("movie.nfo");
+        fs::write(&target, b"<movie><title>Example</title></movie>").await?;
+
+        let write =
+            write_nfo_atomically_with_rewriter(&target, |original| Ok(original.to_vec()), None)
+                .await?;
+
+        assert!(!write.changed);
+        assert_eq!(
+            write.file_fingerprint,
+            Some(nfo_fingerprint(&target).await?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nfo_projection_reuses_a_preloaded_writeback_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("Movies");
+        fs::create_dir_all(&root).await?;
+        fs::write(root.join("Example.Movie.2020.mkv"), b"fixture").await?;
+        fs::write(
+            root.join("Example.Movie.2020.nfo"),
+            b"<movie><title>Example Movie</title></movie>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+        let contexts = database
+            .list_media_item_writeback_contexts_by_ids(std::slice::from_ref(&item_id))
+            .await?;
+        let context = contexts.get(&item_id).ok_or("writeback context")?;
+        let writer = NfoWriteService::new(database.clone());
+
+        database.reset_query_count();
+        let from_context = writer
+            .read_item_projection_with_writeback_context(None, context)
+            .await?
+            .ok_or("NFO projection from context")?;
+        assert_eq!(
+            from_context.metadata.title.as_deref(),
+            Some("Example Movie")
+        );
+        assert_eq!(database.query_count(), 0);
+
+        database.reset_query_count();
+        let from_item = writer
+            .read_item_projection(&item_id)
+            .await?
+            .ok_or("NFO projection from item")?;
+        assert_eq!(from_item.details, from_context.details);
+        assert_eq!(database.query_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_nfo_write_reuses_context_and_preserves_source_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("Movies");
+        fs::create_dir_all(&root).await?;
+        fs::write(root.join("Example.Movie.2020.mkv"), b"fixture").await?;
+        let target = root.join("movie.nfo");
+        fs::write(
+            &target,
+            b"<movie><title>Example</title><custom>keep</custom></movie>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let (item_id, source_id): (String, String) =
+            sqlx::query_as("SELECT item_id, id FROM media_sources LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        let probe = MediaProbeResult {
+            container: Some("mkv".to_owned()),
+            source_size: Some(100),
+            duration_ticks: Some(600_000_000),
+            bitrate: Some(500_000),
+            streams: vec![],
+        };
+        sqlx::query("UPDATE media_items SET sort_title = ?, added_at = 0 WHERE id = ?")
+            .bind("00 example movie")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+            .bind(r#"{"images":{"writeToMetadata":true}}"#)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let writer =
+            NfoWriteService::new_with_config_dir(database.clone(), config.config_dir.clone());
+        database.reset_query_count();
+        assert!(
+            writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            3,
+            "item context, mirror policy, and combined state sync"
+        );
+        let content = fs::read_to_string(&target).await?;
+        assert!(content.contains("<custom>keep</custom>"));
+        assert!(content.contains("<sorttitle>00 example movie</sorttitle>"));
+        assert!(content.contains("<dateadded>1970-01-01 00:00:00</dateadded>"));
+        assert!(root.join("movie.nfo").exists());
+        let mirror = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
+        assert_eq!(fs::read_to_string(&mirror).await?, content);
+
+        database.reset_query_count();
+        assert!(
+            writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "an unchanged NFO skips mirror policy lookup and state sync"
+        );
+        assert_eq!(fs::read_to_string(&target).await?, content);
+        assert_eq!(fs::read_to_string(&mirror).await?, content);
+
+        database.reset_query_count();
+        writer
+            .write_item_movie_nfo(
+                &item_id,
+                &MovieNfoMetadata {
+                    base: NfoMetadata {
+                        title: Some("Example with details".to_owned()),
+                        ..NfoMetadata::default()
+                    },
+                    ..MovieNfoMetadata::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            3,
+            "movie item context, mirror policy, and combined state sync"
+        );
+        let movie_content = fs::read_to_string(&target).await?;
+        assert!(
+            movie_content.contains("<sorttitle>00 example movie</sorttitle>"),
+            "{movie_content}"
+        );
+        assert!(
+            movie_content.contains("<dateadded>1970-01-01 00:00:00</dateadded>"),
+            "{movie_content}"
+        );
+
+        database.reset_query_count();
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, "wrong-source", &probe)
+                .await?
+        );
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(fs::read_to_string(&target).await?, movie_content);
+
+        sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert!(
+            !writer
+                .write_item_probe_details("missing-item", &source_id, &probe)
+                .await?
+        );
+        writer
+            .write_item_movie_nfo(
+                &item_id,
+                &MovieNfoMetadata {
+                    base: NfoMetadata {
+                        title: Some("Video item".to_owned()),
+                        ..NfoMetadata::default()
+                    },
+                    ..MovieNfoMetadata::default()
+                },
+            )
+            .await?;
+        let video_nfo = fs::read_to_string(root.join("Example.Movie.2020.nfo")).await?;
+        assert!(!video_nfo.contains("<sorttitle>"), "{video_nfo}");
+        assert!(!video_nfo.contains("<dateadded>"), "{video_nfo}");
+
+        sqlx::query("UPDATE media_items SET item_type = 'MOVIE', removed_at = 1 WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        fs::remove_file(&target).await?;
+        fs::remove_file(root.join("Example.Movie.2020.nfo")).await?;
+        writer
+            .write_item_movie_nfo(
+                &item_id,
+                &MovieNfoMetadata {
+                    base: NfoMetadata {
+                        title: Some("Removed movie".to_owned()),
+                        ..NfoMetadata::default()
+                    },
+                    ..MovieNfoMetadata::default()
+                },
+            )
+            .await?;
+        let removed_movie_nfo = fs::read_to_string(&target).await?;
+        assert!(
+            !removed_movie_nfo.contains("<sorttitle>"),
+            "{removed_movie_nfo}"
+        );
+        assert!(
+            !removed_movie_nfo.contains("<dateadded>"),
+            "{removed_movie_nfo}"
+        );
+        fs::write(&target, &movie_content).await?;
+        fs::write(&mirror, &movie_content).await?;
+
+        sqlx::query("UPDATE media_items SET removed_at = NULL WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE filesystem_entries SET relative_path = 'Example.strm' WHERE id = (SELECT filesystem_entry_id FROM media_sources WHERE id = ?)")
+            .bind(&source_id).execute(database.pool()).await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        sqlx::query("DELETE FROM media_sources WHERE id = ?")
+            .bind(&source_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(fs::read_to_string(&target).await?, movie_content);
+        Ok(())
+    }
 
     fn mutate_target(path: &Path) -> std::io::Result<()> {
         std::fs::write(path, b"<movie><title>external</title></movie>")
@@ -2950,6 +4374,36 @@ mod tests {
         ));
         let content = tokio::fs::read_to_string(&target).await.expect("target");
         assert!(content.contains("external"));
+    }
+
+    #[tokio::test]
+    async fn atomic_nfo_write_is_marked_for_watcher_suppression() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("movie.nfo");
+        write_movie_nfo_atomically(
+            &target,
+            &MovieNfoMetadata {
+                base: NfoMetadata {
+                    title: Some("movie".to_owned()),
+                    ..NfoMetadata::default()
+                },
+                ..MovieNfoMetadata::default()
+            },
+        )
+        .await
+        .expect("write nfo");
+
+        assert!(
+            crate::application::images::should_suppress_internal_image_write(&target).await,
+            "the watcher should recognize Lux-owned NFO writes"
+        );
+        tokio::fs::write(&target, b"<movie><title>external edit</title></movie>")
+            .await
+            .expect("external edit");
+        assert!(
+            !crate::application::images::should_suppress_internal_image_write(&target).await,
+            "an external edit should invalidate the internal-write marker"
+        );
     }
 
     #[test]

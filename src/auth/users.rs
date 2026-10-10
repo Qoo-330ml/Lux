@@ -20,6 +20,53 @@ pub struct UserRecord {
     pub last_activity_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticationPrincipal {
+    User(UserRecord),
+    SharedAdminApiKey,
+}
+
+impl AuthenticationPrincipal {
+    pub fn user(&self) -> Option<&UserRecord> {
+        match self {
+            Self::User(user) => Some(user),
+            Self::SharedAdminApiKey => None,
+        }
+    }
+
+    pub fn user_id(&self) -> Option<UserId> {
+        self.user().map(|user| user.id)
+    }
+
+    pub const fn is_admin(&self) -> bool {
+        match self {
+            Self::User(user) => user.is_admin,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+
+    pub const fn can_manage_server(&self) -> bool {
+        match self {
+            Self::User(user) => user.can_manage_server,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+
+    pub const fn can_remote_access(&self) -> bool {
+        match self {
+            Self::User(user) => user.can_remote_access,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+
+    pub const fn can_download(&self) -> bool {
+        match self {
+            Self::User(user) => user.can_download,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UserStore {
     database: Database,
@@ -196,6 +243,43 @@ impl UserStore {
             Err(error) => return Err(UserStoreError::Storage(error)),
         };
         updated.map(user_record).transpose()
+    }
+
+    pub async fn change_password(
+        &self,
+        user_id: &UserId,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<bool, UserStoreError> {
+        let user_id = user_id.to_string();
+        let Some(stored) = self.database.find_user_by_id(&user_id).await? else {
+            return Ok(false);
+        };
+        let current_password_matches = self
+            .passwords
+            .verify_password(Some(stored.password_hash.as_str()), current_password)?;
+        if stored.is_disabled || !stored.has_password || !current_password_matches {
+            return Ok(false);
+        }
+
+        let password_hash = self.passwords.hash_password(new_password)?;
+        let updated = self
+            .database
+            .update_user(
+                &user_id,
+                UpdateUser {
+                    display_name: None,
+                    password_hash: Some(&password_hash),
+                    has_password: Some(true),
+                    is_disabled: None,
+                    is_admin: None,
+                    can_manage_server: None,
+                    can_remote_access: None,
+                    can_download: None,
+                },
+            )
+            .await?;
+        Ok(updated.is_some())
     }
 
     pub async fn delete_user(&self, user_id: &str) -> Result<bool, UserStoreError> {

@@ -189,6 +189,34 @@ fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
 }
 
 #[test]
+fn movie_nfo_rewrite_keeps_original_bytes_when_rich_patch_is_semantically_equal()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = r#"<movie><title>电影</title><thumb aspect="poster">https://example.com/poster.jpg</thumb><actor><name>演员甲</name><role>角色甲</role><tmdbid>42</tmdbid><order>0</order></actor><genre>剧情</genre><rating>8</rating></movie>"#;
+    let patch = MovieNfoMetadata {
+        rating: Some(8.0),
+        genres: vec!["剧情".to_owned()],
+        poster_url: Some("https://example.com/poster.jpg".to_owned()),
+        actors: vec![ActorCredit {
+            id: "42".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }],
+        ..MovieNfoMetadata::default()
+    };
+
+    assert_eq!(
+        rewrite_movie_nfo(original.as_bytes(), &patch)?,
+        original.as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
 fn series_nfo_rewrite_writes_rich_fields_with_tvshow_root() -> Result<(), Box<dyn std::error::Error>>
 {
     let rewritten = rewrite_series_nfo(

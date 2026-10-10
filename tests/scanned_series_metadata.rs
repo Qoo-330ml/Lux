@@ -140,6 +140,140 @@ async fn completed_series_scan_indexes_local_nfo_and_images()
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_series_poster_keeps_local_image_batch_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    let series_dir = root.join("Unreadable Show (2024)");
+    let season_dir = series_dir.join("Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    tokio::fs::write(
+        series_dir.join("tvshow.nfo"),
+        "<tvshow><title>Unreadable Show</title></tvshow>",
+    )
+    .await?;
+    let poster_path = series_dir.join("poster.png");
+    let mut poster_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([23, 45, 67, 255]),
+    ))
+    .write_to(&mut poster_png, image::ImageFormat::Png)?;
+    tokio::fs::write(&poster_path, poster_png.get_ref()).await?;
+    let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
+    permissions.set_mode(0o000);
+    tokio::fs::set_permissions(&poster_path, permissions).await?;
+    assert_eq!(
+        tokio::fs::read(&poster_path)
+            .await
+            .expect_err("poster should be unreadable")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "fixture must inject a real permission error"
+    );
+    tokio::fs::write(season_dir.join("Unreadable.Show.S01E01.mkv"), b"episode").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let batch: (String, Option<i64>) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: Option<(String, Option<i64>)> = sqlx::query_as(
+                "SELECT status, images_completed_at FROM scan_local_metadata_batches
+                 WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_optional(database.pool())
+            .await?;
+            if let Some(row) = row
+                && matches!(row.0.as_str(), "FAILED" | "COMPLETED")
+            {
+                return Ok::<_, sqlx::Error>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let series_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        batch.0, "FAILED",
+        "image read error must fail the local batch"
+    );
+    assert_eq!(batch.1, None, "image stage must remain retryable");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_metadata_completeness
+             WHERE item_id = ? AND capability = 'POSTER'",
+        )
+        .bind(&series_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "permission failure must not confirm the poster capability"
+    );
+
+    let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
+    permissions.set_mode(0o644);
+    tokio::fs::set_permissions(&poster_path, permissions).await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
+         WHERE job_id = ? AND status = 'FAILED'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    let retried = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+            let poster_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+            )
+            .bind(&series_id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" && poster_count == 1 {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    assert!(
+        retried,
+        "restoring permissions should let the series poster retry"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn series_scan_indexes_images_in_nested_categories_after_one_nfo_conflict()
 -> Result<(), Box<dyn std::error::Error>> {

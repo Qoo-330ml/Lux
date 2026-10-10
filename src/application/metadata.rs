@@ -1,12 +1,18 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{fs, sync::Semaphore, task::JoinSet};
+use tokio::{
+    fs,
+    sync::{Mutex, OnceCell, Semaphore},
+    task::JoinSet,
+};
 
 use crate::{
     application::scanner::compute_file_fingerprint,
@@ -14,14 +20,17 @@ use crate::{
         images::image_content_tag_and_dimensions_from_bytes,
         nfo::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
-            parse_local_nfo_projection,
+            parse_local_nfo_projection, parse_local_nfo_projection_with_semantic_fingerprint,
         },
-        people::PeopleService,
+        people::{DeferredNfoActorCredits, PeopleService},
     },
     domain::ids::LibraryId,
+    observability::resources::ResourceMetrics,
     storage::{
-        Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
-        StoredMediaSourcePath, StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
+        Database, ItemImageBatchInsert, ItemImageInsert, LocalNfoDefaultsRepair,
+        MediaMetadataUpdate, StorageError, StoredItemImage, StoredMediaMetadata,
+        StoredMediaSourcePath, StoredScanJobMetadataPage, StoredScanJobMetadataSources,
+        StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
     },
 };
 
@@ -31,7 +40,210 @@ const MIN_SCAN_JOB_METADATA_BATCH_SIZE: usize = 8;
 const MAX_SCAN_JOB_METADATA_BATCH_SIZE: usize = 32;
 const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
+const LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE: usize = 16;
+const LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY: usize = 4;
+const LOCAL_NFO_PATH_DISCOVERY_CONCURRENCY: usize = 4;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ScanLocalMovieNfoConcurrencyProbe {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    identity_conflict_gate: Option<Arc<ScanLocalMovieIdentityConflictGate>>,
+}
+
+#[cfg(test)]
+struct ScanLocalMovieIdentityConflictGate {
+    contenders: tokio::sync::Barrier,
+    ready_contenders: tokio::sync::Semaphore,
+    release_contenders: tokio::sync::Semaphore,
+    conflict_checks_passed: tokio::sync::Semaphore,
+    release_first_check: tokio::sync::Semaphore,
+    hold_first_check: std::sync::atomic::AtomicBool,
+    identity_guard_held_after_first_check: std::sync::atomic::AtomicBool,
+    metadata_updates_pushed: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl ScanLocalMovieIdentityConflictGate {
+    fn new(contenders: usize) -> Self {
+        Self {
+            contenders: tokio::sync::Barrier::new(contenders),
+            ready_contenders: tokio::sync::Semaphore::new(0),
+            release_contenders: tokio::sync::Semaphore::new(0),
+            conflict_checks_passed: tokio::sync::Semaphore::new(0),
+            release_first_check: tokio::sync::Semaphore::new(0),
+            hold_first_check: std::sync::atomic::AtomicBool::new(true),
+            identity_guard_held_after_first_check: std::sync::atomic::AtomicBool::new(false),
+            metadata_updates_pushed: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn meet_contenders_before_guard(&self) {
+        self.contenders.wait().await;
+        self.ready_contenders.add_permits(1);
+        if let Ok(release) = self.release_contenders.acquire().await {
+            release.forget();
+        }
+    }
+
+    async fn hold_first_successful_conflict_check(
+        &self,
+        identity_update_guard: Option<&Arc<Mutex<()>>>,
+    ) {
+        self.identity_guard_held_after_first_check.store(
+            identity_update_guard.is_some_and(|guard| guard.try_lock().is_err()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.conflict_checks_passed.add_permits(1);
+        if self
+            .hold_first_check
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Ok(release) = self.release_first_check.acquire().await {
+                release.forget();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct ScanLocalMovieNfoConcurrencyGuard {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ScanLocalMovieNfoConcurrencyProbe {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            identity_conflict_gate: None,
+        }
+    }
+
+    fn with_identity_conflict_gate(mut self, contenders: usize) -> Self {
+        self.identity_conflict_gate = Some(Arc::new(ScanLocalMovieIdentityConflictGate::new(
+            contenders,
+        )));
+        self
+    }
+
+    async fn enter(&self) -> ScanLocalMovieNfoConcurrencyGuard {
+        let active = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.peak
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        let guard = ScanLocalMovieNfoConcurrencyGuard {
+            active: Arc::clone(&self.active),
+        };
+        tokio::task::yield_now().await;
+        guard
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScanLocalMovieNfoConcurrencyGuard {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn spawn_bounded_task<I, F, Fut, T>(
+    pending: &mut JoinSet<(usize, T)>,
+    task_indices: &mut HashMap<tokio::task::Id, usize>,
+    items: &mut impl Iterator<Item = (usize, I)>,
+    operation: &F,
+) -> bool
+where
+    I: Send + 'static,
+    F: Fn(I) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let Some((index, item)) = items.next() else {
+        return false;
+    };
+    let operation = operation.clone();
+    let task = pending.spawn(async move { (index, operation(item).await) });
+    task_indices.insert(task.id(), index);
+    true
+}
+
+async fn run_bounded_tasks_in_order<I, F, Fut, T>(
+    items: Vec<I>,
+    concurrency_limit: usize,
+    operation: F,
+) -> Vec<Result<T, tokio::task::JoinError>>
+where
+    I: Send + 'static,
+    F: Fn(I) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let concurrency_limit = concurrency_limit.max(1);
+    let item_count = items.len();
+    let mut pending = JoinSet::new();
+    let mut task_indices = HashMap::with_capacity(items.len());
+    let mut item_iter = items.into_iter().enumerate();
+    let mut results = (0..item_count)
+        .map(|_| None)
+        .collect::<Vec<Option<Result<T, tokio::task::JoinError>>>>();
+
+    for _ in 0..concurrency_limit {
+        if !spawn_bounded_task(&mut pending, &mut task_indices, &mut item_iter, &operation) {
+            break;
+        }
+    }
+    while let Some(result) = pending.join_next_with_id().await {
+        match result {
+            Ok((task_id, (index, value))) => {
+                task_indices.remove(&task_id);
+                results[index] = Some(Ok(value));
+            }
+            Err(error) => {
+                let task_id = error.id();
+                if let Some(index) = task_indices.remove(&task_id) {
+                    results[index] = Some(Err(error));
+                }
+            }
+        }
+        spawn_bounded_task(&mut pending, &mut task_indices, &mut item_iter, &operation);
+    }
+    results.into_iter().flatten().collect()
+}
+
+fn merged_provider_ids_json(
+    current_json: Option<&str>,
+    incoming: &BTreeMap<String, String>,
+) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+    let mut merged = current_json
+        .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+        .unwrap_or_default();
+    let mut changed = false;
+    for (provider, provider_id) in incoming {
+        let provider = provider.trim();
+        let provider_id = provider_id.trim();
+        if provider.is_empty()
+            || provider_id.is_empty()
+            || merged
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(provider))
+        {
+            continue;
+        }
+        merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+        changed = true;
+    }
+    changed.then(|| serde_json::to_string(&merged).unwrap_or_default())
+}
 
 fn local_image_read_permits() -> Arc<Semaphore> {
     LOCAL_IMAGE_READ_PERMITS
@@ -572,6 +784,9 @@ pub struct MetadataEnricher {
     database: Database,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
+    resources: ResourceMetrics,
+    #[cfg(test)]
+    scan_local_movie_nfo_concurrency_probe: Option<ScanLocalMovieNfoConcurrencyProbe>,
 }
 
 #[derive(Default)]
@@ -610,18 +825,18 @@ impl SeriesEnrichmentMode {
     }
 }
 
-fn local_metadata_source_path(source: StoredScanLocalMetadataSource) -> StoredMediaSourcePath {
+fn local_metadata_source_path(source: &StoredScanLocalMetadataSource) -> StoredMediaSourcePath {
     StoredMediaSourcePath {
-        source_id: source.source_id,
-        item_id: source.item_id,
-        probe_status: source.probe_status,
-        root_path: source.root_path,
-        relative_path: source.relative_path,
+        source_id: source.source_id.clone(),
+        item_id: source.item_id.clone(),
+        probe_status: source.probe_status.clone(),
+        root_path: source.root_path.clone(),
+        relative_path: source.relative_path.clone(),
     }
 }
 
 fn split_scan_local_metadata_sources(
-    sources: Vec<StoredScanLocalMetadataSource>,
+    sources: &[StoredScanLocalMetadataSource],
 ) -> (
     Vec<StoredMediaSourcePath>,
     Vec<StoredMediaSourcePath>,
@@ -641,10 +856,10 @@ fn split_scan_local_metadata_sources(
                     episodes.push(StoredSeriesMetadataSource {
                         series_id: series_id.clone(),
                         season_id: season_id.clone(),
-                        episode_id: source.item_id,
+                        episode_id: source.item_id.clone(),
                         season_number: source.season_number,
-                        root_path: source.root_path,
-                        relative_path: source.relative_path,
+                        root_path: source.root_path.clone(),
+                        relative_path: source.relative_path.clone(),
                     });
                 }
             }
@@ -661,13 +876,428 @@ fn split_scan_local_metadata_sources(
     (movies, home_videos, episodes)
 }
 
+#[derive(Default)]
+struct ScanLocalMetadataNfoSnapshot {
+    nfo_paths_by_item: HashMap<String, PathBuf>,
+    nfo_errors_by_item: HashMap<String, MetadataError>,
+    metadata_by_item: HashMap<String, StoredMediaMetadata>,
+    deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
+    #[cfg(test)]
+    nfo_candidate_probe_count: usize,
+    #[cfg(test)]
+    nfo_candidate_max_concurrency: usize,
+}
+
+#[derive(Clone, Default)]
+struct DeferredLocalNfoMetadataUpdates {
+    state: Arc<Mutex<DeferredLocalNfoMetadataState>>,
+    identity_update_guard: Arc<Mutex<()>>,
+    #[cfg(test)]
+    identity_conflict_gate: Option<Arc<ScanLocalMovieIdentityConflictGate>>,
+}
+
+#[derive(Default)]
+struct DeferredLocalNfoMetadataState {
+    pending: Vec<DeferredLocalNfoMetadataUpdate>,
+    pending_default_repairs: Vec<DeferredLocalNfoDefaultsRepair>,
+    failed_updates: Vec<DeferredLocalNfoMetadataFailure>,
+}
+
+#[derive(Clone)]
+struct DeferredLocalNfoMetadataUpdate {
+    item_id: String,
+    title: String,
+    original_title: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i64>,
+    premiere_date: Option<String>,
+    rating: Option<f64>,
+    rating_source: Option<String>,
+    provider_ids_json: Option<String>,
+    metadata_fingerprint: Vec<u8>,
+    provenance_json: String,
+    locked_fields_json: String,
+}
+
+#[derive(Clone)]
+struct DeferredLocalNfoDefaultsRepair {
+    item_id: String,
+    provider_ids: BTreeMap<String, String>,
+    premiere_date: Option<String>,
+}
+
+impl DeferredLocalNfoDefaultsRepair {
+    fn new(
+        item_id: &str,
+        provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
+    ) -> Self {
+        Self {
+            item_id: item_id.to_owned(),
+            provider_ids: provider_ids.clone(),
+            premiere_date: premiere_date.map(str::to_owned),
+        }
+    }
+
+    fn as_repair(&self) -> LocalNfoDefaultsRepair<'_> {
+        LocalNfoDefaultsRepair {
+            item_id: &self.item_id,
+            provider_ids: &self.provider_ids,
+            premiere_date: self.premiere_date.as_deref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeferredLocalNfoFailureStage {
+    Loaded,
+    Skipped,
+}
+
+struct DeferredLocalNfoMetadataFailure {
+    item_id: String,
+    error: String,
+    stage: DeferredLocalNfoFailureStage,
+}
+
+impl DeferredLocalNfoMetadataUpdate {
+    fn from_update(update: MediaMetadataUpdate<'_>) -> Self {
+        Self {
+            item_id: update.item_id.to_owned(),
+            title: update.title.to_owned(),
+            original_title: update.original_title.map(str::to_owned),
+            overview: update.overview.map(str::to_owned),
+            production_year: update.production_year,
+            premiere_date: update.premiere_date.map(str::to_owned),
+            rating: update.rating,
+            rating_source: update.rating_source.map(str::to_owned),
+            provider_ids_json: update.provider_ids_json.map(str::to_owned),
+            metadata_fingerprint: update.metadata_fingerprint.to_vec(),
+            provenance_json: update.provenance_json.to_owned(),
+            locked_fields_json: update.locked_fields_json.to_owned(),
+        }
+    }
+
+    fn as_update(&self) -> MediaMetadataUpdate<'_> {
+        MediaMetadataUpdate {
+            item_id: &self.item_id,
+            title: &self.title,
+            original_title: self.original_title.as_deref(),
+            overview: self.overview.as_deref(),
+            production_year: self.production_year,
+            premiere_date: self.premiere_date.as_deref(),
+            rating: self.rating,
+            rating_source: self.rating_source.as_deref(),
+            provider_ids_json: self.provider_ids_json.as_deref(),
+            metadata_fingerprint: &self.metadata_fingerprint,
+            provenance_json: &self.provenance_json,
+            locked_fields_json: &self.locked_fields_json,
+        }
+    }
+}
+
+impl DeferredLocalNfoMetadataUpdates {
+    async fn push(&self, update: MediaMetadataUpdate<'_>) {
+        self.state
+            .lock()
+            .await
+            .pending
+            .push(DeferredLocalNfoMetadataUpdate::from_update(update));
+        #[cfg(test)]
+        if let Some(gate) = self.identity_conflict_gate.as_ref() {
+            gate.metadata_updates_pushed.add_permits(1);
+        }
+    }
+
+    async fn pending_identity_item_ids(
+        &self,
+        item_id: &str,
+        sort_title: &str,
+        production_year: i64,
+    ) -> Vec<String> {
+        self.state
+            .lock()
+            .await
+            .pending
+            .iter()
+            .filter(|update| {
+                update.item_id != item_id
+                    && update.title.to_lowercase() == sort_title
+                    && update.production_year == Some(production_year)
+            })
+            .map(|update| update.item_id.clone())
+            .collect()
+    }
+
+    async fn take_pending(&self) -> Vec<DeferredLocalNfoMetadataUpdate> {
+        std::mem::take(&mut self.state.lock().await.pending)
+    }
+
+    async fn push_default_repair(
+        &self,
+        item_id: &str,
+        provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .pending_default_repairs
+            .push(DeferredLocalNfoDefaultsRepair::new(
+                item_id,
+                provider_ids,
+                premiere_date,
+            ));
+    }
+
+    async fn take_default_repairs(&self) -> Vec<DeferredLocalNfoDefaultsRepair> {
+        std::mem::take(&mut self.state.lock().await.pending_default_repairs)
+    }
+
+    async fn record_failure(
+        &self,
+        item_id: String,
+        error: String,
+        stage: DeferredLocalNfoFailureStage,
+    ) {
+        self.state
+            .lock()
+            .await
+            .failed_updates
+            .push(DeferredLocalNfoMetadataFailure {
+                item_id,
+                error,
+                stage,
+            });
+    }
+
+    async fn take_failures(&self) -> Vec<DeferredLocalNfoMetadataFailure> {
+        std::mem::take(&mut self.state.lock().await.failed_updates)
+    }
+}
+
+struct SeriesNfoRequest {
+    item_id: String,
+    nfo_path: PathBuf,
+    metadata: Option<StoredMediaMetadata>,
+    on_demand: bool,
+    deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
+}
+
+struct ScanLocalMovieNfoRequest {
+    item_id: String,
+    nfo_path: PathBuf,
+    metadata: Option<StoredMediaMetadata>,
+    deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
+}
+
+#[derive(Clone, Copy)]
+enum ScanNfoPathSourceKind {
+    Movie,
+    Video,
+    Episode,
+}
+
+struct ScanNfoPathDiscoveryRequest {
+    item_id: String,
+    media_path: PathBuf,
+    kind: ScanNfoPathSourceKind,
+    series_lookup: Option<(String, PathBuf)>,
+    season_lookup: Option<(String, PathBuf, PathBuf, i64)>,
+}
+
+struct ScanNfoPathDiscoveryResult {
+    item_id: String,
+    item_nfo_path: Option<PathBuf>,
+    item_error: Option<MetadataError>,
+    series_lookup: Option<(String, Option<PathBuf>)>,
+    season_lookup: Option<(String, Option<PathBuf>)>,
+}
+
+enum NfoMetadataLookup<'a> {
+    OnDemand,
+    Snapshot {
+        metadata_by_item: &'a mut HashMap<String, StoredMediaMetadata>,
+        deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
+    },
+    OwnedSnapshot {
+        metadata: Option<Box<StoredMediaMetadata>>,
+        deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
+    },
+}
+
+async fn scan_local_metadata_nfo_paths(
+    sources: &[StoredScanLocalMetadataSource],
+) -> ScanLocalMetadataNfoSnapshot {
+    let mut snapshot = ScanLocalMetadataNfoSnapshot::default();
+    let mut seen_series = HashSet::<&str>::new();
+    let mut seen_seasons = HashSet::<&str>::new();
+    let mut requests = Vec::with_capacity(sources.len());
+    for source in sources {
+        let root = Path::new(&source.root_path);
+        let media_path = root.join(&source.relative_path);
+        let kind = match source.item_type.as_str() {
+            "MOVIE" => ScanNfoPathSourceKind::Movie,
+            "VIDEO" => ScanNfoPathSourceKind::Video,
+            "EPISODE" => ScanNfoPathSourceKind::Episode,
+            _ => continue,
+        };
+        let mut series_lookup = None;
+        let mut season_lookup = None;
+        if matches!(kind, ScanNfoPathSourceKind::Episode)
+            && let Some(series_dir) = series_directory(root, &source.relative_path)
+        {
+            if let Some(series_id) = source.series_id.as_deref()
+                && seen_series.insert(series_id)
+            {
+                series_lookup = Some((series_id.to_owned(), series_dir.clone()));
+            }
+            if let (Some(season_id), Some(season_number)) =
+                (source.season_id.as_deref(), source.season_number)
+                && seen_seasons.insert(season_id)
+            {
+                let season_dir = media_path.parent().unwrap_or(&series_dir).to_owned();
+                season_lookup = Some((season_id.to_owned(), series_dir, season_dir, season_number));
+            }
+        }
+        requests.push(ScanNfoPathDiscoveryRequest {
+            item_id: source.item_id.clone(),
+            media_path,
+            kind,
+            series_lookup,
+            season_lookup,
+        });
+    }
+
+    let sidecar_existence = Arc::new(NfoSidecarExistenceCache::default());
+    let item_ids = requests
+        .iter()
+        .map(|request| request.item_id.clone())
+        .collect::<Vec<_>>();
+    let media_paths = requests
+        .iter()
+        .map(|request| request.media_path.clone())
+        .collect::<Vec<_>>();
+    let results = run_bounded_tasks_in_order(requests, LOCAL_NFO_PATH_DISCOVERY_CONCURRENCY, {
+        let sidecar_existence = Arc::clone(&sidecar_existence);
+        move |request| {
+            let sidecar_existence = Arc::clone(&sidecar_existence);
+            async move { discover_scan_nfo_paths(request, sidecar_existence.as_ref()).await }
+        }
+    })
+    .await;
+    for ((item_id, media_path), result) in item_ids.into_iter().zip(media_paths).zip(results) {
+        let discovery = match result {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                snapshot.nfo_errors_by_item.insert(
+                    item_id,
+                    MetadataError::Io {
+                        path: media_path,
+                        source: std::io::Error::other(format!(
+                            "local metadata NFO path discovery task failed: {error}"
+                        )),
+                    },
+                );
+                continue;
+            }
+        };
+        if let Some(path) = discovery.item_nfo_path {
+            snapshot
+                .nfo_paths_by_item
+                .insert(discovery.item_id.clone(), path);
+        }
+        if let Some(error) = discovery.item_error {
+            snapshot
+                .nfo_errors_by_item
+                .insert(discovery.item_id.clone(), error);
+        }
+        if let Some((series_id, Some(path))) = discovery.series_lookup {
+            snapshot.nfo_paths_by_item.insert(series_id, path);
+        }
+        if let Some((season_id, Some(path))) = discovery.season_lookup {
+            snapshot.nfo_paths_by_item.insert(season_id, path);
+        }
+    }
+    #[cfg(test)]
+    {
+        snapshot.nfo_candidate_probe_count = sidecar_existence
+            .probe_stats
+            .probe_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        snapshot.nfo_candidate_max_concurrency = sidecar_existence
+            .probe_stats
+            .max_concurrency
+            .load(std::sync::atomic::Ordering::SeqCst);
+    }
+    snapshot
+}
+
+async fn discover_scan_nfo_paths(
+    request: ScanNfoPathDiscoveryRequest,
+    sidecar_existence: &NfoSidecarExistenceCache,
+) -> ScanNfoPathDiscoveryResult {
+    let mut result = ScanNfoPathDiscoveryResult {
+        item_id: request.item_id,
+        item_nfo_path: None,
+        item_error: None,
+        series_lookup: None,
+        season_lookup: None,
+    };
+    match request.kind {
+        ScanNfoPathSourceKind::Movie => {
+            result.item_nfo_path = find_nfo_path(&request.media_path).await;
+        }
+        ScanNfoPathSourceKind::Video => {
+            let path = request.media_path.with_extension("nfo");
+            match fs::try_exists(&path).await {
+                Ok(true) => result.item_nfo_path = Some(path),
+                Ok(false) => {}
+                Err(source) => result.item_error = Some(MetadataError::Io { path, source }),
+            }
+        }
+        ScanNfoPathSourceKind::Episode => {
+            result.item_nfo_path =
+                find_episode_nfo_with_cache(&request.media_path, sidecar_existence).await;
+            if let Some((series_id, series_dir)) = request.series_lookup {
+                result.series_lookup = Some((
+                    series_id,
+                    find_tvshow_nfo_with_cache(&series_dir, sidecar_existence).await,
+                ));
+            }
+            if let Some((season_id, series_dir, season_dir, season_number)) = request.season_lookup
+            {
+                result.season_lookup = Some((
+                    season_id,
+                    find_season_nfo_with_cache(
+                        &series_dir,
+                        &season_dir,
+                        season_number,
+                        sidecar_existence,
+                    )
+                    .await,
+                ));
+            }
+        }
+    }
+    result
+}
+
 impl MetadataEnricher {
     pub fn new(database: Database) -> Self {
         Self {
             database,
             people: None,
             local_nfo: None,
+            resources: ResourceMetrics::new(),
+            #[cfg(test)]
+            scan_local_movie_nfo_concurrency_probe: None,
         }
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub fn with_people(mut self, people: PeopleService) -> Self {
@@ -712,6 +1342,8 @@ impl MetadataEnricher {
             &mut report,
             &mut series_context,
             SeriesEnrichmentMode::ImagesAndNfo,
+            None,
+            None,
         )
         .await?;
         Ok(report)
@@ -834,6 +1466,8 @@ impl MetadataEnricher {
                 &mut batch_report,
                 &mut series_context,
                 SeriesEnrichmentMode::ImagesAndNfo,
+                None,
+                None,
             )
             .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -892,12 +1526,12 @@ impl MetadataEnricher {
     pub(crate) async fn index_scan_local_metadata_batch_images(
         &self,
         filesystem_entry_ids: &[String],
-    ) -> Result<MetadataReport, MetadataError> {
+    ) -> Result<ScanLocalMetadataImageBatch, MetadataError> {
         let sources = self
             .database
             .list_scan_local_metadata_sources(filesystem_entry_ids)
             .await?;
-        let (movies, _, episodes) = split_scan_local_metadata_sources(sources);
+        let (movies, _, episodes) = split_scan_local_metadata_sources(&sources);
         let mut report = MetadataReport::default();
         let mut directory_cache = DirectoryPathCache::default();
         if let Some((first_movie, remaining_movies)) = movies.split_first() {
@@ -920,9 +1554,11 @@ impl MetadataEnricher {
             &mut report,
             &mut series_context,
             SeriesEnrichmentMode::ImagesOnly,
+            None,
+            None,
         )
         .await;
-        Ok(report)
+        Ok(ScanLocalMetadataImageBatch { report, sources })
     }
 
     async fn index_scan_local_movie_image_page(
@@ -951,43 +1587,312 @@ impl MetadataEnricher {
 
     pub(crate) async fn enrich_scan_local_metadata_batch_nfo(
         &self,
-        filesystem_entry_ids: &[String],
-    ) -> Result<MetadataReport, MetadataError> {
-        let sources = self
+        source_snapshot: Vec<StoredScanLocalMetadataSource>,
+        excluded_item_ids: &[String],
+    ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
+        let item_count = source_snapshot.len();
+        let started = Instant::now();
+        let result = self
+            .enrich_scan_local_metadata_batch_nfo_inner(source_snapshot, excluded_item_ids)
+            .await;
+        let complete = result
+            .as_ref()
+            .is_ok_and(|batch| batch.report.failed_item_ids.is_empty());
+        self.resources.record_metadata_batch(
+            "local_nfo_page",
+            item_count,
+            started.elapsed(),
+            complete,
+        );
+        result
+    }
+
+    async fn enrich_scan_local_metadata_batch_nfo_inner(
+        &self,
+        source_snapshot: Vec<StoredScanLocalMetadataSource>,
+        excluded_item_ids: &[String],
+    ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
+        let excluded_item_ids = excluded_item_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut sources = source_snapshot
+            .into_iter()
+            .filter(|source| !excluded_item_ids.contains(source.item_id.as_str()))
+            .collect::<Vec<_>>();
+        let requested_source_identities = sources
+            .iter()
+            .map(|source| (source.item_id.clone(), source.source_id.clone()))
+            .collect::<Vec<_>>();
+        let current_item_ids = self
             .database
-            .list_scan_local_metadata_sources(filesystem_entry_ids)
+            .list_current_scan_local_metadata_item_ids(&requested_source_identities)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        sources.retain(|source| current_item_ids.contains(&source.item_id));
+        let mut nfo_snapshot = scan_local_metadata_nfo_paths(&sources).await;
+        #[cfg(test)]
+        if let Some(gate) = self
+            .scan_local_movie_nfo_concurrency_probe
+            .as_ref()
+            .and_then(|probe| probe.identity_conflict_gate.as_ref())
+        {
+            nfo_snapshot
+                .deferred_metadata_updates
+                .identity_conflict_gate = Some(Arc::clone(gate));
+        }
+        let mut metadata_item_ids = nfo_snapshot
+            .nfo_paths_by_item
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        metadata_item_ids.sort_unstable();
+        nfo_snapshot.metadata_by_item = self
+            .database
+            .list_media_item_metadata_by_ids(&metadata_item_ids)
             .await?;
-        let (movies, home_videos, episodes) = split_scan_local_metadata_sources(sources);
+        let source_identities = sources
+            .iter()
+            .map(|source| (source.item_id.clone(), source.source_id.clone()))
+            .collect();
+        let (movies, home_videos, episodes) = split_scan_local_metadata_sources(&sources);
         let mut report = MetadataReport::default();
+        let deferred_actor_credits = self
+            .people
+            .as_ref()
+            .map(|_| DeferredNfoActorCredits::default());
+        let mut movie_nfo_requests = Vec::with_capacity(movies.len());
         for source in movies {
             report.items_processed += 1;
-            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                Ok(nfo_report) => {
-                    let failed = nfo_report.nfo_failed > 0;
-                    report.merge(nfo_report);
-                    if failed {
-                        report.mark_item_failed(&source.item_id);
+            if let Some(nfo_path) = nfo_snapshot.nfo_paths_by_item.remove(&source.item_id) {
+                movie_nfo_requests.push(ScanLocalMovieNfoRequest {
+                    item_id: source.item_id.clone(),
+                    nfo_path,
+                    metadata: nfo_snapshot.metadata_by_item.remove(&source.item_id),
+                    deferred_metadata_updates: nfo_snapshot.deferred_metadata_updates.clone(),
+                });
+            }
+        }
+        let movie_nfo_item_ids = movie_nfo_requests
+            .iter()
+            .map(|request| request.item_id.clone())
+            .collect::<Vec<_>>();
+        let movie_nfo_results =
+            run_bounded_tasks_in_order(movie_nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
+                let enricher = self.clone();
+                let deferred_actor_credits = deferred_actor_credits.clone();
+                move |request| {
+                    let enricher = enricher.clone();
+                    let deferred_actor_credits = deferred_actor_credits.clone();
+                    async move {
+                        #[cfg(test)]
+                        let _concurrency_guard =
+                            match &enricher.scan_local_movie_nfo_concurrency_probe {
+                                Some(probe) => Some(probe.enter().await),
+                                None => None,
+                            };
+                        let mut item_report = MetadataReport::default();
+                        enricher
+                            .enrich_nfo_item_best_effort_with_metadata(
+                                &mut item_report,
+                                &request.item_id,
+                                &request.nfo_path,
+                                NfoMetadataLookup::OwnedSnapshot {
+                                    metadata: request.metadata.map(Box::new),
+                                    deferred_metadata_updates: request.deferred_metadata_updates,
+                                },
+                                deferred_actor_credits,
+                            )
+                            .await;
+                        item_report
                     }
                 }
+            })
+            .await;
+        for (result, item_id) in movie_nfo_results.into_iter().zip(movie_nfo_item_ids) {
+            match result {
+                Ok(item_report) => report.merge(item_report),
                 Err(error) => {
-                    tracing::warn!(item_id = %source.item_id, %error, "local movie NFO failed");
+                    tracing::error!(
+                        item_id = %item_id,
+                        %error,
+                        "local movie NFO task failed unexpectedly; continuing with remaining items"
+                    );
                     report.nfo_failed += 1;
-                    report.mark_item_failed(&source.item_id);
+                    report.mark_item_failed(&item_id);
                 }
             }
         }
-        self.enrich_home_video_sources(home_videos, &mut report)
-            .await;
+        self.enrich_home_video_sources_with_snapshot(
+            home_videos,
+            &mut report,
+            &mut nfo_snapshot,
+            deferred_actor_credits.clone(),
+        )
+        .await;
         let mut series_context = SeriesEnrichmentContext::tracking_hierarchy();
         self.enrich_series_scan_job_sources(
             episodes,
             &mut report,
             &mut series_context,
             SeriesEnrichmentMode::NfoOnly,
+            Some(&mut nfo_snapshot),
+            deferred_actor_credits.clone(),
         )
         .await;
-        Ok(report)
+        let deferred_metadata_updates = &nfo_snapshot.deferred_metadata_updates;
+        self.flush_deferred_local_nfo_metadata_updates(deferred_metadata_updates)
+            .await;
+        for failure in deferred_metadata_updates.take_failures().await {
+            tracing::warn!(
+                item_id = %failure.item_id,
+                error = %failure.error,
+                "local NFO metadata update failed"
+            );
+            match failure.stage {
+                DeferredLocalNfoFailureStage::Loaded => {
+                    report.nfo_loaded = report.nfo_loaded.saturating_sub(1);
+                }
+                DeferredLocalNfoFailureStage::Skipped => {
+                    report.nfo_skipped = report.nfo_skipped.saturating_sub(1);
+                }
+            }
+            report.nfo_failed += 1;
+            report.mark_item_failed(&failure.item_id);
+        }
+        if let (Some(people), Some(deferred_actor_credits)) =
+            (&self.people, deferred_actor_credits.as_ref())
+        {
+            for failure in people
+                .flush_deferred_nfo_actor_credits_with_metrics(
+                    deferred_actor_credits,
+                    &self.resources,
+                )
+                .await
+            {
+                tracing::warn!(
+                    item_ids = ?failure.item_ids,
+                    error = %failure.error,
+                    "local NFO actor credits batch could not be committed"
+                );
+                for item_id in failure.item_ids {
+                    report.mark_item_failed(&item_id);
+                }
+            }
+        }
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        })
+    }
+
+    async fn flush_deferred_local_nfo_metadata_updates(
+        &self,
+        deferred_updates: &DeferredLocalNfoMetadataUpdates,
+    ) {
+        let updates = deferred_updates.take_pending().await;
+        let repairs = deferred_updates.take_default_repairs().await;
+        let mut update_offset = 0;
+        let mut repair_offset = 0;
+        while update_offset < updates.len() || repair_offset < repairs.len() {
+            let update_end =
+                (update_offset + LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE).min(updates.len());
+            let update_count = update_end - update_offset;
+            let repair_end = (repair_offset + LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE - update_count)
+                .min(repairs.len());
+            let update_chunk = &updates[update_offset..update_end];
+            let repair_chunk = &repairs[repair_offset..repair_end];
+            let batch_updates = update_chunk
+                .iter()
+                .map(DeferredLocalNfoMetadataUpdate::as_update)
+                .collect::<Vec<_>>();
+            let batch_repairs = repair_chunk
+                .iter()
+                .map(DeferredLocalNfoDefaultsRepair::as_repair)
+                .collect::<Vec<_>>();
+            let transaction_started = std::time::Instant::now();
+            let result = self
+                .database
+                .commit_local_nfo_state_batch(&batch_updates, &batch_repairs)
+                .await;
+            self.resources.record_local_nfo_state_transaction(
+                update_chunk.len(),
+                repair_chunk.len(),
+                transaction_started.elapsed(),
+                result.is_ok(),
+            );
+            drop(batch_updates);
+            drop(batch_repairs);
+            if let Err(batch_error) = result {
+                tracing::warn!(
+                    item_count = update_chunk.len() + repair_chunk.len(),
+                    %batch_error,
+                    "local NFO metadata page transaction failed; retrying items individually"
+                );
+                for update in update_chunk {
+                    let transaction_started = std::time::Instant::now();
+                    let result = self
+                        .database
+                        .update_media_item_metadata(update.as_update())
+                        .await;
+                    self.resources.record_local_nfo_state_transaction(
+                        1,
+                        0,
+                        transaction_started.elapsed(),
+                        result.is_ok(),
+                    );
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            item_id = %update.item_id,
+                            %error,
+                            "local NFO metadata update failed"
+                        );
+                        deferred_updates
+                            .record_failure(
+                                update.item_id.clone(),
+                                error.to_string(),
+                                DeferredLocalNfoFailureStage::Loaded,
+                            )
+                            .await;
+                    }
+                }
+                for repair in repair_chunk {
+                    let repair_update = repair.as_repair();
+                    let transaction_started = std::time::Instant::now();
+                    let result = self
+                        .database
+                        .repair_local_nfo_defaults(
+                            repair_update.item_id,
+                            repair_update.provider_ids,
+                            repair_update.premiere_date,
+                        )
+                        .await;
+                    self.resources.record_local_nfo_state_transaction(
+                        0,
+                        1,
+                        transaction_started.elapsed(),
+                        result.is_ok(),
+                    );
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            item_id = %repair.item_id,
+                            %error,
+                            "local NFO default repair failed"
+                        );
+                        deferred_updates
+                            .record_failure(
+                                repair.item_id.clone(),
+                                error.to_string(),
+                                DeferredLocalNfoFailureStage::Skipped,
+                            )
+                            .await;
+                    }
+                }
+            }
+            update_offset = update_end;
+            repair_offset = repair_end;
+        }
     }
 
     async fn enrich_scan_job_batch(
@@ -996,133 +1901,141 @@ impl MetadataEnricher {
         limit: usize,
     ) -> Result<MetadataReport, MetadataError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let page = self
+            .database
+            .load_scan_job_metadata_page(scan_job_id, limit)
+            .await?;
+        self.enrich_scan_job_metadata_page(scan_job_id, page).await
+    }
+
+    pub(crate) async fn enrich_scan_job_metadata_page(
+        &self,
+        scan_job_id: &str,
+        page: StoredScanJobMetadataPage,
+    ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
-        let movie_sources = self
-            .database
-            .list_scan_job_target_movie_items_page(scan_job_id, limit, 0)
-            .await?;
-        if !movie_sources.is_empty() {
-            let item_ids = movie_sources
-                .iter()
-                .map(|source| source.item_id.clone())
-                .collect::<Vec<_>>();
-            let mut batch_report = MetadataReport::default();
-            self.enrich_movie_sources(movie_sources, &mut batch_report)
+        match page.sources {
+            StoredScanJobMetadataSources::None => Ok(report),
+            StoredScanJobMetadataSources::Movies(movie_sources) => {
+                let item_ids = movie_sources
+                    .iter()
+                    .map(|source| source.item_id.clone())
+                    .collect::<Vec<_>>();
+                let mut batch_report = MetadataReport::default();
+                self.enrich_movie_sources(movie_sources, &mut batch_report)
+                    .await;
+                let failed_item_ids = batch_report.failed_item_ids.clone();
+                report.merge(batch_report);
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &failed_item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                let completed_item_ids = item_ids
+                    .into_iter()
+                    .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &completed_item_ids,
+                        "METADATA",
+                        "DONE",
+                    )
+                    .await?;
+                report
+                    .locally_enriched_item_ids
+                    .extend(completed_item_ids.iter().cloned());
+                Ok(report)
+            }
+            StoredScanJobMetadataSources::HomeVideos(home_video_sources) => {
+                let item_ids = home_video_sources
+                    .iter()
+                    .map(|source| source.item_id.clone())
+                    .collect::<Vec<_>>();
+                let mut batch_report = MetadataReport::default();
+                self.enrich_home_video_sources(home_video_sources, &mut batch_report)
+                    .await;
+                let failed_item_ids = batch_report.failed_item_ids.clone();
+                report.merge(batch_report);
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &failed_item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                let completed_item_ids = item_ids
+                    .into_iter()
+                    .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &completed_item_ids,
+                        "METADATA",
+                        "DONE",
+                    )
+                    .await?;
+                report
+                    .locally_enriched_item_ids
+                    .extend(completed_item_ids.iter().cloned());
+                Ok(report)
+            }
+            StoredScanJobMetadataSources::Episodes(series_sources) => {
+                let item_ids = series_sources
+                    .iter()
+                    .map(|source| source.episode_id.clone())
+                    .collect::<Vec<_>>();
+                let mut batch_report = MetadataReport::default();
+                let mut series_context = SeriesEnrichmentContext::default();
+                self.enrich_series_scan_job_sources(
+                    series_sources,
+                    &mut batch_report,
+                    &mut series_context,
+                    SeriesEnrichmentMode::ImagesAndNfo,
+                    None,
+                    None,
+                )
                 .await;
-            let failed_item_ids = batch_report.failed_item_ids.clone();
-            report.merge(batch_report);
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &failed_item_ids,
-                    "METADATA",
-                    "FAILED",
-                )
-                .await?;
-            let completed_item_ids = item_ids
-                .into_iter()
-                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-                .collect::<Vec<_>>();
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &completed_item_ids,
-                    "METADATA",
-                    "DONE",
-                )
-                .await?;
-            report
-                .locally_enriched_item_ids
-                .extend(completed_item_ids.iter().cloned());
-            return Ok(report);
+                let failed_item_ids = batch_report.failed_item_ids.clone();
+                report.merge(batch_report);
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &failed_item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                let completed_item_ids = item_ids
+                    .into_iter()
+                    .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &completed_item_ids,
+                        "METADATA",
+                        "DONE",
+                    )
+                    .await?;
+                report
+                    .locally_enriched_item_ids
+                    .extend(completed_item_ids.iter().cloned());
+                Ok(report)
+            }
         }
-
-        let home_video_sources = self
-            .database
-            .list_scan_job_target_home_video_items_page(scan_job_id, limit, 0)
-            .await?;
-        if !home_video_sources.is_empty() {
-            let item_ids = home_video_sources
-                .iter()
-                .map(|source| source.item_id.clone())
-                .collect::<Vec<_>>();
-            let mut batch_report = MetadataReport::default();
-            self.enrich_home_video_sources(home_video_sources, &mut batch_report)
-                .await;
-            let failed_item_ids = batch_report.failed_item_ids.clone();
-            report.merge(batch_report);
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &failed_item_ids,
-                    "METADATA",
-                    "FAILED",
-                )
-                .await?;
-            let completed_item_ids = item_ids
-                .into_iter()
-                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-                .collect::<Vec<_>>();
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &completed_item_ids,
-                    "METADATA",
-                    "DONE",
-                )
-                .await?;
-            report
-                .locally_enriched_item_ids
-                .extend(completed_item_ids.iter().cloned());
-            return Ok(report);
-        }
-
-        let series_sources = self
-            .database
-            .list_scan_job_target_series_items_page(scan_job_id, limit, 0)
-            .await?;
-        if series_sources.is_empty() {
-            return Ok(report);
-        }
-        let item_ids = series_sources
-            .iter()
-            .map(|source| source.episode_id.clone())
-            .collect::<Vec<_>>();
-        let mut batch_report = MetadataReport::default();
-        let mut series_context = SeriesEnrichmentContext::default();
-        self.enrich_series_scan_job_sources(
-            series_sources,
-            &mut batch_report,
-            &mut series_context,
-            SeriesEnrichmentMode::ImagesAndNfo,
-        )
-        .await;
-        let failed_item_ids = batch_report.failed_item_ids.clone();
-        report.merge(batch_report);
-        self.database
-            .mark_scan_job_target_stage(scan_job_id, "ITEM", &failed_item_ids, "METADATA", "FAILED")
-            .await?;
-        let completed_item_ids = item_ids
-            .into_iter()
-            .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-            .collect::<Vec<_>>();
-        self.database
-            .mark_scan_job_target_stage(
-                scan_job_id,
-                "ITEM",
-                &completed_item_ids,
-                "METADATA",
-                "DONE",
-            )
-            .await?;
-        report
-            .locally_enriched_item_ids
-            .extend(completed_item_ids.iter().cloned());
-        Ok(report)
     }
 
     async fn enrich_series_scan_job_sources(
@@ -1131,26 +2044,21 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
+        nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) {
-        for source in sources {
-            // Keep the directory/image fast path shared across the batch, but
-            // invoke the fallible series operation one target at a time. A
-            // directory or image error must not turn unrelated episodes into
-            // FAILED targets.
-            let item_id = source.episode_id.clone();
-            let mut item_report = MetadataReport::default();
-            let result = self
-                .enrich_series_sources(vec![source], &mut item_report, context, mode)
-                .await;
-            if let Err(error) = result {
-                tracing::warn!(
-                    item_id = %item_id,
-                    %error,
-                    "local series metadata failed; continuing with remaining targets"
-                );
-                item_report.mark_item_failed(&item_id);
-            }
-            report.merge(item_report);
+        if let Err(error) = self
+            .enrich_series_sources(
+                sources,
+                report,
+                context,
+                mode,
+                nfo_snapshot,
+                deferred_actor_credits,
+            )
+            .await
+        {
+            tracing::warn!(%error, "local series metadata batch failed");
         }
     }
 
@@ -1186,40 +2094,98 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
     ) {
         let mut directory_cache = DirectoryPathCache::default();
-        for source in sources {
-            report.items_processed += 1;
-            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                Ok(nfo_report) => {
-                    let failed = nfo_report.nfo_failed > 0;
-                    report.merge(nfo_report);
-                    if failed {
+        for source_page in sources.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
+            report.items_processed += source_page.len();
+            let nfo_requests = source_page
+                .iter()
+                .map(|source| {
+                    (
+                        source.item_id.clone(),
+                        PathBuf::from(&source.root_path).join(&source.relative_path),
+                    )
+                })
+                .collect();
+            let nfo_results =
+                run_bounded_tasks_in_order(nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
+                    let enricher = self.clone();
+                    move |(item_id, media_path)| {
+                        let enricher = enricher.clone();
+                        async move { enricher.enrich_movie_nfo(&item_id, &media_path).await }
+                    }
+                })
+                .await;
+            for (source, result) in source_page.iter().zip(nfo_results) {
+                match result {
+                    Ok(Ok(nfo_report)) => {
+                        let failed = nfo_report.nfo_failed > 0;
+                        report.merge(nfo_report);
+                        if failed {
+                            report.mark_item_failed(&source.item_id);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            item_id = %source.item_id,
+                            %error,
+                            "local movie NFO failed; continuing with images and remaining items"
+                        );
+                        report.nfo_failed += 1;
+                        report.mark_item_error(&source.item_id, &error);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            item_id = %source.item_id,
+                            %error,
+                            "local movie NFO task failed unexpectedly"
+                        );
+                        report.nfo_failed += 1;
                         report.mark_item_failed(&source.item_id);
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        item_id = %source.item_id,
-                        %error,
-                        "local movie NFO failed; continuing with images and remaining items"
-                    );
-                    report.nfo_failed += 1;
-                    report.mark_item_failed(&source.item_id);
+            }
+
+            let mut image_items = Vec::with_capacity(source_page.len());
+            for source in source_page {
+                if let Some(item) =
+                    prepare_scan_local_movie_image_batch_item(source, &mut directory_cache, report)
+                        .await
+                {
+                    image_items.push(item);
                 }
             }
 
+            if image_items.is_empty() {
+                continue;
+            }
             match self
-                .index_movie_images(&source.item_id, &media_path, &mut directory_cache)
+                .database
+                .insert_item_images_batch_at_indices(&image_items)
                 .await
             {
                 Ok(images_found) => report.images_found += images_found,
-                Err(error) => {
+                Err(batch_error) => {
                     tracing::warn!(
-                        item_id = %source.item_id,
-                        %error,
-                        "local movie image directory failed; continuing with remaining items"
+                        item_count = image_items.len(),
+                        %batch_error,
+                        "local movie image page failed; retrying items individually"
                     );
-                    report.mark_item_failed(&source.item_id);
+                    for item in &image_items {
+                        match self
+                            .database
+                            .insert_item_images_batch_at_indices(std::slice::from_ref(item))
+                            .await
+                        {
+                            Ok(images_found) => report.images_found += images_found,
+                            Err(error) => {
+                                tracing::warn!(
+                                    item_id = %item.item_id,
+                                    %error,
+                                    "local movie image registration failed"
+                                );
+                                report.mark_item_failed(&item.item_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1233,26 +2199,68 @@ impl MetadataEnricher {
         for source in sources {
             report.items_processed += 1;
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self
-                .enrich_home_video_nfo(&source.item_id, &media_path)
-                .await
-            {
-                Ok(nfo_report) => {
-                    let failed = nfo_report.nfo_failed > 0;
-                    report.merge(nfo_report);
-                    if failed {
-                        report.mark_item_failed(&source.item_id);
-                    }
+            let nfo_path = media_path.with_extension("nfo");
+            match fs::try_exists(&nfo_path).await {
+                Ok(true) => {
+                    self.enrich_nfo_item_best_effort_with_metadata(
+                        report,
+                        &source.item_id,
+                        &nfo_path,
+                        NfoMetadataLookup::OnDemand,
+                        None,
+                    )
+                    .await;
                 }
-                Err(error) => {
+                Ok(false) => {}
+                Err(io_error) => {
+                    let error = MetadataError::Io {
+                        path: nfo_path,
+                        source: io_error,
+                    };
                     tracing::warn!(
                         item_id = %source.item_id,
                         %error,
                         "local home video NFO failed; continuing with remaining items"
                     );
                     report.nfo_failed += 1;
-                    report.mark_item_failed(&source.item_id);
+                    report.mark_item_error(&source.item_id, &error);
                 }
+            }
+        }
+    }
+
+    async fn enrich_home_video_sources_with_snapshot(
+        &self,
+        sources: Vec<StoredMediaSourcePath>,
+        report: &mut MetadataReport,
+        snapshot: &mut ScanLocalMetadataNfoSnapshot,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
+    ) {
+        for source in sources {
+            report.items_processed += 1;
+            if let Some(error) = snapshot.nfo_errors_by_item.remove(&source.item_id) {
+                tracing::warn!(
+                    item_id = %source.item_id,
+                    %error,
+                    "local home video NFO could not be checked"
+                );
+                report.nfo_failed += 1;
+                report.mark_item_error(&source.item_id, &error);
+                continue;
+            }
+            if let Some(nfo_path) = snapshot.nfo_paths_by_item.remove(&source.item_id) {
+                let deferred_metadata_updates = Some(snapshot.deferred_metadata_updates.clone());
+                self.enrich_nfo_item_best_effort_with_metadata(
+                    report,
+                    &source.item_id,
+                    &nfo_path,
+                    NfoMetadataLookup::Snapshot {
+                        metadata_by_item: &mut snapshot.metadata_by_item,
+                        deferred_metadata_updates,
+                    },
+                    deferred_actor_credits.clone(),
+                )
+                .await;
             }
         }
     }
@@ -1275,83 +2283,6 @@ impl MetadataEnricher {
             return Ok(MetadataReport::default());
         };
         self.enrich_nfo_item(item_id, &nfo_path).await
-    }
-
-    async fn enrich_home_video_nfo(
-        &self,
-        item_id: &str,
-        media_path: &Path,
-    ) -> Result<MetadataReport, MetadataError> {
-        let nfo_path = media_path.with_extension("nfo");
-        let exists = fs::try_exists(&nfo_path)
-            .await
-            .map_err(|source| MetadataError::Io {
-                path: nfo_path.clone(),
-                source,
-            })?;
-        if !exists {
-            return Ok(MetadataReport::default());
-        }
-        self.enrich_nfo_item(item_id, &nfo_path).await
-    }
-
-    async fn index_movie_images(
-        &self,
-        item_id: &str,
-        media_path: &Path,
-        directory_cache: &mut DirectoryPathCache,
-    ) -> Result<usize, MetadataError> {
-        let image_paths = directory_cache
-            .get(media_path.parent().unwrap_or(Path::new(".")))
-            .await?;
-        let images =
-            if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
-                find_local_images_for_media(image_paths.iter(), media_stem)
-            } else {
-                find_local_images(image_paths.iter())
-            };
-        let has_primary_artwork = images
-            .iter()
-            .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
-        let prepared = prepare_local_images(images).await;
-        let mut image_indexes = BTreeMap::<&'static str, i64>::new();
-        let mut records = Vec::new();
-        for result in prepared {
-            let prepared = match result {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %error.path.display(),
-                        error = %error.error,
-                        "local movie image could not be read; skipping image"
-                    );
-                    continue;
-                }
-            };
-            let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
-            records.push(ItemImageInsert {
-                image_type: prepared.image.image_type.as_str().to_owned(),
-                image_index,
-                local_path: prepared.image.path.to_string_lossy().into_owned(),
-                file_size: prepared.file_size,
-                width: prepared.dimensions.map(|(width, _)| width),
-                height: prepared.dimensions.map(|(_, height)| height),
-                content_tag: prepared.content_tag,
-                source: "LOCAL".to_owned(),
-                source_url: None,
-            });
-        }
-        let inserted_count = self
-            .database
-            .insert_item_images_at_indices(item_id, &records)
-            .await?;
-        if has_primary_artwork {
-            self.database
-                .set_poster_fallback_required(item_id, false)
-                .await?;
-        }
-        Ok(inserted_count)
     }
 
     pub async fn enrich_series_library(
@@ -1377,6 +2308,8 @@ impl MetadataEnricher {
                 &mut report,
                 &mut series_context,
                 SeriesEnrichmentMode::ImagesAndNfo,
+                None,
+                None,
             )
             .await?;
             if last_page {
@@ -1393,9 +2326,14 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
+        mut nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) -> Result<(), MetadataError> {
         let process_images = mode.process_images();
         let process_nfo = mode.process_nfo();
+        let mut image_candidates = Vec::new();
+        let mut queued_image_items = HashSet::new();
+        let mut nfo_requests = Vec::new();
         for source in sources {
             report.items_processed += 1;
             let root = PathBuf::from(&source.root_path);
@@ -1404,7 +2342,18 @@ impl MetadataEnricher {
                 continue;
             };
             let series_paths = if process_images {
-                Some(context.directory_cache.get(&series_dir).await?)
+                match context.directory_cache.get(&series_dir).await {
+                    Ok(paths) => Some(paths),
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.episode_id,
+                            %error,
+                            "local series directory could not be read"
+                        );
+                        report.mark_item_error(&source.episode_id, &error);
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -1413,14 +2362,34 @@ impl MetadataEnricher {
                 .as_deref()
                 .is_none_or(|id| id != source.series_id.as_str());
             if new_series {
-                if process_nfo && let Some(nfo_path) = find_tvshow_nfo(&series_dir).await {
-                    self.enrich_nfo_item_best_effort(report, &source.series_id, &nfo_path)
-                        .await;
+                let nfo_path = if process_nfo {
+                    match nfo_snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.nfo_paths_by_item.remove(&source.series_id),
+                        None => find_tvshow_nfo(&series_dir).await,
+                    }
+                } else {
+                    None
+                };
+                if let Some(nfo_path) = nfo_path {
+                    let metadata = nfo_snapshot
+                        .as_deref_mut()
+                        .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.series_id));
+                    let deferred_metadata_updates = nfo_snapshot
+                        .as_deref()
+                        .map(|snapshot| snapshot.deferred_metadata_updates.clone());
+                    nfo_requests.push(SeriesNfoRequest {
+                        item_id: source.series_id.clone(),
+                        nfo_path,
+                        metadata,
+                        on_demand: nfo_snapshot.is_none(),
+                        deferred_metadata_updates,
+                    });
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
-                    report.images_found += self
-                        .index_images(&source.series_id, find_series_images(series_paths, None))
-                        .await?;
+                    let images = find_series_images(series_paths, None);
+                    if !images.is_empty() && queued_image_items.insert(source.series_id.clone()) {
+                        image_candidates.push((source.series_id.clone(), images));
+                    }
                 }
                 if let Some(last_series_id) = context.last_series_id.as_mut() {
                     *last_series_id = source.series_id.clone();
@@ -1444,7 +2413,18 @@ impl MetadataEnricher {
                 .map(|paths| paths.as_ref().clone())
                 .unwrap_or_default();
             if process_images && season_dir != series_dir {
-                let directory_paths = context.directory_cache.get(season_dir).await?;
+                let directory_paths = match context.directory_cache.get(season_dir).await {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.episode_id,
+                            %error,
+                            "local season directory could not be read"
+                        );
+                        report.mark_item_error(&source.episode_id, &error);
+                        continue;
+                    }
+                };
                 season_paths = season_paths
                     .iter()
                     .filter(|path| is_prefixed_season_image(path, season_number))
@@ -1453,20 +2433,34 @@ impl MetadataEnricher {
                 season_paths.extend(directory_paths.iter().cloned());
             }
             if new_season {
-                if process_nfo
-                    && let Some(nfo_path) =
-                        find_season_nfo(&series_dir, season_dir, season_number).await
-                {
-                    self.enrich_nfo_item_best_effort(report, &source.season_id, &nfo_path)
-                        .await;
+                let nfo_path = if process_nfo {
+                    match nfo_snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.nfo_paths_by_item.remove(&source.season_id),
+                        None => find_season_nfo(&series_dir, season_dir, season_number).await,
+                    }
+                } else {
+                    None
+                };
+                if let Some(nfo_path) = nfo_path {
+                    let metadata = nfo_snapshot
+                        .as_deref_mut()
+                        .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.season_id));
+                    let deferred_metadata_updates = nfo_snapshot
+                        .as_deref()
+                        .map(|snapshot| snapshot.deferred_metadata_updates.clone());
+                    nfo_requests.push(SeriesNfoRequest {
+                        item_id: source.season_id.clone(),
+                        nfo_path,
+                        metadata,
+                        on_demand: nfo_snapshot.is_none(),
+                        deferred_metadata_updates,
+                    });
                 }
                 if process_images {
-                    report.images_found += self
-                        .index_images(
-                            &source.season_id,
-                            find_series_images(&season_paths, Some(season_number)),
-                        )
-                        .await?;
+                    let images = find_series_images(&season_paths, Some(season_number));
+                    if !images.is_empty() && queued_image_items.insert(source.season_id.clone()) {
+                        image_candidates.push((source.season_id.clone(), images));
+                    }
                 }
                 if let Some(last_season_id) = context.last_season_id.as_mut() {
                     *last_season_id = source.season_id.clone();
@@ -1481,33 +2475,147 @@ impl MetadataEnricher {
                 .as_deref()
                 .is_none_or(|id| id != source.episode_id.as_str());
             if new_episode {
-                if process_nfo && let Some(nfo_path) = find_episode_nfo(&media_path).await {
-                    self.enrich_nfo_item_best_effort(report, &source.episode_id, &nfo_path)
-                        .await;
+                let nfo_path = if process_nfo {
+                    match nfo_snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.nfo_paths_by_item.remove(&source.episode_id),
+                        None => find_episode_nfo(&media_path).await,
+                    }
+                } else {
+                    None
+                };
+                if let Some(nfo_path) = nfo_path {
+                    let metadata = nfo_snapshot
+                        .as_deref_mut()
+                        .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.episode_id));
+                    let deferred_metadata_updates = nfo_snapshot
+                        .as_deref()
+                        .map(|snapshot| snapshot.deferred_metadata_updates.clone());
+                    nfo_requests.push(SeriesNfoRequest {
+                        item_id: source.episode_id.clone(),
+                        nfo_path,
+                        metadata,
+                        on_demand: nfo_snapshot.is_none(),
+                        deferred_metadata_updates,
+                    });
                 }
                 if process_images {
-                    report.images_found += self
-                        .index_images(
-                            &source.episode_id,
-                            find_episode_images(&season_paths, &media_path),
-                        )
-                        .await?;
+                    let images = find_episode_images(&season_paths, &media_path);
+                    if !images.is_empty() && queued_image_items.insert(source.episode_id.clone()) {
+                        image_candidates.push((source.episode_id.clone(), images));
+                    }
                 }
                 if let Some(last_episode_id) = context.last_episode_id.as_mut() {
                     *last_episode_id = source.episode_id.clone();
                 }
             }
         }
+        let nfo_item_ids = nfo_requests
+            .iter()
+            .map(|request| request.item_id.clone())
+            .collect::<Vec<_>>();
+        let nfo_results =
+            run_bounded_tasks_in_order(nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
+                let enricher = self.clone();
+                let deferred_actor_credits = deferred_actor_credits.clone();
+                move |request| {
+                    let enricher = enricher.clone();
+                    let deferred_actor_credits = deferred_actor_credits.clone();
+                    async move {
+                        let item_id = request.item_id.clone();
+                        let result = if request.on_demand {
+                            enricher
+                                .enrich_nfo_item_with_actor_credit_batch(
+                                    &request.item_id,
+                                    &request.nfo_path,
+                                    deferred_actor_credits,
+                                )
+                                .await
+                        } else {
+                            enricher
+                                .enrich_nfo_item_with_metadata(
+                                    &request.item_id,
+                                    &request.nfo_path,
+                                    request.metadata,
+                                    deferred_actor_credits,
+                                    request.deferred_metadata_updates,
+                                )
+                                .await
+                        };
+                        (item_id, result)
+                    }
+                }
+            })
+            .await;
+        for (result, item_id) in nfo_results.into_iter().zip(nfo_item_ids) {
+            match result {
+                Ok((_, Ok(nfo_report))) => {
+                    let failed = nfo_report.nfo_failed > 0;
+                    report.merge(nfo_report);
+                    if failed {
+                        report.mark_item_failed(&item_id);
+                    }
+                }
+                Ok((_, Err(error))) => {
+                    tracing::warn!(item_id = %item_id, %error, "local series NFO failed");
+                    report.nfo_failed += 1;
+                    report.mark_item_error(&item_id, &error);
+                }
+                Err(error) => {
+                    tracing::error!(item_id = %item_id, %error, "local series NFO task failed unexpectedly");
+                    report.nfo_failed += 1;
+                    report.mark_item_failed(&item_id);
+                }
+            }
+        }
+        self.index_images_batch(image_candidates, report).await;
         Ok(())
     }
 
-    async fn enrich_nfo_item_best_effort(
+    async fn enrich_nfo_item_best_effort_with_metadata(
         &self,
         report: &mut MetadataReport,
         item_id: &str,
         nfo_path: &Path,
+        metadata: NfoMetadataLookup<'_>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) {
-        match self.enrich_nfo_item(item_id, nfo_path).await {
+        let enriched = match metadata {
+            NfoMetadataLookup::OnDemand => {
+                self.enrich_nfo_item_with_actor_credit_batch(
+                    item_id,
+                    nfo_path,
+                    deferred_actor_credits,
+                )
+                .await
+            }
+            NfoMetadataLookup::Snapshot {
+                metadata_by_item,
+                deferred_metadata_updates,
+            } => {
+                self.enrich_nfo_item_with_metadata(
+                    item_id,
+                    nfo_path,
+                    metadata_by_item.remove(item_id),
+                    deferred_actor_credits,
+                    deferred_metadata_updates,
+                )
+                .await
+            }
+            NfoMetadataLookup::OwnedSnapshot {
+                metadata,
+                deferred_metadata_updates,
+            } => {
+                self.enrich_nfo_item_with_metadata(
+                    item_id,
+                    nfo_path,
+                    metadata.map(|metadata| *metadata),
+                    deferred_actor_credits,
+                    Some(deferred_metadata_updates),
+                )
+                .await
+            }
+        };
+        match enriched {
             Ok(nfo_report) => {
                 let failed = nfo_report.nfo_failed > 0;
                 report.merge(nfo_report);
@@ -1516,14 +2624,26 @@ impl MetadataEnricher {
                 }
             }
             Err(error) => {
-                tracing::warn!(
-                    item_id,
-                    path = %nfo_path.display(),
-                    %error,
-                    "local NFO enrichment failed; continuing with remaining metadata"
-                );
+                if let MetadataError::ConflictingMovieIdentity {
+                    conflicting_item_id,
+                    ..
+                } = &error
+                {
+                    tracing::warn!(
+                        item_id,
+                        conflicting_item_id,
+                        %error,
+                        "local NFO enrichment failed; continuing with remaining metadata"
+                    );
+                } else {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local NFO enrichment failed; continuing with remaining metadata"
+                    );
+                }
                 report.nfo_failed += 1;
-                report.mark_item_failed(item_id);
+                report.mark_item_error(item_id, &error);
             }
         }
     }
@@ -1533,28 +2653,58 @@ impl MetadataEnricher {
         item_id: &str,
         nfo_path: &Path,
     ) -> Result<MetadataReport, MetadataError> {
+        self.enrich_nfo_item_with_actor_credit_batch(item_id, nfo_path, None)
+            .await
+    }
+
+    async fn enrich_nfo_item_with_actor_credit_batch(
+        &self,
+        item_id: &str,
+        nfo_path: &Path,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
+    ) -> Result<MetadataReport, MetadataError> {
+        let metadata = self.database.find_media_item_metadata(item_id).await?;
+        self.enrich_nfo_item_with_metadata(
+            item_id,
+            nfo_path,
+            metadata,
+            deferred_actor_credits,
+            None,
+        )
+        .await
+    }
+
+    async fn enrich_nfo_item_with_metadata(
+        &self,
+        item_id: &str,
+        nfo_path: &Path,
+        metadata: Option<StoredMediaMetadata>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
+        deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
+    ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
-        let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
-            self.database
-                .media_item_metadata_fingerprint(item_id)
-                .await?
-                .as_deref()
+        let already_checked = fingerprint.as_deref().is_some_and(|fingerprint| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.metadata_fingerprint.as_deref())
                 == Some(fingerprint)
-        } else {
-            false
-        };
+        });
         let cached_nfo = if let Some(local_nfo) = &self.local_nfo {
             local_nfo
-                .read_item_if_usable(item_id)
+                .read_item_if_usable_with_fingerprint(item_id)
                 .await
                 .map_err(MetadataError::NfoCache)?
         } else {
             None
         };
         let rich_cache_missing = self.local_nfo.is_some() && cached_nfo.is_none();
+        let semantic_cache_missing = self.local_nfo.is_some()
+            && cached_nfo
+                .as_ref()
+                .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_none());
         let actor_relation_missing = if let Some(people) = &self.people {
-            match people.nfo_relation_snapshot_exists(item_id).await {
+            match people.nfo_relation_snapshot_is_current(item_id).await {
                 Ok(exists) => !exists,
                 Err(error) => {
                     tracing::warn!(
@@ -1568,14 +2718,30 @@ impl MetadataEnricher {
         } else {
             false
         };
-        if already_checked && !rich_cache_missing && !actor_relation_missing {
-            if let Some(details) = cached_nfo {
-                self.database
-                    .merge_local_provider_ids(item_id, &details.provider_ids)
-                    .await?;
-                if let Some(premiere_date) = local_nfo_premiere_date(&details) {
+        if already_checked
+            && !rich_cache_missing
+            && !semantic_cache_missing
+            && !actor_relation_missing
+        {
+            if let (Some(metadata), Some((details, _, _, _))) =
+                (metadata.as_ref(), cached_nfo.as_ref())
+                && local_nfo_defaults_missing(metadata, details)
+            {
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
+                    deferred_updates
+                        .push_default_repair(
+                            item_id,
+                            &details.provider_ids,
+                            local_nfo_premiere_date(details),
+                        )
+                        .await;
+                } else {
                     self.database
-                        .update_media_item_premiere_date_if_missing(item_id, premiere_date)
+                        .repair_local_nfo_defaults(
+                            item_id,
+                            &details.provider_ids,
+                            local_nfo_premiere_date(details),
+                        )
                         .await?;
                 }
             }
@@ -1589,8 +2755,31 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        let projection = match parse_local_nfo_projection(&bytes) {
-            Ok(projection) => projection,
+        let source_fingerprint = nfo_content_fingerprint(&bytes);
+        if !actor_relation_missing
+            && let (Some(metadata), Some((details, cached_fingerprint, _, _))) =
+                (metadata.as_ref(), cached_nfo.as_ref())
+            && cached_fingerprint == &source_fingerprint
+            && cached_nfo
+                .as_ref()
+                .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_some())
+            && !local_nfo_defaults_missing(metadata, details)
+        {
+            if let Some(fingerprint) = fingerprint.as_deref() {
+                self.database
+                    .mark_media_item_metadata_checked(item_id, fingerprint)
+                    .await?;
+            }
+            report.nfo_skipped = 1;
+            return Ok(report);
+        }
+        let parsed_projection = if self.local_nfo.is_some() {
+            parse_local_nfo_projection_with_semantic_fingerprint(&bytes)
+        } else {
+            parse_local_nfo_projection(&bytes).map(|projection| (projection, Vec::new()))
+        };
+        let (projection, semantic_fingerprint) = match parsed_projection {
+            Ok(parsed) => parsed,
             Err(_) => {
                 if let Some(local_nfo) = &self.local_nfo {
                     local_nfo
@@ -1607,7 +2796,75 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        if let Some(current) = self.database.find_media_item_metadata(item_id).await? {
+        let semantically_unchanged = cached_nfo.as_ref().is_some_and(
+            |(_, cached_fingerprint, cached_semantic_fingerprint, _)| {
+                cached_semantic_fingerprint.as_deref() == Some(semantic_fingerprint.as_slice())
+                    && cached_fingerprint.len() == 32
+            },
+        );
+        let relation_current_for_cached_revision = if semantically_unchanged {
+            if let (Some(people), Some((_, cached_fingerprint, _, cached_relation_fingerprint))) =
+                (self.people.as_ref(), cached_nfo.as_ref())
+            {
+                let relation_fingerprint = cached_relation_fingerprint
+                    .as_deref()
+                    .unwrap_or(cached_fingerprint);
+                match people
+                    .item_actor_relation_is_current(item_id, relation_fingerprint)
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id,
+                            %error,
+                            "local actor relation could not be checked against cached NFO revision"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if semantically_unchanged
+            && relation_current_for_cached_revision
+            && !actor_relation_missing
+            && let Some(metadata) = metadata.as_ref()
+            && !local_nfo_defaults_missing(metadata, &projection.details)
+        {
+            if let (Some(local_nfo), Some((details, _, Some(_), relation_fingerprint))) =
+                (self.local_nfo.as_ref(), cached_nfo.as_ref())
+            {
+                let relation_fingerprint = relation_fingerprint
+                    .as_deref()
+                    .or_else(|| cached_nfo.as_ref().map(|(_, raw, _, _)| raw.as_slice()));
+                local_nfo
+                    .write_item_with_semantic_fingerprint(
+                        item_id,
+                        &source_fingerprint,
+                        Some(&semantic_fingerprint),
+                        relation_fingerprint,
+                        details,
+                    )
+                    .await
+                    .map_err(MetadataError::NfoCache)?;
+            }
+            if let Some(fingerprint) = fingerprint.as_deref() {
+                self.database
+                    .mark_media_item_metadata_checked(item_id, fingerprint)
+                    .await?;
+            }
+            report.nfo_skipped = 1;
+            return Ok(report);
+        }
+        let current = metadata;
+        let mut identity_update_guard = None;
+        #[cfg(test)]
+        let mut identity_conflict_gate = None;
+        if let Some(current) = current.as_ref() {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {
                     title: Some(current.title.clone()),
@@ -1627,44 +2884,101 @@ impl MetadataEnricher {
             let title_changed = state.metadata.title.as_deref() != Some(current.title.as_str());
             let year_changed =
                 state.metadata.production_year.map(i64::from) != current.production_year;
+            if title_changed || year_changed {
+                #[cfg(test)]
+                if let Some(gate) = self
+                    .scan_local_movie_nfo_concurrency_probe
+                    .as_ref()
+                    .and_then(|probe| probe.identity_conflict_gate.as_ref())
+                {
+                    gate.meet_contenders_before_guard().await;
+                    identity_conflict_gate = Some(Arc::clone(gate));
+                }
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
+                    identity_update_guard = Some(
+                        Arc::clone(&deferred_updates.identity_update_guard)
+                            .lock_owned()
+                            .await,
+                    );
+                }
+            }
             if (title_changed || year_changed)
                 && let Some(production_year) = state.metadata.production_year
-                && self
-                    .database
-                    .movie_metadata_identity_conflicts(
-                        item_id,
-                        &state
-                            .metadata
-                            .title
-                            .as_deref()
-                            .unwrap_or(&current.title)
-                            .to_lowercase(),
-                        i64::from(production_year),
-                    )
-                    .await?
             {
-                return Err(MetadataError::ConflictingMovieIdentity {
-                    item_id: item_id.to_owned(),
-                });
+                let title = state
+                    .metadata
+                    .title
+                    .as_deref()
+                    .unwrap_or(&current.title)
+                    .to_lowercase();
+                if let Some(conflicting_item_id) = self
+                    .database
+                    .movie_metadata_identity_conflict(item_id, &title, i64::from(production_year))
+                    .await?
+                {
+                    return Err(MetadataError::ConflictingMovieIdentity {
+                        item_id: item_id.to_owned(),
+                        conflicting_item_id,
+                    });
+                }
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
+                    let pending_identity_item_ids = deferred_updates
+                        .pending_identity_item_ids(item_id, &title, i64::from(production_year))
+                        .await;
+                    if !pending_identity_item_ids.is_empty()
+                        && let Some(conflicting_item_id) = self
+                            .database
+                            .movie_metadata_pending_identity_conflict(
+                                item_id,
+                                &pending_identity_item_ids,
+                            )
+                            .await?
+                    {
+                        return Err(MetadataError::ConflictingMovieIdentity {
+                            item_id: item_id.to_owned(),
+                            conflicting_item_id,
+                        });
+                    }
+                }
             }
         }
-        let source_fingerprint = nfo_content_fingerprint(&bytes);
+        #[cfg(test)]
+        if let Some(gate) = identity_conflict_gate {
+            gate.hold_first_successful_conflict_check(
+                deferred_metadata_updates
+                    .as_ref()
+                    .map(|deferred_updates| &deferred_updates.identity_update_guard),
+            )
+            .await;
+        }
         let local_rating = projection.details.rating;
         if let Some(local_nfo) = &self.local_nfo {
             let current = local_nfo
                 .is_current(item_id, &source_fingerprint)
                 .await
                 .map_err(MetadataError::NfoCache)?;
-            if !current {
+            let cache_has_semantic_fingerprint = cached_nfo
+                .as_ref()
+                .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_some());
+            if !current || !cache_has_semantic_fingerprint {
                 local_nfo
-                    .write_item(item_id, &source_fingerprint, &projection.details)
+                    .write_item_with_semantic_fingerprint(
+                        item_id,
+                        &source_fingerprint,
+                        Some(&semantic_fingerprint),
+                        Some(&source_fingerprint),
+                        &projection.details,
+                    )
                     .await
                     .map_err(MetadataError::NfoCache)?;
             }
         }
-        self.database
-            .merge_local_provider_ids(item_id, &projection.details.provider_ids)
-            .await?;
+        let provider_ids_json = merged_provider_ids_json(
+            current
+                .as_ref()
+                .and_then(|metadata| metadata.provider_ids_json.as_deref()),
+            &projection.details.provider_ids,
+        );
         if let Some(people) = &self.people {
             let relation_current = match people
                 .item_actor_relation_is_current(item_id, &source_fingerprint)
@@ -1681,15 +2995,28 @@ impl MetadataEnricher {
                 }
             };
             if !relation_current {
-                match people
-                    .persist_nfo_item_actors(
-                        item_id,
-                        "tmdb",
-                        &projection.actors,
-                        &source_fingerprint,
-                    )
-                    .await
-                {
+                let persist_result =
+                    if let Some(deferred_actor_credits) = deferred_actor_credits.as_ref() {
+                        people
+                            .persist_nfo_item_actors_deferred(
+                                item_id,
+                                "tmdb",
+                                &projection.actors,
+                                &source_fingerprint,
+                                deferred_actor_credits,
+                            )
+                            .await
+                    } else {
+                        people
+                            .persist_nfo_item_actors(
+                                item_id,
+                                "tmdb",
+                                &projection.actors,
+                                &source_fingerprint,
+                            )
+                            .await
+                    };
+                match persist_result {
                     Ok(actor_report) => {
                         if !actor_report.pending_assets.is_empty() {
                             tracing::warn!(
@@ -1705,8 +3032,11 @@ impl MetadataEnricher {
                 }
             }
         }
+        // Provider IDs, the local NFO cache, and actor relations are stored separately from
+        // the metadata columns above, so this enrichment pass can reuse its initial snapshot
+        // instead of issuing the same full metadata read a second time.
         if let Some(fingerprint) = fingerprint.as_deref()
-            && let Some(current) = self.database.find_media_item_metadata(item_id).await?
+            && let Some(current) = current.as_ref()
         {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {
@@ -1726,85 +3056,197 @@ impl MetadataEnricher {
             });
             let provenance_json = state.provenance_json();
             let locked_fields_json = state.locked_fields_json();
-            self.database
-                .update_media_item_metadata(MediaMetadataUpdate {
-                    item_id,
-                    title: state.metadata.title.as_deref().unwrap_or(&current.title),
-                    original_title: state.metadata.original_title.as_deref(),
-                    overview: state.metadata.overview.as_deref(),
-                    production_year: state.metadata.production_year.map(i64::from),
-                    premiere_date: local_nfo_premiere_date(&projection.details),
-                    rating: local_rating,
-                    rating_source: local_rating.map(|_| "NFO"),
-                    metadata_fingerprint: fingerprint,
-                    provenance_json: &provenance_json,
-                    locked_fields_json: &locked_fields_json,
-                })
-                .await?;
+            let update = MediaMetadataUpdate {
+                item_id,
+                title: state.metadata.title.as_deref().unwrap_or(&current.title),
+                original_title: state.metadata.original_title.as_deref(),
+                overview: state.metadata.overview.as_deref(),
+                production_year: state.metadata.production_year.map(i64::from),
+                premiere_date: local_nfo_premiere_date(&projection.details),
+                rating: local_rating,
+                rating_source: local_rating.map(|_| "NFO"),
+                provider_ids_json: provider_ids_json.as_deref(),
+                metadata_fingerprint: fingerprint,
+                provenance_json: &provenance_json,
+                locked_fields_json: &locked_fields_json,
+            };
+            if let Some(deferred_metadata_updates) = deferred_metadata_updates {
+                deferred_metadata_updates.push(update).await;
+                drop(identity_update_guard.take());
+            } else {
+                self.database.update_media_item_metadata(update).await?;
+                drop(identity_update_guard.take());
+            }
         }
         report.nfo_loaded = 1;
         Ok(report)
+    }
+
+    async fn index_images_batch(
+        &self,
+        candidates: Vec<(String, Vec<LocalImage>)>,
+        report: &mut MetadataReport,
+    ) {
+        for page in candidates.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
+            let item_ids = page
+                .iter()
+                .map(|(item_id, _)| item_id.clone())
+                .collect::<Vec<_>>();
+            let indexed_images = match self.database.list_item_images_by_ids(&item_ids).await {
+                Ok(images) => images,
+                Err(error) => {
+                    tracing::warn!(
+                        item_count = page.len(),
+                        %error,
+                        "local series image page could not read existing images; retrying items individually"
+                    );
+                    self.index_images_individually(page, report).await;
+                    continue;
+                }
+            };
+
+            let mut inserts = Vec::with_capacity(page.len());
+            for (item_id, images) in page {
+                let indexed = indexed_images
+                    .get(item_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                match prepare_local_image_batch_item(item_id, images.clone(), indexed).await {
+                    Ok(insert) => inserts.push(insert),
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id,
+                            path = %error.path.display(),
+                            error = %error.error,
+                            "local series image could not be read"
+                        );
+                        report.mark_item_failed(item_id);
+                    }
+                }
+            }
+
+            if inserts.is_empty() {
+                continue;
+            }
+            match self
+                .database
+                .insert_item_images_batch_at_indices(&inserts)
+                .await
+            {
+                Ok(images_found) => report.images_found += images_found,
+                Err(batch_error) => {
+                    tracing::warn!(
+                        item_count = page.len(),
+                        %batch_error,
+                        "local series image page failed; retrying items individually"
+                    );
+                    self.index_images_individually(page, report).await;
+                }
+            }
+        }
+    }
+
+    async fn index_images_individually(
+        &self,
+        candidates: &[(String, Vec<LocalImage>)],
+        report: &mut MetadataReport,
+    ) {
+        for (item_id, images) in candidates {
+            match self.index_images(item_id, images.clone(), report).await {
+                Ok(images_found) => report.images_found += images_found,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local series images could not be indexed"
+                    );
+                    report.mark_item_error(item_id, &error);
+                }
+            }
+        }
     }
 
     async fn index_images(
         &self,
         item_id: &str,
         images: Vec<LocalImage>,
+        report: &mut MetadataReport,
     ) -> Result<usize, MetadataError> {
         let indexed_images = self.database.list_item_images(item_id).await?;
-        let images = images
-            .into_iter()
-            .filter(|image| {
-                !(image.image_type == ImageType::Thumb
-                    && indexed_images.iter().any(|indexed| {
-                        indexed.image_type.eq_ignore_ascii_case("FANART")
-                            && Path::new(&indexed.local_path) == image.path
-                    }))
-            })
-            .collect::<Vec<_>>();
-        let has_primary_artwork = images
-            .iter()
-            .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
-        let prepared = prepare_local_images(images).await;
-        let mut image_indexes = BTreeMap::<&'static str, i64>::new();
-        let mut records = Vec::new();
-        for result in prepared {
-            let prepared = match result {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %error.path.display(),
-                        error = %error.error,
-                        "local series image could not be read; skipping image"
-                    );
-                    continue;
-                }
-            };
-            let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
-            records.push(ItemImageInsert {
-                image_type: prepared.image.image_type.as_str().to_owned(),
-                image_index,
-                local_path: prepared.image.path.to_string_lossy().into_owned(),
-                file_size: prepared.file_size,
-                width: prepared.dimensions.map(|(width, _)| width),
-                height: prepared.dimensions.map(|(_, height)| height),
-                content_tag: prepared.content_tag,
-                source: "LOCAL".to_owned(),
-                source_url: None,
-            });
-        }
-        let inserted_count = self
-            .database
-            .insert_item_images_at_indices(item_id, &records)
-            .await?;
-        if has_primary_artwork {
-            self.database
-                .set_poster_fallback_required(item_id, false)
-                .await?;
-        }
-        Ok(inserted_count)
+        let insert = match prepare_local_image_batch_item(item_id, images, &indexed_images).await {
+            Ok(insert) => insert,
+            Err(error) => {
+                report.mark_item_failed(item_id);
+                return Err(MetadataError::Io {
+                    path: error.path,
+                    source: error.error,
+                });
+            }
+        };
+        self.database
+            .insert_item_images_batch_at_indices(&[insert])
+            .await
+            .map_err(MetadataError::Storage)
     }
+}
+
+async fn prepare_local_image_batch_item(
+    item_id: &str,
+    images: Vec<LocalImage>,
+    indexed_images: &[StoredItemImage],
+) -> Result<ItemImageBatchInsert, LocalImageReadError> {
+    let images = images
+        .into_iter()
+        .filter(|image| {
+            !(image.image_type == ImageType::Thumb
+                && indexed_images.iter().any(|indexed| {
+                    indexed.image_type.eq_ignore_ascii_case("FANART")
+                        && Path::new(&indexed.local_path) == image.path
+                }))
+        })
+        .collect::<Vec<_>>();
+    let clear_poster_fallback = images
+        .iter()
+        .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+    let prepared = prepare_local_images(images).await;
+    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut records = Vec::new();
+    let mut first_error = None;
+    for result in prepared {
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    path = %error.path.display(),
+                    error = %error.error,
+                    "local series image could not be read; failing item"
+                );
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        records.push(ItemImageInsert {
+            image_type: prepared.image.image_type.as_str().to_owned(),
+            image_index,
+            local_path: prepared.image.path.to_string_lossy().into_owned(),
+            file_size: prepared.file_size,
+            width: prepared.dimensions.map(|(width, _)| width),
+            height: prepared.dimensions.map(|(_, height)| height),
+            content_tag: prepared.content_tag,
+            source: "LOCAL".to_owned(),
+            source_url: None,
+        });
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(ItemImageBatchInsert {
+        item_id: item_id.to_owned(),
+        images: records,
+        clear_poster_fallback,
+    })
 }
 
 async fn prepare_scan_local_movie_image_batch_item(
@@ -1835,6 +3277,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     let prepared = prepare_local_images(images).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
+    let mut first_error = None;
     for result in prepared {
         let prepared = match result {
             Ok(prepared) => prepared,
@@ -1843,8 +3286,9 @@ async fn prepare_scan_local_movie_image_batch_item(
                     item_id = %source.item_id,
                     path = %error.path.display(),
                     error = %error.error,
-                    "local movie image could not be read; skipping image"
+                    "local movie image could not be read; failing item"
                 );
+                first_error.get_or_insert(error);
                 continue;
             }
         };
@@ -1860,6 +3304,11 @@ async fn prepare_scan_local_movie_image_batch_item(
             source: "LOCAL".to_owned(),
             source_url: None,
         });
+    }
+    if let Some(error) = first_error {
+        tracing::warn!(item_id = %source.item_id, %error.error, "local movie image batch item failed");
+        report.mark_item_failed(&source.item_id);
+        return None;
     }
     Some(ItemImageBatchInsert {
         item_id: source.item_id.clone(),
@@ -1977,6 +3426,25 @@ fn local_nfo_premiere_date(details: &crate::application::nfo::LocalNfoDetails) -
         .or(details.aired.as_deref())
 }
 
+fn local_nfo_defaults_missing(
+    metadata: &StoredMediaMetadata,
+    details: &crate::application::nfo::LocalNfoDetails,
+) -> bool {
+    let provider_id_missing =
+        merged_provider_ids_json(metadata.provider_ids_json.as_deref(), &details.provider_ids)
+            .is_some();
+    let premiere_date_missing = local_nfo_premiere_date(details)
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|_| {
+            metadata
+                .premiere_date
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        });
+
+    provider_id_missing || premiere_date_missing
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetadataReport {
     pub nfo_loaded: usize,
@@ -1986,6 +3454,19 @@ pub struct MetadataReport {
     pub items_processed: usize,
     pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
+    pub(crate) non_retryable_failed_item_ids: Vec<String>,
+}
+
+pub(crate) struct ScanLocalMetadataNfoBatch {
+    pub(crate) report: MetadataReport,
+    // Each pair is (item_id, preferred source_id) from the NFO stage's source snapshot.
+    pub(crate) source_identities: Vec<(String, String)>,
+}
+
+pub(crate) struct ScanLocalMetadataImageBatch {
+    pub(crate) report: MetadataReport,
+    // Reused by NFO processing after a lightweight preferred-source validation.
+    pub(crate) sources: Vec<StoredScanLocalMetadataSource>,
 }
 
 impl MetadataReport {
@@ -2000,6 +3481,9 @@ impl MetadataReport {
         for item_id in other.failed_item_ids {
             self.mark_item_failed(&item_id);
         }
+        for item_id in other.non_retryable_failed_item_ids {
+            self.mark_item_non_retryable_failed(&item_id);
+        }
     }
 
     fn mark_item_failed(&mut self, item_id: &str) {
@@ -2007,30 +3491,1719 @@ impl MetadataReport {
             self.failed_item_ids.push(item_id.to_owned());
         }
     }
+
+    fn mark_item_non_retryable_failed(&mut self, item_id: &str) {
+        self.mark_item_failed(item_id);
+        if !self
+            .non_retryable_failed_item_ids
+            .iter()
+            .any(|failed| failed == item_id)
+        {
+            self.non_retryable_failed_item_ids.push(item_id.to_owned());
+        }
+    }
+
+    fn mark_item_error(&mut self, item_id: &str, error: &MetadataError) {
+        if error.is_retryable() {
+            self.mark_item_failed(item_id);
+        } else {
+            self.mark_item_non_retryable_failed(item_id);
+        }
+    }
+
+    pub(crate) fn retryable_failed_item_count(&self) -> usize {
+        self.failed_item_ids
+            .iter()
+            .filter(|item_id| {
+                !self
+                    .non_retryable_failed_item_ids
+                    .iter()
+                    .any(|failed| failed == *item_id)
+            })
+            .count()
+    }
 }
 
 pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     let metadata = fs::metadata(path).await?;
-    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
     let modified_at = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
-        .unwrap_or(0);
-    let path = path.to_string_lossy();
-    Ok(compute_file_fingerprint(
-        &path,
-        size,
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(nfo_fingerprint_from_stamp(
+        path,
+        metadata.len(),
         modified_at,
-        None,
-        None,
     ))
+}
+
+pub(crate) fn nfo_fingerprint_from_stamp(path: &Path, size: u64, modified_at: u128) -> Vec<u8> {
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    let modified_at = i64::try_from(modified_at).unwrap_or(0);
+    let path = path.to_string_lossy();
+    compute_file_fingerprint(&path, size, modified_at, None, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_task_helper_caps_concurrency_and_preserves_input_order() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = run_bounded_tasks_in_order((0..12).collect(), 4, {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            move |value| {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                async move {
+                    let running = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_active.fetch_max(running, std::sync::atomic::Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    value * 2
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let results = results
+            .into_iter()
+            .map(|result| result.expect("bounded task should finish"))
+            .collect::<Vec<_>>();
+        assert_eq!(results, (0..12).map(|value| value * 2).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn movie_library_image_registration_batches_multiple_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        let mut fanart_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 255, 0, 255]),
+        ))
+        .write_to(&mut fanart_png, image::ImageFormat::Png)?;
+        for (folder, stem) in [
+            ("Movie One (2024)", "Movie.One.2024"),
+            ("Movie Two (2024)", "Movie.Two.2024"),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join("fanart.png"), fanart_png.get_ref()).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone());
+        database.reset_query_count();
+        let report = enricher.enrich_movie_library(library.id).await?;
+
+        assert_eq!(report.items_processed, 2);
+        assert_eq!(report.images_found, 2);
+        assert_eq!(
+            database.query_count(),
+            2,
+            "one source page query and one shared image insert should cover both movies"
+        );
+        let images: Vec<(String, String)> = sqlx::query_as(
+            "SELECT media_items.title, item_images.image_type
+             FROM item_images
+             JOIN media_items ON media_items.id = item_images.item_id
+             ORDER BY media_items.title",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            images,
+            vec![
+                ("Movie One".to_owned(), "FANART".to_owned()),
+                ("Movie Two".to_owned(), "FANART".to_owned())
+            ]
+        );
+
+        let item_ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, title FROM media_items WHERE library_id = ? ORDER BY title")
+                .bind(library.id.to_string())
+                .fetch_all(database.pool())
+                .await?;
+        let blocked_item_id = item_ids.first().ok_or("missing first movie")?.0.clone();
+        sqlx::query(
+            "CREATE TRIGGER reject_one_movie_image BEFORE INSERT ON item_images
+             WHEN NEW.item_id = (SELECT id FROM media_items WHERE title = 'Movie One')
+             BEGIN SELECT RAISE(ABORT, 'injected item image failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let mut changed_fanart = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 255, 255]),
+        ))
+        .write_to(&mut changed_fanart, image::ImageFormat::Png)?;
+        tokio::fs::write(
+            media_root.join("Movie Two (2024)").join("fanart.png"),
+            changed_fanart.get_ref(),
+        )
+        .await?;
+
+        let recovery_report = enricher.enrich_movie_library(library.id).await?;
+        assert_eq!(recovery_report.images_found, 1);
+        assert!(recovery_report.failed_item_ids.contains(&blocked_item_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn movie_library_keeps_nfo_errors_isolated_per_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, nfo) in [
+            (
+                "Broken Movie (2024)",
+                "Broken.Movie.2024",
+                "<movie><title>Broken</movie>",
+            ),
+            (
+                "Healthy Movie (2024)",
+                "Healthy.Movie.2024",
+                "<movie><title>Healthy From NFO</title></movie>",
+            ),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.nfo")), nfo).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_ids: HashMap<String, String> =
+            sqlx::query_as("SELECT id, title FROM media_items WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_all(database.pool())
+                .await?
+                .into_iter()
+                .map(|(item_id, title)| (title, item_id))
+                .collect();
+
+        let report = MetadataEnricher::new(database.clone())
+            .enrich_movie_library(library.id)
+            .await?;
+
+        assert_eq!(report.items_processed, 2);
+        assert_eq!(report.nfo_loaded, 1);
+        assert_eq!(report.nfo_failed, 1);
+        assert_eq!(
+            report.failed_item_ids,
+            vec![item_ids.get("Broken Movie").ok_or("broken item")?.clone()]
+        );
+        let healthy_title: String =
+            sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+                .bind(item_ids.get("Healthy Movie").ok_or("healthy item")?)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(healthy_title, "Healthy From NFO");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_library_image_registration_batches_multiple_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Series");
+        let mut poster_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut poster_png, image::ImageFormat::Png)?;
+        for (series, episode) in [
+            ("First Show", "First.Show.S01E01"),
+            ("Second Show", "Second.Show.S01E01"),
+        ] {
+            let series_dir = media_root.join(series);
+            let season_dir = series_dir.join("Season 01");
+            tokio::fs::create_dir_all(&season_dir).await?;
+            tokio::fs::write(series_dir.join("poster.png"), poster_png.get_ref()).await?;
+            tokio::fs::write(season_dir.join(format!("{episode}.mkv")), b"media").await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Series", crate::library::LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_series_library(library.id)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone());
+        database.reset_query_count();
+        let report = enricher.enrich_series_library(library.id).await?;
+
+        assert_eq!(report.items_processed, 2);
+        assert_eq!(report.images_found, 2);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "one source page query, one existing-image read, one shared insert, and one fallback update should cover both series"
+        );
+        let images: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT media_items.title, item_images.image_type, item_images.local_path
+             FROM item_images
+             JOIN media_items ON media_items.id = item_images.item_id
+             ORDER BY media_items.title",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(images.len(), 2);
+        assert!(images.iter().all(|(title, image_type, path)| {
+            image_type == "POSTER"
+                && path.ends_with("poster.png")
+                && (title == "First Show" || title == "Second Show")
+        }));
+
+        let first_series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND title = 'First Show'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        let first_tag_before: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&first_series_id)
+        .fetch_one(database.pool())
+        .await?;
+        let second_tag_before: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images
+             WHERE item_id = (SELECT id FROM media_items WHERE library_id = ? AND title = 'Second Show')
+               AND image_type = 'POSTER'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_one_series_image BEFORE INSERT ON item_images
+             WHEN NEW.item_id = (SELECT id FROM media_items WHERE title = 'First Show')
+             BEGIN SELECT RAISE(ABORT, 'injected series image failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let mut changed_poster = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 255, 255]),
+        ))
+        .write_to(&mut changed_poster, image::ImageFormat::Png)?;
+        for series in ["First Show", "Second Show"] {
+            tokio::fs::write(
+                media_root.join(series).join("poster.png"),
+                changed_poster.get_ref(),
+            )
+            .await?;
+        }
+
+        let recovery_report = enricher.enrich_series_library(library.id).await?;
+        assert_eq!(recovery_report.images_found, 1);
+        assert!(recovery_report.failed_item_ids.contains(&first_series_id));
+        let first_tag_after: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&first_series_id)
+        .fetch_one(database.pool())
+        .await?;
+        let second_tag_after: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images
+             WHERE item_id = (SELECT id FROM media_items WHERE library_id = ? AND title = 'Second Show')
+               AND image_type = 'POSTER'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(first_tag_after, first_tag_before);
+        assert_ne!(second_tag_after, second_tag_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_retains_home_video_path_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let blocking_parent = directory.path().join("not-a-directory");
+        tokio::fs::write(&blocking_parent, b"file").await?;
+        let source = StoredScanLocalMetadataSource {
+            source_id: "source-1".to_owned(),
+            item_id: "video-1".to_owned(),
+            item_type: "VIDEO".to_owned(),
+            probe_status: "READY".to_owned(),
+            series_id: None,
+            season_id: None,
+            season_number: None,
+            root_path: directory
+                .path()
+                .to_str()
+                .ok_or("non-UTF8 temporary path")?
+                .to_owned(),
+            relative_path: "not-a-directory/video.mp4".to_owned(),
+        };
+
+        let lookups = scan_local_metadata_nfo_paths(&[source]).await;
+
+        assert!(matches!(
+            lookups.nfo_errors_by_item.get("video-1"),
+            Some(MetadataError::Io { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_caches_shared_episode_sidecar_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let season_dir = directory.path().join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await?;
+        let series_nfo = directory.path().join("Series").join("tvshow.nfo");
+        tokio::fs::write(&series_nfo, "<tvshow />").await?;
+        let season_nfo = season_dir.join("season01.nfo");
+        tokio::fs::write(&season_nfo, "<season />").await?;
+        let shared_nfo = season_dir.join("episode.nfo");
+        tokio::fs::write(&shared_nfo, "<episodedetails />").await?;
+        let named_nfo = season_dir.join("Episode 03.nfo");
+        tokio::fs::write(
+            &named_nfo,
+            "<episodedetails><title>Named</title></episodedetails>",
+        )
+        .await?;
+        let root_path = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF8 temporary path")?
+            .to_owned();
+        let episode_source = |item_id: &str, episode_name: &str| StoredScanLocalMetadataSource {
+            source_id: format!("source-{item_id}"),
+            item_id: item_id.to_owned(),
+            item_type: "EPISODE".to_owned(),
+            probe_status: "READY".to_owned(),
+            series_id: Some("series-1".to_owned()),
+            season_id: Some("season-1".to_owned()),
+            season_number: Some(1),
+            root_path: root_path.clone(),
+            relative_path: format!("Series/Season 01/{episode_name}.mkv"),
+        };
+        let sources = [
+            episode_source("episode-1", "Episode 01"),
+            episode_source("episode-2", "Episode 02"),
+            episode_source("episode-3", "Episode 03"),
+        ];
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-1"),
+            Some(&shared_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-2"),
+            Some(&shared_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-3"),
+            Some(&named_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-1"),
+            Some(&series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-1"),
+            Some(&season_nfo)
+        );
+        assert_eq!(snapshot.nfo_candidate_probe_count, 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_caches_repeated_hierarchy_candidate_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let season_dir = directory.path().join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await?;
+        let series_nfo = directory.path().join("Series").join("tvshow.nfo");
+        tokio::fs::write(&series_nfo, "<tvshow />").await?;
+        let season_nfo = season_dir.join("season01.nfo");
+        tokio::fs::write(&season_nfo, "<season />").await?;
+        let shared_episode_nfo = season_dir.join("episode.nfo");
+        tokio::fs::write(&shared_episode_nfo, "<episodedetails />").await?;
+        let root_path = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF8 temporary path")?
+            .to_owned();
+        let sources = [
+            StoredScanLocalMetadataSource {
+                source_id: "source-first".to_owned(),
+                item_id: "episode-first".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-first".to_owned()),
+                season_id: Some("season-first".to_owned()),
+                season_number: Some(1),
+                root_path: root_path.clone(),
+                relative_path: "Series/Season 01/Episode 01.mkv".to_owned(),
+            },
+            StoredScanLocalMetadataSource {
+                source_id: "source-second".to_owned(),
+                item_id: "episode-second".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-second".to_owned()),
+                season_id: Some("season-second".to_owned()),
+                season_number: Some(1),
+                root_path,
+                relative_path: "Series/Season 01/Episode 02.mkv".to_owned(),
+            },
+        ];
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-first"),
+            Some(&series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-second"),
+            Some(&series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-first"),
+            Some(&season_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-second"),
+            Some(&season_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-first"),
+            Some(&shared_episode_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-second"),
+            Some(&shared_episode_nfo)
+        );
+        assert_eq!(snapshot.nfo_candidate_probe_count, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_path_discovery_has_bounded_concurrency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let season_dir = directory.path().join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await?;
+        let shared_nfo = season_dir.join("episode.nfo");
+        tokio::fs::write(&shared_nfo, "<episodedetails />").await?;
+        let root_path = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF8 temporary path")?
+            .to_owned();
+        let sources = (0..12)
+            .map(|index| StoredScanLocalMetadataSource {
+                source_id: format!("source-{index}"),
+                item_id: format!("episode-{index}"),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: None,
+                season_id: None,
+                season_number: None,
+                root_path: root_path.clone(),
+                relative_path: format!("Series/Season 01/Episode {index:02}.mkv"),
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(snapshot.nfo_candidate_probe_count, 13);
+        assert!(snapshot.nfo_candidate_max_concurrency > 1);
+        assert!(snapshot.nfo_candidate_max_concurrency <= 4);
+        for source in &sources {
+            assert_eq!(
+                snapshot.nfo_paths_by_item.get(&source.item_id),
+                Some(&shared_nfo)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_hierarchy_keeps_first_source_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        let first_season = first_root.join("Series").join("Season 01");
+        let second_season = second_root.join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&first_season).await?;
+        tokio::fs::create_dir_all(&second_season).await?;
+        let first_series_nfo = first_root.join("Series").join("tvshow.nfo");
+        let second_series_nfo = second_root.join("Series").join("tvshow.nfo");
+        let first_season_nfo = first_season.join("season01.nfo");
+        let second_season_nfo = second_season.join("season01.nfo");
+        tokio::fs::write(&first_series_nfo, "<tvshow><title>First</title></tvshow>").await?;
+        tokio::fs::write(&second_series_nfo, "<tvshow><title>Second</title></tvshow>").await?;
+        tokio::fs::write(&first_season_nfo, "<season><title>First</title></season>").await?;
+        tokio::fs::write(&second_season_nfo, "<season><title>Second</title></season>").await?;
+        let sources = [
+            StoredScanLocalMetadataSource {
+                source_id: "source-first".to_owned(),
+                item_id: "episode-first".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-shared".to_owned()),
+                season_id: Some("season-shared".to_owned()),
+                season_number: Some(1),
+                root_path: first_root.to_str().ok_or("non-UTF8 first root")?.to_owned(),
+                relative_path: "Series/Season 01/Episode 01.mkv".to_owned(),
+            },
+            StoredScanLocalMetadataSource {
+                source_id: "source-second".to_owned(),
+                item_id: "episode-second".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-shared".to_owned()),
+                season_id: Some("season-shared".to_owned()),
+                season_number: Some(1),
+                root_path: second_root
+                    .to_str()
+                    .ok_or("non-UTF8 second root")?
+                    .to_owned(),
+                relative_path: "Series/Season 01/Episode 02.mkv".to_owned(),
+            },
+        ];
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-shared"),
+            Some(&first_series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-shared"),
+            Some(&first_season_nfo)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_reuses_the_image_stage_source_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, title) in [
+            ("Movie One (2024)", "Movie.One.2024", "Movie One"),
+            ("Movie Two (2024)", "Movie.Two.2024", "Movie Two"),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(
+                movie_dir.join(format!("{stem}.nfo")),
+                format!("<movie><title>{title}</title></movie>"),
+            )
+            .await?;
+        }
+        let no_nfo_dir = media_root.join("Movie Three (2024)");
+        tokio::fs::create_dir_all(&no_nfo_dir).await?;
+        tokio::fs::write(no_nfo_dir.join("Movie.Three.2024.mkv"), b"media").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let entry_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM filesystem_entries
+             WHERE relative_path LIKE 'Movie % (2024)/%.mkv' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), 3);
+
+        let enricher = MetadataEnricher::new(database.clone());
+        let image_batch = enricher
+            .index_scan_local_metadata_batch_images(&entry_ids)
+            .await?;
+        database.reset_query_count();
+
+        let batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(image_batch.sources, &[])
+            .await?;
+
+        assert_eq!(batch.report.items_processed, 3);
+        assert_eq!(batch.report.nfo_loaded, 2);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "two NFOs should share one metadata lookup and one source validation query"
+        );
+
+        let no_nfo_entry_id: String = sqlx::query_scalar(
+            "SELECT id FROM filesystem_entries WHERE relative_path LIKE 'Movie Three %' LIMIT 1",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        let no_nfo_image_batch = enricher
+            .index_scan_local_metadata_batch_images(std::slice::from_ref(&no_nfo_entry_id))
+            .await?;
+        database.reset_query_count();
+        let no_nfo_batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(no_nfo_image_batch.sources, &[])
+            .await?;
+        assert_eq!(no_nfo_batch.report.items_processed, 1);
+        assert_eq!(no_nfo_batch.report.nfo_loaded, 0);
+        assert_eq!(
+            database.query_count(),
+            1,
+            "a batch without NFO files should skip the media metadata lookup"
+        );
+
+        let stale_image_batch = enricher
+            .index_scan_local_metadata_batch_images(std::slice::from_ref(&entry_ids[0]))
+            .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries SET is_missing = 1
+             WHERE id = ?",
+        )
+        .bind(&entry_ids[0])
+        .execute(database.pool())
+        .await?;
+        database.reset_query_count();
+        let stale_nfo_batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(stale_image_batch.sources, &[])
+            .await?;
+        assert_eq!(stale_nfo_batch.report.items_processed, 0);
+        assert!(stale_nfo_batch.source_identities.is_empty());
+        assert_eq!(
+            database.query_count(),
+            1,
+            "stale preferred sources should be rejected by the same bounded validation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        let entries = [
+            (
+                "Movie One (2024)",
+                "Movie.One.2024",
+                "<movie><title>broken nfo",
+            ),
+            (
+                "Movie Two (2024)",
+                "Movie.Two.2024",
+                "<movie><title>Movie Two</title><actor><name>演员甲</name><tmdbid>101</tmdbid><order>0</order></actor></movie>",
+            ),
+            (
+                "Movie Three (2024)",
+                "Movie.Three.2024",
+                "<movie><title>Movie Three</title><actor><name>演员乙</name><tmdbid>102</tmdbid><order>0</order></actor></movie>",
+            ),
+        ];
+        for (folder, stem, nfo) in entries {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.nfo")), nfo).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let entry_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM filesystem_entries
+             WHERE relative_path LIKE 'Movie % (2024)/%.mkv' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), entries.len());
+
+        let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let resources = ResourceMetrics::new();
+        let concurrency_probe = ScanLocalMovieNfoConcurrencyProbe::new();
+        let mut enricher = MetadataEnricher::new(database.clone())
+            .with_people(people.clone())
+            .with_resource_metrics(resources.clone());
+        enricher.scan_local_movie_nfo_concurrency_probe = Some(concurrency_probe.clone());
+        let image_batch = enricher
+            .index_scan_local_metadata_batch_images(&entry_ids)
+            .await?;
+        let invalid_item_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND title = 'Movie One'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_nfo_person_credit BEFORE INSERT ON person_credits
+             BEGIN SELECT RAISE(ABORT, 'injected actor credit failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(image_batch.sources, &[])
+            .await?;
+
+        assert_eq!(batch.report.items_processed, 3);
+        assert_eq!(batch.report.nfo_loaded, 2);
+        assert_eq!(batch.report.nfo_failed, 1);
+        let max_nfo_concurrency = concurrency_probe
+            .peak
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY).contains(&max_nfo_concurrency),
+            "scan-local movie NFO enrichment should overlap while staying within the configured limit; observed {max_nfo_concurrency}"
+        );
+        assert!(batch.report.failed_item_ids.contains(&invalid_item_id));
+        for title in ["Movie Two", "Movie Three"] {
+            let item_id: String =
+                sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ? AND title = ?")
+                    .bind(library.id.to_string())
+                    .bind(title)
+                    .fetch_one(database.pool())
+                    .await?;
+            assert!(
+                batch.report.failed_item_ids.contains(&item_id),
+                "expected item {item_id} ({title}) to fail as part of the actor-credit batch; failed IDs: {:?}",
+                batch.report.failed_item_ids,
+            );
+        }
+        let failed_chunk_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_index_item_state
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            failed_chunk_items, 0,
+            "the failed chunk should roll back atomically"
+        );
+        let failed_chunk_credits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(failed_chunk_credits, 0);
+        sqlx::query("DROP TRIGGER reject_nfo_person_credit")
+            .execute(database.pool())
+            .await?;
+        let retry_sources = database
+            .list_scan_local_metadata_sources(&entry_ids)
+            .await?;
+        let retry_batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(retry_sources, &[])
+            .await?;
+        assert_eq!(retry_batch.report.nfo_failed, 1);
+        assert_eq!(retry_batch.report.failed_item_ids, vec![invalid_item_id]);
+        let metrics = resources.snapshot().await;
+        assert_eq!(metrics.metadata.counters["batch.local_nfo_page.count"], 2);
+        assert_eq!(metrics.metadata.counters["batch.local_nfo_page.items"], 6);
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_page.max_items"],
+            3
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_page.error.count"],
+            2
+        );
+        assert!(metrics.metadata.stage_p95_ms.contains_key("local_nfo_page"));
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.count"],
+            2
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.items"],
+            4
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.max_items"],
+            2
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.credit_entries"],
+            4
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.success.count"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.error.count"],
+            1
+        );
+        assert!(
+            metrics
+                .metadata
+                .stage_p95_ms
+                .contains_key("local_nfo_actor_credits_tx")
+        );
+        let indexed_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_index_item_state
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            indexed_items, 2,
+            "valid item credits should flush as one page batch"
+        );
+        let credits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(credits, 2);
+
+        for title in ["Movie Two", "Movie Three"] {
+            let item_id: String =
+                sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ? AND title = ?")
+                    .bind(library.id.to_string())
+                    .bind(title)
+                    .fetch_one(database.pool())
+                    .await?;
+            let nfo_path = media_root
+                .join(format!("{title} (2024)"))
+                .join(format!("{}.2024.nfo", title.replace(' ', ".")));
+            let fingerprint = nfo_content_fingerprint(&tokio::fs::read(nfo_path).await?);
+            assert!(
+                people
+                    .item_actor_relation_is_current(&item_id, &fingerprint)
+                    .await?
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_movie_page_serializes_conflicting_identity_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, nfo) in [
+            (
+                "Identity Alpha (1985)",
+                "Identity.Alpha.1985",
+                "<movie><title>Shared Page Identity</title><year>1999</year></movie>",
+            ),
+            (
+                "Identity Beta (1986)",
+                "Identity.Beta.1986",
+                "<movie><title>Shared Page Identity</title><year>1999</year></movie>",
+            ),
+            (
+                "Identity Regular (2000)",
+                "Identity.Regular.2000",
+                "<movie><title>Identity Regular</title><year>2000</year><plot>Ordinary NFO overview</plot></movie>",
+            ),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join("movie.nfo"), nfo).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+
+        let original_items: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT id, title, production_year FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY production_year",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(original_items.len(), 3);
+        let conflict_items = original_items
+            .iter()
+            .filter(|(_, _, year)| matches!(year, 1985 | 1986))
+            .map(|(item_id, _, _)| item_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(conflict_items.len(), 2);
+        let regular_item_id = original_items
+            .iter()
+            .find(|(_, _, year)| *year == 2000)
+            .ok_or("regular movie")?
+            .0
+            .clone();
+        let entry_ids = sqlx::query_scalar::<_, String>(
+            "SELECT source.filesystem_entry_id FROM media_sources source
+             JOIN media_items item ON item.id = source.item_id
+             WHERE item.library_id = ? AND source.filesystem_entry_id IS NOT NULL
+             ORDER BY item.production_year",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), 3);
+        let sources = database
+            .list_scan_local_metadata_sources(&entry_ids)
+            .await?;
+        assert_eq!(sources.len(), 3);
+
+        let concurrency_probe =
+            ScanLocalMovieNfoConcurrencyProbe::new().with_identity_conflict_gate(2);
+        let identity_gate = Arc::clone(
+            concurrency_probe
+                .identity_conflict_gate
+                .as_ref()
+                .ok_or("identity conflict gate")?,
+        );
+        let resources = ResourceMetrics::new();
+        let mut enricher =
+            MetadataEnricher::new(database.clone()).with_resource_metrics(resources.clone());
+        enricher.scan_local_movie_nfo_concurrency_probe = Some(concurrency_probe);
+        let batch_task = tokio::spawn(async move {
+            enricher
+                .enrich_scan_local_metadata_batch_nfo(sources, &[])
+                .await
+        });
+
+        // The changed-identity tasks wait at the test gate. The ordinary movie can
+        // therefore enqueue its update first, making an early page flush observable.
+        let ordinary_update = identity_gate.metadata_updates_pushed.acquire().await?;
+        ordinary_update.forget();
+        for _ in 0..2 {
+            let ready = identity_gate.ready_contenders.acquire().await?;
+            ready.forget();
+        }
+        identity_gate.release_contenders.add_permits(2);
+        let first_check = identity_gate.conflict_checks_passed.acquire().await?;
+        first_check.forget();
+        let identity_guard_held_during_check = identity_gate
+            .identity_guard_held_after_first_check
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let transactions_while_check_is_held = resources.snapshot().await;
+        identity_gate.release_first_check.add_permits(1);
+        assert!(
+            identity_guard_held_during_check,
+            "the page identity guard must remain held after the database check"
+        );
+        assert_eq!(
+            transactions_while_check_is_held
+                .metadata
+                .counters
+                .get("batch.local_nfo_state_tx.count")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "identity conflict checks must not flush pending page metadata updates"
+        );
+
+        let batch = batch_task.await??;
+        assert_eq!(batch.report.items_processed, 3);
+        assert_eq!(batch.report.nfo_loaded, 2);
+        assert_eq!(batch.report.nfo_failed, 1);
+        assert_eq!(batch.report.non_retryable_failed_item_ids.len(), 1);
+        let failed_conflict_id = &batch.report.non_retryable_failed_item_ids[0];
+        assert!(conflict_items.contains(failed_conflict_id));
+        assert!(!batch.report.failed_item_ids.contains(&regular_item_id));
+
+        let shared_identity_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE'
+               AND title = 'Shared Page Identity' AND production_year = 1999",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(shared_identity_count, 1);
+        let unchanged_conflict_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE id IN (?, ?) AND title <> 'Shared Page Identity'",
+        )
+        .bind(&conflict_items[0])
+        .bind(&conflict_items[1])
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(unchanged_conflict_count, 1);
+        let regular_metadata: (String, Option<String>) =
+            sqlx::query_as("SELECT title, overview FROM media_items WHERE id = ?")
+                .bind(&regular_item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(regular_metadata.0, "Identity Regular");
+        assert_eq!(regular_metadata.1.as_deref(), Some("Ordinary NFO overview"));
+        let final_metrics = resources.snapshot().await;
+        assert_eq!(
+            final_metrics
+                .metadata
+                .counters
+                .get("batch.local_nfo_state_tx.count")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "ordinary and accepted identity metadata updates should share the page-end flush"
+        );
+        assert_eq!(
+            final_metrics
+                .metadata
+                .counters
+                .get("batch.local_nfo_state_tx.metadata_updates")
+                .copied()
+                .unwrap_or_default(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_image_registration_rolls_back_when_fallback_update_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Artwork", crate::library::LibraryKind::Series, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, item_type, title, sort_title,
+                identification_status, poster_fallback_required)
+             VALUES ('artwork-item', ?, 'SERIES', 'Show', 'show', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_artwork_fallback BEFORE UPDATE OF poster_fallback_required
+             ON media_items BEGIN SELECT RAISE(ABORT, 'fallback failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let poster = directory.path().join("poster.jpg");
+        let mut poster_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([21, 43, 65, 255]),
+        ))
+        .write_to(&mut poster_png, image::ImageFormat::Png)?;
+        tokio::fs::write(&poster, poster_png.get_ref()).await?;
+        let enricher = MetadataEnricher::new(database.clone());
+        let mut report = MetadataReport::default();
+        assert!(
+            enricher
+                .index_images(
+                    "artwork-item",
+                    vec![LocalImage {
+                        image_type: ImageType::Poster,
+                        path: poster.clone(),
+                    }],
+                    &mut report,
+                )
+                .await
+                .is_err()
+        );
+        assert!(database.list_item_images("artwork-item").await?.is_empty());
+        sqlx::query("DROP TRIGGER reject_artwork_fallback")
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            enricher
+                .index_images(
+                    "artwork-item",
+                    vec![LocalImage {
+                        image_type: ImageType::Poster,
+                        path: poster,
+                    }],
+                    &mut report,
+                )
+                .await?,
+            1
+        );
+        let fallback: i64 = sqlx::query_scalar(
+            "SELECT poster_fallback_required FROM media_items WHERE id = 'artwork-item'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(fallback, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_nfo_metadata_batch_falls_back_per_item_after_transaction_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, title) in [
+            ("Movie One (2024)", "Movie.One.2024", "Updated One"),
+            ("Movie Two (2024)", "Movie.Two.2024", "Updated Two"),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(
+                movie_dir.join(format!("{stem}.nfo")),
+                format!("<movie><title>{title}</title><year>2024</year></movie>"),
+            )
+            .await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let entry_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM filesystem_entries
+             WHERE relative_path LIKE 'Movie % (2024)/%.mkv' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), 2);
+
+        let failed_item_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND title = 'Movie Two'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_second_local_nfo_metadata_update
+             BEFORE UPDATE OF title ON media_items
+             WHEN OLD.title = 'Movie Two'
+             BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let resources = ResourceMetrics::new();
+        let enricher =
+            MetadataEnricher::new(database.clone()).with_resource_metrics(resources.clone());
+        let image_batch = enricher
+            .index_scan_local_metadata_batch_images(&entry_ids)
+            .await?;
+        let batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(image_batch.sources, &[])
+            .await?;
+
+        assert_eq!(batch.report.nfo_loaded, 1);
+        assert_eq!(batch.report.nfo_failed, 1);
+        assert_eq!(batch.report.failed_item_ids, [failed_item_id.as_str()]);
+        let metrics = resources.snapshot().await;
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.count"], 3,
+            "page transaction and fallback writes must all be recorded: {:?}",
+            metrics.metadata.counters
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.items"], 4,
+            "the failed page batch contains both items, then each item is retried"
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.metadata_updates"],
+            4
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.default_repairs"],
+            0
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.success.count"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.error.count"],
+            2
+        );
+        assert!(
+            metrics
+                .metadata
+                .stage_p95_ms
+                .contains_key("local_nfo_state_tx")
+        );
+        let titles: Vec<String> = sqlx::query_scalar(
+            "SELECT title FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(titles, ["Movie Two", "Updated One"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_nfo_defaults_share_the_page_state_write_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "unchanged-nfo-defaults-item";
+        let nfo_path = directory.path().join("movie.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&nfo_path, nfo_bytes).await?;
+        let fingerprint = nfo_fingerprint(&nfo_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', '{}', ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(&fingerprint)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('deferred-metadata-item', ?, 'MOVIE', 'Before', 'before', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        let local_nfo = LocalNfoMetadataStore::new(database.clone());
+        let (_, semantic_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(nfo_bytes)?;
+        let raw_content_fingerprint = nfo_content_fingerprint(nfo_bytes);
+        local_nfo
+            .write_item_with_semantic_fingerprint(
+                item_id,
+                &raw_content_fingerprint,
+                Some(&semantic_fingerprint),
+                Some(&raw_content_fingerprint),
+                &details,
+            )
+            .await?;
+        let metadata = database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or("unchanged media metadata should exist")?;
+        let resources = ResourceMetrics::new();
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(local_nfo)
+            .with_resource_metrics(resources.clone());
+        let deferred = DeferredLocalNfoMetadataUpdates::default();
+        database.reset_query_count();
+        let report = enricher
+            .enrich_nfo_item_with_metadata(
+                item_id,
+                &nfo_path,
+                Some(metadata),
+                None,
+                Some(deferred.clone()),
+            )
+            .await?;
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(
+            database.query_count(),
+            1,
+            "the unchanged NFO should only read its rich cache before page flush"
+        );
+        let defaults_before_flush: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT provider_ids_json, premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(defaults_before_flush, (Some("{}".to_owned()), None));
+
+        let metadata_fingerprint = [8_u8; 32];
+        deferred
+            .push(MediaMetadataUpdate {
+                item_id: "deferred-metadata-item",
+                title: "After",
+                original_title: None,
+                overview: None,
+                production_year: None,
+                premiere_date: None,
+                rating: None,
+                rating_source: None,
+                provider_ids_json: None,
+                metadata_fingerprint: &metadata_fingerprint,
+                provenance_json: "{}",
+                locked_fields_json: "{}",
+            })
+            .await;
+        enricher
+            .flush_deferred_local_nfo_metadata_updates(&deferred)
+            .await;
+        assert!(deferred.take_failures().await.is_empty());
+        let metrics = resources.snapshot().await;
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.count"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.items"],
+            2
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.metadata_updates"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.default_repairs"],
+            1
+        );
+        assert!(
+            metrics
+                .metadata
+                .stage_p95_ms
+                .contains_key("local_nfo_state_tx")
+        );
+
+        let defaults_after_flush: (String, Option<String>) =
+            sqlx::query_as("SELECT provider_ids_json, premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let updated_title: String =
+            sqlx::query_scalar("SELECT title FROM media_items WHERE id = 'deferred-metadata-item'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            defaults_after_flush,
+            (r#"{"tmdb":"42"}"#.to_owned(), Some("2026-01-02".to_owned()))
+        );
+        assert_eq!(updated_title, "After");
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_nfo_with_complete_defaults_skips_repair_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "unchanged-nfo-item";
+        let nfo_path = directory.path().join("movie.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&nfo_path, nfo_bytes).await?;
+        let fingerprint = nfo_fingerprint(&nfo_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, premiere_date, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(r#"{"tmdb":"99"}"#)
+        .bind("2025-01-02")
+        .bind(fingerprint)
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        let (_, semantic_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(nfo_bytes)?;
+        let raw_content_fingerprint = nfo_content_fingerprint(nfo_bytes);
+        LocalNfoMetadataStore::new(database.clone())
+            .write_item_with_semantic_fingerprint(
+                item_id,
+                &raw_content_fingerprint,
+                Some(&semantic_fingerprint),
+                Some(&raw_content_fingerprint),
+                &details,
+            )
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        database.reset_query_count();
+        let report = enricher.enrich_nfo_item(item_id, &nfo_path).await?;
+
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(
+            database.query_count(),
+            2,
+            "unchanged NFO with complete defaults should only read metadata and its rich cache"
+        );
+        let retained_provider_ids: String =
+            sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(retained_provider_ids, r#"{"tmdb":"99"}"#);
+        let retained_premiere_date: Option<String> =
+            sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(retained_premiere_date.as_deref(), Some("2025-01-02"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_nfo_content_at_a_new_path_reuses_the_rich_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "same-content-new-path-item";
+        let original_path = directory.path().join("original.nfo");
+        let moved_path = directory.path().join("moved.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&original_path, nfo_bytes).await?;
+        tokio::fs::write(&moved_path, nfo_bytes).await?;
+        let original_fingerprint = nfo_fingerprint(&original_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, premiere_date, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(r#"{"tmdb":"99"}"#)
+        .bind("2025-01-02")
+        .bind(original_fingerprint)
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        let (_, semantic_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(nfo_bytes)?;
+        let raw_content_fingerprint = nfo_content_fingerprint(nfo_bytes);
+        LocalNfoMetadataStore::new(database.clone())
+            .write_item_with_semantic_fingerprint(
+                item_id,
+                &raw_content_fingerprint,
+                Some(&semantic_fingerprint),
+                Some(&raw_content_fingerprint),
+                &details,
+            )
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        database.reset_query_count();
+        let report = enricher.enrich_nfo_item(item_id, &moved_path).await?;
+
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(report.nfo_loaded, 0);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "a stat fingerprint change with identical content should only sync the new stat fingerprint"
+        );
+        let stored_fingerprint: Vec<u8> =
+            sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(stored_fingerprint, nfo_fingerprint(&moved_path).await?);
+
+        tokio::fs::write(
+            &moved_path,
+            b"<movie><title>Changed title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>",
+        )
+        .await?;
+        let changed_report = enricher.enrich_nfo_item(item_id, &moved_path).await?;
+        assert_eq!(changed_report.nfo_loaded, 1);
+        assert_eq!(changed_report.nfo_skipped, 0);
+        let title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(title, "Changed title");
+        Ok(())
+    }
+
+    #[test]
+    fn merges_only_new_provider_ids() {
+        let current = Some(r#"{"tmdb":"603"}"#);
+        let incoming = BTreeMap::from([
+            ("TMDB".to_owned(), "999".to_owned()),
+            ("imdb".to_owned(), "tt0133093".to_owned()),
+        ]);
+
+        assert_eq!(
+            merged_provider_ids_json(current, &incoming).as_deref(),
+            Some(r#"{"imdb":"tt0133093","tmdb":"603"}"#)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_incoming_ids_are_already_known() {
+        let current = Some(r#"{"tmdb":"603"}"#);
+        let incoming = BTreeMap::from([(String::from("TMDB"), String::from("603"))]);
+
+        assert!(merged_provider_ids_json(current, &incoming).is_none());
+    }
 
     #[tokio::test]
     async fn directory_path_cache_reuses_a_directory_snapshot()
@@ -2049,6 +5222,18 @@ mod tests {
         assert_eq!(cached, initial);
         Ok(())
     }
+
+    #[test]
+    fn conflicting_movie_identity_error_is_non_retryable_and_names_both_items() {
+        let error = MetadataError::ConflictingMovieIdentity {
+            item_id: "current-item".to_owned(),
+            conflicting_item_id: "conflicting-item".to_owned(),
+        };
+        let message = error.to_string();
+        assert!(!error.is_retryable());
+        assert!(message.contains("current_item_id=current-item"));
+        assert!(message.contains("conflicting_item_id=conflicting-item"));
+    }
 }
 
 pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
@@ -2062,6 +5247,62 @@ pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
         return Some(same_name);
     }
     find_directory_nfo(directory).await
+}
+
+type NfoSidecarProbeCell = Arc<OnceCell<Option<bool>>>;
+type NfoSidecarProbeCache = Arc<Mutex<HashMap<PathBuf, NfoSidecarProbeCell>>>;
+
+#[derive(Clone, Default)]
+struct NfoSidecarExistenceCache {
+    entries: NfoSidecarProbeCache,
+    #[cfg(test)]
+    probe_stats: Arc<NfoSidecarProbeStats>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct NfoSidecarProbeStats {
+    probe_count: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    max_concurrency: std::sync::atomic::AtomicUsize,
+}
+
+impl NfoSidecarExistenceCache {
+    async fn try_exists(&self, path: &Path) -> Option<bool> {
+        let result = {
+            let mut entries = self.entries.lock().await;
+            Arc::clone(
+                entries
+                    .entry(path.to_owned())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        *result
+            .get_or_init(|| async {
+                #[cfg(test)]
+                {
+                    self.probe_stats
+                        .probe_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let active = self
+                        .probe_stats
+                        .active
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    self.probe_stats
+                        .max_concurrency
+                        .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let result = fs::try_exists(path).await.ok();
+                #[cfg(test)]
+                self.probe_stats
+                    .active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+            .await
+    }
 }
 
 async fn find_directory_nfo(directory: &Path) -> Option<PathBuf> {
@@ -2168,14 +5409,36 @@ fn is_season_directory(value: &str) -> bool {
 }
 
 async fn find_tvshow_nfo(series_dir: &Path) -> Option<PathBuf> {
+    find_tvshow_nfo_with_cache(series_dir, &NfoSidecarExistenceCache::default()).await
+}
+
+async fn find_tvshow_nfo_with_cache(
+    series_dir: &Path,
+    sidecar_existence: &NfoSidecarExistenceCache,
+) -> Option<PathBuf> {
     let path = series_dir.join("tvshow.nfo");
-    fs::try_exists(&path).await.ok()?.then_some(path)
+    sidecar_existence.try_exists(&path).await?.then_some(path)
 }
 
 async fn find_season_nfo(
     series_dir: &Path,
     season_dir: &Path,
     season_number: i64,
+) -> Option<PathBuf> {
+    find_season_nfo_with_cache(
+        series_dir,
+        season_dir,
+        season_number,
+        &NfoSidecarExistenceCache::default(),
+    )
+    .await
+}
+
+async fn find_season_nfo_with_cache(
+    series_dir: &Path,
+    season_dir: &Path,
+    season_number: i64,
+    sidecar_existence: &NfoSidecarExistenceCache,
 ) -> Option<PathBuf> {
     let names = if season_number == 0 {
         vec!["season00.nfo".to_owned(), "specials.nfo".to_owned()]
@@ -2192,7 +5455,7 @@ async fn find_season_nfo(
     }
     candidates.push(season_dir.join("season.nfo"));
     for candidate in candidates {
-        if fs::try_exists(&candidate).await.ok()? {
+        if sidecar_existence.try_exists(&candidate).await? {
             return Some(candidate);
         }
     }
@@ -2200,14 +5463,21 @@ async fn find_season_nfo(
 }
 
 async fn find_episode_nfo(media_path: &Path) -> Option<PathBuf> {
+    find_episode_nfo_with_cache(media_path, &NfoSidecarExistenceCache::default()).await
+}
+
+async fn find_episode_nfo_with_cache(
+    media_path: &Path,
+    sidecar_existence: &NfoSidecarExistenceCache,
+) -> Option<PathBuf> {
     let same_name = media_path.with_extension("nfo");
-    if fs::try_exists(&same_name).await.ok()? {
+    if sidecar_existence.try_exists(&same_name).await? {
         return Some(same_name);
     }
     let episode_nfo = media_path.parent()?.join("episode.nfo");
-    fs::try_exists(&episode_nfo)
-        .await
-        .ok()?
+    sidecar_existence
+        .try_exists(&episode_nfo)
+        .await?
         .then_some(episode_nfo)
 }
 
@@ -2413,7 +5683,14 @@ pub enum MetadataError {
     NfoCache(LocalNfoMetadataStoreError),
     ConflictingMovieIdentity {
         item_id: String,
+        conflicting_item_id: String,
     },
+}
+
+impl MetadataError {
+    fn is_retryable(&self) -> bool {
+        !matches!(self, Self::ConflictingMovieIdentity { .. })
+    }
 }
 
 impl fmt::Display for MetadataError {
@@ -2429,9 +5706,12 @@ impl fmt::Display for MetadataError {
             ),
             Self::Storage(error) => error.fmt(formatter),
             Self::NfoCache(error) => error.fmt(formatter),
-            Self::ConflictingMovieIdentity { item_id } => write!(
+            Self::ConflictingMovieIdentity {
+                item_id,
+                conflicting_item_id,
+            } => write!(
                 formatter,
-                "local movie NFO conflicts with another movie identity: {item_id}"
+                "local movie NFO conflicts with another movie identity: current_item_id={item_id}, conflicting_item_id={conflicting_item_id}"
             ),
         }
     }

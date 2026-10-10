@@ -13,6 +13,7 @@ use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet, time::sleep};
 use url::{Host, Url};
 
@@ -1228,9 +1229,43 @@ fn build_event_payload_for_format(
         "EventId": event_id,
         "Timestamp": occurred_at,
         "Server": { "Id": server_id },
+        "ServerID": server_id,
+        "ServerName": lux_payload
+            .get("serverName")
+            .or_else(|| lux_payload.get("libraryName"))
+            .and_then(Value::as_str)
+            .unwrap_or(server_id),
+        "TimeStamp": OffsetDateTime::from_unix_timestamp(occurred_at)
+            .ok()
+            .and_then(|value| value.format(&Rfc3339).ok())
+            .unwrap_or_else(|| occurred_at.to_string()),
     });
     if let Some(item_id) = item_id {
         payload["Item"] = json!({ "Id": item_id });
+        payload["ItemID"] = json!(item_id);
+    }
+    let item_fields = [
+        ("itemType", "ItemType"),
+        ("itemName", "ItemName"),
+        ("itemNameParent", "ItemNameParent"),
+        ("itemNameGrandparent", "ItemNameGrandparent"),
+        ("indexNumber", "ItemIndex"),
+        ("parentIndexNumber", "ItemParentIndex"),
+    ];
+    for (source, target) in item_fields {
+        if let Some(value) = lux_payload.get(source) {
+            payload[target] = value.clone();
+            if let Some(item) = payload.get_mut("Item").and_then(Value::as_object_mut) {
+                let item_key = match source {
+                    "itemType" => "Type",
+                    "itemName" => "Name",
+                    "indexNumber" => "IndexNumber",
+                    "parentIndexNumber" => "ParentIndexNumber",
+                    _ => continue,
+                };
+                item.insert(item_key.to_owned(), value.clone());
+            }
+        }
     }
     if let Some(play_session_id) = play_session_id {
         payload["PlaySessionId"] = json!(play_session_id);
@@ -1322,9 +1357,17 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
         "sourceId" | "deletedFileCount" => {
             matches!(event_type, WebhookEventType::MediaRemoved)
         }
-        "itemId" => matches!(
+        "itemId"
+        | "itemType"
+        | "itemName"
+        | "itemNameParent"
+        | "itemNameGrandparent"
+        | "indexNumber"
+        | "parentIndexNumber" => matches!(
             event_type,
-            WebhookEventType::MediaRemoved
+            WebhookEventType::MediaAdded
+                | WebhookEventType::MediaRemoved
+                | WebhookEventType::MetadataUpdated
                 | WebhookEventType::PlaybackStarted
                 | WebhookEventType::PlaybackPaused
                 | WebhookEventType::PlaybackProgress
@@ -1990,6 +2033,12 @@ mod tests {
             WebhookPayloadFormat::Emby,
             json!({
                 "itemId": "item-1",
+                "itemType": "Episode",
+                "itemName": "第二集",
+                "itemNameParent": "第二季",
+                "itemNameGrandparent": "示例剧集",
+                "indexNumber": 2,
+                "parentIndexNumber": 2,
                 "playSessionId": "session-1",
                 "positionTicks": 42,
                 "itemTitle": "第二集",
@@ -2002,6 +2051,14 @@ mod tests {
         .expect("Emby payload should be accepted");
         assert_eq!(payload["Event"], "playback.start");
         assert_eq!(payload["Item"]["Id"], "item-1");
+        assert_eq!(payload["ItemID"], "item-1");
+        assert_eq!(payload["ItemType"], "Episode");
+        assert_eq!(payload["ItemName"], "第二集");
+        assert_eq!(payload["ItemNameParent"], "第二季");
+        assert_eq!(payload["ItemNameGrandparent"], "示例剧集");
+        assert_eq!(payload["ItemIndex"], 2);
+        assert_eq!(payload["ItemParentIndex"], 2);
+        assert_eq!(payload["ServerID"], "server-1");
         assert_eq!(payload["PlaySessionId"], "session-1");
         assert_eq!(payload["PositionTicks"], 42);
         assert!(payload.get("seriesTitle").is_none());

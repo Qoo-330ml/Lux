@@ -99,9 +99,6 @@ async fn playback_events_preserve_same_session_order_and_allow_new_session_rewin
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let admin_api_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
-        .rotate()
-        .await?;
     let app = app_with_state(AppState::ready(
         config,
         database.clone(),
@@ -492,10 +489,11 @@ async fn playback_events_preserve_same_session_order_and_allow_new_session_rewin
     );
     let implicit_stopped = client
         .post(format!("{event_url}/Stopped"))
-        .header("X-Lux-Api-Key", &admin_api_key)
+        .header("X-Emby-Token", &token)
         .json(&json!({
             "ItemId": emby_item_id,
             "MediaSourceId": source_id,
+            "DeviceId": "stop-device",
             "PositionTicks": 100,
         }))
         .send()
@@ -689,9 +687,22 @@ async fn playback_events_preserve_same_session_order_and_allow_new_session_rewin
             .await?;
         assert_eq!(ambiguous_playing.status(), reqwest::StatusCode::NO_CONTENT);
     }
+    let no_device_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "admin",
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(no_device_login.status(), reqwest::StatusCode::OK);
+    let no_device_token = no_device_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing administrator token without device metadata")?
+        .to_owned();
     let ambiguous_stopped = client
         .post(format!("{event_url}/Stopped"))
-        .header("X-Lux-Api-Key", &admin_api_key)
+        .header("X-Emby-Token", &no_device_token)
         .json(&json!({
             "ItemId": emby_item_id,
             "MediaSourceId": source_id,
@@ -779,9 +790,22 @@ async fn emby_session_stop_by_session_id_stops_only_owned_sessions_and_is_idempo
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
     let item_id = emby_public_id(&item_id);
+    let admin_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "admin",
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_token = admin_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing administrator token")?
+        .to_owned();
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
-        .header("X-Emby-Token", &admin_api_key)
+        .header("X-Emby-Token", &admin_token)
         .json(&json!({
             "ItemId": item_id,
             "MediaSourceId": source_id,

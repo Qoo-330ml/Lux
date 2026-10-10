@@ -54,11 +54,13 @@ describe("admin SSE events", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   it("opens one authenticated stream and invalidates matching queries", async () => {
+    vi.useFakeTimers();
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
 
@@ -79,10 +81,12 @@ describe("admin SSE events", () => {
     expect(source.url).toBe("/api/v1/admin/events");
 
     act(() => source.emit("open"));
+    act(() => vi.advanceTimersByTime(250));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["admin"] });
 
     invalidate.mockClear();
     act(() => source.emit("invalidate", JSON.stringify({ scope: "jobs" })));
+    act(() => vi.advanceTimersByTime(250));
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
       { queryKey: ["admin", "jobs"] },
       { queryKey: ["admin", "metadata-jobs"] },
@@ -116,6 +120,7 @@ describe("admin SSE events", () => {
   });
 
   it("does not refresh metadata jobs twice for metadata audit events", async () => {
+    vi.useFakeTimers();
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
 
@@ -132,6 +137,7 @@ describe("admin SSE events", () => {
     await act(async () => await Promise.resolve());
 
     act(() => FakeEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "metadata" })));
+    act(() => vi.advanceTimersByTime(250));
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
       { queryKey: ["admin", "logs"] },
     ]);

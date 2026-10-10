@@ -480,8 +480,13 @@ pub(super) async fn emby_search_hints(
     Query(query): Query<EmbySearchQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     let Some(raw_query) = query.search_term.as_deref() else {
@@ -506,13 +511,7 @@ pub(super) async fn emby_search_hints(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let page = match catalog
-        .search_items(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &search_query,
-            &like_query,
-            offset,
-            limit,
-        )
+        .search_items(principal, &search_query, &like_query, offset, limit)
         .await
     {
         Ok(page) => page,
@@ -1740,14 +1739,10 @@ pub(super) async fn emby_image(
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
-    let user = match require_emby_user_with_query(&headers, &state, &query).await {
-        Ok(user) => Some(user),
-        Err(StatusCode::UNAUTHORIZED) => None,
+    let principal = match optional_emby_access_principal(&headers, &state, &query).await {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let principal = user
-        .as_ref()
-        .map(|user| AccessPrincipal::new(user.id, user.is_admin));
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -1762,7 +1757,7 @@ pub(super) async fn emby_image(
     {
         return response;
     }
-    if (user.is_some() || query.tag.is_some())
+    if (principal.is_some() || query.tag.is_some())
         && let Some(response) = serve_emby_person_item_image(
             &state,
             &headers,
@@ -1783,10 +1778,10 @@ pub(super) async fn emby_image(
     // WebView can also issue the backdrop request with a browser UA, so keep the exception
     // limited to untagged backdrop artwork; media streams and tagged images remain gated.
     let untagged_backdrop_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
-        && user.is_none()
+        && principal.is_none()
         && query.tag.is_none()
         && normalize_image_type(&image_type) == Some("FANART");
-    if (filmly_compat || untagged_backdrop_compat) && user.is_none() {
+    if (filmly_compat || untagged_backdrop_compat) && principal.is_none() {
         return serve_filmly_compat_image(
             images,
             &headers,
@@ -1870,14 +1865,10 @@ pub(super) async fn emby_image_at_index(
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
-    let user = match require_emby_user_with_query(&headers, &state, &query).await {
-        Ok(user) => Some(user),
-        Err(StatusCode::UNAUTHORIZED) => None,
+    let principal = match optional_emby_access_principal(&headers, &state, &query).await {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let principal = user
-        .as_ref()
-        .map(|user| AccessPrincipal::new(user.id, user.is_admin));
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -1892,7 +1883,7 @@ pub(super) async fn emby_image_at_index(
     {
         return response;
     }
-    if (user.is_some() || query.tag.is_some())
+    if (principal.is_some() || query.tag.is_some())
         && let Some(response) = serve_emby_person_item_image(
             &state,
             &headers,
@@ -1909,7 +1900,7 @@ pub(super) async fn emby_image_at_index(
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if filmly_compat && user.is_none() {
+    if filmly_compat && principal.is_none() {
         return serve_filmly_compat_image(
             images,
             &headers,
@@ -1945,6 +1936,19 @@ pub(super) async fn emby_image_at_index(
             )
             .await
         }
+    }
+}
+
+async fn optional_emby_access_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyTokenQuery,
+) -> Result<Option<AccessPrincipal>, StatusCode> {
+    let has_credentials = emby_token_from_headers(headers).is_some() || query.api_key.is_some();
+    match require_emby_principal_with_query(headers, state, query).await {
+        Ok(auth_principal) => emby_access_principal(&auth_principal, None).map(Some),
+        Err(StatusCode::UNAUTHORIZED) if !has_credentials => Ok(None),
+        Err(status) => Err(status),
     }
 }
 
@@ -1991,8 +1995,13 @@ pub(super) async fn emby_update_person_or_library_image(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     if normalize_image_type(&image_type) != Some("POSTER") {
@@ -2008,7 +2017,7 @@ pub(super) async fn emby_update_person_or_library_image(
             .flatten()
             .is_some()
     {
-        if !user.can_manage_server {
+        if !auth_principal.can_manage_server() {
             return StatusCode::FORBIDDEN.into_response();
         }
         let Some(covers) = state.library_covers.as_ref() else {
@@ -2032,10 +2041,7 @@ pub(super) async fn emby_update_person_or_library_image(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -2077,8 +2083,13 @@ pub(super) async fn emby_subtitle_with_source(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     let Ok(stream_index) = stream_index.parse::<i64>() else {
@@ -2087,7 +2098,7 @@ pub(super) async fn emby_subtitle_with_source(
     let item_id = emby_internal_id(&item_id);
     serve_subtitle(
         &state,
-        AccessPrincipal::new(user.id, user.is_admin),
+        principal,
         &method,
         &item_id,
         Some(&media_source_id),
@@ -2103,23 +2114,20 @@ pub(super) async fn emby_subtitle_without_source(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     let Ok(stream_index) = stream_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let item_id = emby_internal_id(&item_id);
-    serve_subtitle(
-        &state,
-        AccessPrincipal::new(user.id, user.is_admin),
-        &method,
-        &item_id,
-        None,
-        stream_index,
-    )
-    .await
+    serve_subtitle(&state, principal, &method, &item_id, None, stream_index).await
 }
 
 #[derive(Default)]
@@ -2258,8 +2266,8 @@ pub(super) async fn emby_stream_principal(
         return Ok(AccessPrincipal::new(user_id, is_admin));
     }
 
-    let user = require_emby_user(headers, state, query.api_key.as_deref()).await?;
-    Ok(AccessPrincipal::new(user.id, user.is_admin))
+    let auth_principal = require_emby_principal(headers, state, query.api_key.as_deref()).await?;
+    emby_access_principal(&auth_principal, None)
 }
 
 pub(super) async fn emby_stream(
@@ -2395,26 +2403,27 @@ pub(super) async fn emby_download(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let item_id = emby_internal_id(&item_id);
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let source = match access
-        .authorized_playback_source(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &item_id,
-            query.media_source_id.as_deref(),
-        )
+        .authorized_playback_source(principal, &item_id, query.media_source_id.as_deref())
         .await
     {
         Ok(Some(source)) => source,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if !user.can_download {
+    if !auth_principal.can_download() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(downloads) = state.downloads.as_ref() else {
@@ -3472,6 +3481,8 @@ pub(super) fn lux_catalog_source_json(
         "editionName": source.edition_name,
         "qualityLabel": source.quality_label,
         "isDefault": source.is_default,
+        "versionKey": source.version_key(),
+        "partIndex": source.part_index(),
         "probeStatus": source.probe_status,
         "streams": source.streams.iter().map(|stream| json!({
             "index": stream.index,

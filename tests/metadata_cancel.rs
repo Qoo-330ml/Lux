@@ -151,8 +151,24 @@ async fn metadata_job_can_be_cancelled_while_running() -> Result<(), Box<dyn std
     let cancelled = metadata.get_job(&job_id).await?;
     assert_eq!(cancelled.status, "CANCELLED");
     assert!(cancelled.processed_count < cancelled.total_count);
+    let stale_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_reidentify_job_items
+         WHERE job_id = ? AND status IN ('PENDING', 'RUNNING')",
+    )
+    .bind(&job_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_items, 0);
     let retried = metadata.retry_job(&job_id).await?;
     assert_eq!(retried.status, "QUEUED");
+    let retryable_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_reidentify_job_items
+         WHERE job_id = ? AND status = 'PENDING'",
+    )
+    .bind(&job_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(retryable_items > 0);
     tmdb_server.abort();
     Ok(())
 }

@@ -121,7 +121,7 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"100
     .await?;
     let fake_ffmpeg = executable_script(
         temp_dir.path(),
-        "printf '1\\n00:00:00,000 --> 00:00:01,000\\nEmbedded Hello\\n'",
+        "#!/bin/sh\nprintf '1\\n00:00:00,000 --> 00:00:01,000\\nEmbedded Hello\\n'",
     )?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;

@@ -18,6 +18,7 @@ pub mod home;
 pub mod identification;
 pub mod image_repairs;
 pub mod images;
+pub(crate) mod internal_write;
 pub mod ip_location;
 pub mod item_merge;
 pub mod libraries;

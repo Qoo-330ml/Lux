@@ -42,14 +42,22 @@ pub(super) async fn emby_playback_info(
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let mut sources = item.media_sources.iter().collect::<Vec<_>>();
+    let sources = item.media_sources.iter().collect::<Vec<_>>();
     let query_media_source_requested = query.media_source_id.is_some();
-    sources.sort_by(|left, right| {
-        right
-            .is_default
-            .cmp(&left.is_default)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    // The catalog already grouped the parts of each version and ordered the versions; only
+    // move the default version (with all of its parts) to the front and keep the rest.
+    let default_version = sources
+        .iter()
+        .map(|source| {
+            crate::application::catalog::belongs_to_default_version(&item.media_sources, source)
+        })
+        .collect::<Vec<_>>();
+    let mut ranked = sources.into_iter().zip(default_version).collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, in_default_version)| !*in_default_version);
+    let mut sources = ranked
+        .into_iter()
+        .map(|(source, _)| source)
+        .collect::<Vec<_>>();
     if let Some(source_id) = query.media_source_id {
         let Some(index) = sources.iter().position(|source| source.id == source_id) else {
             return StatusCode::NOT_FOUND.into_response();
@@ -1057,7 +1065,7 @@ async fn standard_emby_playback_api_key(
     // for administration. Never copy it into a playback URL, even when it
     // was supplied as the query api_key.
     if let Some(service) = state.admin_api_key.as_ref() {
-        match service.resolve(&token).await {
+        match service.resolve_principal(&token).await {
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) => {}
         }
@@ -1808,14 +1816,18 @@ pub(super) async fn emby_sessions(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let user_id = user.id.to_string();
+    let user_id = auth_principal
+        .user_id()
+        .map(|user_id| user_id.to_string())
+        .unwrap_or_default();
     let active_within_seconds = match query.active_within_seconds {
         Some(seconds) if (1..=MAX_PLAYBACK_SESSION_WINDOW_SECONDS).contains(&seconds) => {
             Some(seconds)
@@ -1825,7 +1837,7 @@ pub(super) async fn emby_sessions(
     };
     let sessions = match database
         .list_playback_sessions(
-            (!user.is_admin).then_some(user_id.as_str()),
+            (!auth_principal.is_admin()).then_some(user_id.as_str()),
             active_within_seconds,
         )
         .await
@@ -1848,7 +1860,7 @@ pub(super) async fn emby_sessions(
             .collect::<std::collections::HashMap<_, _>>(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let user_names = if user.is_admin {
+    let user_names = if auth_principal.is_admin() {
         let session_user_ids = sessions
             .iter()
             .map(|session| session.user_id.clone())
@@ -1858,7 +1870,12 @@ pub(super) async fn emby_sessions(
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     } else {
-        std::collections::HashMap::from([(user_id.clone(), user.display_name.clone())])
+        auth_principal
+            .user()
+            .map(|user| {
+                std::collections::HashMap::from([(user_id.clone(), user.display_name.clone())])
+            })
+            .unwrap_or_default()
     };
     let catalog_items = if sessions.is_empty() {
         HashMap::new()
@@ -1883,10 +1900,11 @@ pub(super) async fn emby_sessions(
             )
             .into_response();
         };
-        match catalog
-            .find_items(AccessPrincipal::new(user.id, user.is_admin), &item_ids)
-            .await
-        {
+        let access_principal = match emby_access_principal(&auth_principal, None) {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+        match catalog.find_items(access_principal, &item_ids).await {
             Ok(items) => items,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
@@ -1913,10 +1931,11 @@ pub(super) async fn emby_stop_session(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1925,8 +1944,10 @@ pub(super) async fn emby_stop_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let user_id = user.id.to_string();
-    if !user.is_admin && session.user_id != user_id {
+    if let Some(user) = auth_principal.user()
+        && !user.is_admin
+        && session.user_id != user.id.to_string()
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
     if let Some(transcode_session_id) =
@@ -4033,21 +4054,22 @@ pub(super) async fn handle_emby_user_flag(
     played: bool,
     value: bool,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let target_user_id = principal.user_id_string();
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let item_id = emby_internal_id(&item_id);
-    match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
-        .await
-    {
+    match access.can_view_item(principal, &item_id).await {
         Ok(true) => {}
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -4057,24 +4079,27 @@ pub(super) async fn handle_emby_user_flag(
     };
     let result = if played {
         database
-            .set_user_item_played(&user_id, &item_id, value)
+            .set_user_item_played(&target_user_id, &item_id, value)
             .await
     } else {
         database
-            .set_user_item_favorite(&user_id, &item_id, value)
+            .set_user_item_favorite(&target_user_id, &item_id, value)
             .await
     };
     match result {
         Ok(()) => {
             if played
                 && database
-                    .sync_played_container_states(&user_id, &item_id)
+                    .sync_played_container_states(&target_user_id, &item_id)
                     .await
                     .is_err()
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            let user_state = match database.find_user_item_state(&user_id, &item_id).await {
+            let user_state = match database
+                .find_user_item_state(&target_user_id, &item_id)
+                .await
+            {
                 Ok(user_state) => user_state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };

@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
+    io::Cursor,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,6 +34,7 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError, StoredItemImage,
+        StoredMediaWritebackContext,
     },
 };
 
@@ -44,15 +46,11 @@ const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
 const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
 const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
-const INTERNAL_IMAGE_WRITE_MARKER_TTL: Duration = Duration::from_secs(15);
 pub(crate) const MAX_IMAGE_VARIANTS: usize = 4;
 
 static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<ImagePermitPool>> = OnceLock::new();
 static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<ImagePermitPool>> = OnceLock::new();
 static IMAGE_ITEM_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
-static INTERNAL_IMAGE_WRITES: OnceLock<StdMutex<HashMap<PathBuf, InternalImageWriteMarker>>> =
-    OnceLock::new();
-
 struct ImagePermitPool {
     maximum: usize,
     active: std::sync::atomic::AtomicUsize,
@@ -128,73 +126,20 @@ impl Drop for ImagePermit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InternalImageWriteMarker {
-    expires_at: Instant,
-    expected_stamp: Option<ImageFileStamp>,
-}
-
-fn internal_image_write_registry() -> &'static StdMutex<HashMap<PathBuf, InternalImageWriteMarker>>
-{
-    INTERNAL_IMAGE_WRITES.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
 pub(crate) fn register_internal_image_write(path: &Path) {
-    let now = Instant::now();
-    let mut registry = match internal_image_write_registry().lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    registry.retain(|_, marker| marker.expires_at > now);
-    registry.insert(
-        path.to_owned(),
-        InternalImageWriteMarker {
-            expires_at: now + INTERNAL_IMAGE_WRITE_MARKER_TTL,
-            expected_stamp: None,
-        },
-    );
+    crate::application::internal_write::register(path);
 }
 
-fn finalize_internal_image_write(path: &Path, expected_stamp: Option<ImageFileStamp>) {
-    let now = Instant::now();
-    let mut registry = match internal_image_write_registry().lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    registry.retain(|_, marker| marker.expires_at > now);
-    if let Some(marker) = registry.get_mut(path) {
-        marker.expected_stamp = expected_stamp;
-    }
+fn finalize_internal_image_write(
+    path: &Path,
+    expected_stamp: Option<ImageFileStamp>,
+    content: &[u8],
+) {
+    crate::application::internal_write::finalize(path, expected_stamp, content);
 }
 
 pub(crate) async fn should_suppress_internal_image_write(path: &Path) -> bool {
-    let now = Instant::now();
-    let marker = {
-        let mut registry = match internal_image_write_registry().lock() {
-            Ok(registry) => registry,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        registry.retain(|_, marker| marker.expires_at > now);
-        registry.get(path).copied()
-    };
-    let Some(marker) = marker else {
-        return false;
-    };
-    let Some(expected_stamp) = marker.expected_stamp else {
-        return true;
-    };
-    if image_file_stamp(path).await.ok().flatten() == Some(expected_stamp) {
-        return true;
-    }
-
-    let mut registry = match internal_image_write_registry().lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if registry.get(path).copied() == Some(marker) {
-        registry.remove(path);
-    }
-    false
+    crate::application::internal_write::should_suppress(path).await
 }
 
 fn global_image_download_permits() -> Arc<ImagePermitPool> {
@@ -275,17 +220,18 @@ pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
 
 pub(crate) async fn read_image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i32, i32)> {
     let bytes = bytes.to_owned();
-    tokio::task::spawn_blocking(move || {
-        image::load_from_memory(&bytes).ok().and_then(|image| {
-            Some((
-                i32::try_from(image.width()).ok()?,
-                i32::try_from(image.height()).ok()?,
-            ))
-        })
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || image_dimensions_from_bytes(&bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i32, i32)> {
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
 }
 
 pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
@@ -293,12 +239,7 @@ pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
 ) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
     tokio::task::spawn_blocking(move || {
         let content_tag = format!("{:x}", Sha256::digest(&bytes));
-        let dimensions = image::load_from_memory(&bytes).ok().and_then(|image| {
-            Some((
-                i32::try_from(image.width()).ok()?,
-                i32::try_from(image.height()).ok()?,
-            ))
-        });
+        let dimensions = image_dimensions_from_bytes(&bytes);
         Ok((content_tag, dimensions))
     })
     .await
@@ -856,7 +797,7 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, false)
+        self.local_image_types_impl(item_id, image_types, false, None, None)
             .await
     }
 
@@ -865,8 +806,26 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, true)
+        self.local_image_types_impl(item_id, image_types, true, None, None)
             .await
+    }
+
+    pub(crate) async fn local_image_types_with_indexed_images_and_context(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+        include_fallback: bool,
+        indexed_images: &[StoredItemImage],
+        writeback_context: &StoredMediaWritebackContext,
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
+        self.local_image_types_impl(
+            item_id,
+            image_types,
+            include_fallback,
+            Some(indexed_images),
+            Some(writeback_context),
+        )
+        .await
     }
 
     pub(crate) async fn fallback_image_types(
@@ -906,6 +865,8 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
         include_fallback: bool,
+        indexed_images: Option<&[StoredItemImage]>,
+        writeback_context: Option<&StoredMediaWritebackContext>,
     ) -> Result<BTreeSet<String>, ImageWriteError> {
         let image_types = image_types
             .iter()
@@ -914,10 +875,39 @@ impl ImageWriteService {
                     .ok_or_else(|| ImageWriteError::InvalidImageType((*image_type).to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(indexed_images) = indexed_images {
+            return self
+                .local_image_types_from_indexed_images(
+                    item_id,
+                    &image_types,
+                    include_fallback,
+                    indexed_images,
+                    writeback_context,
+                )
+                .await;
+        }
         let indexed_images = self.database.list_item_images(item_id).await?;
+        self.local_image_types_from_indexed_images(
+            item_id,
+            &image_types,
+            include_fallback,
+            &indexed_images,
+            writeback_context,
+        )
+        .await
+    }
+
+    async fn local_image_types_from_indexed_images(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+        include_fallback: bool,
+        indexed_images: &[StoredItemImage],
+        writeback_context: Option<&StoredMediaWritebackContext>,
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
         let mut found = BTreeSet::new();
 
-        for image_type in &image_types {
+        for &image_type in image_types {
             let mut indexed_exists = false;
             for image in indexed_images.iter().filter(|image| {
                 image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == 0
@@ -932,7 +922,7 @@ impl ImageWriteService {
                 }
             }
             if indexed_exists {
-                found.insert((*image_type).to_owned());
+                found.insert(image_type.to_owned());
             }
         }
 
@@ -943,11 +933,11 @@ impl ImageWriteService {
             reject_metadata_symlinks(&root).await?;
             reject_metadata_symlinks(&directory).await?;
             let paths = read_image_directory_entries(&directory).await?;
-            for image_type in &image_types {
+            for &image_type in image_types {
                 for image_index in 0..MAX_IMAGE_VARIANTS {
                     let stems = image_lookup_stems(image_type, None, None, image_index as i64)?;
                     if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
-                        && !found.contains(*image_type)
+                        && !found.contains(image_type)
                         && !is_legacy_episode_fanart_path_for_type(
                             image_type,
                             None,
@@ -956,27 +946,30 @@ impl ImageWriteService {
                         )
                         && (include_fallback
                             || !indexed_image_path_is_fallback(
-                                &indexed_images,
+                                indexed_images,
                                 image_type,
                                 image_index as i64,
                                 &path,
                             )
                             .await?)
-                        && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
+                        && !image_path_is_owned_by_other_type(indexed_images, image_type, &path)
                             .await?
                         && image_file_stamp(&path).await?.is_some()
                     {
-                        found.insert((*image_type).to_owned());
+                        found.insert(image_type.to_owned());
                         break;
                     }
                 }
             }
         }
 
-        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let (_, directory, movie_stem, episode_stem) = match writeback_context {
+            Some(context) => self.writeback_paths_for_context(item_id, context).await?,
+            None => self.writeback_paths(item_id).await?,
+        };
         let paths = read_image_directory_entries(&directory).await?;
-        for image_type in &image_types {
-            if found.contains(*image_type) {
+        for &image_type in image_types {
+            if found.contains(image_type) {
                 continue;
             }
             for image_index in 0..MAX_IMAGE_VARIANTS {
@@ -995,17 +988,16 @@ impl ImageWriteService {
                     )
                     && (include_fallback
                         || !indexed_image_path_is_fallback(
-                            &indexed_images,
+                            indexed_images,
                             image_type,
                             image_index as i64,
                             &path,
                         )
                         .await?)
-                    && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
-                        .await?
+                    && !image_path_is_owned_by_other_type(indexed_images, image_type, &path).await?
                     && image_file_stamp(&path).await?.is_some()
                 {
-                    found.insert((*image_type).to_owned());
+                    found.insert(image_type.to_owned());
                     break;
                 }
             }
@@ -1384,6 +1376,26 @@ impl ImageWriteService {
             }
         }
         .ok_or(ImageWriteError::ItemNotFound)?;
+        self.writeback_paths_for_context(
+            item_id,
+            &StoredMediaWritebackContext {
+                item_type,
+                source: Some(source),
+            },
+        )
+        .await
+    }
+
+    async fn writeback_paths_for_context(
+        &self,
+        item_id: &str,
+        context: &StoredMediaWritebackContext,
+    ) -> Result<(PathBuf, PathBuf, Option<String>, Option<String>), ImageWriteError> {
+        let item_type = context.item_type.as_str();
+        let source = context
+            .source
+            .as_ref()
+            .ok_or(ImageWriteError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| image_io_error(Path::new(&source.root_path), error))?;
@@ -2200,7 +2212,7 @@ pub async fn write_image_atomically(target: &Path, bytes: &[u8]) -> Result<(), I
             .sync_all()
             .await
             .map_err(|source| image_io_error(parent, source))?;
-        finalize_internal_image_write(target, image_file_stamp(target).await.ok().flatten());
+        finalize_internal_image_write(target, image_file_stamp(target).await.ok().flatten(), bytes);
         Ok(())
     }
     .await;
@@ -2210,30 +2222,17 @@ pub async fn write_image_atomically(target: &Path, bytes: &[u8]) -> Result<(), I
     result
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ImageFileStamp {
-    size: u64,
-    modified: Option<(u64, u32)>,
-}
+type ImageFileStamp = crate::application::internal_write::FileStamp;
 
 async fn image_file_stamp(path: &Path) -> Result<Option<ImageFileStamp>, ImageWriteError> {
-    let metadata = match fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(image_io_error(path, source)),
-    };
-    if metadata.file_type().is_symlink() {
+    if let Ok(metadata) = fs::symlink_metadata(path).await
+        && metadata.file_type().is_symlink()
+    {
         return Err(ImageWriteError::SymlinkTarget(path.to_owned()));
     }
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| (value.as_secs(), value.subsec_nanos()));
-    Ok(Some(ImageFileStamp {
-        size: metadata.len(),
-        modified,
-    }))
+    crate::application::internal_write::file_stamp(path)
+        .await
+        .map_err(|source| image_io_error(path, source))
 }
 
 async fn reject_metadata_symlinks(path: &Path) -> Result<(), ImageWriteError> {
@@ -2848,6 +2847,24 @@ mod tests {
             .expect("metadata worker");
         assert_eq!(content_tag.len(), 64);
         assert_eq!(dimensions, Some((3, 2)));
+    }
+
+    #[tokio::test]
+    async fn combined_local_image_metadata_reads_dimensions_from_header() {
+        // The header describes a large image, while the deliberately invalid
+        // IDAT payload prevents a full pixel decode. A metadata-only reader
+        // can still read the dimensions without decoding.
+        let bytes = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x1f, 0x40, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0xa2, 0x2e, 0x16, 0xb2, 0x00, 0x00, 0x00, 0x03, 0x49, 0x44, 0x41, 0x54, 0x62,
+            0x61, 0x64, 0x84, 0xa0, 0xae, 0x4b, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+            0xae, 0x42, 0x60, 0x82,
+        ];
+        let (_, dimensions) = image_content_tag_and_dimensions_from_bytes(bytes)
+            .await
+            .expect("metadata worker");
+        assert_eq!(dimensions, Some((10_000, 8_000)));
     }
 
     #[tokio::test]

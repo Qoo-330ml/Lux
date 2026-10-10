@@ -140,6 +140,8 @@ async fn emby_item_counts_respects_auth_user_scope_and_favorites()
     assert_eq!(admin_body["ItemCount"], 7);
     assert_eq!(admin_body["SongCount"], 0);
 
+    let viewer_token = emby_login(&client, &base_url, "viewer", "viewer password").await?;
+
     let root_counts = client
         .get(format!("{base_url}/Items/Counts"))
         .header("X-Emby-Token", &admin_token)
@@ -150,7 +152,7 @@ async fn emby_item_counts_respects_auth_user_scope_and_favorites()
 
     let viewer_counts = client
         .get(format!("{base_url}/emby/Items/Counts?UserId={}", viewer.id))
-        .header("X-Emby-Token", &admin_token)
+        .header("X-Emby-Token", &viewer_token)
         .send()
         .await?;
     assert_eq!(viewer_counts.status(), reqwest::StatusCode::OK);
@@ -165,7 +167,7 @@ async fn emby_item_counts_respects_auth_user_scope_and_favorites()
             "{base_url}/emby/Items/Counts?UserId={}&IsFavorite=true",
             viewer.id
         ))
-        .header("X-Emby-Token", &admin_token)
+        .header("X-Emby-Token", &viewer_token)
         .send()
         .await?;
     assert_eq!(viewer_favorites.status(), reqwest::StatusCode::OK);

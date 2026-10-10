@@ -2,6 +2,7 @@ use super::*;
 
 const PERSON_MANIFEST_IDENTITY_BATCH_SIZE: usize = 100;
 const PERSON_MANIFEST_STATE_QUERY_BATCH_SIZE: usize = 100;
+const PERSON_CREDIT_REPLACEMENT_BATCH_SIZE: usize = 16;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PersonCreditKey {
@@ -369,15 +370,79 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace_person_credits_with_fingerprint(
         &self,
         item_id: &str,
         credits: &[NewPersonCredit],
         source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
-        let _metadata_write_guard = self.acquire_metadata_write_lock().await;
-        let _write_guard = self.person_credits_write_lock.lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.replace_person_credits_with_relation_checksum(
+            item_id,
+            credits,
+            source_fingerprint,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn replace_person_credits_with_relation_checksum(
+        &self,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
+        relation_checksum: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.replace_person_credits_batch_with_relation_checksum(&[(
+            item_id,
+            credits,
+            source_fingerprint,
+            relation_checksum,
+        )])
+        .await
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn replace_person_credits_batch_with_relation_checksum(
+        &self,
+        replacements: &[(&str, &[NewPersonCredit], Option<&str>, Option<&str>)],
+    ) -> Result<(), StorageError> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        for replacement_chunk in replacements.chunks(PERSON_CREDIT_REPLACEMENT_BATCH_SIZE) {
+            let _metadata_write_guard = self.acquire_metadata_write_lock().await;
+            let _write_guard = self.person_credits_write_lock.lock().await;
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            for (item_id, credits, source_fingerprint, relation_checksum) in replacement_chunk {
+                self.replace_person_credits_in_transaction(
+                    &mut transaction,
+                    item_id,
+                    credits,
+                    *source_fingerprint,
+                    *relation_checksum,
+                )
+                .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn replace_person_credits_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
+        relation_checksum: Option<&str>,
+    ) -> Result<(), StorageError> {
         let mut seen_keys = HashSet::with_capacity(credits.len());
         let mut duplicates_skipped = 0;
         let mut prepared = Vec::with_capacity(credits.len());
@@ -413,7 +478,7 @@ impl Database {
                  WHERE item_id = ?",
             )
             .bind(item_id)
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -454,7 +519,7 @@ impl Database {
                     .bind(&key.role);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -528,7 +593,7 @@ impl Database {
                     .bind(&credit.lux_person_id);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -544,28 +609,23 @@ impl Database {
         }
         self.query(
             "INSERT INTO person_index_item_state (
-                item_id, source_fingerprint, relation_schema_version, updated_at
-             ) VALUES (?, ?, 2, unixepoch())
+                item_id, source_fingerprint, relation_schema_version, relation_checksum, updated_at
+             ) VALUES (?, ?, 2, ?, unixepoch())
              ON CONFLICT(item_id) DO UPDATE SET
                 source_fingerprint = excluded.source_fingerprint,
                 relation_schema_version = excluded.relation_schema_version,
+                relation_checksum = excluded.relation_checksum,
                 updated_at = excluded.updated_at",
         )
         .bind(item_id)
         .bind(source_fingerprint)
-        .execute(&mut *transaction)
+        .bind(relation_checksum)
+        .execute(&mut **transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         Ok(())
     }
 
@@ -1752,7 +1812,7 @@ impl Database {
         self.query(
             "INSERT INTO legacy_person_migration_state (id, status, schema_version, updated_at)
              VALUES (1, 'COMPLETED', ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
+            ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 schema_version = excluded.schema_version,
                 updated_at = excluded.updated_at",
@@ -1778,7 +1838,9 @@ impl Database {
              ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 schema_version = excluded.schema_version,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE person_manifest_restore_state.status <> 'PENDING'
+                OR person_manifest_restore_state.schema_version <> excluded.schema_version",
         )
         .bind(schema_version)
         .bind(current_unix_timestamp())

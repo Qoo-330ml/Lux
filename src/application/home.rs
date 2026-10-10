@@ -154,7 +154,7 @@ impl HomeService {
         library_ids.sort_unstable();
         library_ids.dedup();
         let recommended = self.carousel(principal, library_ids.clone()).await?;
-        let user_id = principal.user_id.to_string();
+        let user_id = principal.user_id_string();
         let (continue_watching, recently_added, latest_groups, views) = tokio::try_join!(
             async {
                 self.inner
@@ -219,7 +219,7 @@ impl HomeService {
         library_ids: &[String],
     ) -> Result<Arc<CachedHomeSnapshot>, HomeError> {
         let key = HomeCacheKey {
-            user_id: principal.user_id.to_string(),
+            user_id: principal.user_id_string(),
             is_admin: principal.is_admin,
             library_ids: library_ids.to_vec(),
         };
@@ -475,7 +475,7 @@ impl HomeService {
         principal: AccessPrincipal,
         accessible_library_ids: &[String],
     ) -> Result<CachedHomeSnapshot, HomeError> {
-        let user_id = principal.user_id.to_string();
+        let user_id = principal.user_id_string();
         let recommended = self
             .inner
             .catalog

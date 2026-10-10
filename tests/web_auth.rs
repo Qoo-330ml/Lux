@@ -198,6 +198,139 @@ async fn expired_web_sessions_are_rejected() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
+async fn authenticated_user_can_change_own_password() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server) = test_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "admin password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_session = cookie_value(admin_login.headers(), "lux_session");
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let admin_cookie = format!("lux_session={admin_session}; lux_csrf={admin_csrf}");
+
+    let create_user = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "username": "regular",
+            "displayName": "Regular",
+            "password": "old password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(create_user.status(), reqwest::StatusCode::CREATED);
+
+    let regular_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "regular", "password": "old password" }))
+        .send()
+        .await?;
+    assert_eq!(regular_login.status(), reqwest::StatusCode::OK);
+    let regular_session = cookie_value(regular_login.headers(), "lux_session");
+    let regular_csrf = cookie_value(regular_login.headers(), "lux_csrf");
+    let regular_cookie = format!("lux_session={regular_session}; lux_csrf={regular_csrf}");
+
+    let missing_csrf = client
+        .patch(format!("{base_url}/api/v1/auth/password"))
+        .header(COOKIE, &regular_cookie)
+        .json(&json!({
+            "currentPassword": "old password",
+            "newPassword": "new password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let wrong_current = client
+        .patch(format!("{base_url}/api/v1/auth/password"))
+        .header(COOKIE, &regular_cookie)
+        .header("x-csrf-token", &regular_csrf)
+        .json(&json!({
+            "currentPassword": "wrong password",
+            "newPassword": "new password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(wrong_current.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        wrong_current.json::<serde_json::Value>().await?["error"]["code"],
+        "INVALID_CREDENTIALS"
+    );
+
+    let empty_new_password = client
+        .patch(format!("{base_url}/api/v1/auth/password"))
+        .header(COOKIE, &regular_cookie)
+        .header("x-csrf-token", &regular_csrf)
+        .json(&json!({
+            "currentPassword": "old password",
+            "newPassword": ""
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        empty_new_password.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let changed = client
+        .patch(format!("{base_url}/api/v1/auth/password"))
+        .header(COOKIE, &regular_cookie)
+        .header("x-csrf-token", &regular_csrf)
+        .json(&json!({
+            "currentPassword": "old password",
+            "newPassword": "new password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(changed.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let current_session = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &regular_cookie)
+        .send()
+        .await?;
+    assert_eq!(current_session.status(), reqwest::StatusCode::OK);
+
+    let old_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "regular", "password": "old password" }))
+        .send()
+        .await?;
+    assert_eq!(old_login.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let new_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "regular", "password": "new password" }))
+        .send()
+        .await?;
+    assert_eq!(new_login.status(), reqwest::StatusCode::OK);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn avatar_upload_requires_csrf_and_survives_a_second_login()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

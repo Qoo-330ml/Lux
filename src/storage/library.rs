@@ -1,5 +1,7 @@
 use super::*;
 
+const SCHEDULED_TASK_CONFIG_OWNER_BATCH_SIZE: usize = 500;
+
 struct LibraryTaskPlanAssignment {
     id: String,
     task_name: String,
@@ -295,6 +297,38 @@ impl Database {
         Ok(id)
     }
 
+    async fn insert_library_scrapers_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        scrapers: &[crate::library::LibraryScraper],
+    ) -> Result<(), StorageError> {
+        for chunk in scrapers.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                 VALUES {values}"
+            )));
+            for scraper in chunk {
+                query = query
+                    .bind(library_id)
+                    .bind(&scraper.scraper_id)
+                    .bind(scraper.position)
+                    .bind(scraper.role.as_str());
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -330,22 +364,8 @@ impl Database {
             source,
         })?;
 
-        for scraper in library.scrapers {
-            self.query(
-                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(library.id)
-            .bind(&scraper.scraper_id)
-            .bind(scraper.position)
-            .bind(scraper.role.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        self.insert_library_scrapers_in_transaction(&mut transaction, library.id, library.scrapers)
+            .await?;
 
         let registrations = [
             (
@@ -439,17 +459,20 @@ impl Database {
             })
     }
 
-    pub(crate) async fn person_index_item_state_is_current(
+    pub(crate) async fn person_index_item_state_matches_snapshot(
         &self,
         item_id: &str,
         source_fingerprint: Option<&str>,
+        relation_checksum: Option<&str>,
     ) -> Result<bool, StorageError> {
-        let Some(source_fingerprint) = source_fingerprint else {
+        let (Some(source_fingerprint), Some(relation_checksum)) =
+            (source_fingerprint, relation_checksum)
+        else {
             return Ok(false);
         };
         let row = self
             .query(
-                "SELECT source_fingerprint, relation_schema_version
+                "SELECT source_fingerprint, relation_schema_version, relation_checksum
                  FROM person_index_item_state WHERE item_id = ?",
             )
             .bind(item_id)
@@ -463,6 +486,8 @@ impl Database {
             row.get::<Option<String>, _>("source_fingerprint")
                 .as_deref()
                 == Some(source_fingerprint)
+                && row.get::<Option<String>, _>("relation_checksum").as_deref()
+                    == Some(relation_checksum)
                 && row.get::<i64, _>("relation_schema_version") == 2
         }))
     }
@@ -685,6 +710,54 @@ impl Database {
             cover_image_tag: row.get("cover_image_tag"),
             media_strategy_json: row.get("media_strategy_json"),
         }))
+    }
+
+    pub(crate) async fn assign_chapter_source_to_unassigned_libraries(
+        &self,
+        plugin_id: &str,
+        library_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if library_ids.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for chunk in library_ids.chunks(100) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE libraries
+                 SET chapter_source_id = ?, updated_at = unixepoch()
+                 WHERE kind <> 'MOVIE'
+                   AND chapter_source_id IS NULL
+                   AND id IN ({placeholders})"
+            )));
+            query = query.bind(plugin_id);
+            for library_id in chunk {
+                query = query.bind(library_id);
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn register_auto_library_cover_task(
@@ -925,7 +998,8 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE library_cover_jobs
-             SET status = ?, error = ?, processed_count = CASE
+             SET status = ?, error = ?,
+                 processed_count = CASE
                     WHEN ? = 'COMPLETED' THEN total_count ELSE processed_count END,
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
@@ -1162,22 +1236,8 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            for scraper in scrapers {
-                self.query(
-                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(library_id)
-                .bind(&scraper.scraper_id)
-                .bind(scraper.position)
-                .bind(scraper.role.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            }
+            self.insert_library_scrapers_in_transaction(&mut transaction, library_id, scrapers)
+                .await?;
             let primary_scraper = scrapers.first().map(|scraper| scraper.scraper_id.as_str());
             self.query(
                 "UPDATE libraries
@@ -2569,11 +2629,28 @@ impl Database {
         })
     }
 
-    pub(crate) async fn disable_plugin_scheduled_task(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_plugin_library_scheduled_tasks(
         &self,
-        plugin_id: &str,
+        owner_ids: &[String],
         task_type: &str,
+        task_name: &str,
+        task_description: &str,
+        plugin_id: &str,
+        schedule: &str,
+        is_enabled: bool,
+        resource_limit_json: &str,
     ) -> Result<(), StorageError> {
+        let mut unique_owner_ids = Vec::with_capacity(owner_ids.len());
+        let mut seen_owner_ids = HashSet::with_capacity(owner_ids.len());
+        for owner_id in owner_ids {
+            if seen_owner_ids.insert(owner_id) {
+                unique_owner_ids.push(owner_id);
+            }
+        }
+        if unique_owner_ids.is_empty() {
+            return Ok(());
+        }
         let mut transaction = self
             .pool
             .begin()
@@ -2582,32 +2659,107 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query(
+        for chunk in unique_owner_ids.chunks(100) {
+            let rows =
+                std::iter::repeat_n("('LIBRARY', ?, ?, ?, ?, 'PLUGIN', ?, ?, ?, ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+                 ) VALUES {rows}
+                 ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                    task_name = excluded.task_name,
+                    task_description = excluded.task_description,
+                    source_type = excluded.source_type,
+                    plugin_id = excluded.plugin_id,
+                    cron_or_interval = excluded.cron_or_interval,
+                    is_enabled = excluded.is_enabled,
+                    resource_limit_json = excluded.resource_limit_json,
+                    updated_at = unixepoch()"
+            )));
+            for owner_id in chunk {
+                query = query
+                    .bind(*owner_id)
+                    .bind(task_type)
+                    .bind(task_name)
+                    .bind(task_description)
+                    .bind(plugin_id)
+                    .bind(schedule)
+                    .bind(database_flag(is_enabled))
+                    .bind(resource_limit_json);
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn disable_plugin_scheduled_tasks(
+        &self,
+        plugin_id: &str,
+        task_types: &[String],
+    ) -> Result<(), StorageError> {
+        if task_types.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", task_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut config_update = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_configs
              SET is_enabled = 0, updated_at = unixepoch()
-             WHERE source_type = 'PLUGIN' AND plugin_id = ? AND task_type = ?",
-        )
-        .bind(plugin_id)
-        .bind(task_type)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
+             WHERE source_type = 'PLUGIN' AND plugin_id = ?
+               AND task_type IN ({placeholders})"
+        )));
+        config_update = config_update.bind(plugin_id);
+        for task_type in task_types {
+            config_update = config_update.bind(task_type);
+        }
+        config_update
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut plan_update = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_plans
              SET is_enabled = 0, updated_at = unixepoch()
-             WHERE source_type = 'PLUGIN' AND plugin_id = ? AND task_type = ?",
-        )
-        .bind(plugin_id)
-        .bind(task_type)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+             WHERE source_type = 'PLUGIN' AND plugin_id = ?
+               AND task_type IN ({placeholders})"
+        )));
+        plan_update = plan_update.bind(plugin_id);
+        for task_type in task_types {
+            plan_update = plan_update.bind(task_type);
+        }
+        plan_update
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         transaction
             .commit()
             .await
@@ -2903,6 +3055,58 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_scheduled_task_configs_by_owner_ids(
+        &self,
+        owner_type: &str,
+        owner_ids: &[String],
+        task_type: &str,
+    ) -> Result<HashMap<String, StoredScheduledTaskConfig>, StorageError> {
+        let mut unique_owner_ids = Vec::with_capacity(owner_ids.len());
+        let mut seen_owner_ids = HashSet::with_capacity(owner_ids.len());
+        for owner_id in owner_ids {
+            if seen_owner_ids.insert(owner_id.clone()) {
+                unique_owner_ids.push(owner_id.clone());
+            }
+        }
+        let mut configs = HashMap::with_capacity(unique_owner_ids.len());
+        for chunk in unique_owner_ids.chunks(SCHEDULED_TASK_CONFIG_OWNER_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT s.owner_type, s.owner_id, s.task_type, s.plan_id, s.task_name,
+                        s.task_description, s.source_type, s.plugin_id,
+                        s.cron_or_interval, s.is_enabled, s.resource_limit_json,
+                        s.created_at, s.updated_at,
+                        l.name AS library_name
+                 FROM scheduled_task_configs s
+                 LEFT JOIN libraries l
+                   ON s.owner_type = 'LIBRARY' AND l.id = s.owner_id
+                 WHERE s.owner_type = ? AND s.task_type = ?
+                   AND s.owner_id IN ({placeholders})"
+            )));
+            query = query.bind(owner_type).bind(task_type);
+            for owner_id in chunk {
+                query = query.bind(owner_id);
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                let config = stored_scheduled_task(row);
+                configs.insert(config.owner_id.clone(), config);
+            }
+        }
+        Ok(configs)
     }
 
     pub(crate) async fn library_exists(&self, library_id: &str) -> Result<bool, StorageError> {
@@ -3432,7 +3636,7 @@ mod scheduled_task_plan_mirror_tests {
         .expect("plugin config should be inserted");
 
         database
-            .disable_plugin_scheduled_task("org.lux.danmaku", "DANMAKU_MATCH")
+            .disable_plugin_scheduled_tasks("org.lux.danmaku", &["DANMAKU_MATCH".to_owned()])
             .await
             .expect("plugin task should be disabled");
 
@@ -3450,6 +3654,98 @@ mod scheduled_task_plan_mirror_tests {
         .expect("plugin plan should remain available");
         assert_eq!(config_enabled, 0);
         assert_eq!(plan_enabled, 0);
+    }
+
+    #[tokio::test]
+    async fn disabling_multiple_plugin_tasks_batches_the_same_updates() {
+        let (_temp_dir, database) = test_database().await;
+        for (task_type, plan_id) in [
+            ("PLUGIN_TASK_ONE", "plugin-plan-one"),
+            ("PLUGIN_TASK_TWO", "plugin-plan-two"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_task_plans (
+                    id, task_type, plan_name, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, scope_type, is_default
+                 ) VALUES (?, ?, 'Plugin plan', 'Plugin task', 'Plugin task',
+                           'PLUGIN', 'org.lux.test-plugin', '0 2 * * *', 1,
+                           '{}', 'GLOBAL', 1)",
+            )
+            .bind(plan_id)
+            .bind(task_type)
+            .execute(database.pool())
+            .await
+            .expect("plugin plan should be inserted");
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, plan_id
+                 ) VALUES ('GLOBAL', 'global', ?, 'Plugin task', 'Plugin task',
+                           'PLUGIN', 'org.lux.test-plugin', '0 2 * * *', 1, '{}', ?)",
+            )
+            .bind(task_type)
+            .bind(plan_id)
+            .execute(database.pool())
+            .await
+            .expect("plugin task config should be inserted");
+        }
+
+        database.reset_query_count();
+        database
+            .disable_plugin_scheduled_tasks(
+                "org.lux.test-plugin",
+                &["PLUGIN_TASK_ONE".to_owned(), "PLUGIN_TASK_TWO".to_owned()],
+            )
+            .await
+            .expect("plugin tasks should be disabled");
+
+        assert_eq!(
+            database.query_count(),
+            2,
+            "both task types should share the two mirror updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_library_task_registration_uses_bounded_batches() {
+        const OWNER_COUNT: usize = 205;
+        let (_temp_dir, database) = test_database().await;
+        let owner_ids = (0..OWNER_COUNT)
+            .map(|index| format!("plugin-library-owner-{index:03}"))
+            .collect::<Vec<_>>();
+        let mut owner_ids = owner_ids;
+        owner_ids.push(owner_ids[0].clone());
+
+        database.reset_query_count();
+        database
+            .register_plugin_library_scheduled_tasks(
+                &owner_ids,
+                "PLUGIN_LIBRARY_BATCH",
+                "Plugin library task",
+                "Plugin library task",
+                "org.lux.test-plugin",
+                "0 2 * * *",
+                true,
+                "{}",
+            )
+            .await
+            .expect("library plugin tasks should register");
+
+        assert_eq!(
+            database.query_count(),
+            3,
+            "library plugin task registration should use bounded multi-row upserts"
+        );
+        let registered_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_configs
+             WHERE task_type = 'PLUGIN_LIBRARY_BATCH'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("library plugin task count should be queryable");
+        assert_eq!(registered_count, OWNER_COUNT as i64);
     }
 
     #[tokio::test]
@@ -3664,5 +3960,170 @@ mod scheduled_task_plan_mirror_tests {
         assert_eq!(mirror.1, default_schedule_and_enabled.0);
         assert_eq!(mirror.2, default_schedule_and_enabled.1);
         assert_eq!(mirror.3, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_configs_for_libraries_are_loaded_in_one_query() {
+        let (_temp_dir, database) = test_database().await;
+        let libraries = LibraryService::new(database.clone());
+        let first = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("first library should be created");
+        let second = libraries
+            .create_library("More Movies", LibraryKind::Movie, false)
+            .await
+            .expect("second library should be created");
+        let library_ids = vec![first.id.to_string(), second.id.to_string()];
+
+        database.reset_query_count();
+        let configs = database
+            .list_scheduled_task_configs_by_owner_ids(
+                "LIBRARY",
+                &library_ids,
+                "RECONCILIATION_SCAN",
+            )
+            .await
+            .expect("scheduled task configs should load");
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(database.query_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod library_scraper_batch_tests {
+    use super::*;
+    use crate::{
+        application::libraries::LibraryService,
+        config::Config,
+        library::{LibraryKind, LibraryScraper, LibraryScraperRole},
+    };
+
+    #[tokio::test]
+    async fn library_scraper_rows_insert_in_one_bounded_statement() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let scrapers = (0..5)
+            .map(|position| LibraryScraper {
+                scraper_id: format!("scraper-{position}"),
+                position,
+                role: if position == 0 {
+                    LibraryScraperRole::Primary
+                } else {
+                    LibraryScraperRole::Supplement
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut transaction = database.pool.begin().await.expect("transaction");
+
+        database.reset_query_count();
+        database
+            .insert_library_scrapers_in_transaction(
+                &mut transaction,
+                &library.id.to_string(),
+                &scrapers,
+            )
+            .await
+            .expect("scraper rows");
+        transaction.commit().await.expect("commit");
+
+        assert_eq!(database.query_count(), 1);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM library_scrapers WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("scraper count");
+        assert_eq!(count, scrapers.len() as i64);
+
+        let stored: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT scraper_id, position, role FROM library_scrapers
+             WHERE library_id = ? ORDER BY position",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("ordered scraper rows");
+        let expected = scrapers
+            .iter()
+            .map(|scraper| {
+                (
+                    scraper.scraper_id.clone(),
+                    scraper.position,
+                    scraper.role.as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stored, expected);
+
+        let mut transaction = database.pool.begin().await.expect("empty transaction");
+        database.reset_query_count();
+        database
+            .insert_library_scrapers_in_transaction(&mut transaction, &library.id.to_string(), &[])
+            .await
+            .expect("empty input");
+        assert_eq!(database.query_count(), 0);
+        transaction.rollback().await.expect("empty rollback");
+
+        // Exercise the storage boundary beyond the API's 16-scraper limit.
+        let mut batch_scrapers = (0..205)
+            .map(|position| LibraryScraper {
+                scraper_id: format!("batch-scraper-{position}"),
+                position: position + 5,
+                role: LibraryScraperRole::Backup,
+            })
+            .collect::<Vec<_>>();
+        let mut transaction = database.pool.begin().await.expect("batch transaction");
+        database.reset_query_count();
+        database
+            .insert_library_scrapers_in_transaction(
+                &mut transaction,
+                &library.id.to_string(),
+                &batch_scrapers,
+            )
+            .await
+            .expect("bounded inserts");
+        assert_eq!(database.query_count(), 3);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM library_scrapers WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("batch row count");
+        assert_eq!(count, 210);
+        transaction.rollback().await.expect("batch rollback");
+
+        batch_scrapers[200].scraper_id = batch_scrapers[0].scraper_id.clone();
+        let mut transaction = database.pool.begin().await.expect("conflicting batch");
+        assert!(
+            database
+                .insert_library_scrapers_in_transaction(
+                    &mut transaction,
+                    &library.id.to_string(),
+                    &batch_scrapers
+                )
+                .await
+                .is_err()
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("conflicting batch rollback");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM library_scrapers WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("rows after failed batch");
+        assert_eq!(count, 5);
     }
 }

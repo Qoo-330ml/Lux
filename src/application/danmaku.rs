@@ -34,6 +34,7 @@ const MAX_PROVIDER_BASE_URL_CHARS: usize = 4096;
 const MAX_CONCURRENCY: i64 = 64;
 const MAX_EFFECTIVE_CONCURRENCY: usize = 4;
 const WORK_PAGE_SIZE: i64 = 100;
+const DANMAKU_CANCEL_CHECK_INTERVAL: usize = 8;
 pub const DEFAULT_DANMAKU_CONCURRENCY: i64 = 2;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -374,6 +375,34 @@ impl DanmakuService {
         if !(0..=MAX_CONCURRENCY).contains(&concurrency) {
             return Err(DanmakuServiceError::InvalidConcurrency);
         }
+        let Some(plugins) = &self.plugins else {
+            return Err(DanmakuServiceError::ProviderNotConfigured);
+        };
+        let settings = plugins
+            .danmaku_settings()
+            .await
+            .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?;
+        let mut available = None;
+        self.create_job_with_settings(
+            library_id,
+            concurrency,
+            overwrite,
+            &settings,
+            plugins,
+            &mut available,
+        )
+        .await
+    }
+
+    async fn create_job_with_settings(
+        &self,
+        library_id: LibraryId,
+        concurrency: i64,
+        overwrite: bool,
+        settings: &DanmakuSettings,
+        plugins: &PluginService,
+        available: &mut Option<bool>,
+    ) -> Result<DanmakuMatchJob, DanmakuServiceError> {
         let library_id = library_id.to_string();
         self.database
             .find_library(&library_id)
@@ -386,21 +415,21 @@ impl DanmakuService {
         {
             return Err(DanmakuServiceError::AlreadyActive);
         }
-        let Some(plugins) = &self.plugins else {
-            return Err(DanmakuServiceError::ProviderNotConfigured);
-        };
-        let settings = plugins
-            .danmaku_settings()
-            .await
-            .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?;
         if !settings.library_ids.iter().any(|id| id == &library_id) {
             return Err(DanmakuServiceError::LibraryNotSelected);
         }
-        if !plugins
-            .has_available_danmaku()
-            .await
-            .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?
-        {
+        let is_available = match *available {
+            Some(value) => value,
+            None => {
+                let value = plugins
+                    .has_available_danmaku()
+                    .await
+                    .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?;
+                *available = Some(value);
+                value
+            }
+        };
+        if !is_available {
             return Err(DanmakuServiceError::ProviderNotConfigured);
         }
         let id = Uuid::now_v7().to_string();
@@ -428,11 +457,22 @@ impl DanmakuService {
         let concurrency = settings.concurrency;
         let overwrite = settings.overwrite;
         let mut jobs = Vec::with_capacity(settings.library_ids.len());
-        for library_id in settings.library_ids {
+        let mut available = None;
+        for library_id in &settings.library_ids {
             let library_id = library_id
                 .parse::<LibraryId>()
                 .map_err(|_| DanmakuServiceError::LibraryNotFound)?;
-            match self.create_job(library_id, concurrency, overwrite).await {
+            match self
+                .create_job_with_settings(
+                    library_id,
+                    concurrency,
+                    overwrite,
+                    &settings,
+                    plugins,
+                    &mut available,
+                )
+                .await
+            {
                 Ok(job) => jobs.push(job),
                 Err(DanmakuServiceError::AlreadyActive) => {}
                 Err(error) => return Err(error),
@@ -613,6 +653,7 @@ impl DanmakuService {
             .await;
         let mut workers: JoinSet<Result<Option<WorkerResult>, StorageError>> = JoinSet::new();
         let mut cancelled = false;
+        let mut items_since_cancel_check = DANMAKU_CANCEL_CHECK_INTERVAL;
 
         loop {
             let items = self
@@ -623,13 +664,16 @@ impl DanmakuService {
                 break;
             }
             for item in items {
-                if self
-                    .database
-                    .danmaku_match_job_cancel_requested(&job.id)
-                    .await?
-                {
-                    cancelled = true;
-                    break;
+                if danmaku_cancel_check_due(items_since_cancel_check) {
+                    if self
+                        .database
+                        .danmaku_match_job_cancel_requested(&job.id)
+                        .await?
+                    {
+                        cancelled = true;
+                        break;
+                    }
+                    items_since_cancel_check = 0;
                 }
                 while workers.len() >= concurrency {
                     self.finish_worker(&job.id, workers.join_next().await)
@@ -671,6 +715,7 @@ impl DanmakuService {
                     .await;
                     Ok(Some(result))
                 });
+                items_since_cancel_check = items_since_cancel_check.saturating_add(1);
             }
             while !workers.is_empty() {
                 self.finish_worker(&job.id, workers.join_next().await)
@@ -855,6 +900,15 @@ fn effective_danmaku_concurrency(configured: i64) -> usize {
     usize::try_from(configured)
         .unwrap_or(1)
         .clamp(1, MAX_EFFECTIVE_CONCURRENCY)
+}
+
+fn danmaku_cancel_check_due(items_since_last_check: usize) -> bool {
+    items_since_last_check >= DANMAKU_CANCEL_CHECK_INTERVAL
+}
+
+#[cfg(test)]
+fn danmaku_cancel_check_count(item_count: usize) -> usize {
+    item_count.div_ceil(DANMAKU_CANCEL_CHECK_INTERVAL)
 }
 
 struct TrackWrite {
@@ -1178,9 +1232,19 @@ fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_danmaku_concurrency, match_file_name_candidates};
-    use crate::application::{plugins::DanmakuSettings, schedule::DEFAULT_DANMAKU_MATCH_SCHEDULE};
-    use crate::storage::StoredDanmakuSource;
+    use super::{
+        danmaku_cancel_check_count, effective_danmaku_concurrency, match_file_name_candidates,
+    };
+    use crate::application::{
+        libraries::LibraryService,
+        plugins::{DANMAKU_PLUGIN_ID, DanmakuSettings},
+        schedule::DEFAULT_DANMAKU_MATCH_SCHEDULE,
+    };
+    use crate::{
+        config::Config,
+        library::LibraryKind,
+        storage::{Database, StoredDanmakuSource},
+    };
 
     #[test]
     fn worker_concurrency_has_a_memory_safe_ceiling() {
@@ -1188,6 +1252,15 @@ mod tests {
         assert_eq!(effective_danmaku_concurrency(1), 1);
         assert_eq!(effective_danmaku_concurrency(2), 2);
         assert_eq!(effective_danmaku_concurrency(64), 4);
+    }
+
+    #[test]
+    fn cancellation_checks_start_immediately_and_repeat_every_eight_items() {
+        assert_eq!(danmaku_cancel_check_count(0), 0);
+        assert_eq!(danmaku_cancel_check_count(1), 1);
+        assert_eq!(danmaku_cancel_check_count(8), 1);
+        assert_eq!(danmaku_cancel_check_count(9), 2);
+        assert_eq!(danmaku_cancel_check_count(100), 13);
     }
 
     #[test]
@@ -1252,5 +1325,80 @@ mod tests {
             match_file_name_candidates("Original.S01E01.mkv", &source, &settings),
             vec!["简体剧名 S02E03", "English Show S02E03"]
         );
+    }
+
+    #[tokio::test]
+    async fn configured_jobs_reuse_plugin_settings_across_libraries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = DANMAKU_PLUGIN_ID;
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path().join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
+        tokio::fs::create_dir_all(&plugin_dir).await?;
+        tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+        tokio::fs::write(
+            config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 1,
+                "id": PLUGIN_ID,
+                "name": "Test danmaku",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "danmaku",
+                "category": "MEDIA",
+                "capabilities": ["danmaku.match"],
+                "configFields": [
+                    {"key": "providerBaseUrl", "label": "Provider", "type": "text", "required": true},
+                    {"key": "libraryIds", "label": "Libraries", "type": "select", "multiple": true, "optionsSource": "media-libraries"},
+                    {"key": "matchOriginalFilename", "label": "Original", "type": "toggle", "defaultValue": true},
+                    {"key": "matchSimplifiedTraditionalTitles", "label": "CJK", "type": "toggle", "defaultValue": true},
+                    {"key": "matchEnglishTitle", "label": "English", "type": "toggle", "defaultValue": false},
+                    {"key": "concurrency", "label": "Concurrency", "type": "number", "defaultValue": 2, "minimum": 0, "maximum": 64},
+                    {"key": "overwrite", "label": "Overwrite", "type": "toggle", "defaultValue": false},
+                    {"key": "schedule", "label": "Schedule", "type": "text", "required": true, "defaultValue": "0 6 * * *"}
+                ],
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let first = libraries
+            .create_library("Danmaku one", LibraryKind::Series, false)
+            .await?;
+        let second = libraries
+            .create_library("Danmaku two", LibraryKind::Series, false)
+            .await?;
+        tokio::fs::create_dir_all(config_dir.join("plugin-config")).await?;
+        tokio::fs::write(
+            config_dir.join(format!("plugin-config/{PLUGIN_ID}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "providerBaseUrl": "https://danmu.example",
+                "libraryIds": [first.id.to_string(), second.id.to_string()],
+                "matchOriginalFilename": true,
+                "matchSimplifiedTraditionalTitles": true,
+                "matchEnglishTitle": false,
+                "concurrency": 2,
+                "overwrite": false,
+                "schedule": "0 6 * * *"
+            }))?,
+        )
+        .await?;
+        let plugins = crate::application::plugins::PluginService::new_without_login_background_worker_for_test(database.clone(), config_dir);
+        plugins.install(PLUGIN_ID).await?;
+
+        let service = super::DanmakuService::new(database.clone()).with_plugins(plugins);
+        database.reset_query_count();
+        let jobs = service.create_configured_jobs().await?;
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(database.query_count(), 19);
+        Ok(())
     }
 }

@@ -81,6 +81,7 @@ export function heroSlides(home: Pick<HomeResponse, "recommended" | "continueWat
     ...(home.continueWatching ?? []),
     ...(home.recentlyAdded ?? []),
   ]) {
+    if (item.itemType !== "MOVIE" && item.itemType !== "SERIES") continue;
     if (!unique.has(item.id)) unique.set(item.id, item);
   }
   return [...unique.values()].slice(0, HERO_CAROUSEL_MAX_SLIDES);

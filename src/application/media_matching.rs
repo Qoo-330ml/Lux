@@ -471,6 +471,28 @@ fn is_technical_word(value: &str) -> bool {
     )
 }
 
+/// Splits a trailing part marker (`cd1`, `disc2`, `part3` ...) out of a version label
+/// or file stem. Returns the label without the marker and the part number.
+pub(crate) fn split_part_marker(value: &str) -> (String, Option<u32>) {
+    let normalized = normalize_separators(value);
+    let mut part = None;
+    let mut rest = Vec::new();
+    for word in normalized.split_whitespace() {
+        let lowered = word.to_lowercase();
+        let number = ["cd", "disc", "disk", "part"].iter().find_map(|prefix| {
+            lowered
+                .strip_prefix(prefix)
+                .filter(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+        });
+        match number {
+            Some(number) if part.is_none() => part = Some(number),
+            _ => rest.push(word),
+        }
+    }
+    (rest.join(" "), part)
+}
+
 fn is_multi_part_marker(value: &str) -> bool {
     ["cd", "disc", "disk", "part"].iter().any(|prefix| {
         value
@@ -560,7 +582,24 @@ fn is_cjk(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaKind, parse_media_name, parse_media_name_with_variant_suffix};
+    use super::{
+        MediaKind, parse_media_name, parse_media_name_with_variant_suffix, split_part_marker,
+    };
+
+    #[test]
+    fn part_markers_are_split_out_of_version_labels() {
+        assert_eq!(
+            split_part_marker("有码 4K cd2"),
+            ("有码 4K".to_owned(), Some(2))
+        );
+        assert_eq!(split_part_marker("Disc1"), (String::new(), Some(1)));
+        assert_eq!(
+            split_part_marker("Part 3 Cut"),
+            ("Part 3 Cut".to_owned(), None)
+        );
+        assert_eq!(split_part_marker("cd"), ("cd".to_owned(), None));
+        assert_eq!(split_part_marker("Extended"), ("Extended".to_owned(), None));
+    }
 
     #[test]
     fn inferred_variant_suffixes_are_generic_and_only_applied_when_supplied() {

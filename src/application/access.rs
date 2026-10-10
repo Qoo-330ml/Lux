@@ -7,13 +7,27 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AccessPrincipal {
-    pub user_id: UserId,
+    pub user_id: Option<UserId>,
     pub is_admin: bool,
 }
 
 impl AccessPrincipal {
     pub const fn new(user_id: UserId, is_admin: bool) -> Self {
-        Self { user_id, is_admin }
+        Self {
+            user_id: Some(user_id),
+            is_admin,
+        }
+    }
+
+    pub const fn server_admin(target_user_id: Option<UserId>) -> Self {
+        Self {
+            user_id: target_user_id,
+            is_admin: true,
+        }
+    }
+
+    pub fn user_id_string(self) -> String {
+        self.user_id.map_or_else(String::new, |id| id.to_string())
     }
 }
 
@@ -35,9 +49,12 @@ impl MediaAccessService {
         if principal.is_admin {
             return Ok(true);
         }
+        let Some(user_id) = principal.user_id else {
+            return Ok(false);
+        };
         Ok(self
             .database
-            .has_user_library_access(&principal.user_id.to_string(), library_id)
+            .has_user_library_access(&user_id.to_string(), library_id)
             .await?)
     }
 
@@ -62,9 +79,12 @@ impl MediaAccessService {
         if principal.is_admin {
             return Ok(self.database.list_enabled_library_ids().await?);
         }
+        let Some(user_id) = principal.user_id else {
+            return Ok(Vec::new());
+        };
         Ok(self
             .database
-            .list_accessible_library_ids(&principal.user_id.to_string())
+            .list_accessible_library_ids(&user_id.to_string())
             .await?)
     }
 
@@ -79,7 +99,7 @@ impl MediaAccessService {
             .find_authorized_playback_source(
                 item_id,
                 source_id,
-                &principal.user_id.to_string(),
+                &principal.user_id_string(),
                 principal.is_admin,
             )
             .await?)

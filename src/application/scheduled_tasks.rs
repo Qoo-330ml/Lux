@@ -6,7 +6,10 @@ use std::{
 };
 
 use time::OffsetDateTime;
-use tokio::{sync::Mutex, time::interval};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::interval,
+};
 
 use crate::{
     application::{
@@ -21,8 +24,8 @@ use crate::{
         plugins::PluginService,
         probe::MediaProbeService,
         reidentify::{
-            MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
-            MetadataReidentifyService,
+            MetadataDispatchError, MetadataRefreshMode, MetadataReidentifyError,
+            MetadataReidentifyJob, MetadataReidentifyService,
         },
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::{
@@ -47,6 +50,7 @@ const SCHEDULER_PAGE_SIZE: i64 = 100;
 const THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE: i64 = 4;
 const THUMBNAIL_SCRAPER_RETRY_LEASE_SECONDS: i64 = 15 * 60;
 const THUMBNAIL_SCRAPER_RETRY_INTERNAL_FAILURE_DELAY_SECONDS: i64 = 5 * 60;
+const THUMBNAIL_METADATA_JOB_STATUS_FALLBACK: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct ScheduledTaskService {
@@ -61,6 +65,7 @@ pub struct ScheduledTaskService {
     library_covers: Option<LibraryCoverService>,
     danmaku: Option<DanmakuService>,
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
+    thumbnail_retry_semaphore: Arc<Semaphore>,
 }
 
 struct TaskCursor {
@@ -113,6 +118,7 @@ pub enum ScheduledTaskError {
     ServiceUnavailable,
     Scan(ScanJobError),
     Metadata(MetadataReidentifyError),
+    MetadataDispatch(MetadataDispatchError),
     Strm(StrmProbeError),
     Chapter(ChapterDetectionError),
     Cover(LibraryCoverError),
@@ -132,6 +138,7 @@ impl fmt::Display for ScheduledTaskError {
             }
             Self::Scan(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
+            Self::MetadataDispatch(error) => error.fmt(formatter),
             Self::Strm(error) => error.fmt(formatter),
             Self::Chapter(error) => error.fmt(formatter),
             Self::Cover(error) => error.fmt(formatter),
@@ -168,6 +175,9 @@ impl ScheduledTaskService {
             library_covers: None,
             danmaku: None,
             cursors: Arc::new(Mutex::new(HashMap::new())),
+            thumbnail_retry_semaphore: Arc::new(Semaphore::new(
+                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE as usize,
+            )),
         }
     }
 
@@ -281,10 +291,18 @@ impl ScheduledTaskService {
                 {
                     continue;
                 }
-                if let Err(error) = self
-                    .run_task(&task.owner_type, &task.owner_id, &task.task_type)
-                    .await
-                {
+                let result = match normalize_scheduled_task_request(
+                    &task.owner_type,
+                    &task.owner_id,
+                    &task.task_type,
+                ) {
+                    Ok((owner_type, owner_id, task_type)) => {
+                        self.run_task_with_config(&owner_type, &owner_id, &task_type, &task)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
                     match error {
                         ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
                         | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive) => {}
@@ -313,8 +331,41 @@ impl ScheduledTaskService {
             }
             return;
         }
+        let task_type = plan.task_type.trim().to_ascii_uppercase();
+        let owner_ids = plan
+            .libraries
+            .iter()
+            .map(|library| library.id.clone())
+            .collect::<Vec<_>>();
+        let configs = match self
+            .database
+            .list_scheduled_task_configs_by_owner_ids("LIBRARY", &owner_ids, &task_type)
+            .await
+        {
+            Ok(configs) => configs,
+            Err(error) => {
+                self.log_dispatch_error(key, ScheduledTaskError::Storage(error));
+                return;
+            }
+        };
         for library in &plan.libraries {
-            if let Err(error) = self.run_task("LIBRARY", &library.id, &plan.task_type).await {
+            let result = match normalize_scheduled_task_request("LIBRARY", &library.id, &task_type)
+            {
+                Ok((owner_type, owner_id, normalized_task_type)) => match configs.get(&owner_id) {
+                    Some(task) => {
+                        self.run_task_with_config(
+                            &owner_type,
+                            &owner_id,
+                            &normalized_task_type,
+                            task,
+                        )
+                        .await
+                    }
+                    None => Err(ScheduledTaskError::NotRegistered),
+                },
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
                 self.log_dispatch_error(key, error);
             }
         }
@@ -352,12 +403,16 @@ impl ScheduledTaskService {
             return;
         };
         let now = OffsetDateTime::now_utc().unix_timestamp();
+        let available = self.thumbnail_retry_semaphore.available_permits();
+        if available == 0 {
+            return;
+        }
         let retries = match self
             .database
             .claim_due_thumbnail_scraper_retries(
                 now,
                 now.saturating_add(THUMBNAIL_SCRAPER_RETRY_LEASE_SECONDS),
-                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE,
+                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE.min(available as i64),
             )
             .await
         {
@@ -368,11 +423,15 @@ impl ScheduledTaskService {
             }
         };
         for retry in retries {
+            let Ok(permit) = self.thumbnail_retry_semaphore.clone().try_acquire_owned() else {
+                break;
+            };
             let database = self.database.clone();
             let metadata = metadata.clone();
             let thumbnails = thumbnails.clone();
             tokio::spawn(async move {
                 run_thumbnail_scraper_retry(database, metadata, thumbnails, retry).await;
+                drop(permit);
             });
         }
     }
@@ -383,43 +442,25 @@ impl ScheduledTaskService {
         owner_id: &str,
         task_type: &str,
     ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
-        let owner_type = owner_type.trim().to_ascii_uppercase();
-        let owner_id = owner_id.trim();
-        let task_type = task_type.trim().to_ascii_uppercase();
-        if !matches!(owner_type.as_str(), "GLOBAL" | "LIBRARY") || owner_id.is_empty() {
-            return Err(ScheduledTaskError::InvalidOwner);
-        }
-        if owner_type == "GLOBAL" && owner_id != "global" {
-            return Err(ScheduledTaskError::InvalidOwner);
-        }
-        if owner_type == "LIBRARY" && owner_id.parse::<LibraryId>().is_err() {
-            return Err(ScheduledTaskError::InvalidOwner);
-        }
-        if owner_type == "GLOBAL"
-            && !matches!(
-                task_type.as_str(),
-                STRM_MEDIA_INFO_TASK_TYPE | DANMAKU_MATCH_TASK_TYPE
-            )
-        {
-            return Err(ScheduledTaskError::UnsupportedTask);
-        }
-        if owner_type == "LIBRARY"
-            && !matches!(
-                task_type.as_str(),
-                RECONCILIATION_TASK_TYPE
-                    | METADATA_TASK_TYPE
-                    | CHAPTER_DETECTION_TASK_TYPE
-                    | AUTO_LIBRARY_COVER_TASK_TYPE
-            )
-        {
-            return Err(ScheduledTaskError::UnsupportedTask);
-        }
+        let (owner_type, owner_id, task_type) =
+            normalize_scheduled_task_request(owner_type, owner_id, task_type)?;
         let task = self
             .database
-            .find_scheduled_task_config(&owner_type, owner_id, &task_type)
+            .find_scheduled_task_config(&owner_type, &owner_id, &task_type)
             .await?
             .ok_or(ScheduledTaskError::NotRegistered)?;
-        match (owner_type.as_str(), task_type.as_str()) {
+        self.run_task_with_config(&owner_type, &owner_id, &task_type, &task)
+            .await
+    }
+
+    async fn run_task_with_config(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        task_type: &str,
+        task: &StoredScheduledTaskConfig,
+    ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
+        match (owner_type, task_type) {
             ("LIBRARY", RECONCILIATION_TASK_TYPE) => self.run_reconciliation(owner_id).await,
             ("LIBRARY", METADATA_TASK_TYPE) => self.run_metadata(owner_id).await,
             ("GLOBAL", STRM_MEDIA_INFO_TASK_TYPE) => self.run_strm_media_info().await,
@@ -481,11 +522,10 @@ impl ScheduledTaskService {
             .create_library_refresh_job(library_id, MetadataRefreshMode::FillMissing)
             .await
             .map_err(ScheduledTaskError::Metadata)?;
-        let worker = service.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
-        });
+        service
+            .enqueue_fill_missing_job(&job)
+            .await
+            .map_err(ScheduledTaskError::MetadataDispatch)?;
         Ok(ScheduledTaskRun::Metadata { job })
     }
 
@@ -613,6 +653,45 @@ impl ScheduledTaskService {
     }
 }
 
+fn normalize_scheduled_task_request(
+    owner_type: &str,
+    owner_id: &str,
+    task_type: &str,
+) -> Result<(String, String, String), ScheduledTaskError> {
+    let owner_type = owner_type.trim().to_ascii_uppercase();
+    let owner_id = owner_id.trim().to_owned();
+    let task_type = task_type.trim().to_ascii_uppercase();
+    if !matches!(owner_type.as_str(), "GLOBAL" | "LIBRARY") || owner_id.is_empty() {
+        return Err(ScheduledTaskError::InvalidOwner);
+    }
+    if owner_type == "GLOBAL" && owner_id != "global" {
+        return Err(ScheduledTaskError::InvalidOwner);
+    }
+    if owner_type == "LIBRARY" && owner_id.parse::<LibraryId>().is_err() {
+        return Err(ScheduledTaskError::InvalidOwner);
+    }
+    if owner_type == "GLOBAL"
+        && !matches!(
+            task_type.as_str(),
+            STRM_MEDIA_INFO_TASK_TYPE | DANMAKU_MATCH_TASK_TYPE
+        )
+    {
+        return Err(ScheduledTaskError::UnsupportedTask);
+    }
+    if owner_type == "LIBRARY"
+        && !matches!(
+            task_type.as_str(),
+            RECONCILIATION_TASK_TYPE
+                | METADATA_TASK_TYPE
+                | CHAPTER_DETECTION_TASK_TYPE
+                | AUTO_LIBRARY_COVER_TASK_TYPE
+        )
+    {
+        return Err(ScheduledTaskError::UnsupportedTask);
+    }
+    Ok((owner_type, owner_id, task_type))
+}
+
 async fn run_thumbnail_scraper_retry(
     database: Database,
     metadata: MetadataReidentifyService,
@@ -625,28 +704,20 @@ async fn run_thumbnail_scraper_retry(
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
-    let applicable = match thumbnails.scraper_first_retry_is_applicable(&item_id).await {
-        Ok(applicable) => applicable,
+    let retry_state = match thumbnails.scraper_first_retry_state(&item_id).await {
+        Ok(retry_state) => retry_state,
         Err(error) => {
             release_thumbnail_scraper_retry(&database, &retry, now).await;
-            tracing::warn!(item_id, %error, "thumbnail scraper retry policy could not be checked");
+            tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be checked");
             return;
         }
     };
-    if !applicable {
+    if !retry_state.applicable {
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
 
-    let images_missing = match thumbnails.scraper_first_images_missing(&item_id).await {
-        Ok(images_missing) => images_missing,
-        Err(error) => {
-            release_thumbnail_scraper_retry(&database, &retry, now).await;
-            tracing::warn!(item_id, %error, "thumbnail scraper retry images could not be checked");
-            return;
-        }
-    };
-    if !images_missing {
+    if !retry_state.images_missing {
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
@@ -678,7 +749,27 @@ async fn run_thumbnail_scraper_retry(
             return;
         }
     };
-    metadata.run(&job.id).await;
+    let completion = match metadata.enqueue_fill_missing_job(&job).await {
+        Ok(completion) => completion,
+        Err(error) => {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry metadata job could not be dispatched");
+            return;
+        }
+    };
+    if let Some(completion) = completion {
+        if completion.await.is_err()
+            && let Err(error) = wait_for_metadata_job_terminal(&metadata, &job.id).await
+        {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry metadata job status could not be checked");
+            return;
+        }
+    } else if let Err(error) = wait_for_metadata_job_terminal(&metadata, &job.id).await {
+        release_thumbnail_scraper_retry(&database, &retry, now).await;
+        tracing::warn!(item_id, %error, "thumbnail scraper retry metadata job status could not be checked");
+        return;
+    }
 
     let attempted_at = OffsetDateTime::now_utc().unix_timestamp();
     let attempt_count = retry.attempt_count.saturating_add(1).min(3);
@@ -709,6 +800,19 @@ async fn run_thumbnail_scraper_retry(
             attempted_at,
         )
         .await;
+    }
+}
+
+async fn wait_for_metadata_job_terminal(
+    metadata: &MetadataReidentifyService,
+    job_id: &str,
+) -> Result<(), MetadataReidentifyError> {
+    loop {
+        let job = metadata.get_job(job_id).await?;
+        if !matches!(job.status.as_str(), "QUEUED" | "RUNNING") {
+            return Ok(());
+        }
+        tokio::time::sleep(THUMBNAIL_METADATA_JOB_STATUS_FALLBACK).await;
     }
 }
 

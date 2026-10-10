@@ -7,7 +7,7 @@ use tokio::fs;
 
 use crate::{
     application::images::write_image_atomically,
-    storage::{Database, StorageError, StoredItemImagePathConflict},
+    storage::{Database, StorageError, StoredItemImage, StoredItemImagePathConflict},
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -27,6 +27,13 @@ pub async fn repair_episode_image_path_conflicts(
             .or_default()
             .push(conflict);
     }
+    let mut item_ids = groups
+        .keys()
+        .map(|(item_id, _)| item_id.clone())
+        .collect::<Vec<_>>();
+    item_ids.sort_unstable();
+    item_ids.dedup();
+    let images_by_item = database.list_item_images_by_ids(&item_ids).await?;
 
     let mut report = EpisodeImagePathRepairReport::default();
     for conflicts in groups.into_values() {
@@ -63,15 +70,16 @@ pub async fn repair_episode_image_path_conflicts(
             continue;
         }
 
+        let indexed_images = images_by_item
+            .get(&thumbnail.item_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let mut repaired = false;
         for variant in 0..1000_usize {
             let Some(target) = episode_thumbnail_repair_target(&source, variant) else {
                 break;
             };
-            if database
-                .item_image_path_is_in_use(&thumbnail.item_id, &target, &thumbnail.id)
-                .await?
-            {
+            if image_path_is_in_use(indexed_images, &target, &thumbnail.id) {
                 continue;
             }
             let target_exists = match fs::symlink_metadata(&target).await {
@@ -99,6 +107,12 @@ pub async fn repair_episode_image_path_conflicts(
                         }
                     }
                 }
+            }
+            if database
+                .item_image_path_is_in_use(&thumbnail.item_id, &target, &thumbnail.id)
+                .await?
+            {
+                continue;
             }
             if database
                 .update_item_image_local_path(&thumbnail.id, &target)
@@ -135,4 +149,59 @@ fn episode_thumbnail_repair_target(path: &Path, variant: usize) -> Option<PathBu
         format!("-thumbnail-{variant}")
     };
     Some(path.with_file_name(format!("{base}{suffix}.{extension}")))
+}
+
+fn image_path_is_in_use(
+    images: &[StoredItemImage],
+    local_path: &Path,
+    excluded_image_id: &str,
+) -> bool {
+    let local_path = local_path.to_string_lossy();
+    images
+        .iter()
+        .any(|image| image.id != excluded_image_id && image.local_path == local_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_path_is_in_use;
+    use crate::storage::StoredItemImage;
+    use std::path::Path;
+
+    fn image(id: &str, local_path: &str) -> StoredItemImage {
+        StoredItemImage {
+            id: id.to_owned(),
+            item_id: "item".to_owned(),
+            image_type: "THUMB".to_owned(),
+            image_index: 0,
+            local_path: local_path.to_owned(),
+            file_size: None,
+            content_tag: None,
+            source: "TEST".to_owned(),
+            root_path: None,
+        }
+    }
+
+    #[test]
+    fn image_path_usage_excludes_the_image_being_repaired() {
+        let images = vec![
+            image("thumb", "/media/thumb.jpg"),
+            image("other", "/media/thumb.jpg"),
+        ];
+        assert!(image_path_is_in_use(
+            &images,
+            Path::new("/media/thumb.jpg"),
+            "thumb"
+        ));
+        assert!(!image_path_is_in_use(
+            &images,
+            Path::new("/media/other.jpg"),
+            "thumb"
+        ));
+        assert!(!image_path_is_in_use(
+            &images[..1],
+            Path::new("/media/thumb.jpg"),
+            "thumb"
+        ));
+    }
 }

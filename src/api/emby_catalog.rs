@@ -388,14 +388,16 @@ pub(super) async fn emby_user_views(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     match emby_visible_library_items(&state, principal).await {
         Ok(items) => {
             let total = items.len();
@@ -415,11 +417,12 @@ pub(super) async fn emby_library_virtual_folders(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(libraries) = state.libraries.as_ref() else {
@@ -439,16 +442,23 @@ pub(super) async fn emby_library_virtual_folders(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
+    };
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match libraries
-        .list_libraries_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
-        .await
+    let views =
+        match emby_libraries_for_principal(libraries, &auth_principal, &accessible_library_ids)
+            .await
+        {
+            Ok(views) => views,
+            Err(status) => return status.into_response(),
+        };
     {
-        Ok(views) => Json(
+        Json(
             views
                 .iter()
                 .map(|view| {
@@ -461,9 +471,32 @@ pub(super) async fn emby_library_virtual_folders(
                 })
                 .collect::<Vec<_>>(),
         )
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        .into_response()
     }
+}
+
+async fn emby_libraries_for_principal(
+    libraries: &LibraryService,
+    principal: &crate::auth::users::AuthenticationPrincipal,
+    accessible_library_ids: &[String],
+) -> Result<Vec<crate::application::libraries::LibraryView>, StatusCode> {
+    if let Some(user) = principal.user() {
+        return libraries
+            .list_libraries_for_user(&user.id.to_string(), user.is_admin, accessible_library_ids)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut views = libraries
+        .list_libraries()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    views.retain(|view| {
+        view.library.is_enabled
+            && accessible_library_ids
+                .iter()
+                .any(|library_id| library_id == &view.library.id.to_string())
+    });
+    Ok(views)
 }
 
 pub(super) async fn emby_library_selectable_media_folders(
@@ -471,11 +504,12 @@ pub(super) async fn emby_library_selectable_media_folders(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(libraries) = state.libraries.as_ref() else {
@@ -484,15 +518,15 @@ pub(super) async fn emby_library_selectable_media_folders(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
+    };
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match libraries
-        .list_libraries_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
-        .await
-    {
+    match emby_libraries_for_principal(libraries, &auth_principal, &accessible_library_ids).await {
         Ok(views) => Json(
             views
                 .iter()
@@ -509,11 +543,12 @@ pub(super) async fn emby_library_media_folders(
     Query(query): Query<EmbyMediaFoldersQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -522,7 +557,10 @@ pub(super) async fn emby_library_media_folders(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
+    };
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -609,19 +647,21 @@ pub(super) async fn emby_persons(
     Query(query): Query<EmbyPersonsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Some(user_id) = query.user_id.as_deref()
-        && let Err(status) = ensure_emby_user_scope(&user, user_id)
-    {
-        return status.into_response();
-    }
+    let auth_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -704,22 +744,22 @@ pub(super) async fn emby_person(
     Query(query): Query<EmbyPersonQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Some(user_id) = query.user_id.as_deref()
-        && let Err(status) = ensure_emby_user_scope(&user, user_id)
-    {
-        return status.into_response();
-    }
+    let auth_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -748,14 +788,17 @@ pub(super) async fn emby_user_root(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
-    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    emby_user_root_response(&state, principal).await
 }
 
 pub(super) async fn emby_items_root(
@@ -763,15 +806,19 @@ pub(super) async fn emby_items_root(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    let requested_user_id = query.user_id.unwrap_or_else(|| user.id.to_string());
-    if let Err(status) = ensure_emby_user_scope(&user, &requested_user_id) {
-        return status.into_response();
-    }
-    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    emby_user_root_response(&state, principal).await
 }
 
 pub(super) async fn emby_user_root_response(
@@ -785,7 +832,7 @@ pub(super) async fn emby_user_root_response(
     Json(json!({
         "Name": "Media Folders",
         "SortName": "Media Folders",
-        "Id": principal.user_id.to_string(),
+        "Id": principal.user_id_string(),
         "ServerId": state.server_id,
         "Type": "Folder",
         "IsFolder": true,
@@ -820,7 +867,7 @@ pub(super) async fn emby_visible_library_items(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let views = libraries
         .list_libraries_for_user(
-            &principal.user_id.to_string(),
+            &principal.user_id_string(),
             principal.is_admin,
             &accessible_library_ids,
         )
@@ -902,13 +949,16 @@ pub(super) async fn emby_user_resume(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let (offset, limit) = match emby_page_params(&query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
@@ -916,7 +966,6 @@ pub(super) async fn emby_user_resume(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let page = match catalog
         .list_continue_watching(principal, &user_id, offset, limit)
         .await
@@ -932,8 +981,8 @@ pub(super) async fn emby_user_resume(
         &user_id,
         &page,
         query.fields.as_deref(),
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
     )
     .await
 }
@@ -944,13 +993,16 @@ pub(super) async fn emby_user_latest(
     Query(mut query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let group_items = query.group_items.unwrap_or(true);
     let parent_is_library = match query.parent_id.as_deref() {
         Some(parent_id) => emby_parent_is_library(&state, parent_id).await,
@@ -964,7 +1016,6 @@ pub(super) async fn emby_user_latest(
     }
     query.sort_by = Some("DateCreated".to_owned());
     query.sort_order = Some("Descending".to_owned());
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let page = match emby_catalog_page_from_query(&state, principal, &query).await {
         Ok(page) => page,
         Err(status) => return status.into_response(),
@@ -980,8 +1031,8 @@ pub(super) async fn emby_user_latest(
             &user_id,
             &grouped_page,
             query.fields.as_deref(),
-            user.can_download,
-            user.can_manage_server,
+            auth_principal.can_download(),
+            auth_principal.can_manage_server(),
         )
         .await
         {
@@ -1008,8 +1059,8 @@ pub(super) async fn emby_user_latest(
         &user_id,
         &page,
         query.fields.as_deref(),
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
     )
     .await
     {
@@ -1024,21 +1075,23 @@ pub(super) async fn emby_user_favorites(
     Query(mut query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     query.is_favorite = Some(true);
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     emby_list_items(
         &headers,
         &state,
         principal,
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
         &query,
     )
     .await
@@ -1165,14 +1218,25 @@ pub(super) async fn emby_user_next_up(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
-    emby_next_up_response(&state, &user, &user_id, &query).await
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    emby_next_up_response(
+        &state,
+        principal,
+        &user_id,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
+        &query,
+    )
+    .await
 }
 
 pub(super) async fn emby_shows_next_up(
@@ -1180,21 +1244,36 @@ pub(super) async fn emby_shows_next_up(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    let user_id = query.user_id.clone().unwrap_or_else(|| user.id.to_string());
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
-    emby_next_up_response(&state, &user, &user_id, &query).await
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let user_id = principal.user_id_string();
+    emby_next_up_response(
+        &state,
+        principal,
+        &user_id,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
+        &query,
+    )
+    .await
 }
 
 pub(super) async fn emby_next_up_response(
     state: &AppState,
-    user: &UserRecord,
+    principal: AccessPrincipal,
     user_id: &str,
+    can_download: bool,
+    can_delete: bool,
     query: &EmbyItemsQuery,
 ) -> Response {
     let (offset, limit) = match emby_page_params(query) {
@@ -1206,13 +1285,7 @@ pub(super) async fn emby_next_up_response(
     };
     let series_id = query.series_id.as_deref().map(emby_internal_id);
     match catalog
-        .list_next_up(
-            AccessPrincipal::new(user.id, user.is_admin),
-            user_id,
-            series_id.as_deref(),
-            offset,
-            limit,
-        )
+        .list_next_up(principal, user_id, series_id.as_deref(), offset, limit)
         .await
     {
         Ok(page) => {
@@ -1221,9 +1294,9 @@ pub(super) async fn emby_next_up_response(
                 user_id,
                 &page,
                 query.fields.as_deref(),
-                user.can_download,
+                can_download,
                 EmbyCatalogPageOptions {
-                    can_delete: user.can_manage_server,
+                    can_delete,
                     preferred_source_id: None,
                     include_start_index: query.enable_total_record_count != Some(false),
                 },
@@ -1243,10 +1316,18 @@ pub(super) async fn emby_show_seasons(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let (offset, limit) = match emby_page_params(&query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
@@ -1256,23 +1337,17 @@ pub(super) async fn emby_show_seasons(
     };
     let series_id = emby_internal_id(&series_id);
     match catalog
-        .list_children(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &series_id,
-            "SEASON",
-            offset,
-            limit,
-        )
+        .list_children(principal, &series_id, "SEASON", offset, limit)
         .await
     {
         Ok(page) => {
             emby_catalog_page_for_user_with_fields(
                 &state,
-                &user.id.to_string(),
+                &principal.user_id_string(),
                 &page,
                 query.fields.as_deref(),
-                user.can_download,
-                user.can_manage_server,
+                auth_principal.can_download(),
+                auth_principal.can_manage_server(),
             )
             .await
         }
@@ -1289,10 +1364,18 @@ pub(super) async fn emby_show_episodes(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let (offset, limit) = match emby_show_episode_page_params(&query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
@@ -1310,7 +1393,6 @@ pub(super) async fn emby_show_episodes(
             && !value.eq_ignore_ascii_case("undefined"))
         .then_some(emby_internal_id(value))
     });
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let episodes = catalog
         .list_series_episodes(principal, &series_id, season_id.as_deref(), offset, limit)
         .await;
@@ -1318,12 +1400,12 @@ pub(super) async fn emby_show_episodes(
         Ok(page) => {
             emby_catalog_page_for_user_with_preferred_source_and_options(
                 &state,
-                &user.id.to_string(),
+                &principal.user_id_string(),
                 &page,
                 query.fields.as_deref(),
-                user.can_download,
+                auth_principal.can_download(),
                 EmbyCatalogPageOptions {
-                    can_delete: user.can_manage_server,
+                    can_delete: auth_principal.can_manage_server(),
                     preferred_source_id: None,
                     include_start_index: true,
                 },
@@ -1340,12 +1422,12 @@ pub(super) async fn emby_show_episodes(
             Ok(page) => {
                 emby_catalog_page_for_user_with_preferred_source_and_options(
                     &state,
-                    &user.id.to_string(),
+                    &principal.user_id_string(),
                     &page,
                     query.fields.as_deref(),
-                    user.can_download,
+                    auth_principal.can_download(),
                     EmbyCatalogPageOptions {
-                        can_delete: user.can_manage_server,
+                        can_delete: auth_principal.can_manage_server(),
                         preferred_source_id: None,
                         include_start_index: true,
                     },
@@ -1370,10 +1452,18 @@ pub(super) async fn emby_collection_children(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let (offset, limit) = match emby_page_params(&query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
@@ -1383,22 +1473,17 @@ pub(super) async fn emby_collection_children(
     };
     let collection_id = emby_internal_id(&collection_id);
     match catalog
-        .list_collection_items(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &collection_id,
-            offset,
-            limit,
-        )
+        .list_collection_items(principal, &collection_id, offset, limit)
         .await
     {
         Ok(page) => {
             emby_catalog_page_for_user_with_fields(
                 &state,
-                &user.id.to_string(),
+                &principal.user_id_string(),
                 &page,
                 query.fields.as_deref(),
-                user.can_download,
-                user.can_manage_server,
+                auth_principal.can_download(),
+                auth_principal.can_manage_server(),
             )
             .await
         }
@@ -1722,20 +1807,24 @@ pub(super) async fn emby_user_items(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let mut query = query;
+    query.user_id = Some(user_id);
     emby_list_items(
         &headers,
         &state,
         principal,
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
         &query,
     )
     .await
@@ -1746,22 +1835,24 @@ pub(super) async fn emby_items(
     Query(query): Query<EmbyItemsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Some(user_id) = query.user_id.as_deref()
-        && let Err(status) = ensure_emby_user_scope(&user, user_id)
-    {
-        return status.into_response();
-    }
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     emby_list_items(
         &headers,
         &state,
         principal,
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
         &query,
     )
     .await
@@ -1772,41 +1863,19 @@ pub(super) async fn emby_items_counts(
     Query(query): Query<EmbyItemCountsQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-
-    let (principal, target_user_id) = match query.user_id.as_deref() {
-        Some(requested_id) => {
-            if let Err(status) = ensure_emby_user_scope(&user, requested_id) {
-                return status.into_response();
-            }
-            let target_user = match auth.user_by_id(requested_id).await {
-                Ok(Some(target_user)) => target_user,
-                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            if target_user.is_disabled {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            let target_user_id = match requested_id.parse::<crate::domain::ids::UserId>() {
-                Ok(target_user_id) => target_user_id,
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-            };
-            (
-                AccessPrincipal::new(target_user_id, target_user.is_admin),
-                target_user.id.to_string(),
-            )
-        }
-        None => (
-            AccessPrincipal::new(user.id, user.is_admin),
-            user.id.to_string(),
-        ),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let target_user_id = principal.user_id_string();
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1848,7 +1917,7 @@ pub(super) async fn emby_list_items(
     can_delete: bool,
     query: &EmbyItemsQuery,
 ) -> Response {
-    let root_id = principal.user_id.to_string();
+    let root_id = principal.user_id_string();
     if emby_query_targets_user_root_views(query, &root_id) {
         return match emby_visible_library_items(state, principal).await {
             Ok(items) => Json(json!({
@@ -1870,7 +1939,7 @@ pub(super) async fn emby_list_items(
             let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
             emby_catalog_page_for_user_with_preferred_source_and_options(
                 state,
-                &principal.user_id.to_string(),
+                &principal.user_id_string(),
                 &page,
                 query.fields.as_deref(),
                 can_download,
@@ -1972,14 +2041,14 @@ pub(super) async fn emby_single_id_lookup_response(
         None
     };
     let user_state = match database
-        .find_user_item_state(&principal.user_id.to_string(), &item.id)
+        .find_user_item_state(&principal.user_id_string(), &item.id)
         .await
     {
         Ok(state) => state,
         Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
     };
     let unplayed_item_count =
-        match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item).await {
+        match emby_unplayed_episode_count(catalog, &principal.user_id_string(), &item).await {
             Ok(count) => count,
             Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
         };
@@ -2302,18 +2371,22 @@ pub(super) async fn emby_item(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let fields = emby_detail_fields(query.fields.as_deref());
     emby_item_response(
         &state,
         principal,
         &item_id,
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
         fields.as_deref(),
     )
     .await
@@ -2339,12 +2412,16 @@ pub(super) async fn emby_delete_item(
     Query(query): Query<EmbyDeleteItemQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(status) = emby_access_principal(&auth_principal, None) {
+        return status.into_response();
     }
     delete_media_item(&headers, &state, &item_id, query.source_id.as_deref()).await
 }
@@ -2390,8 +2467,13 @@ pub(super) async fn emby_update_item(
     State(state): State<AppState>,
     Json(request): Json<EmbyPersonUpdateRequest>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     if request.id != item_id {
@@ -2407,10 +2489,7 @@ pub(super) async fn emby_update_item(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -2459,21 +2538,23 @@ pub(super) async fn emby_user_item(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
-        return status.into_response();
-    }
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let fields = emby_detail_fields(query.fields.as_deref());
     emby_item_response(
         &state,
         principal,
         &item_id,
-        user.can_download,
-        user.can_manage_server,
+        auth_principal.can_download(),
+        auth_principal.can_manage_server(),
         fields.as_deref(),
     )
     .await
@@ -2487,7 +2568,7 @@ pub(super) async fn emby_item_response(
     can_delete: bool,
     fields: Option<&str>,
 ) -> Response {
-    if item_id == principal.user_id.to_string() {
+    if item_id == principal.user_id_string() {
         return emby_user_root_response(state, principal).await;
     }
     let response_fields = emby_item_detail_response_fields(fields);
@@ -2553,13 +2634,16 @@ pub(super) async fn emby_item_response(
         };
     match catalog_item {
         Some(item) if resolved_from_media_source_id => {
-            let unplayed_item_count =
-                match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
+            let unplayed_item_count = match emby_unplayed_episode_count(
+                catalog,
+                &principal.user_id_string(),
+                &item,
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
@@ -2599,7 +2683,7 @@ pub(super) async fn emby_item_response(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            let user_id = principal.user_id.to_string();
+            let user_id = principal.user_id_string();
             let (nfo, user_state, aspect_ratio, actors) = tokio::join!(
                 async {
                     if work_plan.read_nfo {
@@ -2640,13 +2724,16 @@ pub(super) async fn emby_item_response(
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let unplayed_item_count =
-                match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
+            let unplayed_item_count = match emby_unplayed_episode_count(
+                catalog,
+                &principal.user_id_string(),
+                &item,
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
@@ -2747,7 +2834,7 @@ pub(super) async fn emby_person_image_response(
     if normalize_image_type(image_type) != Some("POSTER") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(status) = require_emby_user(headers, state, query.api_key.as_deref()).await {
+    if let Err(status) = require_emby_principal(headers, state, query.api_key.as_deref()).await {
         return status.into_response();
     }
     let Some(people) = state.people.as_ref() else {
@@ -3089,20 +3176,6 @@ pub(super) fn emby_person_type_filter(person_types: Option<&str>) -> Option<&'st
         .map(|_| "Actor")
 }
 
-pub(super) fn ensure_emby_user_scope(
-    user: &UserRecord,
-    requested_id: &str,
-) -> Result<(), StatusCode> {
-    let requested_id = requested_id
-        .parse::<crate::domain::ids::UserId>()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    if user.is_admin || user.id == requested_id {
-        Ok(())
-    } else {
-        Err(StatusCode::FORBIDDEN)
-    }
-}
-
 pub(super) struct EmbyItemJsonOptions<'a> {
     nfo: Option<&'a LocalNfoDetails>,
     can_download: bool,
@@ -3348,7 +3421,16 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             object.insert("FileName".to_owned(), json!(file_name));
         }
         if !is_folder {
-            emby_insert_optional(&mut object, "PartCount", default_source.map(|_| json!(1)));
+            emby_insert_optional(
+                &mut object,
+                "PartCount",
+                default_source.map(|source| {
+                    json!(crate::application::catalog::catalog_source_part_count(
+                        &item.media_sources,
+                        source
+                    ))
+                }),
+            );
             emby_insert_optional(
                 &mut object,
                 "Container",

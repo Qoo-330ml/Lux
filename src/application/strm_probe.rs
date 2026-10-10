@@ -16,6 +16,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    application::strm_target::{StrmTargetKind, classify_strm_target},
     application::{
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
@@ -26,15 +27,15 @@ use crate::{
             MAX_STRM_THUMBNAIL_POSITION_PERCENT, MIN_STRM_THUMBNAIL_POSITION_PERCENT,
             MediaProbeOutput, PluginService, PluginServiceError,
         },
-        probe::{safe_media_path, write_media_info_sidecar},
+        probe::{MediaInfoSidecarContext, safe_media_path, write_media_info_sidecar_with_context},
         strm_probe_policy::validate_remote_media_url,
         thumbnail_policy::ThumbnailScrapingMode,
     },
     domain::ids::LibraryId,
     observability::resources::ResourceMetrics,
     storage::{
-        Database, ItemImageMetadata, MediaProbeUpdate, MediaStreamUpdate, StorageError,
-        StoredStrmMediaSource, StoredStrmProbeJob,
+        Database, ItemImageBatchInsert, ItemImageInsert, MediaProbeUpdate, MediaStreamUpdate,
+        StorageError, StoredStrmMediaSource, StoredStrmProbeJob,
     },
 };
 
@@ -71,6 +72,7 @@ pub struct StrmProbeService {
     database: Database,
     plugins: PluginService,
     operations: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    incremental_creation_lock: Arc<Mutex<()>>,
     resources: ResourceMetrics,
 }
 
@@ -80,6 +82,7 @@ impl StrmProbeService {
             database,
             plugins,
             operations: Arc::new(Mutex::new(HashMap::new())),
+            incremental_creation_lock: Arc::new(Mutex::new(())),
             resources: ResourceMetrics::new(),
         }
     }
@@ -94,6 +97,7 @@ impl StrmProbeService {
         library_ids: &[LibraryId],
         options: StrmProbeOptions,
     ) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
+        let _creation_guard = self.incremental_creation_lock.lock().await;
         if library_ids.is_empty() || library_ids.len() > MAX_LIBRARY_COUNT {
             return Err(StrmProbeError::InvalidLibraryCount);
         }
@@ -109,22 +113,24 @@ impl StrmProbeService {
             return Err(StrmProbeError::AlreadyActive);
         }
         let mut unique_ids = HashSet::new();
-        let mut libraries = Vec::with_capacity(library_ids.len());
+        let mut unique_library_ids = Vec::with_capacity(library_ids.len());
         for library_id in library_ids {
             let library_id = library_id.to_string();
             if !unique_ids.insert(library_id.clone()) {
                 continue;
             }
-            let library = self
-                .database
-                .find_library(&library_id)
-                .await?
-                .ok_or(StrmProbeError::LibraryNotFound)?;
-            let total_count = self
-                .database
-                .count_strm_media_sources_for_library(&library_id)
-                .await?;
-            libraries.push((library.id, total_count));
+            unique_library_ids.push(library_id);
+        }
+        let source_counts = self
+            .database
+            .list_strm_media_source_counts_for_libraries(&unique_library_ids)
+            .await?;
+        let mut libraries = Vec::with_capacity(unique_library_ids.len());
+        for library_id in unique_library_ids {
+            let Some(total_count) = source_counts.get(&library_id).copied() else {
+                return Err(StrmProbeError::LibraryNotFound);
+            };
+            libraries.push((library_id, total_count));
         }
         if libraries.is_empty() {
             return Err(StrmProbeError::InvalidLibraryCount);
@@ -172,15 +178,16 @@ impl StrmProbeService {
         if !library.is_enabled {
             return Ok(None);
         }
+        let _creation_guard = self.incremental_creation_lock.lock().await;
+        if self.database.has_active_strm_probe_jobs().await? {
+            return Err(StrmProbeError::AlreadyActive);
+        }
         let total_count = self
             .database
             .count_strm_media_sources_for_incremental_scan(scan_job_id)
             .await?;
         if total_count == 0 {
             return Ok(None);
-        }
-        if self.database.has_active_strm_probe_jobs().await? {
-            return Err(StrmProbeError::AlreadyActive);
         }
         let operation_id = Uuid::now_v7().to_string();
         let job = self
@@ -595,15 +602,19 @@ impl StrmProbeService {
             .await;
         drop(permit);
         match result {
-            Ok(result) => SourceOutcome::ready(
-                source.source_id,
-                source.item_id,
-                source.root_path,
-                path,
-                result,
-                media_info_needed,
-                thumbnail_needed,
-            ),
+            Ok(result) => {
+                let mut outcome = SourceOutcome::ready(
+                    source.source_id,
+                    source.item_id,
+                    source.root_path,
+                    path,
+                    result,
+                    media_info_needed,
+                    thumbnail_needed,
+                );
+                outcome.sidecar_context = Some(sidecar_context_for_target(&url));
+                outcome
+            }
             Err(error) => {
                 SourceOutcome::failed(&source.source_id, failure_status(&error), error.to_string())
             }
@@ -667,12 +678,17 @@ impl StrmProbeService {
                     duration_ticks: result.media.duration_ticks,
                     bitrate: result.media.bitrate,
                     streams: &streams,
+                    chapters: &[],
                 })
                 .await?;
             if job.write_sidecars
-                && write_media_info_sidecar(&outcome.path, &result.media)
-                    .await
-                    .is_err()
+                && write_media_info_sidecar_with_context(
+                    &outcome.path,
+                    &result.media,
+                    outcome.sidecar_context,
+                )
+                .await
+                .is_err()
             {
                 self.database
                     .mark_media_probe_failed(
@@ -732,39 +748,29 @@ impl StrmProbeService {
                 i64::try_from(thumbnail.len()).map_err(|_| StrmProbeError::WorkerFailed)?;
             let content_tag = hex_sha256(thumbnail);
             let dimensions = read_image_dimensions_from_bytes(thumbnail).await;
-            for image_type in ["POSTER", "THUMB"] {
-                if self
-                    .database
-                    .upsert_item_image(
-                        &outcome.item_id,
-                        image_type,
-                        &target,
-                        ItemImageMetadata {
-                            file_size,
-                            width: dimensions.map(|(width, _)| width),
-                            height: dimensions.map(|(_, height)| height),
-                            content_tag: &content_tag,
-                            source: "STRM_FFMPEG",
-                            source_url: None,
-                        },
-                    )
-                    .await
-                    .is_err()
-                {
-                    self.database
-                        .mark_media_probe_failed(
-                            &outcome.source_id,
-                            "FAILED",
-                            "thumbnail registration failed",
-                        )
-                        .await?;
-                    return Ok(1);
-                }
-            }
-            self.database
-                .set_poster_fallback_required(&outcome.item_id, false)
+            let image_batch = strm_thumbnail_image_batch(
+                &outcome.item_id,
+                &target,
+                file_size,
+                dimensions.map(|(width, _)| width),
+                dimensions.map(|(_, height)| height),
+                &content_tag,
+            );
+            if self
+                .database
+                .insert_item_images_batch_at_indices(&[image_batch])
                 .await
-                .map_err(StrmProbeError::Storage)?;
+                .is_err()
+            {
+                self.database
+                    .mark_media_probe_failed(
+                        &outcome.source_id,
+                        "FAILED",
+                        "thumbnail registration failed",
+                    )
+                    .await?;
+                return Ok(1);
+            }
         }
         Ok(0)
     }
@@ -871,6 +877,36 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 fn strm_thumbnail_path(path: &Path) -> Option<PathBuf> {
     canonical_thumbnail_path(path)
+}
+
+fn strm_thumbnail_image_batch(
+    item_id: &str,
+    target: &Path,
+    file_size: i64,
+    width: Option<i32>,
+    height: Option<i32>,
+    content_tag: &str,
+) -> ItemImageBatchInsert {
+    let local_path = target.to_string_lossy().into_owned();
+    let images = ["POSTER", "THUMB"]
+        .into_iter()
+        .map(|image_type| ItemImageInsert {
+            image_type: image_type.to_owned(),
+            image_index: 0,
+            local_path: local_path.clone(),
+            file_size,
+            width,
+            height,
+            content_tag: content_tag.to_owned(),
+            source: "STRM_FFMPEG".to_owned(),
+            source_url: None,
+        })
+        .collect();
+    ItemImageBatchInsert {
+        item_id: item_id.to_owned(),
+        images,
+        clear_poster_fallback: true,
+    }
 }
 
 async fn safe_strm_thumbnail_target(media_path: &Path, root_path: &str) -> Option<PathBuf> {
@@ -1015,6 +1051,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_jobs_reads_selected_libraries_and_counts_in_one_batch() {
+        const LIBRARY_COUNT: usize = MAX_LIBRARY_COUNT;
+
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|_| Uuid::now_v7().to_string())
+            .collect::<Vec<_>>();
+        for library_id in &library_ids {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await
+                .expect("library");
+        }
+        let library_ids = library_ids
+            .iter()
+            .map(|library_id| library_id.parse::<LibraryId>().expect("library id"))
+            .collect::<Vec<_>>();
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+
+        database.reset_query_count();
+        let jobs = service
+            .create_jobs(
+                &library_ids,
+                StrmProbeOptions {
+                    concurrency: 1,
+                    include_ready: false,
+                    write_sidecars: false,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: 30,
+                },
+            )
+            .await
+            .expect("STRM jobs");
+
+        assert_eq!(jobs.len(), LIBRARY_COUNT);
+        assert_eq!(database.query_count(), 131);
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn create_jobs_rejects_a_missing_library_after_batch_lookup() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+
+        let error = service
+            .create_jobs(
+                &[Uuid::now_v7()
+                    .to_string()
+                    .parse::<LibraryId>()
+                    .expect("library id")],
+                StrmProbeOptions {
+                    concurrency: 1,
+                    include_ready: false,
+                    write_sidecars: false,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: 30,
+                },
+            )
+            .await
+            .expect_err("missing library should be rejected");
+        assert!(matches!(error, StrmProbeError::LibraryNotFound));
+        database.close().await;
+    }
+
+    #[tokio::test]
     async fn operation_semaphore_uses_the_effective_worker_limit() {
         let temp_dir = tempfile::tempdir().expect("temporary directory");
         let config = Config {
@@ -1073,6 +1190,35 @@ mod tests {
             Some(PathBuf::from("/library/Example.S01E01-thumbnail.jpg"))
         );
     }
+
+    #[test]
+    fn strm_thumbnail_image_batch_registers_both_types_and_clears_fallback() {
+        let batch = strm_thumbnail_image_batch(
+            "item-1",
+            Path::new("/library/Example-thumbnail.jpg"),
+            128,
+            Some(1280),
+            Some(720),
+            "sha256",
+        );
+
+        assert_eq!(batch.item_id, "item-1");
+        assert!(batch.clear_poster_fallback);
+        assert_eq!(
+            batch
+                .images
+                .iter()
+                .map(|image| image.image_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["POSTER", "THUMB"]
+        );
+        assert!(
+            batch
+                .images
+                .iter()
+                .all(|image| image.local_path == "/library/Example-thumbnail.jpg")
+        );
+    }
 }
 
 struct SourceOutcome {
@@ -1080,6 +1226,7 @@ struct SourceOutcome {
     item_id: String,
     root_path: String,
     path: PathBuf,
+    sidecar_context: Option<MediaInfoSidecarContext>,
     result: Option<MediaProbeOutput>,
     media_info_needed: bool,
     thumbnail_needed: bool,
@@ -1103,6 +1250,7 @@ impl SourceOutcome {
             item_id,
             root_path,
             path,
+            sidecar_context: None,
             result: Some(result),
             skipped: false,
             media_info_needed,
@@ -1118,6 +1266,7 @@ impl SourceOutcome {
             item_id: String::new(),
             root_path: String::new(),
             path: PathBuf::new(),
+            sidecar_context: None,
             result: None,
             skipped: true,
             media_info_needed: false,
@@ -1133,6 +1282,7 @@ impl SourceOutcome {
             item_id: String::new(),
             root_path: String::new(),
             path: PathBuf::new(),
+            sidecar_context: None,
             result: None,
             skipped: false,
             media_info_needed: false,
@@ -1155,6 +1305,26 @@ fn failure_status(error: &PluginServiceError) -> &'static str {
             "TIMEOUT"
         }
         _ => "FAILED",
+    }
+}
+
+fn sidecar_context_for_target(target: &str) -> MediaInfoSidecarContext {
+    match classify_strm_target(target).kind {
+        StrmTargetKind::Url => MediaInfoSidecarContext {
+            protocol: "Http",
+            is_remote: true,
+            supports_transcoding: true,
+        },
+        StrmTargetKind::Path => MediaInfoSidecarContext {
+            protocol: "File",
+            is_remote: false,
+            supports_transcoding: true,
+        },
+        _ => MediaInfoSidecarContext {
+            protocol: "File",
+            is_remote: false,
+            supports_transcoding: false,
+        },
     }
 }
 

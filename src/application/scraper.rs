@@ -26,7 +26,7 @@ use crate::{
     },
     library::LibraryScraperRole,
     observability::resources::ResourceMetrics,
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, StoredLibraryScraper},
 };
 
 const SCRAPER_MAX_RETRIES: u32 = 2;
@@ -661,6 +661,57 @@ mod tests {
             decode_bundle_response(bundle_value.clone()).expect("owned bundle response")
         );
         assert_eq!(bundle_value["metadata"]["Name"], "Example");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_scraper_resolution_reads_one_configuration_per_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ITEM_COUNT: usize = 205;
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Unconfigured", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_ids = (0..ITEM_COUNT)
+            .map(|index| format!("unconfigured-item-{index:03}"))
+            .collect::<Vec<_>>();
+        for item_id in &item_ids {
+            sqlx::query(
+                "INSERT INTO media_items
+                    (id, library_id, item_type, title, sort_title, identification_status)
+                 VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let plugins = PluginService::new(database.clone(), config.config_dir);
+        let resolver = ScraperResolver::new(database.clone(), plugins);
+
+        database.reset_query_count();
+        for item_id in &item_ids {
+            assert!(resolver.for_item_ordered(item_id).await?.is_empty());
+        }
+        assert!((ITEM_COUNT..=ITEM_COUNT + 1).contains(&database.query_count()));
+
+        database.reset_query_count();
+        let available = resolver.has_selected_scrapers_for_items(&item_ids).await?;
+        assert_eq!(available.len(), ITEM_COUNT);
+        assert!(
+            available
+                .values()
+                .all(|available| matches!(available, Ok(false)))
+        );
+        assert!((1..=2).contains(&database.query_count()));
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -1433,11 +1484,11 @@ impl ScraperResolver {
         }
     }
 
-    pub async fn for_item_ordered(
+    async fn resolve_configured_scrapers(
         &self,
-        item_id: &str,
+        configured: &[StoredLibraryScraper],
+        legacy_scraper_id: Option<&str>,
     ) -> Result<Vec<ResolvedScraper>, ScraperError> {
-        let configured = self.database.find_item_scrapers(item_id).await?;
         let mut resolved = Vec::with_capacity(configured.len());
         let mut first_error = None;
         for scraper in configured {
@@ -1461,13 +1512,13 @@ impl ScraperResolver {
                 }
             };
             resolved.push(ResolvedScraper {
-                scraper_id: scraper.scraper_id,
+                scraper_id: scraper.scraper_id.clone(),
                 role,
                 provider: ScraperProvider::from_scraper(client),
             });
         }
         if resolved.is_empty()
-            && let Some(scraper_id) = self.database.find_item_scraper_id(item_id).await?
+            && let Some(scraper_id) = legacy_scraper_id
         {
             let scraper_id = scraper_id.trim();
             if !scraper_id.is_empty()
@@ -1491,6 +1542,44 @@ impl ScraperResolver {
             return Err(error);
         }
         Ok(resolved)
+    }
+
+    pub async fn for_item_ordered(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<ResolvedScraper>, ScraperError> {
+        let mut configurations = self
+            .database
+            .list_item_scraper_configurations_by_ids(&[item_id.to_owned()])
+            .await?;
+        let (configured, legacy_scraper_id) = configurations
+            .remove(item_id)
+            .unwrap_or_else(|| (Vec::new(), None));
+        self.resolve_configured_scrapers(&configured, legacy_scraper_id.as_deref())
+            .await
+    }
+
+    pub(crate) async fn has_selected_scrapers_for_items(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Result<bool, ScraperError>>, ScraperError> {
+        let configurations = self
+            .database
+            .list_item_scraper_configurations_by_ids(item_ids)
+            .await?;
+        let mut available = HashMap::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            let Some((configured, legacy_scraper_id)) = configurations.get(item_id) else {
+                available.insert(item_id.clone(), Ok(false));
+                continue;
+            };
+            let result = self
+                .resolve_configured_scrapers(configured, legacy_scraper_id.as_deref())
+                .await
+                .map(|resolved| !resolved.is_empty());
+            available.insert(item_id.clone(), result);
+        }
+        Ok(available)
     }
 }
 

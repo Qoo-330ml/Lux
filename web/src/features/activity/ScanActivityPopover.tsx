@@ -34,7 +34,7 @@ export function ScanActivityPopover() {
   const activity = useQuery({
     queryKey: queryKeys.adminTaskActivity,
     queryFn: () => api.adminTaskActivity(),
-    refetchInterval: 5_000,
+    refetchInterval: open ? 5_000 : false,
     refetchIntervalInBackground: false,
   });
   const libraries = useQuery({

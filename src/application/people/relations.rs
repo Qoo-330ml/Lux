@@ -1,6 +1,33 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::observability::resources::ResourceMetrics;
+
 use super::*;
+
+#[derive(Clone)]
+struct ResolvedNfoActor {
+    actor: ActorCredit,
+    actor_id: String,
+    actor_provider: String,
+    identities: Vec<PersonIdentity>,
+    person_key: Option<String>,
+    person: Option<PersonMetadata>,
+}
+
+fn spawn_nfo_person_asset_task(
+    tasks: &mut tokio::task::JoinSet<(usize, PersonAssetResult)>,
+    service: PeopleService,
+    actor: ResolvedNfoActor,
+    deferred_assets: DeferredNfoActorCredits,
+    index: usize,
+) {
+    tasks.spawn(async move {
+        let result = service
+            .persist_nfo_person_assets_for_page(&actor, &deferred_assets)
+            .await;
+        (index, result)
+    });
+}
 
 impl PeopleService {
     pub(super) async fn resolve_person_key(
@@ -158,7 +185,7 @@ impl PeopleService {
         provider: &str,
         actors: &[ActorCredit],
     ) -> Result<usize, PeopleError> {
-        self.persist_item_actors_with_source(item_id, provider, actors, None)
+        self.persist_item_actors_with_source(item_id, provider, actors, None, None)
             .await
             .map(|report| report.stored_count)
     }
@@ -170,8 +197,103 @@ impl PeopleService {
         actors: &[ActorCredit],
         source_fingerprint: &[u8],
     ) -> Result<ActorPersistReport, PeopleError> {
-        self.persist_item_actors_with_source(item_id, provider, actors, Some(source_fingerprint))
-            .await
+        self.persist_item_actors_with_source(
+            item_id,
+            provider,
+            actors,
+            Some(source_fingerprint),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn persist_nfo_item_actors_deferred(
+        &self,
+        item_id: &str,
+        provider: &str,
+        actors: &[ActorCredit],
+        source_fingerprint: &[u8],
+        deferred_credits: &DeferredNfoActorCredits,
+    ) -> Result<ActorPersistReport, PeopleError> {
+        self.persist_item_actors_with_source(
+            item_id,
+            provider,
+            actors,
+            Some(source_fingerprint),
+            Some(deferred_credits),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush_deferred_nfo_actor_credits(
+        &self,
+        deferred_credits: &DeferredNfoActorCredits,
+    ) -> Vec<NfoActorCreditsFlushFailure> {
+        self.flush_deferred_nfo_actor_credits_with_metrics(
+            deferred_credits,
+            &ResourceMetrics::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn flush_deferred_nfo_actor_credits_with_metrics(
+        &self,
+        deferred_credits: &DeferredNfoActorCredits,
+        resources: &ResourceMetrics,
+    ) -> Vec<NfoActorCreditsFlushFailure> {
+        let Some(database) = &self.database else {
+            return Vec::new();
+        };
+        let _flush_guard = deferred_credits.flush_lock.lock().await;
+        let pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
+        let mut failures = Vec::new();
+        let mut retry_pending = Vec::new();
+        for chunk in pending.chunks(16) {
+            let replacements = chunk
+                .iter()
+                .map(|pending| {
+                    (
+                        pending.item_id.as_str(),
+                        pending.credits.as_slice(),
+                        pending.source_fingerprint.as_deref(),
+                        Some(pending.relation_checksum.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let credit_entry_count = chunk
+                .iter()
+                .map(|pending| pending.credits.len())
+                .fold(0_usize, usize::saturating_add);
+            let started_at = std::time::Instant::now();
+            let result = database
+                .replace_person_credits_batch_with_relation_checksum(&replacements)
+                .await;
+            resources.record_local_nfo_actor_credit_transaction(
+                chunk.len(),
+                credit_entry_count,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            if let Err(error) = result {
+                retry_pending.extend(chunk.iter().cloned());
+                failures.push(NfoActorCreditsFlushFailure {
+                    item_ids: chunk
+                        .iter()
+                        .map(|pending| pending.item_id.clone())
+                        .collect(),
+                    error: error.to_string(),
+                });
+            }
+        }
+        if !retry_pending.is_empty() {
+            deferred_credits
+                .pending
+                .lock()
+                .await
+                .splice(0..0, retry_pending);
+        }
+        failures
     }
 
     pub(crate) async fn update_item_actor_metadata(
@@ -192,6 +314,8 @@ impl PeopleService {
         } else {
             legacy_path
         };
+        let relation_guard = self.relation_lock_for(&relation_path).await;
+        let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
         acquire_exclusive_file_lock(&lock_path).await?;
         let result = self
@@ -223,12 +347,12 @@ impl PeopleService {
             let Some(person) = enriched.person.clone() else {
                 continue;
             };
-            let merged = stored_actor
-                .person
-                .take()
+            let previous = stored_actor.person.clone();
+            let merged = previous
+                .clone()
                 .unwrap_or_default()
                 .supplement_missing_from(person);
-            if stored_actor.person.as_ref() != Some(&merged) {
+            if previous.as_ref() != Some(&merged) {
                 stored_actor.person = Some(merged);
                 changed_indices.push(index);
             }
@@ -254,13 +378,17 @@ impl PeopleService {
                     &actor.name,
                     &actor_provider,
                     &actor.identities,
-                    actor.person.as_ref(),
+                    PersonManifestWriteOptions {
+                        metadata: actor.person.as_ref(),
+                        deferred_restore_pending: None,
+                    },
                 )
                 .await?;
             }
         }
         let bytes = serde_json::to_vec_pretty(&relation)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let relation_checksum = relation_snapshot_checksum(&bytes);
         write_atomically(relation_path, &bytes).await?;
         if let Some(database) = &self.database {
             let credits = relation
@@ -269,10 +397,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits_with_fingerprint(
+                .replace_person_credits_with_relation_checksum(
                     item_id,
                     &credits,
                     relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
                 )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
@@ -286,6 +415,7 @@ impl PeopleService {
         provider: &str,
         actors: &[ActorCredit],
         source_fingerprint: Option<&[u8]>,
+        deferred_credits: Option<&DeferredNfoActorCredits>,
     ) -> Result<ActorPersistReport, PeopleError> {
         let relation_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
@@ -294,6 +424,8 @@ impl PeopleService {
             PeopleError::Serialization("people relation path has no parent".to_owned())
         })?;
         create_private_dir(relation_dir).await?;
+        let relation_guard = self.relation_lock_for(&relation_path).await;
+        let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
         acquire_exclusive_file_lock(&lock_path).await?;
         let result = self
@@ -303,6 +435,7 @@ impl PeopleService {
                 actors,
                 source_fingerprint,
                 &relation_path,
+                deferred_credits,
             )
             .await;
         let _ = fs::remove_file(&lock_path).await;
@@ -316,6 +449,7 @@ impl PeopleService {
         actors: &[ActorCredit],
         source_fingerprint: Option<&[u8]>,
         relation_path: &Path,
+        deferred_credits: Option<&DeferredNfoActorCredits>,
     ) -> Result<ActorPersistReport, PeopleError> {
         let previous_relation = read_relation(relation_path).await?;
         let source_locator = if let Some(database) = &self.database {
@@ -384,8 +518,7 @@ impl PeopleService {
             );
         }
 
-        let mut stored = Vec::with_capacity(prepared_actors.len());
-        let mut pending_assets = Vec::new();
+        let mut resolved_actors = Vec::with_capacity(prepared_actors.len());
         for (actor, identities, bridge_candidates) in prepared_actors {
             let primary = identities.first();
             let actor_id = primary
@@ -516,55 +649,59 @@ impl PeopleService {
                     );
                 }
             }
-            let has_stable_identity = person_key.is_some();
-            let assets = if has_stable_identity {
-                self.persist_person_assets(
-                    actor,
-                    actor_provider,
-                    actor_id,
-                    person_key.as_deref(),
-                    &identities,
-                )
-                .await
-            } else {
-                PersonAssetResult {
-                    image_file: None,
-                    pending_assets: Vec::new(),
-                }
-            };
+            let person = actor.person.clone().or_else(|| {
+                bridge_candidates
+                    .first()
+                    .filter(|_| bridge_candidates.len() == 1)
+                    .and_then(|previous| previous.person.clone())
+            });
+            resolved_actors.push(ResolvedNfoActor {
+                actor: actor.clone(),
+                actor_id: actor_id.to_owned(),
+                actor_provider: actor_provider.to_owned(),
+                identities,
+                person_key,
+                person,
+            });
+        }
+
+        let asset_results = self
+            .persist_resolved_nfo_person_assets(&resolved_actors, deferred_credits)
+            .await;
+        let mut stored = Vec::with_capacity(resolved_actors.len());
+        let mut pending_assets = Vec::new();
+        for (resolved, assets) in resolved_actors.into_iter().zip(asset_results) {
+            let has_stable_identity = resolved.person_key.is_some();
             if has_stable_identity && !assets.pending_assets.is_empty() {
-                pending_assets.push(actor_id.to_owned());
+                pending_assets.push(resolved.actor_id.clone());
             }
-            let lux_person_id = person_key
+            let lux_person_id = resolved
+                .person_key
                 .as_deref()
                 .filter(|person_key| person_key.starts_with("lux-"))
                 .map(str::to_owned);
             stored.push(StoredActor {
-                id: has_stable_identity.then(|| actor_id.to_owned()),
-                name: actor.name.trim().to_owned(),
+                id: has_stable_identity.then_some(resolved.actor_id),
+                name: resolved.actor.name.trim().to_owned(),
                 provider: if has_stable_identity {
-                    actor_provider.to_owned()
+                    resolved.actor_provider
                 } else {
                     String::new()
                 },
-                person_key,
+                person_key: resolved.person_key,
                 lux_person_id,
-                identities,
-                character: actor
+                identities: resolved.identities,
+                character: resolved
+                    .actor
                     .character
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned),
-                order: actor.order,
+                order: resolved.actor.order,
                 image_file: assets.image_file,
                 pending_assets: assets.pending_assets,
-                person: actor.person.clone().or_else(|| {
-                    bridge_candidates
-                        .first()
-                        .filter(|_| bridge_candidates.len() == 1)
-                        .and_then(|previous| previous.person.clone())
-                }),
+                person: resolved.person,
             });
         }
 
@@ -602,6 +739,7 @@ impl PeopleService {
         };
         let bytes = serde_json::to_vec_pretty(&relation)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let relation_checksum = relation_snapshot_checksum(&bytes);
         write_atomically(relation_path, &bytes).await?;
         if let Some(database) = &self.database {
             let credits = relation
@@ -609,19 +747,170 @@ impl PeopleService {
                 .iter()
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
-            database
-                .replace_person_credits_with_fingerprint(
-                    item_id,
-                    &credits,
-                    relation.source_fingerprint.as_deref(),
-                )
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if let Some(deferred_credits) = deferred_credits {
+                deferred_credits
+                    .pending
+                    .lock()
+                    .await
+                    .push(PendingNfoActorCredits {
+                        item_id: item_id.to_owned(),
+                        credits,
+                        source_fingerprint: relation.source_fingerprint.clone(),
+                        relation_checksum,
+                    });
+            } else {
+                database
+                    .replace_person_credits_with_relation_checksum(
+                        item_id,
+                        &credits,
+                        relation.source_fingerprint.as_deref(),
+                        Some(&relation_checksum),
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            }
         }
         Ok(ActorPersistReport {
             stored_count: relation.actors.len(),
             pending_assets,
         })
+    }
+
+    async fn persist_resolved_nfo_person_assets(
+        &self,
+        actors: &[ResolvedNfoActor],
+        deferred_assets: Option<&DeferredNfoActorCredits>,
+    ) -> Vec<PersonAssetResult> {
+        let Some(deferred_assets) = deferred_assets else {
+            let mut results = Vec::with_capacity(actors.len());
+            for actor in actors {
+                let result = if actor.person_key.is_some() {
+                    self.persist_person_assets(
+                        &actor.actor,
+                        &actor.actor_provider,
+                        &actor.actor_id,
+                        actor.person_key.as_deref(),
+                        &actor.identities,
+                    )
+                    .await
+                } else {
+                    PersonAssetResult::default()
+                };
+                results.push(result);
+            }
+            return results;
+        };
+
+        let mut results = vec![None; actors.len()];
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut request_indices = actors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, actor)| actor.person_key.as_ref().map(|_| index));
+
+        while tasks.len() < LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY
+            && let Some(index) = request_indices.next()
+        {
+            spawn_nfo_person_asset_task(
+                &mut tasks,
+                self.clone(),
+                actors[index].clone(),
+                deferred_assets.clone(),
+                index,
+            );
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((index, assets)) => results[index] = Some(assets),
+                Err(error) => {
+                    tracing::warn!(%error, "local NFO person asset task failed");
+                }
+            }
+            if let Some(index) = request_indices.next() {
+                spawn_nfo_person_asset_task(
+                    &mut tasks,
+                    self.clone(),
+                    actors[index].clone(),
+                    deferred_assets.clone(),
+                    index,
+                );
+            }
+        }
+
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| match result {
+                Some(result) => result,
+                None if actors[index].person_key.is_some() => PersonAssetResult::failed(),
+                None => PersonAssetResult::default(),
+            })
+            .collect()
+    }
+
+    async fn persist_nfo_person_assets_for_page(
+        &self,
+        actor: &ResolvedNfoActor,
+        deferred_assets: &DeferredNfoActorCredits,
+    ) -> PersonAssetResult {
+        let cache_key = serde_json::to_vec(&(
+            &actor.actor.name,
+            &actor.actor.profile_url,
+            &actor.actor.person,
+            &actor.actor_id,
+            &actor.actor_provider,
+            &actor.identities,
+            &actor.person_key,
+        ))
+        .ok()
+        .map(|bytes| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+        let Some(cache_key) = cache_key else {
+            return self
+                .persist_person_assets_with_deferred_manifest(
+                    &actor.actor,
+                    &actor.actor_provider,
+                    &actor.actor_id,
+                    actor.person_key.as_deref(),
+                    &actor.identities,
+                    Some(deferred_assets),
+                )
+                .await;
+        };
+
+        let cell = {
+            let mut page_results = deferred_assets.person_asset_results.lock().await;
+            page_results
+                .entry(cache_key)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        cell.get_or_init(|| async {
+            let permit = deferred_assets.person_asset_permits.acquire().await;
+            let Ok(_permit) = permit else {
+                return PersonAssetResult::failed();
+            };
+            #[cfg(test)]
+            if let Some(probe) = deferred_assets.person_asset_test_probe.as_ref() {
+                probe.hold_after_permit().await;
+            }
+            self.persist_person_assets_with_deferred_manifest(
+                &actor.actor,
+                &actor.actor_provider,
+                &actor.actor_id,
+                actor.person_key.as_deref(),
+                &actor.identities,
+                Some(deferred_assets),
+            )
+            .await
+        })
+        .await
+        .clone()
     }
 
     pub(super) async fn persist_person_assets(
@@ -632,6 +921,38 @@ impl PeopleService {
         person_key: Option<&str>,
         identities: &[PersonIdentity],
     ) -> PersonAssetResult {
+        self.persist_person_assets_with_deferred_manifest(
+            actor,
+            provider,
+            provider_id,
+            person_key,
+            identities,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn persist_person_assets_with_deferred_manifest(
+        &self,
+        actor: &ActorCredit,
+        provider: &str,
+        provider_id: &str,
+        person_key: Option<&str>,
+        identities: &[PersonIdentity],
+        deferred_restore_pending: Option<&DeferredNfoActorCredits>,
+    ) -> PersonAssetResult {
+        let lock_key = person_key
+            .filter(|key| key.starts_with("lux-"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{provider}:{provider_id}"));
+        let person_asset_lock = {
+            let mut locks = self.person_asset_locks.lock().await;
+            locks
+                .entry(lock_key)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _person_asset_guard = person_asset_lock.lock().await;
         let mut pending_assets = Vec::new();
         let person_dir = if let Some(person_key) = person_key.filter(|key| key.starts_with("lux-"))
         {
@@ -732,7 +1053,9 @@ impl PeopleService {
                     identities,
                 )
                 .await?;
-            write_atomically(&nfo_path, &bytes).await
+            write_atomically_if_changed(&nfo_path, &bytes)
+                .await
+                .map(|_| ())
         }
         .await;
         if let Err(error) = nfo_result {
@@ -748,7 +1071,10 @@ impl PeopleService {
                     &actor.name,
                     provider,
                     identities,
-                    actor.person.as_ref(),
+                    PersonManifestWriteOptions {
+                        metadata: actor.person.as_ref(),
+                        deferred_restore_pending,
+                    },
                 )
                 .await
             {
@@ -813,7 +1139,9 @@ impl PeopleService {
                                         break;
                                     }
                                 };
-                                if let Err(error) = write_atomically(&index_path, &bytes).await {
+                                if let Err(error) =
+                                    write_atomically_if_changed(&index_path, &bytes).await
+                                {
                                     result = Err(error);
                                     break;
                                 }
@@ -847,7 +1175,9 @@ impl PeopleService {
                     person_key: Some(person_key.to_owned()),
                 };
                 if let Ok(bytes) = serde_json::to_vec_pretty(&index)
-                    && write_atomically(&index_path, &bytes).await.is_err()
+                    && write_atomically_if_changed(&index_path, &bytes)
+                        .await
+                        .is_err()
                 {
                     pending_assets.push(PENDING_PERSON_INDEX.to_owned());
                 }
@@ -912,7 +1242,7 @@ impl PeopleService {
         display_name: &str,
         source_provider: &str,
         identities: &[PersonIdentity],
-        metadata: Option<&PersonMetadata>,
+        options: PersonManifestWriteOptions<'_>,
     ) -> Result<(), PeopleError> {
         let manifest_path = person_dir.join(PERSON_MANIFEST);
         acquire_person_manifest_lock(&manifest_path).await?;
@@ -976,7 +1306,7 @@ impl PeopleService {
                     .cmp(&right.provider)
                     .then(left.id.cmp(&right.id))
             });
-            if let Some(metadata) = metadata {
+            if let Some(metadata) = options.metadata {
                 for field in person_metadata_fields(metadata) {
                     manifest
                         .field_sources
@@ -1010,7 +1340,8 @@ impl PeopleService {
             manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-            self.mark_person_manifest_restore_pending().await?;
+            self.ensure_person_manifest_restore_pending(options.deferred_restore_pending)
+                .await?;
             write_atomically(&manifest_path, &bytes).await
         }
         .await;

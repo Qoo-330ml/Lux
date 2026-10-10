@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -10,7 +11,7 @@ use axum::{
     body::{Body, Bytes, to_bytes},
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, RawQuery, State},
     http::{
-        HeaderMap, HeaderValue, Method, Request, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
         header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
     middleware::{self, Next},
@@ -126,6 +127,7 @@ use crate::{
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     process::Command,
+    sync::Mutex as AsyncMutex,
 };
 
 #[path = "admin.rs"]
@@ -153,8 +155,67 @@ mod routes;
 #[path = "users.rs"]
 mod users;
 
+const ADMIN_HEALTH_PROBE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdminHealthProbeSnapshot {
+    pub(crate) database_writable: bool,
+    pub(crate) config_available: bool,
+    pub(crate) config_writable: bool,
+    pub(crate) ffprobe_available: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct AdminHealthProbeCache {
+    cached: Arc<AsyncMutex<Option<CachedAdminHealthProbes>>>,
+}
+
+struct CachedAdminHealthProbes {
+    expires_at: Instant,
+    snapshot: AdminHealthProbeSnapshot,
+}
+
+impl AdminHealthProbeCache {
+    async fn get_or_probe<F, Fut>(&self, probe: F) -> AdminHealthProbeSnapshot
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = AdminHealthProbeSnapshot>,
+    {
+        self.get_or_probe_with_clock(probe, Instant::now).await
+    }
+
+    #[cfg(test)]
+    async fn get_or_probe_at<F, Fut>(&self, now: Instant, probe: F) -> AdminHealthProbeSnapshot
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = AdminHealthProbeSnapshot>,
+    {
+        self.get_or_probe_with_clock(probe, || now).await
+    }
+
+    async fn get_or_probe_with_clock<F, Fut, C>(&self, probe: F, now: C) -> AdminHealthProbeSnapshot
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = AdminHealthProbeSnapshot>,
+        C: Fn() -> Instant,
+    {
+        let mut cached = self.cached.lock().await;
+        if let Some(cached) = cached.as_ref().filter(|cached| now() < cached.expires_at) {
+            return cached.snapshot;
+        }
+
+        let snapshot = probe().await;
+        *cached = Some(CachedAdminHealthProbes {
+            expires_at: now() + ADMIN_HEALTH_PROBE_CACHE_TTL,
+            snapshot,
+        });
+        snapshot
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AppState {
+    admin_health_probe_cache: AdminHealthProbeCache,
     database: Option<Database>,
     config_dir: Option<PathBuf>,
     database_setup: Option<DatabaseSetupService>,
@@ -383,6 +444,7 @@ impl AppState {
         .with_library_covers(library_covers.clone())
         .with_danmaku(danmaku.clone());
         Self {
+            admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
             database_setup,
@@ -622,6 +684,13 @@ pub fn app_with_state(state: AppState) -> Router {
 
 async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserRecord, Response> {
     users::require_web_user(headers, state).await
+}
+
+async fn require_web_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<crate::auth::users::AuthenticationPrincipal, Response> {
+    users::require_web_principal(headers, state).await
 }
 
 async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
@@ -1054,9 +1123,13 @@ async fn lux_search_people(
     Query(query): Query<LuxPeopleSearchQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let Some(raw_query) = query
         .q
@@ -1087,10 +1160,7 @@ async fn lux_search_people(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1126,9 +1196,13 @@ async fn lux_get_person_items(
     Query(query): Query<LuxPageQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let (offset, limit) = match lux_page_params(&query) {
         Ok(params) => params,
@@ -1145,10 +1219,7 @@ async fn lux_get_person_items(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1183,16 +1254,12 @@ async fn lux_get_person_items(
         ..CatalogFilter::default()
     };
     match catalog
-        .list_all_items_filtered(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &filter,
-            offset,
-            limit,
-        )
+        .list_all_items_filtered(principal, &filter, offset, limit)
         .await
     {
         Ok(page) => {
-            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+            match lux_catalog_page_json_for_user(database, &principal.user_id_string(), &page).await
+            {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
@@ -1217,17 +1284,18 @@ async fn lux_get_person(
     Path(person_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1239,12 +1307,15 @@ async fn lux_get_person(
     };
     match people.find_person(&library_ids, "Actor", &person_id).await {
         Ok(Some(mut person)) => {
-            person.is_favorite = match database
-                .find_user_person_favorite(&user.id.to_string(), &person.id)
-                .await
-            {
-                Ok(is_favorite) => is_favorite,
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            person.is_favorite = match auth_principal.user_id() {
+                Some(user_id) => match database
+                    .find_user_person_favorite(&user_id.to_string(), &person.id)
+                    .await
+                {
+                    Ok(is_favorite) => is_favorite,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                },
+                None => false,
             };
             Json(person).into_response()
         }
@@ -1350,9 +1421,13 @@ async fn lux_update_person(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     if !person_update_is_bounded(&request) {
         return api_error(
@@ -1366,10 +1441,7 @@ async fn lux_update_person(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1505,7 +1577,7 @@ async fn lux_get_person_image_inner(
     person_id: String,
     state: AppState,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
+    if let Err(response) = require_web_principal(&headers, &state).await {
         return response;
     }
     let Some(people) = state.people.as_ref() else {
@@ -1535,6 +1607,11 @@ async fn lux_get_person_image_inner(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
 
     use super::{
         CatalogSort, EmbyItemDetailWorkPlan, FilmlyImageCompatMode, MediaStrategySettings,
@@ -1562,7 +1639,6 @@ mod tests {
     use crate::storage::{Database, StorageError};
     use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
     use serde_json::json;
-    use std::time::Duration;
 
     #[test]
     fn emby_item_ids_are_reversible_decimal_wire_ids() {
@@ -2314,5 +2390,124 @@ mod tests {
     fn hls_manifest_rejects_unexpected_media_paths() {
         let manifest = "#EXTM3U\n#EXTINF:4.0,\n../outside.m4s\n";
         assert!(super::rewrite_hls_manifest(manifest, |_| None).is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_health_probe_cache_reuses_results_and_coalesces_expired_refreshes() {
+        let cache = super::AdminHealthProbeCache::default();
+        let now = Instant::now();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let probes = Arc::clone(&probes);
+            cache
+                .get_or_probe_at(now, move || async move {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    super::AdminHealthProbeSnapshot {
+                        database_writable: true,
+                        config_available: true,
+                        config_writable: true,
+                        ffprobe_available: true,
+                    }
+                })
+                .await
+        };
+        let cached = cache
+            .get_or_probe_at(now + Duration::from_secs(29), || async {
+                super::AdminHealthProbeSnapshot::default()
+            })
+            .await;
+        assert_eq!(cached, first);
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+
+        let refresh_at = now + Duration::from_secs(31);
+        let first_cache = cache.clone();
+        let second_cache = cache.clone();
+        let first_probes = Arc::clone(&probes);
+        let second_probes = Arc::clone(&probes);
+        let (first_refresh, second_refresh) = tokio::join!(
+            first_cache.get_or_probe_at(refresh_at, move || async move {
+                first_probes.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                super::AdminHealthProbeSnapshot::default()
+            }),
+            second_cache.get_or_probe_at(refresh_at, move || async move {
+                second_probes.fetch_add(1, Ordering::Relaxed);
+                super::AdminHealthProbeSnapshot::default()
+            }),
+        );
+        assert_eq!(first_refresh, second_refresh);
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_health_probe_cache_rechecks_expiry_after_waiting_for_refresh_lock() {
+        let cache = super::AdminHealthProbeCache::default();
+        {
+            let mut cached = cache.cached.lock().await;
+            *cached = Some(super::CachedAdminHealthProbes {
+                expires_at: Instant::now() + Duration::from_millis(100),
+                snapshot: super::AdminHealthProbeSnapshot::default(),
+            });
+        }
+
+        let guard = cache.cached.lock().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let request_cache = cache.clone();
+        let request_probes = Arc::clone(&probes);
+        let mut request = tokio::spawn(async move {
+            request_cache
+                .get_or_probe(move || async move {
+                    request_probes.fetch_add(1, Ordering::Relaxed);
+                    super::AdminHealthProbeSnapshot {
+                        database_writable: true,
+                        ..Default::default()
+                    }
+                })
+                .await
+        });
+
+        let while_locked = tokio::time::timeout(Duration::from_millis(10), &mut request).await;
+        assert!(
+            while_locked.is_err(),
+            "request should wait for the cache lock"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(guard);
+
+        let refreshed = request.await.expect("health probe task should finish");
+        assert!(refreshed.database_writable);
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_health_probe_cache_ttl_starts_after_probe_finishes() {
+        let cache = super::AdminHealthProbeCache::default();
+        let start = Instant::now();
+        let elapsed = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_elapsed = Arc::clone(&elapsed);
+        let probe_count = Arc::clone(&probes);
+        let clock_elapsed = Arc::clone(&elapsed);
+        cache
+            .get_or_probe_with_clock(
+                move || async move {
+                    probe_count.fetch_add(1, Ordering::Relaxed);
+                    probe_elapsed.store(40, Ordering::Relaxed);
+                    super::AdminHealthProbeSnapshot {
+                        database_writable: true,
+                        ..Default::default()
+                    }
+                },
+                move || start + Duration::from_secs(clock_elapsed.load(Ordering::Relaxed) as u64),
+            )
+            .await;
+
+        let cached = cache
+            .get_or_probe_at(start + Duration::from_secs(69), || async {
+                super::AdminHealthProbeSnapshot::default()
+            })
+            .await;
+        assert!(cached.database_writable);
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
     }
 }

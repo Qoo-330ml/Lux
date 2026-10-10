@@ -1,4 +1,4 @@
-import { CalendarDays, CirclePlus, ExternalLink, Globe2, Languages, Link2, UsersRound } from "lucide-react";
+import { CalendarDays, ExternalLink, Globe2, Languages, Link2, UsersRound } from "lucide-react";
 import type { MediaNfoCredit, MediaNfoDetails } from "../../lib/api/types";
 import { MediaInfoContent, languageLabel, type MediaInfoPanelProps } from "./MediaInfoPanel";
 
@@ -39,7 +39,6 @@ export function MediaNfoPanel({
     { label: "原始片名", value: originalTitle, icon: <Globe2 size={14} /> },
     { label: "年份", value: productionYear != null ? String(productionYear) : undefined, icon: <CalendarDays size={14} /> },
     { label: "原始语言", value: originalLanguage ? languageLabel(originalLanguage) : undefined, icon: <Languages size={14} /> },
-    { label: "添加于", value: addedAtLabel, icon: <CirclePlus size={14} /> },
   ].filter((row) => Boolean(row.value));
   const summaryRows: Array<{ label: string; value?: string | null; icon?: React.ReactNode }> = [
     ...(!hasRating && details?.votes != null ? [{ label: "投票数", value: `${details.votes} 票` }] : []),
@@ -105,39 +104,44 @@ export function MediaNfoPanel({
           {details?.directors?.length ? <CreditItem label="导演" credits={details.directors} /> : null}
           {details?.writers?.length ? <CreditItem label="编剧" credits={details.writers} /> : null}
           {providerIds.length ? (
-            <div className="lux-media-nfo-secondary-item">
+            <div className="lux-media-nfo-secondary-item lux-media-nfo-provider-item">
               <span><Link2 size={14} />外部 ID</span>
-              <strong>{providerIds.map(([provider, id]) => `${provider.toUpperCase()} ${id}`).join(" · ")}</strong>
+              <strong className="lux-media-nfo-provider-ids">
+                {providerIds.map(([provider, id]) => <span key={`${provider}-${id}`}>{provider.toUpperCase()} {id}</span>)}
+              </strong>
             </div>
           ) : null}
         </div>
       ) : null}
       {details?.website || details?.trailers?.length ? (
         <div className="lux-media-nfo-links" aria-label="本地 NFO 链接">
-          {details?.website && isHttpUrl(details.website) ? (
-            <a href={details.website} target="_blank" rel="noreferrer" aria-label="官方网站">
-              <ExternalLink size={14} /> 官方网站
-            </a>
-          ) : null}
-          {(details?.trailers ?? []).filter(isHttpUrl).map((trailer, index) => (
-            <a href={trailer} target="_blank" rel="noreferrer" aria-label={`预告片 ${index + 1}`} key={trailer}>
-              <ExternalLink size={14} /> 预告片 {index + 1}
-            </a>
-          ))}
+          <span className="lux-media-nfo-links-label">更多来源</span>
+          <div className="lux-media-nfo-links-list">
+            {details?.website && isHttpUrl(details.website) ? (
+              <a href={details.website} target="_blank" rel="noreferrer" aria-label="官方网站">
+                <ExternalLink size={14} /> 官方网站
+              </a>
+            ) : null}
+            {(details?.trailers ?? []).filter(isHttpUrl).map((trailer, index) => (
+              <a href={trailer} target="_blank" rel="noreferrer" aria-label={`预告片 ${index + 1}`} key={trailer}>
+                <ExternalLink size={14} /> 预告片 {index + 1}
+              </a>
+            ))}
+          </div>
         </div>
       ) : null}
       {mediaInfo ? (
         <section className="lux-media-nfo-media" aria-labelledby="media-file-heading">
           <div className="lux-media-nfo-media-heading">
             <h3 id="media-file-heading">媒体文件</h3>
-            <span>{mediaInfo.source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"}</span>
           </div>
           <MediaInfoContent
             {...mediaInfo}
+            addedAtLabel={addedAtLabel}
             includeMetadataRows={!hasNfoDetails}
             includeOriginalLanguage={false}
-            includeSourceRow={false}
-            collapseTechnicalDetails
+            compactSummary
+            includeSourceRow
           />
         </section>
       ) : null}

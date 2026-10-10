@@ -59,6 +59,10 @@ pub(super) fn encode_fingerprint(fingerprint: &[u8]) -> String {
     encoded
 }
 
+pub(super) fn relation_snapshot_checksum(bytes: &[u8]) -> String {
+    encode_fingerprint(&Sha256::digest(bytes))
+}
+
 pub(super) fn decode_fingerprint(value: &str) -> Option<Vec<u8>> {
     if value.is_empty() || value.len() % 2 != 0 {
         return None;
@@ -1178,12 +1182,63 @@ pub(super) async fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), Pe
     result
 }
 
+pub(super) async fn write_atomically_if_changed(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<bool, PeopleError> {
+    use tokio::io::AsyncReadExt;
+
+    if let Some(metadata) = safe_metadata(path).await? {
+        if !metadata.is_file() {
+            return Err(PeopleError::Serialization(
+                "people data path is not a file".to_owned(),
+            ));
+        }
+        if metadata.len() == bytes.len() as u64 {
+            let file = fs::File::open(path)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            let mut existing = Vec::with_capacity(bytes.len());
+            file.take((bytes.len() as u64).saturating_add(1))
+                .read_to_end(&mut existing)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            if existing == bytes {
+                restrict_permissions(path, false).await?;
+                return Ok(false);
+            }
+        }
+    }
+
+    write_atomically(path, bytes).await?;
+    Ok(true)
+}
+
 pub(super) async fn acquire_person_manifest_lock(manifest_path: &Path) -> Result<(), PeopleError> {
     acquire_exclusive_file_lock(&manifest_path.with_file_name(".person.json.lock")).await
 }
 
+const PERSON_LOCK_WAIT_BACKOFF_MS: [u64; 6] = [10, 20, 40, 80, 160, 250];
+const PERSON_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn person_manifest_lock_backoff(retry_number: usize) -> Duration {
+    let delay_index = retry_number.min(PERSON_LOCK_WAIT_BACKOFF_MS.len() - 1);
+    Duration::from_millis(PERSON_LOCK_WAIT_BACKOFF_MS[delay_index])
+}
+
 pub(super) async fn acquire_exclusive_file_lock(lock_path: &Path) -> Result<(), PeopleError> {
-    for _ in 0..100 {
+    let deadline = Instant::now() + PERSON_LOCK_WAIT_TIMEOUT;
+    let mut retry_number = 0_usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(person_manifest_lock_timeout(lock_path));
+        }
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1210,10 +1265,16 @@ pub(super) async fn acquire_exclusive_file_lock(lock_path: &Path) -> Result<(), 
                     .and_then(|modified| modified.elapsed().ok())
                     .is_some_and(|age| age > Duration::from_secs(300));
                 if stale {
-                    let _ = fs::remove_file(&lock_path).await;
-                } else {
-                    sleep(Duration::from_millis(10)).await;
+                    if fs::remove_file(lock_path).await.is_ok() {
+                        continue;
+                    }
                 }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(person_manifest_lock_timeout(lock_path));
+                }
+                sleep(person_manifest_lock_backoff(retry_number).min(remaining)).await;
+                retry_number = retry_number.saturating_add(1);
             }
             Err(source) => {
                 return Err(PeopleError::Io {
@@ -1223,13 +1284,16 @@ pub(super) async fn acquire_exclusive_file_lock(lock_path: &Path) -> Result<(), 
             }
         }
     }
-    Err(PeopleError::Io {
+}
+
+fn person_manifest_lock_timeout(lock_path: &Path) -> PeopleError {
+    PeopleError::Io {
         path: lock_path.to_owned(),
         source: std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "person manifest lock could not be acquired",
         ),
-    })
+    }
 }
 
 pub(super) async fn restrict_permissions(path: &Path, directory: bool) -> Result<(), PeopleError> {
@@ -1255,5 +1319,62 @@ pub(super) fn valid_image(content_type: &str, bytes: &[u8]) -> bool {
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{acquire_exclusive_file_lock, person_manifest_lock_backoff};
+
+    #[test]
+    fn person_manifest_lock_backoff_starts_at_ten_ms_and_caps_at_250_ms() {
+        let delays = (0..=6)
+            .map(person_manifest_lock_backoff)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            delays,
+            [10, 20, 40, 80, 160, 250, 250].map(std::time::Duration::from_millis)
+        );
+        assert_eq!(
+            person_manifest_lock_backoff(usize::MAX),
+            std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_file_lock_still_acquires_immediately_when_uncontended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let lock_path = directory.path().join(".person.json.lock");
+
+        acquire_exclusive_file_lock(&lock_path).await?;
+
+        assert!(tokio::fs::try_exists(&lock_path).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exclusive_file_lock_times_out_when_another_process_holds_the_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir()?;
+        let lock_path = directory.path().join(".person.json.lock");
+        tokio::fs::write(&lock_path, "held by another process").await?;
+        let started = Instant::now();
+
+        let error = acquire_exclusive_file_lock(&lock_path)
+            .await
+            .expect_err("the existing lock should time out");
+
+        assert!(matches!(
+            error,
+            crate::application::people::PeopleError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(started.elapsed() <= Duration::from_millis(1_500));
+        Ok(())
     }
 }

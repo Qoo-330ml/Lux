@@ -1,5 +1,5 @@
 import { useQueryClient, type QueryKey } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 type AdminEventScope =
   | "all"
@@ -60,13 +60,26 @@ const queryKeysByScope: Record<Exclude<AdminEventScope, "all">, QueryKey[]> = {
 
 export function useAdminEvents() {
   const queryClient = useQueryClient();
+  const pendingKeys = useRef(new Map<string, QueryKey>());
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const source = new EventSource("/api/v1/admin/events");
+    const flush = () => {
+      flushTimer.current = null;
+      const keys = [...pendingKeys.current.values()];
+      pendingKeys.current.clear();
+      for (const queryKey of keys) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    };
     const invalidate = (scope: AdminEventScope) => {
       const keys = scope === "all" ? [adminQueryRoot] : queryKeysByScope[scope];
       for (const queryKey of keys) {
-        void queryClient.invalidateQueries({ queryKey });
+        pendingKeys.current.set(JSON.stringify(queryKey), queryKey);
+      }
+      if (flushTimer.current === null) {
+        flushTimer.current = setTimeout(flush, 250);
       }
     };
     const handleOpen = () => invalidate("all");
@@ -82,6 +95,9 @@ export function useAdminEvents() {
       source.removeEventListener("open", handleOpen);
       source.removeEventListener("invalidate", handleInvalidate);
       source.close();
+      if (flushTimer.current !== null) clearTimeout(flushTimer.current);
+      flushTimer.current = null;
+      pendingKeys.current.clear();
     };
   }, [queryClient]);
 }

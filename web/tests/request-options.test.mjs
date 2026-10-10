@@ -51,6 +51,25 @@ test("legacy web requests use the stored CSRF token when the cookie is missing",
   }
 });
 
+test("legacy requests prefer a shared CSRF token updated by another tab", () => {
+  const previousStorage = globalThis.localStorage;
+  let storedValue = "old-tab-token";
+  globalThis.localStorage = {
+    getItem(key) { return key === "lux_csrf_token" ? storedValue : null; },
+    setItem(key, value) { if (key === "lux_csrf_token") storedValue = value; },
+    removeItem(key) { if (key === "lux_csrf_token") storedValue = null; },
+  };
+  try {
+    rememberCsrfToken("old-tab-token");
+    storedValue = "new-tab-token";
+    assert.equal(readCsrfToken(), "new-tab-token");
+  } finally {
+    clearCsrfToken();
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
 test("legacy web requests keep the login CSRF nonce in memory when privacy mode blocks storage", () => {
   const previousDocument = globalThis.document;
   const previousStorage = globalThis.localStorage;

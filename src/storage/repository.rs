@@ -1202,7 +1202,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
-#[allow(dead_code)] // The local metadata worker consumes these batches in the next phase task.
+#[allow(dead_code)] // Storage tests exercise the single-batch enqueue contract.
 #[derive(Clone, Copy)]
 pub(crate) struct NewScanLocalMetadataBatch<'a> {
     pub(crate) id: &'a str,
@@ -1212,7 +1212,7 @@ pub(crate) struct NewScanLocalMetadataBatch<'a> {
     pub(crate) source_ids: &'a [String],
 }
 
-#[allow(dead_code)] // Fields are consumed by the later local metadata worker.
+#[allow(dead_code)] // The active worker reads a subset; tests inspect the complete stored row.
 #[derive(Debug)]
 pub(crate) struct StoredScanLocalMetadataBatch {
     pub(crate) id: String,
@@ -1220,7 +1220,9 @@ pub(crate) struct StoredScanLocalMetadataBatch {
     pub(crate) library_root_id: String,
     pub(crate) batch_sequence: i64,
     pub(crate) source_refs_json: String,
+    pub(crate) non_retryable_item_ids_json: String,
     pub(crate) source_count: i64,
+    pub(crate) images_completed_at: Option<i64>,
     pub(crate) status: String,
     pub(crate) attempts: i64,
     pub(crate) next_attempt_at: Option<i64>,
@@ -1654,7 +1656,9 @@ fn stored_scan_local_metadata_batch(row: sqlx::any::AnyRow) -> StoredScanLocalMe
         library_root_id: row.get("library_root_id"),
         batch_sequence: row.get("batch_sequence"),
         source_refs_json: row.get("source_refs_json"),
+        non_retryable_item_ids_json: row.get("non_retryable_item_ids_json"),
         source_count: row.get("source_count"),
+        images_completed_at: row.get("images_completed_at"),
         status: row.get("status"),
         attempts: row.get("attempts"),
         next_attempt_at: row.get("next_attempt_at"),
@@ -1797,7 +1801,7 @@ struct PrefetchedMovieItem {
     removed_at: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct NewPersonCredit {
     pub(crate) person_id: String,
     pub(crate) lux_person_id: Option<String>,
@@ -1985,8 +1989,9 @@ pub(crate) struct NewCollection<'a> {
     pub(crate) member_provider_ids: &'a [(String, String, i64)],
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredMediaMetadata {
+    pub(crate) library_id: String,
     pub(crate) item_type: String,
     pub(crate) title: String,
     pub(crate) original_title: Option<String>,
@@ -2004,6 +2009,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
     pub(crate) nfo_metadata_json: Option<String>,
+    pub(crate) metadata_fingerprint: Option<Vec<u8>>,
     pub(crate) series_item_id: Option<String>,
     pub(crate) series_title: Option<String>,
     pub(crate) series_production_year: Option<i64>,
@@ -2035,7 +2041,7 @@ pub(crate) struct StoredMetadataCapabilityAttempt {
     pub(crate) next_retry_at: Option<i64>,
 }
 
-#[allow(dead_code)] // Consumed by local metadata scanning in the next phase task.
+#[allow(dead_code)] // Storage tests cover the legacy completeness read projection.
 #[derive(Debug)]
 pub(crate) struct StoredItemMetadataCompleteness {
     pub(crate) item_id: String,
@@ -2476,7 +2482,6 @@ pub(crate) struct ItemImageInsert {
     pub(crate) source_url: Option<String>,
 }
 
-#[allow(dead_code)] // LUX-306 consumes this storage contract from the local image worker.
 pub(crate) struct ItemImageBatchInsert {
     pub(crate) item_id: String,
     pub(crate) images: Vec<ItemImageInsert>,
@@ -2493,7 +2498,7 @@ pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) now: i64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredItemImage {
     pub(crate) id: String,
     pub(crate) item_id: String,
@@ -2989,13 +2994,19 @@ pub(crate) enum CatalogSort {
     Rating,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredMediaSourcePath {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
     pub(crate) probe_status: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredMediaWritebackContext {
+    pub(crate) item_type: String,
+    pub(crate) source: Option<StoredMediaSourcePath>,
 }
 
 #[derive(Debug)]
@@ -3200,6 +3211,31 @@ pub(crate) struct StoredSeriesMetadataSource {
     pub(crate) season_number: Option<i64>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanJobMetadataPage {
+    pub(crate) job_type: Option<String>,
+    pub(crate) job_status: Option<String>,
+    pub(crate) auto_metadata_match: bool,
+    pub(crate) has_pending: bool,
+    pub(crate) sources: StoredScanJobMetadataSources,
+}
+
+#[derive(Debug)]
+pub(crate) enum StoredScanJobMetadataSources {
+    None,
+    Movies(Vec<StoredMediaSourcePath>),
+    HomeVideos(Vec<StoredMediaSourcePath>),
+    Episodes(Vec<StoredSeriesMetadataSource>),
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestPostprocessingState {
+    pub(crate) manifest_id: String,
+    pub(crate) workflow_version: i64,
+    pub(crate) discovery_format_version: i64,
+    pub(crate) roots: Vec<StoredScanManifestPostprocessingRoot>,
 }
 
 #[derive(Debug)]
@@ -3409,9 +3445,16 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) premiere_date: Option<&'a str>,
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<&'a str>,
+    pub(crate) provider_ids_json: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
+}
+
+pub(crate) struct LocalNfoDefaultsRepair<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) provider_ids: &'a BTreeMap<String, String>,
+    pub(crate) premiere_date: Option<&'a str>,
 }
 
 pub(crate) struct ExternalSubtitleUpdate<'a> {
@@ -3593,6 +3636,7 @@ pub(crate) struct MediaProbeUpdate<'a> {
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) bitrate: Option<i64>,
     pub(crate) streams: &'a [MediaStreamUpdate<'a>],
+    pub(crate) chapters: &'a [MediaInfoChapterUpdate],
 }
 
 pub(crate) struct MediaStreamUpdate<'a> {
@@ -3606,6 +3650,12 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) is_external: bool,
     pub(crate) is_default: bool,
     pub(crate) is_forced: bool,
+}
+
+pub(crate) struct MediaInfoChapterUpdate {
+    pub(crate) start_position_ticks: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) chapter_index: i64,
 }
 
 #[derive(Debug)]

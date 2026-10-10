@@ -20,7 +20,10 @@ use luxd::{
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
-        reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
+        reidentify::{
+            MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
+            MetadataReidentifyService,
+        },
         scanner::LibraryScanner,
         scraper::ScraperProvider,
         setup::SetupService,
@@ -33,8 +36,10 @@ use luxd::{
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore};
 use uuid::Uuid;
+
+static FILL_MISSING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn tmdb_search_stub() -> Json<Value> {
     Json(json!({
@@ -98,6 +103,69 @@ async fn delayed_tmdb_stub(AxumState(tracker): AxumState<ConcurrencyTracker>) ->
     tmdb_search_stub().await
 }
 
+async fn delayed_empty_tmdb_stub() -> Json<Value> {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Json(json!({
+        "page": 1,
+        "total_pages": 1,
+        "total_results": 0,
+        "results": []
+    }))
+}
+
+#[derive(Clone)]
+struct BlockingRequestGate {
+    started: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+async fn gated_empty_tmdb_stub(AxumState(gate): AxumState<BlockingRequestGate>) -> Json<Value> {
+    gate.started.fetch_add(1, Ordering::SeqCst);
+    let _permit = gate.release.acquire().await.ok();
+    Json(json!({
+        "page": 1,
+        "total_pages": 1,
+        "total_results": 0,
+        "results": []
+    }))
+}
+
+fn fill_missing_dispatch_job(id: &str, library_id: &str) -> MetadataReidentifyJob {
+    MetadataReidentifyJob {
+        id: id.to_owned(),
+        status: "QUEUED".to_owned(),
+        processed_count: 0,
+        total_count: 0,
+        error: None,
+        created_at: 0,
+        updated_at: 0,
+        started_at: None,
+        finished_at: None,
+        mode: "FILL_MISSING".to_owned(),
+        items: Vec::new(),
+        cancel_requested: false,
+        library_id: Some(library_id.to_owned()),
+        job_scope: "ITEMS".to_owned(),
+        pending_count: 0,
+    }
+}
+
+async fn persist_queued_dispatch_job(
+    database: &Database,
+    job: &MetadataReidentifyJob,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs
+            (id, status, total_count, mode, library_id, job_scope)
+         VALUES (?, 'QUEUED', 0, 'FILL_MISSING', ?, 'ITEMS')",
+    )
+    .bind(&job.id)
+    .bind(job.library_id.as_deref())
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
 async fn setup_movie_library_with_parent_folder()
 -> Result<(tempfile::TempDir, Database, String, String), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -157,7 +225,86 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn metadata_reidentify_deduplicates_repeated_item_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for (title, filename) in [
+        ("Alpha Movie (2020)", "Alpha.Movie.2020.mkv"),
+        ("Middle Movie (2021)", "Middle.Movie.2021.mkv"),
+        ("Zulu Movie (2022)", "Zulu.Movie.2022.mkv"),
+    ] {
+        let movie_dir = root.join(title);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(filename), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 3);
+
+    let requested_ids = vec![
+        item_ids[2].clone(),
+        item_ids[0].clone(),
+        item_ids[1].clone(),
+        item_ids[2].clone(),
+        item_ids[0].clone(),
+    ];
+    let service = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = service.create_job(requested_ids).await?;
+
+    assert_eq!(job.total_count, 3);
+    assert_eq!(job.items.len(), 3);
+    assert_eq!(
+        job.items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>(),
+        item_ids,
+        "the returned job items should retain the established item-id ordering"
+    );
+    let (item_count, unique_item_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT item_id)
+         FROM metadata_reidentify_job_items WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_count, 3);
+    assert_eq!(unique_item_count, 3);
+
+    let persisted_item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM metadata_reidentify_job_items WHERE job_id = ? ORDER BY item_id",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(persisted_item_ids, item_ids);
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -213,10 +360,9 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     );
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth)
-            .with_scraper(tmdb.provider()),
-    );
+    let app_state = AppState::ready(config, database.clone(), setup, auth, emby_auth)
+        .with_scraper(tmdb.provider());
+    let app = app_with_state(app_state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -497,6 +643,46 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     assert_eq!(library_job["job"]["mode"], "FILL_MISSING");
     assert_eq!(library_job["job"]["status"], "COMPLETED");
 
+    let library_refresh_fill_started = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{}/metadata/refresh",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "FILL_MISSING" }))
+        .send()
+        .await?;
+    assert_eq!(
+        library_refresh_fill_started.status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    let library_refresh_fill_body: Value = library_refresh_fill_started.json().await?;
+    let library_refresh_fill_job_id = library_refresh_fill_body["job"]["id"]
+        .as_str()
+        .ok_or("missing library FILL_MISSING metadata refresh job ID")?
+        .to_owned();
+    assert_eq!(library_refresh_fill_body["job"]["mode"], "FILL_MISSING");
+    let mut library_refresh_fill_job = Value::Null;
+    for _ in 0..80 {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/admin/metadata/reidentify/{library_refresh_fill_job_id}"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        library_refresh_fill_job = response.json().await?;
+        if matches!(
+            library_refresh_fill_job["job"]["status"].as_str(),
+            Some("COMPLETED" | "COMPLETED_WITH_ISSUES" | "FAILED" | "DEFERRED")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(library_refresh_fill_job["job"]["status"], "COMPLETED");
+
     let listed = client
         .get(format!(
             "{base_url}/api/v1/admin/metadata/reidentify?page=1&pageSize=50"
@@ -555,6 +741,70 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     assert_eq!(refresh_job["job"]["mode"], "FULL_REFRESH");
     assert_eq!(refresh_job["job"]["status"], "COMPLETED");
     assert_eq!(refresh_job["job"]["items"][0]["candidateCount"], 0);
+
+    app_state.shutdown_background_workers().await;
+    let unavailable = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{item_id}/metadata/refresh"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "FILL_MISSING" }))
+        .send()
+        .await?;
+    assert_eq!(
+        unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unavailable_body: Value = unavailable.json().await?;
+    assert_eq!(unavailable_body["error"]["code"], "DATABASE_UNAVAILABLE");
+    let queued_after_dispatch_failure: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_reidentify_jobs
+         WHERE mode = 'FILL_MISSING' AND status = 'QUEUED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        queued_after_dispatch_failure, 1,
+        "a created job must remain queued and retryable if dispatch is unavailable"
+    );
+    let queued_job_id: String = sqlx::query_scalar(
+        "SELECT id FROM metadata_reidentify_jobs
+         WHERE mode = 'FILL_MISSING' AND status = 'QUEUED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'FAILED', error = 'TEST_RETRY', finished_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&queued_job_id)
+    .execute(database.pool())
+    .await?;
+    let retry_unavailable = client
+        .post(format!(
+            "{base_url}/api/v1/admin/metadata/reidentify/{queued_job_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(
+        retry_unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let retry_unavailable_body: Value = retry_unavailable.json().await?;
+    assert_eq!(
+        retry_unavailable_body["error"]["code"],
+        "DATABASE_UNAVAILABLE"
+    );
+    let retry_job_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&queued_job_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(retry_job_status, "QUEUED");
 
     server.abort();
     tmdb_server.abort();
@@ -656,6 +906,7 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn fill_missing_skips_complete_movie_without_scraper_request()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -885,6 +1136,641 @@ async fn library_metadata_job_processes_items_concurrently()
 }
 
 #[tokio::test]
+async fn fill_missing_jobs_share_a_process_global_worker_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8098".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let tmdb_app = Router::new().fallback(any(delayed_empty_tmdb_stub));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+    let mut job_ids = Vec::new();
+    for library_index in 0..2 {
+        let library_name = format!("Movies {library_index}");
+        let library = libraries
+            .create_library(&library_name, LibraryKind::Movie, false)
+            .await?;
+        let root = temp_dir.path().join(format!("Movies {library_index}"));
+        for item_index in 0..4 {
+            let title = format!("Movie {library_index}-{item_index} (2024)");
+            let movie_dir = root.join(&title);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(
+                movie_dir.join(format!("Movie.{library_index}-{item_index}.2024.mkv")),
+                b"fixture",
+            )
+            .await?;
+        }
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+             ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(item_ids.len(), 4);
+        let job = metadata.create_fill_missing_job(item_ids).await?;
+        job_ids.push(job.id);
+    }
+    assert_ne!(job_ids[0], job_ids[1]);
+
+    let run_metadata = metadata.clone();
+    let first_job_id = job_ids[0].clone();
+    let second_job_id = job_ids[1].clone();
+    let run_handle = tokio::spawn(async move {
+        tokio::join!(
+            run_metadata.run(&first_job_id),
+            run_metadata.run(&second_job_id)
+        );
+    });
+    let mut maximum_running_items = 0_i64;
+    while !run_handle.is_finished() {
+        let running_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id IN (?, ?) AND status = 'RUNNING'",
+        )
+        .bind(&job_ids[0])
+        .bind(&job_ids[1])
+        .fetch_one(database.pool())
+        .await?;
+        maximum_running_items = maximum_running_items.max(running_items);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    run_handle.await?;
+
+    assert!(maximum_running_items > 0);
+    assert!(
+        maximum_running_items <= 4,
+        "automatic FILL_MISSING jobs must claim at most four running items process-wide; observed {maximum_running_items}"
+    );
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8100".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let gate = BlockingRequestGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(gated_empty_tmdb_stub))
+        .with_state(gate.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(5),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+    let library = libraries
+        .create_library("Serialized fill missing", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Serialized fill missing");
+    for item_index in 0..3 {
+        let title = format!("Serialized Movie {item_index} (2024)");
+        let movie_dir = root.join(&title);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Serialized.Movie.{item_index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 3);
+
+    let first_job = metadata
+        .create_fill_missing_job(vec![item_ids[0].clone()])
+        .await?;
+    metadata.enqueue_fill_missing_job(&first_job).await?;
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let status = metadata.get_job(&first_job.id).await?.status;
+        return Err(
+            format!("first gated scraper request did not start; job status: {status}").into(),
+        );
+    }
+
+    let second_job = metadata
+        .create_fill_missing_job(vec![item_ids[1].clone()])
+        .await?;
+    assert_ne!(first_job.id, second_job.id);
+    metadata.enqueue_fill_missing_job(&second_job).await?;
+    metadata.cancel(&second_job.id).await?;
+    let third_job = metadata
+        .create_fill_missing_job(vec![item_ids[2].clone()])
+        .await?;
+    assert_ne!(second_job.id, third_job.id);
+    metadata.enqueue_fill_missing_job(&third_job).await?;
+
+    let other_library = libraries
+        .create_library("Independent fill missing", LibraryKind::Movie, false)
+        .await?;
+    let other_root = temp_dir.path().join("Independent fill missing");
+    let other_movie_dir = other_root.join("Independent Movie (2024)");
+    tokio::fs::create_dir_all(&other_movie_dir).await?;
+    tokio::fs::write(
+        other_movie_dir.join("Independent.Movie.2024.mkv"),
+        b"fixture",
+    )
+    .await?;
+    libraries
+        .add_root(
+            other_library.id,
+            other_root.to_str().ok_or("non-utf8 root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(other_library.id)
+        .await?;
+    let other_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         LIMIT 1",
+    )
+    .bind(other_library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let other_job = metadata
+        .create_fill_missing_job(vec![other_item_id])
+        .await?;
+    metadata.enqueue_fill_missing_job(&other_job).await?;
+    let mut misrouted_job = first_job.clone();
+    misrouted_job.library_id = Some(other_library.id.to_string());
+    assert!(matches!(
+        metadata.enqueue_fill_missing_job(&misrouted_job).await,
+        Err(luxd::application::reidentify::MetadataDispatchError::InvalidJob)
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    let queued_jobs = (0..30)
+        .map(|index| {
+            fill_missing_dispatch_job(
+                &format!("queued-fill-missing-{index}"),
+                &library.id.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for job in &queued_jobs {
+        persist_queued_dispatch_job(&database, job).await?;
+        metadata.enqueue_fill_missing_job(job).await?;
+    }
+    let overflow_job = fill_missing_dispatch_job("overflow-fill-missing", &library.id.to_string());
+    persist_queued_dispatch_job(&database, &overflow_job).await?;
+    let mut first_overflow_submission = Box::pin(metadata.enqueue_fill_missing_job(&overflow_job));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut first_overflow_submission,)
+            .await
+            .is_err(),
+        "a full per-library dispatcher queue must apply backpressure"
+    );
+    let mut duplicate_overflow_submission =
+        Box::pin(metadata.enqueue_fill_missing_job(&overflow_job));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            &mut duplicate_overflow_submission,
+        )
+        .await
+        .is_err(),
+        "a duplicate must not report success while the first submission is still waiting for capacity"
+    );
+    drop(first_overflow_submission);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (first_status, second_status, third_status, other_status): (
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS first_status,
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS second_status,
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS third_status,
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS other_status",
+    )
+    .bind(&first_job.id)
+    .bind(&second_job.id)
+    .bind(&third_job.id)
+    .bind(&other_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(first_status, "RUNNING");
+    assert_eq!(second_status, "QUEUED");
+    assert_eq!(third_status, "QUEUED");
+    assert_eq!(other_status, "RUNNING");
+
+    gate.release.add_permits(2);
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let first_status = metadata.get_job(&first_job.id).await?.status;
+        let second_status = metadata.get_job(&second_job.id).await?.status;
+        return Err(format!(
+            "third same-library gated scraper request did not start; starts={}, jobs={first_status}/{second_status}",
+            gate.started.load(Ordering::SeqCst)
+        )
+        .into());
+    }
+    let overflow_completion = duplicate_overflow_submission
+        .await?
+        .ok_or("cancelled backpressured submission should be retryable")?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let second_status: String =
+                sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(&second_job.id)
+                    .fetch_one(database.pool())
+                    .await
+                    .expect("cancelled job status query should succeed");
+            let third_status: String =
+                sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(&third_job.id)
+                    .fetch_one(database.pool())
+                    .await
+                    .expect("next same-library job status query should succeed");
+            if second_status == "CANCELLED" && third_status == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_millis(150), metadata.shutdown())
+        .await
+        .expect("dispatcher shutdown must not wait for a job blocked in the scraper");
+    assert!(matches!(
+        metadata
+            .enqueue_fill_missing_job(&fill_missing_dispatch_job(
+                "after-shutdown-fill-missing",
+                &library.id.to_string(),
+            ))
+            .await,
+        Err(luxd::application::reidentify::MetadataDispatchError::ShuttingDown)
+    ));
+    gate.release.add_permits(16);
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let statuses: Vec<String> = sqlx::query_scalar(
+                "SELECT status FROM metadata_reidentify_jobs
+                 WHERE id IN (?, ?, ?, ?) ORDER BY created_at, id",
+            )
+            .bind(&first_job.id)
+            .bind(&second_job.id)
+            .bind(&third_job.id)
+            .bind(&other_job.id)
+            .fetch_all(database.pool())
+            .await
+            .expect("metadata job status query should succeed");
+            if statuses.len() == 4
+                && statuses.iter().all(|status| {
+                    matches!(
+                        status.as_str(),
+                        "COMPLETED" | "COMPLETED_WITH_ISSUES" | "DEFERRED" | "FAILED" | "CANCELLED"
+                    )
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let first_status = metadata.get_job(&first_job.id).await?.status;
+        let second_status = metadata.get_job(&second_job.id).await?.status;
+        return Err(format!(
+            "dispatched jobs did not finish before shutdown; jobs={first_status}/{second_status}"
+        )
+        .into());
+    }
+    tokio::time::timeout(Duration::from_secs(5), overflow_completion).await??;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_fill_missing_dispatcher_coalesces_requests_before_claim()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8101".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Coalesced fill missing", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Coalesced fill missing");
+    for item_index in 0..2 {
+        let title = format!("Coalesced Movie {item_index} (2024)");
+        let movie_dir = root.join(&title);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Coalesced.Movie.{item_index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 2);
+
+    let gate = BlockingRequestGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(gated_empty_tmdb_stub))
+        .with_state(gate.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(5),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+
+    let first_job = metadata
+        .create_fill_missing_job(vec![item_ids[0].clone()])
+        .await?;
+    let completion = metadata
+        .enqueue_fill_missing_job(&first_job)
+        .await?
+        .ok_or("first dispatcher submission should own the completion receiver")?;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status_before_second_request: String =
+        sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&first_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        status_before_second_request, "QUEUED",
+        "an idle dispatcher must hold its first job through the coalescing window"
+    );
+
+    let merged_job = metadata
+        .create_fill_missing_job(vec![item_ids[1].clone()])
+        .await?;
+    assert_eq!(merged_job.id, first_job.id);
+    assert_eq!(merged_job.total_count, 2);
+    assert!(
+        metadata
+            .enqueue_fill_missing_job(&merged_job)
+            .await?
+            .is_none()
+    );
+    assert_eq!(gate.started.load(Ordering::SeqCst), 0);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    gate.release.add_permits(16);
+    tokio::time::timeout(Duration::from_secs(5), completion).await??;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_fill_missing_job_finishes_while_waiting_for_worker_permit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8099".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let gate = BlockingRequestGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(gated_empty_tmdb_stub))
+        .with_state(gate.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(5),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+    let mut job_ids = Vec::new();
+    for (library_index, item_count) in [(0, 4), (1, 1)] {
+        let library = libraries
+            .create_library(
+                &format!("Cancel Movies {library_index}"),
+                LibraryKind::Movie,
+                false,
+            )
+            .await?;
+        let root = temp_dir
+            .path()
+            .join(format!("Cancel Movies {library_index}"));
+        for item_index in 0..item_count {
+            let title = format!("Cancel Movie {library_index}-{item_index} (2024)");
+            let movie_dir = root.join(&title);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(
+                movie_dir.join(format!(
+                    "Cancel.Movie.{library_index}-{item_index}.2024.mkv"
+                )),
+                b"fixture",
+            )
+            .await?;
+        }
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+             ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(item_ids.len(), item_count);
+        let job = metadata.create_fill_missing_job(item_ids).await?;
+        job_ids.push(job.id);
+    }
+
+    let first_service = metadata.clone();
+    let first_job_id = job_ids[0].clone();
+    let first_run = tokio::spawn(async move { first_service.run(&first_job_id).await });
+    for _ in 0..200 {
+        if gate.started.load(Ordering::SeqCst) >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gate.started.load(Ordering::SeqCst), 4);
+
+    let waiting_service = metadata.clone();
+    let waiting_job_id = job_ids[1].clone();
+    let mut waiting_run = tokio::spawn(async move { waiting_service.run(&waiting_job_id).await });
+    for _ in 0..100 {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                .bind(&job_ids[1])
+                .fetch_one(database.pool())
+                .await?;
+        if status == "RUNNING" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let waiting_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job_ids[1])
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(waiting_status, "RUNNING");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    metadata.cancel(&job_ids[1]).await?;
+    let completed_before_release =
+        match tokio::time::timeout(Duration::from_millis(1500), &mut waiting_run).await {
+            Ok(result) => {
+                result?;
+                true
+            }
+            Err(_) => false,
+        };
+
+    gate.release.add_permits(16);
+    first_run.await?;
+    if !completed_before_release {
+        waiting_run.await?;
+    }
+    assert!(
+        completed_before_release,
+        "cancelled FILL_MISSING job should stop waiting without consuming a worker permit"
+    );
+    let cancelled = metadata.get_job(&job_ids[1]).await?;
+    assert_eq!(cancelled.status, "CANCELLED");
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_metadata_job_excludes_parent_folders() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
@@ -1029,6 +1915,7 @@ async fn metadata_job_requeues_running_items_when_explicitly_run()
 #[tokio::test]
 async fn metadata_job_with_item_issues_does_not_enqueue_job_failed_webhook()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let (_temp_dir, database, _library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
     let item_id: String = sqlx::query_scalar(
@@ -1073,6 +1960,7 @@ async fn metadata_job_with_item_issues_does_not_enqueue_job_failed_webhook()
 
 #[tokio::test]
 async fn scraper_unavailable_metadata_job_is_deferred() -> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let (_temp_dir, database, _library_id, _folder_id) =
         setup_movie_library_with_parent_folder().await?;
     let item_id: String = sqlx::query_scalar(

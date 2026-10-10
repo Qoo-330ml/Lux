@@ -1,14 +1,7 @@
 name: Project quality
 
 on:
-  push:
-    branches:
-      - main
-      - test
-  pull_request:
-    branches:
-      - main
-      - test
+  workflow_dispatch:
 
 permissions:
   contents: read

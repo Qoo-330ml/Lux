@@ -116,6 +116,49 @@ async fn an_installed_other_provider_disables_ip138() -> Result<(), Box<dyn std:
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn batching_preserves_hiofd_priority_over_other_installed_providers()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempdir()?;
+    let config_dir = root.path().join("config");
+    for (plugin_id, country) in [
+        ("org.lux.aaa-ip-location", "Other provider"),
+        ("org.lux.ip-hiofd", "Preferred provider"),
+    ] {
+        let plugin_dir = config_dir.join("plugins").join(plugin_id);
+        write_fake_plugin(
+            &plugin_dir,
+            plugin_id,
+            &json!({"ip": "8.8.8.8", "country": country}).to_string(),
+        )?;
+        fs::set_permissions(
+            plugin_dir.join("binaries/plugin"),
+            fs::Permissions::from_mode(0o700),
+        )?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    sqlx::query(
+        "INSERT INTO installed_plugins (plugin_id, is_enabled)
+         VALUES ('org.lux.aaa-ip-location', 1), ('org.lux.ip-hiofd', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    let plugins = PluginService::new(database, config_dir);
+    let location = plugins
+        .lookup_ip_location("8.8.8.8".parse::<IpAddr>()?)
+        .await?;
+
+    assert_eq!(location.country.as_deref(), Some("Preferred provider"));
+    Ok(())
+}
+
+#[cfg(unix)]
 fn write_fake_plugin(
     root: &std::path::Path,
     plugin_id: &str,

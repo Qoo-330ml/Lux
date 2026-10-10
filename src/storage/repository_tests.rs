@@ -5,17 +5,341 @@ use crate::{
         candidates::MetadataCandidateService,
         catalog::CatalogService,
         libraries::LibraryService,
+        metadata::MetadataEnricher,
         scanner::{LibraryScanner, ScanJobService},
         setup::SetupService,
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
     storage::{
-        ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
-        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMetadataCandidate,
-        NewNotificationDestination, NewNotificationEvent,
+        ItemImageBatchInsert, ItemImageInsert, LocalNfoDefaultsRepair, MetadataAutoMatchPolicy,
+        MetadataCapabilityResult, MetadataImageUnavailable, NewFilesystemEntry,
+        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMediaChapterMarker,
+        NewMetadataCandidate, NewNotificationDestination, NewNotificationEvent,
     },
 };
+
+#[tokio::test]
+async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    for item_id in ["fts-first", "fts-second"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let original_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("initial FTS row");
+    let mapped_rowid: i64 =
+        sqlx::query_scalar("SELECT fts_rowid FROM media_search_map WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("indexed FTS row mapping");
+    assert_eq!(mapped_rowid, original_rowid);
+    let unique_index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_index_list('media_search_map') WHERE \"unique\" = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("mapping uniqueness index");
+    assert!(unique_index_count > 0);
+
+    sqlx::query("UPDATE media_items SET overview = 'new overview' WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("non-search metadata update");
+    sqlx::query("UPDATE media_items SET title = 'renamed media' WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("search metadata update");
+    let renamed_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("renamed FTS row");
+    assert_eq!(renamed_rowid, original_rowid);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND title MATCH 'renamed'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("updated FTS content"),
+        1
+    );
+
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('fts-alias', 'fts-first', 'first alias', 'first alias')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("insert alias");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("inserted alias search"),
+        1
+    );
+    sqlx::query(
+        "UPDATE item_aliases SET alias = 'second alias', alias_normalized = 'second alias'
+         WHERE id = 'fts-alias'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("update alias");
+    sqlx::query("UPDATE item_aliases SET item_id = 'fts-second' WHERE id = 'fts-alias'")
+        .execute(database.pool())
+        .await
+        .expect("move alias to another item");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("old item's alias search"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-second' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("new item's alias search"),
+        1
+    );
+    sqlx::query("DELETE FROM item_aliases WHERE id = 'fts-alias'")
+        .execute(database.pool())
+        .await
+        .expect("delete alias");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-second' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("deleted alias search"),
+        0
+    );
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("delete media item");
+    let remaining_mappings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search_map WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted row mapping");
+    let remaining_search_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted FTS row");
+    assert_eq!(remaining_mappings, 0);
+    assert_eq!(remaining_search_rows, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_scopes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("STRM count", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root_path.to_str().expect("UTF-8 media root"),
+        )
+        .await
+        .expect("library root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+
+    for (entry_id, path) in [
+        ("strm-count-nfo-entry", "Movie/Movie.nfo"),
+        ("strm-count-video-entry", "Movie/Movie.strm"),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: &root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                inode: None,
+                fingerprint: b"fingerprint",
+                last_seen_generation: "strm-count-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('strm-count-item', ?, 'MOVIE', 'STRM Movie', 'strm-movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+         VALUES ('strm-count-source', 'strm-count-item', 'STRM_URL', 'strm-count-video-entry')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("STRM media source");
+
+    database
+        .create_scan_job(
+            "strm-count-nfo",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "nfo",
+            0,
+            false,
+        )
+        .await
+        .expect("NFO scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-nfo", &root_id, "Movie/Movie.nfo", "MODIFY")
+        .await
+        .expect("enqueue NFO scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-nfo'")
+        .execute(database.pool())
+        .await
+        .expect("mark NFO scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-nfo")
+            .await
+            .expect("count NFO scan STRM sources"),
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "file-only scans use the narrow path"
+    );
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED' WHERE id = 'strm-count-nfo'")
+        .execute(database.pool())
+        .await
+        .expect("complete NFO scan job");
+
+    database
+        .create_scan_job(
+            "strm-count-strm",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "strm",
+            0,
+            false,
+        )
+        .await
+        .expect("STRM scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-strm", &root_id, "Movie/Movie.strm", "MODIFY")
+        .await
+        .expect("enqueue STRM scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-strm'")
+        .execute(database.pool())
+        .await
+        .expect("mark STRM scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-strm")
+            .await
+            .expect("count STRM scan sources"),
+        1
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "STRM file scans use the narrow path"
+    );
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED' WHERE id = 'strm-count-strm'")
+        .execute(database.pool())
+        .await
+        .expect("complete STRM scan job");
+
+    database
+        .create_scan_job(
+            "strm-count-directory",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "directory",
+            0,
+            false,
+        )
+        .await
+        .expect("directory scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-directory", &root_id, ".", "MODIFY")
+        .await
+        .expect("enqueue directory scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-directory'")
+        .execute(database.pool())
+        .await
+        .expect("mark directory scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-directory")
+            .await
+            .expect("count directory STRM sources"),
+        1
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "directory scans retain recursive counting"
+    );
+
+    database.close().await;
+}
 
 async fn refresh_recommendation_stats(database: &Database) {
     sqlx::query(
@@ -32,6 +356,685 @@ async fn refresh_recommendation_stats(database: &Database) {
             .await
             .expect("refresh recommendation stats")
     );
+}
+
+#[tokio::test]
+async fn scan_job_metadata_target_selection_uses_one_query_without_a_local_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('metadata-target-without-source', ?, 'MOVIE', 'Movie', 'movie', 'PENDING')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', 'metadata-target-without-source',
+                       'metadata-target-without-source', 'NEW', 'PENDING')",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_scan_job_targets(&job.id, 32)
+        .await?;
+
+    assert_eq!(report.items_processed, 0);
+    assert_eq!(
+        database.query_count(),
+        1,
+        "pending state and the unavailable-source result should share one bounded page query"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_metadata_completion_wait_state_uses_one_query_and_stops_for_cancelled_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', 'completion-wait-target', 'completion-wait-target',
+                       'NEW', 'PENDING')",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state(&job.id)
+            .await?,
+        (true, false)
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "pending state and job cancellation must be observed by one storage query"
+    );
+
+    database.request_scan_job_cancel(&job.id).await?;
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state(&job.id)
+            .await?,
+        (true, true)
+    );
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state("missing-completion-wait-job")
+            .await?,
+        (false, false)
+    );
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'completion-wait-target'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state(&job.id)
+            .await?,
+        (false, false)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_nfo_metadata_batch_rolls_back_all_updates_on_a_batch_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    for item_id in ["nfo-batch-first", "nfo-batch-second"] {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', 'Old title', 'old title', 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+    }
+    sqlx::query(
+        "CREATE TRIGGER reject_second_local_nfo_update
+         BEFORE UPDATE OF title ON media_items
+         WHEN OLD.id = 'nfo-batch-second'
+         BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let first_fingerprint = [1_u8; 32];
+    let second_fingerprint = [2_u8; 32];
+    let updates = [
+        MediaMetadataUpdate {
+            item_id: "nfo-batch-first",
+            title: "First title",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: None,
+            rating_source: None,
+            provider_ids_json: None,
+            metadata_fingerprint: &first_fingerprint,
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        },
+        MediaMetadataUpdate {
+            item_id: "nfo-batch-second",
+            title: "Second title",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: None,
+            rating_source: None,
+            provider_ids_json: None,
+            metadata_fingerprint: &second_fingerprint,
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        },
+    ];
+
+    assert!(
+        database
+            .commit_local_nfo_state_batch(&updates, &[])
+            .await
+            .is_err()
+    );
+    let titles: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM media_items
+         WHERE id IN ('nfo-batch-first', 'nfo-batch-second') ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(titles, ["Old title", "Old title"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_nfo_state_batch_rolls_back_metadata_and_fills_only_missing_defaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 provider_ids_json
+             ) VALUES ('nfo-state-metadata', ?, 'MOVIE', 'Old title', 'old title',
+                       'LOCAL_CONFIRMED', '{}'),
+                      ('nfo-state-defaults', ?, 'MOVIE', 'Keep title', 'keep title',
+                       'LOCAL_CONFIRMED', '{\"tmdb\":\"99\"}')",
+        )
+        .bind(library.id.to_string())
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_local_nfo_default_repair
+         BEFORE UPDATE OF premiere_date ON media_items
+         WHEN OLD.id = 'nfo-state-defaults'
+         BEGIN SELECT RAISE(ABORT, 'injected defaults failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let fingerprint = [7_u8; 32];
+    let updates = [MediaMetadataUpdate {
+        item_id: "nfo-state-metadata",
+        title: "Updated title",
+        original_title: None,
+        overview: None,
+        production_year: None,
+        premiere_date: None,
+        rating: None,
+        rating_source: None,
+        provider_ids_json: None,
+        metadata_fingerprint: &fingerprint,
+        provenance_json: "{}",
+        locked_fields_json: "{}",
+    }];
+    let provider_ids = std::collections::BTreeMap::from([
+        ("tmdb".to_owned(), "42".to_owned()),
+        ("imdb".to_owned(), "tt123".to_owned()),
+    ]);
+    let repairs = [LocalNfoDefaultsRepair {
+        item_id: "nfo-state-defaults",
+        provider_ids: &provider_ids,
+        premiere_date: Some("2026-01-02"),
+    }];
+
+    assert!(
+        database
+            .commit_local_nfo_state_batch(&updates, &repairs)
+            .await
+            .is_err()
+    );
+    let unchanged: (String, Option<String>) = sqlx::query_as(
+        "SELECT metadata.title, defaults.premiere_date
+         FROM media_items metadata
+         CROSS JOIN media_items defaults
+         WHERE metadata.id = 'nfo-state-metadata'
+           AND defaults.id = 'nfo-state-defaults'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged, ("Old title".to_owned(), None));
+
+    sqlx::query("DROP TRIGGER reject_local_nfo_default_repair")
+        .execute(database.pool())
+        .await?;
+    database
+        .commit_local_nfo_state_batch(&updates, &repairs)
+        .await?;
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM media_items WHERE id = 'nfo-state-metadata'")
+            .fetch_one(database.pool())
+            .await?;
+    let repaired: (String, Option<String>) = sqlx::query_as(
+        "SELECT provider_ids_json, premiere_date FROM media_items
+         WHERE id = 'nfo-state-defaults'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(title, "Updated title");
+    assert_eq!(
+        repaired,
+        (
+            r#"{"imdb":"tt123","tmdb":"99"}"#.to_owned(),
+            Some("2026-01-02".to_owned())
+        )
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_unchanged_local_nfo_default_repair
+         BEFORE UPDATE OF premiere_date ON media_items
+         WHEN OLD.id = 'nfo-state-defaults'
+         BEGIN SELECT RAISE(ABORT, 'unchanged defaults must not update'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    database.commit_local_nfo_state_batch(&[], &repairs).await?;
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF8 test root")?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('metadata-page-root', ?, ?, ?, 1, 0)",
+        )
+        .bind(library.id.to_string())
+        .bind(root_path)
+        .bind(root_path)
+        .execute(database.pool())
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query("UPDATE scan_jobs SET auto_metadata_match = 1 WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    for (item_id, item_type, parent_id, series_id, season_number) in [
+        ("movie-z", "MOVIE", None, None, None),
+        ("movie-a", "MOVIE", None, None, None),
+        ("video-a", "VIDEO", None, None, None),
+        ("series-a", "SERIES", None, None, None),
+        (
+            "season-a",
+            "SEASON",
+            Some("series-a"),
+            Some("series-a"),
+            Some(1_i64),
+        ),
+        (
+            "episode-a",
+            "EPISODE",
+            Some("season-a"),
+            Some("series-a"),
+            Some(1_i64),
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, season_number,
+                     title, sort_title, identification_status
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(season_number)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    for item_id in ["movie-z", "movie-a", "video-a", "episode-a"] {
+        let entry_id = format!("entry-{item_id}");
+        let source_id = format!("source-{item_id}");
+        let relative_path = format!("{item_id}.mkv");
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES (?, 'metadata-page-root', ?, 'FILE', 1, 1, 'generation')",
+            )
+            .bind(&entry_id)
+            .bind(&relative_path)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default
+                 ) VALUES (?, ?, 'LOCAL_FILE', ?, 1)",
+            )
+            .bind(&source_id)
+            .bind(item_id)
+            .bind(&entry_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind, metadata_state
+                 ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'PENDING')",
+            )
+            .bind(&job.id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 1).await?;
+    assert!(page.has_pending);
+    assert_eq!(page.job_type.as_deref(), Some(job.job_type.as_str()));
+    assert_eq!(page.job_status.as_deref(), Some(job.status.as_str()));
+    assert!(page.auto_metadata_match);
+    let StoredScanJobMetadataSources::Movies(movies) = page.sources else {
+        return Err("movie targets should have priority over other media types".into());
+    };
+    assert_eq!(movies.len(), 1);
+    assert_eq!(movies[0].item_id, "movie-a");
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id IN ('movie-a', 'movie-z')",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query("DELETE FROM media_sources WHERE item_id = 'movie-z'")
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'PENDING'
+             WHERE job_id = ? AND target_id = 'movie-z'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    let StoredScanJobMetadataSources::HomeVideos(videos) = page.sources else {
+        return Err("home video targets should follow movies".into());
+    };
+    assert_eq!(
+        videos
+            .iter()
+            .map(|source| source.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["video-a"]
+    );
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'video-a'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    let StoredScanJobMetadataSources::Episodes(episodes) = page.sources else {
+        return Err("episode targets should follow home videos".into());
+    };
+    assert_eq!(episodes.len(), 1);
+    assert_eq!(episodes[0].episode_id, "episode-a");
+    assert_eq!(episodes[0].series_id, "series-a");
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'episode-a'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    assert!(
+        page.has_pending,
+        "an unavailable movie source remains pending"
+    );
+    assert!(matches!(page.sources, StoredScanJobMetadataSources::None));
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'FAILED'
+             WHERE job_id = ? AND target_id = 'movie-z'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    assert!(!page.has_pending);
+    assert!(matches!(page.sources, StoredScanJobMetadataSources::None));
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query("UPDATE scan_jobs SET status = 'FAILED' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES ('metadata-page-empty-job', ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let empty_job_page = database
+        .load_scan_job_metadata_page("metadata-page-empty-job", 8)
+        .await?;
+    assert_eq!(
+        empty_job_page.job_type.as_deref(),
+        Some("RECONCILE_LIBRARY")
+    );
+    assert_eq!(empty_job_page.job_status.as_deref(), Some("RUNNING"));
+    assert!(!empty_job_page.auto_metadata_match);
+    assert!(!empty_job_page.has_pending);
+    assert!(matches!(
+        empty_job_page.sources,
+        StoredScanJobMetadataSources::None
+    ));
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    let failed_job_page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    assert_eq!(
+        failed_job_page.job_type.as_deref(),
+        Some(job.job_type.as_str())
+    );
+    assert_eq!(failed_job_page.job_status.as_deref(), Some("FAILED"));
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    let missing_job_page = database
+        .load_scan_job_metadata_page("metadata-page-job-does-not-exist", 8)
+        .await?;
+    assert_eq!(missing_job_page.job_type, None);
+    assert_eq!(missing_job_page.job_status, None);
+    assert!(!missing_job_page.auto_metadata_match);
+    assert!(!missing_job_page.has_pending);
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_manifest_postprocessing_state_loads_roots_in_one_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF8 test root")?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('manifest-state-root', ?, ?, ?, 1, 0)",
+        )
+        .bind(library.id.to_string())
+        .bind(root_path)
+        .bind(root_path)
+        .execute(database.pool())
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "UPDATE scan_manifests SET state = 'POSTPROCESSING', workflow_version = 3,
+                 discovery_format_version = 3, discovery_mode = 'LITE'
+             WHERE job_id = ?",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_roots (
+                 manifest_id, library_root_id, state, postprocessing_target_stage
+             ) VALUES (?, 'manifest-state-root', 'COMPLETE', 'NEW')
+             ON CONFLICT(manifest_id, library_root_id) DO UPDATE SET
+                 state = 'COMPLETE', postprocessing_target_stage = 'NEW'",
+        )
+        .bind(&manifest_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at, device, inode
+             ) VALUES (?, 'manifest-state-root', '', 1,
+                       'DIRECTORY', 0, 1, 11, 22)
+             ON CONFLICT(manifest_id, library_root_id, relative_path, observation_sequence)
+             DO UPDATE SET device = 11, inode = 22",
+        )
+        .bind(&manifest_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, last_seen_change_kind
+             ) VALUES ('manifest-positive-entry', 'manifest-state-root', 'movie.mkv',
+                       'FILE', 1, 1, ?, 'NEW')",
+        )
+        .bind(&job.generation)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    let state = database
+        .get_scan_manifest_postprocessing_state_by_job(&job.id)
+        .await?
+        .ok_or("scan manifest state should be present")?;
+    assert_eq!(state.manifest_id, manifest_id);
+    assert_eq!(state.workflow_version, 3);
+    assert_eq!(state.discovery_format_version, 3);
+    assert_eq!(state.roots.len(), 1);
+    assert_eq!(state.roots[0].expected_device, Some(11));
+    assert_eq!(state.roots[0].expected_inode, Some(22));
+    assert!(state.roots[0].has_positive_rows);
+    assert!(state.roots[0].has_stage_rows);
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    assert!(
+        database
+            .get_scan_manifest_postprocessing_state_by_job("missing-manifest-job")
+            .await?
+            .is_none()
+    );
+    assert_eq!(database.query_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -407,6 +1410,108 @@ async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users
     .await
     .expect("remaining recommendation stats");
     assert_eq!(remaining_stats, 2);
+}
+
+#[tokio::test]
+async fn played_container_state_sync_batches_parent_queries_and_preserves_state() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let admin = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Shows", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let user_id = admin.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, title, sort_title,
+             identification_status, has_available_source
+         ) VALUES
+            ('played-parent-series', ?, 'SERIES', NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 1),
+            ('played-parent-season', ?, 'SEASON', 'played-parent-series', 'played-parent-series', 'Season', 'season', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-1', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-2', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media hierarchy");
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, play_count)
+         VALUES (?, 'played-episode-1', 1, 1), (?, 'played-episode-2', 1, 1)",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("episode states");
+
+    database.reset_query_count();
+    database
+        .sync_played_container_states(&user_id, "played-episode-1")
+        .await
+        .expect("played parent states");
+    assert_eq!(database.query_count(), 3);
+
+    let played_states: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT item_id, is_played, play_count FROM user_item_state
+         WHERE user_id = ? AND item_id IN ('played-parent-season', 'played-parent-series')
+         ORDER BY item_id",
+    )
+    .bind(&user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("played parent state rows");
+    assert_eq!(
+        played_states,
+        vec![
+            ("played-parent-season".to_owned(), 1, 1),
+            ("played-parent-series".to_owned(), 1, 1),
+        ]
+    );
+
+    sqlx::query(
+        "UPDATE user_item_state SET is_played = 0 WHERE user_id = ? AND item_id = 'played-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("unmark episode");
+    database.reset_query_count();
+    database
+        .sync_played_container_states(&user_id, "played-episode-2")
+        .await
+        .expect("unplayed parent states");
+    assert_eq!(database.query_count(), 3);
+
+    let unplayed_states: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT item_id, is_played, version FROM user_item_state
+         WHERE user_id = ? AND item_id IN ('played-parent-season', 'played-parent-series')
+         ORDER BY item_id",
+    )
+    .bind(&user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("unplayed parent state rows");
+    assert_eq!(
+        unplayed_states,
+        vec![
+            ("played-parent-season".to_owned(), 0, 1),
+            ("played-parent-series".to_owned(), 0, 1),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -795,6 +1900,73 @@ async fn listing_recommendations_does_not_refresh_global_stats_synchronously() {
     assert_eq!(batch_key, -1);
 }
 
+#[tokio::test]
+async fn cancelled_recommendation_listing_still_saves_the_daily_batch() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendations", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, has_available_source
+             ) VALUES ('cancel-recommendation-item', ?, 'MOVIE',
+                       'Cancel recommendation item', 'cancel recommendation item',
+                       'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+    let service = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+
+    // Hold the scoring lock so the detached task is parked after it has been spawned, then drop
+    // the caller the way a home-cache invalidation does.
+    let compute_lock = service.recommendation_compute_lock();
+    let held = compute_lock.lock().await;
+    let caller = {
+        let service = service.clone();
+        let library_id = library_id.clone();
+        let user_id = user_id.clone();
+        tokio::spawn(async move {
+            service
+                .list_recommended_for_library_ids(&[library_id], &user_id, 7)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    caller.abort();
+    let _ = caller.await;
+    drop(held);
+
+    let mut saved = 0_i64;
+    for _ in 0..100 {
+        saved = sqlx::query_scalar("SELECT COUNT(*) FROM recommendation_daily_batches")
+            .fetch_one(database.pool())
+            .await
+            .expect("daily batch count");
+        if saved > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(saved, 1, "the detached scoring task must persist its batch");
+}
+
 #[test]
 fn database_pool_max_connections_uses_backend_defaults() {
     assert_eq!(
@@ -1180,6 +2352,12 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(retryable.id, "retry-batch");
     assert!(
         database
+            .mark_scan_local_metadata_images_complete(&retryable.id)
+            .await
+            .expect("mark image stage complete before NFO work")
+    );
+    assert!(
+        database
             .fail_scan_local_metadata_batch(&retryable.id, "temporary failure", Some(i64::MAX))
             .await
             .expect("fail with delayed retry")
@@ -1205,16 +2383,14 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(retried.id, retryable.id);
     assert_eq!(retried.attempts, 2);
     assert!(
-        database
-            .has_pending_scan_local_metadata_images("retry-job")
-            .await
-            .expect("claim resets the image stage")
+        retried.images_completed_at.is_some(),
+        "a retry retains its completed image stage"
     );
     assert!(
-        database
-            .mark_scan_local_metadata_images_complete(&retried.id)
+        !database
+            .has_pending_scan_local_metadata_images("retry-job")
             .await
-            .expect("mark retried images complete")
+            .expect("completed image stage stays out of the pending queue")
     );
     assert!(
         database
@@ -1274,10 +2450,14 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(recovered.id, "batch-e");
     assert_eq!(recovered.attempts, 2);
     assert!(
-        database
+        recovered.images_completed_at.is_some(),
+        "interrupted work retains its completed image stage"
+    );
+    assert!(
+        !database
             .has_pending_scan_local_metadata_images("interrupted-job")
             .await
-            .expect("reclaimed batch reruns the image stage")
+            .expect("recovered batch does not repeat the image stage")
     );
 
     database.close().await;
@@ -2146,11 +3326,33 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
                 &item_id,
                 "POSTER",
                 failed_fingerprint,
-                Some(2_000),
+                Some(4_000_000_000),
                 "local read failed",
             )
             .await
             .expect("record local read failure")
+    );
+    assert!(
+        !database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", failed_fingerprint,)
+            .await
+            .expect("respect completeness retry backoff")
+    );
+    database
+        .query(
+            "UPDATE item_metadata_completeness
+             SET retry_after = 0
+             WHERE item_id = ? AND capability = 'POSTER'",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await
+        .expect("expire completeness retry backoff");
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", failed_fingerprint,)
+            .await
+            .expect("claim completeness after retry backoff")
     );
     assert!(
         database
@@ -2292,6 +3494,311 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
             .is_empty()
     );
 
+    database.close().await;
+}
+
+#[tokio::test]
+async fn local_metadata_completeness_claim_result_and_enqueue_are_atomic() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Atomic Completeness (2025)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Atomic.Completeness.2025.mkv"), b"video")
+        .await
+        .expect("movie file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Atomic completeness", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movie");
+    let library_id = library.id.to_string();
+    let item_id = database
+        .query_scalar::<String>(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("movie item");
+    let results = [
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: b"atomic-completeness-v1",
+            is_missing: true,
+            checked_at: 1,
+        },
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: b"atomic-completeness-v1",
+            is_missing: false,
+            checked_at: 1,
+        },
+    ];
+    let eligible_item_ids = [item_id.clone()];
+
+    sqlx::query(
+        "CREATE TRIGGER reject_atomic_fill_missing_item
+         BEFORE INSERT ON metadata_reidentify_job_items
+         WHEN EXISTS (
+             SELECT 1 FROM metadata_reidentify_jobs
+             WHERE id = NEW.job_id AND mode = 'FILL_MISSING'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'forced fill-missing enqueue failure');
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("install enqueue failure trigger");
+
+    assert!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library_id,
+                &results,
+                &eligible_item_ids,
+                MetadataAutoMatchPolicy::Enabled,
+            )
+            .await
+            .is_err(),
+        "enqueue failure should abort the combined transaction"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_metadata_completeness
+                 WHERE item_id = ?",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count completeness rows after rollback"),
+        0,
+        "failed transaction must not leave a RUNNING or READY claim"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count fill-missing jobs after rollback"),
+        0
+    );
+
+    sqlx::query("DROP TRIGGER reject_atomic_fill_missing_item")
+        .execute(database.pool())
+        .await
+        .expect("remove enqueue failure trigger");
+    let independent_database = Database::connect(&config)
+        .await
+        .expect("independent database handle");
+    let (retry_a, retry_b) = tokio::join!(
+        database.complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        ),
+        independent_database.complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        ),
+    );
+    let retry_a = retry_a.expect("first retry should commit");
+    let retry_b = retry_b.expect("duplicate retry should commit without changes");
+    assert_eq!(retry_a.updated_count + retry_b.updated_count, 2);
+    assert_eq!(
+        retry_a.scheduled_job_ids.len() + retry_b.scheduled_job_ids.len(),
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_metadata_completeness
+                 WHERE item_id = ? AND local_state = 'READY'",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read completed completeness states"),
+        2
+    );
+    let job_id = retry_a
+        .scheduled_job_ids
+        .first()
+        .or_else(|| retry_b.scheduled_job_ids.first())
+        .expect("one concurrent request schedules a job");
+    fail_fill_missing_job_with_unavailable_provider(&database, job_id, &item_id)
+        .await
+        .expect("mark the first job deferred for provider unavailability");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(job_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await
+    .expect("make the provider retry due");
+    let disabled_retry = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Disabled,
+        )
+        .await
+        .expect("disabled auto-match must preserve due retry without enqueueing");
+    assert_eq!(disabled_retry.updated_count, 0);
+    assert!(disabled_retry.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(job_id)
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read retry state after disabled policy"),
+        0
+    );
+    sqlx::query(
+        "CREATE TRIGGER reject_atomic_fill_missing_retry_item
+         BEFORE INSERT ON metadata_reidentify_job_items
+         WHEN EXISTS (
+             SELECT 1 FROM metadata_reidentify_jobs
+             WHERE id = NEW.job_id AND mode = 'FILL_MISSING'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'forced retried fill-missing enqueue failure');
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("install retry enqueue failure trigger");
+    assert!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library_id,
+                &results,
+                &eligible_item_ids,
+                MetadataAutoMatchPolicy::Enabled,
+            )
+            .await
+            .is_err(),
+        "retry enqueue failure should abort retry consumption"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(job_id)
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read retry state after rollback"),
+        0,
+        "failed retry enqueue must restore the deferred retry"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count jobs after retry rollback"),
+        1,
+        "failed retry enqueue must not leave a partial job"
+    );
+    sqlx::query("DROP TRIGGER reject_atomic_fill_missing_retry_item")
+        .execute(database.pool())
+        .await
+        .expect("remove retry enqueue failure trigger");
+    let enabled_retry = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("enabled auto-match must schedule the due provider retry");
+    assert_eq!(enabled_retry.updated_count, 0);
+    assert_eq!(enabled_retry.scheduled_job_ids.len(), 1);
+    assert_ne!(enabled_retry.scheduled_job_ids[0], *job_id);
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(job_id)
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read consumed retry state"),
+        1
+    );
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED' WHERE job_id = ?",
+    )
+    .bind(&enabled_retry.scheduled_job_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("complete the retried fill-missing item");
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'COMPLETED', processed_count = total_count WHERE id = ?",
+    )
+    .bind(&enabled_retry.scheduled_job_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("complete the retried fill-missing job");
+    let unchanged = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("unchanged ready completeness should be a no-op");
+    assert_eq!(unchanged.updated_count, 0);
+    assert!(unchanged.scheduled_job_ids.is_empty());
+    independent_database.close().await;
     database.close().await;
 }
 
@@ -2639,7 +4146,7 @@ async fn metadata_completeness_results_use_bounded_update_batches() {
             &library_id,
             &results,
             &[],
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await
         .expect("complete completeness results");
@@ -2661,6 +4168,65 @@ async fn metadata_completeness_results_use_bounded_update_batches() {
     assert_eq!(ready_count, RESULT_COUNT as i64);
     assert_eq!(missing_count, RESULT_COUNT.div_ceil(2) as i64);
 
+    database.close().await;
+}
+
+#[tokio::test]
+async fn local_metadata_due_retry_candidates_use_bounded_query_batches() {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness retry batches", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("completeness-retry-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let results = item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-retry-batch-v1",
+            is_missing: false,
+            checked_at: 10,
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let commit = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &item_ids,
+            MetadataAutoMatchPolicy::Disabled,
+        )
+        .await
+        .expect("complete a candidate page larger than one SQL chunk");
+
+    assert_eq!(commit.updated_count, ITEM_COUNT);
+    assert_eq!(database.query_count(), 13);
     database.close().await;
 }
 
@@ -2907,12 +4473,18 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
             clear_poster_fallback: true,
         },
     ];
+    database.reset_query_count();
     assert_eq!(
         database
             .insert_item_images_batch_at_indices(&batch)
             .await
             .expect("insert images for both items"),
         4
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "image rows and fallback clear share one transaction"
     );
     assert_eq!(
         database
@@ -3507,7 +5079,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &incremental_disabled_result,
             std::slice::from_ref(&item_ids[0]),
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await
         .expect("incremental job policy overrides enabled full-scan policy");
@@ -3547,16 +5119,22 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         is_missing: true,
         checked_at: 10,
     }];
+    database.reset_query_count();
     let incremental_enabled = database
         .complete_local_metadata_and_enqueue_fill_missing_with_policy(
             &library_id,
             &incremental_enabled_result,
             std::slice::from_ref(&item_ids[2]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("incremental job policy can enable auto-match for its sources");
     assert_eq!(incremental_enabled.scheduled_job_ids.len(), 1);
+    assert_eq!(
+        database.query_count(),
+        7,
+        "completeness confirmation and schedulable-item lookup should share one page query"
+    );
 
     let replay_fingerprint = b"replay-without-new-result";
     assert!(
@@ -3583,7 +5161,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &replay_result,
             std::slice::from_ref(&item_ids[3]),
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await
         .expect("persist missing without scheduling when the call disables auto-match");
@@ -3594,7 +5172,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("schedule an already-confirmed missing poster after policy changes");
@@ -3605,11 +5183,44 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("deduplicate replay against the active fill-missing job");
     assert!(replayed_active_job.scheduled_job_ids.is_empty());
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'DEFERRED', updated_at = unixepoch()
+         WHERE id IN (
+             SELECT job_id FROM metadata_reidentify_job_items WHERE item_id = ?
+         ) AND mode = 'FILL_MISSING'",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("defer the existing fill-missing job");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE item_id = ? AND job_id IN (
+             SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
+         )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("record provider-unavailable item result");
+    let replayed_deferred_job = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("deduplicate replay against the deferred fill-missing job");
+    assert!(replayed_deferred_job.scheduled_job_ids.is_empty());
 
     sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
@@ -3656,8 +5267,11 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
 
     sqlx::query(
         "CREATE TRIGGER reject_fill_missing_job
-         BEFORE INSERT ON metadata_reidentify_jobs
-         WHEN NEW.mode = 'FILL_MISSING'
+         BEFORE INSERT ON metadata_reidentify_job_items
+         WHEN EXISTS (
+             SELECT 1 FROM metadata_reidentify_jobs
+             WHERE id = NEW.job_id AND mode = 'FILL_MISSING'
+         )
          BEGIN SELECT RAISE(ABORT, 'injected fill-missing job failure'); END",
     )
     .execute(database.pool())
@@ -3708,7 +5322,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         (
             "FILL_MISSING".to_owned(),
             "QUEUED".to_owned(),
-            1,
+            4,
             "ITEMS".to_owned()
         )
     );
@@ -3720,7 +5334,54 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .fetch_all(database.pool())
         .await
         .expect("scheduled item page");
-    assert_eq!(scheduled_items, vec![item_ids[1].clone()]);
+    assert_eq!(scheduled_items, item_ids.clone());
+
+    let queued_merge_fingerprint = b"queued-merge-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_ids[0],
+                "STILL",
+                queued_merge_fingerprint,
+            )
+            .await
+            .expect("prepare queued merge check")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_ids[0],
+                "STILL",
+                queued_merge_fingerprint,
+            )
+            .await
+            .expect("claim queued merge check")
+    );
+    let queued_merge_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[0],
+        capability: "STILL",
+        input_fingerprint: queued_merge_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let merged = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &queued_merge_result,
+            &[item_ids[0].clone()],
+        )
+        .await
+        .expect("merge into queued fill-missing job");
+    assert!(merged.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT total_count FROM metadata_reidentify_jobs WHERE id = ?",)
+            .bind(scheduled_job_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read merged queued job count"),
+        4
+    );
 
     let replayed = database
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
@@ -3786,8 +5447,8 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             .fetch_one(database.pool())
             .await
             .expect("count fill-missing jobs"),
-        4,
-        "replay, manual, and incremental-policy jobs plus one eligible auto job are retained"
+        2,
+        "queued fill-missing jobs are coalesced per library"
     );
 
     let pagination_root_path = temp_dir.path().join("Pagination Movies");
@@ -3875,7 +5536,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &pagination_library_id,
             &pagination_results,
             &pagination_item_ids,
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("enqueue pagination jobs");
@@ -3911,7 +5572,994 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .expect("removed item completeness row");
     assert_eq!(removed_completeness.local_state, "RUNNING");
 
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET error = 'METADATA_WRITE_FAILED'
+         WHERE item_id = ? AND status = 'FAILED'
+           AND job_id IN (
+               SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
+           )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("set a non-provider deferred error");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED'
+         WHERE item_id = ? AND status = 'PENDING'
+           AND job_id IN (
+               SELECT id FROM metadata_reidentify_jobs
+               WHERE mode = 'FILL_MISSING' AND status = 'QUEUED'
+           )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("finish the changed snapshot job before testing deferred retry");
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'COMPLETED', processed_count = total_count
+         WHERE mode = 'FILL_MISSING' AND status = 'QUEUED' AND id IN (
+             SELECT job_id FROM metadata_reidentify_job_items WHERE item_id = ?
+         )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("close the queued snapshot job before testing deferred retry");
+    let retried_non_provider_failure = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("allow retry after a non-provider failure");
+    assert_eq!(retried_non_provider_failure.scheduled_job_ids.len(), 1);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'DEFERRED', updated_at = unixepoch() - 3601
+         WHERE id IN (
+             SELECT job_id FROM metadata_reidentify_job_items WHERE item_id = ?
+         ) AND mode = 'FILL_MISSING'",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("age prior deferred fill-missing jobs");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE',
+             automatic_retry_after = unixepoch() - 1
+         WHERE item_id = ? AND job_id IN (
+             SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
+         )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("restore provider failure after deferral window");
+    let retried_expired_provider_failure = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("allow retry after deferred deduplication expires");
+    assert_eq!(retried_expired_provider_failure.scheduled_job_ids.len(), 1);
+
     database.close().await;
+}
+
+#[tokio::test]
+async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Deferred snapshot", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id = "deferred-snapshot-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let first_fingerprint = b"deferred-input-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    let first_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: first_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &first_result,
+            &[item_id.into()],
+        )
+        .await?;
+    let first_job_id = &first.scheduled_job_ids[0];
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs SET status = 'DEFERRED', updated_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(first_job_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+    let same_snapshot = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.into()])
+        .await?;
+    assert!(same_snapshot.scheduled_job_ids.is_empty());
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+
+    let changed_fingerprint = b"deferred-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    let changed_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: changed_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let changed = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &changed_result,
+            &[item_id.into()],
+        )
+        .await?;
+    assert_eq!(changed.scheduled_job_ids.len(), 1);
+    assert_ne!(changed.scheduled_job_ids[0], *first_job_id);
+
+    let changed_job_id = &changed.scheduled_job_ids[0];
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items SET status = 'COMPLETED'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(changed_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'COMPLETED', processed_count = total_count
+         WHERE id = ?",
+    )
+    .bind(changed_job_id)
+    .execute(database.pool())
+    .await?;
+
+    let old_retry_consumed: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        old_retry_consumed, 1,
+        "the newer fingerprint supersedes the old provider failure"
+    );
+    let (_, due_retries) = database
+        .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            &[NewItemMetadataCompletenessCheck {
+                item_id,
+                capability: "POSTER",
+                input_fingerprint: changed_fingerprint,
+            }],
+            &library_id,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    assert!(
+        due_retries.is_empty(),
+        "an obsolete fingerprint must not keep unlocking the completed newer request"
+    );
+    Ok(())
+}
+
+async fn fail_fill_missing_job_with_unavailable_provider(
+    database: &Database,
+    job_id: &str,
+    item_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.to_owned()]
+    );
+    database
+        .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some("SCRAPER_UNAVAILABLE"))
+        .await?;
+    database
+        .finish_metadata_reidentify_job(job_id, "DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_changed_fill_request_consumes_obsolete_provider_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection
+    };
+    let database =
+        Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
+            .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Postgres obsolete failure", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        database
+            .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        let item_id = "postgres-obsolete-fill-failure";
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+
+        let old_fingerprint = b"postgres-obsolete-input-v1";
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "POSTER", old_fingerprint)
+                .await?
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "POSTER", old_fingerprint)
+                .await?
+        );
+        let old_result = [NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: old_fingerprint,
+            is_missing: true,
+            checked_at: 10,
+        }];
+        let old_dispatch = database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &old_result,
+                &[item_id.into()],
+            )
+            .await?;
+        let old_job_id = old_dispatch
+            .scheduled_job_ids
+            .first()
+            .ok_or("expected old fill-missing job")?
+            .clone();
+        fail_fill_missing_job_with_unavailable_provider(&database, &old_job_id, item_id).await?;
+        database
+            .query(
+                "UPDATE metadata_reidentify_job_items
+                 SET automatic_retry_after = unixepoch() - 1
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(&old_job_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+
+        let new_fingerprint = b"postgres-obsolete-input-v2";
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "POSTER", new_fingerprint)
+                .await?
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "POSTER", new_fingerprint)
+                .await?
+        );
+        let new_result = [NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: new_fingerprint,
+            is_missing: true,
+            checked_at: 11,
+        }];
+        let new_dispatch = database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &new_result,
+                &[item_id.into()],
+            )
+            .await?;
+        let new_job_id = new_dispatch
+            .scheduled_job_ids
+            .first()
+            .ok_or("expected new fill-missing job")?
+            .clone();
+        assert_ne!(new_job_id, old_job_id);
+        assert_eq!(
+            database
+                .query_scalar::<i64>(
+                    "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                     WHERE job_id = ? AND item_id = ?",
+                )
+                .bind(&old_job_id)
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?,
+            1,
+            "the newer fingerprint supersedes the old provider failure"
+        );
+
+        database
+            .query(
+                "UPDATE metadata_reidentify_job_items SET status = 'COMPLETED'
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(&new_job_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "UPDATE metadata_reidentify_jobs
+                 SET status = 'COMPLETED', processed_count = total_count
+                 WHERE id = ?",
+            )
+            .bind(&new_job_id)
+            .execute(database.pool())
+            .await?;
+
+        let (_, due_retries) = database
+            .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+                &[NewItemMetadataCompletenessCheck {
+                    item_id,
+                    capability: "POSTER",
+                    input_fingerprint: new_fingerprint,
+                }],
+                &library_id,
+                &[item_id.to_owned()],
+            )
+            .await?;
+        assert!(
+            due_retries.is_empty(),
+            "an obsolete fingerprint must not unlock the completed newer request"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill backoff", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id = "fill-backoff-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let first_fingerprint = b"fill-backoff-input-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    let first_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: first_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &first_result,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    let first_job_id = first_dispatch.scheduled_job_ids[0].clone();
+    fail_fill_missing_job_with_unavailable_provider(&database, &first_job_id, item_id).await?;
+
+    let first_backoff: (i64, i64) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after - unixepoch()
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(first_backoff.0, 1);
+    assert!((299..=300).contains(&first_backoff.1));
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_count = 0, automatic_retry_after = NULL
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE server_settings SET value = CAST(unixepoch() + 300 AS TEXT)
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+    )
+    .execute(database.pool())
+    .await?;
+    let suppressed = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
+        .await?;
+    assert!(suppressed.scheduled_job_ids.is_empty());
+    sqlx::query(
+        "UPDATE server_settings SET value = CAST(unixepoch() - 1 AS TEXT)
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+    )
+    .execute(database.pool())
+    .await?;
+    let due_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
+        .await?;
+    assert_eq!(due_dispatch.scheduled_job_ids.len(), 1);
+    let second_job_id = due_dispatch.scheduled_job_ids[0].clone();
+    assert_ne!(second_job_id, first_job_id);
+    let inherited_count: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_count FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(inherited_count, 1);
+
+    fail_fill_missing_job_with_unavailable_provider(&database, &second_job_id, item_id).await?;
+    let second_backoff: (i64, i64) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after - unixepoch()
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(second_backoff.0, 2);
+    assert!((1_799..=1_800).contains(&second_backoff.1));
+
+    assert!(
+        database
+            .retry_metadata_reidentify_job(&second_job_id)
+            .await?
+    );
+    let manual_retry_state: (String, Option<i64>) = database
+        .query_as(
+            "SELECT items.status, items.automatic_retry_after
+             FROM metadata_reidentify_job_items items
+             WHERE items.job_id = ? AND items.item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(manual_retry_state, ("PENDING".to_owned(), None));
+    fail_fill_missing_job_with_unavailable_provider(&database, &second_job_id, item_id).await?;
+    let capped_backoff: (i64, i64) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after - unixepoch()
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(capped_backoff.0, 3);
+    assert!((21_599..=21_600).contains(&capped_backoff.1));
+
+    let changed_fingerprint = b"fill-backoff-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    let changed_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: changed_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let changed_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &changed_result,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    assert_eq!(changed_dispatch.scheduled_job_ids.len(), 1);
+    let changed_job_id = &changed_dispatch.scheduled_job_ids[0];
+    let changed_retry_state: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(changed_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(changed_retry_state, (0, None));
+
+    fail_fill_missing_job_with_unavailable_provider(&database, changed_job_id, item_id).await?;
+    let changed_capability_request = [crate::storage::MetadataFillMissingRequest {
+        item_id: item_id.to_owned(),
+        input_fingerprint: Some(changed_fingerprint.to_vec()),
+        capabilities_json: "[\"BACKDROP\"]".to_owned(),
+        automatic_retry_count: 0,
+    }];
+    let mut transaction = database.begin_metadata_write_transaction().await?;
+    let changed_capability_job_ids = database
+        .enqueue_or_update_fill_missing_requests_in_transaction(
+            &mut transaction,
+            &library_id,
+            &changed_capability_request,
+        )
+        .await?;
+    transaction.commit().await?;
+    assert_eq!(changed_capability_job_ids.len(), 1);
+    let changed_capability_retry_state: (i64, Option<i64>, String) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after, request_capabilities_json
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&changed_capability_job_ids[0])
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        changed_capability_retry_state,
+        (0, None, "[\"BACKDROP\"]".to_owned())
+    );
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_fill_missing_retry_backoff_is_consumed_after_a_successful_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Retry consumption", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id = "retry-consumption-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let fingerprint = b"retry-consumption-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+            .await?
+    );
+    let result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &result,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    let first_job_id = first_dispatch.scheduled_job_ids[0].clone();
+    fail_fill_missing_job_with_unavailable_provider(&database, &first_job_id, item_id).await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+
+    let retry_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
+        .await?;
+    assert_eq!(retry_dispatch.scheduled_job_ids.len(), 1);
+    let retry_job_id = retry_dispatch.scheduled_job_ids[0].clone();
+    let consumed_legacy_retry: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(consumed_legacy_retry, 1);
+    assert!(
+        database
+            .claim_metadata_reidentify_job(&retry_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(&retry_job_id, 1)
+            .await?,
+        vec![item_id.to_owned()]
+    );
+    database
+        .finish_metadata_reidentify_item(&retry_job_id, item_id, "COMPLETED", 1, None)
+        .await?;
+    database
+        .finish_metadata_reidentify_job(&retry_job_id, "COMPLETED", None)
+        .await?;
+
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint,
+    }];
+    let (claimed_indices, due_retry_item_ids) = database
+        .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            &retry_check,
+            &library_id,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    assert!(claimed_indices.is_empty());
+    assert!(
+        due_retry_item_ids.is_empty(),
+        "a historical expired failure must not trigger another automatic retry"
+    );
+
+    assert!(
+        database
+            .retry_metadata_reidentify_job(&first_job_id)
+            .await?
+    );
+    assert!(
+        database
+            .claim_metadata_reidentify_job(&first_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(&first_job_id, 1)
+            .await?,
+        vec![item_id.to_owned()]
+    );
+    database
+        .finish_metadata_reidentify_item(
+            &first_job_id,
+            item_id,
+            "FAILED",
+            0,
+            Some("SCRAPER_UNAVAILABLE"),
+        )
+        .await?;
+    database
+        .finish_metadata_reidentify_job(
+            &first_job_id,
+            "DEFERRED",
+            Some("DEFERRED_PROVIDER_UNAVAILABLE"),
+        )
+        .await?;
+    let manual_retry_backoff: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_consumed
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(manual_retry_backoff, (2, Some(0)));
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill backoff scope", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = [
+        "fill-backoff-manual",
+        "fill-backoff-reidentify",
+        "fill-backoff-full-refresh",
+        "fill-backoff-cancelled",
+    ];
+    for item_id in item_ids {
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let manual_job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &[item_ids[0].to_owned()])
+        .await?;
+    fail_fill_missing_job_with_unavailable_provider(&database, &manual_job_id, item_ids[0]).await?;
+    for (job_id, item_id, mode) in [
+        ("retry-reidentify", item_ids[1], "REIDENTIFY"),
+        ("retry-full-refresh", item_ids[2], "FULL_REFRESH"),
+    ] {
+        database
+            .create_metadata_reidentify_job(job_id, &[item_id.to_owned()], mode)
+            .await?;
+        fail_fill_missing_job_with_unavailable_provider(&database, job_id, item_id).await?;
+    }
+
+    let cancelled_item = item_ids[3];
+    let fingerprint = b"cancelled-fill-backoff-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(cancelled_item, "POSTER", fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(cancelled_item, "POSTER", fingerprint)
+            .await?
+    );
+    let result = [NewItemMetadataCompletenessResult {
+        item_id: cancelled_item,
+        capability: "POSTER",
+        input_fingerprint: fingerprint,
+        is_missing: true,
+        checked_at: 20,
+    }];
+    let dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &result,
+            &[cancelled_item.to_owned()],
+        )
+        .await?;
+    let cancelled_job_id = &dispatch.scheduled_job_ids[0];
+    assert!(
+        database
+            .claim_metadata_reidentify_job(cancelled_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(cancelled_job_id, 1)
+            .await?,
+        vec![cancelled_item.to_owned()]
+    );
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(cancelled_job_id)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_item(
+            cancelled_job_id,
+            cancelled_item,
+            "FAILED",
+            0,
+            Some("SCRAPER_UNAVAILABLE"),
+        )
+        .await?;
+    database
+        .finish_metadata_reidentify_job(
+            cancelled_job_id,
+            "DEFERRED",
+            Some("DEFERRED_PROVIDER_UNAVAILABLE"),
+        )
+        .await?;
+
+    let retry_states: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT items.item_id, items.automatic_retry_count, items.automatic_retry_after
+         FROM metadata_reidentify_job_items items
+         WHERE items.job_id IN (?, ?, ?, ?)
+         ORDER BY items.item_id",
+    )
+    .bind(&manual_job_id)
+    .bind("retry-reidentify")
+    .bind("retry-full-refresh")
+    .bind(cancelled_job_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(retry_states.len(), 4);
+    for (_, retry_count, retry_after) in retry_states {
+        assert_eq!(retry_count, 0);
+        assert_eq!(retry_after, None);
+    }
+
+    database.close().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -3989,6 +6637,100 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert_eq!(item_ids.len(), 2);
     let item_id = item_ids[0].clone();
     let replay_item_id = item_ids[1].clone();
+    let scan_job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    let scan_job_id = scan_job.id;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = $1")
+        .bind(&scan_job_id)
+        .fetch_one(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_roots (
+                 manifest_id, library_root_id, state, postprocessing_target_stage
+             ) VALUES (?, ?, 'COMPLETE', 'NEW')
+             ON CONFLICT(manifest_id, library_root_id) DO UPDATE SET
+                 state = 'COMPLETE', postprocessing_target_stage = 'NEW'",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'PENDING')
+             ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET metadata_state = 'PENDING'",
+        )
+        .bind(&scan_job_id)
+        .bind(&item_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let metadata_page = database
+        .load_scan_job_metadata_page(&scan_job_id, 8)
+        .await?;
+    assert!(metadata_page.has_pending);
+    assert!(matches!(
+        metadata_page.sources,
+        StoredScanJobMetadataSources::Movies(ref sources)
+            if sources.iter().any(|source| source.item_id == item_id)
+    ));
+    assert_eq!(database.query_count(), 1);
+    database.reset_query_count();
+    let manifest_state = database
+        .get_scan_manifest_postprocessing_state_by_job(&scan_job_id)
+        .await?
+        .ok_or("PostgreSQL scan manifest should be present")?;
+    assert!(!manifest_state.roots.is_empty());
+    assert_eq!(database.query_count(), 1);
+
+    let combined_fingerprint = b"postgres-combined-completeness-v1";
+    let combined_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "COMBINED_CHECK",
+        input_fingerprint: combined_fingerprint,
+        is_missing: false,
+        checked_at: 999,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library.id.to_string(),
+                &combined_result,
+                &[],
+                MetadataAutoMatchPolicy::Disabled,
+            )
+            .await?
+            .updated_count,
+        1
+    );
+    assert_eq!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library.id.to_string(),
+                &combined_result,
+                &[],
+                MetadataAutoMatchPolicy::Disabled,
+            )
+            .await?
+            .updated_count,
+        0,
+        "the same PostgreSQL fingerprint should be complete only once"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        0,
+        "a non-missing combined result must not create a fill-missing job"
+    );
 
     let completeness_fingerprint_v1 = b"postgres-batch-input-v1";
     let completeness_checks = [
@@ -4075,7 +6817,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
                 &completion_library_id,
                 &results,
                 &[],
-                Some(false),
+                MetadataAutoMatchPolicy::Disabled,
             )
             .await
     });
@@ -4221,7 +6963,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &library_id,
             &replay_result,
             std::slice::from_ref(&replay_item_id),
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await?;
     assert_eq!(policy_disabled.updated_count, 1);
@@ -4239,7 +6981,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &library_id,
             &[],
             std::slice::from_ref(&replay_item_id),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await?;
     assert_eq!(enabled_policy_replay.updated_count, 0);
@@ -4249,15 +6991,120 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &library_id,
             &[],
             std::slice::from_ref(&replay_item_id),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await?;
     assert!(duplicate_policy_replay.scheduled_job_ids.is_empty());
+    let existing_fill_missing_job_id = enabled_policy_replay
+        .scheduled_job_ids
+        .first()
+        .ok_or("enabled policy replay did not schedule a fill-missing job")?;
+    assert!(
+        database
+            .claim_metadata_reidentify_job(existing_fill_missing_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(existing_fill_missing_job_id, 1)
+            .await?,
+        vec![replay_item_id.clone()]
+    );
+    database
+        .finish_metadata_reidentify_item(
+            existing_fill_missing_job_id,
+            &replay_item_id,
+            "COMPLETED",
+            1,
+            None,
+        )
+        .await?;
+    database
+        .finish_metadata_reidentify_job(existing_fill_missing_job_id, "COMPLETED", None)
+        .await?;
     database
         .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
+
+    let failed_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    let failed_job_id = failed_dispatch
+        .scheduled_job_ids
+        .first()
+        .ok_or("PostgreSQL provider-unavailable job was not scheduled")?
+        .clone();
+    fail_fill_missing_job_with_unavailable_provider(&database, &failed_job_id, &replay_item_id)
+        .await?;
+    database
+        .query(
+            "UPDATE metadata_reidentify_job_items
+             SET automatic_retry_after = unixepoch() - 1
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&failed_job_id)
+        .bind(&replay_item_id)
+        .execute(database.pool())
+        .await?;
+    let retry_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    let retry_job_id = retry_dispatch
+        .scheduled_job_ids
+        .first()
+        .ok_or("PostgreSQL due retry was not scheduled")?
+        .clone();
+    let consumed_retry: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&failed_job_id)
+        .bind(&replay_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(consumed_retry, 1);
+    assert!(
+        database
+            .claim_metadata_reidentify_job(&retry_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(&retry_job_id, 1)
+            .await?,
+        vec![replay_item_id.clone()]
+    );
+    database
+        .finish_metadata_reidentify_item(&retry_job_id, &replay_item_id, "COMPLETED", 1, None)
+        .await?;
+    database
+        .finish_metadata_reidentify_job(&retry_job_id, "COMPLETED", None)
+        .await?;
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id: &replay_item_id,
+        capability: "POSTER",
+        input_fingerprint: replay_fingerprint,
+    }];
+    let (claimed_retry, due_retry_item_ids) = database
+        .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            &retry_check,
+            &library_id,
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    assert!(claimed_retry.is_empty());
+    assert!(due_retry_item_ids.is_empty());
 
     let completeness_fingerprint_v2 = b"postgres-batch-input-v2";
     let replacement_check = [NewItemMetadataCompletenessCheck {
@@ -4611,6 +7458,8 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     )
     .execute(database.pool())
     .await?;
+    // Drain the earlier queued job above so this injected failure exercises new-job insertion,
+    // rather than correctly reusing that job's remaining capacity.
     assert!(
         database
             .complete_local_metadata_and_enqueue_fill_missing(
@@ -4665,6 +7514,136 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert_eq!(replayed.updated_count, 0);
     assert!(replayed.scheduled_job_ids.is_empty());
 
+    fail_fill_missing_job_with_unavailable_provider(
+        &database,
+        &scheduled.scheduled_job_ids[0],
+        &item_id,
+    )
+    .await?;
+    let retry_pending = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(retry_pending.scheduled_job_ids.is_empty());
+    let failed_retry_state: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&scheduled.scheduled_job_ids[0])
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let now: i64 = database
+        .query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(failed_retry_state.0, 1);
+    assert!(failed_retry_state.1.is_some_and(|retry_at| retry_at > now));
+
+    database
+        .query(
+            "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_count = 0, automatic_retry_after = NULL
+         WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&scheduled.scheduled_job_ids[0])
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE server_settings SET value = CAST(unixepoch() + 300 AS TEXT)
+             WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+        )
+        .execute(database.pool())
+        .await?;
+    let legacy_retry_pending = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(legacy_retry_pending.scheduled_job_ids.is_empty());
+    database
+        .query(
+            "UPDATE server_settings SET value = CAST(unixepoch() - 1 AS TEXT)
+             WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+        )
+        .execute(database.pool())
+        .await?;
+    let due_retry = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(due_retry.scheduled_job_ids.len(), 1);
+    assert_ne!(
+        due_retry.scheduled_job_ids[0],
+        scheduled.scheduled_job_ids[0]
+    );
+    let inherited_retry_state: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&due_retry.scheduled_job_ids[0])
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(inherited_retry_state, (1, None));
+
+    let queued_capacity_fingerprint = b"postgres-queued-capacity-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &replay_item_id,
+                "TRAILER",
+                queued_capacity_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &replay_item_id,
+                "TRAILER",
+                queued_capacity_fingerprint,
+            )
+            .await?
+    );
+    let queued_capacity_result = [NewItemMetadataCompletenessResult {
+        item_id: &replay_item_id,
+        capability: "TRAILER",
+        input_fingerprint: queued_capacity_fingerprint,
+        is_missing: true,
+        checked_at: 1_003,
+    }];
+    database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &queued_capacity_result,
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    let reused_queued_job_id: String = database
+        .query_scalar(
+            "SELECT job_id FROM metadata_reidentify_job_items
+             WHERE item_id = ? AND status = 'PENDING'
+               AND job_id = ?",
+        )
+        .bind(&replay_item_id)
+        .bind(&due_retry.scheduled_job_ids[0])
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(reused_queued_job_id, due_retry.scheduled_job_ids[0]);
+
     let still_fingerprint = b"postgres-still-v1";
     assert!(
         database
@@ -4683,6 +7662,10 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         is_missing: true,
         checked_at: 1_003,
     }];
+    let fill_missing_jobs_before_deduplicated: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'")
+        .fetch_one(database.pool())
+        .await?;
     let deduplicated = database
         .complete_local_metadata_and_enqueue_fill_missing(
             &library_id,
@@ -4692,14 +7675,13 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .await?;
     assert_eq!(deduplicated.updated_count, 1);
     assert!(deduplicated.scheduled_job_ids.is_empty());
+    let fill_missing_jobs_after_deduplicated: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'")
+        .fetch_one(database.pool())
+        .await?;
     assert_eq!(
-        database
-            .query_scalar::<i64>(
-                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
-            )
-            .fetch_one(database.pool())
-            .await?,
-        2
+        fill_missing_jobs_after_deduplicated, fill_missing_jobs_before_deduplicated,
+        "a deduplicated completeness result must not create another job"
     );
 
     let pagination_root_path = temp_dir.path().join("Pagination Movies");
@@ -4779,7 +7761,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &pagination_library_id,
             &pagination_results,
             &pagination_item_ids,
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await?;
     assert_eq!(pagination_dispatch.updated_count, 102);
@@ -5747,6 +8729,7 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             premiere_date: None,
             rating: Some(10.0),
             rating_source: Some("TEST"),
+            provider_ids_json: None,
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "{}",
@@ -5759,6 +8742,33 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .await
             .expect("metadata timestamp");
     assert!(updated_at > 0);
+    sqlx::query("UPDATE media_items SET updated_at = 123 WHERE id = 'rating-low'")
+        .execute(database.pool())
+        .await
+        .expect("set stable metadata timestamp");
+    database
+        .update_media_item_metadata(MediaMetadataUpdate {
+            item_id: "rating-low",
+            title: "rating-low",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: Some(10.0),
+            rating_source: Some("TEST"),
+            provider_ids_json: None,
+            metadata_fingerprint: &[],
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        })
+        .await
+        .expect("no-op metadata update");
+    let unchanged_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'rating-low'")
+            .fetch_one(database.pool())
+            .await
+            .expect("no-op metadata timestamp");
+    assert_eq!(unchanged_at, 123);
     database.reset_query_count();
     let refreshed_rows = database
         .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
@@ -8487,6 +11497,11 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
         .expect("source count");
     assert_eq!(item_count, 1);
     assert_eq!(source_count, 2);
+    let default_count: i64 = sqlx::query_scalar("SELECT SUM(is_default) FROM media_sources")
+        .fetch_one(database.pool())
+        .await
+        .expect("default source count");
+    assert_eq!(default_count, 1, "an item has exactly one default source");
     let folder_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type = 'FOLDER'")
             .fetch_one(database.pool())
@@ -8889,6 +11904,10 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
                 status TEXT NOT NULL,
                 priority INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT 0,
+                request_fingerprint BLOB,
+                request_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                claimed_request_fingerprint BLOB,
+                claimed_request_capabilities_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (job_id, item_id)
             )",
     )
@@ -9153,6 +12172,181 @@ async fn postgres_metadata_claim_uses_materialized_priorities_and_preserves_grou
 }
 
 #[tokio::test]
+async fn server_settings_are_written_with_one_upsert() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    database.reset_query_count();
+    database
+        .set_server_settings(
+            95,
+            300_000_000,
+            r#"{"thumbnailScrapingMode":"SCRAPER_FIRST"}"#,
+            true,
+            "PLUGIN",
+        )
+        .await?;
+
+    assert_eq!(database.query_count(), 1);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM server_settings
+         WHERE key IN (
+             'resume_played_percent', 'resume_min_ticks', 'media_strategy',
+             'force_admin_library_order', 'login_background_source'
+         )
+         ORDER BY key",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            ("force_admin_library_order".to_owned(), "1".to_owned()),
+            ("login_background_source".to_owned(), "PLUGIN".to_owned()),
+            (
+                "media_strategy".to_owned(),
+                r#"{"thumbnailScrapingMode":"SCRAPER_FIRST"}"#.to_owned()
+            ),
+            ("resume_min_ticks".to_owned(), "300000000".to_owned()),
+            ("resume_played_percent".to_owned(), "95".to_owned()),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uninstalling_a_plugin_batches_library_scraper_rewrites()
+-> Result<(), Box<dyn std::error::Error>> {
+    const REMOVED_PLUGIN: &str = "org.lux.removed-scraper";
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let first = libraries
+        .create_library("First", LibraryKind::Movie, false)
+        .await?;
+    let second = libraries
+        .create_library("Second", LibraryKind::Movie, false)
+        .await?;
+    let first_id = first.id.to_string();
+    let second_id = second.id.to_string();
+
+    sqlx::query(
+        "INSERT INTO installed_plugins (plugin_id, is_enabled)
+         VALUES (?, 1)",
+    )
+    .bind(REMOVED_PLUGIN)
+    .execute(database.pool())
+    .await?;
+    for (library_id, scrapers) in [
+        (
+            first_id.as_str(),
+            [
+                (REMOVED_PLUGIN, 0_i64, "PRIMARY"),
+                ("backup-one", 1, "BACKUP"),
+            ]
+            .as_slice(),
+        ),
+        (
+            second_id.as_str(),
+            [
+                (REMOVED_PLUGIN, 0_i64, "PRIMARY"),
+                ("backup-two", 1, "BACKUP"),
+                ("supplement-two", 2, "SUPPLEMENT"),
+            ]
+            .as_slice(),
+        ),
+    ] {
+        for (scraper_id, position, role) in scrapers {
+            sqlx::query(
+                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(library_id)
+            .bind(scraper_id)
+            .bind(position)
+            .bind(role)
+            .execute(database.pool())
+            .await?;
+        }
+    }
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = ?, chapter_source_id = ?
+         WHERE id = ?",
+    )
+    .bind(REMOVED_PLUGIN)
+    .bind(REMOVED_PLUGIN)
+    .bind(&first_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE libraries SET scraper_id = ? WHERE id = ?")
+        .bind(REMOVED_PLUGIN)
+        .bind(&second_id)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    database.uninstall_plugin(REMOVED_PLUGIN).await?;
+    assert_eq!(database.query_count(), 6);
+
+    let first_scrapers: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT scraper_id, position, role FROM library_scrapers
+         WHERE library_id = ? ORDER BY position",
+    )
+    .bind(&first_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        first_scrapers,
+        vec![("backup-one".to_owned(), 0, "PRIMARY".to_owned())]
+    );
+    let second_scrapers: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT scraper_id, position, role FROM library_scrapers
+         WHERE library_id = ? ORDER BY position",
+    )
+    .bind(&second_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        second_scrapers,
+        vec![
+            ("backup-two".to_owned(), 0, "PRIMARY".to_owned()),
+            ("supplement-two".to_owned(), 1, "SUPPLEMENT".to_owned()),
+        ]
+    );
+    let library_values: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, scraper_id, chapter_source_id FROM libraries
+         WHERE id IN (?, ?) ORDER BY id",
+    )
+    .bind(&first_id)
+    .bind(&second_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        library_values,
+        vec![
+            (first_id.clone(), Some("backup-one".to_owned()), None),
+            (second_id.clone(), Some("backup-two".to_owned()), None),
+        ]
+    );
+    let installed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM installed_plugins WHERE plugin_id = ?")
+            .bind(REMOVED_PLUGIN)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(installed, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
@@ -9338,6 +12532,398 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
 }
 
 #[tokio::test]
+async fn local_metadata_completeness_dependencies_are_read_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness dependencies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("completeness-dependency-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO metadata_capability_attempts
+             (item_id, provider, provider_id, capability, status, next_retry_at)
+         VALUES (?, 'tmdb', '42', 'CREDITS', 'UNAVAILABLE', 123)",
+    )
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO metadata_image_attempts
+             (item_id, image_type, candidate_key, status)
+         VALUES (?, 'POSTER', 'tmdb:42:POSTER', 'FAILED')",
+    )
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        database.find_item_media_strategy_settings(item_id).await?;
+        database.list_item_images(item_id).await?;
+        database.list_metadata_attempts(item_id).await?;
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT * 3);
+
+    database.reset_query_count();
+    let strategies = database
+        .list_item_media_strategy_settings_by_ids(&item_ids)
+        .await?;
+    let images = database.list_item_images_by_ids(&item_ids).await?;
+    let attempts = database
+        .list_metadata_attempts_by_item_ids(&item_ids)
+        .await?;
+
+    assert_eq!(strategies.len(), ITEM_COUNT);
+    assert_eq!(images.len(), 0);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[&item_ids[0]].0[0].capability, "CREDITS");
+    assert_eq!(attempts[&item_ids[0]].1[0].image_type, "POSTER");
+    assert_eq!(database.query_count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_scraper_configurations_are_read_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library_with_scraper(
+            "Scraper configuration",
+            LibraryKind::Movie,
+            false,
+            Some("legacy-tmdb"),
+            true,
+        )
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("scraper-config-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        database
+            .query(
+                "SELECT ls.scraper_id, ls.position, ls.role
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN library_scrapers ls ON ls.library_id = l.id
+                 WHERE mi.id = ? AND mi.removed_at IS NULL
+                 ORDER BY ls.position",
+            )
+            .bind(item_id)
+            .fetch_all(database.pool())
+            .await?;
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT);
+
+    database.reset_query_count();
+    let configurations = database
+        .list_item_scraper_configurations_by_ids(&item_ids)
+        .await?;
+    assert_eq!(configurations.len(), ITEM_COUNT);
+    let (configured, legacy) = &configurations[&item_ids[0]];
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].scraper_id, "legacy-tmdb");
+    assert_eq!(legacy.as_deref(), Some("legacy-tmdb"));
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_installation_statuses_are_read_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    const PLUGIN_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let plugin_ids = (0..PLUGIN_COUNT)
+        .map(|index| format!("org.lux.batch-plugin-{index:03}"))
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "INSERT INTO installed_plugins (plugin_id, is_enabled)
+         VALUES (?, 1), (?, 0)",
+    )
+    .bind(&plugin_ids[0])
+    .bind(&plugin_ids[1])
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    for plugin_id in &plugin_ids {
+        database.plugin_installation_status(plugin_id).await?;
+    }
+    assert_eq!(database.query_count(), PLUGIN_COUNT);
+
+    database.reset_query_count();
+    let statuses = database
+        .list_plugin_installation_statuses_by_ids(&plugin_ids)
+        .await?;
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses[&plugin_ids[0]]);
+    assert!(!statuses[&plugin_ids[1]]);
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_media_metadata_with_libraries_uses_one_bounded_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Metadata preflight", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("metadata-preflight-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        assert!(database.find_media_item_metadata(item_id).await?.is_some());
+        assert_eq!(
+            database.find_item_library_id(item_id).await?.as_deref(),
+            Some(library_id.as_str())
+        );
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT * 2);
+
+    database.reset_query_count();
+    let metadata = database
+        .list_active_media_item_metadata_with_libraries(&item_ids)
+        .await?;
+    assert_eq!(metadata.len(), ITEM_COUNT);
+    assert!(
+        metadata
+            .values()
+            .all(|(id, item)| { id == &library_id && item.item_type == "MOVIE" })
+    );
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_writeback_contexts_are_read_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Writeback contexts", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("writeback-context-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        assert_eq!(
+            database
+                .find_media_item_kind(item_id)
+                .await?
+                .as_ref()
+                .map(|kind| kind.item_type.as_str()),
+            Some("MOVIE")
+        );
+        assert!(
+            database
+                .find_metadata_writeback_source_path(item_id)
+                .await?
+                .is_none()
+        );
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT * 2);
+
+    database.reset_query_count();
+    let contexts = database
+        .list_media_item_writeback_contexts_by_ids(&item_ids)
+        .await?;
+    assert_eq!(contexts.len(), ITEM_COUNT);
+    assert_eq!(contexts[&item_ids[0]].item_type, "MOVIE");
+    assert!(contexts[&item_ids[0]].source.is_none());
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_writeback_contexts_preserve_direct_and_episode_source_selection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Writeback source selection", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES
+            ('writeback-movie', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED'),
+            ('writeback-series', ?, 'SERIES', 'Series', 'series', 'LOCAL_CONFIRMED'),
+            ('writeback-episode', ?, 'EPISODE', 'Episode', 'episode', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET series_id = 'writeback-series'
+         WHERE id = 'writeback-episode'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('writeback-root', ?, ?, ?, 1, 1)",
+    )
+    .bind(&library_id)
+    .bind(temp_dir.path().to_string_lossy().as_ref())
+    .bind(temp_dir.path().to_string_lossy().as_ref())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation
+         ) VALUES
+            ('writeback-movie-file', 'writeback-root', 'movie.mkv', 'FILE', 10, 1, 'generation'),
+            ('writeback-episode-file', 'writeback-root', 'show/episode.mkv', 'FILE', 10, 1, 'generation')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+         ) VALUES
+            ('writeback-movie-source', 'writeback-movie', 'LOCAL_FILE',
+             'writeback-movie-file', 1, 'READY'),
+            ('writeback-episode-source', 'writeback-episode', 'LOCAL_FILE',
+             'writeback-episode-file', 1, 'READY')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    let contexts = database
+        .list_media_item_writeback_contexts_by_ids(&[
+            "writeback-movie".to_owned(),
+            "writeback-series".to_owned(),
+        ])
+        .await?;
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(contexts["writeback-movie"].item_type, "MOVIE");
+    assert_eq!(
+        contexts["writeback-movie"]
+            .source
+            .as_ref()
+            .map(|source| source.item_id.as_str()),
+        Some("writeback-movie")
+    );
+    assert_eq!(contexts["writeback-series"].item_type, "SERIES");
+    assert_eq!(
+        contexts["writeback-series"]
+            .source
+            .as_ref()
+            .map(|source| source.item_id.as_str()),
+        Some("writeback-episode")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_jobs_reconcile_items_left_running_by_workers() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
@@ -9365,6 +12951,10 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
                 candidate_count INTEGER NOT NULL,
                 error TEXT,
                 updated_at INTEGER NOT NULL,
+                request_fingerprint BLOB,
+                request_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                claimed_request_fingerprint BLOB,
+                claimed_request_capabilities_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (job_id, item_id)
             )",
     )
@@ -9747,10 +13337,11 @@ async fn media_probe_streams_are_replaced_in_bounded_batches() {
             duration_ticks: Some(456),
             bitrate: Some(789),
             streams: &streams,
+            chapters: &[],
         })
         .await
         .expect("save probe result");
-    assert_eq!(database.query_count(), 5);
+    assert_eq!(database.query_count(), 6);
 
     let stored_indices: Vec<i64> = sqlx::query_scalar(
         "SELECT stream_index FROM media_streams
@@ -9813,6 +13404,7 @@ async fn media_probe_streams_are_replaced_in_bounded_batches() {
                 duration_ticks: Some(200),
                 bitrate: Some(300),
                 streams: &invalid_streams,
+                chapters: &[],
             })
             .await
             .is_err()
@@ -9858,10 +13450,11 @@ async fn media_probe_streams_are_replaced_in_bounded_batches() {
             duration_ticks: None,
             bitrate: None,
             streams: &[],
+            chapters: &[],
         })
         .await
         .expect("save probe result with no streams");
-    assert_eq!(database.query_count(), 2);
+    assert_eq!(database.query_count(), 3);
     let empty_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_streams WHERE media_source_id = 'probe-batch-source'",
     )
@@ -10469,6 +14062,78 @@ async fn chapter_detection_outcomes_commit_status_state_and_progress_as_one_batc
 }
 
 #[tokio::test]
+async fn detected_media_chapters_are_inserted_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Chapter markers", LibraryKind::Series, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    libraries
+        .add_root(library.id, root_path.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+         VALUES ('marker-item', ?, 'EPISODE', 'Episode', 'episode', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries
+         (id, library_root_id, relative_path, entry_kind, size, modified_at, fingerprint, last_seen_generation)
+         VALUES ('marker-entry', ?, 'episode.mkv', 'FILE', 1, 1, ?, 'generation')",
+    )
+    .bind(&root_id)
+    .bind(vec![1_u8])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+         VALUES ('marker-source', 'marker-item', 'LOCAL_FILE', 'marker-entry')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let markers = (0_usize..3)
+        .map(|index| NewMediaChapterMarker {
+            start_position_ticks: ((index + 1) * 10_000_000) as i64,
+            name: None,
+            marker_type: ["INTRO_START", "INTRO_END", "CREDITS_START"][index].to_owned(),
+            chapter_index: index as i64,
+            confidence: 0.9,
+        })
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    assert!(
+        database
+            .replace_detected_media_chapters("marker-source", "detector", &[1], &markers)
+            .await?
+    );
+    assert_eq!(database.query_count(), 3);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_chapters
+             WHERE media_source_id = 'marker-source' AND provider_id = 'detector'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        3
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -10807,26 +14472,49 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
     assert_eq!(second_page_after_delete, ["item-z"]);
 
     database
-        .replace_person_credits_with_fingerprint("item-a", &[], Some("fingerprint-a"))
+        .replace_person_credits_with_relation_checksum(
+            "item-a",
+            &[],
+            Some("fingerprint-a"),
+            Some("relation-a"),
+        )
         .await
         .expect("store fingerprint");
     assert!(
         database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-a"),
+            )
             .await
-            .expect("same fingerprint")
+            .expect("matching fingerprint and relation checksum")
     );
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", None)
+            .person_index_item_state_matches_snapshot("item-a", None, Some("relation-a"))
             .await
             .expect("missing fingerprint must not be current")
     );
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-b"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-b"),
+                Some("relation-a"),
+            )
             .await
             .expect("changed fingerprint")
+    );
+    assert!(
+        !database
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-b"),
+            )
+            .await
+            .expect("changed relation checksum")
     );
     sqlx::query(
         "UPDATE person_index_item_state
@@ -10838,7 +14526,11 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
     .expect("change relation schema version");
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-a"),
+            )
             .await
             .expect("changed relation schema version")
     );
@@ -10848,10 +14540,119 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
         .expect("clear person credits");
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-a"),
+            )
             .await
             .expect("cleared relation must be rebuilt")
     );
+}
+
+#[tokio::test]
+async fn person_credit_writes_persist_relation_checksums_and_legacy_writes_clear_them() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("People checksum", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-checksum', ?, 'MOVIE', 'Checksum', 'checksum', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-checksum-batch', ?, 'MOVIE', 'Checksum batch', 'checksum batch', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("batch media item");
+
+    database
+        .replace_person_credits_with_relation_checksum(
+            "item-checksum",
+            &[],
+            Some("source-v1"),
+            Some("relation-v1"),
+        )
+        .await
+        .expect("store relation snapshot");
+    let stored_single_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT relation_checksum FROM person_index_item_state WHERE item_id = 'item-checksum'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("read single-item relation checksum");
+    assert_eq!(stored_single_checksum.as_deref(), Some("relation-v1"));
+
+    let no_credits = [];
+    database
+        .replace_person_credits_batch_with_relation_checksum(&[
+            (
+                "item-checksum",
+                &no_credits,
+                Some("source-v1"),
+                Some("relation-v2"),
+            ),
+            (
+                "item-checksum-batch",
+                &no_credits,
+                Some("source-batch"),
+                Some("relation-batch"),
+            ),
+        ])
+        .await
+        .expect("store relation checksums in a batch");
+    let stored_batch_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT relation_checksum FROM person_index_item_state
+         WHERE item_id = 'item-checksum-batch'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("read batched relation checksum");
+    assert_eq!(stored_batch_checksum.as_deref(), Some("relation-batch"));
+
+    assert!(
+        database
+            .person_index_item_state_matches_snapshot(
+                "item-checksum",
+                Some("source-v1"),
+                Some("relation-v2")
+            )
+            .await
+            .expect("matching source and relation checksums")
+    );
+
+    database
+        .replace_person_credits_with_fingerprint("item-checksum", &[], Some("source-v1"))
+        .await
+        .expect("legacy writer stores no relation checksum");
+    assert!(
+        !database
+            .person_index_item_state_matches_snapshot("item-checksum", Some("source-v1"), None)
+            .await
+            .expect("legacy checksum-free state must be stale")
+    );
+    let stored_checksum_after_legacy_write: Option<String> = sqlx::query_scalar(
+        "SELECT relation_checksum FROM person_index_item_state WHERE item_id = 'item-checksum'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("read legacy checksum");
+    assert_eq!(stored_checksum_after_legacy_write, None);
 }
 
 #[tokio::test]
@@ -11020,12 +14821,34 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
         .await
         .expect("web playback session");
 
+    for index in 0..129 {
+        let id = format!("expired-session-{index:03}");
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: &id,
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: &format!("lux-web:{id}"),
+                tier: 1,
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: 99,
+                now: 1,
+            })
+            .await
+            .expect("additional web playback session");
+    }
+
+    database.reset_query_count();
     let expired = database
         .take_expired_web_playback_sessions(100)
         .await
         .expect("expired sessions");
 
-    assert_eq!(expired.len(), 1);
+    assert_eq!(expired.len(), 128);
+    assert_eq!(database.query_count(), 2);
     assert_eq!(expired[0].id, "expired-session");
     let state: String =
         sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'expired-session'")
@@ -11033,6 +14856,14 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
             .await
             .expect("session state");
     assert_eq!(state, "STOPPED");
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_playback_sessions
+         WHERE state = 'ACTIVE' AND expires_at < 100",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining expired sessions");
+    assert_eq!(active_count, 2);
 }
 
 #[tokio::test]
@@ -11083,6 +14914,35 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
         })
         .await
         .expect("web playback session");
+
+    for index in 0..129 {
+        let id = format!("inactive-session-{index:03}");
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: &id,
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: &format!("lux-web:{id}"),
+                tier: 4,
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: 10_000,
+                now: 1_000,
+            })
+            .await
+            .expect("additional inactive web playback session");
+        sqlx::query(
+            "UPDATE web_playback_sessions
+             SET last_heartbeat_at = 900
+             WHERE id = ?",
+        )
+        .bind(&id)
+        .execute(database.pool())
+        .await
+        .expect("stale additional heartbeat");
+    }
     assert_eq!(
         database
             .accept_web_playback_event(NewWebPlaybackEvent {
@@ -11115,12 +14975,14 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
     .await
     .expect("stale heartbeat");
 
+    database.reset_query_count();
     let inactive = database
         .take_inactive_web_playback_sessions(1_000, 90)
         .await
         .expect("inactive sessions");
 
-    assert_eq!(inactive.len(), 1);
+    assert_eq!(inactive.len(), 128);
+    assert_eq!(database.query_count(), 2);
     assert_eq!(inactive[0].id, "inactive-session");
     let state: String =
         sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'inactive-session'")
@@ -11128,6 +14990,94 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
             .await
             .expect("session state");
     assert_eq!(state, "STOPPED");
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_playback_sessions
+         WHERE state = 'ACTIVE' AND plan = 'SERVER_HLS' AND last_heartbeat_at < 910",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining inactive sessions");
+    assert_eq!(active_count, 2);
+}
+
+#[tokio::test]
+async fn web_playback_cleanup_updates_each_kind_in_one_statement() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let setup = SetupService::new(database.clone()).expect("setup service");
+    setup
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("user");
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback cleanup batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback cleanup batch',
+                       'playback cleanup batch', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    for prefix in ["expired", "inactive"] {
+        for index in 0..3 {
+            let id = format!("{prefix}-session-{index}");
+            database
+                .insert_web_playback_session(NewWebPlaybackSession {
+                    id: &id,
+                    user_id: &user_id,
+                    item_id: &item_id,
+                    media_source_id: None,
+                    play_session_id: &format!("lux-web:{id}"),
+                    tier: 1,
+                    plan: "SERVER_HLS",
+                    temp_dir: None,
+                    is_admin: true,
+                    expires_at: if prefix == "expired" { 99 } else { 10_000 },
+                    now: 1_000,
+                })
+                .await
+                .expect("web playback session");
+        }
+    }
+    sqlx::query(
+        "UPDATE web_playback_sessions
+         SET last_heartbeat_at = 900
+         WHERE id LIKE 'inactive-session-%'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("inactive heartbeat");
+
+    database.reset_query_count();
+    let expired = database
+        .take_expired_web_playback_sessions(1_000)
+        .await
+        .expect("expired sessions");
+    assert_eq!(expired.len(), 3);
+    assert_eq!(database.query_count(), 2);
+
+    database.reset_query_count();
+    let inactive = database
+        .take_inactive_web_playback_sessions(1_000, 90)
+        .await
+        .expect("inactive sessions");
+    assert_eq!(inactive.len(), 3);
+    assert_eq!(database.query_count(), 2);
 }
 
 #[tokio::test]
@@ -11658,6 +15608,1075 @@ async fn empty_reconciliation_batch_is_a_noop() {
 }
 
 #[tokio::test]
+async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let media_root = temp_dir.path().join("Movies");
+    for title in ["First Movie (2025)", "Second Movie (2025)"] {
+        let directory = media_root.join(title);
+        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::write(
+            directory.join(format!("{}.mkv", title.replace(' ', "."))),
+            b"video",
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill missing coalesce", LibraryKind::Movie, false)
+        .await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().ok_or("media root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(item_ids.len(), 2);
+    let library_id = library.id.to_string();
+    let first_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    let merged_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids)
+        .await?;
+    assert_eq!(merged_job, first_job);
+    let repeated_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids)
+        .await?;
+    assert_eq!(repeated_job, first_job);
+    let job_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+    let item_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_job_items WHERE job_id = ?")
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(job_count, 1);
+    assert_eq!(item_count, 2);
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(&first_job)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_job(&first_job, "COMPLETED", None)
+        .await?;
+    let cancelled_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'FAILED'",
+        )
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cancelled_items, 2);
+    assert!(database.retry_metadata_reidentify_job(&first_job).await?);
+    let pending_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'PENDING'",
+        )
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(pending_items, 2);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs SET status = 'DEFERRED', updated_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&first_job)
+    .execute(database.pool())
+    .await
+    .expect("defer fill-missing job after provider failure");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("record deferred provider failure");
+    let repeated_deferred_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    assert_eq!(repeated_deferred_job, first_job);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET error = 'METADATA_WRITE_FAILED'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("change deferred error to a non-provider failure");
+    let retried_non_provider_failure = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    assert_ne!(retried_non_provider_failure, first_job);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs SET status = 'DEFERRED', updated_at = unixepoch() - 3601
+         WHERE id = ?",
+    )
+    .bind(&retried_non_provider_failure)
+    .execute(database.pool())
+    .await
+    .expect("age deferred fill-missing job");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&retried_non_provider_failure)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("record old provider failure");
+    let retried_expired_deferred_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    assert_ne!(retried_expired_deferred_job, retried_non_provider_failure);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_job_creation_reuses_later_queued_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill missing queued capacity", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..331)
+        .map(|index| format!("queue-capacity-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..100])
+        .await?;
+    database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[100..200])
+        .await?;
+    database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[200..250])
+        .await?;
+    let initial_jobs: Vec<(String, i64)> = database
+        .query_as(
+            "SELECT id, total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+             ORDER BY created_at, id",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        initial_jobs
+            .iter()
+            .map(|(_, count)| *count)
+            .collect::<Vec<_>>(),
+        vec![100, 100, 50]
+    );
+
+    let reused_job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[250..251])
+        .await?;
+    assert_eq!(reused_job_id, initial_jobs[2].0);
+
+    let jobs: Vec<(String, i64)> = database
+        .query_as(
+            "SELECT id, total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+             ORDER BY created_at, id",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        jobs.len(),
+        3,
+        "an available queued slot must prevent a new job"
+    );
+    assert_eq!(
+        jobs.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+        vec![100, 100, 51]
+    );
+
+    let first_reused_job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[251..])
+        .await?;
+    assert_eq!(first_reused_job_id, initial_jobs[2].0);
+    let jobs: Vec<(String, i64)> = database
+        .query_as(
+            "SELECT id, total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+             ORDER BY created_at, id",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(jobs.len(), 4);
+    assert_eq!(
+        jobs.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+        vec![100, 100, 100, 31]
+    );
+    let queued_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id IN (
+                 SELECT id FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'
+             )",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(queued_items, 331);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_fill_missing_job_keeps_empty_request_snapshot_defaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Snapshot migration", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_id = "legacy-fill-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &[item_id.to_owned()])
+        .await?;
+    let snapshot: (Option<Vec<u8>>, String, Option<Vec<u8>>, String) = database
+        .query_as(
+            "SELECT request_fingerprint, request_capabilities_json,
+                    claimed_request_fingerprint, claimed_request_capabilities_json
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(snapshot, (None, "[]".to_owned(), None, "[]".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_local_fill_request_during_running_item_is_not_lost()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Running Request Movie (2025)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Running.Request.Movie.2025.mkv"), b"video").await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Running fill request", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("media root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = database
+        .query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id LIMIT 1",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    let library_id = library.id.to_string();
+
+    let first_fingerprint = b"fill-request-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    let first_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: first_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &first_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(first_commit.scheduled_job_ids.len(), 1);
+    let job_id = &first_commit.scheduled_job_ids[0];
+    sqlx::query(
+        "CREATE TABLE fill_request_write_probe (
+             item_inserts INTEGER NOT NULL DEFAULT 0,
+             item_updates INTEGER NOT NULL DEFAULT 0,
+             job_inserts INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO fill_request_write_probe DEFAULT VALUES;
+         CREATE TRIGGER fill_request_item_insert_probe AFTER INSERT
+         ON metadata_reidentify_job_items
+         BEGIN
+             UPDATE fill_request_write_probe SET item_inserts = item_inserts + 1;
+         END;
+         CREATE TRIGGER fill_request_item_update_probe AFTER UPDATE
+         ON metadata_reidentify_job_items
+         BEGIN
+             UPDATE fill_request_write_probe SET item_updates = item_updates + 1;
+         END;
+         CREATE TRIGGER fill_request_job_insert_probe AFTER INSERT
+         ON metadata_reidentify_jobs
+         BEGIN
+             UPDATE fill_request_write_probe SET job_inserts = job_inserts + 1;
+         END;",
+    )
+    .execute(database.pool())
+    .await?;
+    let repeated_request = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(repeated_request.scheduled_job_ids.is_empty());
+    let repeated_writes: (i64, i64, i64) = database
+        .query_as("SELECT item_inserts, item_updates, job_inserts FROM fill_request_write_probe")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(repeated_writes, (0, 0, 0), "same input performs no job DML");
+
+    let queued_fingerprint = b"fill-request-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", queued_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", queued_fingerprint)
+            .await?
+    );
+    let queued_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: queued_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let queued_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &queued_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(queued_commit.scheduled_job_ids.is_empty());
+    let changed_queued_writes: (i64, i64, i64) = database
+        .query_as("SELECT item_inserts, item_updates, job_inserts FROM fill_request_write_probe")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        changed_queued_writes,
+        (0, 1, 0),
+        "queued input changes update the existing job item once"
+    );
+    let queued_snapshot: Vec<u8> = database
+        .query_scalar(
+            "SELECT request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(queued_snapshot, queued_fingerprint);
+
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    let same_running_request = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(same_running_request.scheduled_job_ids.is_empty());
+
+    let second_fingerprint = b"fill-request-v3";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", second_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", second_fingerprint)
+            .await?
+    );
+    let second_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: second_fingerprint,
+        is_missing: true,
+        checked_at: 12,
+    }];
+    let second_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &second_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(second_commit.scheduled_job_ids.is_empty());
+
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "CREDITS", second_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "CREDITS", second_fingerprint)
+            .await?
+    );
+    let added_capability_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "CREDITS",
+        input_fingerprint: second_fingerprint,
+        is_missing: true,
+        checked_at: 13,
+    }];
+    let changed_capability_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &added_capability_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(changed_capability_commit.scheduled_job_ids.is_empty());
+    let latest_capabilities: String = database
+        .query_scalar(
+            "SELECT request_capabilities_json FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(latest_capabilities, "[\"CREDITS\",\"POSTER\"]");
+
+    database
+        .finish_metadata_reidentify_item(job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+    assert_eq!(
+        database.next_metadata_reidentify_item(job_id).await?,
+        Some(item_id.clone()),
+        "the changed request must be claimable after the active item finishes"
+    );
+    let processed_count: i64 = database
+        .query_scalar("SELECT processed_count FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(processed_count, 0, "a requeued item is not yet processed");
+
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    assert_eq!(
+        database
+            .fail_running_metadata_reidentify_items(job_id, "WORKER_FAILED")
+            .await?,
+        1
+    );
+    database
+        .finish_metadata_reidentify_job(job_id, "FAILED", Some("ITEM_FAILED"))
+        .await?;
+    assert!(database.retry_metadata_reidentify_job(job_id).await?);
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    let claimed_after_worker_retry: Vec<u8> = database
+        .query_scalar(
+            "SELECT claimed_request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(claimed_after_worker_retry, second_fingerprint);
+    database
+        .finish_metadata_reidentify_item(job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+    assert_eq!(database.next_metadata_reidentify_item(job_id).await?, None);
+    let completed_count: i64 = database
+        .query_scalar("SELECT processed_count FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(completed_count, 1, "only the final pass is counted");
+
+    database
+        .query("UPDATE metadata_reidentify_jobs SET status = 'QUEUED' WHERE id = ?")
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+    let completed_item_new_fingerprint = b"fill-request-completed-new-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                completed_item_new_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                completed_item_new_fingerprint,
+            )
+            .await?
+    );
+    let completed_item_new_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: completed_item_new_fingerprint,
+        is_missing: true,
+        checked_at: 12,
+    }];
+    let completed_item_new_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &completed_item_new_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(completed_item_new_commit.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database.next_metadata_reidentify_item(job_id).await?,
+        Some(item_id.clone()),
+        "a changed request reopens a completed item in a queued retry"
+    );
+    let requeued_processed_count: i64 = database
+        .query_scalar("SELECT processed_count FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(requeued_processed_count, 0);
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    database
+        .finish_metadata_reidentify_item(job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+
+    let cancelled_fingerprint = b"fill-request-v4";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", cancelled_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", cancelled_fingerprint)
+            .await?
+    );
+    let cancelled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: cancelled_fingerprint,
+        is_missing: true,
+        checked_at: 13,
+    }];
+    let cancelled_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &cancelled_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    let cancelled_job_id = &cancelled_commit.scheduled_job_ids[0];
+    assert!(
+        database
+            .claim_metadata_reidentify_job(cancelled_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(cancelled_job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    let newer_cancelled_fingerprint = b"fill-request-v5";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                newer_cancelled_fingerprint,
+            )
+            .await?
+    );
+    assert!(database
+        .claim_item_metadata_completeness_check(
+            &item_id,
+            "POSTER",
+            newer_cancelled_fingerprint,
+        )
+        .await?);
+    let newer_cancelled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: newer_cancelled_fingerprint,
+        is_missing: true,
+        checked_at: 14,
+    }];
+    database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &newer_cancelled_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(cancelled_job_id)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_item(cancelled_job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+    assert_eq!(
+        database
+            .next_metadata_reidentify_item(cancelled_job_id)
+            .await?,
+        None,
+        "a cancellation request must prevent a follow-up pass"
+    );
+
+    let worker_error_item_id = "fill-request-worker-error-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Worker Error', 'worker error', 'LOCAL_CONFIRMED')",
+        )
+        .bind(worker_error_item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let worker_first_fingerprint = b"worker-input-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_first_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_first_fingerprint,
+            )
+            .await?
+    );
+    let worker_first_result = [NewItemMetadataCompletenessResult {
+        item_id: worker_error_item_id,
+        capability: "POSTER",
+        input_fingerprint: worker_first_fingerprint,
+        is_missing: true,
+        checked_at: 15,
+    }];
+    let worker_first_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &worker_first_result,
+            &[worker_error_item_id.into()],
+        )
+        .await?;
+    let worker_job_id = &worker_first_commit.scheduled_job_ids[0];
+    assert!(
+        database
+            .claim_metadata_reidentify_job(worker_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(worker_job_id, 1)
+            .await?,
+        vec![worker_error_item_id]
+    );
+    let worker_latest_fingerprint = b"worker-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_latest_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_latest_fingerprint,
+            )
+            .await?
+    );
+    let worker_latest_result = [NewItemMetadataCompletenessResult {
+        item_id: worker_error_item_id,
+        capability: "POSTER",
+        input_fingerprint: worker_latest_fingerprint,
+        is_missing: true,
+        checked_at: 16,
+    }];
+    database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &worker_latest_result,
+            &[worker_error_item_id.into()],
+        )
+        .await?;
+    assert_eq!(
+        database
+            .fail_running_metadata_reidentify_items(worker_job_id, "WORKER_FAILED")
+            .await?,
+        1
+    );
+    let latest_after_failure: Vec<u8> = database
+        .query_scalar(
+            "SELECT request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(worker_job_id)
+        .bind(worker_error_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(latest_after_failure, worker_latest_fingerprint);
+    database
+        .finish_metadata_reidentify_job(worker_job_id, "FAILED", Some("ITEM_FAILED"))
+        .await?;
+    assert!(
+        database
+            .retry_metadata_reidentify_job(worker_job_id)
+            .await?
+    );
+    assert!(
+        database
+            .claim_metadata_reidentify_job(worker_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(worker_job_id, 1)
+            .await?,
+        vec![worker_error_item_id]
+    );
+    let claimed_after_retry: Vec<u8> = database
+        .query_scalar(
+            "SELECT claimed_request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(worker_job_id)
+        .bind(worker_error_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(claimed_after_retry, worker_latest_fingerprint);
+    Ok(())
+}
+
+#[tokio::test]
+async fn person_credit_page_replacement_commits_all_items_atomically() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("People", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    for item_id in ["credit-page-a", "credit-page-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+
+    let credit = |person_id: &str| NewPersonCredit {
+        person_id: person_id.to_owned(),
+        lux_person_id: None,
+        person_type: "Actor".to_owned(),
+        person_name: person_id.to_owned(),
+        provider: "tmdb".to_owned(),
+        role: "Actor".to_owned(),
+        sort_order: 0,
+        biography: None,
+        birthday: None,
+        deathday: None,
+        known_for_department: None,
+        place_of_birth: None,
+        provider_ids: std::collections::BTreeMap::new(),
+        genres: Vec::new(),
+        tags: Vec::new(),
+        production_locations: Vec::new(),
+        premiere_date: None,
+        production_year: None,
+        taglines: Vec::new(),
+    };
+    let credits_a = [credit("actor-a")];
+    let credits_b = [credit("actor-b")];
+    let replacements = [
+        (
+            "credit-page-a",
+            credits_a.as_slice(),
+            Some("fingerprint-a"),
+            Some("relation-a"),
+        ),
+        (
+            "credit-page-b",
+            credits_b.as_slice(),
+            Some("fingerprint-b"),
+            Some("relation-b"),
+        ),
+    ];
+
+    sqlx::query(
+        "CREATE TRIGGER fail_second_person_credit_page_state
+         BEFORE INSERT ON person_index_item_state
+         WHEN NEW.item_id = 'credit-page-b'
+         BEGIN SELECT RAISE(ABORT, 'forced second item failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("failure trigger");
+    assert!(
+        database
+            .replace_person_credits_batch_with_relation_checksum(&replacements)
+            .await
+            .is_err()
+    );
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits
+         WHERE item_id IN ('credit-page-a', 'credit-page-b')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("credits after rollback");
+    assert_eq!(row_count, 0, "the failed page must roll back both items");
+    let state_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_index_item_state
+         WHERE item_id IN ('credit-page-a', 'credit-page-b')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("states after rollback");
+    assert_eq!(state_count, 0, "the failed page must roll back both states");
+
+    sqlx::query("DROP TRIGGER fail_second_person_credit_page_state")
+        .execute(database.pool())
+        .await
+        .expect("drop failure trigger");
+    database
+        .replace_person_credits_batch_with_relation_checksum(&replacements)
+        .await
+        .expect("replace whole page");
+    let persisted_checksums: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT item_id, relation_checksum FROM person_index_item_state
+         WHERE item_id IN ('credit-page-a', 'credit-page-b') ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("persisted page checksums");
+    assert_eq!(
+        persisted_checksums,
+        vec![
+            ("credit-page-a".to_owned(), Some("relation-a".to_owned())),
+            ("credit-page-b".to_owned(), Some("relation-b".to_owned())),
+        ]
+    );
+    let stored_credit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits
+         WHERE item_id IN ('credit-page-a', 'credit-page-b')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored page credits");
+    assert_eq!(stored_credit_count, 2);
+}
+
+#[tokio::test]
+async fn person_manifest_restore_pending_skips_unchanged_state_updates() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    database
+        .mark_person_manifest_restore_pending(3)
+        .await
+        .expect("mark restore pending");
+    sqlx::query(
+        "CREATE TABLE person_manifest_restore_update_probe (count INTEGER NOT NULL);
+         INSERT INTO person_manifest_restore_update_probe (count) VALUES (0);
+         CREATE TRIGGER person_manifest_restore_update_probe_trigger
+         AFTER UPDATE ON person_manifest_restore_state
+         BEGIN
+             UPDATE person_manifest_restore_update_probe SET count = count + 1;
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("update probe");
+
+    database
+        .mark_person_manifest_restore_pending(3)
+        .await
+        .expect("repeat current pending state");
+    let update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_manifest_restore_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("probe after duplicate pending state");
+    assert_eq!(update_count, 0);
+
+    database
+        .mark_person_manifest_restore_completed(3)
+        .await
+        .expect("complete restore");
+    database
+        .mark_person_manifest_restore_pending(3)
+        .await
+        .expect("requeue after completion");
+    database
+        .mark_person_manifest_restore_pending(4)
+        .await
+        .expect("requeue for a new schema");
+    let update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_manifest_restore_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("probe after meaningful changes");
+    assert_eq!(update_count, 3);
+    let (status, schema_version): (String, i64) = sqlx::query_as(
+        "SELECT status, schema_version FROM person_manifest_restore_state WHERE id = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("restore state");
+    assert_eq!((status.as_str(), schema_version), ("PENDING", 4));
+}
+
+#[tokio::test]
 async fn person_credit_refresh_preserves_unchanged_rows() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -11777,4 +16796,974 @@ async fn person_credit_refresh_preserves_unchanged_rows() {
     .await
     .expect("remaining credits");
     assert_eq!(remaining_people, ["person-1", "person-3"]);
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_merges_movie_items_and_moves_every_source_to_the_primary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Merge", LibraryKind::Movie, false)
+            .await?;
+        for (item_id, title, source_id, is_default) in [
+            ("merge-primary", "Movie", "merge-source-1", 1),
+            ("merge-secondary", "Movie Part 2", "merge-source-2", 1),
+        ] {
+            database
+                .query(
+                    "INSERT INTO media_items (
+                        id, library_id, item_type, title, sort_title, identification_status,
+                        has_available_source
+                     ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+                )
+                .bind(item_id)
+                .bind(library.id.to_string())
+                .bind(title)
+                .bind(title.to_lowercase())
+                .execute(database.pool())
+                .await?;
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, ?, 'LOCAL_FILE', ?, 'PENDING')",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .bind(is_default)
+                .execute(database.pool())
+                .await?;
+        }
+        let item_ids = vec!["merge-primary".to_owned(), "merge-secondary".to_owned()];
+        let merged = database
+            .merge_media_items("merge-primary", &item_ids)
+            .await?;
+        assert_eq!(merged.merged_item_ids, vec!["merge-secondary".to_owned()]);
+        let sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = $1")
+                .bind("merge-primary")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(sources, 2);
+        let defaults: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_sources WHERE item_id = $1 AND is_default = 1",
+        )
+        .bind("merge-primary")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(defaults, 1, "exactly one default source after the merge");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_metadata_update_persists_and_skips_unchanged_ratings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Rating", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status,
+                    has_available_source
+                 ) VALUES ('rating-item', ?, 'MOVIE', 'Old', 'old', 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let update = |title: &'static str, rating: Option<f64>| MediaMetadataUpdate {
+            item_id: "rating-item",
+            title,
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating,
+            rating_source: Some("nfo"),
+            provider_ids_json: None,
+            metadata_fingerprint: b"fingerprint",
+            provenance_json: "{}",
+            locked_fields_json: "[]",
+        };
+        let rating = || async {
+            sqlx::query_scalar::<_, Option<f64>>("SELECT rating FROM media_items WHERE id = $1")
+                .bind("rating-item")
+                .fetch_one(database.pool())
+                .await
+        };
+
+        // Only the rating differs from the stored row: the unchanged-write guard must still see it.
+        database
+            .update_media_item_metadata(update("Old", None))
+            .await?;
+        assert_eq!(rating().await?, None);
+        database
+            .update_media_item_metadata(update("Old", Some(8.2)))
+            .await?;
+        assert_eq!(rating().await?, Some(8.2));
+        // Same values again, then a missing rating must not erase the stored one.
+        database
+            .update_media_item_metadata(update("Old", Some(8.2)))
+            .await?;
+        database
+            .update_media_item_metadata(update("Old", None))
+            .await?;
+        assert_eq!(rating().await?, Some(8.2));
+        database
+            .update_media_item_metadata(update("Old", Some(9.1)))
+            .await?;
+        assert_eq!(rating().await?, Some(9.1));
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+fn strm_file(index: i64, relative_path: &str) -> NewMovieFile {
+    NewMovieFile {
+        filesystem_entry_id: format!("scope-entry-{index}"),
+        source_id: format!("scope-source-{index}"),
+        relative_path: relative_path.to_owned(),
+        size: 1,
+        modified_at: index,
+        fingerprint: vec![index as u8],
+        title: format!("Scope {index}"),
+        sort_title: format!("scope {index}"),
+        original_title: format!("Scope {index}"),
+        production_year: Some(2024),
+        provider_ids_json: None,
+        source_kind: "STRM_URL".to_owned(),
+        strm_target_kind: Some("PATH".to_owned()),
+        edition_name: None,
+        quality_label: None,
+        container: "strm".to_owned(),
+        external_url: Some(format!("/cloud/scope-{index}.mp4")),
+    }
+}
+
+/// STRM sources selected for an incremental scan job must be exactly those under the scanned
+/// paths: a directory (not a sibling that merely shares its prefix), an exact file, or the root.
+async fn assert_incremental_scan_scope(database: &Database, temp_dir: &std::path::Path) {
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Scope", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    database
+        .insert_movie_files_batch(
+            &library.id.to_string(),
+            &root.id.to_string(),
+            "generation",
+            &[
+                strm_file(1, "A/Movie.One/Movie.One.strm"),
+                strm_file(2, "A/Movie.One/extras/Movie.One.Extra.strm"),
+                strm_file(3, "A/Movie.One.2/Movie.One.2.strm"),
+                strm_file(4, "B/Movie.Two/Movie.Two.strm"),
+                strm_file(5, "Movie.Root.strm"),
+            ],
+        )
+        .await
+        .expect("insert");
+    // Real scans also record the scanned directories; the count query uses them to tell a
+    // directory scope from a plain file scope.
+    for (index, directory) in ["A/Movie.One", "B/Movie.Two"].into_iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                    id, library_root_id, relative_path, entry_kind, size, modified_at,
+                    fingerprint, last_seen_generation, is_missing
+                 ) VALUES (?, ?, ?, 'DIRECTORY', 0, 0, ?, 'generation', 0)",
+            )
+            .bind(format!("scope-directory-{index}"))
+            .bind(root.id.to_string())
+            .bind(directory)
+            .bind(vec![0_u8])
+            .execute(database.pool())
+            .await
+            .expect("directory entry");
+    }
+    let now = 1_700_000_000_i64;
+    let jobs = [
+        ("scope-dir", vec!["A/Movie.One"]),
+        ("scope-file", vec!["B/Movie.Two/Movie.Two.strm"]),
+        ("scope-root", vec!["."]),
+        ("scope-two", vec!["A/Movie.One", "B/Movie.Two"]),
+        ("scope-none", vec!["C/Missing"]),
+    ];
+    for (job_id, paths) in &jobs {
+        database
+            .query(
+                "INSERT INTO scan_jobs (
+                id, library_id, job_type, status, generation, scan_phase, created_at, updated_at
+             ) VALUES (?, ?, 'INCREMENTAL_SCAN', 'COMPLETED', ?, 'IDLE', ?, ?)",
+            )
+            .bind(*job_id)
+            .bind(library.id.to_string())
+            .bind(format!("generation-{job_id}"))
+            .bind(now)
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .expect("scan job");
+        for path in paths {
+            database
+                .query(
+                "INSERT INTO scan_job_paths (job_id, library_root_id, relative_path, change_kind, processed_at)
+                 VALUES (?, ?, ?, 'MODIFY', ?)",
+            )
+            .bind(*job_id)
+            .bind(root.id.to_string())
+            .bind(*path)
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .expect("scan path");
+        }
+    }
+    for (job_id, expected) in [
+        ("scope-dir", vec!["scope-source-1", "scope-source-2"]),
+        ("scope-file", vec!["scope-source-4"]),
+        (
+            "scope-root",
+            vec![
+                "scope-source-1",
+                "scope-source-2",
+                "scope-source-3",
+                "scope-source-4",
+                "scope-source-5",
+            ],
+        ),
+        (
+            "scope-two",
+            vec!["scope-source-1", "scope-source-2", "scope-source-4"],
+        ),
+        ("scope-none", vec![]),
+    ] {
+        let listed = database
+            .list_strm_media_sources_for_incremental_scan_page(job_id, None, 100)
+            .await
+            .expect("list");
+        let mut listed = listed
+            .into_iter()
+            .map(|source| source.source_id)
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert_eq!(listed, expected, "listed sources for {job_id}");
+        let counted = database
+            .count_strm_media_sources_for_incremental_scan(job_id)
+            .await
+            .expect("count");
+        assert_eq!(
+            counted,
+            i64::try_from(expected.len()).expect("small"),
+            "counted sources for {job_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn incremental_scan_scope_selects_only_sources_under_the_scanned_paths() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_incremental_scan_scope(&database, temp_dir.path()).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_incremental_scan_scope_selects_only_sources_under_the_scanned_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        let path = temp_dir.path().to_path_buf();
+        async move { assert_incremental_scan_scope(&database, &path).await }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome?;
+    drop_database?;
+    Ok(())
+}
+
+async fn assert_terminal_local_metadata_batches_are_cleaned(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Batches", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = libraries
+        .add_root(library.id, root_path.to_str().ok_or("root path")?)
+        .await?
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    for (job_id, status, phase) in [
+        ("done-job", "COMPLETED", "IDLE"),
+        ("cancelled-job", "CANCELLED", "IDLE"),
+        ("running-job", "RUNNING", "FINALIZING"),
+    ] {
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+                 VALUES (?, ?, 'RECONCILE_LIBRARY', ?, 'generation', ?)",
+            )
+            .bind(job_id)
+            .bind(&library_id)
+            .bind(status)
+            .bind(phase)
+            .execute(database.pool())
+            .await?;
+    }
+    // (id, job, status)
+    let batches = [
+        ("done-completed", "done-job", "COMPLETED"),
+        ("done-failed", "done-job", "FAILED"),
+        ("done-pending", "done-job", "PENDING"),
+        ("cancelled-cancelled", "cancelled-job", "CANCELLED"),
+        ("orphan-completed", "missing-job", "COMPLETED"),
+        ("running-completed", "running-job", "COMPLETED"),
+        ("running-pending", "running-job", "PENDING"),
+    ];
+    for (sequence, (id, job_id, status)) in batches.into_iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO scan_local_metadata_batches
+                 (id, job_id, library_root_id, batch_sequence, source_refs_json, source_count,
+                  status)
+                 VALUES (?, ?, ?, ?, '[\"source\"]', 1, ?)",
+            )
+            .bind(id)
+            .bind(job_id)
+            .bind(&root_id)
+            .bind(i64::try_from(sequence)?)
+            .bind(status)
+            .execute(database.pool())
+            .await?;
+    }
+
+    // A batch that just finished is kept for a grace period; backdate all but one.
+    database
+        .query(
+            "UPDATE scan_local_metadata_batches SET updated_at = unixepoch() - 7200
+             WHERE id <> 'cancelled-cancelled'",
+        )
+        .execute(database.pool())
+        .await?;
+    let report = database.cleanup_completed_scan_manifest_payloads().await?;
+    assert_eq!(report.scan_local_metadata_batches_deleted, 2);
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM scan_local_metadata_batches ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        remaining,
+        [
+            "cancelled-cancelled",
+            "done-failed",
+            "done-pending",
+            "running-completed",
+            "running-pending"
+        ]
+    );
+    database
+        .query("UPDATE scan_local_metadata_batches SET updated_at = unixepoch() - 7200")
+        .execute(database.pool())
+        .await?;
+    let report = database.cleanup_completed_scan_manifest_payloads().await?;
+    assert_eq!(report.scan_local_metadata_batches_deleted, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_local_metadata_batches_are_cleaned_after_the_scan_finishes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_terminal_local_metadata_batches_are_cleaned(&database)
+        .await
+        .expect("batch cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_finishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_terminal_local_metadata_batches_are_cleaned(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
+
+async fn assert_removed_media_item_purge(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library = LibraryService::new(database.clone())
+        .create_library("Purge", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('purge-user', 'purge-user', 'Purge User', 'test')",
+        )
+        .execute(database.pool())
+        .await?;
+    let day = 86_400_i64;
+    // (id, item_type, removed_days_ago)
+    let items = [
+        ("expired", "MOVIE", Some(60_i64)),
+        ("expired-two", "EPISODE", Some(45)),
+        ("expired-three", "VIDEO", Some(40)),
+        ("recent", "MOVIE", Some(2)),
+        ("active", "MOVIE", None),
+        ("watched", "MOVIE", Some(90)),
+        ("merge-target", "MOVIE", Some(90)),
+        ("merged-away", "MOVIE", None),
+        ("expired-series", "SERIES", Some(90)),
+    ];
+    for (id, item_type, removed_days_ago) in items {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source, removed_at
+                 ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 0,
+                           CASE WHEN ? IS NULL THEN NULL ELSE unixepoch() - ? END)",
+            )
+            .bind(id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(id)
+            .bind(id)
+            .bind(removed_days_ago.unwrap_or_default())
+            .bind(removed_days_ago.unwrap_or_default() * day)
+            .execute(database.pool())
+            .await?;
+        if removed_days_ago.is_none() {
+            database
+                .query("UPDATE media_items SET removed_at = NULL WHERE id = ?")
+                .bind(id)
+                .execute(database.pool())
+                .await?;
+        }
+        database
+            .query(
+                "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+                 VALUES (?, ?, 'PRIMARY', 0, ?)",
+            )
+            .bind(format!("image-{id}"))
+            .bind(id)
+            .bind(format!("/images/{id}.jpg"))
+            .execute(database.pool())
+            .await?;
+    }
+    database
+        .query(
+            "INSERT INTO user_item_state (user_id, item_id, is_played)
+             VALUES ('purge-user', 'watched', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE media_items SET merged_into_item_id = 'merge-target' WHERE id = 'merged-away'",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let retention = 30 * day;
+    // Batch of one with several passes proves the purge pages through the backlog.
+    let purged = database
+        .purge_expired_removed_media_items(retention, 1, 2, std::time::Duration::ZERO)
+        .await?;
+    assert_eq!(purged, 2);
+    let purged = database
+        .purge_expired_removed_media_items(retention, 1, 10, std::time::Duration::ZERO)
+        .await?;
+    assert_eq!(purged, 1);
+    assert_eq!(
+        database
+            .purge_expired_removed_media_items(retention, 10, 10, std::time::Duration::ZERO)
+            .await?,
+        0
+    );
+
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM media_items ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        remaining,
+        [
+            "active",
+            "expired-series",
+            "merge-target",
+            "merged-away",
+            "recent",
+            "watched"
+        ]
+    );
+    let orphan_images: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM item_images
+             WHERE item_id IN ('expired', 'expired-two', 'expired-three')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(orphan_images, 0);
+    let remaining_images: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining_images, 6);
+    let orphan_search_rows: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM media_search
+             WHERE item_id IN ('expired', 'expired-two', 'expired-three')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(orphan_search_rows, 0);
+    // Retention is measured from the removal time: a zero-day window also takes the
+    // recently removed item, but still never the guarded ones.
+    assert_eq!(
+        database
+            .purge_expired_removed_media_items(0, 10, 10, std::time::Duration::ZERO)
+            .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_soft_deleted_media_items_are_purged_in_batches() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_removed_media_item_purge(&database)
+        .await
+        .expect("removed item purge");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_expired_soft_deleted_media_items_are_purged_in_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_removed_media_item_purge(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
+
+async fn assert_media_source_defaults_are_normalized(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library = LibraryService::new(database.clone())
+        .create_library("Defaults", LibraryKind::Movie, false)
+        .await?;
+    // (item, [(source, is_default)])
+    let items: [(&str, [(&str, i64); 3]); 4] = [
+        ("two-defaults", [("a1", 1), ("a2", 1), ("a3", 0)]),
+        ("no-default", [("b1", 0), ("b2", 0), ("b3", 0)]),
+        ("three-defaults", [("c1", 1), ("c2", 1), ("c3", 1)]),
+        ("healthy", [("d1", 0), ("d2", 1), ("d3", 0)]),
+    ];
+    for (item_id, sources) in items {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        for (source_id, is_default) in sources {
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, ?, 'LOCAL_FILE', ?, 'PENDING')",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .bind(is_default)
+                .execute(database.pool())
+                .await?;
+        }
+    }
+
+    assert_eq!(database.normalize_media_source_defaults().await?, 3);
+    let defaults: Vec<String> = database
+        .query_scalar("SELECT id FROM media_sources WHERE is_default = 1 ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(defaults, ["a1", "b1", "c1", "d2"]);
+    assert_eq!(database.normalize_media_source_defaults().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_items_are_normalized_to_one_default_source() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_media_source_defaults_are_normalized(&database)
+        .await
+        .expect("default normalization");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_items_are_normalized_to_one_default_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_media_source_defaults_are_normalized(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
 }

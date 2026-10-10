@@ -26,9 +26,11 @@ export type MediaInfoPanelProps = {
   lastAirDate?: string | null;
   status?: string | null;
   originalLanguage?: string | null;
+  addedAtLabel?: string | null;
   includeMetadataRows?: boolean;
   includeOriginalLanguage?: boolean;
   includeSourceRow?: boolean;
+  compactSummary?: boolean;
   collapseTechnicalDetails?: boolean;
 };
 
@@ -50,28 +52,47 @@ export function MediaInfoContent({
   lastAirDate,
   status,
   originalLanguage,
+  addedAtLabel,
   includeMetadataRows = true,
   includeOriginalLanguage = true,
   includeSourceRow = true,
+  compactSummary = false,
   collapseTechnicalDetails = false,
 }: MediaInfoPanelProps) {
   const streams = source.streams ?? [];
   const streamGroups = ["VIDEO", "AUDIO", "SUBTITLE"]
     .map((type) => ({ type, streams: streams.filter((stream) => stream.type?.toUpperCase() === type) }))
     .filter((group) => group.streams.length);
+  const compactSummaryValues = [
+    mediaTypeLabel(itemType),
+    includeSourceRow ? (source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件") : undefined,
+    source.qualityLabel || source.editionName || undefined,
+    addedAtLabel,
+  ].filter((value): value is string => Boolean(value));
 
   return (
     <>
-      <div className="lux-media-file-summary">
-        <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
-        {includeMetadataRows ? <>
-          <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
-          <InfoRow label="状态" value={status ?? undefined} />
-          {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
-        </> : null}
-        {includeSourceRow ? <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} /> : null}
-        <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
-      </div>
+      {compactSummary ? (
+        <div className="lux-media-file-summary is-compact" aria-label="媒体文件摘要">
+          {compactSummaryValues.map((value, index) => <span key={`${value}-${index}`}>{value}</span>)}
+          {includeMetadataRows ? <>
+            <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
+            <InfoRow label="状态" value={status ?? undefined} />
+            {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
+          </> : null}
+        </div>
+      ) : (
+        <div className="lux-media-file-summary">
+          <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
+          {includeMetadataRows ? <>
+            <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
+            <InfoRow label="状态" value={status ?? undefined} />
+            {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
+          </> : null}
+          {includeSourceRow ? <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} /> : null}
+          <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
+        </div>
+      )}
       {source.externalUrl ? (
         collapseTechnicalDetails ? (
           <details className="lux-media-info-address">

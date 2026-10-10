@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -35,6 +35,7 @@ pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
 pub const LOGIN_BACKGROUND_GET_CAPABILITY: &str = "login_background.get";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
+pub const EMBY_ROUTE_CAPABILITY: &str = "emby.route";
 pub const METADATA_SEARCH_CAPABILITY: &str = "metadata.search";
 pub const METADATA_GET_CAPABILITY: &str = "metadata.get";
 pub const METADATA_BUNDLE_CAPABILITY: &str = "metadata.bundle";
@@ -88,6 +89,8 @@ pub struct PluginManifest {
     pub supported_media_source_kinds: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub emby_routes: Vec<PluginEmbyRoute>,
     #[serde(default)]
     pub config_fields: Vec<PluginConfigField>,
     #[serde(default)]
@@ -314,6 +317,31 @@ impl PluginManifest {
             }
         }
         self.runtime.validate()?;
+        if self.emby_routes.len() > 32 {
+            return Err(PluginManifestError::Invalid(
+                "manifest declares too many Emby routes".to_owned(),
+            ));
+        }
+        if !self.emby_routes.is_empty()
+            && !self
+                .capabilities
+                .iter()
+                .any(|capability| capability == EMBY_ROUTE_CAPABILITY)
+        {
+            return Err(PluginManifestError::Invalid(
+                "Emby routes require emby.route".to_owned(),
+            ));
+        }
+        let mut route_keys = std::collections::HashSet::new();
+        for route in &self.emby_routes {
+            route.validate()?;
+            if !route_keys.insert((route.method.as_str(), route.path.as_str())) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "duplicate Emby route: {} {}",
+                    route.method, route.path
+                )));
+            }
+        }
         if self.supported_item_types.len() > 32
             || self.supported_media_source_kinds.len() > 8
             || self.capabilities.len() > 64
@@ -494,6 +522,42 @@ fn default_plugin_category() -> String {
 pub struct PluginRuntime {
     pub kind: String,
     pub entrypoint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginEmbyRoute {
+    pub method: String,
+    pub path: String,
+    pub rpc_method: String,
+}
+
+impl PluginEmbyRoute {
+    fn validate(&self) -> Result<(), PluginManifestError> {
+        let method = self.method.to_ascii_uppercase();
+        if method != self.method
+            || !matches!(
+                method.as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"
+            )
+        {
+            return Err(PluginManifestError::Invalid(
+                "Emby route method must be an uppercase HTTP method".to_owned(),
+            ));
+        }
+        if self.path.len() > 256
+            || !self.path.starts_with('/')
+            || self.path.contains('?')
+            || self.path.contains('#')
+            || self.path.contains('*')
+            || self.path.contains("..")
+        {
+            return Err(PluginManifestError::Invalid(
+                "Emby route path must be an exact safe path".to_owned(),
+            ));
+        }
+        validate_identifier("Emby route RPC method", &self.rpc_method, 128)
+    }
 }
 
 impl PluginRuntime {
@@ -817,6 +881,233 @@ impl PluginRequest {
             params,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginEmbyRouteRequest {
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body_base64: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginEmbyRouteResponse {
+    pub status_code: u16,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_info_import: Option<PluginMediaInfoImport>,
+}
+
+pub const MEDIA_INFO_IMPORT_CAPABILITY: &str = "media.info.import";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMediaInfoImport {
+    pub target: PluginMediaInfoTarget,
+    pub media: MediaProbeRpcResult,
+    #[serde(default)]
+    pub chapters: Vec<PluginMediaInfoChapter>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMediaInfoTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMediaInfoChapter {
+    pub start_position_ticks: i64,
+    pub chapter_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl PluginEmbyRouteResponse {
+    /// Validates the operation contract. Authorization and target resolution remain host duties.
+    pub fn validate_media_info_import(
+        &self,
+        host_capabilities: &[String],
+        plugin_capabilities: &[String],
+    ) -> bool {
+        let Some(operation) = &self.media_info_import else {
+            return true;
+        };
+        (200..300).contains(&self.status_code)
+            && [host_capabilities, plugin_capabilities]
+                .iter()
+                .all(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == MEDIA_INFO_IMPORT_CAPABILITY)
+                })
+            && operation.is_valid()
+    }
+}
+
+impl PluginMediaInfoImport {
+    pub fn is_valid(&self) -> bool {
+        let target = &self.target;
+        let selectors = [&target.item_id, &target.media_source_id, &target.path];
+        if selectors
+            .iter()
+            .filter(|selector| selector.is_some())
+            .count()
+            != 1
+            || [&target.item_id, &target.media_source_id].iter().any(|id| {
+                id.as_ref().is_some_and(|id| {
+                    id.is_empty()
+                        || id.len() > 128
+                        || !id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            })
+            || target.path.as_ref().is_some_and(|path| {
+                path.len() > 8192
+                    || path.chars().any(char::is_control)
+                    || !Path::new(path).is_absolute()
+                    || path
+                        .split(['/', '\\'])
+                        .any(|component| matches!(component, "." | ".."))
+            })
+            || serde_json::to_vec(self)
+                .ok()
+                .is_none_or(|bytes| bytes.len() > 256 * 1024)
+        {
+            return false;
+        }
+        let media = &self.media;
+        if !bounded_import_text(&media.container, 128)
+            || [media.source_size, media.duration_ticks, media.bitrate]
+                .iter()
+                .flatten()
+                .any(|value| *value < 0)
+            || media.thumbnail_jpeg_base64.is_some()
+            || media.streams.is_empty()
+            || media.streams.len() > 128
+            || self.chapters.len() > 512
+        {
+            return false;
+        }
+        let mut indexes = std::collections::HashSet::new();
+        if media.streams.iter().any(|stream| {
+            stream.stream_index < 0
+                || !indexes.insert(stream.stream_index)
+                || !bounded_import_text(&stream.codec, 256)
+                || !bounded_import_text(&stream.language, 256)
+                || !bounded_import_text(&stream.title, 512)
+                || stream
+                    .details
+                    .iter()
+                    .any(|(key, value)| !valid_import_detail(key, value))
+        }) {
+            return false;
+        }
+        indexes.clear();
+        self.chapters.iter().all(|chapter| {
+            chapter.start_position_ticks >= 0
+                && chapter.chapter_index >= 0
+                && indexes.insert(chapter.chapter_index)
+                && bounded_import_text(&chapter.name, 512)
+                && media
+                    .duration_ticks
+                    .is_none_or(|duration| chapter.start_position_ticks <= duration)
+        })
+    }
+}
+
+fn bounded_import_text(text: &Option<String>, limit: usize) -> bool {
+    text.as_ref()
+        .is_none_or(|text| text.len() <= limit && !text.chars().any(char::is_control))
+}
+
+fn valid_import_detail(key: &str, value: &Value) -> bool {
+    match key {
+        "IsInterlaced" | "IsHearingImpaired" | "IsTextSubtitleStream" => {
+            valid_import_boolean(value)
+        }
+        "BitRate" | "BitDepth" | "RefFrames" | "Height" | "Width" | "Level" | "Channels" => {
+            valid_nonnegative_integer(value)
+        }
+        "AverageFrameRate" | "RealFrameRate" => valid_frame_rate(value),
+        "SampleRate" => valid_nonnegative_integer(value),
+        "DisplayLanguage"
+        | "TimeBase"
+        | "VideoRange"
+        | "VideoRangeType"
+        | "Profile"
+        | "AspectRatio"
+        | "PixelFormat"
+        | "ChannelLayout"
+        | "ColorSpace"
+        | "ColorTransfer"
+        | "ColorPrimaries"
+        | "ExtendedVideoType"
+        | "ExtendedVideoSubType"
+        | "ExtendedVideoSubTypeDescription" => value
+            .as_str()
+            .is_some_and(|text| text.len() <= 512 && !text.chars().any(char::is_control)),
+        _ => false,
+    }
+}
+
+fn valid_import_boolean(value: &Value) -> bool {
+    value.is_boolean()
+        || value.as_i64().is_some()
+        || value.as_str().is_some_and(|text| {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "true" | "false" | "1" | "0" | "yes" | "no"
+            )
+        })
+}
+
+fn valid_nonnegative_integer(value: &Value) -> bool {
+    value.as_i64().is_some_and(|number| number >= 0)
+        || value.as_str().is_some_and(|text| {
+            text.len() <= 32
+                && !text.is_empty()
+                && text.parse::<i64>().is_ok_and(|number| number >= 0)
+        })
+}
+
+fn valid_frame_rate(value: &Value) -> bool {
+    if value
+        .as_f64()
+        .is_some_and(|number| number.is_finite() && number >= 0.0)
+    {
+        return true;
+    }
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let Some((numerator, denominator)) = text.split_once('/') else {
+        return false;
+    };
+    text.len() <= 32
+        && !numerator.is_empty()
+        && !denominator.is_empty()
+        && numerator.parse::<u64>().is_ok()
+        && denominator.parse::<u64>().is_ok()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

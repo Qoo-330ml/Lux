@@ -225,6 +225,13 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   `includeThumbnail` 和 `thumbnailPositionPercent`。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
   缩略图由 `ffmpeg` 在 duration 的 `thumbnailPositionPercent` 百分比位置生成 JPEG（缺省为 30），并通过受限的
   `thumbnailJpegBase64` 返回。宿主可以把成功截图以同一文件同时登记为 `POSTER` 和 `THUMB`。插件不解析 `.strm` 内容，也不因地址类型拒绝输入。
+- `emby.route`：由插件 manifest 的 `embyRoutes` 声明精确的 Emby 方法和路径。宿主只向已安装、已启用且
+  声明匹配路由的插件转发请求；请求只包含方法、路径、原始 query、脱敏后的非认证头和有界 Base64 body。
+  插件返回状态码、受限头和有界 Base64 body。认证头、Cookie、完整 URL 和 Lux 内部身份不会传给插件。
+  首个兼容路由是 `POST /Items/SyncMediaInfo`；神医兼容插件在宿主声明 `media.info.import` 时可返回受限的
+  `mediaInfoImport` Bundle，宿主负责校验目标并把媒体流、格式、时长、码率和章节写入已索引的 STRM 媒体源。
+  未安装或未启用插件时返回 404；插件或 Bundle 不满足能力和大小边界时拒绝请求。该路由不触发远程媒体读取或
+  SHA1 计算，SHA1、FF 缓存和远程缓存仍由 MediaTidy 负责。
 - `ip.location`：接收一个已由 Lux 宿主校验的公网 IP，返回统一的归属地字段；第三方供应商协议只存在于插件进程。
 - `chapters.detect`：接收同一季度至少两个分集的有界 Chromaprint 指纹序列。每个分集只包含请求内临时 `key`、固定 `sampleRate: 11025`、`fingerprintPointDurationTicks: 1238095`、指纹 Base64、窗口起点和窗口时长；宿主对每个文件固定取第一个音频流并让 FFmpeg chromaprint muxer 输出 raw `uint32` 点序列，按 little-endian 编码，不能把 Base64 字节索引当作时间。插件不得接收路径、URL、媒体源 ID 或任务对象。结果只能返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`，时间必须落在对应窗口内，置信度为 0-1。
 - `chapters.lookup`：接收请求内临时 `key`、TMDb/TVDb/IMDb ID、季号、集号和可选时长；插件不得接收路径、URL、媒体源 ID、音频指纹或任务对象。插件只能访问 manifest 声明的固定网络主机，返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`；无数据时返回空标记，宿主不会因空响应删除已有标记。
@@ -462,7 +469,9 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 `MEDIA_PROBE_INVALID_OUTPUT`；错误消息不能包含完整 URL 或 stderr。
 
 媒体探测调用只能由后台 STRM 探测任务触发，不得从播放、PlaybackInfo 或普通用户请求路径触发。Lux 宿主负责并发、超时、取消、重启恢复、任务状态、数据库写入和可选的
-`*-mediainfo.json` 原子写入。`permissions.network` 是能力声明，不替代宿主的出站 URL 安全策略。
+`*-mediainfo.json` 原子写入。写入已有 sidecar 时只更新宿主管理的媒体信息字段，并保留未知字段、章节及外部扩展；`existingInfoPolicy=OVERWRITE`
+表示重新探测并更新这些宿主字段，不表示删除未知字段。已有 sidecar 无法解析时不得覆盖原文件。Lux 不生成或修改 `.strm` 内容，也不在该 RPC 中计算 SHA1。
+`permissions.network` 是能力声明，不替代宿主的出站 URL 安全策略。
 
 ### 通知器调用约定
 

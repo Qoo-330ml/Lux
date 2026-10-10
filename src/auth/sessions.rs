@@ -56,6 +56,18 @@ impl WebAuthService {
         }))
     }
 
+    pub async fn change_password(
+        &self,
+        user_id: &UserId,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<bool, WebAuthError> {
+        Ok(self
+            .users
+            .change_password(user_id, current_password, new_password)
+            .await?)
+    }
+
     pub async fn resolve(
         &self,
         session_token: &str,

@@ -313,6 +313,7 @@ impl PeopleService {
             }
             let bytes = serde_json::to_vec_pretty(&relation)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            let relation_checksum = relation_snapshot_checksum(&bytes);
             write_atomically(&relation_path, &bytes).await?;
             let credits = relation
                 .actors
@@ -320,10 +321,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits_with_fingerprint(
+                .replace_person_credits_with_relation_checksum(
                     &item_id,
                     &credits,
                     relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
                 )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;

@@ -529,6 +529,43 @@ describe("HomePage shelves", () => {
     expect(container.querySelector(".lux-hero-actions a.lux-button-primary")?.textContent).toContain("继续播放");
   });
 
+  it("does not promote a continue-watching episode into the carousel", async () => {
+    mockHomeSections({
+      libraries: [],
+      recommended: [],
+      continueWatching: [{
+        id: "episode-only",
+        title: "不应进入轮播的单集",
+        itemType: "EPISODE",
+        userData: { positionTicks: 120_000_000 },
+      }],
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector('[aria-label="精选媒体轮播"] .lux-hero-title-text')?.textContent)
+      .toBe("你的私人影院");
+    expect(container.querySelector('[aria-label="精选媒体轮播"]')?.textContent)
+      .not.toContain("不应进入轮播的单集");
+  });
+
   it("starts the highlighted movie from the carousel instead of opening its detail page", async () => {
     mockHomeSections({
       libraries: [],

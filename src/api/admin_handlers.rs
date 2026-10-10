@@ -47,6 +47,13 @@ pub(crate) struct ScanPathRequest {
     pub(crate) recursive: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RefreshLocalMetadataRequest {
+    pub(crate) root_id: Option<String>,
+    pub(crate) paths: Vec<String>,
+}
+
 fn default_recursive_scan() -> bool {
     true
 }
@@ -224,6 +231,37 @@ impl MetadataRefreshRequestMode {
             Self::FullRefresh => "FULL_REFRESH",
         }
     }
+}
+
+async fn schedule_admin_metadata_job(
+    reidentify: &crate::application::reidentify::MetadataReidentifyService,
+    job: &crate::application::reidentify::MetadataReidentifyJob,
+) -> Result<(), crate::application::reidentify::MetadataDispatchError> {
+    if job.mode == crate::application::reidentify::MetadataRefreshMode::FillMissing.as_str() {
+        reidentify.enqueue_fill_missing_job(job).await?;
+    } else {
+        let worker = reidentify.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            worker.run(&job_id).await;
+        });
+    }
+    Ok(())
+}
+
+fn metadata_dispatch_unavailable(
+    headers: &HeaderMap,
+    job_id: &str,
+    error: crate::application::reidentify::MetadataDispatchError,
+) -> Response {
+    tracing::warn!(job_id, %error, "administrator metadata job could not be dispatched");
+    api_error(
+        headers,
+        StatusCode::SERVICE_UNAVAILABLE,
+        lux::ApiErrorCode::DatabaseUnavailable,
+        "元数据任务队列暂不可用，请稍后重试",
+    )
+    .into_response()
 }
 
 pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -1224,6 +1262,79 @@ pub(crate) async fn admin_start_library_path_scan(
         .into_response()
 }
 
+/// Re-indexes NFO and images for exact directories without a scan. Meant for tools that write
+/// or repair sidecars next to unchanged videos (a scraper publishing a poster, Immortal).
+pub(crate) async fn admin_refresh_library_local_metadata(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<RefreshLocalMetadataRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let accepted = match scan_jobs
+        .start_local_metadata_refresh(library_id, request.root_id.as_deref(), &request.paths)
+        .await
+    {
+        Ok(accepted) => accepted,
+        Err(ScanJobError::LibraryNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response();
+        }
+        Err(
+            ScanJobError::NoChanges
+            | ScanJobError::Scanner(
+                ScannerError::InvalidRootId(_) | ScannerError::InvalidRelativePath(_),
+            ),
+        ) => {
+            return api_error(
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                lux::ApiErrorCode::InvalidRequest,
+                "目录列表为空，或根目录 / 相对路径无效",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "LOCAL_METADATA_REFRESH_STARTED",
+        Some("library"),
+        Some(&library_id.to_string()),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": "LOCAL_METADATA",
+            "directories": accepted.directories,
+            "entries": accepted.entries,
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) async fn admin_start_library_reidentify(
     headers: HeaderMap,
     Path(library_id): Path<String>,
@@ -1260,10 +1371,9 @@ pub(crate) async fn admin_start_library_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        reidentify.run(&job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,
@@ -1355,10 +1465,9 @@ pub(crate) async fn admin_start_library_metadata_refresh(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        reidentify.run(&job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,
@@ -1503,10 +1612,9 @@ pub(crate) async fn admin_start_item_metadata_refresh(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        reidentify.run(&job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,
@@ -2629,6 +2737,7 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
         ScheduledTaskError::ServiceUnavailable
         | ScheduledTaskError::Scan(_)
         | ScheduledTaskError::Metadata(_)
+        | ScheduledTaskError::MetadataDispatch(_)
         | ScheduledTaskError::Strm(_)
         | ScheduledTaskError::Chapter(_)
         | ScheduledTaskError::Cover(_)
@@ -2672,45 +2781,40 @@ pub(crate) async fn admin_list_task_activity(
             "scanPhase": job.scan_phase,
         })
     }));
-    for status in ["PENDING", "RUNNING"] {
-        let metadata_status = if status == "PENDING" {
-            "QUEUED"
-        } else {
-            status
-        };
-        let metadata_jobs = match database
-            .list_metadata_reidentify_jobs(Some(metadata_status), 0, 100)
-            .await
-        {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        let metadata_labels = match database
-            .list_current_metadata_reidentify_items(
-                &metadata_jobs
-                    .iter()
-                    .map(|job| job.id.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .await
-        {
-            Ok(items) => activity_item_labels(items),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(metadata_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "metadata",
-                "taskType": job.mode,
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-                "cancelRequested": job.cancel_requested,
-                "currentItem": metadata_labels.get(&job.id),
-            })
-        }));
+    let metadata_jobs = match database
+        .list_metadata_reidentify_jobs_for_activity(100)
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let metadata_labels = match database
+        .list_current_metadata_reidentify_items(
+            &metadata_jobs
+                .iter()
+                .map(|job| job.id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+    {
+        Ok(items) => activity_item_labels(items),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    activities.extend(metadata_jobs.iter().map(|job| {
+        json!({
+            "id": job.id,
+            "kind": "metadata",
+            "taskType": job.mode,
+            "libraryId": job.library_id,
+            "status": job.status,
+            "processedCount": job.processed_count,
+            "totalCount": job.total_count,
+            "cancelRequested": job.cancel_requested,
+            "currentItem": metadata_labels.get(&job.id),
+        })
+    }));
 
+    for status in ["PENDING", "RUNNING"] {
         let strm_jobs = match database.list_strm_probe_jobs(Some(status), 0, 100).await {
             Ok(jobs) => jobs,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -4005,11 +4109,24 @@ pub(crate) async fn require_admin(
     state: &AppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
-    if users::lux_user_token_from_headers(headers).is_some()
-        && resolve_shared_admin_api_key(headers, state)
-            .await?
-            .is_none()
-    {
+    if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
+        if !principal.can_manage_server()
+            || (state.remote_access.is_remote(
+                header_str(headers, "x-lux-peer-ip"),
+                header_str(headers, "x-forwarded-for"),
+            ) && !principal.can_remote_access())
+        {
+            return Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "没有服务器管理权限",
+            )
+            .into_response());
+        }
+        return Ok(());
+    }
+    if users::lux_user_token_from_headers(headers).is_some() {
         return Err(api_error(
             headers,
             StatusCode::FORBIDDEN,
@@ -4113,7 +4230,7 @@ pub(crate) async fn require_admin_web_session(
 pub(crate) async fn resolve_shared_admin_api_key(
     headers: &HeaderMap,
     state: &AppState,
-) -> Result<Option<UserRecord>, Response> {
+) -> Result<Option<crate::auth::users::AuthenticationPrincipal>, Response> {
     let Some(candidate) = lux_api_key_from_headers(headers) else {
         return Ok(None);
     };
@@ -4126,7 +4243,7 @@ pub(crate) async fn resolve_shared_admin_api_key(
         )
         .into_response());
     };
-    service.resolve(&candidate).await.map_err(|_| {
+    service.resolve_principal(&candidate).await.map_err(|_| {
         api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4192,7 +4309,7 @@ pub(crate) async fn record_audit_event(
             let Some(service) = state.admin_api_key.as_ref() else {
                 return;
             };
-            let Ok(Some(_)) = service.resolve(&candidate).await else {
+            let Ok(Some(_)) = service.resolve_principal(&candidate).await else {
                 return;
             };
             (None, None, audit_metadata_for_shared_api_key(metadata_json))
@@ -5329,24 +5446,41 @@ pub(crate) async fn admin_health_payload(state: &AppState) -> Result<Value, Stat
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let resources = state.resources.snapshot().await;
-    let database_writable = database.probe_write().await.is_ok();
     let database_pool = database.pool_snapshot();
-    let config_available = match state.config_dir.as_deref() {
-        Some(path) => fs::metadata(path)
-            .await
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false),
-        None => false,
-    };
-    let config_writable = match state.config_dir.as_deref() {
-        Some(path) if config_available => probe_directory_writable(path).await,
-        _ => false,
-    };
-    let ffprobe_available = Command::new("ffprobe")
-        .arg("-version")
-        .output()
-        .await
-        .is_ok_and(|output| output.status.success());
+    let probes = state
+        .admin_health_probe_cache
+        .get_or_probe(|| async {
+            let database_writable = database.probe_write().await.is_ok();
+            let config_available = match state.config_dir.as_deref() {
+                Some(path) => fs::metadata(path)
+                    .await
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false),
+                None => false,
+            };
+            let config_writable = match state.config_dir.as_deref() {
+                Some(path) if config_available => probe_directory_writable(path).await,
+                _ => false,
+            };
+            let ffprobe_available = Command::new("ffprobe")
+                .arg("-version")
+                .output()
+                .await
+                .is_ok_and(|output| output.status.success());
+            AdminHealthProbeSnapshot {
+                database_writable,
+                config_available,
+                config_writable,
+                ffprobe_available,
+            }
+        })
+        .await;
+    let AdminHealthProbeSnapshot {
+        database_writable,
+        config_available,
+        config_writable,
+        ffprobe_available,
+    } = probes;
     let libraries = match state.libraries.as_ref() {
         Some(libraries) => match libraries.list_libraries().await {
             Ok(views) => views
@@ -6887,11 +7021,9 @@ pub(crate) async fn admin_retry_metadata_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let worker = reidentify.clone();
-    let worker_job_id = job.id.clone();
-    tokio::spawn(async move {
-        worker.run(&worker_job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,

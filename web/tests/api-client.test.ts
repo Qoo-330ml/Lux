@@ -300,6 +300,23 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
   });
 
+  it("uses the session-only password change contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+
+    await new LuxApiClient().updatePassword({
+      currentPassword: "old password",
+      newPassword: "new password",
+    });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/auth/password");
+    expect(options?.method).toBe("PATCH");
+    expect(options?.body).toBe(JSON.stringify({
+      currentPassword: "old password",
+      newPassword: "new password",
+    }));
+  });
+
   it("checks and selects the configured database backend without changing the setup API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
@@ -493,7 +510,7 @@ describe("LuxApiClient", () => {
     });
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "/api/v1/items/series-1/children?page=1&pageSize=60&itemType=EPISODE&seasonId=season-1",
+      "/api/v1/items/series-1/children?page=1&pageSize=100&itemType=EPISODE&seasonId=season-1",
     );
   });
 
@@ -1148,6 +1165,32 @@ describe("LuxApiClient", () => {
       expect(fetchMock).toHaveBeenCalledTimes(4);
     } finally {
       restoreClientState();
+    }
+  });
+
+  it("prefers the shared CSRF token updated by another tab over its stale memory copy", async () => {
+    const headers: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/auth/login") {
+        return new Response(JSON.stringify({ user: { id: "user-1" }, csrfToken: "old-tab-token" }), { status: 200 });
+      }
+      headers.push((init?.headers as Headers).get("X-CSRF-Token") ?? "");
+      return new Response(null, { status: 204 });
+    });
+    const cookieDocument = installCookieDocument("");
+    const storage = installLocalStorage(null);
+    try {
+      const client = new LuxApiClient();
+      await client.login("user", "password");
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: { getItem: () => "new-tab-token", setItem() {}, removeItem() {} },
+      });
+      await client.setFavorite("item-1", true);
+      expect(headers).toEqual(["new-tab-token"]);
+    } finally {
+      storage.restore();
+      cookieDocument.restore();
     }
   });
 

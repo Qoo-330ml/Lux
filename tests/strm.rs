@@ -197,20 +197,35 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .ok_or("missing user id")?
         .to_owned();
 
-    let admin_key_playback = client
+    let shared_key_playback = client
         .get(format!(
             "http://{address}/Items/{remote_item_id}/PlaybackInfo"
         ))
         .query(&[("api_key", admin_api_key.as_str())])
         .send()
         .await?;
-    assert_eq!(admin_key_playback.status(), reqwest::StatusCode::OK);
-    let admin_key_playback_body = admin_key_playback.json::<Value>().await?;
-    let admin_key_direct_url = admin_key_playback_body["MediaSources"][0]["DirectStreamUrl"]
+    assert_eq!(
+        shared_key_playback.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let user_playback_with_shared_key_query = client
+        .get(format!(
+            "http://{address}/Items/{remote_item_id}/PlaybackInfo"
+        ))
+        .header("X-Emby-Token", &token)
+        .query(&[("api_key", admin_api_key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(
+        user_playback_with_shared_key_query.status(),
+        reqwest::StatusCode::OK
+    );
+    let user_playback_body = user_playback_with_shared_key_query.json::<Value>().await?;
+    let user_direct_url = user_playback_body["MediaSources"][0]["DirectStreamUrl"]
         .as_str()
-        .ok_or("missing admin-key direct stream URL")?;
-    assert!(!admin_key_direct_url.contains(&admin_api_key));
-    assert!(!admin_key_direct_url.contains("&DeviceId="));
+        .ok_or("missing user direct stream URL")?;
+    assert!(!user_direct_url.contains(&admin_api_key));
 
     let popcorn_detail = client
         .get(format!(

@@ -6,26 +6,20 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::{fs, sync::Mutex};
 
-use crate::{
-    auth::users::UserRecord,
-    domain::ids::UserId,
-    storage::{Database, StorageError},
-};
+use crate::{auth::users::AuthenticationPrincipal, storage::Database};
 
 pub const ADMIN_API_KEY_FILE: &str = "lux_admin_api_key";
 
 #[derive(Clone)]
 pub struct AdminApiKeyService {
     config_dir: PathBuf,
-    database: Database,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl AdminApiKeyService {
-    pub fn new(config_dir: PathBuf, database: Database) -> Self {
+    pub fn new(config_dir: PathBuf, _database: Database) -> Self {
         Self {
             config_dir,
-            database,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -46,21 +40,18 @@ impl AdminApiKeyService {
         write_key(&self.key_path(), None).await
     }
 
-    pub async fn resolve(&self, candidate: &str) -> Result<Option<UserRecord>, AdminApiKeyError> {
+    pub async fn resolve_principal(
+        &self,
+        candidate: &str,
+    ) -> Result<Option<AuthenticationPrincipal>, AdminApiKeyError> {
         let Some(stored_key) = read_key(&self.key_path()).await? else {
             return Ok(None);
         };
-        if !keys_match(candidate.trim(), &stored_key) {
-            return Ok(None);
+        if keys_match(candidate.trim(), &stored_key) {
+            Ok(Some(AuthenticationPrincipal::SharedAdminApiKey))
+        } else {
+            Ok(None)
         }
-
-        self.database
-            .list_users()
-            .await?
-            .into_iter()
-            .find(|user| user.can_manage_server)
-            .map(user_record)
-            .transpose()
     }
 
     fn key_path(&self) -> PathBuf {
@@ -127,38 +118,10 @@ async fn write_key(path: &std::path::Path, value: Option<&str>) -> Result<(), Ad
     Ok(())
 }
 
-fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, AdminApiKeyError> {
-    let id: UserId = stored
-        .id
-        .parse()
-        .map_err(|error: uuid::Error| AdminApiKeyError::InvalidUserId(error.to_string()))?;
-    Ok(UserRecord {
-        id,
-        username_normalized: stored.username_normalized,
-        display_name: stored.display_name,
-        has_password: stored.has_password,
-        is_disabled: stored.is_disabled,
-        is_admin: stored.is_admin,
-        can_manage_server: stored.can_manage_server,
-        can_remote_access: stored.can_remote_access,
-        can_download: stored.can_download,
-        last_login_at: stored.last_login_at,
-        last_activity_at: stored.last_activity_at,
-    })
-}
-
 #[derive(Debug)]
 pub enum AdminApiKeyError {
-    InvalidUserId(String),
     Io(std::io::Error),
-    Storage(StorageError),
     TokenGeneration(String),
-}
-
-impl From<StorageError> for AdminApiKeyError {
-    fn from(error: StorageError) -> Self {
-        Self::Storage(error)
-    }
 }
 
 impl From<std::io::Error> for AdminApiKeyError {
@@ -170,9 +133,7 @@ impl From<std::io::Error> for AdminApiKeyError {
 impl std::fmt::Display for AdminApiKeyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::Io(error) => write!(formatter, "admin API key storage failed: {error}"),
-            Self::Storage(error) => error.fmt(formatter),
             Self::TokenGeneration(error) => {
                 write!(formatter, "admin API key generation failed: {error}")
             }
@@ -184,8 +145,7 @@ impl std::error::Error for AdminApiKeyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Storage(error) => Some(error),
-            Self::InvalidUserId(_) | Self::TokenGeneration(_) => None,
+            Self::TokenGeneration(_) => None,
         }
     }
 }
