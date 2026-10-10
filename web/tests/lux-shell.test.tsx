@@ -375,6 +375,56 @@ describe("LuxShell user control", () => {
     ]);
   });
 
+  it("renders the first indexed movie and local poster before a scan completes", async () => {
+    FakeEventSource.instances = [];
+    sessionStorage.clear();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    const firstBatch = [{
+      id: "movie-1", title: "首批本地电影", itemType: "MOVIE",
+      imageTags: { poster: "local-poster-v1" }, localMetadataPending: true,
+    }];
+    const fixture = { indexed: false, scanCompleted: false };
+    const latest = vi.spyOn(api, "homeLibrariesLatest").mockImplementation(async () => ({
+      libraries: [{ libraryId: "library-1", items: fixture.indexed ? firstBatch : [] }],
+    }));
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const user = { id: "user-1", usernameNormalized: "test" };
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <Routes>
+              <Route element={<LuxShell user={user} />}>
+                <Route index element={<HomePage user={user} />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(1));
+    expect(container.querySelector(".lux-media-card")).toBeNull();
+
+    // The API fixture publishes a committed batch while its scan remains running.
+    fixture.indexed = true;
+    act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
+    await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(
+      '[aria-label="最新电影库"] .lux-media-card img',
+    )?.src).toContain("tag=local-poster-v1"));
+    expect(container.textContent).toContain("首批本地电影");
+    expect(fixture.scanCompleted).toBe(false);
+  });
+
   it("refreshes the library poster tags after a scraper home event", async () => {
     FakeEventSource.instances = [];
     sessionStorage.clear();
