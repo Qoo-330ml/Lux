@@ -1259,6 +1259,140 @@ impl LocalPosterQueueSnapshot {
     }
 }
 
+// The baseline processes local metadata inline; the candidate drains an outbox.
+// Keep their completion evidence explicit while sharing all HTTP sampling code.
+enum BenchmarkPosterSnapshot {
+    Detached(LocalPosterQueueSnapshot),
+    Inline {
+        total: i64,
+        status: String,
+        posters: i64,
+    },
+}
+
+impl BenchmarkPosterSnapshot {
+    fn is_drained(&self, required: usize) -> bool {
+        match self {
+            Self::Detached(snapshot) => snapshot.is_drained(required),
+            Self::Inline {
+                total,
+                status,
+                posters,
+            } => status == "COMPLETED" && *total >= required as i64 && *posters >= required as i64,
+        }
+    }
+    fn has_completed_batch_missing_image_marker(&self) -> bool {
+        matches!(self, Self::Detached(snapshot) if snapshot.has_completed_batch_missing_image_marker())
+    }
+    fn is_pending_measurement_window(&self) -> bool {
+        matches!(self, Self::Detached(snapshot) if snapshot.is_pending_measurement_window())
+    }
+    fn cancelled_batch_count(&self) -> i64 {
+        match self {
+            Self::Detached(snapshot) => snapshot.cancelled_batch_count,
+            Self::Inline { status, .. } => i64::from(status == "CANCELLED" || status == "FAILED"),
+        }
+    }
+    fn poster_item_count(&self) -> i64 {
+        match self {
+            Self::Detached(snapshot) => snapshot.poster_item_count,
+            Self::Inline { posters, .. } => *posters,
+        }
+    }
+    fn pending_measurement_unavailable_reason(&self) -> &'static str {
+        match self {
+            Self::Detached(snapshot) => snapshot.pending_measurement_unavailable_reason(),
+            Self::Inline { .. } => "inline baseline has no detached image queue",
+        }
+    }
+    fn report(&self, required: usize) -> serde_json::Value {
+        match self {
+            Self::Detached(snapshot) => snapshot.report(required),
+            Self::Inline {
+                total,
+                status,
+                posters,
+            } => json!({
+                "completionModel": "inline_metadata_baseline",
+                "scanTotalCount": total, "scanStatus": status,
+                "posterItemCount": posters, "requiredPosterItemCount": required,
+                "drained": self.is_drained(required),
+            }),
+        }
+    }
+}
+
+#[test]
+fn inline_poster_drain_requires_scan_completion_and_all_fixture_posters() {
+    assert!(
+        BenchmarkPosterSnapshot::Inline {
+            total: 100,
+            status: "COMPLETED".into(),
+            posters: 100
+        }
+        .is_drained(100)
+    );
+    for (status, posters) in [("RUNNING", 100), ("FAILED", 100), ("COMPLETED", 99)] {
+        assert!(
+            !BenchmarkPosterSnapshot::Inline {
+                total: 100,
+                status: status.into(),
+                posters
+            }
+            .is_drained(100)
+        );
+    }
+}
+
+async fn load_benchmark_poster_snapshot(
+    pool: &sqlx::AnyPool,
+    job_id: &str,
+    library_id: &str,
+    job_placeholder: &str,
+    library_placeholder: &str,
+) -> Result<BenchmarkPosterSnapshot, sqlx::Error> {
+    match env::var("LUX_PERF_POSTER_QUEUE_MODE").as_deref() {
+        Err(_) | Ok("detached_batches") => Ok(BenchmarkPosterSnapshot::Detached(
+            load_local_poster_queue_snapshot(
+                pool,
+                job_id,
+                library_id,
+                job_placeholder,
+                library_placeholder,
+            )
+            .await?,
+        )),
+        Ok("inline_metadata_baseline") => {
+            let library_placeholder = if job_placeholder == "$1" { "$2" } else { "?" };
+            let query = format!("SELECT job.total_count, job.status,
+                (SELECT COUNT(DISTINCT image.item_id) FROM item_images image
+                 JOIN media_items item ON item.id = image.item_id
+                 WHERE item.library_id = {library_placeholder} AND image.image_type = 'POSTER' AND image.source = 'LOCAL')
+                FROM scan_jobs job WHERE job.id = {job_placeholder}");
+            // SQLite binds the subquery before the WHERE clause; PostgreSQL
+            // parameter numbering is independent of textual occurrence order.
+            let (first, second) = if job_placeholder == "$1" {
+                (job_id, library_id)
+            } else {
+                (library_id, job_id)
+            };
+            let (total, status, posters) = sqlx::query_as(sqlx::AssertSqlSafe(query))
+                .bind(first)
+                .bind(second)
+                .fetch_one(pool)
+                .await?;
+            Ok(BenchmarkPosterSnapshot::Inline {
+                total,
+                status,
+                posters,
+            })
+        }
+        Ok(_) => Err(sqlx::Error::Protocol(
+            "unsupported poster queue mode".into(),
+        )),
+    }
+}
+
 async fn load_local_poster_queue_snapshot(
     pool: &sqlx::AnyPool,
     job_id: &str,
@@ -1379,19 +1513,6 @@ impl PoolPressureMonitor {
             self.saturated_samples.load(Ordering::Relaxed),
         )
     }
-}
-
-async fn measure_get_requests_with_pool_pressure(
-    client: &reqwest::Client,
-    pool: sqlx::AnyPool,
-    url: &str,
-    cookies: &str,
-    label: &str,
-) -> Result<(Vec<u128>, serde_json::Value), Box<dyn std::error::Error>> {
-    let monitor = start_pool_pressure_monitor(pool);
-    let request_result = measure_get_requests(client, url, cookies, label).await;
-    let pressure = monitor.stop().await;
-    Ok((request_result?, pressure))
 }
 
 async fn measure_catalog_get_requests_with_pool_pressure(
@@ -2946,7 +3067,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .iter()
         .map(|sample| sample.elapsed_ns / 1_000_000)
         .collect();
-    let scan_finished_queue_snapshot = load_local_poster_queue_snapshot(
+    let scan_finished_queue_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
         &scan_job.id,
         &library.id.to_string(),
@@ -2977,7 +3098,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     } else {
         None
     };
-    let scan_finished_queue_after_api_snapshot = load_local_poster_queue_snapshot(
+    let scan_finished_queue_after_api_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
         &scan_job.id,
         &library.id.to_string(),
@@ -3006,7 +3127,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
 
     let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
     let (local_poster_queue_ms, local_poster_queue_final_snapshot) = loop {
-        let snapshot = load_local_poster_queue_snapshot(
+        let snapshot = load_benchmark_poster_snapshot(
             database.pool(),
             &scan_job.id,
             &library.id.to_string(),
@@ -3021,7 +3142,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             )
             .into());
         }
-        if snapshot.cancelled_batch_count > 0 {
+        if snapshot.cancelled_batch_count() > 0 {
             return Err(format!(
                 "LUX-304 image queue contains cancelled batches and cannot be considered drained: {}",
                 snapshot.report(file_count)
@@ -3065,7 +3186,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     assert!(scan_running_at_api_start);
     assert!(first_item_visible_ms <= scan_job_completion_ms);
     assert_eq!(
-        local_poster_queue_final_snapshot.poster_item_count,
+        local_poster_queue_final_snapshot.poster_item_count(),
         i64::try_from(file_count).unwrap_or(i64::MAX),
         "the drained poster count must exactly match the synthetic fixture"
     );
@@ -3084,6 +3205,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         "LUX-304 POSTER RESULT {}",
         serde_json::to_string(&json!({
             "commit": luxd::COMMIT,
+            "posterQueueMode": env::var("LUX_PERF_POSTER_QUEUE_MODE").unwrap_or_else(|_| "detached_batches".into()),
             "architecture": std::env::consts::ARCH,
             "databaseBackend": backend,
             "fileCount": file_count,
@@ -3122,7 +3244,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "localPosterQueueCompleteMs": local_poster_queue_ms,
             "localPosterQueueFinalSnapshot":
                 local_poster_queue_final_snapshot.report(file_count),
-            "localPosterQueueDrainCondition": "all scan job local metadata batches are COMPLETED, every batch has images_completed_at, there are no pending/running/failed/cancelled batches, and the library has at least fileCount distinct LOCAL POSTER items",
+            "localPosterQueueDrainCondition": "detached: every batch COMPLETED with images_completed_at and full poster count; inline baseline: scan COMPLETED and full poster count",
             "onlineFillMissingJobCount": online_fill_missing_job_count,
             "processPeakRssBytes": process_peak_rss_bytes(),
         }))?
