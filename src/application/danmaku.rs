@@ -1391,7 +1391,7 @@ mod tests {
             }))?,
         )
         .await?;
-        let plugins = crate::application::plugins::PluginService::new(database.clone(), config_dir);
+        let plugins = crate::application::plugins::PluginService::new_without_login_background_worker_for_test(database.clone(), config_dir);
         plugins.install(PLUGIN_ID).await?;
 
         let service = super::DanmakuService::new(database.clone()).with_plugins(plugins);
