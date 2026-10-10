@@ -481,7 +481,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-person-title-row { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin-top: 6px; }
 .lux-person-title-row h1 { margin: 0; }
 .lux-person-edit-button { margin-left: auto; }
-.lux-person-title-input { min-width: min(100%, 420px); padding: 7px 10px; border: 1px solid var(--lux-line); border-radius: 8px; color: var(--lux-text); background: var(--lux-panel); font: inherit; font-size: clamp(1.6rem, 4vw, 2.8rem); line-height: 1.15; }
+.lux-person-title-input { --lux-input-font-size: clamp(1.6rem, 4vw, 2.8rem); min-width: min(100%, 420px); padding: 7px 10px; border: 1px solid var(--lux-line); border-radius: 8px; color: var(--lux-text); background: var(--lux-panel); font: inherit; font-size: var(--lux-input-font-size); line-height: 1.15; }
 .lux-person-edit-actions { display: flex; gap: 8px; margin-left: auto; }
 .lux-person-editor { display: grid; gap: 16px; margin-top: 24px; }
 .lux-person-editor-field { display: grid; gap: 7px; color: var(--lux-subtle); font-size: .78rem; }
@@ -2376,7 +2376,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 }
 
 @media (pointer: coarse) {
-  :where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]), textarea, select) { font-size: 16px; }
+  /* iOS zooms small text fields on focus; the floor must beat page-specific fonts. */
+  :where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]):not([type="range"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]), textarea, select) { font-size: max(16px, var(--lux-input-font-size, 1em)) !important; }
 }
 
 @media (prefers-reduced-motion: reduce) {

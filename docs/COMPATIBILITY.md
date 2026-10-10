@@ -257,6 +257,13 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 | 网易爆米花 | 2.12.5 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 未单独验证（已有远程连接） | 未单独验证（已有会话） | 通过 | 通过（资源差异） | 进度通过；收藏未测试 | 未测试 | 2026-08-28 使用现有远程 Lux 服务器播放《黑色月光》第 1 集；画面稳定，进度由约 00:56 推进至 02:00，退出后详情页读回约 03:14，未出现网络错误提示。此前《风柜来的人》和另一资源曾出现网络提示，暂按资源相关风险记录 |
 | Lux Web | Chrome 151 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | Direct、服务器 HLS、客户端 HEVC fallback 通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本 source 切换、SRT 字幕、已登记 Bilibili XML 弹幕和可见性开关通过 | Chrome headless：普通用户无管理入口、Direct Range、HLS manifest/init/segment、HEVC Worker/WASM/MSE、390/768/1440 viewport、键盘/触摸 seek、覆盖层和会话清理通过；播放器联合 smoke 为 0 error / 0 warning、无外部请求；`scripts/browser-smoke.mjs`、`scripts/admin-smoke.mjs` 和 `scripts/player-danmaku-smoke.mjs` 已固化 |
 
+## LUX-114 iOS 输入框聚焦缩放修复（2026-10-10）
+
+- 原触屏规则使用零优先级的 `:where(...)`，被登录框的 `13px` 和管理页的局部字号覆盖。触屏文本输入框、文本域和原生选择框现以 `!important` 保证至少 `16px`，避免小字号触发 iOS 聚焦自动放大。
+- 大字号输入框通过 `--lux-input-font-size` 保留字号；已有的大字号继承也保留。复选框、单选框、滑块、文件/颜色选择和输入按钮不应用字号下限。viewport 继续允许手动缩放。
+- macOS arm64 Chromium 的 iPhone 15 触屏模拟中，登录框实际字号由 `13px` 变为 `16px`；聚焦后模拟 viewport scale 为 `1`，无横向溢出。加载真实样式的 24 个合成文本控件在 `320`、`393`、`844`、`768`、`1024px` 下均不小于 `16px`，包括横屏、文本域和原生选择框；人物标题保持大字号，滑块/复选框尺寸保持 `18px`。桌面 `1440px` 登录框保持 `13px`。
+- 自动化证据为响应式样式回归、Web 全量测试和构建，以及 Playwright 的 computed-style/聚焦检查。Chromium 触屏模拟不能证明 iOS 软件键盘和 Safari 真机缩放行为；仍需部署后在真实 iPhone/iPad 上复测。
+
 ## Android 真机实测（2026-08-28）
 
 本次使用 Android 17（SDK 37）、设备 `23127PN0CC`、`arm64-v8a`，通过 adb/scrcpy 操作，宿主机
