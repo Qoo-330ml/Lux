@@ -17415,3 +17415,222 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
     drop_database?;
     Ok(())
 }
+
+async fn assert_removed_media_item_purge(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library = LibraryService::new(database.clone())
+        .create_library("Purge", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('purge-user', 'purge-user', 'Purge User', 'test')",
+        )
+        .execute(database.pool())
+        .await?;
+    let day = 86_400_i64;
+    // (id, item_type, removed_days_ago)
+    let items = [
+        ("expired", "MOVIE", Some(60_i64)),
+        ("expired-two", "EPISODE", Some(45)),
+        ("expired-three", "VIDEO", Some(40)),
+        ("recent", "MOVIE", Some(2)),
+        ("active", "MOVIE", None),
+        ("watched", "MOVIE", Some(90)),
+        ("merge-target", "MOVIE", Some(90)),
+        ("merged-away", "MOVIE", None),
+        ("expired-series", "SERIES", Some(90)),
+    ];
+    for (id, item_type, removed_days_ago) in items {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source, removed_at
+                 ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 0,
+                           CASE WHEN ? IS NULL THEN NULL ELSE unixepoch() - ? END)",
+            )
+            .bind(id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(id)
+            .bind(id)
+            .bind(removed_days_ago.unwrap_or_default())
+            .bind(removed_days_ago.unwrap_or_default() * day)
+            .execute(database.pool())
+            .await?;
+        if removed_days_ago.is_none() {
+            database
+                .query("UPDATE media_items SET removed_at = NULL WHERE id = ?")
+                .bind(id)
+                .execute(database.pool())
+                .await?;
+        }
+        database
+            .query(
+                "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+                 VALUES (?, ?, 'PRIMARY', 0, ?)",
+            )
+            .bind(format!("image-{id}"))
+            .bind(id)
+            .bind(format!("/images/{id}.jpg"))
+            .execute(database.pool())
+            .await?;
+    }
+    database
+        .query(
+            "INSERT INTO user_item_state (user_id, item_id, is_played)
+             VALUES ('purge-user', 'watched', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE media_items SET merged_into_item_id = 'merge-target' WHERE id = 'merged-away'",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let retention = 30 * day;
+    // Batch of one with several passes proves the purge pages through the backlog.
+    let purged = database
+        .purge_expired_removed_media_items(retention, 1, 2, std::time::Duration::ZERO)
+        .await?;
+    assert_eq!(purged, 2);
+    let purged = database
+        .purge_expired_removed_media_items(retention, 1, 10, std::time::Duration::ZERO)
+        .await?;
+    assert_eq!(purged, 1);
+    assert_eq!(
+        database
+            .purge_expired_removed_media_items(retention, 10, 10, std::time::Duration::ZERO)
+            .await?,
+        0
+    );
+
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM media_items ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        remaining,
+        [
+            "active",
+            "expired-series",
+            "merge-target",
+            "merged-away",
+            "recent",
+            "watched"
+        ]
+    );
+    let orphan_images: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM item_images
+             WHERE item_id IN ('expired', 'expired-two', 'expired-three')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(orphan_images, 0);
+    let remaining_images: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining_images, 6);
+    let orphan_search_rows: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM media_search
+             WHERE item_id IN ('expired', 'expired-two', 'expired-three')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(orphan_search_rows, 0);
+    // Retention is measured from the removal time: a zero-day window also takes the
+    // recently removed item, but still never the guarded ones.
+    assert_eq!(
+        database
+            .purge_expired_removed_media_items(0, 10, 10, std::time::Duration::ZERO)
+            .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_soft_deleted_media_items_are_purged_in_batches() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_removed_media_item_purge(&database)
+        .await
+        .expect("removed item purge");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_expired_soft_deleted_media_items_are_purged_in_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_removed_media_item_purge(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
