@@ -2748,17 +2748,30 @@ impl LibraryScanner {
             return Ok(report);
         }
 
-        let existing_item = self
-            .database
-            .find_media_item(
-                library_id_text,
-                &parsed_name.sort_title,
-                parsed_name.production_year.map(i64::from),
-            )
-            .await?;
-        let (item_id, created_item) = if let Some(item) = existing_item {
-            self.database.restore_media_item(&item.id).await?;
-            (item.id, false)
+        // NFO or online metadata can replace the parsed title and year. The exact
+        // sibling base's indexed item remains the identity anchor for this version.
+        let base_item_id = match inferred_suffix {
+            Some(suffix) => {
+                self.find_inferred_movie_variant_base_item(&root.id, root_path, path, suffix)
+                    .await?
+            }
+            None => None,
+        };
+        let existing_item_id = match base_item_id {
+            Some(item_id) => Some(item_id),
+            None => self
+                .database
+                .find_media_item(
+                    library_id_text,
+                    &parsed_name.sort_title,
+                    parsed_name.production_year.map(i64::from),
+                )
+                .await?
+                .map(|item| item.id),
+        };
+        let (item_id, created_item) = if let Some(item_id) = existing_item_id {
+            self.database.restore_media_item(&item_id).await?;
+            (item_id, false)
         } else {
             let item_id = ItemId::new().to_string();
             self.database
@@ -2877,6 +2890,40 @@ impl LibraryScanner {
         report.created_sources = 1;
         report.created_items = if created_item { 1 } else { 0 };
         Ok(report)
+    }
+
+    async fn find_inferred_movie_variant_base_item(
+        &self,
+        library_root_id: &str,
+        root_path: &Path,
+        path: &Path,
+        suffix: &str,
+    ) -> Result<Option<String>, ScannerError> {
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        let Some(base) = stem.strip_suffix(&format!("-{suffix}")) else {
+            return Ok(None);
+        };
+        let Some(directory) = path.parent() else {
+            return Ok(None);
+        };
+        let relative_paths = movie_variant_extensions(path)
+            .into_iter()
+            .map(|extension| {
+                let sibling = directory.join(format!("{base}.{extension}"));
+                sibling
+                    .strip_prefix(root_path)
+                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or(ScannerError::NonUtf8Path)
+            })
+            .collect::<Result<Vec<_>, ScannerError>>()?;
+        Ok(self
+            .database
+            .find_movie_item_for_filesystem_paths(library_root_id, &relative_paths)
+            .await?)
     }
 }
 
@@ -5169,27 +5216,29 @@ impl ScanJobService {
                     } else {
                         None
                     };
-                    let variant_identity_is_current =
-                        match inferred_suffix.as_deref().and_then(|suffix| {
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .and_then(|name| {
-                                    parse_movie_filename_with_variant_suffix(name, suffix)
-                                })
-                        }) {
-                            Some(parsed) => {
+                    let variant_identity_is_current = match inferred_suffix.as_deref() {
+                        Some(suffix) => {
+                            let base_item_id = self
+                                .scanner
+                                .find_inferred_movie_variant_base_item(
+                                    &root.id, &root_path, &path, suffix,
+                                )
+                                .await?;
+                            if let Some(base_item_id) = base_item_id {
                                 self.database
                                     .scan_manifest_movie_variant_identity_is_current(
                                         &root.id,
                                         &observation.relative_path,
-                                        &parsed.sort_title,
-                                        parsed.production_year.map(i64::from),
-                                        parsed.edition_name.as_deref(),
+                                        &base_item_id,
+                                        Some(suffix),
                                     )
                                     .await?
+                            } else {
+                                false
                             }
-                            None => false,
-                        };
+                        }
+                        None => false,
+                    };
                     if inferred_suffix.is_none() || variant_identity_is_current {
                         seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
                             filesystem_entry_id: baseline.id.clone(),
@@ -12108,15 +12157,7 @@ where
     let filename = path.file_name()?.to_str()?;
     let candidates = trailing_hyphen_variant_candidates(filename)?;
     let directory = path.parent()?;
-    let mut extensions = Vec::with_capacity(7);
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-        extensions.push(extension.to_owned());
-    }
-    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
-        if !extensions.iter().any(|existing| existing == extension) {
-            extensions.push(extension.to_owned());
-        }
-    }
+    let extensions = movie_variant_extensions(path);
     let mut matched_suffixes = HashSet::new();
     for (base, suffix) in candidates.iter().rev() {
         for extension in &extensions {
@@ -12135,6 +12176,19 @@ where
     } else {
         None
     }
+}
+
+fn movie_variant_extensions(path: &Path) -> Vec<String> {
+    let mut extensions = Vec::with_capacity(7);
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        extensions.push(extension.to_owned());
+    }
+    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
+        if !extensions.iter().any(|existing| existing == extension) {
+            extensions.push(extension.to_owned());
+        }
+    }
+    extensions
 }
 
 fn is_supported_movie_file(path: &Path) -> bool {
