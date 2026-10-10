@@ -451,7 +451,7 @@ Lux 的核心价值不是功能数量，而是：
 - 空闲常驻内存目标小于 300 MB。
 - 默认扫描时常驻内存目标小于 750 MB。
 - 所有后台队列有界；队列满时合并事件或施加背压，不无限增长。
-- 元数据补全使用独立的网络 I/O 并发策略：SQLite 默认有效并发 4，PostgreSQL 默认有效并发 8；进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
+- 元数据补全使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 的 worker 默认并发均为 4；`FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
 - ffprobe 默认并发 256，可按媒体库配置 1 至 512；实际运行的单库有效上限为 512、进程全局硬上限为 512，
   并根据 CPU、内存和前台 p95 动态降档。4 核 NAS 的默认有效并发目标为 128，8 核目标为 256，16 核及以上目标为 512；ffprobe 只处理本轮
   fingerprint 变化或新增的 source，未变化 source 不得重复探测。
@@ -520,7 +520,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 2 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=2`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 2 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 

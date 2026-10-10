@@ -38,11 +38,11 @@ use crate::{
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
-const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 2;
+const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 4;
 const METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY: usize = 32;
 const METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
-const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
+const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
@@ -2115,7 +2115,7 @@ fn metadata_worker_configured_concurrency(
     mode: MetadataRefreshMode,
 ) -> usize {
     if matches!(mode, MetadataRefreshMode::FillMissing) {
-        2
+        METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT
     } else {
         metadata_worker_default_concurrency(backend)
     }
@@ -3206,40 +3206,33 @@ mod tests {
     }
 
     #[test]
-    fn metadata_worker_defaults_match_database_write_capacity() {
+    fn metadata_worker_defaults_are_four_for_both_backends() {
         assert_eq!(
             metadata_worker_default_concurrency(DatabaseBackend::Sqlite),
             4
         );
         assert_eq!(
             metadata_worker_default_concurrency(DatabaseBackend::Postgres),
-            8
+            4
         );
     }
 
     #[test]
-    fn fill_missing_worker_default_is_conservative_on_both_backends() {
-        assert_eq!(
-            metadata_worker_configured_concurrency(
-                DatabaseBackend::Sqlite,
+    fn metadata_worker_mode_defaults_are_four_for_both_backends() {
+        for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+            for mode in [
+                MetadataRefreshMode::Reidentify,
                 MetadataRefreshMode::FillMissing,
-            ),
-            2
-        );
-        assert_eq!(
-            metadata_worker_configured_concurrency(
-                DatabaseBackend::Postgres,
-                MetadataRefreshMode::FillMissing,
-            ),
-            2
-        );
-        assert_eq!(
-            metadata_worker_configured_concurrency(
-                DatabaseBackend::Postgres,
                 MetadataRefreshMode::FullRefresh,
-            ),
-            8
-        );
+            ] {
+                assert_eq!(
+                    metadata_worker_configured_concurrency(backend, mode),
+                    4,
+                    "unexpected default for {backend:?} in {mode:?} mode"
+                );
+            }
+        }
+        assert_eq!(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT, 4);
     }
 
     #[test]
@@ -3255,6 +3248,7 @@ mod tests {
         let first = metadata_fill_missing_global_permits();
         let second = metadata_fill_missing_global_permits();
         assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT, 4);
         assert!(first.available_permits() <= METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT);
     }
 

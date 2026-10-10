@@ -95,7 +95,7 @@ LUX_PROXY_URL=http://192.168.1.2:7890
 
 `LUX_PROXY_URL` 可选，用于 Lux 及其外置插件的出站网络请求，例如元数据、图片和人物头像下载。支持 `http://`、`https://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://` 代理地址；代理 URL 可包含用户名认证信息。留空时使用标准系统代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`）；这些变量也可使用小写形式。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。包含认证信息的代理 URL 应只通过受保护的环境变量或 secrets 注入，不能写入日志。TMDb/豆瓣凭据请在各自插件的专属配置中设置，不再通过 `LUX_TMDB_*` 环境变量注入 Lux 主进程。
 
-本地文件索引默认使用 2 路 worker。官方 Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=2`、`LUX_PROBE_CONCURRENCY=8` 和 `LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立限制 ffprobe、ffmpeg 子进程。只设置扫描并发不会限制后两个阶段。`LUX_SCAN_CONCURRENCY` 范围为 1-1024，`LUX_PROBE_CONCURRENCY` 范围为 1-512，`LUX_FFMPEG_CONCURRENCY` 范围为 1-4。非容器部署未设置扫描环境变量时，新建媒体库索引默认 2 路；资源自适应仍可能在 CPU、内存或存储延迟较高时降低实际并发，SQLite 的批量入库保持单写者。
+本地文件索引默认使用 4 路 worker，在线元数据刮削默认使用 4 路 worker；`FILL_MISSING` 的进程级上限也是 4。官方 Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8` 和 `LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立限制 ffprobe、ffmpeg 子进程。只设置扫描并发不会限制后两个阶段。`LUX_SCAN_CONCURRENCY` 范围为 1-1024，`LUX_PROBE_CONCURRENCY` 范围为 1-512，`LUX_FFMPEG_CONCURRENCY` 范围为 1-4。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路；资源自适应仍可能在 CPU、内存、前台延迟或存储延迟较高时降低实际并发，SQLite 的批量入库保持单写者。
 
 修改 Compose 中的该变量后需要重新创建容器，单纯执行 `docker restart lux` 不会更新容器环境变量：
 
