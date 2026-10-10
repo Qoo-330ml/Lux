@@ -262,7 +262,13 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 
 新建扫描 workflow 3 的目标行为是：已提交的正向索引按批次向 Lux Web 目录/首页可见；本地 NFO/图片读取由独立有界 worker 早于全库遍历结束启动；本地检查确认的缺失才进入独立 FILL_MISSING 作业。`ScanCompleted` 与 `JOB_COMPLETED` 仍表示索引完成，不等待在线补缺；Emby 路由、DTO、图片标签与授权合同不变。删除仍要求根路径完整、二次文件状态确认和基线 CAS。
 
-这条记录是产品兼容性决策，当前不证明 workflow 3、增量事件或在线补缺队列已在运行时实现。实现结果和 SQLite/PostgreSQL A/B 数据须在阶段 23 相关 LUX 任务完成后追加；既有 workflow 1/2 继续按其原合同恢复。
+运行复核（2026-10-10）：冻结 `32c158ec` 的本机 SQLite 故障/竞态回归通过：scanned_metadata 22/22、scanned_series_metadata 3/3、scanning_jobs 81/81；专门断言空 provider 后 `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL。1k 自动补缺在 SQLite/PostgreSQL 16.15 各真实处理 10 jobs/1000 items，provider 被阻塞时 scan/local 均完成；每 job 最多 100 项。此前零候选 REIDENTIFY 阻止备用 provider 接管的回归已在 `0f6d8a9c` 修复。
+
+**阶段 23 仍开放。** 10k SQLite online fixture 达到容量 32 dispatcher 后反向阻塞本地 worker，600 秒等待失败；10k PG 未运行。LUX-424 背压条款与 LUX-303 不阻塞本地 worker 的合同冲突，等待所有者选择后再修订调度/存储边界。性能记录有逐请求公平计时，但两组 SQLite poster 尚不足三轮，基线/候选默认并发分别 16/2，相同配置最终复测未完成；不能认定回退或达标。详见 [阶段 23 复核](STAGE-23-GATE-REVIEW-2026-10-09.md) 与 [性能记录](PERFORMANCE.md)。
+
+另一个会话已将冻结提交链集成到 `test=0980dd36` 并增加后续修改。基于该 revision 的 `18b88888` 的组件回归验证 mock 空首页收到 home 通知后出现电影标题和 poster URL；Web 冻结安装、Node134、Vitest570、build 通过。该测试未建模 scan lifecycle、未请求/解码 poster，不是浏览器/真实扫描端到端验证，`32c158ec` 的 Rust/性能门不覆盖新的 test。既有 workflow 1/2 保留原合同；上述结果不证明 FNOS/NAS、部署或第三方客户端行为。
+
+最终远端刷新又观察到 `origin/test=b4635ee3`（PR #43 PostgreSQL movie merge 修复）；该后续 revision 的 Rust/性能验收也未由本轮记录覆盖。
 
 ## 目标矩阵
 

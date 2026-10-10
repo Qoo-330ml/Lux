@@ -1095,6 +1095,68 @@ LUX-304/1k 的 image-pending 窗口开始采样时已没有 pending batch，因�
 
 一次额外的 SQLite/1k 基准候选运行触发了 poster 必须早于 scan 完成的断言；该次未留下时间样本。加入具体时间的断言错误信息后，诊断复跑通过，且正式三轮均通过。该失败被如实记录，不并入正式三轮统计。以上仅是本机 ARM64 与本地 PostgreSQL 容器 A/B，不外推到 NAS/x86_64，也不代表部署后或真实客户端验收；阶段 23 总体验收仍开放。
 
+### 阶段 23 公平计时复核与未关闭门（2026-10-10）
+
+**阶段 23 未通过。** 本次冻结测量和常规 Rust 质量门对应 `32c158ecbe1196db7a53a39e7f6ba8149c93095b`；基线为 LUX-295 前的 `6424ab122a556e2214f9948580b8c7bf42407aa3`，只应用相同的测量补丁，未应用候选产品修改。两边 `tests/performance.rs` SHA-256 均为 `54cb1d45d496b3154ee0bb28f62daf66c7f0d02bd497e537fe493d36ba9010ad`。环境为 Mac16,10、16 GiB、macOS 26.5、ARM64、Rust 1.97.1，本地 PostgreSQL 16.15；SQLite/PostgreSQL pool 上限分别为 8/20。
+
+另一会话随后将该提交链集成到 `test`；本轮观察到 `test/origin/test=0980dd36b58735afe0935108fbc6c11a24643ff5`，包含默认并发及其他后续修改。这里的运行证据不覆盖 `0980dd36`，也不证明部署状态或 NAS/FNOS/x86_64 性能。
+
+最终远端刷新为 `origin/test=b4635ee3`，又包含 PR #43 的 PostgreSQL movie merge 修复；`origin/main=4ee1ea5f`。本轮冻结测量和基于 `0980dd36` 的组件记录均不能替代该后续源码的最终验收。
+
+#### 计时与采样合同
+
+- 请求从发起至完整 body 接收结束计时，保留全部 50 个请求的起止纳秒；JSON 校验在整批接收后进入 `spawn_blocking`。两版用生产入口的 `into_make_service_with_connect_info`，避免每次连接额外克隆整棵 Router。
+- `startedDuringScanP95Ms` 仅在全部 50 个请求都在扫描中发起时可用，跨过扫描结束点的慢请求保留完整时延；`scanActiveP95Ms` 仅在全部 50 个请求起止均位于扫描窗口内时可用。二者含义不同，null 不表示零时延。
+- LUX-304 两版均先等待至少 50 项电影已提交，首个 HTTP 页都断言 50 项。SQLite/1k 候选的请求跨过扫描终点，因此完整窗口 p95 为 null；只能报告扫描中发起的固定 cohort。
+- 扫描结束由扫描 task 自身记录；本地 poster observer 从扫描开始并行观察，每 100ms 检查一次。detached drain 必须满足全量 poster 与全部 batch `COMPLETED/images_completed_at`，计时为首次观察上界；inline 基线用 scan task 完成时间并严格核验全量 poster。请求等待不混入独立扫描/队列耗时。
+- 原始 48 行覆盖 24 对、各配置三轮。3 对在结束检查时发现 Cargo 活动，整对剔除：`lux270-10000-sqlite-r2`、`lux304-1000-sqlite-r3`、`lux304-10000-sqlite-r3`。仅首对补跑成功；10k poster 的前三次补跑仍发现编译活动，均剔除。保留 44 行诊断样本。原始样本只有端点主机观测，补跑另有 1 秒进程采样；这些观测不能排除短暂未采到的系统活动。
+- 本矩阵没有固定 `LUX_SCAN_CONCURRENCY`：基线默认 16、测量候选默认 2（活动 preparation peak 也不同），最新 `test` 默认已改为 4。下面是默认配置的诊断对照，不能将差异归因于扫描实现；相同并发对照仍未运行。不得以此放宽 5% 门槛。
+
+#### 已过滤的诊断中位数（ms；不是阶段门通过证据）
+
+| 后端 / 文件数 | B/C 轮数 | 索引 B→C | 管理前台 p95 B→C | 目录 p95 B→C | 热目录 p95 B→C | 独立重扫 B→C |
+|---|---:|---:|---:|---:|---:|---:|
+| sqlite / 1000 | 3/3 | 53 → 58 | 343 → 343 | 351 → 355 | 207 → 210 | 28 → 29 |
+| postgres / 1000 | 3/3 | 139 → 152 | 482 → 500 | 507 → 525 | 294 → 312 | 583 → 613 |
+| sqlite / 10000 | 3/3 | 521 → 566 | 361 → 324 | 402 → 361 | 214 → 222 | 340 → 243 |
+| postgres / 10000 | 3/3 | 1107 → 1190 | 357 → 374 | 415 → 437 | 243 → 254 | 889 → 959 |
+
+上述索引差异四组约 +7.5% 至 +9.4%；PostgreSQL/10k 目录 p95 `415→437ms`（+5.3%），PostgreSQL/1k 热目录 `294→312ms`（+6.1%）。尚无相同并发复测，不能认定这些差异是实现回退，也不能认定达标。SQLx 执行时长不包含 pool acquire；SQL/pool 样本没有给出相应的统一 SQL 回退解释，runtime/HTTP 排队和 pool 等待仍需定位。
+
+| 后端 / 文件数 | B/C 轮数 | 首条可查 B→C | 首 poster B→C | scan 完成 B→C | local queue B→C | 扫描中发起目录 p95 B→C | queue 后目录 p95 B→C |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| sqlite / 1000 | 2/2 | 63.5 → 78 | 101 → 90.5 | 441 → 112 | 441 → 312 | 188.5 → 197.5 | 206 → 191.5 |
+| postgres / 1000 | 3/3 | 133 → 156 | 491 → 168 | 1744 → 587 | 1744 → 1010 | 256 → 285 | 245 → 298 |
+| sqlite / 10000 | 2/2 | 63.5 → 66 | 1192 → 89.5 | 7740 → 1504 | 7740 → 4393 | 185 → 215 | 200.5 → 234 |
+| postgres / 10000 | 3/3 | 136 → 156 | 2420 → 325 | 16091 → 3018 | 16091 → 3641 | 221 → 221 | 234 → 279 |
+
+候选已记录的每次有效 poster 运行都断言首条和首 poster 早于 scan 完成、本地队列在 scan 后继续；这证明各次 fixture 行为，不代替双后端完整多轮门。两组 SQLite poster 只有两轮。PostgreSQL queue 后目录 p95 为 `245→298ms`（+21.6%）与 `234→279ms`（+19.2%）；该阶段缺少完整请求 phase/SQL/pool 分解，不能先归因产品实现。事务、DML/SQL、WAL、pool、严格 queue snapshot 和 RSS 原始字段随日志保存；没有用缺失值补零。
+
+#### 真实自动补缺队列：1k 通过，10k 暴露阻塞
+
+使用 `application::scanner::tests::stage23_online_fill_missing_benchmark` 配置合成空搜索 provider。provider gate 在 scan 与 local queue 完成前保持关闭，随后放行；此处测的是调度/存储排空，不是真实网络延迟。
+
+| 文件数 / 后端 | scan 完成 ms | local 完成 ms | gate 释放后 online drain ms | job / item | 结果 |
+|---|---:|---:|---:|---:|---|
+| 1000 / SQLite | 84 | 1153 | 668 | 10 / 1000 | 通过 |
+| 1000 / PostgreSQL | 591 | 4077 | 2494 | 10 / 1000 | 通过 |
+| 10000 / SQLite | 已完成 10000 项 | 超时 | 未释放，不能报告时延 | 40 / 3970（阻塞快照） | 602.59s 后失败 |
+| 10000 / PostgreSQL | 未运行 | 未运行 | 未运行 | 未运行 | SQLite 失败后矩阵停止 |
+
+1k 两组明确验证每 job 最多 100 项、所有 item `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL，scan/local 均在 provider 放行前完成。10k SQLite 快照为 scan `COMPLETED/IDLE`，local 15 批完成、31 批待处理、4 批运行；online 39 QUEUED+1 RUNNING。`local_metadata_completeness` 在持久化后等待 `enqueue_fill_missing_job_id`，该方法最终等待容量 32 channel 的 `sender.reserve().await`；provider 阻塞导致队列满，背压传回本地 worker。失败的 online 时延保持 unavailable，poster 矩阵中的 `onlineFillMissingJobCount=0` 仅表示该 fixture 禁止在线调度。
+
+该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。已报告此规格冲突，按 AGENTS.md 在修订公共调度/存储边界前等待项目所有者选择。建议自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用有界通知/分页异步领取；保留管理员请求背压和完成等待合同，禁止按 job 无界 spawn。该建议尚未实施。
+
+#### 质量门与证据
+
+`32c158ec` 的 build、fmt、全目标全 feature Clippy 零警告和 Rust all-targets（串行线程）通过：1514 passed、0 failed、36 ignored，110 个目标；`scanned_metadata` 22/22、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81。此前 REIDENTIFY 零候选停止备用接管的回归已在 `0f6d8a9c` 修复；两项查询计数 fixture 的登录背景 SELECT 已在 `32c158ec` 用仅测试构造隔离，生产构造保留 worker。provider 空候选专项实际运行通过。
+
+原候选 Web 为 Node 132、Vitest 561 项及 build 通过；基于 `0980dd36` 补空首页失效刷新 DOM 回归（`18b88888`），冻结安装、Node 134/134、Vitest 76 文件/570 项、Web build 均通过。该组件用 mock API/EventSource 验证空列表收到 home 通知后呈现条目标题和带 poster tag 的图片 URL；未建模 scan lifecycle，也未请求或解码 poster。它不证明扫描运行期间的实际 Web 可见性或浏览器/真实扫描端到端行为。`0980dd36` 的 Rust 全门尚未在本轮重跑。
+
+收紧 DOM 用例表述后的定向文件 17/17 通过；一次默认并行 Web 全量有 5 个 `home-page.test.tsx` 轮播用例失败（Node134 通过、Vitest565/570），保留失败日志。该文件隔离 17/17 通过，随后完整命令 `corepack pnpm --dir web test --maxWorkers=1 --minWorkers=1` 为 Node134/134、Vitest76 文件/570 项全绿；build 通过。没有用隔离结果替代全量，也没有改变生产代码或放宽断言。并行波动根因尚未证实，不能仅凭外部编译活动归因主机负载。
+
+持久证据目录：`/Volumes/Toshiba/mywork/Lux-stage23-evidence-20261010-32c158ec`。含 manifest/源码与二进制 hash、基线测量补丁、原始/修复/已过滤诊断 JSONL、逐请求区间、质量门与失败日志、阻塞状态快照和脚本。源码片段中的合成数据库密码已脱敏，原始 hash 与归档 hash 分开保存。全部技术项通过前不请求阶段关闭确认；当前保持开放。
+
 ### LUX-323 完整性结果分片：结果 UPDATE 次数推导
 
 2026-10-02 对扫描本地 metadata completeness 消费路径做静态计数，不作为耗时基准。每个 claim 批次最多 512 条 capability 结果，在线补缺候选最多 256 个 item，每个 FILL_MISSING 调度分片最多 100 个 item，因此最多分成 3 个事务。
