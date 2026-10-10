@@ -61,9 +61,78 @@ const INCREMENTAL_FILES: usize = 100;
 const METADATA_BENCHMARK_ITEMS: usize = 32;
 const POOL_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 
+#[derive(Clone, Copy)]
+struct CatalogPageExpectation {
+    fixture_file_count: usize,
+    require_complete_fixture: bool,
+    require_posters: bool,
+}
+
 #[test]
 fn process_peak_rss_is_reported_in_bytes() {
     assert!(process_peak_rss_bytes().is_some_and(|bytes| bytes > 0));
+}
+
+#[test]
+fn performance_catalog_samples_reject_empty_and_foreign_fixture_pages() {
+    let expectation = CatalogPageExpectation {
+        fixture_file_count: 2,
+        require_complete_fixture: false,
+        require_posters: false,
+    };
+
+    assert!(validate_fixture_catalog_page(&json!({"items": [], "total": 0}), expectation).is_err());
+    assert!(
+        validate_fixture_catalog_page(
+            &json!({
+                "items": [{"itemType": "MOVIE", "title": "Unrelated Movie"}],
+                "total": 1
+            }),
+            expectation
+        )
+        .is_err()
+    );
+    assert!(
+        validate_fixture_catalog_page(
+            &json!({
+                "items": [{"itemType": "MOVIE", "title": "Fixture Movie 000000"}],
+                "total": 3
+            }),
+            expectation
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn performance_catalog_drain_page_matches_fixture_and_has_posters() {
+    let drained_page = json!({
+        "items": [
+            {"itemType": "MOVIE", "title": "Fixture Movie 000000", "imageTags": {"poster": "poster-0"}},
+            {"itemType": "MOVIE", "title": "Fixture Movie 000001", "imageTags": {"poster": "poster-1"}}
+        ],
+        "total": 2
+    });
+    let expectation = CatalogPageExpectation {
+        fixture_file_count: 2,
+        require_complete_fixture: true,
+        require_posters: true,
+    };
+
+    assert!(validate_fixture_catalog_page(&drained_page, expectation).is_ok());
+    let missing_poster = json!({
+        "items": [
+            {"itemType": "MOVIE", "title": "Fixture Movie 000000", "imageTags": {"poster": "poster-0"}},
+            {"itemType": "MOVIE", "title": "Fixture Movie 000001", "imageTags": {"poster": null}}
+        ],
+        "total": 2
+    });
+    assert!(validate_fixture_catalog_page(&missing_poster, expectation).is_err());
+    let missing_fixture_item = json!({
+        "items": [{"itemType": "MOVIE", "title": "Fixture Movie 000000", "imageTags": {"poster": "poster-0"}}],
+        "total": 1
+    });
+    assert!(validate_fixture_catalog_page(&missing_fixture_item, expectation).is_err());
 }
 
 fn process_peak_rss_bytes() -> Option<u64> {
@@ -87,6 +156,36 @@ fn process_peak_rss_bytes() -> Option<u64> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+async fn wait_for_fixture_catalog_page(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<(u128, serde_json::Value), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let started = Instant::now();
+        let response = client.get(url).header(COOKIE, cookies).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if status != reqwest::StatusCode::OK {
+            return Err(format!("{label} request returned {status}").into());
+        }
+        let page: serde_json::Value = serde_json::from_slice(&body)?;
+        let total = page["total"].as_u64().unwrap_or_default();
+        let items_empty = page["items"].as_array().is_none_or(Vec::is_empty);
+        if total > 0 && !items_empty {
+            validate_fixture_catalog_page(&page, expectation).map_err(std::io::Error::other)?;
+            return Ok((started.elapsed().as_millis(), page));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{label} never returned a visible fixture item").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1225,31 +1324,62 @@ async fn measure_get_requests_with_pool_pressure(
     Ok((request_result?, pressure))
 }
 
-async fn measure_get_request(
-    client: &reqwest::Client,
-    url: &str,
-    cookies: &str,
-    label: &str,
-) -> Result<u128, Box<dyn std::error::Error>> {
-    let started = Instant::now();
-    let response = client.get(url).header(COOKIE, cookies).send().await?;
-    let status = response.status();
-    let _ = response.bytes().await?;
-    if status != reqwest::StatusCode::OK {
-        return Err(format!("{label} request returned {status}").into());
-    }
-    Ok(started.elapsed().as_millis())
-}
-
-async fn measure_get_request_with_pool_pressure(
+async fn measure_catalog_get_requests_with_pool_pressure(
     client: &reqwest::Client,
     pool: sqlx::AnyPool,
     url: &str,
     cookies: &str,
     label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<(Vec<u128>, serde_json::Value), Box<dyn std::error::Error>> {
+    let monitor = start_pool_pressure_monitor(pool);
+    let request_result =
+        measure_catalog_get_requests(client, url, cookies, label, expectation).await;
+    let pressure = monitor.stop().await;
+    Ok((request_result?, pressure))
+}
+
+async fn measure_get_request_checked(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let response = client.get(url).header(COOKIE, cookies).send().await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if status != reqwest::StatusCode::OK {
+        return Err(format!("{label} request returned {status}").into());
+    }
+    let elapsed_ms = started.elapsed().as_millis();
+    let page: serde_json::Value = serde_json::from_slice(&body)?;
+    validate_fixture_catalog_page(&page, expectation).map_err(std::io::Error::other)?;
+    Ok(elapsed_ms)
+}
+
+async fn measure_catalog_get_request(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    measure_get_request_checked(client, url, cookies, label, expectation).await
+}
+
+async fn measure_catalog_get_request_with_pool_pressure(
+    client: &reqwest::Client,
+    pool: sqlx::AnyPool,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
 ) -> Result<(u128, serde_json::Value), Box<dyn std::error::Error>> {
     let monitor = start_pool_pressure_monitor(pool);
-    let request_result = measure_get_request(client, url, cookies, label).await;
+    let request_result =
+        measure_catalog_get_request(client, url, cookies, label, expectation).await;
     let pressure = monitor.stop().await;
     Ok((request_result?, pressure))
 }
@@ -2207,13 +2337,19 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
         library.id
     );
+    let catalog_page_expectation = CatalogPageExpectation {
+        fixture_file_count: file_count,
+        require_complete_fixture: false,
+        require_posters: false,
+    };
     let (catalog_list_first_request_ms, catalog_list_first_request_pool_pressure) =
-        measure_get_request_with_pool_pressure(
+        measure_catalog_get_request_with_pool_pressure(
             &client,
             database.pool().clone(),
             &catalog_page_url,
             &cookies,
             "Manifest first catalog page",
+            catalog_page_expectation,
         )
         .await?;
     let catalog_list_first_request_sql_latency_window = statement_counts.take_query_latency_values(
@@ -2222,12 +2358,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "SQLx events observed during the single first catalog-page request; global instrumentation may include concurrent background SQL.",
     );
     let (catalog_list_warm_page_ms, catalog_list_warm_pool_pressure) =
-        measure_get_requests_with_pool_pressure(
+        measure_catalog_get_requests_with_pool_pressure(
             &client,
             database.pool().clone(),
             &catalog_page_url,
             &cookies,
             "Manifest warmed catalog page",
+            catalog_page_expectation,
         )
         .await?;
     let catalog_list_warm_sql_latency_window = statement_counts.take_query_latency_values(
@@ -2272,14 +2409,16 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "Manifest foreground",
     )
     .await?;
-    let (catalog_list_ms, catalog_list_pool_pressure) = measure_get_requests_with_pool_pressure(
-        &client,
-        database.pool().clone(),
-        &catalog_page_url,
-        &cookies,
-        "Manifest catalog list",
-    )
-    .await?;
+    let (catalog_list_ms, catalog_list_pool_pressure) =
+        measure_catalog_get_requests_with_pool_pressure(
+            &client,
+            database.pool().clone(),
+            &catalog_page_url,
+            &cookies,
+            "Manifest catalog list",
+            catalog_page_expectation,
+        )
+        .await?;
     let (rescan_processed, rescan_batch_durations) = rescan_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?
@@ -2587,76 +2726,99 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
     let scan_job = jobs.create_movie_scan_job(library.id).await?;
     let scan_started = Instant::now();
-    let observation_database = database.clone();
-    let observation_library_id = library.id.to_string();
-    let observation_started = scan_started;
-    let first_visibility_handle = tokio::spawn(async move {
-        let mut first_item_visible_ms = None;
-        let mut first_poster_indexed_ms = None;
-        let deadline = Instant::now() + Duration::from_secs(600);
-        loop {
-            if first_item_visible_ms.is_none()
-                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
-                    "SELECT id FROM media_items
-                     WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE' LIMIT 1"
-                )))
-                .bind(&observation_library_id)
-                .fetch_optional(observation_database.pool())
-                .await?
-                .is_some()
-            {
-                first_item_visible_ms = Some(observation_started.elapsed().as_millis());
-            }
-            if first_poster_indexed_ms.is_none()
-                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
-                    "SELECT image.item_id FROM item_images image
-                     JOIN media_items item ON item.id = image.item_id
-                     WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
-                       AND image.source = 'LOCAL' LIMIT 1"
-                )))
-                .bind(&observation_library_id)
-                .fetch_optional(observation_database.pool())
-                .await?
-                .is_some()
-            {
-                first_poster_indexed_ms = Some(observation_started.elapsed().as_millis());
-            }
-            if let (Some(first_item_visible_ms), Some(first_poster_indexed_ms)) =
-                (first_item_visible_ms, first_poster_indexed_ms)
-            {
-                return Ok::<_, sqlx::Error>((first_item_visible_ms, first_poster_indexed_ms));
-            }
-            if Instant::now() >= deadline {
-                return Err(sqlx::Error::Protocol(
-                    "LUX-304 first item/poster visibility timed out".to_owned(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    });
     let scan_worker = jobs.clone();
     let scan_job_id = scan_job.id.clone();
     let scan_handle =
         tokio::spawn(async move { scan_worker.run_to_completion(&scan_job_id, 500, None).await });
     tokio::task::yield_now().await;
-    let scan_running_at_api_start = !scan_handle.is_finished();
-    let api_client = client.clone();
+    // The direct worker does not invalidate AppState's catalog cache. Wait for
+    // a committed fixture item before the first request so an empty page is
+    // never cached for the scan-active sample.
     let catalog_list_url = format!(
         "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
         library.id
     );
-    let api_url = catalog_list_url.clone();
-    let api_cookies = cookies.clone();
-    let catalog_list_handle = tokio::spawn(async move {
-        measure_get_requests(
-            &api_client,
-            &api_url,
-            &api_cookies,
-            "LUX-304 progressive catalog list",
-        )
-        .await
-        .map_err(|error| error.to_string())
+    // Catalog cache keys include the page limit, so each phase gets a fresh
+    // cache entry while sampling the same library and first page.
+    let image_pending_catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=51",
+        library.id
+    );
+    let drained_catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=52",
+        library.id
+    );
+    let catalog_page_expectation = CatalogPageExpectation {
+        fixture_file_count: file_count,
+        require_complete_fixture: false,
+        require_posters: false,
+    };
+    let first_poster_observer_database = database.clone();
+    let first_poster_observer_library_id = library.id.to_string();
+    let first_poster_observer_started = scan_started;
+    let first_poster_indexed_handle = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            if sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                "SELECT image.item_id FROM item_images image
+                 JOIN media_items item ON item.id = image.item_id
+                 WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
+                   AND image.source = 'LOCAL' LIMIT 1"
+            )))
+            .bind(&first_poster_observer_library_id)
+            .fetch_optional(first_poster_observer_database.pool())
+            .await?
+            .is_some()
+            {
+                return Ok::<_, sqlx::Error>(first_poster_observer_started.elapsed().as_millis());
+            }
+            if Instant::now() >= deadline {
+                return Err(sqlx::Error::Protocol(
+                    "LUX-304 first poster visibility timed out".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     });
+    let first_item_deadline = Instant::now() + Duration::from_secs(600);
+    let first_item_visible_ms = loop {
+        if sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT id FROM media_items
+             WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE' LIMIT 1"
+        )))
+        .bind(library.id.to_string())
+        .fetch_optional(database.pool())
+        .await?
+        .is_some()
+        {
+            break scan_started.elapsed().as_millis();
+        }
+        if Instant::now() >= first_item_deadline {
+            return Err("LUX-304 first item visibility timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let scan_running_at_api_start = !scan_handle.is_finished();
+    if !scan_running_at_api_start {
+        return Err("LUX-304 scan completed before the scan-active catalog sample began".into());
+    }
+    let (first_catalog_request_ms, first_catalog_page) = wait_for_fixture_catalog_page(
+        &client,
+        &catalog_list_url,
+        &cookies,
+        "LUX-304 first visible catalog page",
+        catalog_page_expectation,
+    )
+    .await?;
+    let first_catalog_visible_total = first_catalog_page["total"].as_u64().unwrap_or_default();
+    let catalog_list_ms = measure_catalog_get_requests(
+        &client,
+        &catalog_list_url,
+        &cookies,
+        "LUX-304 progressive catalog list",
+        catalog_page_expectation,
+    )
+    .await?;
     scan_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
@@ -2669,13 +2831,9 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         queue_library_id_placeholder,
     )
     .await?;
-    let (first_item_visible_ms, first_poster_indexed_ms) = first_visibility_handle
+    let first_poster_indexed_ms = first_poster_indexed_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let catalog_list_ms = catalog_list_handle
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .map_err(std::io::Error::other)?;
     let catalog_list_p95_ms = percentile(&catalog_list_ms, 95);
 
     let require_detached_poster_queue = env::var("LUX_PERF_REQUIRE_DETACHED_POSTER_QUEUE")
@@ -2684,11 +2842,12 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let scan_finished_image_pending = scan_finished_queue_snapshot.is_pending_measurement_window();
     let catalog_list_after_scan_image_pending_ms = if scan_finished_image_pending {
         Some(
-            measure_get_requests(
+            measure_catalog_get_requests(
                 &client,
-                &catalog_list_url,
+                &image_pending_catalog_list_url,
                 &cookies,
                 "LUX-304 catalog list after scan while images are pending",
+                catalog_page_expectation,
             )
             .await?,
         )
@@ -2758,11 +2917,17 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let catalog_list_after_queue_ms = measure_get_requests(
+    let drained_catalog_expectation = CatalogPageExpectation {
+        fixture_file_count: file_count,
+        require_complete_fixture: true,
+        require_posters: true,
+    };
+    let catalog_list_after_queue_ms = measure_catalog_get_requests(
         &client,
-        &catalog_list_url,
+        &drained_catalog_list_url,
         &cookies,
         "LUX-304 catalog list after local posters",
+        drained_catalog_expectation,
     )
     .await?;
     let catalog_list_after_queue_p95_ms = percentile(&catalog_list_after_queue_ms, 95);
@@ -2776,6 +2941,12 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     assert_eq!(online_fill_missing_job_count, 0);
     assert!(scan_running_at_api_start);
     assert!(first_item_visible_ms <= scan_job_completion_ms);
+    assert_eq!(
+        local_poster_queue_final_snapshot.poster_item_count,
+        i64::try_from(file_count).unwrap_or(i64::MAX),
+        "the drained poster count must exactly match the synthetic fixture"
+    );
+    assert!(first_catalog_visible_total > 0);
     assert!(
         first_poster_indexed_ms <= scan_job_completion_ms,
         "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
@@ -2796,6 +2967,8 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "directoryCount": directory_count,
             "scanJobCompletionMs": scan_job_completion_ms,
             "firstItemVisibleMs": first_item_visible_ms,
+            "firstCatalogRequestMs": first_catalog_request_ms,
+            "firstCatalogVisibleTotal": first_catalog_visible_total,
             "firstPosterIndexedMs": first_poster_indexed_ms,
             "catalogListP95DuringScanMs": catalog_list_p95_ms,
             "catalogListRequestCount": catalog_list_ms.len(),
@@ -3346,12 +3519,33 @@ async fn measure_get_requests(
     cookies: &str,
     label: &str,
 ) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    measure_get_requests_checked(client, url, cookies, label, None).await
+}
+
+async fn measure_catalog_get_requests(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    measure_get_requests_checked(client, url, cookies, label, Some(expectation)).await
+}
+
+async fn measure_get_requests_checked(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: Option<CatalogPageExpectation>,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
     let mut requests = Vec::with_capacity(FOREGROUND_REQUESTS);
     for _ in 0..FOREGROUND_REQUESTS {
         let client = client.clone();
         let url = url.to_owned();
         let cookies = cookies.to_owned();
         let label = label.to_owned();
+        let expectation = expectation;
         requests.push(tokio::spawn(async move {
             let started = Instant::now();
             let response = client
@@ -3361,11 +3555,19 @@ async fn measure_get_requests(
                 .await
                 .map_err(|error| error.to_string())?;
             let status = response.status();
-            let _ = response.bytes().await.map_err(|error| error.to_string())?;
+            let body = response.bytes().await.map_err(|error| error.to_string())?;
+            let elapsed_ms = started.elapsed().as_millis();
             if status != reqwest::StatusCode::OK {
                 return Err(format!("{label} request returned {status}"));
             }
-            Ok::<u128, String>(started.elapsed().as_millis())
+            if let Some(expectation) = expectation {
+                let page = serde_json::from_slice(&body)
+                    .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
+                validate_fixture_catalog_page(&page, expectation).map_err(|error| {
+                    format!("{label} returned an invalid fixture page: {error}")
+                })?;
+            }
+            Ok::<u128, String>(elapsed_ms)
         }));
     }
     let mut durations = Vec::with_capacity(FOREGROUND_REQUESTS);
@@ -3376,6 +3578,58 @@ async fn measure_get_requests(
         durations.push(result.map_err(std::io::Error::other)?);
     }
     Ok(durations)
+}
+
+fn validate_fixture_catalog_page(
+    page: &serde_json::Value,
+    expectation: CatalogPageExpectation,
+) -> Result<(), String> {
+    let total = page["total"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "catalog total is missing or invalid".to_owned())?;
+    if total == 0 {
+        return Err("catalog total is zero".to_owned());
+    }
+    if total > expectation.fixture_file_count {
+        return Err(format!(
+            "catalog total {total} exceeds fixture size {}",
+            expectation.fixture_file_count
+        ));
+    }
+    if expectation.require_complete_fixture && total != expectation.fixture_file_count {
+        return Err(format!(
+            "drained catalog total {total} does not match fixture size {}",
+            expectation.fixture_file_count
+        ));
+    }
+    let items = page["items"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| "catalog items page is empty or missing".to_owned())?;
+    if items.len() > total {
+        return Err(format!(
+            "catalog page has {} items but total is {total}",
+            items.len()
+        ));
+    }
+    for item in items {
+        if item["itemType"] != "MOVIE"
+            || !item["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("Fixture Movie "))
+        {
+            return Err("catalog page contains an item outside the movie fixture".to_owned());
+        }
+        if expectation.require_posters
+            && !item["imageTags"]["poster"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty())
+        {
+            return Err("drained catalog page contains a movie without a poster tag".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn percentile(values: &[u128], percentile: usize) -> u128 {
