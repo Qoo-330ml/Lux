@@ -109,6 +109,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(_) => {}
         Err(error) => error!(%error, "episode image path repair failed"),
     }
+    match database.normalize_media_source_defaults().await {
+        Ok(0) => {}
+        Ok(repaired) => info!(
+            repaired,
+            "media items normalized to a single default source"
+        ),
+        Err(error) => error!(%error, "default media source normalization failed"),
+    }
     match database.run_database_lifecycle_cleanup().await {
         Ok(Some(report)) => {
             info!(

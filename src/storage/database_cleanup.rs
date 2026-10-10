@@ -976,3 +976,64 @@ impl Database {
         Ok(purged)
     }
 }
+
+const SOURCE_DEFAULT_REPAIR_BATCH_SIZE: i64 = 500;
+
+impl Database {
+    /// Gives every media item exactly one default source. Older scans marked every new
+    /// source as default, so items that gained a second version ended up with several
+    /// defaults (and merges or removals could leave none). The oldest of the current
+    /// defaults wins, which keeps today's effective choice; with no default the oldest
+    /// source becomes one. Returns the number of repaired items.
+    pub async fn normalize_media_source_defaults(&self) -> Result<u64, StorageError> {
+        let mut repaired = 0_u64;
+        loop {
+            let item_ids = self
+                .query_scalar::<String>(
+                    "SELECT item_id FROM media_sources
+                     GROUP BY item_id
+                     HAVING SUM(is_default) <> 1
+                     LIMIT ?",
+                )
+                .bind(SOURCE_DEFAULT_REPAIR_BATCH_SIZE)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if item_ids.is_empty() {
+                break;
+            }
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE media_sources
+                 SET is_default = CASE WHEN id = (
+                     SELECT chosen.id FROM media_sources chosen
+                     WHERE chosen.item_id = media_sources.item_id
+                     ORDER BY chosen.is_default DESC, chosen.id
+                     LIMIT 1
+                 ) THEN 1 ELSE 0 END,
+                     updated_at = unixepoch()
+                 WHERE item_id IN ({placeholders})"
+            )));
+            for item_id in &item_ids {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            repaired = repaired.saturating_add(item_ids.len() as u64);
+            if repaired > 100_000_000 {
+                break;
+            }
+        }
+        Ok(repaired)
+    }
+}

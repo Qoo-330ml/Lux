@@ -11497,6 +11497,11 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
         .expect("source count");
     assert_eq!(item_count, 1);
     assert_eq!(source_count, 2);
+    let default_count: i64 = sqlx::query_scalar("SELECT SUM(is_default) FROM media_sources")
+        .fetch_one(database.pool())
+        .await
+        .expect("default source count");
+    assert_eq!(default_count, 1, "an item has exactly one default source");
     let folder_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type = 'FOLDER'")
             .fetch_one(database.pool())
@@ -17618,6 +17623,134 @@ async fn postgres_expired_soft_deleted_media_items_are_purged_in_batches()
         let database = database.clone();
         async move {
             assert_removed_media_item_purge(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
+
+async fn assert_media_source_defaults_are_normalized(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library = LibraryService::new(database.clone())
+        .create_library("Defaults", LibraryKind::Movie, false)
+        .await?;
+    // (item, [(source, is_default)])
+    let items: [(&str, [(&str, i64); 3]); 4] = [
+        ("two-defaults", [("a1", 1), ("a2", 1), ("a3", 0)]),
+        ("no-default", [("b1", 0), ("b2", 0), ("b3", 0)]),
+        ("three-defaults", [("c1", 1), ("c2", 1), ("c3", 1)]),
+        ("healthy", [("d1", 0), ("d2", 1), ("d3", 0)]),
+    ];
+    for (item_id, sources) in items {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        for (source_id, is_default) in sources {
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, ?, 'LOCAL_FILE', ?, 'PENDING')",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .bind(is_default)
+                .execute(database.pool())
+                .await?;
+        }
+    }
+
+    assert_eq!(database.normalize_media_source_defaults().await?, 3);
+    let defaults: Vec<String> = database
+        .query_scalar("SELECT id FROM media_sources WHERE is_default = 1 ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(defaults, ["a1", "b1", "c1", "d2"]);
+    assert_eq!(database.normalize_media_source_defaults().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_items_are_normalized_to_one_default_source() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_media_source_defaults_are_normalized(&database)
+        .await
+        .expect("default normalization");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_items_are_normalized_to_one_default_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_media_source_defaults_are_normalized(&database)
                 .await
                 .map_err(|error| error.to_string())
         }
