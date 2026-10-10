@@ -14240,6 +14240,31 @@ mod tests {
             }
         })
         .await??;
+        let fill_item: (String, Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT status, error, automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ?",
+        )
+        .bind(&fill_job.0)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            fill_item.0, "COMPLETED",
+            "fill-missing result: {fill_item:?}"
+        );
+        assert_eq!(
+            fill_item.1.as_deref(),
+            Some("LOW_CONFIDENCE"),
+            "an empty provider search is a no-candidate result, not provider unavailability"
+        );
+        assert_eq!(
+            fill_item.2, 0,
+            "no-candidate results do not consume retry budget"
+        );
+        assert_eq!(
+            fill_item.3, None,
+            "no-candidate results do not enter cooldown"
+        );
         let home_event = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             user_events_receiver.recv(),
