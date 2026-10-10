@@ -1329,14 +1329,14 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 @media (max-width: 640px) {
   .lux-bento-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .lux-bento-card-hero,
   .lux-bento-card-users,
   .lux-bento-card-cpu,
   .lux-bento-card-mem,
   .lux-bento-card-storage {
-    grid-column: span 1;
+    grid-column: span 2;
   }
 }
 

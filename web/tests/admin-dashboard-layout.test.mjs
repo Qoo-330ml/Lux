@@ -79,6 +79,18 @@ test("dashboard overview uses modern bento box grid rhythm", () => {
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-metrics\s*\{/);
 });
 
+test("mobile dashboard places only the movie and series count cards side by side", () => {
+  assert.match(
+    stylesheet,
+    /@media \(max-width: 640px\) \{\s*\.lux-bento-grid\s*\{\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/,
+  );
+  assert.match(
+    stylesheet,
+    /@media \(max-width: 640px\) \{[\s\S]*?\.lux-bento-card-hero,\s*\.lux-bento-card-users,\s*\.lux-bento-card-cpu,\s*\.lux-bento-card-mem,\s*\.lux-bento-card-storage\s*\{\s*grid-column:\s*span 2;/,
+  );
+  assert.match(stylesheet, /\.lux-bento-card-media-count\s*\{\s*grid-column:\s*span 1;/);
+});
+
 test("light mode preserves the same flat admin surfaces", () => {
   const lightAdminStyles = stylesheet.slice(stylesheet.indexOf("/* The admin console is a normal light surface"));
 

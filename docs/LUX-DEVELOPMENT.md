@@ -10181,6 +10181,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-10）：旧样式下新增七组回归全部失败，修复后主题定向测试 18/18、Web 全量 Node 134/134、Vitest 576/576 通过，TypeScript 检查和 Vite 生产构建通过。Playwright 以本地样式夹具在 390px 与 320px 检查计算样式；320px 页面宽度未溢出，手机操作默认文字为深灰、悬停文字为深色，已看状态为深绿，焦点轮廓为深色；播放器键盘焦点仍为白色 3px。语义错误、成功、警告、活动色对浅色背景的自动对比度断言均达到 4.5:1。`cargo fmt --all -- --check`、Toshiba 共享 target 上的全目标全 feature Clippy 和 `git diff --check` 通过；本任务仅修改 Web，没有 Rust 行为变化，未运行 Rust 测试。这里只验证本地 Web 样式，不代表部署状态或真实 iOS Safari 渲染。
 
+#### LUX-473：压缩移动端仪表盘媒体数量卡片并同步浏览器主题色
+
+范围：Lux 管理仪表盘在手机宽度下让电影数量和剧集数量卡片并排显示，其余概览卡片继续占满一行。应用账户主题时同步更新 `meta[name="theme-color"]`，使 Safari 页面顶部浏览器区域匹配当前 Lux 深浅主题；保留现有桌面布局、卡片内容、主题背景和深色默认值。
+
+验收：
+
+- [x] 640px 及以下，电影数量与剧集数量卡片左右并排，服务器概况、用户、CPU、内存和存储卡片继续单列全宽；较宽视口布局不变。
+- [x] 浅色主题将浏览器 `theme-color` 更新为浅色页面背景 `#f4f3f1`，深色主题更新为 `#050506`；主题切换后无需刷新即可更新。
+- [x] 两项行为均有回归测试；Web 全量测试和生产构建通过。
+
+预计文件：`docs/LUX-DEVELOPMENT.md`、`web/src/react.css`、`web/src/features/account/account-settings.ts`、`web/tests/admin-dashboard-layout.test.mjs`、`web/tests/account-settings.test.tsx`。
+
+明确不做：其他仪表盘重排、浏览器 UI 自动读取 CSS 颜色、浅色主题之外的主题改动或真实 iOS 设备渲染声明。
+
+结果（2026-10-10）：新布局和主题色回归在旧实现下均失败，修改后定向测试通过；Web 全量 Node 测试 135/135、Vitest 579/579 和生产构建通过。Playwright 的 CSS 预览在 390px 与 320px 检查到电影/剧集卡同排、用户卡全宽，页面滚动宽度分别等于视口宽度。主题色切换由账户主题单测验证。浏览器预览使用 Chromium，不代表真实 iOS Safari 渲染或部署状态。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
