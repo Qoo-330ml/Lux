@@ -4894,12 +4894,56 @@ impl Database {
         Ok(baselines)
     }
 
+    pub(crate) async fn find_movie_item_for_filesystem_paths(
+        &self,
+        library_root_id: &str,
+        relative_paths: &[String],
+    ) -> Result<Option<String>, StorageError> {
+        if relative_paths.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = std::iter::repeat_n("?", relative_paths.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT DISTINCT current_item.id
+             FROM filesystem_entries entry
+             JOIN media_sources source ON source.filesystem_entry_id = entry.id
+             JOIN media_items item ON item.id = source.item_id
+             JOIN media_items current_item
+               ON current_item.id = COALESCE(item.merged_into_item_id, item.id)
+             JOIN library_roots root ON root.id = entry.library_root_id
+             WHERE entry.library_root_id = ? AND entry.relative_path IN ({placeholders})
+               AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+               AND current_item.library_id = root.library_id
+               AND current_item.item_type = 'MOVIE' AND current_item.removed_at IS NULL
+               AND current_item.merged_into_item_id IS NULL
+             LIMIT 2"
+        );
+        let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+        statement = statement.bind(library_root_id);
+        for relative_path in relative_paths {
+            statement = statement.bind(relative_path);
+        }
+        let item_ids =
+            statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        Ok(match item_ids.as_slice() {
+            [item_id] => Some(item_id.clone()),
+            _ => None,
+        })
+    }
+
     pub(crate) async fn scan_manifest_movie_variant_identity_is_current(
         &self,
         library_root_id: &str,
         relative_path: &str,
-        sort_title: &str,
-        production_year: Option<i64>,
+        base_item_id: &str,
         edition_name: Option<&str>,
     ) -> Result<bool, StorageError> {
         self.query_scalar::<i64>(
@@ -4909,15 +4953,14 @@ impl Database {
              JOIN media_items item ON item.id = source.item_id
              WHERE entry.library_root_id = ? AND entry.relative_path = ?
                AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
-               AND item.removed_at IS NULL AND item.sort_title = ?
-               AND COALESCE(item.production_year, -1) = COALESCE(?, -1)
+               AND item.removed_at IS NULL
+               AND COALESCE(item.merged_into_item_id, item.id) = ?
                AND COALESCE(source.edition_name, '') = COALESCE(?, '')
              LIMIT 1",
         )
         .bind(library_root_id)
         .bind(relative_path)
-        .bind(sort_title)
-        .bind(production_year)
+        .bind(base_item_id)
         .bind(edition_name)
         .fetch_optional(&self.pool)
         .await
@@ -12204,6 +12247,12 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        // The moved source may now be a second default of the target item, and the old
+        // item may have lost its only default.
+        self.normalize_default_source_in_transaction(&mut transaction, new_item_id)
+            .await?;
+        self.normalize_default_source_in_transaction(&mut transaction, &old_item_id)
+            .await?;
 
         for item_id in [Some(old_item_id), parent_id, series_id]
             .into_iter()
@@ -13534,6 +13583,85 @@ mod tests {
                 .await?
                 .is_some()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reassigned_media_source_does_not_add_a_second_default_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/media', '/media', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES
+                    ('item-a', 'lib', 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED'),
+                    ('item-b', 'lib', 'MOVIE', 'Movie B', 'movie b', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES
+                    ('entry-1', 'root', 'Movie/a.mkv', 'FILE', 10, 1, 'generation'),
+                    ('entry-2', 'root', 'Movie/b.mkv', 'FILE', 10, 1, 'generation'),
+                    ('entry-3', 'root', 'Movie/c.mkv', 'FILE', 10, 1, 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+                 ) VALUES
+                    ('source-1', 'item-a', 'LOCAL_FILE', 'entry-1', 1, 'READY'),
+                    ('source-2', 'item-b', 'LOCAL_FILE', 'entry-2', 1, 'READY'),
+                    ('source-3', 'item-b', 'LOCAL_FILE', 'entry-3', 0, 'READY')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        // Moving a default source onto an item that already has one keeps a single default.
+        assert!(
+            database
+                .reassign_media_source_item("entry-2", "item-a")
+                .await?
+        );
+        let a_defaults: Vec<String> = database
+            .query_scalar(
+                "SELECT id FROM media_sources WHERE item_id = 'item-a' AND is_default = 1",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(a_defaults, ["source-1"]);
+        // The item that lost its default source still has exactly one.
+        let b_defaults: Vec<String> = database
+            .query_scalar(
+                "SELECT id FROM media_sources WHERE item_id = 'item-b' AND is_default = 1",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(b_defaults, ["source-3"]);
         Ok(())
     }
 }

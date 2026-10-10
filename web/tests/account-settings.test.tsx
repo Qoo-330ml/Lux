@@ -56,6 +56,7 @@ describe("account settings", () => {
   beforeEach(() => {
     localStorage.clear();
     document.documentElement.removeAttribute("data-lux-theme");
+    document.documentElement.removeAttribute("data-lux-accent");
     vi.spyOn(api, "libraries").mockResolvedValue({
       libraries: [
         { id: "movies", name: "电影", kind: "MOVIE" },
@@ -88,6 +89,17 @@ describe("account settings", () => {
 
     expect(readAccountSettings("user-a").theme).toBe("light");
     expect(readAccountSettings("user-b").theme).toBe("dark");
+  });
+
+  it("defaults to silver when no valid accent preference is saved", () => {
+    expect(readAccountSettings(user.id).accentColor).toBe("silver");
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({ accentColor: "unknown" }));
+    expect(readAccountSettings(user.id).accentColor).toBe("silver");
+  });
+
+  it.each(["silver", "berry", "ocean", "amber", "mint"])("keeps the saved %s accent preference", (accentColor) => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({ accentColor }));
+    expect(readAccountSettings(user.id).accentColor).toBe(accentColor);
   });
 
   it("switches the favicon to match the selected theme", () => {
@@ -124,6 +136,21 @@ describe("account settings", () => {
 
     expect(document.documentElement.dataset.luxAccent).toBe("ocean");
     expect(JSON.parse(localStorage.getItem(accountSettingsStorageKey(user.id)) ?? "{}")).toMatchObject({ accentColor: "ocean" });
+
+    const silverOption = container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 银灰"]');
+    expect(silverOption).not.toBeNull();
+    await act(async () => { silverOption?.click(); });
+    expect(silverOption?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.documentElement.dataset.luxAccent).toBe("silver");
+    expect(JSON.parse(localStorage.getItem(accountSettingsStorageKey(user.id)) ?? "{}")).toMatchObject({ accentColor: "silver" });
+
+    await act(async () => {
+      const lightOption = Array.from(container.querySelectorAll<HTMLButtonElement>(".lux-theme-options button"))
+        .find((button) => button.textContent === "浅色");
+      lightOption?.click();
+    });
+    expect(document.documentElement.dataset.luxTheme).toBe("light");
+    expect(readAccountSettings(user.id)).toMatchObject({ theme: "light", accentColor: "silver" });
   });
 
   it("renders the current account settings sections", async () => {

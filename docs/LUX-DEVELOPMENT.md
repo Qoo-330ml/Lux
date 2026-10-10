@@ -451,7 +451,7 @@ Lux 的核心价值不是功能数量，而是：
 - 空闲常驻内存目标小于 300 MB。
 - 默认扫描时常驻内存目标小于 750 MB。
 - 所有后台队列有界；队列满时合并事件或施加背压，不无限增长。
-- 元数据补全使用独立的网络 I/O 并发策略：SQLite 默认有效并发 4，PostgreSQL 默认有效并发 8；进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
+- 元数据补全使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 的 worker 默认并发均为 4；`FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
 - ffprobe 默认并发 256，可按媒体库配置 1 至 512；实际运行的单库有效上限为 512、进程全局硬上限为 512，
   并根据 CPU、内存和前台 p95 动态降档。4 核 NAS 的默认有效并发目标为 128，8 核目标为 256，16 核及以上目标为 512；ffprobe 只处理本轮
   fingerprint 变化或新增的 source，未变化 source 不得重复探测。
@@ -520,7 +520,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 2 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=2`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 2 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -10121,6 +10121,36 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 结果（2026-10-09）：旧实现下新回归先失败，证明 DB index-state 写入失败后 relation 文件虽仍在且判 stale，同一个 deferred collector 已丢弃 pending，解除 SQL 故障后无法 flush。修复将 flush 串行化，失败 chunk 按原顺序放回队列头部，避免并发追加的较新快照被失败旧项覆盖；数据库缺失时不消费队列。SQLite trigger 回归确认 failure 后 stale、同 collector retry 后 checksum/current 恢复、重复 flush 无副作用且仅一条 credit。people service library tests 45/45、scanner Home-event worker regression 1/1、`tests/metadata.rs` 21/21 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 与 `git diff --check` 通过。使用 Toshiba 的共享 Cargo target，本机 `arm64`。没有运行 PostgreSQL、FNOS 或生产性能测量；relation file、DB transaction 与进程内 Home event 仍是分开的持久化/缓存边界，不声称跨系统 ACID。
 
 补充重启恢复回归（2026-10-09）：`deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 注入 credits/index-state 写入失败后丢弃 page-local collector、关闭并重新打开 SQLite 与 PeopleService；确认 `people.json` 的字节 checksum 保持不变、重启后的 current 检查仍判 stale，再由既有 person index rebuild 从文件快照恢复 credits/checksum 并转为 current。定向命令 `cargo test --locked --lib deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 通过（1/1），使用 Toshiba 共享 Cargo target。本用例模拟持久化边界上的服务状态丢失，不等同于断电/文件系统崩溃测试，也不证明 PostgreSQL 或 FNOS 行为。
+
+#### LUX-470：Logo 银灰默认强调色
+
+范围：个人设置新增「银灰」强调色，并作为未保存颜色偏好时的默认值。沿用 Logo 的中性灰色：深色模式使用 `#CBD5E1`，浅色模式使用 `#3A3F4B`。强调色实心控件使用独立前景色，深色模式为 `#181B22`、浅色模式为白色；选中状态保持既有勾选和开关位置反馈。已保存的莓果、海蓝、琥珀、薄荷偏好继续有效。
+
+验收：
+
+- [x] 无本地偏好或无效强调色时默认银灰；已保存的五种颜色可读取、切换并按账户持久化。
+- [x] 个人设置显示银灰选项，使用 `aria-pressed` 标记选择；切换主题保持所选色系并调整银灰明度。
+- [x] 银灰文字、实心按钮文字、勾选和启用开关在深浅模式均清晰，相关文字对比度至少 4.5:1。
+- [x] Web 全量测试与构建、定向浏览器检查、Rust 格式与静态检查通过；记录本机 ARM 验证边界。
+
+实施切片：A 修改 `web/src/features/account/account-settings.ts`、`web/src/features/account/AccountPage.tsx`、`web/src/react.css`、`web/tests/account-settings.test.tsx` 和本文档；先用账户偏好回归验证默认值、旧颜色兼容和银灰切换。B 修改 `web/src/features/admin/plugin-library.css` 的启用开关前景色，并进行深浅模式控件对比度与 Web 全量验收。只调整 Web 外观和本地偏好，不修改服务端设置或数据库。
+
+结果（2026-10-10）：新账户默认值、银灰偏好读取和银灰选项的回归先失败；实现后账户设置测试 21/21 通过。Web 全量 Node 测试 132/132、Vitest 567/567 和生产构建通过；本机通过 Corepack 调用 pnpm，安装使用 frozen lockfile。Playwright 在模拟 API 的真实账户页面验证默认银灰、海蓝与银灰刷新恢复、主题切换和 Tab/Space 选择；1440/1024/768/320px 下五个选项均无横向溢出，页面无控制台错误。实际 CSS 控件测量中，深色银灰按钮文字对比度 11.61:1、浅色石墨灰按钮文字 10.54:1，强调色对页面分别为 13.72:1 和 9.50:1；检查普通 checkbox、权限勾选、账户/策略/插件启用开关。播放器始终使用黑色背景，因此银灰播放器控件在浅色页面主题下也使用浅银灰与深色前景。`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过，Cargo 使用 Toshiba 共享 target，本机 `arm64`。本任务没有 Rust 逻辑变化，未运行 Rust 测试；浏览器验证使用模拟账号和 API，不证明部署状态、服务端持久化或 NAS 行为。
+
+#### LUX-471：浅色媒体操作菜单与手机详情顶部遮罩
+
+范围：修复媒体操作菜单和手机详情页顶部遮罩遗漏的浅色主题样式。其他浅色配色问题只报告，等待项目所有者选择后再修改。
+
+验收：
+
+- [x] 浅色媒体操作菜单使用浅色背景，标题、图标、悬停和键盘焦点清晰；挂载在 body 的菜单继续继承主题。
+- [x] 手机详情页顶部使用浅色渐变遮罩，品牌、返回和菜单按钮同步使用深色前景；保留原有模糊、渐隐与安全区几何。
+- [x] 深色模式菜单与顶部遮罩保留原配色；窄屏菜单不超出视口。
+- [x] 两项回归在旧实现下失败，修复后定向测试、Web 全量测试和构建通过。
+
+修改文件：`web/src/react.css`、`web/tests/light-theme-contrast.test.ts` 和本文档。仅新增这两处的浅色样式，不调整其他界面配色、服务端逻辑或数据库。
+
+结果（2026-10-10）：定向 Vitest 18/18、全量 Node 134/134、Vitest 569/569 与生产构建通过。Playwright 使用本地模拟 API，在 390px 和 320px 视口检查浅色菜单、独立手机顶部遮罩与菜单视口边界，1440px 检查桌面菜单，并验证深色原配色。截图和 computed style 确认 body portal 正常应用浅色主题，菜单悬停使用深色文字。`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过；本机 `arm64`，Cargo 使用 Toshiba 共享 target。本任务没有 Rust 行为变化，未运行 Rust 测试；不证明部署状态或真实 iOS Safari 渲染。
 
 ## 28. 参考资料
 

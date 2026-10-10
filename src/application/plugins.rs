@@ -168,6 +168,26 @@ impl PluginService {
         config_dir: PathBuf,
         proxy_url: Option<String>,
     ) -> Self {
+        let service = Self::build_with_proxy(database, config_dir, proxy_url);
+        service.start_login_background_refresh_worker();
+        service
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_login_background_worker_for_test(
+        database: Database,
+        config_dir: PathBuf,
+    ) -> Self {
+        // Query-count fixtures isolate the requested operation from the
+        // periodic worker's unrelated initial login-background SELECT.
+        Self::build_with_proxy(database, config_dir, None)
+    }
+
+    fn build_with_proxy(
+        database: Database,
+        config_dir: PathBuf,
+        proxy_url: Option<String>,
+    ) -> Self {
         let catalog = Arc::new(RwLock::new(PluginCatalog::discover(
             &config_dir.join("plugins"),
         )));
@@ -175,7 +195,7 @@ impl PluginService {
             .with_config_dir(config_dir.clone())
             .with_network_proxy_url(proxy_url.clone());
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
-        let service = Self {
+        Self {
             database,
             config_dir: config_dir.clone(),
             catalog,
@@ -191,9 +211,7 @@ impl PluginService {
             login_background_refresh_worker_started: Arc::new(AtomicBool::new(false)),
             login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             login_background_asset_upload_lock: Arc::new(Mutex::new(())),
-        };
-        service.start_login_background_refresh_worker();
-        service
+        }
     }
 
     pub(crate) fn provider_cache(&self) -> ProviderResponseCache {
@@ -3944,7 +3962,10 @@ mod plugin_discovery_tests {
             config_dir: config_dir.clone(),
         };
         let database = Database::connect(&config).await?;
-        let service = PluginService::new(database.clone(), config_dir);
+        let service = PluginService::new_without_login_background_worker_for_test(
+            database.clone(),
+            config_dir,
+        );
         service.install(FIRST_PLUGIN_ID).await?;
         service.install(SECOND_PLUGIN_ID).await?;
 

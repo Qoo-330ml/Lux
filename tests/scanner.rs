@@ -290,6 +290,58 @@ async fn movie_scan_groups_chinese_source_variants_into_one_item()
 }
 
 #[tokio::test]
+async fn movie_scan_gives_every_item_exactly_one_default_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for name in [
+        "ABF-301 (118abf301)-有码-C.mp4",
+        "ABF-301 (118abf301)-破解-C.mp4",
+        "ABF-301 (118abf301)-破解-4K.mp4",
+        "ABF-302 (118abf302)-有码.mp4",
+    ] {
+        tokio::fs::write(root.join(name), b"video").await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let per_item: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT COUNT(*), SUM(is_default) FROM media_sources GROUP BY item_id ORDER BY 1",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(per_item, vec![(1, 1), (3, 1)]);
+
+    // A rescan that adds another version to an existing item must not add a default.
+    tokio::fs::write(root.join("ABF-302 (118abf302)-破解.mp4"), b"video").await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let per_item: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT COUNT(*), SUM(is_default) FROM media_sources GROUP BY item_id ORDER BY 1",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(per_item, vec![(2, 1), (3, 1)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -306,7 +358,7 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
     }
     let alternate_dir = media_root.join("ADN-725");
     tokio::fs::create_dir_all(&alternate_dir).await?;
-    tokio::fs::write(alternate_dir.join("ADN-725.mp4"), b"base").await?;
+    tokio::fs::write(alternate_dir.join("ADN-725.MKV"), b"base").await?;
     tokio::fs::write(
         alternate_dir.join("ADN-725-Alternate-Cut.mp4"),
         b"alternate version",
@@ -372,7 +424,7 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
                 "ADN-725/ADN-725-Alternate-Cut.mp4".to_owned(),
                 Some("Alternate-Cut".to_owned()),
             ),
-            ("ADN-725/ADN-725.mp4".to_owned(), None),
+            ("ADN-725/ADN-725.MKV".to_owned(), None),
             ("Unpaired/ADN-999-Alternate.mp4".to_owned(), None),
         ]
     );
@@ -419,6 +471,18 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
     .await?;
     assert_eq!(removed_legacy_items, 2);
 
+    let alternate_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND title = 'ADN 725'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET title = 'Metadata Title', sort_title = 'metadata title',
+               production_year = 2024 WHERE id = ?",
+    )
+    .bind(&alternate_item_id)
+    .execute(database.pool())
+    .await?;
     sqlx::query("UPDATE media_sources SET probe_status = 'READY'")
         .execute(database.pool())
         .await?;
@@ -429,6 +493,15 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
             .fetch_all(database.pool())
             .await?;
     assert_eq!(probe_statuses, vec!["READY".to_owned(); 7]);
+    let alternate_sources: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = ?")
+            .bind(&alternate_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        alternate_sources, 2,
+        "generic suffix with a different base extension"
+    );
     Ok(())
 }
 
@@ -989,7 +1062,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 167);
+    assert_eq!(database.schema_version().await?, 168);
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name IN ('filesystem_entries', 'media_items', 'media_sources', 'media_streams')

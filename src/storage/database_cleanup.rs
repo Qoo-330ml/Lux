@@ -8,6 +8,8 @@ const DATABASE_CLEANUP_COMPLETED: &str = "COMPLETED";
 const SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER: &str = "scan_job_events_config_log_migration_v1";
 const AUDIT_EVENTS_LOG_MIGRATION_MARKER: &str = "audit_events_config_log_migration_v1";
 const CLEANUP_BATCH_SIZE: i64 = 1_000;
+/// Grace period so a batch is never removed while its worker is still finishing it.
+const LOCAL_METADATA_BATCH_RETENTION_SECONDS: i64 = 3_600;
 const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES / 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -17,6 +19,7 @@ pub struct DatabaseLifecycleCleanupReport {
     pub scan_manifest_deltas_deleted: u64,
     pub scan_manifest_entries_deleted: u64,
     pub scan_manifest_directories_deleted: u64,
+    pub scan_local_metadata_batches_deleted: u64,
     pub scan_job_targets_deleted: u64,
     pub scan_jobs_summarized: u64,
 }
@@ -435,6 +438,7 @@ impl Database {
             return if report.scan_manifest_deltas_deleted > 0
                 || report.scan_manifest_entries_deleted > 0
                 || report.scan_manifest_directories_deleted > 0
+                || report.scan_local_metadata_batches_deleted > 0
             {
                 Ok(Some(report))
             } else {
@@ -541,6 +545,8 @@ impl Database {
             scan_manifest_deltas_deleted: manifest_payload.scan_manifest_deltas_deleted,
             scan_manifest_entries_deleted: manifest_payload.scan_manifest_entries_deleted,
             scan_manifest_directories_deleted: manifest_payload.scan_manifest_directories_deleted,
+            scan_local_metadata_batches_deleted: manifest_payload
+                .scan_local_metadata_batches_deleted,
             scan_job_targets_deleted: self.delete_non_retryable_scan_job_targets().await?,
             scan_jobs_summarized: self.summarize_terminal_scan_jobs().await?,
         })
@@ -569,12 +575,58 @@ impl Database {
         })?;
         let scan_manifest_directories_deleted =
             self.delete_completed_scan_manifest_directories().await?;
+        let scan_local_metadata_batches_deleted =
+            self.delete_terminal_scan_local_metadata_batches().await?;
         Ok(DatabaseLifecycleCleanupReport {
             scan_manifest_deltas_deleted,
             scan_manifest_entries_deleted,
             scan_manifest_directories_deleted,
+            scan_local_metadata_batches_deleted,
             ..DatabaseLifecycleCleanupReport::default()
         })
+    }
+
+    /// Local-metadata batches carry the full source id list of up to 256 sources. Once
+    /// a batch is COMPLETED (or CANCELLED) and its scan job is no longer running nothing
+    /// reads it again: the batch id is only consulted while a job is still enqueueing.
+    async fn delete_terminal_scan_local_metadata_batches(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_local_metadata_batches
+                     WHERE id IN (
+                         SELECT batch.id
+                         FROM scan_local_metadata_batches batch
+                         WHERE batch.status IN ('COMPLETED', 'CANCELLED')
+                           AND batch.updated_at < unixepoch() - ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM scan_jobs sj
+                               WHERE sj.id = batch.job_id
+                                 AND NOT (
+                                     (sj.status IN ('COMPLETED', 'FAILED')
+                                      AND sj.scan_phase = 'IDLE')
+                                     OR sj.status = 'CANCELLED'
+                                 )
+                           )
+                         LIMIT ?
+                     )",
+                )
+                .bind(LOCAL_METADATA_BATCH_RETENTION_SECONDS)
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
     }
 
     async fn delete_completed_scan_manifest_deltas(&self) -> Result<u64, StorageError> {
@@ -823,5 +875,165 @@ impl Database {
                 source,
             })?;
         Ok(result.rows_affected())
+    }
+}
+
+const REMOVED_ITEM_RETENTION_ENV: &str = "LUX_REMOVED_ITEM_RETENTION_DAYS";
+const DEFAULT_REMOVED_ITEM_RETENTION_DAYS: i64 = 30;
+const REMOVED_ITEM_PURGE_BATCH_SIZE: i64 = 200;
+const REMOVED_ITEM_PURGE_MAX_BATCHES: u32 = 500;
+const REMOVED_ITEM_PURGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+const SECONDS_PER_DAY: i64 = 86_400;
+
+static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Retention window for soft-deleted media items, in days. `0` disables the purge.
+pub fn removed_item_retention_days() -> i64 {
+    std::env::var(REMOVED_ITEM_RETENTION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days >= 0)
+        .unwrap_or(DEFAULT_REMOVED_ITEM_RETENTION_DAYS)
+}
+
+impl Database {
+    /// Runs one bounded purge pass in the background unless one is already running.
+    pub fn spawn_removed_media_item_purge(&self) {
+        let retention_days = removed_item_retention_days();
+        if retention_days == 0 {
+            return;
+        }
+        if REMOVED_ITEM_PURGE_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            let result = database
+                .purge_expired_removed_media_items(
+                    retention_days.saturating_mul(SECONDS_PER_DAY),
+                    REMOVED_ITEM_PURGE_BATCH_SIZE,
+                    REMOVED_ITEM_PURGE_MAX_BATCHES,
+                    REMOVED_ITEM_PURGE_PAUSE,
+                )
+                .await;
+            REMOVED_ITEM_PURGE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+            match result {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "expired soft-deleted media items purged"),
+                Err(error) => tracing::warn!(%error, "soft-deleted media item purge failed"),
+            }
+        });
+    }
+
+    /// Hard-deletes soft-deleted media items older than `retention_seconds` in small
+    /// batches, letting `ON DELETE CASCADE` remove images, credits and search rows.
+    /// Items that still carry user state, playback history or are a merge target are kept.
+    pub async fn purge_expired_removed_media_items(
+        &self,
+        retention_seconds: i64,
+        batch_size: i64,
+        max_batches: u32,
+        pause: std::time::Duration,
+    ) -> Result<u64, StorageError> {
+        let mut purged = 0_u64;
+        for _ in 0..max_batches {
+            let count = self
+                .query(
+                    "DELETE FROM media_items
+                     WHERE id IN (
+                         SELECT mi.id FROM media_items mi
+                         WHERE mi.removed_at IS NOT NULL
+                           AND mi.removed_at < unixepoch() - ?
+                           AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
+                         ORDER BY mi.removed_at
+                         LIMIT ?
+                     )",
+                )
+                .bind(retention_seconds)
+                .bind(batch_size)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            purged = purged.saturating_add(count);
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+        }
+        Ok(purged)
+    }
+}
+
+const SOURCE_DEFAULT_REPAIR_BATCH_SIZE: i64 = 500;
+
+impl Database {
+    /// Gives every media item exactly one default source. Older scans marked every new
+    /// source as default, so items that gained a second version ended up with several
+    /// defaults (and merges or removals could leave none). The oldest of the current
+    /// defaults wins, which keeps today's effective choice; with no default the oldest
+    /// source becomes one. Returns the number of repaired items.
+    pub async fn normalize_media_source_defaults(&self) -> Result<u64, StorageError> {
+        let mut repaired = 0_u64;
+        loop {
+            let item_ids = self
+                .query_scalar::<String>(
+                    "SELECT item_id FROM media_sources
+                     GROUP BY item_id
+                     HAVING SUM(is_default) <> 1
+                     LIMIT ?",
+                )
+                .bind(SOURCE_DEFAULT_REPAIR_BATCH_SIZE)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if item_ids.is_empty() {
+                break;
+            }
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE media_sources
+                 SET is_default = CASE WHEN id = (
+                     SELECT chosen.id FROM media_sources chosen
+                     WHERE chosen.item_id = media_sources.item_id
+                     ORDER BY chosen.is_default DESC, chosen.id
+                     LIMIT 1
+                 ) THEN 1 ELSE 0 END,
+                     updated_at = unixepoch()
+                 WHERE item_id IN ({placeholders})"
+            )));
+            for item_id in &item_ids {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            repaired = repaired.saturating_add(item_ids.len() as u64);
+            if repaired > 100_000_000 {
+                break;
+            }
+        }
+        Ok(repaired)
     }
 }

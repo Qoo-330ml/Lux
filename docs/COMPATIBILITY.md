@@ -218,6 +218,28 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 这些测试证明 Lux 服务端的请求路径、权限、状态码、响应字段和资源清理，不替代 Qmby 在 FNOS 部署实例上的完整
 登录、首页、详情、播放、进度和停止请求序列复测。
 
+## LUX-057 多版本重扫保持元数据身份
+
+电影文件名的通用连字符后缀仍要求同目录存在唯一匹配的基础视频。重新扫描已入库版本时，
+以基础视频当前关联的电影条目 ID 确定归属，包含其管理员合并后的主条目；NFO 或在线元数据
+修改标题、年份不会使版本脱离原条目。稳定全量扫描保留媒体源 ID 和 READY 探测状态；
+视频内容变化或目录重扫仍更新文件索引，已拆分的旧版本可在重扫时归回基础视频的条目。
+
+自动化覆盖：`tests/scanned_metadata.rs::movie_variant_rescan_preserves_nfo_identity_and_filename_poster`
+使用 `ABS-123.mp4`、`ABS-123-C.mp4`、本地 NFO 和 `ABS-123-poster.jpg`，
+验证元数据改写后的连续全量扫描、文件变化、目录重扫和旧拆分修复；
+`tests/scanner.rs::movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases`
+覆盖通用多段后缀、不同扩展名、旧拆分修复和稳定重扫。验证环境为本机 ARM64/SQLite，
+不代表已部署实例或第三方客户端验证。
+
+验证记录（2026-10-10）：相关 `scanner`、`scanning_jobs`、`scanned_metadata` 和 `item_merge`
+目标共 122 项通过；build、fmt、Clippy 全目标/全特性零警告、Web 561 项测试和构建、
+5 项 Python 工具测试及 `git diff --check` 通过。`check-all.sh` 的库测试阶段出现两项失败：
+NFO 人物关系故障注入断言和插件迁移查询计数；插件计数失败在修复前的 `21782159` 定向复现，
+NFO 测试在该基线定向和整组运行通过。基线整组另出现弹幕查询计数失败。
+后续完整集成运行受其他 Cargo 任务覆盖共享 target 二进制影响，出现新增回归缺失，不能作为本次完整门禁证据；
+相关目标重新编译后复制测试二进制、确认包含新增回归再运行。完整 Rust 门禁未全绿。
+
 ## LUX-266 全量扫描 Manifest 存储兼容
 
 新建全量扫描时，job、Manifest、root 状态和目录 frontier 同事务创建；扫描发现将文件/目录 stat 与 fingerprint 作为追加式 observation 持久化，目录 frontier 不再写入 `reconciliation_scan_entries`。Unix 扫描逐段从 root directory handle 打开路径组件并拒绝符号链接，再通过已打开目录 handle 枚举，避免目录在校验与打开之间被替换后越出 library root；发现 chunk 与收尾事务都检查取消标记，取消任务不能进入 `READY_TO_DIFF`。已发现的文件索引工作暂由旧表的 FILE 行承接，直到 LUX-267 将差异应用切换到 Manifest。此内部存储变化不改变 Lux、Webhook 或 Emby 公共合同。
@@ -256,6 +278,13 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 | VidHub | 3.0.1 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 通过（隔离测试服务器） | 通过 | 媒体库、条目详情通过 | 通过 | 进度/已观看通过；收藏另有实测 | 未测试 | 2026-08-28 使用独立临时媒体 `VidHub Green Compatibility` 进入 VideoPlayActivity；DirectPlay 会话播放完成，进度约 20 秒且 `Played=true` |
 | 网易爆米花 | 2.12.5 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 未单独验证（已有远程连接） | 未单独验证（已有会话） | 通过 | 通过（资源差异） | 进度通过；收藏未测试 | 未测试 | 2026-08-28 使用现有远程 Lux 服务器播放《黑色月光》第 1 集；画面稳定，进度由约 00:56 推进至 02:00，退出后详情页读回约 03:14，未出现网络错误提示。此前《风柜来的人》和另一资源曾出现网络提示，暂按资源相关风险记录 |
 | Lux Web | Chrome 151 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | Direct、服务器 HLS、客户端 HEVC fallback 通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本 source 切换、SRT 字幕、已登记 Bilibili XML 弹幕和可见性开关通过 | Chrome headless：普通用户无管理入口、Direct Range、HLS manifest/init/segment、HEVC Worker/WASM/MSE、390/768/1440 viewport、键盘/触摸 seek、覆盖层和会话清理通过；播放器联合 smoke 为 0 error / 0 warning、无外部请求；`scripts/browser-smoke.mjs`、`scripts/admin-smoke.mjs` 和 `scripts/player-danmaku-smoke.mjs` 已固化 |
+
+## LUX-114 iOS 输入框聚焦缩放修复（2026-10-10）
+
+- 原触屏规则使用零优先级的 `:where(...)`，被登录框的 `13px` 和管理页的局部字号覆盖。触屏文本输入框、文本域和原生选择框现以 `!important` 保证至少 `16px`，避免小字号触发 iOS 聚焦自动放大。
+- 大字号输入框通过 `--lux-input-font-size` 保留字号；已有的大字号继承也保留。复选框、单选框、滑块、文件/颜色选择和输入按钮不应用字号下限。viewport 继续允许手动缩放。
+- macOS arm64 Chromium 的 iPhone 15 触屏模拟中，登录框实际字号由 `13px` 变为 `16px`；聚焦后模拟 viewport scale 为 `1`，无横向溢出。加载真实样式的 24 个合成文本控件在 `320`、`393`、`844`、`768`、`1024px` 下均不小于 `16px`，包括横屏、文本域和原生选择框；人物标题保持大字号，滑块/复选框尺寸保持 `18px`。桌面 `1440px` 登录框保持 `13px`。
+- 自动化证据为响应式样式回归、Web 全量测试和构建，以及 Playwright 的 computed-style/聚焦检查。Chromium 触屏模拟不能证明 iOS 软件键盘和 Safari 真机缩放行为；仍需部署后在真实 iPhone/iPad 上复测。
 
 ## Android 真机实测（2026-08-28）
 
