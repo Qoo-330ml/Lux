@@ -1423,6 +1423,50 @@ async fn load_benchmark_poster_snapshot(
     }
 }
 
+async fn observe_benchmark_poster_completion(
+    pool: sqlx::AnyPool,
+    job_id: String,
+    library_id: String,
+    job_placeholder: &'static str,
+    library_placeholder: &'static str,
+    file_count: usize,
+    epoch: Instant,
+) -> Result<(u128, BenchmarkPosterSnapshot), sqlx::Error> {
+    let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let snapshot = load_benchmark_poster_snapshot(
+            &pool,
+            &job_id,
+            &library_id,
+            job_placeholder,
+            library_placeholder,
+        )
+        .await?;
+        if snapshot.has_completed_batch_missing_image_marker() {
+            return Err(sqlx::Error::Protocol(format!(
+                "LUX-304 completed image batch is missing images_completed_at and cannot be considered drained: {}",
+                snapshot.report(file_count)
+            )));
+        }
+        if snapshot.cancelled_batch_count() > 0 {
+            return Err(sqlx::Error::Protocol(format!(
+                "LUX-304 image queue contains cancelled batches and cannot be considered drained: {}",
+                snapshot.report(file_count)
+            )));
+        }
+        if snapshot.is_drained(file_count) {
+            return Ok((epoch.elapsed().as_nanos(), snapshot));
+        }
+        if Instant::now() >= poster_queue_deadline {
+            return Err(sqlx::Error::Protocol(format!(
+                "LUX-304 strict local image queue drain timed out: {}",
+                snapshot.report(file_count)
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn load_local_poster_queue_snapshot(
     pool: &sqlx::AnyPool,
     job_id: &str,
@@ -2977,6 +3021,15 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             .map_err(|error| error.to_string())?;
         Ok::<_, String>(scan_started.elapsed().as_nanos())
     });
+    let local_poster_completion_handle = tokio::spawn(observe_benchmark_poster_completion(
+        database.pool().clone(),
+        scan_job.id.clone(),
+        library.id.to_string(),
+        job_id_placeholder,
+        queue_library_id_placeholder,
+        file_count,
+        scan_started,
+    ));
     tokio::task::yield_now().await;
     // The direct worker does not invalidate AppState's catalog cache. Wait for
     // a committed fixture item before the first request so an empty page is
@@ -3152,41 +3205,18 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             }
         });
 
-    let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
-    let (local_poster_queue_ms, local_poster_queue_final_snapshot) = loop {
-        let snapshot = load_benchmark_poster_snapshot(
-            database.pool(),
-            &scan_job.id,
-            &library.id.to_string(),
-            job_id_placeholder,
-            queue_library_id_placeholder,
-        )
-        .await?;
-        if snapshot.has_completed_batch_missing_image_marker() {
-            return Err(format!(
-                "LUX-304 completed image batch is missing images_completed_at and cannot be considered drained: {}",
-                snapshot.report(file_count)
-            )
-            .into());
-        }
-        if snapshot.cancelled_batch_count() > 0 {
-            return Err(format!(
-                "LUX-304 image queue contains cancelled batches and cannot be considered drained: {}",
-                snapshot.report(file_count)
-            )
-            .into());
-        }
-        if snapshot.is_drained(file_count) {
-            break (scan_started.elapsed().as_millis(), snapshot);
-        }
-        if Instant::now() >= poster_queue_deadline {
-            return Err(format!(
-                "LUX-304 strict local image queue drain timed out: {}",
-                snapshot.report(file_count)
-            )
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let (local_poster_queue_observed_ns, local_poster_queue_final_snapshot) =
+        local_poster_completion_handle
+            .await
+            .map_err(std::io::Error::other)??;
+    let inline_baseline =
+        env::var("LUX_PERF_POSTER_QUEUE_MODE").as_deref() == Ok("inline_metadata_baseline");
+    let local_poster_queue_ms = if inline_baseline {
+        // Inline scan completion already includes the entire local stage;
+        // polling verifies the final posters but must not add API wait time.
+        scan_job_completion_ms
+    } else {
+        local_poster_queue_observed_ns / 1_000_000
     };
     let drained_catalog_expectation = CatalogPageExpectation {
         fixture_file_count: file_count,
@@ -3270,6 +3300,9 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "catalogListAfterPosterQueueRequestCount": catalog_list_after_queue_ms.len(),
             "scanRunningAtApiStart": scan_running_at_api_start,
             "localPosterQueueCompleteMs": local_poster_queue_ms,
+            "localPosterQueueFirstObservedCompleteMs": local_poster_queue_observed_ns / 1_000_000,
+            "localPosterQueueObservationIntervalMs": 100,
+            "localPosterQueueTimingNote": "inline baseline uses scan worker completion timestamp with strict poster validation; detached completion is first observed drain from a concurrent observer started with scan, independent of HTTP joins; polling is an upper bound with 100ms nominal resolution",
             "localPosterQueueFinalSnapshot":
                 local_poster_queue_final_snapshot.report(file_count),
             "localPosterQueueDrainCondition": "detached: every batch COMPLETED with images_completed_at and full poster count; inline baseline: scan COMPLETED and full poster count",
