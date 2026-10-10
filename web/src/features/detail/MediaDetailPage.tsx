@@ -565,7 +565,8 @@ function MediaSourceSelector({
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
   const audioStreams = streamsOfType(selectedSource, "AUDIO");
   const subtitleStreams = streamsOfType(selectedSource, "SUBTITLE");
-  const options = sources.map((source, index) => ({
+  const versionSources = versionSelectableSources(sources);
+  const options = versionSources.map((source, index) => ({
     value: source.id,
     label: (
       <span className="lux-source-option-content">
@@ -578,13 +579,13 @@ function MediaSourceSelector({
   return (
     <section
       className="lux-source-selector"
-      aria-labelledby={sources.length > 1 ? "media-source-heading" : undefined}
-      aria-label={sources.length > 1 ? undefined : "播放轨道选择"}
+      aria-labelledby={versionSources.length > 1 ? "media-source-heading" : undefined}
+      aria-label={versionSources.length > 1 ? undefined : "播放轨道选择"}
     >
-      {sources.length > 1 ? <>
+      {versionSources.length > 1 ? <>
         <div className="lux-section-heading">
           <h2 id="media-source-heading">选择版本</h2>
-          <span>{sources.length} 个视频文件</span>
+          <span>{versionSources.length} 个版本</span>
         </div>
         <div className="lux-source-select">
           <LuxSelect
@@ -654,6 +655,20 @@ function MediaTrackSelector({
         />
       </div>
     </div>
+  );
+}
+
+/** Parts of one version (cd1, cd2 ...) are not alternative versions: list only the first part. */
+function versionSelectableSources(sources: MediaSource[]) {
+  return sources.filter(
+    (source) =>
+      source.partIndex == null ||
+      !sources.some(
+        (other) =>
+          other.versionKey === source.versionKey &&
+          other.partIndex != null &&
+          other.partIndex < source.partIndex!,
+      ),
   );
 }
 

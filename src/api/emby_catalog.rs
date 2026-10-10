@@ -3421,7 +3421,16 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             object.insert("FileName".to_owned(), json!(file_name));
         }
         if !is_folder {
-            emby_insert_optional(&mut object, "PartCount", default_source.map(|_| json!(1)));
+            emby_insert_optional(
+                &mut object,
+                "PartCount",
+                default_source.map(|source| {
+                    json!(crate::application::catalog::catalog_source_part_count(
+                        &item.media_sources,
+                        source
+                    ))
+                }),
+            );
             emby_insert_optional(
                 &mut object,
                 "Container",
