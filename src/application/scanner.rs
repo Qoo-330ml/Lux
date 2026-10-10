@@ -14119,6 +14119,175 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stage 23 synthetic automatic online queue measurement; requires LUX_PERF_MEDIA_ROOT"]
+    async fn stage23_online_fill_missing_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                candidates::MetadataSelectionService, images::ImageWriteService,
+                libraries::LibraryService, nfo::LocalNfoMetadataStore,
+                reidentify::MetadataReidentifyService,
+            },
+            config::{Config, DatabaseConfiguration, PostgresConnection},
+            library::LibraryKind,
+            storage::Database,
+        };
+        use std::time::{Duration, Instant};
+        let count: usize = std::env::var("LUX_PERF_FILE_COUNT")?.parse()?;
+        let root = std::path::PathBuf::from(std::env::var("LUX_PERF_MEDIA_ROOT")?);
+        let backend = std::env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".into());
+        let configuration = match backend.as_str() {
+            "sqlite" => DatabaseConfiguration::Sqlite,
+            "postgres" => {
+                let name = std::env::var("POSTGRES_TEST_DATABASE")?;
+                if !name.starts_with("s23_") {
+                    return Err("benchmark requires an s23_ disposable database".into());
+                }
+                DatabaseConfiguration::Postgres(PostgresConnection {
+                    host: "127.0.0.1".into(),
+                    port: std::env::var("POSTGRES_TEST_PORT")?.parse()?,
+                    database: name,
+                    username: std::env::var("POSTGRES_TEST_USER")?,
+                    password: std::env::var("POSTGRES_TEST_PASSWORD")?,
+                    ssl_mode: "disable".into(),
+                })
+            }
+            _ => return Err("unsupported benchmark database backend".into()),
+        };
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:0".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect_with_configuration(&config, &configuration).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Online fixture", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 fixture")?)
+            .await?;
+        let provider = GateSearchScraper {
+            search_started: Arc::new(Notify::new()),
+            release_search: Arc::new(Semaphore::new(0)),
+        };
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir.clone(),
+        );
+        let metadata = MetadataReidentifyService::with_selection(
+            database.clone(),
+            ScraperProvider::from_adapter(provider.clone()),
+            Some(selection.clone()),
+        );
+        let jobs = ScanJobService::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+            .with_metadata_selection(selection)
+            .with_metadata_reidentify(metadata);
+        jobs.start_local_metadata_outbox_worker().await?;
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let started = Instant::now();
+        let scan_jobs = jobs.clone();
+        let job_id = job.id.clone();
+        let scan = tokio::spawn(async move {
+            scan_jobs.run_to_completion(&job_id, 500, None).await?;
+            Ok::<_, super::ScanJobError>(started.elapsed().as_nanos())
+        });
+        tokio::time::timeout(Duration::from_secs(600), provider.search_started.notified()).await?;
+        let first_provider_request_ns = started.elapsed().as_nanos();
+        let scan_complete_ns = tokio::time::timeout(Duration::from_secs(600), scan).await???;
+        let bind = if backend == "postgres" { "$1" } else { "?" };
+        let local_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status <> 'COMPLETED' OR images_completed_at IS NULL THEN 1 ELSE 0 END), 0) FROM scan_local_metadata_batches WHERE job_id = {bind}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let local_complete_ns = loop {
+            let (batches, unfinished): (i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(local_query.clone()))
+                    .bind(&job.id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if batches > 0 && unfinished == 0 {
+                break started.elapsed().as_nanos();
+            }
+            if Instant::now() > deadline {
+                return Err("local queue timed out while provider was blocked".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let queue_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status IN ('QUEUED', 'RUNNING') THEN 1 ELSE 0 END), 0), COALESCE(MAX(total_count), 0) FROM metadata_reidentify_jobs WHERE library_id = {bind} AND mode = 'FILL_MISSING'"
+        );
+        let (jobs_before_release, active_before_release, max_items_before_release): (
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(sqlx::AssertSqlSafe(queue_query.clone()))
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+        assert!(
+            jobs_before_release > 0 && active_before_release > 0,
+            "the provider gate must leave real online jobs active"
+        );
+        let release_ns = started.elapsed().as_nanos();
+        // Title fallback may issue several searches per item. After the gate
+        // opens, keep every synthetic search unblocked until the queue drains.
+        provider
+            .release_search
+            .add_permits(Semaphore::MAX_PERMITS / 2);
+        let item_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN item.status = 'COMPLETED' AND item.error = 'LOW_CONFIDENCE' AND item.automatic_retry_count = 0 AND item.automatic_retry_after IS NULL THEN 1 ELSE 0 END), 0) FROM metadata_reidentify_job_items item JOIN metadata_reidentify_jobs job ON job.id = item.job_id WHERE job.library_id = {bind} AND job.mode = 'FILL_MISSING'"
+        );
+        let mut peak_jobs = active_before_release;
+        let (online_complete_ns, job_count, item_count) = loop {
+            let (job_count, active, max_items): (i64, i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(queue_query.clone()))
+                    .bind(library.id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            let (items, successful): (i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(item_query.clone()))
+                    .bind(library.id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            peak_jobs = peak_jobs.max(active);
+            assert!(max_items <= 100 && max_items_before_release <= 100);
+            assert!(
+                items <= count as i64,
+                "duplicate automatic work in synthetic fixture"
+            );
+            if items == count as i64 && successful == items && active == 0 {
+                break (started.elapsed().as_nanos(), job_count, items);
+            }
+            if Instant::now() > deadline {
+                return Err(format!("online drain timed out: jobs={job_count}, active={active}, items={items}, lowConfidence={successful}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(scan_complete_ns < release_ns && local_complete_ns < release_ns);
+        println!(
+            "STAGE23 ONLINE RESULT {}",
+            serde_json::json!({
+                "commit": crate::COMMIT, "architecture": std::env::consts::ARCH,
+                "databaseBackend": backend, "fileCount": count,
+                "firstProviderRequestMs": first_provider_request_ns / 1_000_000,
+                "scanJobCompletionMs": scan_complete_ns / 1_000_000,
+                "localQueueCompleteMs": local_complete_ns / 1_000_000,
+                "providerGateReleasedMs": release_ns / 1_000_000,
+                "onlineQueueCompleteMs": online_complete_ns / 1_000_000,
+                "onlineDrainAfterProviderReleaseMs": (online_complete_ns - release_ns) / 1_000_000,
+                "onlineFillMissingJobCount": job_count, "onlineItemCount": item_count,
+                "maxObservedActiveJobs": peak_jobs, "maxItemsPerJobBound": 100,
+                "scanAndLocalQueueCompletedWhileProviderBlocked": true,
+                "providerMode": "synthetic empty search; held until scan and local queue complete",
+                "timingNote": "providerGateReleasedMs includes intentional gate hold; onlineDrainAfterProviderReleaseMs measures scheduling/storage drain with an immediate empty provider, not real network latency",
+            })
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
     -> Result<(), Box<dyn std::error::Error>> {
