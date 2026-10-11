@@ -10265,13 +10265,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] `scanner.rs` 不再承载完整的 `LibraryScanner` 实现和文件名/混合库分类实现。
-- [ ] `LibraryScanner`、`ParsedMovieFilename`、`ParsedEpisodeFilename`、`parse_movie_filename`、`parse_episode_filename` 和 `compute_file_fingerprint` 保持现有公开路径与签名。
-- [ ] 电影、剧集、混合库、文件移动、版本归并和 STRM 路径行为由既有测试覆盖且通过。
+- [x] `scanner.rs` 不再承载完整的 `LibraryScanner` 实现和文件名/混合库分类实现。
+- [x] `LibraryScanner`、`ParsedMovieFilename`、`ParsedEpisodeFilename`、`parse_movie_filename`、`parse_episode_filename` 和 `compute_file_fingerprint` 保持现有公开路径与签名。
+- [x] 电影、剧集、混合库、文件移动、版本归并和 STRM 路径行为由既有测试覆盖且通过。
 
 验证：`cargo test --locked --test scanner --test series_scanner --test mixed_scanner`、`cargo test --locked --lib scanner::tests`、fmt 检查和 build。
 
 预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/names.rs`、本文档。
+
+结果（2026-10-12）：`LibraryScanner` 扫描实现、文件准备、文件名解析与混合库分类移入 `scanner/library.rs`、`scanner/library/prepare.rs` 和 `scanner/names.rs`；文件遍历和受限 STRM 读取留在 library 模块。根模块通过 re-export 保持现有公开路径。scanner 根从约 15,151 行减至 11,701 行，拆出的文件处理模块分别约 2,070、900 和 511 行。scanner library tests 41 passed、1 ignored；`scanner`、`series_scanner`、`mixed_scanner` 集成目标 30 项通过；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。该任务只移动实现并调整子树内可见性，不声称运行时性能变化。
 
 #### LUX-478：隔离扫描任务 facade 与单元测试
 
