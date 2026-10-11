@@ -1645,6 +1645,186 @@ async fn incremental_sidecar_change_replaces_local_image() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn workflow3_running_discovery_indexes_poster_added_to_unvisited_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let target_movie_dir = media_root.join("00 Late Poster Movie (2024)");
+    let following_movie_dir = target_movie_dir.join("01 Following Movie (2024)");
+    tokio::fs::create_dir_all(&target_movie_dir).await?;
+    tokio::fs::create_dir_all(&following_movie_dir).await?;
+    tokio::fs::write(
+        target_movie_dir.join("Late.Poster.Movie.2024.mkv"),
+        b"movie",
+    )
+    .await?;
+    tokio::fs::write(
+        following_movie_dir.join("Following.Movie.2024.mkv"),
+        b"movie",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+    // Drain the startup backfill before discovery so it cannot race this job for the item.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let backfill_status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+            )
+            .bind(root.id.to_string())
+            .fetch_optional(database.pool())
+            .await?;
+            if backfill_status.as_deref() == Some("COMPLETED") {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let job = jobs.create_movie_scan_job(library.id).await?;
+
+    let root_batch = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(root_batch.status, "RUNNING");
+    let scan_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    let manifest_state: String =
+        sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(scan_status, "RUNNING");
+    assert_eq!(manifest_state, "DISCOVERING");
+
+    let poster_path = target_movie_dir.join("poster.png");
+    let mut poster_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([12, 34, 56, 255]),
+    ))
+    .write_to(&mut poster_png, image::ImageFormat::Png)?;
+    tokio::fs::write(&poster_path, poster_png.get_ref()).await?;
+
+    let target_batch = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(target_batch.status, "RUNNING");
+    let batch_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        batch_count > 0,
+        "the discovery batch publishes local image work"
+    );
+    wait_for_local_metadata_batches(&database, &job.id).await?;
+    let target_media_relative_path = "00 Late Poster Movie (2024)/Late.Poster.Movie.2024.mkv";
+    let item_id: String = sqlx::query_scalar(
+        "SELECT source.item_id
+         FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = ?",
+    )
+    .bind(target_media_relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    let poster_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'POSTER' ORDER BY image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    let canonical_poster_paths: Vec<(String, Option<std::path::PathBuf>)> = poster_paths
+        .iter()
+        .map(|local_path| (local_path.clone(), std::fs::canonicalize(local_path).ok()))
+        .collect();
+    let expected_canonical_poster = std::fs::canonicalize(&poster_path)?;
+    assert!(
+        canonical_poster_paths
+            .iter()
+            .any(|(_, canonical_path)| canonical_path.as_ref() == Some(&expected_canonical_poster)),
+        "the late poster is indexed for item {item_id} from {target_media_relative_path:?}: requested_path={poster_path:?}, canonical_requested_path={expected_canonical_poster:?}, poster_paths={canonical_poster_paths:?}"
+    );
+    let completed_image_batches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_local_metadata_batches
+         WHERE job_id = ? AND status = 'COMPLETED' AND images_completed_at IS NOT NULL",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        completed_image_batches > 0,
+        "the same job's local image stage completed"
+    );
+
+    let scan_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    let manifest_state: String =
+        sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(scan_status, "RUNNING");
+    assert_eq!(manifest_state, "DISCOVERING");
+    let following_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = '00 Late Poster Movie (2024)/01 Following Movie (2024)/Following.Movie.2024.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        following_item_count, 0,
+        "the following directory is not visited yet"
+    );
+
+    let following_batch = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(following_batch.status, "RUNNING");
+    let following_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = '00 Late Poster Movie (2024)/01 Following Movie (2024)/Following.Movie.2024.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        following_item_count, 1,
+        "the same job visits the following directory"
+    );
+
+    jobs.run_to_completion(&job.id, 1, None).await?;
+    let final_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(final_status, "COMPLETED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn movie_scan_indexes_multiple_emby_backdrops_in_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
