@@ -1247,6 +1247,7 @@ impl MetadataReidentifyService {
                                         .await;
                                     }
                                     self.refresh_with_scraper_roles(
+                                        job_id,
                                         item_id,
                                         &item,
                                         mode,
@@ -1254,6 +1255,17 @@ impl MetadataReidentifyService {
                                         request_plan.map(|plan| plan.requestable),
                                     )
                                     .await
+                                }
+                                Ok(None) if !matches!(mode, MetadataRefreshMode::Reidentify) => {
+                                    tracing::warn!(
+                                        event = "metadata_reidentify_item_skipped",
+                                        job_id,
+                                        item_id,
+                                        mode = mode.as_str(),
+                                        reason_code = "NO_SCRAPER_SELECTED",
+                                        "metadata reidentify item was skipped"
+                                    );
+                                    Ok(0)
                                 }
                                 Ok(None) => Ok(0),
                                 Err(error) => Err(MetadataReidentifyError::Scraper(error)),
@@ -1307,14 +1319,21 @@ impl MetadataReidentifyService {
                     .await;
                 }
             }
-            Err(MetadataReidentifyError::LowConfidence) => {
-                let code = MetadataReidentifyError::LowConfidence.code();
-                if self
+            Err(error @ MetadataReidentifyError::LowConfidence) => {
+                let code = error.code();
+                let recorded = self
                     .database
                     .finish_metadata_reidentify_item(job_id, item_id, "COMPLETED", 0, Some(code))
-                    .await
-                    .is_err()
-                {
+                    .await;
+                self.log_metadata_reidentify_item_issue(
+                    job_id,
+                    item_id,
+                    mode,
+                    "COMPLETED",
+                    &error,
+                    recorded.is_ok(),
+                );
+                if recorded.is_err() {
                     tracing::error!(
                         job_id,
                         item_id,
@@ -1326,12 +1345,19 @@ impl MetadataReidentifyService {
             }
             Err(error) => {
                 let code = error.code();
-                if self
+                let recorded = self
                     .database
                     .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some(code))
-                    .await
-                    .is_err()
-                {
+                    .await;
+                self.log_metadata_reidentify_item_issue(
+                    job_id,
+                    item_id,
+                    mode,
+                    "FAILED",
+                    &error,
+                    recorded.is_ok(),
+                );
+                if recorded.is_err() {
                     tracing::error!(
                         job_id,
                         item_id,
@@ -1342,6 +1368,32 @@ impl MetadataReidentifyService {
                 self.publish_job_progress(job_id);
             }
         }
+    }
+
+    fn log_metadata_reidentify_item_issue(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        mode: MetadataRefreshMode,
+        item_status: &str,
+        error: &MetadataReidentifyError,
+        item_result_recorded: bool,
+    ) {
+        let diagnostic = metadata_reidentify_issue_diagnostic(error);
+        tracing::warn!(
+            event = "metadata_reidentify_item_issue",
+            job_id,
+            item_id,
+            mode = mode.as_str(),
+            item_status,
+            error_code = error.code(),
+            failure_stage = diagnostic.stage,
+            failure_reason = diagnostic.reason_code,
+            upstream_status_known = diagnostic.upstream_status.is_some(),
+            upstream_status = diagnostic.upstream_status,
+            item_result_recorded,
+            "metadata reidentify item needs attention"
+        );
     }
 
     async fn schedule_thumbnail_scraper_retry_if_needed(
@@ -1486,6 +1538,7 @@ impl MetadataReidentifyService {
 
     async fn refresh_with_scraper_roles(
         &self,
+        job_id: &str,
         item_id: &str,
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
@@ -1540,14 +1593,35 @@ impl MetadataReidentifyService {
                         break;
                     }
                     Ok(RefreshItemOutcome::NeedsReview(count)) => {
+                        log_metadata_scraper_attempt_issue(
+                            job_id,
+                            item_id,
+                            mode,
+                            scraper,
+                            &MetadataReidentifyError::LowConfidence,
+                            "NEEDS_REVIEW",
+                        );
                         candidate_count = candidate_count.saturating_add(count);
                         last_recoverable_error = Some(MetadataReidentifyError::LowConfidence);
                         saw_needs_review = true;
                     }
                     Err(error) if recoverable_scraper_attempt(&error) => {
+                        log_metadata_scraper_attempt_issue(
+                            job_id,
+                            item_id,
+                            mode,
+                            scraper,
+                            &error,
+                            "RECOVERABLE",
+                        );
                         last_recoverable_error = Some(error);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        log_metadata_scraper_attempt_issue(
+                            job_id, item_id, mode, scraper, &error, "FAILED",
+                        );
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1598,8 +1672,22 @@ impl MetadataReidentifyService {
                             RefreshItemOutcome::Confirmed(count)
                             | RefreshItemOutcome::NeedsReview(count),
                         ) => candidate_count = candidate_count.saturating_add(count),
-                        Err(error) if recoverable_scraper_attempt(&error) => {}
-                        Err(error) => return Err(error),
+                        Err(error) if recoverable_scraper_attempt(&error) => {
+                            log_metadata_scraper_attempt_issue(
+                                job_id,
+                                item_id,
+                                mode,
+                                scraper,
+                                &error,
+                                "RECOVERABLE",
+                            );
+                        }
+                        Err(error) => {
+                            log_metadata_scraper_attempt_issue(
+                                job_id, item_id, mode, scraper, &error, "FAILED",
+                            );
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -1640,12 +1728,18 @@ impl MetadataReidentifyService {
                         RefreshItemOutcome::Confirmed(count)
                         | RefreshItemOutcome::NeedsReview(count),
                     ) => candidate_count = candidate_count.saturating_add(count),
-                    Err(error) if recoverable_scraper_attempt(&error) => {}
-                    Err(error) => tracing::warn!(
-                        item_id,
-                        scraper_id = %scraper.scraper_id,
-                        %error,
-                        "supplemental scraper attempt failed"
+                    Err(error) if recoverable_scraper_attempt(&error) => {
+                        log_metadata_scraper_attempt_issue(
+                            job_id,
+                            item_id,
+                            mode,
+                            scraper,
+                            &error,
+                            "RECOVERABLE",
+                        );
+                    }
+                    Err(error) => log_metadata_scraper_attempt_issue(
+                        job_id, item_id, mode, scraper, &error, "FAILED",
                     ),
                 }
             }
@@ -1982,6 +2076,151 @@ impl fmt::Display for MetadataReidentifyError {
 
 impl std::error::Error for MetadataReidentifyError {}
 
+fn log_metadata_scraper_attempt_issue(
+    job_id: &str,
+    item_id: &str,
+    mode: MetadataRefreshMode,
+    scraper: &ResolvedScraper,
+    error: &MetadataReidentifyError,
+    attempt_outcome: &str,
+) {
+    let diagnostic = metadata_reidentify_issue_diagnostic(error);
+    tracing::warn!(
+        event = "metadata_reidentify_scraper_attempt_issue",
+        job_id,
+        item_id,
+        mode = mode.as_str(),
+        scraper_id = %scraper.scraper_id,
+        scraper_role = scraper.role.as_str(),
+        attempt_outcome,
+        error_code = error.code(),
+        failure_stage = diagnostic.stage,
+        failure_reason = diagnostic.reason_code,
+        upstream_status_known = diagnostic.upstream_status.is_some(),
+        upstream_status = diagnostic.upstream_status,
+        "configured scraper attempt did not complete"
+    );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetadataReidentifyIssueDiagnostic {
+    stage: &'static str,
+    reason_code: &'static str,
+    upstream_status: Option<u16>,
+}
+
+fn metadata_reidentify_issue_diagnostic(
+    error: &MetadataReidentifyError,
+) -> MetadataReidentifyIssueDiagnostic {
+    let diagnostic = match error {
+        MetadataReidentifyError::LowConfidence => ("MATCH", "NO_CONFIRMED_CANDIDATE", None),
+        MetadataReidentifyError::Scraper(error)
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(error)) => {
+            ("SCRAPER", scraper_failure_reason(error), None)
+        }
+        MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {
+            ("SCRAPER_RESPONSE", "INVALID_CANDIDATE_RESPONSE", None)
+        }
+        MetadataReidentifyError::Candidate(MetadataCandidateError::Storage(_))
+        | MetadataReidentifyError::Storage(_) => ("STORAGE", "STORAGE_ERROR", None),
+        MetadataReidentifyError::Selection(MetadataSelectionError::Image(error)) => {
+            let (reason_code, upstream_status) = image_write_failure_reason(error);
+            ("IMAGE_WRITE", reason_code, upstream_status)
+        }
+        MetadataReidentifyError::Selection(MetadataSelectionError::Nfo(_)) => {
+            ("NFO_WRITE", "NFO_WRITE_FAILED", None)
+        }
+        MetadataReidentifyError::Selection(MetadataSelectionError::People(_)) => {
+            ("PEOPLE_WRITE", "PEOPLE_WRITE_FAILED", None)
+        }
+        MetadataReidentifyError::Selection(MetadataSelectionError::Storage(_)) => {
+            ("STORAGE", "STORAGE_ERROR", None)
+        }
+        MetadataReidentifyError::Selection(_) => ("METADATA_WRITE", "METADATA_WRITE_FAILED", None),
+        MetadataReidentifyError::SelectionUnavailable => {
+            ("METADATA_WRITE", "METADATA_SELECTION_UNAVAILABLE", None)
+        }
+        MetadataReidentifyError::ItemNotFound(_)
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::ItemNotFound) => {
+            ("ITEM_LOOKUP", "ITEM_NOT_FOUND", None)
+        }
+        MetadataReidentifyError::InvalidSearch
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidSearch) => {
+            ("MATCH", "INVALID_SEARCH_INPUT", None)
+        }
+        MetadataReidentifyError::InvalidItemCount
+        | MetadataReidentifyError::InvalidRefreshMode
+        | MetadataReidentifyError::JobNotFound
+        | MetadataReidentifyError::JobNotRetryable
+        | MetadataReidentifyError::JobNotCancelable
+        | MetadataReidentifyError::LibraryJobAlreadyActive(_) => {
+            ("JOB", "INVALID_METADATA_JOB", None)
+        }
+    };
+    MetadataReidentifyIssueDiagnostic {
+        stage: diagnostic.0,
+        reason_code: diagnostic.1,
+        upstream_status: diagnostic.2,
+    }
+}
+
+fn scraper_failure_reason(error: &ScraperError) -> &'static str {
+    use crate::application::{plugin_runtime::PluginRuntimeError, plugins::PluginServiceError};
+
+    match error {
+        ScraperError::UnsupportedCapability(_) => "UNSUPPORTED_CAPABILITY",
+        ScraperError::Storage(_) => "STORAGE_ERROR",
+        ScraperError::Provider(_) => "PROVIDER_ERROR",
+        ScraperError::InvalidResponse(_) => "SCRAPER_INVALID_RESPONSE",
+        ScraperError::Plugin(error) => match error {
+            PluginServiceError::UnknownPlugin(_) => "PLUGIN_UNKNOWN",
+            PluginServiceError::Unavailable(_) => "PLUGIN_UNAVAILABLE",
+            PluginServiceError::InvalidConfig => "PLUGIN_CONFIG_INVALID",
+            PluginServiceError::NoUpdate => "PLUGIN_NOT_READY",
+            PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",
+            PluginServiceError::ImageAsset(_) => "PLUGIN_ASSET_FAILED",
+            PluginServiceError::ConfigIo(_) => "PLUGIN_CONFIG_IO_FAILED",
+            PluginServiceError::Runtime(error) => match error {
+                PluginRuntimeError::UnknownPlugin(_) => "PLUGIN_UNKNOWN",
+                PluginRuntimeError::Io(_) => "PLUGIN_IO_FAILED",
+                PluginRuntimeError::Json(_) | PluginRuntimeError::Protocol(_) => {
+                    "PLUGIN_PROTOCOL_FAILED"
+                }
+                PluginRuntimeError::Plugin { .. } => "PLUGIN_REPORTED_ERROR",
+                PluginRuntimeError::Timeout => "PLUGIN_TIMEOUT",
+                PluginRuntimeError::Exited => "PLUGIN_EXITED",
+            },
+            PluginServiceError::Store(_) => "PLUGIN_STORE_FAILED",
+            PluginServiceError::Storage(_) => "STORAGE_ERROR",
+        },
+    }
+}
+
+fn image_write_failure_reason(
+    error: &crate::application::images::ImageWriteError,
+) -> (&'static str, Option<u16>) {
+    use crate::application::images::ImageWriteError;
+
+    match error {
+        ImageWriteError::InvalidConfiguration(_) => ("IMAGE_CONFIG_INVALID", None),
+        ImageWriteError::InvalidImageType(_) => ("IMAGE_TYPE_INVALID", None),
+        ImageWriteError::InvalidUrl(_) => ("IMAGE_URL_INVALID", None),
+        ImageWriteError::ClientBuild(_) => ("IMAGE_CLIENT_INIT_FAILED", None),
+        ImageWriteError::Download(_) => ("IMAGE_DOWNLOAD_FAILED", None),
+        ImageWriteError::UpstreamStatus { status } => ("IMAGE_UPSTREAM_STATUS", Some(*status)),
+        ImageWriteError::UnsupportedContentType { .. } => ("IMAGE_CONTENT_TYPE_UNSUPPORTED", None),
+        ImageWriteError::InvalidContent { .. } => ("IMAGE_CONTENT_INVALID", None),
+        ImageWriteError::TooLarge { .. } => ("IMAGE_TOO_LARGE", None),
+        ImageWriteError::ItemNotFound => ("IMAGE_ITEM_NOT_FOUND", None),
+        ImageWriteError::PathOutsideRoot(_) => ("IMAGE_PATH_OUTSIDE_ROOT", None),
+        ImageWriteError::SymlinkTarget(_) => ("IMAGE_SYMLINK_REJECTED", None),
+        ImageWriteError::ConcurrentModification(_) => ("IMAGE_CONCURRENT_MODIFICATION", None),
+        ImageWriteError::AttemptInProgress => ("IMAGE_ATTEMPT_IN_PROGRESS", None),
+        ImageWriteError::Io { .. } => ("IMAGE_IO_FAILED", None),
+        ImageWriteError::Storage(_) => ("STORAGE_ERROR", None),
+    }
+}
+
 impl From<MetadataSelectionError> for MetadataReidentifyError {
     fn from(error: MetadataSelectionError) -> Self {
         Self::Selection(error)
@@ -2176,6 +2415,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         error::Error,
+        io::{self, Write},
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -2191,9 +2431,10 @@ mod tests {
         MetadataRequestPlan, acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
         candidate_count_for_page, deduplicate_item_ids_preserving_first_occurrence,
         dispatch_panic_outcome, metadata_fill_missing_global_permits, metadata_global_permits,
-        metadata_request_plan_is_complete, metadata_worker_concurrency,
-        metadata_worker_configured_concurrency, metadata_worker_default_concurrency,
-        reserve_fill_missing_queue_capacity, run_fill_missing_dispatcher_loop,
+        metadata_reidentify_issue_diagnostic, metadata_request_plan_is_complete,
+        metadata_worker_concurrency, metadata_worker_configured_concurrency,
+        metadata_worker_default_concurrency, reserve_fill_missing_queue_capacity,
+        run_fill_missing_dispatcher_loop,
     };
     use crate::{
         application::{
@@ -2213,6 +2454,34 @@ mod tests {
         library::{LibraryKind, LibraryScraperRole},
         storage::Database,
     };
+
+    #[derive(Clone)]
+    struct CapturedTraceWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedTraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedTraceWriterFactory {
+        type Writer = CapturedTraceWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedTraceWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CapturedTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("captured trace buffer is unavailable"))?;
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Clone)]
     struct RoleRecordingAdapter {
@@ -2700,6 +2969,7 @@ mod tests {
 
         service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &item,
                 super::MetadataRefreshMode::FillMissing,
@@ -2756,6 +3026,7 @@ mod tests {
 
         service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &item,
                 super::MetadataRefreshMode::FullRefresh,
@@ -2803,6 +3074,7 @@ mod tests {
 
         let candidate_count = service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &item,
                 super::MetadataRefreshMode::Reidentify,
@@ -2903,6 +3175,7 @@ mod tests {
         }];
         service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &item,
                 super::MetadataRefreshMode::FullRefresh,
@@ -2940,6 +3213,7 @@ mod tests {
         ];
         service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &current,
                 super::MetadataRefreshMode::FullRefresh,
@@ -3016,6 +3290,7 @@ mod tests {
 
         service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &item,
                 super::MetadataRefreshMode::FullRefresh,
@@ -3030,6 +3305,83 @@ mod tests {
                 .fetch_one(database.pool())
                 .await?;
         assert_eq!(selected_scraper.as_deref(), Some("primary"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supplemental_scraper_attempt_failures_are_logged_after_primary_success()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CapturedTraceWriterFactory(Arc::clone(&captured_logs)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+        let primary = RoleRecordingAdapter::new("primary", Arc::clone(&calls));
+        let supplement =
+            RoleRecordingAdapter::with_search_failure("supplement", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir,
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(selection),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "supplement".to_owned(),
+                role: LibraryScraperRole::Supplement,
+                provider: super::ScraperProvider::from_adapter(supplement),
+            },
+        ];
+
+        service
+            .refresh_with_scraper_roles(
+                "metadata-supplement-job",
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let calls = calls
+            .lock()
+            .expect("scraper call list should not be poisoned")
+            .clone();
+        assert!(calls.iter().any(|call| call == "primary:search"));
+        assert!(calls.iter().any(|call| call == "supplement:search"));
+        let logs = String::from_utf8(
+            captured_logs
+                .lock()
+                .map_err(|_| "trace buffer poisoned")?
+                .clone(),
+        )?;
+        assert!(logs.contains("metadata_reidentify_scraper_attempt_issue"));
+        assert!(logs.contains("metadata-supplement-job"));
+        assert!(logs.contains(&item_id));
+        assert!(logs.contains("supplement"));
+        assert!(logs.contains("SUPPLEMENT"));
+        assert!(logs.contains("PROVIDER_ERROR"));
+        assert!(logs.contains("RECOVERABLE"));
+        assert!(!logs.contains("test scraper search failed"));
         Ok(())
     }
 
@@ -3067,6 +3419,7 @@ mod tests {
 
         service
             .refresh_with_scraper_roles(
+                "metadata-test-job",
                 &item_id,
                 &item,
                 super::MetadataRefreshMode::FullRefresh,
@@ -3457,5 +3810,105 @@ mod tests {
         );
 
         assert_eq!(unique_ids, ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn metadata_reidentify_issue_diagnostic_classifies_failures_without_raw_provider_text() {
+        let low_confidence = super::MetadataReidentifyError::LowConfidence;
+        let diagnostic = metadata_reidentify_issue_diagnostic(&low_confidence);
+        assert_eq!(diagnostic.stage, "MATCH");
+        assert_eq!(diagnostic.reason_code, "NO_CONFIRMED_CANDIDATE");
+
+        let image_upstream = super::MetadataReidentifyError::Selection(
+            crate::application::candidates::MetadataSelectionError::Image(
+                crate::application::images::ImageWriteError::UpstreamStatus { status: 502 },
+            ),
+        );
+        let diagnostic = metadata_reidentify_issue_diagnostic(&image_upstream);
+        assert_eq!(diagnostic.stage, "IMAGE_WRITE");
+        assert_eq!(diagnostic.reason_code, "IMAGE_UPSTREAM_STATUS");
+        assert_eq!(diagnostic.upstream_status, Some(502));
+
+        let provider_error = super::MetadataReidentifyError::Scraper(ScraperError::Provider(
+            "provider response contains private diagnostic marker".to_owned(),
+        ));
+        let diagnostic = metadata_reidentify_issue_diagnostic(&provider_error);
+        assert_eq!(diagnostic.reason_code, "PROVIDER_ERROR");
+        assert!(!format!("{diagnostic:?}").contains("private diagnostic marker"));
+
+        let plugin_timeout = super::MetadataReidentifyError::Scraper(ScraperError::Plugin(
+            crate::application::plugins::PluginServiceError::Runtime(
+                crate::application::plugin_runtime::PluginRuntimeError::Timeout,
+            ),
+        ));
+        let diagnostic = metadata_reidentify_issue_diagnostic(&plugin_timeout);
+        assert_eq!(diagnostic.stage, "SCRAPER");
+        assert_eq!(diagnostic.reason_code, "PLUGIN_TIMEOUT");
+    }
+
+    #[test]
+    fn metadata_scraper_attempt_log_records_manual_review_without_item_content() {
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CapturedTraceWriterFactory(Arc::clone(&captured_logs)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+        let scraper = super::ResolvedScraper {
+            scraper_id: "primary".to_owned(),
+            role: LibraryScraperRole::Primary,
+            provider: super::ScraperProvider::from_adapter(RoleRecordingAdapter::new(
+                "primary",
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        };
+
+        super::log_metadata_scraper_attempt_issue(
+            "metadata-job",
+            "media-item",
+            super::MetadataRefreshMode::FullRefresh,
+            &scraper,
+            &super::MetadataReidentifyError::LowConfidence,
+            "NEEDS_REVIEW",
+        );
+        let upstream_error = super::MetadataReidentifyError::Selection(
+            crate::application::candidates::MetadataSelectionError::Image(
+                crate::application::images::ImageWriteError::UpstreamStatus { status: 502 },
+            ),
+        );
+        super::log_metadata_scraper_attempt_issue(
+            "metadata-job",
+            "media-item",
+            super::MetadataRefreshMode::FullRefresh,
+            &scraper,
+            &upstream_error,
+            "FAILED",
+        );
+
+        let logs = String::from_utf8(
+            captured_logs
+                .lock()
+                .expect("trace buffer should not be poisoned")
+                .clone(),
+        )
+        .expect("trace output should be valid UTF-8");
+        assert!(logs.contains("metadata_reidentify_scraper_attempt_issue"));
+        assert!(logs.contains("metadata-job"));
+        assert!(logs.contains("media-item"));
+        assert!(logs.contains("primary"));
+        assert!(logs.contains("NEEDS_REVIEW"));
+        assert!(logs.contains("LOW_CONFIDENCE"));
+        assert!(logs.contains("NO_CONFIRMED_CANDIDATE"));
+        assert!(!logs.contains("Example Movie"));
+        let log_events = logs
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("captured logs should be valid JSON lines");
+        assert_eq!(log_events.len(), 2);
+        assert!(log_events[0]["fields"].get("upstream_status").is_none());
+        assert_eq!(log_events[1]["fields"]["upstream_status"], 502);
     }
 }

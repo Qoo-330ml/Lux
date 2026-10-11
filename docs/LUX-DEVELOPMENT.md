@@ -10234,6 +10234,25 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验证：存储与增量扫描定向单测通过；scanning_jobs 81/81、scanned_metadata 23/23、scanned_series_metadata 3/3；cargo build --locked、cargo test --locked --all-targets（库测试 835 passed、20 ignored，所有集成目标通过）、cargo fmt --all -- --check、cargo clippy --locked --all-targets --all-features -- -D warnings 通过。Cargo 使用 Toshiba 原项目共享 target。本机 arm64；未部署 FNOS、未触发生产刮削。
 
+#### LUX-476：补充元数据刮削逐条诊断日志
+
+范围：为元数据刷新/补全任务增加结构化运行日志，帮助按 job ID 和 item ID 定位每条失败的阶段与原因。记录刮削器选择、插件不可用/超时/退出/无效响应、候选匹配未确认、元数据写回、图片下载/校验/路径写回及可用的图片上游 HTTP 状态码。主、备用或补充来源的单次尝试失败时，即使后续回退成功，也单独保留尝试记录；主来源返回低置信度候选、需要人工复核时记录 `NEEDS_REVIEW`，但保留原完成状态。没有选中刮削器而被跳过的条目单独记录 `NO_SCRAPER_SELECTED` 原因。保留现有任务状态、持久化错误码和 API DTO；LOW_CONFIDENCE 仍是完成状态下带错误码的条目，任务详情必须列出所有带错误码的条目。
+
+运行日志事件名固定为 `metadata_reidentify_item_issue`、`metadata_reidentify_item_skipped` 和 `metadata_reidentify_scraper_attempt_issue`；逐尝试事件额外包含 `scraper_id`、`scraper_role` 和 `attempt_outcome`。字段使用 `job_id`、`item_id`、`mode`、`item_status`、`error_code`、`failure_stage`、`failure_reason`、`upstream_status` 和 `item_result_recorded` 等稳定值。禁止写入标题、路径、完整外部错误文本、图片 URL、查询参数或凭据。管理员可从“任务与日志”导出运行日志后按事件名、job ID 或 item ID 搜索。
+
+验收：
+
+- [x] 每条已记录的失败/低匹配结果产生带 job/item ID、模式、阶段和稳定原因码的 JSON 运行日志；图片上游 HTTP 状态存在时可查询。
+- [x] 主、备用或补充刮削器尝试的失败即使后续来源成功也会记录，并标明来源 ID、角色和尝试结果；低置信度待复核结果记录为 `NEEDS_REVIEW`。
+- [x] 未选刮削器导致补全项跳过时产生 `metadata_reidentify_item_skipped` 日志，但不改变该任务的既有状态语义。
+- [x] 原始 provider 错误、URL、标题、路径和凭据不会写入诊断日志；图片状态码只在已知时记录。
+- [x] 元数据任务详情在返回的条目页中包含所有 `error != null` 的条目，包括状态为 `COMPLETED` 的 `LOW_CONFIDENCE`；没有问题的条目保持隐藏。
+- [x] 不新增 migration、公共 API 字段或日志查询端点；已有任务错误码和状态合同保持不变。
+
+验证：Toshiba 原项目共享 target 下，刮削 service 单测、`reidentify` 集成测试、`cargo build --locked`、library-only Clippy、格式检查、管理任务页定向测试、Web 类型检查和生产构建通过。全量 Rust 测试与 all-targets Clippy 被未修改的 `tests/performance.rs` 中未定义变量/函数挡住；Web 全量测试有 5 个 `HomePage` 轮播测试失败，单独运行该文件可复现，其余 Node 测试和 576 个 Vitest 通过。本次改动没有部署到生产，也没有对报告用户的媒体库执行刮削。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`、本文档。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

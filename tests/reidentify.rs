@@ -1,8 +1,9 @@
 mod common;
 
 use std::{
+    io::{self, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -20,12 +21,13 @@ use luxd::{
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
+        plugins::PluginService,
         reidentify::{
             MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
             MetadataReidentifyService,
         },
         scanner::LibraryScanner,
-        scraper::ScraperProvider,
+        scraper::{ScraperProvider, ScraperResolver},
         setup::SetupService,
         webhooks::WebhookService,
     },
@@ -40,6 +42,34 @@ use tokio::{net::TcpListener, sync::Semaphore};
 use uuid::Uuid;
 
 static FILL_MISSING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone)]
+struct CapturedLogWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriterFactory {
+    type Writer = CapturedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogWriter(Arc::clone(&self.0))
+    }
+}
+
+impl Write for CapturedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut output = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("captured log buffer is unavailable"))?;
+        output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 async fn tmdb_search_stub() -> Json<Value> {
     Json(json!({
@@ -2157,5 +2187,60 @@ async fn scraper_unavailable_metadata_job_is_deferred() -> Result<(), Box<dyn st
         finished.error.as_deref(),
         Some("DEFERRED_PROVIDER_UNAVAILABLE")
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fill_missing_without_selected_scraper_records_a_structured_skip_log()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let captured_logs = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedLogWriterFactory(Arc::clone(&captured_logs)))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+    let (temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let selection =
+        MetadataSelectionService::new(database.clone(), ImageWriteService::new(database.clone())?);
+    let resolver = ScraperResolver::new(
+        database.clone(),
+        PluginService::new(database.clone(), temp_dir.path().join("config")),
+    );
+    let metadata = MetadataReidentifyService::with_resolver_and_selection(
+        database.clone(),
+        unreachable_tmdb_provider()?,
+        resolver,
+        Some(selection),
+    );
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let finished = metadata.get_job(&job.id).await?;
+    assert_eq!(finished.status, "COMPLETED");
+    assert_eq!(finished.items.len(), 1);
+    assert_eq!(finished.items[0].status, "COMPLETED");
+    assert_eq!(finished.items[0].error, None);
+    let logs = String::from_utf8(
+        captured_logs
+            .lock()
+            .map_err(|_| "log buffer poisoned")?
+            .clone(),
+    )?;
+    assert!(logs.contains("metadata_reidentify_item_skipped"));
+    assert!(logs.contains("NO_SCRAPER_SELECTED"));
+    assert!(logs.contains(&job.id));
+    assert!(logs.contains(&item_id));
     Ok(())
 }
