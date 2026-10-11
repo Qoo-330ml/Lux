@@ -8,6 +8,36 @@ struct ManifestApplyRootPreparation {
     removal_candidates: Vec<StoredScanManifestDelta>,
 }
 
+struct ManifestApplyRootDeltaContext<'a> {
+    job: &'a StoredScanJob,
+    manifest_id: &'a str,
+    library_kind: &'a str,
+    root_id: &'a str,
+    root: &'a StoredLibraryRoot,
+    root_deltas: &'a [StoredScanManifestDelta],
+    cancellation: &'a AtomicBool,
+}
+
+struct ManifestApplyPreparationContext<'a> {
+    job_id: &'a str,
+    root: &'a StoredLibraryRoot,
+    root_deltas: &'a [StoredScanManifestDelta],
+    library_kind: &'a str,
+    expected_root_device: Option<i64>,
+    expected_root_inode: Option<i64>,
+    cancellation: &'a AtomicBool,
+}
+
+struct ManifestApplyCommitContext<'a> {
+    job: &'a StoredScanJob,
+    manifest_id: &'a str,
+    root_id: &'a str,
+    root_deltas: &'a [StoredScanManifestDelta],
+    files: &'a ManifestApplyPreparedFiles,
+    removed_media_paths: &'a [String],
+    removed_sidecar_paths: &'a [String],
+}
+
 enum ManifestApplyPreparationOutcome {
     Prepared(ManifestApplyRootPreparation),
     Cancelled(ScanBatchReport),
@@ -663,15 +693,15 @@ impl ScanJobService {
                 .collect::<Vec<_>>();
             let result = match roots.get(&root_id) {
                 Some(root) => match self
-                    .apply_scan_manifest_root_deltas(
+                    .apply_scan_manifest_root_deltas(ManifestApplyRootDeltaContext {
                         job,
                         manifest_id,
                         library_kind,
-                        &root_id,
+                        root_id: &root_id,
                         root,
-                        &root_deltas,
+                        root_deltas: &root_deltas,
                         cancellation,
-                    )
+                    })
                     .await?
                 {
                     ManifestApplyRootOutcome::Applied(result) => result,
@@ -703,14 +733,17 @@ impl ScanJobService {
 
     async fn apply_scan_manifest_root_deltas(
         &self,
-        job: &StoredScanJob,
-        manifest_id: &str,
-        library_kind: &str,
-        root_id: &str,
-        root: &StoredLibraryRoot,
-        root_deltas: &[StoredScanManifestDelta],
-        cancellation: &AtomicBool,
+        context: ManifestApplyRootDeltaContext<'_>,
     ) -> Result<ManifestApplyRootOutcome, ScanJobError> {
+        let ManifestApplyRootDeltaContext {
+            job,
+            manifest_id,
+            library_kind,
+            root_id,
+            root,
+            root_deltas,
+            cancellation,
+        } = context;
         let root_path = PathBuf::from(&root.canonical_path);
         let root_identity = self
             .database
@@ -743,15 +776,15 @@ impl ScanJobService {
             .map(|(_, device, inode)| (*device, *inode))
             .unwrap_or((None, None));
         let prepared = match self
-            .prepare_manifest_root_delta_files(
-                job,
+            .prepare_manifest_root_delta_files(ManifestApplyPreparationContext {
+                job_id: &job.id,
                 root,
                 root_deltas,
                 library_kind,
                 expected_root_device,
                 expected_root_inode,
                 cancellation,
-            )
+            })
             .await?
         {
             ManifestApplyPreparationOutcome::Prepared(prepared) => prepared,
@@ -791,15 +824,15 @@ impl ScanJobService {
         files.unstable_delta_ids.sort();
         files.unstable_delta_ids.dedup();
         let result = self
-            .commit_manifest_root_delta_batch(
+            .commit_manifest_root_delta_batch(ManifestApplyCommitContext {
                 job,
                 manifest_id,
                 root_id,
                 root_deltas,
-                &files,
-                &removed_media_paths,
-                &removed_sidecar_paths,
-            )
+                files: &files,
+                removed_media_paths: &removed_media_paths,
+                removed_sidecar_paths: &removed_sidecar_paths,
+            })
             .await?;
         Ok(ManifestApplyRootOutcome::Applied(result))
     }
@@ -852,14 +885,17 @@ impl ScanJobService {
 
     async fn prepare_manifest_root_delta_files(
         &self,
-        job: &StoredScanJob,
-        root: &StoredLibraryRoot,
-        root_deltas: &[StoredScanManifestDelta],
-        library_kind: &str,
-        expected_root_device: Option<i64>,
-        expected_root_inode: Option<i64>,
-        cancellation: &AtomicBool,
+        context: ManifestApplyPreparationContext<'_>,
     ) -> Result<ManifestApplyPreparationOutcome, ScanJobError> {
+        let ManifestApplyPreparationContext {
+            job_id,
+            root,
+            root_deltas,
+            library_kind,
+            expected_root_device,
+            expected_root_inode,
+            cancellation,
+        } = context;
         let root_path = PathBuf::from(&root.canonical_path);
         let mut files = ManifestApplyPreparedFiles::default();
         let mut removal_candidates = Vec::new();
@@ -869,7 +905,7 @@ impl ScanJobService {
         for delta in root_deltas {
             if cancellation.load(Ordering::Acquire) {
                 return Ok(ManifestApplyPreparationOutcome::Cancelled(
-                    self.cancel_running_job(&job.id).await?,
+                    self.cancel_running_job(job_id).await?,
                 ));
             }
             if delta.delta_kind == "REMOVE" {
@@ -1054,14 +1090,17 @@ impl ScanJobService {
 
     async fn commit_manifest_root_delta_batch(
         &self,
-        job: &StoredScanJob,
-        manifest_id: &str,
-        root_id: &str,
-        root_deltas: &[StoredScanManifestDelta],
-        files: &ManifestApplyPreparedFiles,
-        removed_media_paths: &[String],
-        removed_sidecar_paths: &[String],
+        context: ManifestApplyCommitContext<'_>,
     ) -> Result<ManifestApplyRootResult, ScanJobError> {
+        let ManifestApplyCommitContext {
+            job,
+            manifest_id,
+            root_id,
+            root_deltas,
+            files,
+            removed_media_paths,
+            removed_sidecar_paths,
+        } = context;
         let transaction_started = Instant::now();
         let result = self
             .database

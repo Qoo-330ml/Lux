@@ -25,6 +25,14 @@ struct ReconciliationFileBatchState {
     episode_files_by_root: HashMap<String, Vec<NewEpisodeFile>>,
 }
 
+struct ReconciliationFileBatchContext<'a> {
+    job: &'a StoredScanJob,
+    library_kind: &'a str,
+    roots: &'a [StoredLibraryRoot],
+    batch: &'a [StoredReconciliationScanEntry],
+    cancellation: &'a AtomicBool,
+}
+
 impl ReconciliationFileBatchState {
     fn new(next_count: i64) -> Self {
         Self {
@@ -56,6 +64,13 @@ struct MovieReconciliationFileBatchState {
     )>,
     regular_works: Vec<ReconciliationRegularWork>,
     prepared_files: HashMap<String, Vec<NewMovieFile>>,
+}
+
+struct MovieReconciliationFileBatchContext<'a> {
+    job: &'a StoredScanJob,
+    roots: &'a [StoredLibraryRoot],
+    batch: &'a [StoredReconciliationScanEntry],
+    cancellation: &'a AtomicBool,
 }
 
 impl MovieReconciliationFileBatchState {
@@ -404,19 +419,22 @@ impl ScanJobService {
                 concurrency,
             )
             .await?;
+        let context = ReconciliationFileBatchContext {
+            job,
+            library_kind,
+            roots,
+            batch,
+            cancellation,
+        };
         let mut classification_cache = MixedClassificationCache::default();
         for index in 0..batch.len() {
             if let Some(report) = self
                 .process_reconciliation_file_entry(
-                    job,
-                    library_kind,
-                    roots,
-                    batch,
+                    &context,
                     &mut quick_results,
                     &mut state,
                     &mut classification_cache,
                     index,
-                    cancellation,
                 )
                 .await?
             {
@@ -483,16 +501,16 @@ impl ScanJobService {
 
     async fn process_reconciliation_file_entry(
         &self,
-        job: &StoredScanJob,
-        library_kind: &str,
-        roots: &[StoredLibraryRoot],
-        batch: &[StoredReconciliationScanEntry],
+        context: &ReconciliationFileBatchContext<'_>,
         quick_results: &mut [Option<(String, ScanReport)>],
         state: &mut ReconciliationFileBatchState,
         classification_cache: &mut MixedClassificationCache,
         entry_index: usize,
-        cancellation: &AtomicBool,
     ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        let job = context.job;
+        let roots = context.roots;
+        let batch = context.batch;
+        let cancellation = context.cancellation;
         if cancellation.load(Ordering::Acquire) {
             return self.cancel_running_job(&job.id).await.map(Some);
         }
@@ -548,8 +566,7 @@ impl ScanJobService {
             return Ok(None);
         }
         self.queue_reconciliation_media_work(
-            job,
-            library_kind,
+            context,
             root,
             entry,
             &path,
@@ -670,14 +687,15 @@ impl ScanJobService {
 
     async fn queue_reconciliation_media_work(
         &self,
-        job: &StoredScanJob,
-        library_kind: &str,
+        context: &ReconciliationFileBatchContext<'_>,
         root: &StoredLibraryRoot,
         entry: &StoredReconciliationScanEntry,
         path: &Path,
         state: &mut ReconciliationFileBatchState,
         classification_cache: &mut MixedClassificationCache,
     ) -> Result<(), ScanJobError> {
+        let job = context.job;
+        let library_kind = context.library_kind;
         let existing_entries = state
             .existing_entries_by_root
             .get(&root.id)
@@ -1158,12 +1176,12 @@ impl ScanJobService {
             self.publish_webhook_event(completed_job, WebhookEventType::ScanCompleted, None)
                 .await;
         }
-        return Ok(ScanBatchReport {
+        Ok(ScanBatchReport {
             status: "COMPLETED".to_owned(),
             processed: 0,
             created_items: 0,
             completed: true,
-        });
+        })
     }
 
     async fn scan_reconciliation_file_fingerprints(
@@ -1236,17 +1254,15 @@ impl ScanJobService {
                 concurrency,
             )
             .await?;
+        let context = MovieReconciliationFileBatchContext {
+            job,
+            roots,
+            batch,
+            cancellation,
+        };
         for index in 0..batch.len() {
             if let Some(report) = self
-                .process_movie_reconciliation_entry(
-                    job,
-                    roots,
-                    batch,
-                    &mut quick_results,
-                    &mut state,
-                    index,
-                    cancellation,
-                )
+                .process_movie_reconciliation_entry(&context, &mut quick_results, &mut state, index)
                 .await?
             {
                 return Ok(report);
@@ -1273,14 +1289,15 @@ impl ScanJobService {
 
     async fn process_movie_reconciliation_entry(
         &self,
-        job: &StoredScanJob,
-        roots: &[StoredLibraryRoot],
-        batch: &[StoredReconciliationScanEntry],
+        context: &MovieReconciliationFileBatchContext<'_>,
         quick_results: &mut [Option<(String, ScanReport)>],
         state: &mut MovieReconciliationFileBatchState,
         index: usize,
-        cancellation: &AtomicBool,
     ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        let job = context.job;
+        let roots = context.roots;
+        let batch = context.batch;
+        let cancellation = context.cancellation;
         if cancellation.load(Ordering::Acquire) {
             return self.cancel_running_job(&job.id).await.map(Some);
         }
