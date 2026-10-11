@@ -1,9 +1,11 @@
 use super::*;
 
 mod incremental;
+mod lifecycle;
 pub(in crate::application::scanner) mod local_metadata;
 mod manifest_discovery;
 mod manifest_index;
+mod postprocessing;
 mod reconciliation;
 
 #[derive(Clone)]

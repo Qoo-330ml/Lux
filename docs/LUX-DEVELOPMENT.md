@@ -10345,13 +10345,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] lifecycle 负责任务状态转换与锁；postprocessing 负责已有后处理调用，不互相复制状态。
-- [ ] 增量与全量扫描的完成、取消、失败重试、锁释放、Home 刷新、Webhook/用户事件顺序保持。
-- [ ] 相关定向测试通过，文件职责与模块可见性记录清楚。
+- [x] lifecycle 负责任务状态转换与锁；postprocessing 负责已有后处理调用，不互相复制状态。
+- [x] 增量与全量扫描的完成、取消、失败重试、锁释放、Home 刷新、Webhook/用户事件顺序保持。
+- [x] 相关定向测试通过，文件职责与模块可见性记录清楚。
 
 验证：`cargo test --locked --test scanning_jobs --test shutdown_jobs --test scanned_metadata --test watch`、fmt 和 build。
 
 预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/lifecycle.rs`、`src/application/scanner/jobs/postprocessing.rs`、本文档。
+
+结果（2026-10-12）：任务创建、取消/重试、run fencing、状态查询与失败收尾移入 `jobs/lifecycle.rs`；后处理执行体、扫描锁协调、probe、metadata、thumbnail、cover 与 webhook 发布移入 `jobs/postprocessing.rs`。`run_to_completion*` 公开入口仍与每任务 worker/run guard 协调放在 `jobs/local_metadata.rs`，并调用 postprocessing 执行体；`ScanJobService` 公开方法路径与签名保持不变。索引完成和后处理仍由既有 `scan_phase` 分离，后处理仍在现有有界 worker 中释放共享扫描锁。定向集成目标 `scanned_metadata` 23 项、`scanning_jobs` 81 项、`shutdown_jobs` 1 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 3,195 行降至 826 行；lifecycle 与 postprocessing 模块分别 1,323 行和 1,078 行。未改状态、事件或副作用顺序，也未据此作性能结论。
 
 #### LUX-483：简化扫描长编排函数并关闭阶段 24
 
