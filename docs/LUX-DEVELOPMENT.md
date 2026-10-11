@@ -10355,20 +10355,50 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：任务创建、取消/重试、run fencing、状态查询与失败收尾移入 `jobs/lifecycle.rs`；后处理执行体、扫描锁协调、probe、metadata、thumbnail、cover 与 webhook 发布移入 `jobs/postprocessing.rs`。`run_to_completion*` 公开入口仍与每任务 worker/run guard 协调放在 `jobs/local_metadata.rs`，并调用 postprocessing 执行体；`ScanJobService` 公开方法路径与签名保持不变。索引完成和后处理仍由既有 `scan_phase` 分离，后处理仍在现有有界 worker 中释放共享扫描锁。定向集成目标 `scanned_metadata` 23 项、`scanning_jobs` 81 项、`shutdown_jobs` 1 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 3,195 行降至 826 行；lifecycle 与 postprocessing 模块分别 1,323 行和 1,078 行。未改状态、事件或副作用顺序，也未据此作性能结论。
 
-#### LUX-483：简化扫描长编排函数并关闭阶段 24
+#### LUX-483：收口 scanner facade 与 reconciliation helper
 
-范围：在模块边界稳定后，整理 `run_reconciliation_file_batch`、`run_movie_reconciliation_file_batch`、Manifest diff/apply 与全量/增量完成编排，将已有步骤提取成命名清楚的准备、校验、提交和发布操作。只重排现有控制流，不改变事务、取消检查、错误传播和副作用顺序。
+范围：把 scanner 根模块残留、同时供 `LibraryScanner` 与 reconciliation 使用的 batch/task helper 归入 `scanner/library.rs`，跨模块调用使用 scanner 内部最小可见性；根模块只保留 facade、稳定共享类型、错误/API 与 re-export。`lifecycle.rs` 已承载扫描批次 runner，本任务不再新增重复 runner 模块。只移动实现，不改行为。
 
 验收：
 
-- [ ] 单个编排函数目标不超过 150 行；超出时需在实现记录说明其单一职责与保留理由。
-- [ ] `scanner.rs` 只保留 facade、共享 API 和路由 re-export，目标不超过 600 行；生产子模块按职责保持可审阅规模。
+- [x] `scanner.rs` 不超过 600 行，电影/剧集文件解析和 fingerprint 等公开路径保持不变。
+- [x] library/reconciliation 共用的 task/result helper 位于 `library` 模块，未改变扫描批次、事务或错误传播。
+- [x] scanner 单测、scanning_jobs 定向回归、fmt 和 build 通过。
+
+验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test scanning_jobs --test scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/jobs/reconciliation.rs`、本文档。
+
+结果（2026-10-12）：电影/剧集并发扫描与 reconciliation 共用的 task/result 类型和 JoinSet 收集 helper 从根模块移入 `scanner/library.rs`，reconciliation 通过 scanner 子树内受限可见性调用。根模块为 557 行，保留 facade、稳定共享 DTO/error、文件 fingerprint API 与 re-export；不新增与 `jobs/lifecycle.rs` 重叠的 runner。scanner 单测 41 项通过（1 项按要求忽略），`scanner` 18 项、`scanning_jobs` 81 项通过；build、fmt 和 `git diff --check` 通过。纯移动，无行为或性能结论。
+
+#### LUX-484：简化 reconciliation 与 Manifest 编排
+
+范围：整理 `run_reconciliation_file_batch`、`run_movie_reconciliation_file_batch`、Manifest diff/apply，将已有准备、根与文件身份校验、事务提交和事件发布步骤提取成有名操作。只重排现有控制流，不改变事务、取消检查、错误传播和副作用顺序。
+
+验收：
+
+- [ ] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [ ] 根离线/替换、同路径更新、并发增量索引、提交失败、删除确认与 workflow 2 兼容语义保持。
+- [ ] 相关定向测试通过。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+#### LUX-485：简化扫描完成编排并关闭阶段 24
+
+范围：整理增量批次与全量/增量完成、取消收尾和后处理编排，将已有步骤提取成明确的准备、校验、提交和发布操作。保持索引完成与后处理两个阶段；不改变事务、锁释放、取消、错误传播、worker 上限及事件顺序。
+
+验收：
+
+- [ ] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [ ] 增量/全量成功、取消、失败重试、共享扫描锁释放、Home 刷新与 webhook/用户事件顺序保持。
 - [ ] 全量 Rust 完成门通过：build、all-targets tests、fmt、all-targets/all-features Clippy；扫描定向目标通过。
-- [ ] 模块边界记录更新；阶段门由项目所有者确认后再进入后续阶段。
+- [ ] 模块边界记录更新；阶段门由项目所有者确认后再进入下一阶段。
 
-验证：Toshiba 挂载检查后设置共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行全部扫描定向目标与 `cargo test --locked --all-targets`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，记录 `uname -m`。不得以本机 ARM 结果推断 NAS/x86 性能。
+验证：Toshiba 挂载检查后设置共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行扫描定向目标与 `cargo test --locked --all-targets`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，记录 `uname -m`。不得以本机 ARM 结果推断 NAS/x86 性能。
 
-预计文件：`src/application/scanner/jobs/runner.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/postprocessing.rs`、`tests/scanning_jobs.rs`、本文档。
+预计文件：`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/postprocessing.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
 
 依赖：无。明确不做：Storage/API 重构、schema/SQL 修改、新后台 worker、新扫描状态、新性能承诺或部署。
 

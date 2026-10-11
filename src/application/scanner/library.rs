@@ -2,6 +2,282 @@ use super::*;
 
 mod prepare;
 
+pub(in crate::application::scanner) type MoviePreparationOutput = (
+    usize,
+    String,
+    StoredReconciliationScanEntry,
+    Option<NewMovieFile>,
+);
+pub(in crate::application::scanner) type MoviePreparationTask =
+    Result<MoviePreparationOutput, ScannerError>;
+pub(in crate::application::scanner) type MovieFingerprintTask =
+    Result<(usize, MovieQuickScanResult), ScannerError>;
+pub(in crate::application::scanner) type EpisodeQuickResult =
+    Option<(String, ScanReport, Option<(String, String)>)>;
+pub(in crate::application::scanner) type EpisodeFingerprintTask =
+    Result<(usize, EpisodeQuickResult), ScannerError>;
+pub(in crate::application::scanner) type ReconciliationFingerprintTask =
+    Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+pub(in crate::application::scanner) type ReconciliationRegularTask =
+    Result<(usize, ScanReport), ScannerError>;
+pub(in crate::application::scanner) type ReconciliationRegularGroupTask =
+    Result<Vec<(usize, ScanReport)>, ScannerError>;
+
+pub(in crate::application::scanner) struct ReconciliationScanWork {
+    pub(in crate::application::scanner) entry: StoredReconciliationScanEntry,
+    pub(in crate::application::scanner) path: PathBuf,
+    pub(in crate::application::scanner) classification: MixedClassification,
+}
+
+#[derive(Clone)]
+pub(in crate::application::scanner) struct ReconciliationRegularWork {
+    pub(in crate::application::scanner) index: usize,
+    pub(in crate::application::scanner) entry: StoredReconciliationScanEntry,
+    pub(in crate::application::scanner) root: StoredLibraryRoot,
+    pub(in crate::application::scanner) path: PathBuf,
+    pub(in crate::application::scanner) classification: MixedClassification,
+}
+
+pub(in crate::application::scanner) enum MovieQuickScanResult {
+    Unchanged {
+        entry_id: String,
+        report: ScanReport,
+    },
+    Rescan,
+    RescanWithVariantSuffix(String),
+}
+
+pub(in crate::application::scanner) fn reconciliation_regular_group_key(
+    root_id: &str,
+    path: &Path,
+    classification: MixedClassification,
+    inferred_suffix: Option<&str>,
+    fallback_index: usize,
+) -> String {
+    let parsed_key = match classification {
+        MixedClassification::Movie => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                inferred_suffix
+                    .and_then(|suffix| parse_movie_filename_with_variant_suffix(name, suffix))
+                    .or_else(|| parse_movie_filename(name))
+            })
+            .map(|parsed| {
+                format!(
+                    "movie:{}:{:?}:{:?}",
+                    parsed.sort_title, parsed.production_year, parsed.provider_ids
+                )
+            }),
+        MixedClassification::Episode => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_episode_filename)
+            .map(|parsed| {
+                format!(
+                    "episode:{}:{:?}:{:?}:{:?}",
+                    parsed.sort_title, parsed.production_year, parsed.season, parsed.episode
+                )
+            }),
+        MixedClassification::Unresolved => None,
+    };
+    parsed_key.map_or_else(
+        || format!("path:{root_id}:{fallback_index}"),
+        |key| format!("{root_id}:{key}"),
+    )
+}
+
+pub(in crate::application::scanner) async fn collect_movie_fingerprint_task(
+    tasks: &mut JoinSet<MovieFingerprintTask>,
+    results: &mut [MovieQuickScanResult],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-fingerprint-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-fingerprint-task>"),
+                source: std::io::Error::other("movie fingerprint task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
+
+pub(in crate::application::scanner) async fn collect_episode_fingerprint_task(
+    tasks: &mut JoinSet<EpisodeFingerprintTask>,
+    results: &mut [EpisodeQuickResult],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-fingerprint-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-fingerprint-task>"),
+                source: std::io::Error::other("episode fingerprint task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
+
+pub(in crate::application::scanner) async fn collect_reconciliation_fingerprint_task(
+    tasks: &mut JoinSet<ReconciliationFingerprintTask>,
+    results: &mut [Option<(String, ScanReport)>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-fingerprint-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-fingerprint-task>"),
+                source: std::io::Error::other("reconciliation fingerprint task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
+
+pub(in crate::application::scanner) async fn collect_reconciliation_regular_task(
+    tasks: &mut JoinSet<ReconciliationRegularTask>,
+    results: &mut [Option<ScanReport>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-task>"),
+                source: std::io::Error::other("reconciliation regular task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = Some(result);
+    }
+    Ok(())
+}
+
+pub(in crate::application::scanner) async fn collect_reconciliation_regular_group_task(
+    tasks: &mut JoinSet<ReconciliationRegularGroupTask>,
+    results: &mut [Option<ScanReport>],
+) -> Result<(), ScannerError> {
+    let reports = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-group-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-group-task>"),
+                source: std::io::Error::other("reconciliation regular group task set is empty"),
+            });
+        }
+    };
+    for (index, report) in reports {
+        if let Some(slot) = results.get_mut(index) {
+            *slot = Some(report);
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::application::scanner) async fn join_movie_preparation(
+    tasks: &mut JoinSet<MoviePreparationTask>,
+) -> Result<MoviePreparationOutput, ScannerError> {
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(ScannerError::Io {
+            path: PathBuf::from("<scan-preparation-task>"),
+            source: std::io::Error::other(error.to_string()),
+        }),
+        None => Err(ScannerError::Io {
+            path: PathBuf::from("<scan-preparation-task>"),
+            source: std::io::Error::other("scan preparation task set is empty"),
+        }),
+    }
+}
+
+pub(in crate::application::scanner) async fn collect_movie_preparation_task(
+    tasks: &mut JoinSet<Result<(usize, Option<NewMovieFile>), ScannerError>>,
+    results: &mut Vec<(usize, Option<NewMovieFile>)>,
+) -> Result<(), ScannerError> {
+    let result = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-preparation-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-preparation-task>"),
+                source: std::io::Error::other("movie preparation task set is empty"),
+            });
+        }
+    };
+    results.push(result);
+    Ok(())
+}
+
+pub(in crate::application::scanner) async fn collect_episode_preparation_task(
+    tasks: &mut JoinSet<Result<(usize, Option<NewEpisodeFile>), ScannerError>>,
+    results: &mut [Option<NewEpisodeFile>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-preparation-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-preparation-task>"),
+                source: std::io::Error::other("episode preparation task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
+
 pub(super) struct FileBatchWalker {
     directories: Vec<PathBuf>,
     current: Option<(PathBuf, fs::ReadDir)>,
