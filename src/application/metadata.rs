@@ -1995,6 +1995,16 @@ impl MetadataEnricher {
                     .iter()
                     .map(|source| source.episode_id.clone())
                     .collect::<Vec<_>>();
+                let hierarchy_item_ids = series_sources
+                    .iter()
+                    .map(|source| {
+                        (
+                            source.episode_id.clone(),
+                            source.series_id.clone(),
+                            source.season_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let mut batch_report = MetadataReport::default();
                 let mut series_context = SeriesEnrichmentContext::default();
                 self.enrich_series_scan_job_sources(
@@ -2007,6 +2017,7 @@ impl MetadataEnricher {
                 )
                 .await;
                 let failed_item_ids = batch_report.failed_item_ids.clone();
+                let failed_item_id_set = failed_item_ids.iter().cloned().collect::<HashSet<_>>();
                 report.merge(batch_report);
                 self.database
                     .mark_scan_job_target_stage(
@@ -2033,6 +2044,21 @@ impl MetadataEnricher {
                 report
                     .locally_enriched_item_ids
                     .extend(completed_item_ids.iter().cloned());
+                let completed_item_id_set =
+                    completed_item_ids.iter().cloned().collect::<HashSet<_>>();
+                for (episode_id, series_id, season_id) in hierarchy_item_ids {
+                    if !completed_item_id_set.contains(&episode_id) {
+                        continue;
+                    }
+                    if !failed_item_id_set.contains(&series_id) {
+                        report.locally_enriched_item_ids.push(series_id);
+                    }
+                    if !failed_item_id_set.contains(&season_id) {
+                        report.locally_enriched_item_ids.push(season_id);
+                    }
+                }
+                report.locally_enriched_item_ids.sort_unstable();
+                report.locally_enriched_item_ids.dedup();
                 Ok(report)
             }
         }
@@ -3452,6 +3478,7 @@ pub struct MetadataReport {
     pub nfo_skipped: usize,
     pub images_found: usize,
     pub items_processed: usize,
+    // Includes successfully checked episode hierarchy rows as well as direct scan items.
     pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
     pub(crate) non_retryable_failed_item_ids: Vec<String>,

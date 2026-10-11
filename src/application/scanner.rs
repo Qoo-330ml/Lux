@@ -14517,24 +14517,15 @@ mod tests {
             http_addr: "127.0.0.1:8097".parse()?,
             config_dir: temp_dir.path().join("config"),
         };
-        let media_root = temp_dir.path().join("Movies");
-        let movie_dir = media_root.join("Incremental Policy Movie (2024)");
-        tokio::fs::create_dir_all(&movie_dir).await?;
-        tokio::fs::write(
-            movie_dir.join("Incremental.Policy.Movie.2024.mkv"),
-            b"movie",
-        )
-        .await?;
-        tokio::fs::write(
-            movie_dir.join("Incremental.Policy.Movie.2024.nfo"),
-            "<movie><title>Incremental Policy Movie</title></movie>",
-        )
-        .await?;
+        let media_root = temp_dir.path().join("Shows");
+        let series_dir = media_root.join("Incremental Policy Show (2024)");
+        let season_dir = series_dir.join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await?;
 
         let database = Database::connect(&config).await?;
         let libraries = LibraryService::new(database.clone());
         let library = libraries
-            .create_library("Incremental policy", LibraryKind::Movie, false)
+            .create_library("Incremental policy", LibraryKind::Series, false)
             .await?;
         let root = libraries
             .add_root(
@@ -14572,14 +14563,32 @@ mod tests {
             .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
             .with_metadata_selection(selection)
             .with_metadata_reidentify(metadata.clone());
+        let initial_scan = jobs.create_movie_scan_job(library.id).await?;
+        jobs.run_to_completion_with_metadata(&initial_scan.id, 100, None, Some(metadata.clone()))
+            .await?;
+        tokio::fs::write(
+            season_dir.join("Incremental.Policy.Show.S01E01.mkv"),
+            b"episode",
+        )
+        .await?;
+        tokio::fs::write(
+            season_dir.join("Incremental.Policy.Show.S01E02.mkv"),
+            b"episode",
+        )
+        .await?;
         let scan_job = jobs
             .enqueue_incremental_changes(
                 library.id,
-                vec![super::IncrementalScanChange {
-                    root_id: root.root.id.to_string(),
-                    relative_path: "Incremental Policy Movie (2024)".to_owned(),
-                    kind: crate::application::watch::ChangeKind::Create,
-                }],
+                [1, 2]
+                    .into_iter()
+                    .map(|episode_number| super::IncrementalScanChange {
+                        root_id: root.root.id.to_string(),
+                        relative_path: format!(
+                            "Incremental Policy Show (2024)/Season 01/Incremental.Policy.Show.S01E{episode_number:02}.mkv"
+                        ),
+                        kind: crate::application::watch::ChangeKind::Create,
+                    })
+                    .collect(),
             )
             .await?;
         assert_eq!(
@@ -14600,23 +14609,35 @@ mod tests {
             "SELECT item.id FROM media_items item
              JOIN media_sources source ON source.item_id = item.id
              JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
-             WHERE item.library_id = ? AND item.item_type = 'MOVIE'
-               AND entry.relative_path LIKE 'Incremental Policy Movie (2024)/%'",
+             WHERE item.library_id = ? AND item.item_type = 'EPISODE'
+               AND entry.relative_path LIKE 'Incremental Policy Show (2024)/%'",
         )
         .bind(&library_id)
         .fetch_one(database.pool())
         .await?;
+        let hierarchy_types: Vec<String> = sqlx::query_scalar(
+            "SELECT item_type FROM media_items WHERE library_id = ?
+             ORDER BY CASE item_type WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 ELSE 2 END",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            hierarchy_types,
+            vec!["SERIES", "SEASON", "EPISODE", "EPISODE"],
+            "the incremental fixture must contain the episode hierarchy"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM item_metadata_completeness
-                 WHERE item_id = ? AND capability = 'POSTER'
+                 WHERE item_id = ? AND capability = 'METADATA'
                    AND local_state = 'READY' AND is_missing = 1",
             )
             .bind(&incremental_item_id)
             .fetch_one(database.pool())
             .await?,
             1,
-            "incremental local metadata must persist a missing poster before online dispatch"
+            "incremental local metadata must persist missing episode metadata before online dispatch"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -14638,6 +14659,21 @@ mod tests {
         .bind(&library_id)
         .fetch_one(database.pool())
         .await?;
+        let first_fill_missing_item_types: Vec<String> = sqlx::query_scalar(
+            "SELECT item.item_type FROM metadata_reidentify_job_items job_item
+             JOIN media_items item ON item.id = job_item.item_id
+             WHERE job_item.job_id = ?
+             ORDER BY CASE item.item_type
+                 WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 WHEN 'EPISODE' THEN 2 ELSE 3 END",
+        )
+        .bind(&first_fill_missing_job_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            first_fill_missing_item_types,
+            vec!["SERIES", "SEASON", "EPISODE", "EPISODE"],
+            "incremental episode metadata should include its season and series containers"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let status: String =
@@ -14681,8 +14717,8 @@ mod tests {
             .execute(database.pool())
             .await?;
         tokio::fs::write(
-            movie_dir.join("Incremental.Policy.Movie.2024.mkv"),
-            b"changed movie",
+            season_dir.join("Incremental.Policy.Show.S01E01.mkv"),
+            b"changed episode",
         )
         .await?;
         let retry_scan_job = jobs
@@ -14690,7 +14726,9 @@ mod tests {
                 library.id,
                 vec![super::IncrementalScanChange {
                     root_id: root.root.id.to_string(),
-                    relative_path: "Incremental Policy Movie (2024)".to_owned(),
+                    relative_path:
+                        "Incremental Policy Show (2024)/Season 01/Incremental.Policy.Show.S01E01.mkv"
+                            .to_owned(),
                     kind: crate::application::watch::ChangeKind::Modify,
                 }],
             )
@@ -14713,24 +14751,19 @@ mod tests {
             .execute(database.pool())
             .await?;
 
-        let opted_out_movie_dir = media_root.join("Opted Out Policy Movie (2024)");
-        tokio::fs::create_dir_all(&opted_out_movie_dir).await?;
-        tokio::fs::write(
-            opted_out_movie_dir.join("Opted.Out.Policy.Movie.2024.mkv"),
-            b"movie",
-        )
-        .await?;
-        tokio::fs::write(
-            opted_out_movie_dir.join("Opted.Out.Policy.Movie.2024.nfo"),
-            "<movie><title>Opted Out Policy Movie</title></movie>",
-        )
-        .await?;
+        let opted_out_series_dir = media_root.join("Opted Out Policy Show (2024)");
+        let opted_out_season_dir = opted_out_series_dir.join("Season 01");
+        tokio::fs::create_dir_all(&opted_out_season_dir).await?;
+        let opted_out_episode_path = opted_out_season_dir.join("Opted.Out.Policy.Show.S01E01.mkv");
+        tokio::fs::write(&opted_out_episode_path, b"episode").await?;
         let opted_out_job = jobs
             .enqueue_incremental_changes(
                 library.id,
                 vec![super::IncrementalScanChange {
                     root_id: root.root.id.to_string(),
-                    relative_path: "Opted Out Policy Movie (2024)".to_owned(),
+                    relative_path:
+                        "Opted Out Policy Show (2024)/Season 01/Opted.Out.Policy.Show.S01E01.mkv"
+                            .to_owned(),
                     kind: crate::application::watch::ChangeKind::Create,
                 }],
             )
@@ -14748,8 +14781,8 @@ mod tests {
             "SELECT item.id FROM media_items item
              JOIN media_sources source ON source.item_id = item.id
              JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
-             WHERE item.library_id = ? AND item.item_type = 'MOVIE'
-               AND entry.relative_path LIKE 'Opted Out Policy Movie (2024)/%'",
+             WHERE item.library_id = ? AND item.item_type = 'EPISODE'
+               AND entry.relative_path LIKE 'Opted Out Policy Show (2024)/%'",
         )
         .bind(&library_id)
         .fetch_one(database.pool())
@@ -14757,14 +14790,36 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM item_metadata_completeness
-                 WHERE item_id = ? AND capability = 'POSTER'
+                 WHERE item_id = ? AND capability = 'METADATA'
                    AND local_state = 'READY' AND is_missing = 1",
             )
             .bind(&opted_out_item_id)
             .fetch_one(database.pool())
             .await?,
             1,
-            "an opted-out incremental job still persists local missing state"
+            "an opted-out incremental job still persists episode metadata missing state"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT item.id) FROM media_items item
+                 JOIN item_metadata_completeness completeness ON completeness.item_id = item.id
+                 WHERE item.library_id = ? AND item.item_type IN ('SERIES', 'SEASON', 'EPISODE')
+                   AND item.id IN (
+                       SELECT id FROM media_items WHERE id = ?
+                       UNION SELECT parent_id FROM media_items WHERE id = ?
+                       UNION SELECT series_id FROM media_items WHERE id = ?
+                   )
+                   AND completeness.capability = 'METADATA'
+                   AND completeness.local_state = 'READY' AND completeness.is_missing = 1",
+            )
+            .bind(&library_id)
+            .bind(&opted_out_item_id)
+            .bind(&opted_out_item_id)
+            .bind(&opted_out_item_id)
+            .fetch_one(database.pool())
+            .await?,
+            3,
+            "an opted-out incremental scan still records local missing metadata for the hierarchy"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
