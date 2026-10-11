@@ -8707,6 +8707,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：预检失败与明确不可用状态现在分开处理。已配置 scraper 的 item 级或整批预检错误会进入现有补全 worker，错误由 worker 记录为 `SCRAPER_UNAVAILABLE` 并使用 LUX-402 退避；明确无 scraper 仍不入队。`cargo test --locked --all-targets --no-fail-fast` 中 library tests 为 750 passed、12 ignored，`scanning_jobs` 81/81、`scanned_metadata` 16/16、`storage` 49/49 通过；全目标的 `emby_counts` 与 `strm` 失败已在干净 `origin/test=8412cc2a` 基线复现，`libraries_api` 全目标并行运行时失败后独立复跑 13/13 通过。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。该分支未部署到 FNOS，也没有生产 CPU 降幅证据。
 
+补充结果（2026-10-09，阶段 23 无候选分类）：自动搜索所有标题/年份变体都成功返回空结果时，旧逻辑把它转换成 `SCRAPER_UNAVAILABLE`，导致合法的“没有匹配”进入 provider 退避；分集在找不到系列父候选时也会这样误分类。现在空搜索结果作为无候选返回，仍保留真实请求错误的 `SCRAPER_UNAVAILABLE` 分类。新增电影与分集 FILL_MISSING 集成回归，确认 job 不进入 `DEFERRED`、item 记录 `LOW_CONFIDENCE` 且 `candidate_count=0`、没有候选行，并且 title/provider IDs 不变。`cargo test --locked --test reidentify -- --test-threads=1` 在本机 ARM64/SQLite fixture 上 19/19 通过，包含既有 provider unavailable deferred 回归；没有运行 PostgreSQL 专项或性能基准，也未部署 FNOS。
+
 短计划与文件：预计修改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先在 scanner 单测中固定“预检错误继续排队、明确无 scraper 不排队”的决策，再把预检错误送入已有 provider-unavailable job 流程，最后运行窄测试与相关完整检查。
 
 #### LUX-408：合并扫描本地 metadata outbox 批量写入
@@ -9592,7 +9594,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### 阶段 23 总体验收与阶段门
 
-2026-10-09 阶段门复核仍为开放，六项验收的证据、缺口与关闭条件见[阶段 23 证据复核](STAGE-23-GATE-REVIEW-2026-10-09.md)。当前 1k A/B 前台 p95 超过 5% 回退门；新增故障覆盖与更大 fixture 的双后端 A/B 尚未纳入最终候选。项目所有者确认仍是阶段关闭的必要条件。
+2026-10-09 阶段门复核仍为开放，六项验收的证据、缺口与关闭条件见[阶段 23 证据复核](STAGE-23-GATE-REVIEW-2026-10-09.md)。集成候选目前仅有 1/24 个有效 A/B 配对，首轮 1k SQLite 前台 p95 已超过 5% 回退门；下一 PostgreSQL 配对因旧基线缺少测试 harness 依赖的 `images_completed_at` 列而中止，不能计为样本。补缺空搜索结果的直接回归已在隔离候选通过，但 A/B、Rust 全目标稳定通过及兼容性记录仍未完成。项目所有者确认仍是阶段关闭的必要条件。
 
 #### LUX-462：补全阶段 23 基准的 SQL 延迟、连接池与后台队列观测
 

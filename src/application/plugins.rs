@@ -168,6 +168,23 @@ impl PluginService {
         config_dir: PathBuf,
         proxy_url: Option<String>,
     ) -> Self {
+        Self::new_with_proxy_and_login_background_worker(database, config_dir, proxy_url, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_login_background_worker(
+        database: Database,
+        config_dir: PathBuf,
+    ) -> Self {
+        Self::new_with_proxy_and_login_background_worker(database, config_dir, None, false)
+    }
+
+    fn new_with_proxy_and_login_background_worker(
+        database: Database,
+        config_dir: PathBuf,
+        proxy_url: Option<String>,
+        start_login_background_worker: bool,
+    ) -> Self {
         let catalog = Arc::new(RwLock::new(PluginCatalog::discover(
             &config_dir.join("plugins"),
         )));
@@ -192,7 +209,9 @@ impl PluginService {
             login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             login_background_asset_upload_lock: Arc::new(Mutex::new(())),
         };
-        service.start_login_background_refresh_worker();
+        if start_login_background_worker {
+            service.start_login_background_refresh_worker();
+        }
         service
     }
 
