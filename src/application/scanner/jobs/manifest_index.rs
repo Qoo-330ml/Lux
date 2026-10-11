@@ -1,5 +1,73 @@
 use super::*;
 
+use crate::storage::StoredScanManifestDelta;
+use crate::storage::{StoredScanManifestDiffCandidate, StoredScanManifestRemovalCandidate};
+
+struct ManifestApplyRootPreparation {
+    files: ManifestApplyPreparedFiles,
+    removal_candidates: Vec<StoredScanManifestDelta>,
+}
+
+enum ManifestApplyPreparationOutcome {
+    Prepared(ManifestApplyRootPreparation),
+    Cancelled(ScanBatchReport),
+}
+
+enum ManifestApplyRootOutcome {
+    Applied(ManifestApplyRootResult),
+    Cancelled(ScanBatchReport),
+}
+
+enum ManifestApplyBatchOutcome {
+    Applied {
+        processed: usize,
+        created_items: usize,
+        transaction_elapsed: Duration,
+    },
+    Cancelled(ScanBatchReport),
+}
+
+struct ManifestApplyRootResult {
+    processed: usize,
+    created_items: usize,
+    transaction_elapsed: Duration,
+}
+
+struct ManifestRemovalValidation {
+    root_identity_lost: bool,
+    unstable_ids: Vec<String>,
+    removed_media_paths: Vec<String>,
+    removed_sidecar_paths: Vec<String>,
+}
+
+impl ManifestRemovalValidation {
+    fn root_lost() -> Self {
+        Self {
+            root_identity_lost: true,
+            unstable_ids: Vec::new(),
+            removed_media_paths: Vec::new(),
+            removed_sidecar_paths: Vec::new(),
+        }
+    }
+}
+
+async fn join_manifest_delta_preparation(
+    tasks: &mut JoinSet<ManifestDeltaPreparation>,
+    root_path: &Path,
+) -> Result<ManifestDeltaPreparation, ScanJobError> {
+    tasks
+        .join_next()
+        .await
+        .ok_or_else(|| {
+            StorageError::Conflict("manifest preparation task set became empty".to_owned())
+        })?
+        .map_err(|error| ScannerError::Io {
+            path: root_path.to_owned(),
+            source: std::io::Error::other(error.to_string()),
+        })
+        .map_err(Into::into)
+}
+
 impl ScanJobService {
     pub(in crate::application::scanner) async fn run_scan_manifest_diff_batch(
         &self,
@@ -10,12 +78,65 @@ impl ScanJobService {
         discovery_format_version: i64,
         lite_mode: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
+        if let Some(report) = self
+            .verify_scan_manifest_diff_roots(job, manifest_id, cancellation)
+            .await?
+        {
+            return Ok(report);
+        }
+        self.update_activity(&job.id, Some("文件差异计算"), "FINALIZING")
+            .await?;
+        let page_size = i64::try_from(MANIFEST_DIFF_BATCH_SIZE).unwrap_or(i64::MAX);
+        if !positives_already_indexed
+            && let Some(report) = self
+                .persist_scan_manifest_positive_deltas(job, manifest_id, cancellation, page_size)
+                .await?
+        {
+            return Ok(report);
+        }
+        if let Some(report) = self
+            .persist_scan_manifest_removal_deltas(
+                job,
+                manifest_id,
+                cancellation,
+                discovery_format_version,
+                lite_mode,
+                page_size,
+            )
+            .await?
+        {
+            return Ok(report);
+        }
+        self.finish_scan_manifest_diff_batch(job, manifest_id, cancellation)
+            .await
+    }
+
+    async fn manifest_diff_cancellation_report(
+        &self,
+        job_id: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        if self
+            .cancellation_requested(job_id, false, cancellation)
+            .await?
+        {
+            return self.cancel_running_job(job_id).await.map(Some);
+        }
+        Ok(None)
+    }
+
+    async fn verify_scan_manifest_diff_roots(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
         for root in self.database.list_library_roots(&job.library_id).await? {
-            if self
-                .cancellation_requested(&job.id, false, cancellation)
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
                 .await?
             {
-                return self.cancel_running_job(&job.id).await;
+                return Ok(Some(report));
             }
             let Some((state, expected_device, expected_inode)) = self
                 .database
@@ -27,13 +148,11 @@ impl ScanJobService {
             if state != "COMPLETE" {
                 continue;
             }
-            let root_path = PathBuf::from(&root.canonical_path);
-            let root_matches_snapshot = match stat_manifest_root(root_path).await {
-                Ok(observed) => {
+            let root_matches_snapshot = stat_manifest_root(PathBuf::from(&root.canonical_path))
+                .await
+                .is_ok_and(|observed| {
                     manifest_root_identity_matches(expected_device, expected_inode, &observed)
-                }
-                Err(_) => false,
-            };
+                });
             if !root_matches_snapshot {
                 self.database
                     .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
@@ -48,289 +167,344 @@ impl ScanJobService {
                 .await;
             }
         }
-        self.update_activity(&job.id, Some("文件差异计算"), "FINALIZING")
-            .await?;
-        let page_size = i64::try_from(MANIFEST_DIFF_BATCH_SIZE).unwrap_or(i64::MAX);
+        Ok(None)
+    }
+
+    async fn persist_scan_manifest_positive_deltas(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
         let mut after_library_root_id: Option<String> = None;
         let mut after_relative_path: Option<String> = None;
-        if !positives_already_indexed {
+        loop {
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
+                .await?
+            {
+                return Ok(Some(report));
+            }
+            let candidates = self
+                .database
+                .list_scan_manifest_diff_candidates(
+                    manifest_id,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    page_size,
+                )
+                .await?;
+            let Some(last_candidate) = candidates.last() else {
+                break;
+            };
+            self.insert_scan_manifest_positive_delta_page(manifest_id, &candidates)
+                .await?;
+            after_library_root_id = Some(last_candidate.library_root_id.clone());
+            after_relative_path = Some(last_candidate.relative_path.clone());
+        }
+        Ok(None)
+    }
+
+    async fn insert_scan_manifest_positive_delta_page(
+        &self,
+        manifest_id: &str,
+        candidates: &[StoredScanManifestDiffCandidate],
+    ) -> Result<(), ScanJobError> {
+        let delta_ids = candidates
+            .iter()
+            .map(|_| Uuid::now_v7().to_string())
+            .collect::<Vec<_>>();
+        let mut deltas = Vec::with_capacity(candidates.len());
+        for (candidate, id) in candidates.iter().zip(&delta_ids) {
+            if candidate.delta_kind != "ADD"
+                && (candidate.base_filesystem_entry_id.is_none()
+                    || candidate.base_entry_kind.as_deref() != Some("FILE"))
+            {
+                return Err(StorageError::Conflict(
+                    "manifest difference has an invalid filesystem baseline".to_owned(),
+                )
+                .into());
+            }
+            deltas.push(NewScanManifestDelta {
+                id,
+                library_root_id: &candidate.library_root_id,
+                relative_path: &candidate.relative_path,
+                observation_sequence: Some(candidate.observation_sequence),
+                delta_kind: &candidate.delta_kind,
+                base_filesystem_entry_id: candidate.base_filesystem_entry_id.as_deref(),
+                base_fingerprint: candidate.base_fingerprint.as_deref(),
+            });
+        }
+        self.database
+            .insert_scan_manifest_deltas(manifest_id, &deltas)
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_scan_manifest_removal_deltas(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        discovery_format_version: i64,
+        lite_mode: bool,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        if discovery_format_version != 3 {
+            return self
+                .persist_legacy_scan_manifest_removals(
+                    job,
+                    manifest_id,
+                    cancellation,
+                    discovery_format_version,
+                    page_size,
+                )
+                .await;
+        }
+        if lite_mode {
+            return self
+                .persist_lite_scan_manifest_removals(job, manifest_id, cancellation, page_size)
+                .await;
+        }
+        if let Some(report) = self
+            .persist_directory_scan_manifest_removals(job, manifest_id, cancellation, page_size)
+            .await?
+        {
+            return Ok(Some(report));
+        }
+        self.persist_uncovered_scan_manifest_removals(
+            job,
+            manifest_id,
+            cancellation,
+            discovery_format_version,
+            page_size,
+        )
+        .await
+    }
+
+    async fn persist_lite_scan_manifest_removals(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        let mut after_library_root_id: Option<String> = None;
+        let mut after_relative_path: Option<String> = None;
+        loop {
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
+                .await?
+            {
+                return Ok(Some(report));
+            }
+            let candidates = self
+                .database
+                .list_scan_manifest_removal_candidates(
+                    manifest_id,
+                    3,
+                    false,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    page_size,
+                )
+                .await?;
+            let Some(last_candidate) = candidates.last() else {
+                break;
+            };
+            self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
+                .await?;
+            after_library_root_id = Some(last_candidate.library_root_id.clone());
+            after_relative_path = Some(last_candidate.relative_path.clone());
+        }
+        Ok(None)
+    }
+
+    async fn persist_directory_scan_manifest_removals(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        let mut after_library_root_id: Option<String> = None;
+        let mut after_relative_path: Option<String> = None;
+        loop {
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
+                .await?
+            {
+                return Ok(Some(report));
+            }
+            let directories = self
+                .database
+                .list_scan_manifest_complete_directories(
+                    manifest_id,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_directory) = directories.last() else {
+                break;
+            };
             loop {
-                if self
-                    .cancellation_requested(&job.id, false, cancellation)
+                if let Some(report) = self
+                    .manifest_diff_cancellation_report(&job.id, cancellation)
                     .await?
                 {
-                    return self.cancel_running_job(&job.id).await;
+                    return Ok(Some(report));
                 }
                 let candidates = self
                     .database
-                    .list_scan_manifest_diff_candidates(
+                    .list_scan_manifest_removal_candidates_for_directories(
                         manifest_id,
-                        after_library_root_id.as_deref(),
-                        after_relative_path.as_deref(),
+                        &directories,
                         page_size,
                     )
                     .await?;
-                let Some(last_candidate) = candidates.last() else {
+                if candidates.is_empty() {
                     break;
-                };
-                let delta_ids = candidates
-                    .iter()
-                    .map(|_| Uuid::now_v7().to_string())
-                    .collect::<Vec<_>>();
-                let mut deltas = Vec::with_capacity(candidates.len());
-                for (candidate, id) in candidates.iter().zip(&delta_ids) {
-                    if candidate.delta_kind != "ADD"
-                        && (candidate.base_filesystem_entry_id.is_none()
-                            || candidate.base_entry_kind.as_deref() != Some("FILE"))
-                    {
-                        return Err(StorageError::Conflict(
-                            "manifest difference has an invalid filesystem baseline".to_owned(),
-                        )
-                        .into());
-                    }
-                    deltas.push(NewScanManifestDelta {
-                        id,
-                        library_root_id: &candidate.library_root_id,
-                        relative_path: &candidate.relative_path,
-                        observation_sequence: Some(candidate.observation_sequence),
-                        delta_kind: &candidate.delta_kind,
-                        base_filesystem_entry_id: candidate.base_filesystem_entry_id.as_deref(),
-                        base_fingerprint: candidate.base_fingerprint.as_deref(),
-                    });
                 }
-                self.database
-                    .insert_scan_manifest_deltas(manifest_id, &deltas)
+                self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
                     .await?;
-                after_library_root_id = Some(last_candidate.library_root_id.clone());
-                after_relative_path = Some(last_candidate.relative_path.clone());
             }
+            after_library_root_id = Some(last_directory.library_root_id.clone());
+            after_relative_path = Some(last_directory.relative_path.clone());
         }
+        Ok(None)
+    }
 
-        if discovery_format_version == 3 {
-            let mut removal_after_library_root_id: Option<String> = None;
-            let mut removal_after_relative_path: Option<String> = None;
-            if lite_mode {
-                loop {
-                    if self
-                        .cancellation_requested(&job.id, false, cancellation)
-                        .await?
-                    {
-                        return self.cancel_running_job(&job.id).await;
-                    }
-                    let candidates = self
-                        .database
-                        .list_scan_manifest_removal_candidates(
-                            manifest_id,
-                            discovery_format_version,
-                            false,
-                            removal_after_library_root_id.as_deref(),
-                            removal_after_relative_path.as_deref(),
-                            page_size,
-                        )
-                        .await?;
-                    let Some(last_candidate) = candidates.last() else {
-                        break;
-                    };
-                    let delta_ids = candidates
-                        .iter()
-                        .map(|_| Uuid::now_v7().to_string())
-                        .collect::<Vec<_>>();
-                    let deltas = candidates
-                        .iter()
-                        .zip(&delta_ids)
-                        .map(|(candidate, id)| NewScanManifestDelta {
-                            id,
-                            library_root_id: &candidate.library_root_id,
-                            relative_path: &candidate.relative_path,
-                            observation_sequence: None,
-                            delta_kind: "REMOVE",
-                            base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
-                            base_fingerprint: candidate.base_fingerprint.as_deref(),
-                        })
-                        .collect::<Vec<_>>();
-                    self.database
-                        .insert_scan_manifest_deltas(manifest_id, &deltas)
-                        .await?;
-                    removal_after_library_root_id = Some(last_candidate.library_root_id.clone());
-                    removal_after_relative_path = Some(last_candidate.relative_path.clone());
-                }
-            } else {
-                let mut directory_after_library_root_id: Option<String> = None;
-                let mut directory_after_relative_path: Option<String> = None;
-                loop {
-                    if self
-                        .cancellation_requested(&job.id, false, cancellation)
-                        .await?
-                    {
-                        return self.cancel_running_job(&job.id).await;
-                    }
-                    let directories = self
-                        .database
-                        .list_scan_manifest_complete_directories(
-                            manifest_id,
-                            directory_after_library_root_id.as_deref(),
-                            directory_after_relative_path.as_deref(),
-                            MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
-                        )
-                        .await?;
-                    let Some(last_directory) = directories.last() else {
-                        break;
-                    };
-                    loop {
-                        if self
-                            .cancellation_requested(&job.id, false, cancellation)
-                            .await?
-                        {
-                            return self.cancel_running_job(&job.id).await;
-                        }
-                        let candidates = self
-                            .database
-                            .list_scan_manifest_removal_candidates_for_directories(
-                                manifest_id,
-                                &directories,
-                                page_size,
-                            )
-                            .await?;
-                        if candidates.is_empty() {
-                            break;
-                        }
-                        let delta_ids = candidates
-                            .iter()
-                            .map(|_| Uuid::now_v7().to_string())
-                            .collect::<Vec<_>>();
-                        let deltas = candidates
-                            .iter()
-                            .zip(&delta_ids)
-                            .map(|(candidate, id)| NewScanManifestDelta {
-                                id,
-                                library_root_id: &candidate.library_root_id,
-                                relative_path: &candidate.relative_path,
-                                observation_sequence: None,
-                                delta_kind: "REMOVE",
-                                base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
-                                base_fingerprint: candidate.base_fingerprint.as_deref(),
-                            })
-                            .collect::<Vec<_>>();
-                        self.database
-                            .insert_scan_manifest_deltas(manifest_id, &deltas)
-                            .await?;
-                    }
-                    directory_after_library_root_id = Some(last_directory.library_root_id.clone());
-                    directory_after_relative_path = Some(last_directory.relative_path.clone());
-                }
-                if self
-                    .database
-                    .scan_manifest_has_uncovered_files(manifest_id)
-                    .await?
-                {
-                    let mut uncovered_after_library_root_id: Option<String> = None;
-                    let mut uncovered_after_relative_path: Option<String> = None;
-                    loop {
-                        if self
-                            .cancellation_requested(&job.id, false, cancellation)
-                            .await?
-                        {
-                            return self.cancel_running_job(&job.id).await;
-                        }
-                        let candidates = self
-                            .database
-                            .list_scan_manifest_removal_candidates(
-                                manifest_id,
-                                discovery_format_version,
-                                true,
-                                uncovered_after_library_root_id.as_deref(),
-                                uncovered_after_relative_path.as_deref(),
-                                page_size,
-                            )
-                            .await?;
-                        let Some(last_candidate) = candidates.last() else {
-                            break;
-                        };
-                        let delta_ids = candidates
-                            .iter()
-                            .map(|_| Uuid::now_v7().to_string())
-                            .collect::<Vec<_>>();
-                        let deltas = candidates
-                            .iter()
-                            .zip(&delta_ids)
-                            .map(|(candidate, id)| NewScanManifestDelta {
-                                id,
-                                library_root_id: &candidate.library_root_id,
-                                relative_path: &candidate.relative_path,
-                                observation_sequence: None,
-                                delta_kind: "REMOVE",
-                                base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
-                                base_fingerprint: candidate.base_fingerprint.as_deref(),
-                            })
-                            .collect::<Vec<_>>();
-                        self.database
-                            .insert_scan_manifest_deltas(manifest_id, &deltas)
-                            .await?;
-                        uncovered_after_library_root_id =
-                            Some(last_candidate.library_root_id.clone());
-                        uncovered_after_relative_path = Some(last_candidate.relative_path.clone());
-                    }
-                }
-            }
-        } else {
-            after_library_root_id = None;
-            after_relative_path = None;
-            loop {
-                if self
-                    .cancellation_requested(&job.id, false, cancellation)
-                    .await?
-                {
-                    return self.cancel_running_job(&job.id).await;
-                }
-                let candidates = self
-                    .database
-                    .list_scan_manifest_removal_candidates(
-                        manifest_id,
-                        discovery_format_version,
-                        false,
-                        after_library_root_id.as_deref(),
-                        after_relative_path.as_deref(),
-                        page_size,
-                    )
-                    .await?;
-                let Some(last_candidate) = candidates.last() else {
-                    break;
-                };
-                let delta_ids = candidates
-                    .iter()
-                    .map(|_| Uuid::now_v7().to_string())
-                    .collect::<Vec<_>>();
-                let deltas = candidates
-                    .iter()
-                    .zip(&delta_ids)
-                    .map(|(candidate, id)| NewScanManifestDelta {
-                        id,
-                        library_root_id: &candidate.library_root_id,
-                        relative_path: &candidate.relative_path,
-                        observation_sequence: None,
-                        delta_kind: "REMOVE",
-                        base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
-                        base_fingerprint: candidate.base_fingerprint.as_deref(),
-                    })
-                    .collect::<Vec<_>>();
-                self.database
-                    .insert_scan_manifest_deltas(manifest_id, &deltas)
-                    .await?;
-                after_library_root_id = Some(last_candidate.library_root_id.clone());
-                after_relative_path = Some(last_candidate.relative_path.clone());
-            }
+    async fn persist_uncovered_scan_manifest_removals(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        discovery_format_version: i64,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        if !self
+            .database
+            .scan_manifest_has_uncovered_files(manifest_id)
+            .await?
+        {
+            return Ok(None);
         }
+        let mut after_library_root_id: Option<String> = None;
+        let mut after_relative_path: Option<String> = None;
+        loop {
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
+                .await?
+            {
+                return Ok(Some(report));
+            }
+            let candidates = self
+                .database
+                .list_scan_manifest_removal_candidates(
+                    manifest_id,
+                    discovery_format_version,
+                    true,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    page_size,
+                )
+                .await?;
+            let Some(last_candidate) = candidates.last() else {
+                break;
+            };
+            self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
+                .await?;
+            after_library_root_id = Some(last_candidate.library_root_id.clone());
+            after_relative_path = Some(last_candidate.relative_path.clone());
+        }
+        Ok(None)
+    }
 
+    async fn persist_legacy_scan_manifest_removals(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        discovery_format_version: i64,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        let mut after_library_root_id: Option<String> = None;
+        let mut after_relative_path: Option<String> = None;
+        loop {
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
+                .await?
+            {
+                return Ok(Some(report));
+            }
+            let candidates = self
+                .database
+                .list_scan_manifest_removal_candidates(
+                    manifest_id,
+                    discovery_format_version,
+                    false,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    page_size,
+                )
+                .await?;
+            let Some(last_candidate) = candidates.last() else {
+                break;
+            };
+            self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
+                .await?;
+            after_library_root_id = Some(last_candidate.library_root_id.clone());
+            after_relative_path = Some(last_candidate.relative_path.clone());
+        }
+        Ok(None)
+    }
+
+    async fn insert_scan_manifest_removal_delta_page(
+        &self,
+        manifest_id: &str,
+        candidates: &[StoredScanManifestRemovalCandidate],
+    ) -> Result<(), ScanJobError> {
+        let delta_ids = candidates
+            .iter()
+            .map(|_| Uuid::now_v7().to_string())
+            .collect::<Vec<_>>();
+        let deltas = candidates
+            .iter()
+            .zip(&delta_ids)
+            .map(|(candidate, id)| NewScanManifestDelta {
+                id,
+                library_root_id: &candidate.library_root_id,
+                relative_path: &candidate.relative_path,
+                observation_sequence: None,
+                delta_kind: "REMOVE",
+                base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                base_fingerprint: candidate.base_fingerprint.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        self.database
+            .insert_scan_manifest_deltas(manifest_id, &deltas)
+            .await?;
+        Ok(())
+    }
+
+    async fn finish_scan_manifest_diff_batch(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<ScanBatchReport, ScanJobError> {
         if !self
             .database
             .finish_scan_manifest_diff(manifest_id, &job.id)
             .await?
         {
-            if self
-                .cancellation_requested(&job.id, false, cancellation)
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
                 .await?
             {
-                return self.cancel_running_job(&job.id).await;
+                return Ok(report);
             }
             self.record_event(
                 &job.id,
@@ -383,7 +557,6 @@ impl ScanJobService {
         cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let apply_started = Instant::now();
-        let mut transaction_elapsed = Duration::ZERO;
         let deltas = self
             .database
             .list_pending_scan_manifest_deltas(
@@ -412,349 +585,25 @@ impl ScanJobService {
             .into_iter()
             .collect::<Vec<_>>();
         let roots = self.database.list_library_roots_by_ids(&root_ids).await?;
-        let mut processed = 0_usize;
-        let mut created_items = 0_usize;
-        for root_id in root_ids {
-            if self
-                .cancellation_requested(&job.id, false, cancellation)
-                .await?
-            {
-                return self.cancel_running_job(&job.id).await;
-            }
-            let root_deltas = deltas
-                .iter()
-                .filter(|delta| delta.library_root_id == root_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let Some(root) = roots.get(&root_id) else {
-                let unstable_delta_ids = root_deltas
-                    .iter()
-                    .map(|delta| delta.id.clone())
-                    .collect::<Vec<_>>();
-                let transaction_started = Instant::now();
-                let result = self
-                    .database
-                    .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
-                        job_id: &job.id,
-                        manifest_id,
-                        library_id: &job.library_id,
-                        library_root_id: &root_id,
-                        generation: &job.generation,
-                        deltas: &root_deltas,
-                        unstable_delta_ids: &unstable_delta_ids,
-                        movie_files: &[],
-                        episode_files: &[],
-                        unresolved_files: &[],
-                        sidecar_entries: &[],
-                        removed_media_paths: &[],
-                        removed_sidecar_paths: &[],
-                    })
-                    .await?;
-                transaction_elapsed += transaction_started.elapsed();
-                processed = processed.saturating_add(
-                    result
-                        .applied_count
-                        .saturating_add(result.conflict_count)
-                        .saturating_add(result.unstable_count),
-                );
-                continue;
-            };
-            let root_path = PathBuf::from(&root.canonical_path);
-            let root_identity = self
-                .database
-                .get_scan_manifest_root_identity(manifest_id, &root_id)
-                .await?;
-            let root_is_same_object = match root_identity.as_ref() {
-                Some((state, expected_device, expected_inode)) if state == "COMPLETE" => {
-                    match stat_manifest_root(root_path.clone()).await {
-                        Ok(observed) => manifest_root_identity_matches(
-                            *expected_device,
-                            *expected_inode,
-                            &observed,
-                        ),
-                        Err(_) => false,
-                    }
-                }
-                _ => false,
-            };
-            if !root_is_same_object {
-                self.database
-                    .mark_scan_manifest_root_unavailable(manifest_id, &root_id)
-                    .await?;
-                let unstable_delta_ids = root_deltas
-                    .iter()
-                    .map(|delta| delta.id.clone())
-                    .collect::<Vec<_>>();
-                let transaction_started = Instant::now();
-                let result = self
-                    .database
-                    .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
-                        job_id: &job.id,
-                        manifest_id,
-                        library_id: &job.library_id,
-                        library_root_id: &root_id,
-                        generation: &job.generation,
-                        deltas: &root_deltas,
-                        unstable_delta_ids: &unstable_delta_ids,
-                        movie_files: &[],
-                        episode_files: &[],
-                        unresolved_files: &[],
-                        sidecar_entries: &[],
-                        removed_media_paths: &[],
-                        removed_sidecar_paths: &[],
-                    })
-                    .await?;
-                transaction_elapsed += transaction_started.elapsed();
-                processed = processed.saturating_add(
-                    result
-                        .applied_count
-                        .saturating_add(result.conflict_count)
-                        .saturating_add(result.unstable_count),
-                );
-                continue;
-            }
-            let (expected_root_device, expected_root_inode) = root_identity
-                .as_ref()
-                .map(|(_, device, inode)| (*device, *inode))
-                .unwrap_or((None, None));
-            let mut prepared_files = ManifestApplyPreparedFiles::default();
-            let mut removed_media_paths = Vec::new();
-            let mut removed_sidecar_paths = Vec::new();
-            let mut removal_candidates = Vec::new();
-            let mut mixed_cache = MixedClassificationCache::default();
-            let mut root_identity_lost;
-
-            let preparation_concurrency = self.scanner.scan_concurrency.max(1);
-            let mut preparation_tasks: JoinSet<ManifestDeltaPreparation> = JoinSet::new();
-            for delta in &root_deltas {
-                if cancellation.load(Ordering::Acquire) {
-                    return self.cancel_running_job(&job.id).await;
-                }
-                if delta.delta_kind == "REMOVE" {
-                    removal_candidates.push(delta.clone());
-                    continue;
-                }
-                if delta.fingerprint.is_none() {
-                    prepared_files.unstable_delta_ids.push(delta.id.clone());
-                    continue;
-                }
-                let path = root_path.join(&delta.relative_path);
-                let classification = if is_supported_movie_file(Path::new(&delta.relative_path)) {
-                    Some(match library.kind.as_str() {
-                        "MOVIE" => {
-                            if parse_movie_filename(
-                                path.file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or_default(),
-                            )
-                            .is_some()
-                            {
-                                MixedClassification::Movie
-                            } else {
-                                MixedClassification::Unresolved
-                            }
-                        }
-                        "SERIES" => {
-                            if parse_episode_filename(
-                                path.file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or_default(),
-                            )
-                            .is_some()
-                            {
-                                MixedClassification::Episode
-                            } else {
-                                MixedClassification::Unresolved
-                            }
-                        }
-                        "HOMEVIDEOS" => MixedClassification::Unresolved,
-                        _ => classify_mixed_file(&root_path, &path, &mut mixed_cache).await,
-                    })
-                } else {
-                    None
-                };
-                if preparation_tasks.len() >= preparation_concurrency {
-                    let preparation = preparation_tasks
-                        .join_next()
-                        .await
-                        .ok_or_else(|| {
-                            StorageError::Conflict(
-                                "manifest preparation task set became empty".to_owned(),
-                            )
-                        })?
-                        .map_err(|error| ScannerError::Io {
-                            path: root_path.clone(),
-                            source: std::io::Error::other(error.to_string()),
-                        })?;
-                    prepared_files.record(preparation);
-                }
-                let scanner = self.scanner.clone();
-                let root = root.clone();
-                let root_path = root_path.clone();
-                let delta = delta.clone();
-                let library_kind = library.kind.clone();
-                preparation_tasks.spawn(async move {
-                    prepare_manifest_delta(
-                        ManifestFilePreparationContext {
-                            scanner,
-                            root,
-                            root_path,
-                            expected_root_device,
-                            expected_root_inode,
-                            movie_folder_provider_ids_cache: None,
-                            verify_path_after_preparation: true,
-                        },
-                        delta,
-                        classification,
-                        &library_kind,
-                    )
-                    .await
-                });
-            }
-            while let Some(preparation) = preparation_tasks.join_next().await {
-                let preparation = preparation.map_err(|error| ScannerError::Io {
-                    path: root_path.clone(),
-                    source: std::io::Error::other(error.to_string()),
-                })?;
-                prepared_files.record(preparation);
-            }
-            root_identity_lost = prepared_files.root_identity_lost;
-
-            if !root_identity_lost {
-                let root_still_matches =
-                    stat_manifest_root(root_path.clone())
-                        .await
-                        .is_ok_and(|observed| {
-                            manifest_root_identity_matches(
-                                expected_root_device,
-                                expected_root_inode,
-                                &observed,
-                            )
-                        });
-                root_identity_lost = !root_still_matches;
-            }
-
-            if !root_identity_lost {
-                let mut removal_outcomes = Vec::with_capacity(removal_candidates.len());
-                for delta in &removal_candidates {
-                    let outcome = match stat_manifest_relative_file(
-                        root_path.clone(),
-                        delta.relative_path.clone(),
-                        expected_root_device,
-                        expected_root_inode,
-                    )
-                    .await
-                    {
-                        Ok(None) => ManifestRemovalOutcome::Missing,
-                        Ok(Some(_)) => ManifestRemovalOutcome::Present,
-                        Err(ScannerError::RootIdentityChanged(_)) => {
-                            root_identity_lost = true;
-                            ManifestRemovalOutcome::RootIdentityChanged
-                        }
-                        Err(ScannerError::Io { .. }) => ManifestRemovalOutcome::PathIoError,
-                        Err(_) => ManifestRemovalOutcome::InvalidPath,
-                    };
-                    removal_outcomes.push((delta.id.clone(), outcome));
-                    if root_identity_lost {
-                        break;
-                    }
-                }
-                if !root_identity_lost {
-                    let root_still_matches_after_removal_probes =
-                        stat_manifest_root(root_path.clone())
-                            .await
-                            .is_ok_and(|observed| {
-                                manifest_root_identity_matches(
-                                    expected_root_device,
-                                    expected_root_inode,
-                                    &observed,
-                                )
-                            });
-                    root_identity_lost = !root_still_matches_after_removal_probes;
-                }
-                let decision = classify_manifest_removal_outcomes(&removal_outcomes);
-                root_identity_lost |= decision.root_identity_lost;
-                prepared_files
-                    .unstable_delta_ids
-                    .extend(decision.unstable_ids);
-                if !root_identity_lost {
-                    for delta in &removal_candidates {
-                        if !decision
-                            .confirmed_missing_ids
-                            .iter()
-                            .any(|id| id == &delta.id)
-                        {
-                            continue;
-                        }
-                        if is_supported_movie_file(Path::new(&delta.relative_path)) {
-                            removed_media_paths.push(delta.relative_path.clone());
-                        }
-                        if is_supported_sidecar_file(Path::new(&delta.relative_path)) {
-                            removed_sidecar_paths.push(delta.relative_path.clone());
-                        }
-                    }
-                }
-            }
-
-            if root_identity_lost {
-                self.database
-                    .mark_scan_manifest_root_unavailable(manifest_id, &root_id)
-                    .await?;
-                prepared_files
-                    .unstable_delta_ids
-                    .extend(root_deltas.iter().map(|delta| delta.id.clone()));
-                prepared_files.movie_files.clear();
-                prepared_files.episode_files.clear();
-                prepared_files.unresolved_files.clear();
-                prepared_files.sidecar_entries.clear();
-                removed_media_paths.clear();
-                removed_sidecar_paths.clear();
-            }
-            prepared_files.unstable_delta_ids.sort();
-            prepared_files.unstable_delta_ids.dedup();
-
-            let transaction_started = Instant::now();
-            let result = self
-                .database
-                .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
-                    job_id: &job.id,
-                    manifest_id,
-                    library_id: &job.library_id,
-                    library_root_id: &root_id,
-                    generation: &job.generation,
-                    deltas: &root_deltas,
-                    unstable_delta_ids: &prepared_files.unstable_delta_ids,
-                    movie_files: &prepared_files.movie_files,
-                    episode_files: &prepared_files.episode_files,
-                    unresolved_files: &prepared_files.unresolved_files,
-                    sidecar_entries: &prepared_files.sidecar_entries,
-                    removed_media_paths: &removed_media_paths,
-                    removed_sidecar_paths: &removed_sidecar_paths,
-                })
-                .await?;
-            transaction_elapsed += transaction_started.elapsed();
-            processed = processed.saturating_add(
-                result
-                    .applied_count
-                    .saturating_add(result.conflict_count)
-                    .saturating_add(result.unstable_count),
-            );
-            created_items = created_items.saturating_add(result.created_items);
-            if result.metadata_targets_changed {
-                self.notify_local_metadata_worker(&job.id);
-            }
-        }
-
-        if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
-            let elapsed = apply_started.elapsed();
-            tracing::debug!(
-                target: "lux::scan_performance",
-                application_ms = elapsed.saturating_sub(transaction_elapsed).as_millis() as u64,
-                transaction_ms = transaction_elapsed.as_millis() as u64,
-                delta_count = deltas.len() as u64,
-                "manifest apply phase timing"
-            );
-        }
+        let (processed, created_items, transaction_elapsed) = match self
+            .apply_scan_manifest_roots(
+                job,
+                manifest_id,
+                &library.kind,
+                &deltas,
+                &roots,
+                cancellation,
+            )
+            .await?
+        {
+            ManifestApplyBatchOutcome::Applied {
+                processed,
+                created_items,
+                transaction_elapsed,
+            } => (processed, created_items, transaction_elapsed),
+            ManifestApplyBatchOutcome::Cancelled(report) => return Ok(report),
+        };
+        self.record_manifest_apply_timing(apply_started, transaction_elapsed, deltas.len());
         if self
             .cancellation_requested(&job.id, false, cancellation)
             .await?
@@ -778,6 +627,489 @@ impl ScanJobService {
             created_items,
             completed: false,
         })
+    }
+
+    async fn apply_scan_manifest_roots(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        library_kind: &str,
+        deltas: &[StoredScanManifestDelta],
+        roots: &HashMap<String, StoredLibraryRoot>,
+        cancellation: &AtomicBool,
+    ) -> Result<ManifestApplyBatchOutcome, ScanJobError> {
+        let mut processed = 0_usize;
+        let mut created_items = 0_usize;
+        let mut transaction_elapsed = Duration::ZERO;
+        let root_ids = deltas
+            .iter()
+            .map(|delta| delta.library_root_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for root_id in root_ids {
+            if self
+                .cancellation_requested(&job.id, false, cancellation)
+                .await?
+            {
+                return Ok(ManifestApplyBatchOutcome::Cancelled(
+                    self.cancel_running_job(&job.id).await?,
+                ));
+            }
+            let root_deltas = deltas
+                .iter()
+                .filter(|delta| delta.library_root_id == root_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let result = match roots.get(&root_id) {
+                Some(root) => match self
+                    .apply_scan_manifest_root_deltas(
+                        job,
+                        manifest_id,
+                        library_kind,
+                        &root_id,
+                        root,
+                        &root_deltas,
+                        cancellation,
+                    )
+                    .await?
+                {
+                    ManifestApplyRootOutcome::Applied(result) => result,
+                    ManifestApplyRootOutcome::Cancelled(report) => {
+                        return Ok(ManifestApplyBatchOutcome::Cancelled(report));
+                    }
+                },
+                None => {
+                    self.commit_unavailable_manifest_root_deltas(
+                        job,
+                        manifest_id,
+                        &root_id,
+                        &root_deltas,
+                        false,
+                    )
+                    .await?
+                }
+            };
+            processed = processed.saturating_add(result.processed);
+            created_items = created_items.saturating_add(result.created_items);
+            transaction_elapsed += result.transaction_elapsed;
+        }
+        Ok(ManifestApplyBatchOutcome::Applied {
+            processed,
+            created_items,
+            transaction_elapsed,
+        })
+    }
+
+    async fn apply_scan_manifest_root_deltas(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        library_kind: &str,
+        root_id: &str,
+        root: &StoredLibraryRoot,
+        root_deltas: &[StoredScanManifestDelta],
+        cancellation: &AtomicBool,
+    ) -> Result<ManifestApplyRootOutcome, ScanJobError> {
+        let root_path = PathBuf::from(&root.canonical_path);
+        let root_identity = self
+            .database
+            .get_scan_manifest_root_identity(manifest_id, root_id)
+            .await?;
+        let root_is_same_object = match root_identity.as_ref() {
+            Some((state, expected_device, expected_inode)) if state == "COMPLETE" => {
+                stat_manifest_root(root_path.clone())
+                    .await
+                    .is_ok_and(|observed| {
+                        manifest_root_identity_matches(*expected_device, *expected_inode, &observed)
+                    })
+            }
+            _ => false,
+        };
+        if !root_is_same_object {
+            let result = self
+                .commit_unavailable_manifest_root_deltas(
+                    job,
+                    manifest_id,
+                    root_id,
+                    root_deltas,
+                    true,
+                )
+                .await?;
+            return Ok(ManifestApplyRootOutcome::Applied(result));
+        }
+        let (expected_root_device, expected_root_inode) = root_identity
+            .as_ref()
+            .map(|(_, device, inode)| (*device, *inode))
+            .unwrap_or((None, None));
+        let prepared = match self
+            .prepare_manifest_root_delta_files(
+                job,
+                root,
+                root_deltas,
+                library_kind,
+                expected_root_device,
+                expected_root_inode,
+                cancellation,
+            )
+            .await?
+        {
+            ManifestApplyPreparationOutcome::Prepared(prepared) => prepared,
+            ManifestApplyPreparationOutcome::Cancelled(report) => {
+                return Ok(ManifestApplyRootOutcome::Cancelled(report));
+            }
+        };
+        let validation = if prepared.files.root_identity_lost {
+            ManifestRemovalValidation::root_lost()
+        } else {
+            self.validate_manifest_root_removals(
+                &root_path,
+                expected_root_device,
+                expected_root_inode,
+                &prepared.removal_candidates,
+            )
+            .await?
+        };
+        let mut files = prepared.files;
+        let mut removed_media_paths = validation.removed_media_paths;
+        let mut removed_sidecar_paths = validation.removed_sidecar_paths;
+        files.unstable_delta_ids.extend(validation.unstable_ids);
+        if validation.root_identity_lost {
+            self.database
+                .mark_scan_manifest_root_unavailable(manifest_id, root_id)
+                .await?;
+            files
+                .unstable_delta_ids
+                .extend(root_deltas.iter().map(|delta| delta.id.clone()));
+            files.movie_files.clear();
+            files.episode_files.clear();
+            files.unresolved_files.clear();
+            files.sidecar_entries.clear();
+            removed_media_paths.clear();
+            removed_sidecar_paths.clear();
+        }
+        files.unstable_delta_ids.sort();
+        files.unstable_delta_ids.dedup();
+        let result = self
+            .commit_manifest_root_delta_batch(
+                job,
+                manifest_id,
+                root_id,
+                root_deltas,
+                &files,
+                &removed_media_paths,
+                &removed_sidecar_paths,
+            )
+            .await?;
+        Ok(ManifestApplyRootOutcome::Applied(result))
+    }
+
+    async fn commit_unavailable_manifest_root_deltas(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        root_id: &str,
+        root_deltas: &[StoredScanManifestDelta],
+        mark_unavailable: bool,
+    ) -> Result<ManifestApplyRootResult, ScanJobError> {
+        if mark_unavailable {
+            self.database
+                .mark_scan_manifest_root_unavailable(manifest_id, root_id)
+                .await?;
+        }
+        let unstable_delta_ids = root_deltas
+            .iter()
+            .map(|delta| delta.id.clone())
+            .collect::<Vec<_>>();
+        let transaction_started = Instant::now();
+        let result = self
+            .database
+            .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
+                job_id: &job.id,
+                manifest_id,
+                library_id: &job.library_id,
+                library_root_id: root_id,
+                generation: &job.generation,
+                deltas: root_deltas,
+                unstable_delta_ids: &unstable_delta_ids,
+                movie_files: &[],
+                episode_files: &[],
+                unresolved_files: &[],
+                sidecar_entries: &[],
+                removed_media_paths: &[],
+                removed_sidecar_paths: &[],
+            })
+            .await?;
+        Ok(ManifestApplyRootResult {
+            processed: result
+                .applied_count
+                .saturating_add(result.conflict_count)
+                .saturating_add(result.unstable_count),
+            created_items: 0,
+            transaction_elapsed: transaction_started.elapsed(),
+        })
+    }
+
+    async fn prepare_manifest_root_delta_files(
+        &self,
+        job: &StoredScanJob,
+        root: &StoredLibraryRoot,
+        root_deltas: &[StoredScanManifestDelta],
+        library_kind: &str,
+        expected_root_device: Option<i64>,
+        expected_root_inode: Option<i64>,
+        cancellation: &AtomicBool,
+    ) -> Result<ManifestApplyPreparationOutcome, ScanJobError> {
+        let root_path = PathBuf::from(&root.canonical_path);
+        let mut files = ManifestApplyPreparedFiles::default();
+        let mut removal_candidates = Vec::new();
+        let mut mixed_cache = MixedClassificationCache::default();
+        let preparation_concurrency = self.scanner.scan_concurrency.max(1);
+        let mut preparation_tasks: JoinSet<ManifestDeltaPreparation> = JoinSet::new();
+        for delta in root_deltas {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(ManifestApplyPreparationOutcome::Cancelled(
+                    self.cancel_running_job(&job.id).await?,
+                ));
+            }
+            if delta.delta_kind == "REMOVE" {
+                removal_candidates.push(delta.clone());
+                continue;
+            }
+            if delta.fingerprint.is_none() {
+                files.unstable_delta_ids.push(delta.id.clone());
+                continue;
+            }
+            let path = root_path.join(&delta.relative_path);
+            let classification = self
+                .classify_manifest_delta(library_kind, &root_path, &path, &mut mixed_cache)
+                .await;
+            if preparation_tasks.len() >= preparation_concurrency {
+                let preparation =
+                    join_manifest_delta_preparation(&mut preparation_tasks, &root_path).await?;
+                files.record(preparation);
+            }
+            let scanner = self.scanner.clone();
+            let root = root.clone();
+            let root_path = root_path.clone();
+            let delta = delta.clone();
+            let library_kind = library_kind.to_owned();
+            preparation_tasks.spawn(async move {
+                prepare_manifest_delta(
+                    ManifestFilePreparationContext {
+                        scanner,
+                        root,
+                        root_path,
+                        expected_root_device,
+                        expected_root_inode,
+                        movie_folder_provider_ids_cache: None,
+                        verify_path_after_preparation: true,
+                    },
+                    delta,
+                    classification,
+                    &library_kind,
+                )
+                .await
+            });
+        }
+        while let Some(preparation) = preparation_tasks.join_next().await {
+            let preparation = preparation.map_err(|error| ScannerError::Io {
+                path: root_path.clone(),
+                source: std::io::Error::other(error.to_string()),
+            })?;
+            files.record(preparation);
+        }
+        Ok(ManifestApplyPreparationOutcome::Prepared(
+            ManifestApplyRootPreparation {
+                files,
+                removal_candidates,
+            },
+        ))
+    }
+
+    async fn classify_manifest_delta(
+        &self,
+        library_kind: &str,
+        root_path: &Path,
+        path: &Path,
+        mixed_cache: &mut MixedClassificationCache,
+    ) -> Option<MixedClassification> {
+        if !is_supported_movie_file(path) {
+            return None;
+        }
+        Some(match library_kind {
+            "MOVIE" => {
+                if parse_movie_filename(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default(),
+                )
+                .is_some()
+                {
+                    MixedClassification::Movie
+                } else {
+                    MixedClassification::Unresolved
+                }
+            }
+            "SERIES" => {
+                if parse_episode_filename(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default(),
+                )
+                .is_some()
+                {
+                    MixedClassification::Episode
+                } else {
+                    MixedClassification::Unresolved
+                }
+            }
+            "HOMEVIDEOS" => MixedClassification::Unresolved,
+            _ => classify_mixed_file(root_path, path, mixed_cache).await,
+        })
+    }
+
+    async fn validate_manifest_root_removals(
+        &self,
+        root_path: &Path,
+        expected_root_device: Option<i64>,
+        expected_root_inode: Option<i64>,
+        removal_candidates: &[StoredScanManifestDelta],
+    ) -> Result<ManifestRemovalValidation, ScanJobError> {
+        let root_matches = stat_manifest_root(root_path.to_owned())
+            .await
+            .is_ok_and(|observed| {
+                manifest_root_identity_matches(expected_root_device, expected_root_inode, &observed)
+            });
+        let mut root_identity_lost = !root_matches;
+        let mut removal_outcomes = Vec::with_capacity(removal_candidates.len());
+        if !root_identity_lost {
+            for delta in removal_candidates {
+                let outcome = match stat_manifest_relative_file(
+                    root_path.to_owned(),
+                    delta.relative_path.clone(),
+                    expected_root_device,
+                    expected_root_inode,
+                )
+                .await
+                {
+                    Ok(None) => ManifestRemovalOutcome::Missing,
+                    Ok(Some(_)) => ManifestRemovalOutcome::Present,
+                    Err(ScannerError::RootIdentityChanged(_)) => {
+                        root_identity_lost = true;
+                        ManifestRemovalOutcome::RootIdentityChanged
+                    }
+                    Err(ScannerError::Io { .. }) => ManifestRemovalOutcome::PathIoError,
+                    Err(_) => ManifestRemovalOutcome::InvalidPath,
+                };
+                removal_outcomes.push((delta.id.clone(), outcome));
+                if root_identity_lost {
+                    break;
+                }
+            }
+        }
+        if !root_identity_lost {
+            root_identity_lost =
+                !stat_manifest_root(root_path.to_owned())
+                    .await
+                    .is_ok_and(|observed| {
+                        manifest_root_identity_matches(
+                            expected_root_device,
+                            expected_root_inode,
+                            &observed,
+                        )
+                    });
+        }
+        let decision = classify_manifest_removal_outcomes(&removal_outcomes);
+        root_identity_lost |= decision.root_identity_lost;
+        let mut validation = ManifestRemovalValidation {
+            root_identity_lost,
+            unstable_ids: decision.unstable_ids,
+            removed_media_paths: Vec::new(),
+            removed_sidecar_paths: Vec::new(),
+        };
+        if !validation.root_identity_lost {
+            for delta in removal_candidates {
+                if !decision
+                    .confirmed_missing_ids
+                    .iter()
+                    .any(|id| id == &delta.id)
+                {
+                    continue;
+                }
+                if is_supported_movie_file(Path::new(&delta.relative_path)) {
+                    validation
+                        .removed_media_paths
+                        .push(delta.relative_path.clone());
+                }
+                if is_supported_sidecar_file(Path::new(&delta.relative_path)) {
+                    validation
+                        .removed_sidecar_paths
+                        .push(delta.relative_path.clone());
+                }
+            }
+        }
+        Ok(validation)
+    }
+
+    async fn commit_manifest_root_delta_batch(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        root_id: &str,
+        root_deltas: &[StoredScanManifestDelta],
+        files: &ManifestApplyPreparedFiles,
+        removed_media_paths: &[String],
+        removed_sidecar_paths: &[String],
+    ) -> Result<ManifestApplyRootResult, ScanJobError> {
+        let transaction_started = Instant::now();
+        let result = self
+            .database
+            .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
+                job_id: &job.id,
+                manifest_id,
+                library_id: &job.library_id,
+                library_root_id: root_id,
+                generation: &job.generation,
+                deltas: root_deltas,
+                unstable_delta_ids: &files.unstable_delta_ids,
+                movie_files: &files.movie_files,
+                episode_files: &files.episode_files,
+                unresolved_files: &files.unresolved_files,
+                sidecar_entries: &files.sidecar_entries,
+                removed_media_paths,
+                removed_sidecar_paths,
+            })
+            .await?;
+        if result.metadata_targets_changed {
+            self.notify_local_metadata_worker(&job.id);
+        }
+        Ok(ManifestApplyRootResult {
+            processed: result
+                .applied_count
+                .saturating_add(result.conflict_count)
+                .saturating_add(result.unstable_count),
+            created_items: result.created_items,
+            transaction_elapsed: transaction_started.elapsed(),
+        })
+    }
+
+    fn record_manifest_apply_timing(
+        &self,
+        apply_started: Instant,
+        transaction_elapsed: Duration,
+        delta_count: usize,
+    ) {
+        if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+            let elapsed = apply_started.elapsed();
+            tracing::debug!(
+                target: "lux::scan_performance",
+                application_ms = elapsed.saturating_sub(transaction_elapsed).as_millis() as u64,
+                transaction_ms = transaction_elapsed.as_millis() as u64,
+                delta_count = delta_count as u64,
+                "manifest apply phase timing"
+            );
+        }
     }
 
     pub async fn materialize_manifest_postprocessing_targets(

@@ -10377,13 +10377,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
-- [ ] 根离线/替换、同路径更新、并发增量索引、提交失败、删除确认与 workflow 2 兼容语义保持。
-- [ ] 相关定向测试通过。
+- [x] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [x] 根离线/替换、同路径更新、并发增量索引、提交失败、删除确认与 workflow 2 兼容语义保持。
+- [x] 相关定向测试通过。
 
 验证：`cargo test --locked --test scanning_jobs --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
 
 预计文件：`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+结果（2026-10-12）：reconciliation 文件批次拆为 entry 分类、regular 扫描、并发文件准备和逐根提交；movie 路径另拆为 quick/sidecar、同目录分组扫描、准备和提交。Manifest diff/apply 拆为持久化 delta、根身份校验、准备、删除确认与事务提交步骤。相关方法均不超过 150 行，未改每根事务、root fencing、取消检查、增量冲突处理、删除确认或事件顺序。定向集成目标 `mixed_scanner` 1 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项全部通过；build、fmt 与 `git diff --check` 通过。
 
 #### LUX-485：简化扫描完成编排并关闭阶段 24
 
