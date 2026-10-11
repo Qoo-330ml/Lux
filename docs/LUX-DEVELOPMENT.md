@@ -2191,6 +2191,7 @@ services:
 | LUX-301 | src/application/scanner.rs、src/api/legacy.rs、docs/LUX-DEVELOPMENT.md；扫描后持久化本地完整性状态 |
 | LUX-302 | src/storage/metadata.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失记录与补全任务原子提交 |
 | LUX-303 | src/application/metadata.rs、src/application/scanner.rs、src/application/reidentify.rs、src/api/legacy.rs、docs/LUX-DEVELOPMENT.md；渐进扫描接入 FILL_MISSING |
+| LUX-475 | src/storage/jobs.rs、src/application/metadata.rs、src/application/scanner.rs、docs/LUX-DEVELOPMENT.md；渐进扫描将分集所属的季度与剧集容器纳入 FILL_MISSING |
 | LUX-304 | tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；渐进扫描及海报处理性能测量 |
 | LUX-305 | src/storage/catalog.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；本地图片批量写入合同 |
 | LUX-306 | src/application/metadata.rs、tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；海报 worker 批量写入及复测 |
@@ -10210,6 +10211,26 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`docs/LUX-DEVELOPMENT.md`、`web/src/react.css`、`web/tests/admin-dashboard-layout.test.mjs`。
 
 结果（2026-10-10）：手机断点将管理页扩至视口宽度，左右安全区感知内边距最少 12px；平板以上和普通媒体浏览页规则不变。定向布局测试、Web Node 测试 136/136、Vitest 579/579、生产构建、Rust fmt/build/Clippy 均通过。Playwright Chromium 样式预览在 390px 下主体可用宽度 366px，320px 下 296px；滚动宽度分别与视口相等。561px 下保留 92% 外层宽度与 20px 边距；1280px 桌面布局也保持原有比例。Rust 全目标测试的首次运行有 835 个单测通过、20 个忽略，随后在 `tests/scanned_metadata.rs::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 遇到一次本地元数据批次失败；单独复跑该用例以及整个 `scanned_metadata` 目标（23/23）均通过。该前端改动未修改 Rust 源码，全目标套件未重新运行；浏览器检查使用本地 CSS 预览，不代表真实 iOS Safari 渲染或部署状态。
+
+#### LUX-475：渐进扫描补全剧集与季度容器元数据
+
+范围：workflow 3 本地 metadata completeness 和实时增量扫描在当前分集媒体源通过有效性检查、其本地图片/NFO 处理完成后，将该分集及其同库、未删除的父 SEASON 与 SERIES 一并纳入本地完整性计划。按现有扫描策略只派发确实缺失且可请求的能力；同一页多个分集共享的季/剧集去重。source identity 检查失败或层级关系无效时不得借旧分集身份调度容器。保持本地 NFO/图片优先级、字段锁定、INCREMENTAL_SCAN 策略快照、活动任务去重和独立异步 FILL_MISSING worker。
+
+验收：
+
+- [x] 开启自动补缺的增量扫描为分集及其季、剧集容器保存完整性状态，并将三个条目合并进有界 FILL_MISSING 工作。
+- [x] 关闭自动补缺时仍保存这三个条目的本地缺失状态，但不创建在线任务。
+- [x] source identity 检查失败、文件已缺失、条目已删除或容器跨库/类型不符时，不扩展到其父项。
+- [x] 同页多个分集共享的季和剧集只参与一次计划/派发；现有去重、策略快照和分集任务行为不变。
+- [x] 不新增 schema、公共 API 或扫描路径中的 provider 请求；provider 仍只由现有后台 worker 调用。
+
+验证：定向 cargo test --locked --lib 覆盖 source 身份/父级扩展和增量扫描派发；cargo build --locked、cargo test --locked --all-targets、cargo fmt --all -- --check、cargo clippy --locked --all-targets --all-features -- -D warnings。Cargo 命令使用 Toshiba 原项目共享 target。
+
+预计文件：src/storage/jobs.rs、src/application/metadata.rs、src/application/scanner.rs、docs/LUX-DEVELOPMENT.md。
+
+结果（2026-10-11）：增量扫描的本地 metadata worker 在分集本地检查成功后，将所属季/剧集加入 completeness 计划，并在派发前去重；本地 outbox/backfill 路径则在首选 source 身份校验通过后扩展层级。失败的本地 NFO/图片项不会触发容器补缺。SQLite 回归覆盖首选 source 变化、文件缺失、条目删除和层级扩展；增量扫描回归用同季两集验证只产生一个季项、一个剧集项及两个分集项，并验证策略关闭时仍保存三类缺失状态。
+
+验证：存储与增量扫描定向单测通过；scanning_jobs 81/81、scanned_metadata 23/23、scanned_series_metadata 3/3；cargo build --locked、cargo test --locked --all-targets（库测试 835 passed、20 ignored，所有集成目标通过）、cargo fmt --all -- --check、cargo clippy --locked --all-targets --all-features -- -D warnings 通过。Cargo 使用 Toshiba 原项目共享 target。本机 arm64；未部署 FNOS、未触发生产刮削。
 
 ## 28. 参考资料
 

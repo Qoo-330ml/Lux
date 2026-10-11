@@ -1122,21 +1122,35 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT mi.id AS item_id, preferred.id AS source_id
-                 FROM media_items mi
-                 JOIN media_sources preferred ON preferred.id = (
-                     SELECT candidate.id FROM media_sources candidate
-                     JOIN filesystem_entries candidate_entry
-                       ON candidate_entry.id = candidate.filesystem_entry_id
-                     WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
-                     ORDER BY candidate.is_default DESC, candidate.id
-                     LIMIT 1
+                "WITH current_sources AS (
+                     SELECT mi.id AS source_item_id, mi.parent_id, mi.series_id,
+                            mi.library_id, preferred.id AS source_id
+                     FROM media_items mi
+                     JOIN media_sources preferred ON preferred.id = (
+                         SELECT candidate.id FROM media_sources candidate
+                         JOIN filesystem_entries candidate_entry
+                           ON candidate_entry.id = candidate.filesystem_entry_id
+                         WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
+                         ORDER BY candidate.is_default DESC, candidate.id
+                         LIMIT 1
+                     )
+                     JOIN filesystem_entries preferred_entry
+                       ON preferred_entry.id = preferred.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
+                     WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
+                       AND preferred_entry.is_missing = 0
                  )
-                 JOIN filesystem_entries preferred_entry
-                   ON preferred_entry.id = preferred.filesystem_entry_id
-                 JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
-                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
-                   AND preferred_entry.is_missing = 0"
+                 SELECT source_item_id, source_id, source_item_id AS item_id
+                 FROM current_sources
+                 UNION ALL
+                 SELECT current_sources.source_item_id, current_sources.source_id,
+                        related.id AS item_id
+                 FROM current_sources
+                 JOIN media_items related
+                   ON related.id IN (current_sources.parent_id, current_sources.series_id)
+                  AND related.library_id = current_sources.library_id
+                  AND related.removed_at IS NULL
+                  AND related.item_type IN ('SERIES', 'SEASON')"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
@@ -1151,9 +1165,11 @@ impl Database {
                         source,
                     })?;
             for row in rows {
+                let source_item_id: String = row.get("source_item_id");
                 let item_id: String = row.get("item_id");
                 let source_id: String = row.get("source_id");
-                if expected_source_by_item.get(item_id.as_str()) == Some(&source_id.as_str()) {
+                if expected_source_by_item.get(source_item_id.as_str()) == Some(&source_id.as_str())
+                {
                     current_item_ids.push(item_id);
                 }
             }
@@ -12727,7 +12743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_metadata_completeness_reuses_current_source_identities()
+    async fn local_metadata_completeness_reuses_current_source_identities_and_expands_episode_hierarchy()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let database = Database::connect(&Config {
@@ -12736,7 +12752,7 @@ mod tests {
         })
         .await?;
         database
-            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'SERIES')")
             .execute(database.pool())
             .await?;
         database
@@ -12750,8 +12766,15 @@ mod tests {
         database
             .query(
                 "INSERT INTO media_items (
-                     id, library_id, item_type, title, sort_title, identification_status
-                 ) VALUES ('item', 'lib', 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+                     id, library_id, item_type, parent_id, series_id, season_number,
+                     episode_number, title, sort_title, production_year, identification_status
+                 ) VALUES
+                    ('series', 'lib', 'SERIES', NULL, NULL, NULL, NULL,
+                     'Show', 'show', 2024, 'LOCAL_CONFIRMED'),
+                    ('season', 'lib', 'SEASON', 'series', 'series', 1, NULL,
+                     'Season 01', 'season 01', NULL, 'LOCAL_CONFIRMED'),
+                    ('item', 'lib', 'EPISODE', 'season', 'series', 1, 1,
+                     'Episode', 'episode', NULL, 'LOCAL_CONFIRMED')",
             )
             .execute(database.pool())
             .await?;
@@ -12800,7 +12823,7 @@ mod tests {
             database
                 .list_current_scan_local_metadata_item_ids(&identities)
                 .await?,
-            vec!["item".to_owned()]
+            vec!["item".to_owned(), "season".to_owned(), "series".to_owned()]
         );
         let metadata = database
             .list_active_media_item_metadata_with_libraries(&["item".to_owned()])
@@ -12831,7 +12854,7 @@ mod tests {
                     "source-new".to_owned(),
                 )])
                 .await?,
-            vec!["item".to_owned()]
+            vec!["item".to_owned(), "season".to_owned(), "series".to_owned()]
         );
         database
             .query("UPDATE media_items SET removed_at = unixepoch() WHERE id = 'item'")
