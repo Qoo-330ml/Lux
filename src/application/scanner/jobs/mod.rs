@@ -1,5 +1,8 @@
 use super::*;
 
+mod manifest_discovery;
+mod manifest_index;
+
 #[derive(Clone)]
 pub struct ScanJobService {
     pub(super) scanner: LibraryScanner,

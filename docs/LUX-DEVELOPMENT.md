@@ -10297,13 +10297,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] runner 只根据已持久化阶段选择 discovery、diff、apply 或 indexed completion，不内嵌目录处理算法。
-- [ ] 根被替换/卸载、目录观察改变、并发增量索引、批次提交失败、取消/恢复与 workflow 2 兼容语义保持。
-- [ ] 所有 Manifest 定向回归及 scanner 单测通过。
+- [x] runner 只根据已持久化阶段选择 discovery、diff、apply 或 indexed completion，不内嵌目录处理算法。
+- [x] 根被替换/卸载、目录观察改变、并发增量索引、批次提交失败、取消/恢复与 workflow 2 兼容语义保持。
+- [x] 所有 Manifest 定向回归及 scanner 单测通过。
 
 验证：`cargo test --locked --test scanning_jobs --test scanner --test scanned_metadata`、scanner library tests、fmt 和 build。
 
 预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/manifest_discovery.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+结果（2026-10-12）：Manifest 目录发现、受观察保护的批次提交与 lite discovery 移入 `jobs/manifest_discovery.rs`；差异计算、批次应用、postprocessing target materialization 和 indexed completion 移入 `jobs/manifest_index.rs`。runner 仍按持久化 Manifest 状态选择阶段，workflow 兼容判断、批次大小和调用顺序保持原样；底层 descriptor/stat/STRM 安全访问仍在 `scanner/manifest.rs`。定向集成测试 `scanned_metadata` 23 项、`scanner` 18 项、`scanning_jobs` 81 项通过；scanner library tests 41 项通过、1 项按要求忽略；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 8,756 行减至 6,353 行，两个 Manifest 阶段模块分别 1,436 行和 973 行。仅验证本地行为，无运行时性能结论。
 
 #### LUX-480：拆分 reconciliation 与增量扫描
 
