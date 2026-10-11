@@ -10281,13 +10281,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] `ScanJobService`、`ScanJob`、`ScanJobError`、`ScanBatchReport`、`IncrementalScanChange` 与 `LocalMetadataRefreshAccepted` 的现有导出路径不变。
-- [ ] 活动任务 guard、删除 fencing、取消标志和 worker 通知仍共享同一组 `Arc` 状态。
-- [ ] 所有既有 scanner 单测仍在 `application::scanner::tests` 名称空间下运行。
+- [x] `ScanJobService`、`ScanJob`、`ScanJobError`、`ScanBatchReport`、`IncrementalScanChange` 与 `LocalMetadataRefreshAccepted` 的现有导出路径不变。
+- [x] 活动任务 guard、删除 fencing、取消标志和 worker 通知仍共享同一组 `Arc` 状态。
+- [x] 所有既有 scanner 单测仍在 `application::scanner::tests` 名称空间下运行。
 
 验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test shutdown_jobs --test scanning_jobs`、fmt 检查和 build。
 
 预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/tests.rs`、本文档。
+
+结果（2026-10-12）：`ScanJobService` 状态、运行/删除 guard、worker handle 与公开任务 DTO/error 移至 `scanner/jobs/mod.rs`，scanner 单测移至 `scanner/tests.rs`，根模块 re-export 保持类型路径及 `scanner::tests` 测试路径。取消与删除协调仍共享原 `Arc` 注册表、通知和标志。scanner library tests 41 passed、1 ignored；`scanning_jobs` 81/81、`shutdown_jobs` 1/1 通过；fmt 与 `git diff --check` 通过。剩余 runner 和各扫描阶段仍在 `scanner.rs`，后续任务继续拆分。
 
 #### LUX-479：拆分 Manifest 扫描阶段
 
