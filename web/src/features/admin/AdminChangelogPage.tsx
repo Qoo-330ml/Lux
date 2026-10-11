@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "Unreleased",
+    date: "2026-10-11",
+    sections: [
+      { kind: "changed", items: [
+        "增量扫描检查分集元数据时，同时检查所属季度和剧集容器；同一批次的共享父项会去重，关闭自动补缺时仍记录本地缺失状态。",
+        "性能基准验证目录页和海报确实来自测试媒体，并增加可选的目录请求时序探针。阶段 23 双后端性能门仍未通过，数据与限制见 docs/PERFORMANCE.md。",
+      ] },
+      { kind: "fixed", items: [
+        "自动元数据搜索没有匹配项时按“无候选”处理，不再误判为刮削器不可用。",
+        "本地海报读取失败时保留批次重试状态，避免误标图片阶段完成；恢复文件访问后可继续处理。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.22",
     date: "2026-10-10",
     sections: [
