@@ -1,7 +1,9 @@
 use super::*;
 
+mod incremental;
 mod manifest_discovery;
 mod manifest_index;
+mod reconciliation;
 
 #[derive(Clone)]
 pub struct ScanJobService {

@@ -10313,13 +10313,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] reconciliation 和 incremental 算法从 runner 中分离，阶段状态由现有数据库记录驱动。
-- [ ] 根离线、扫描期间根替换、文件身份变化、reconciliation 重试和实时扫描抢占回归保持。
-- [ ] 不新增 whole-library request path 或无界后台工作。
+- [x] reconciliation 和 incremental 算法从 runner 中分离，阶段状态由现有数据库记录驱动。
+- [x] 根离线、扫描期间根替换、文件身份变化、reconciliation 重试和实时扫描抢占回归保持。
+- [x] 不新增 whole-library request path 或无界后台工作。
 
 验证：`cargo test --locked --test scanning_jobs --test watch --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
 
 预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/incremental.rs`、本文档。
+
+结果（2026-10-12）：持久化 reconciliation 的目录发现、文件批次、指纹与缺失确认移入 `jobs/reconciliation.rs`；实时/定向增量批次及媒体/sidecar 处理移入 `jobs/incremental.rs`。root runner 保留既有任务读取与阶段路由，未增加整库请求路径、后台队列或工作单元。定向集成目标 `mixed_scanner` 1 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 6,353 行减至 4,355 行，两个新模块分别 1,470 行和 534 行；扫描和并发语义由原有回归覆盖，不据此推断性能变化。
 
 #### LUX-481：抽离本地元数据 outbox worker
 
