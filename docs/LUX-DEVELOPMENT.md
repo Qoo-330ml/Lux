@@ -10337,7 +10337,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
 
-结果（2026-10-12）：local metadata 的 batch/backfill/completeness helpers、单任务 worker、outbox worker、等待器、取消收尾及 refresh 实现移入 `jobs/local_metadata.rs`；outbox worker 从 incremental 模块抽出，scanner facade 保留稳定服务 API 与 worker 调用入口。`scanned_metadata` 23 项、`scanning_jobs` 81 项、scanner 单测 41 项通过（1 项按要求忽略）；`scanned_series_metadata` 2 项通过，`unreadable_series_poster_keeps_local_image_batch_retryable` 失败。该失败在本分支与干净基线 `01f0c9e4` 上均可复现，错误为 batch `COMPLETED` 而预期 `FAILED`，本次纯移动未改变该行为；因此相关重试验收暂未勾选。`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 4,355 行减至 3,195 行，`jobs/local_metadata.rs` 为 1,415 行；未把在线 provider 请求移入扫描路径，也未增加后台队列。
+结果（2026-10-12）：local metadata 的 batch/backfill/completeness helpers、单任务 worker、outbox worker、等待器、取消收尾及 refresh 实现移入 `jobs/local_metadata.rs`；outbox worker 从 incremental 模块抽出，scanner facade 保留稳定服务 API 与 worker 调用入口。`scanned_metadata` 23 项、`scanning_jobs` 81 项、scanner 单测 41 项通过（1 项按要求忽略）。`unreadable_series_poster_keeps_local_image_batch_retryable` 仍呈间歇性：在 LUX-480 基线 `01f0c9e4` 和当前隔离运行中出现过 batch `COMPLETED` 而预期 `FAILED`，后续完整 `scanned_series_metadata` 多次运行通过 3/3；因此不将图片失败重试验收标为已确认。`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 4,355 行减至 3,195 行，`jobs/local_metadata.rs` 为 1,415 行；未把在线 provider 请求移入扫描路径，也未增加后台队列。
 
 #### LUX-482：拆分任务生命周期与扫描后处理
 
@@ -10393,14 +10393,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
-- [ ] 增量/全量成功、取消、失败重试、共享扫描锁释放、Home 刷新与 webhook/用户事件顺序保持。
+- [x] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [x] 增量/全量成功、取消、失败重试、共享扫描锁释放、Home 刷新与 webhook/用户事件顺序保持。
 - [ ] 全量 Rust 完成门通过：build、all-targets tests、fmt、all-targets/all-features Clippy；扫描定向目标通过。
-- [ ] 模块边界记录更新；阶段门由项目所有者确认后再进入下一阶段。
+- [x] 模块边界记录更新；进入下一阶段前仍须项目所有者确认。
 
 验证：Toshiba 挂载检查后设置共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行扫描定向目标与 `cargo test --locked --all-targets`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，记录 `uname -m`。不得以本机 ARM 结果推断 NAS/x86 性能。
 
 预计文件：`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/postprocessing.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+结果（2026-10-12）：incremental batch 与空队列完成拆为路径处理、终结状态更新；`run_to_completion*` 公共入口和 run guard 移到 postprocessing，主循环拆为扫描批次循环、Manifest target 准备、增量收尾和全量 probe/metadata/cover/thumbnail/completion 阶段。局部 worker 与 outbox loop 拆为单页/单批处理和等待入口；NFO 并发上限、批次优先级、通知与 fallback 顺序保持。相关 orchestration 方法均不超过 150 行。扫描定向集成 `mixed_scanner` 1 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项、`shutdown_jobs` 1 项、`watch` 5 项通过（合计 143 项）；scanner 单测 41 项通过、1 项按要求忽略。series 不可读海报用例此前有过隔离失败，整文件运行通过，仍按 LUX-481 标为间歇性风险。`cargo build --locked`、fmt、`git diff --check` 和 `cargo clippy --locked --lib --all-features -- -D warnings` 通过；`cargo test --locked --all-targets` 与 all-targets/all-features Clippy 被未修改的 `tests/performance.rs` 阻挡：45 个未定义变量/函数错误及 unused imports。机器为 `arm64`，不得外推 NAS/x86 性能。全量项目完成门未通过，阶段24记录已更新；暂不进入下一阶段。
 
 依赖：无。明确不做：Storage/API 重构、schema/SQL 修改、新后台 worker、新扫描状态、新性能承诺或部署。
 

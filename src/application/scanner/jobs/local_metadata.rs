@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::application::candidates::LocalMetadataCompletenessPlan;
+use crate::storage::{StoredMediaMetadata, StoredScanJobMetadataPage};
+
 pub(in crate::application::scanner) const LOCAL_METADATA_IDLE_FALLBACK: Duration =
     Duration::from_secs(1);
 
@@ -547,6 +550,35 @@ pub(in crate::application::scanner) async fn complete_local_metadata_completenes
     let Some(selection) = selection else {
         return Ok(());
     };
+    let (auto_match_policy, checks_by_library) = build_local_metadata_completeness_checks(
+        database,
+        selection,
+        metadata_reidentify,
+        trigger,
+        item_ids,
+    )
+    .await?;
+    let scheduled_job_ids =
+        persist_local_metadata_completeness_checks(database, checks_by_library, auto_match_policy)
+            .await?;
+    dispatch_local_metadata_fill_missing_jobs(metadata_reidentify, scheduled_job_ids, user_events)
+        .await;
+    Ok(())
+}
+
+async fn build_local_metadata_completeness_checks(
+    database: &Database,
+    selection: &MetadataSelectionService,
+    metadata_reidentify: Option<&MetadataReidentifyService>,
+    trigger: LocalMetadataCompletenessTrigger<'_>,
+    item_ids: &[String],
+) -> Result<
+    (
+        MetadataAutoMatchPolicy,
+        BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>>,
+    ),
+    String,
+> {
     let auto_match_policy = resolve_local_metadata_auto_match_policy(database, trigger).await?;
     let metadata_by_item = database
         .list_active_media_item_metadata_with_libraries(item_ids)
@@ -564,37 +596,81 @@ pub(in crate::application::scanner) async fn complete_local_metadata_completenes
         .local_metadata_completeness_plans(&plan_inputs)
         .await
         .map_err(|error| error.to_string())?;
-    let scraper_check_item_ids =
-        if auto_match_policy.allows_scraper_lookup() && metadata_reidentify.is_some() {
-            item_ids
-                .iter()
-                .filter(|item_id| {
-                    plans_by_item
-                        .get(*item_id)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|plan| plan.has_requestable_capability)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+    let scraper_check_item_ids = collect_scraper_preflight_item_ids(
+        item_ids,
+        &plans_by_item,
+        auto_match_policy,
+        metadata_reidentify.is_some(),
+    );
     let (scraper_availability_by_item, scraper_availability_error) =
-        if let Some(metadata_reidentify) = metadata_reidentify
-            && !scraper_check_item_ids.is_empty()
+        load_local_metadata_scraper_availability(metadata_reidentify, &scraper_check_item_ids)
+            .await;
+    let checks_by_library = build_local_metadata_completeness_checks_by_library(
+        item_ids,
+        &metadata_by_item,
+        &plans_by_item,
+        auto_match_policy,
+        metadata_reidentify.is_some(),
+        &scraper_availability_by_item,
+        scraper_availability_error.as_deref(),
+    );
+    Ok((auto_match_policy, checks_by_library))
+}
+
+fn collect_scraper_preflight_item_ids(
+    item_ids: &[String],
+    plans_by_item: &HashMap<String, Option<LocalMetadataCompletenessPlan>>,
+    auto_match_policy: MetadataAutoMatchPolicy,
+    has_metadata_reidentify: bool,
+) -> Vec<String> {
+    if !auto_match_policy.allows_scraper_lookup() || !has_metadata_reidentify {
+        return Vec::new();
+    }
+    item_ids
+        .iter()
+        .filter(|item_id| {
+            plans_by_item
+                .get(*item_id)
+                .and_then(Option::as_ref)
+                .is_some_and(|plan| plan.has_requestable_capability)
+        })
+        .cloned()
+        .collect()
+}
+
+async fn load_local_metadata_scraper_availability(
+    metadata_reidentify: Option<&MetadataReidentifyService>,
+    item_ids: &[String],
+) -> (
+    HashMap<String, Result<bool, MetadataReidentifyError>>,
+    Option<String>,
+) {
+    if let Some(metadata_reidentify) = metadata_reidentify
+        && !item_ids.is_empty()
+    {
+        match metadata_reidentify
+            .has_selected_scrapers_for_items(item_ids)
+            .await
         {
-            match metadata_reidentify
-                .has_selected_scrapers_for_items(&scraper_check_item_ids)
-                .await
-            {
-                Ok(available) => (available, None),
-                Err(error) => (HashMap::new(), Some(error.to_string())),
-            }
-        } else {
-            (HashMap::new(), None)
-        };
-    let mut checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> =
-        BTreeMap::new();
+            Ok(available) => (available, None),
+            Err(error) => (HashMap::new(), Some(error.to_string())),
+        }
+    } else {
+        (HashMap::new(), None)
+    }
+}
+
+fn build_local_metadata_completeness_checks_by_library(
+    item_ids: &[String],
+    metadata_by_item: &HashMap<String, (String, StoredMediaMetadata)>,
+    plans_by_item: &HashMap<String, Option<LocalMetadataCompletenessPlan>>,
+    auto_match_policy: MetadataAutoMatchPolicy,
+    has_metadata_reidentify: bool,
+    scraper_availability_by_item: &HashMap<String, Result<bool, MetadataReidentifyError>>,
+    scraper_availability_error: Option<&str>,
+) -> BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> {
+    let mut checks_by_library =
+        BTreeMap::<String, Vec<PendingLocalMetadataCompletenessCheck>>::new();
     for item_id in item_ids {
         let Some((library_id, _current)) = metadata_by_item.get(item_id) else {
             continue;
@@ -602,41 +678,14 @@ pub(in crate::application::scanner) async fn complete_local_metadata_completenes
         let Some(plan) = plans_by_item.get(item_id).and_then(Option::as_ref) else {
             continue;
         };
-        let eligible_for_fill_missing = if plan.has_requestable_capability
-            && auto_match_policy.allows_scraper_lookup()
-        {
-            if metadata_reidentify.is_some() {
-                let availability = scraper_availability_by_item.get(item_id);
-                let preflight_result = if let Some(error) = scraper_availability_error.as_deref() {
-                    tracing::warn!(
-                        item_id = %item_id,
-                        error,
-                        "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                    );
-                    Err(())
-                } else {
-                    match availability {
-                        Some(Ok(available)) => Ok(Some(*available)),
-                        None => Ok(None),
-                        Some(Err(error)) => {
-                            tracing::warn!(
-                                item_id = %item_id,
-                                %error,
-                                "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                            );
-                            Err(())
-                        }
-                    }
-                };
-                let preflight = ScraperAvailabilityPreflight::from_check_result(preflight_result);
-                // The metadata worker can persist SCRAPER_UNAVAILABLE and apply its bounded retry.
-                preflight.allows_fill_missing()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let eligible_for_fill_missing = local_metadata_item_is_fill_missing_eligible(
+            item_id,
+            plan,
+            auto_match_policy,
+            has_metadata_reidentify,
+            scraper_availability_by_item,
+            scraper_availability_error,
+        );
         let checks = checks_by_library.entry(library_id.clone()).or_default();
         checks.extend(plan.capabilities.iter().map(|(capability, is_missing)| {
             (
@@ -648,7 +697,53 @@ pub(in crate::application::scanner) async fn complete_local_metadata_completenes
             )
         }));
     }
+    checks_by_library
+}
 
+fn local_metadata_item_is_fill_missing_eligible(
+    item_id: &str,
+    plan: &LocalMetadataCompletenessPlan,
+    auto_match_policy: MetadataAutoMatchPolicy,
+    has_metadata_reidentify: bool,
+    scraper_availability_by_item: &HashMap<String, Result<bool, MetadataReidentifyError>>,
+    scraper_availability_error: Option<&str>,
+) -> bool {
+    if !plan.has_requestable_capability || !auto_match_policy.allows_scraper_lookup() {
+        return false;
+    }
+    if !has_metadata_reidentify {
+        return false;
+    }
+    let availability = scraper_availability_by_item.get(item_id);
+    let preflight_result = if let Some(error) = scraper_availability_error {
+        tracing::warn!(
+            item_id,
+            error,
+            "local metadata can confirm missing capabilities but scraper availability could not be checked"
+        );
+        Err(())
+    } else {
+        match availability {
+            Some(Ok(available)) => Ok(Some(*available)),
+            None => Ok(None),
+            Some(Err(error)) => {
+                tracing::warn!(
+                    item_id,
+                    %error,
+                    "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                );
+                Err(())
+            }
+        }
+    };
+    ScraperAvailabilityPreflight::from_check_result(preflight_result).allows_fill_missing()
+}
+
+async fn persist_local_metadata_completeness_checks(
+    database: &Database,
+    checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>>,
+    auto_match_policy: MetadataAutoMatchPolicy,
+) -> Result<Vec<(String, String)>, String> {
     let checked_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -693,38 +788,437 @@ pub(in crate::application::scanner) async fn complete_local_metadata_completenes
             );
         }
     }
-    if let Some(metadata_reidentify) = metadata_reidentify.cloned()
-        && !scheduled_job_ids.is_empty()
-    {
-        let mut completions = Vec::with_capacity(scheduled_job_ids.len());
-        for (library_id, job_id) in scheduled_job_ids {
-            match metadata_reidentify
-                .enqueue_fill_missing_job_id(&job_id)
-                .await
-            {
-                Ok(Some(completion)) => completions.push(completion),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        library_id,
-                        job_id,
-                        %error,
-                        "local metadata completeness job could not be dispatched"
-                    );
-                }
+    Ok(scheduled_job_ids)
+}
+
+async fn dispatch_local_metadata_fill_missing_jobs(
+    metadata_reidentify: Option<&MetadataReidentifyService>,
+    scheduled_job_ids: Vec<(String, String)>,
+    user_events: &UserEventHub,
+) {
+    let Some(metadata_reidentify) = metadata_reidentify.cloned() else {
+        return;
+    };
+    if scheduled_job_ids.is_empty() {
+        return;
+    }
+    let mut completions = Vec::with_capacity(scheduled_job_ids.len());
+    for (library_id, job_id) in scheduled_job_ids {
+        match metadata_reidentify
+            .enqueue_fill_missing_job_id(&job_id)
+            .await
+        {
+            Ok(Some(completion)) => completions.push(completion),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    library_id,
+                    job_id,
+                    %error,
+                    "local metadata completeness job could not be dispatched"
+                );
             }
         }
-        if !completions.is_empty() {
-            let user_events = user_events.clone();
-            tokio::spawn(async move {
-                for completion in completions {
-                    let _ = completion.await;
-                    user_events.publish_home_coalesced().await;
+    }
+    if !completions.is_empty() {
+        let user_events = user_events.clone();
+        tokio::spawn(async move {
+            for completion in completions {
+                let _ = completion.await;
+                user_events.publish_home_coalesced().await;
+            }
+        });
+    }
+}
+
+struct ScanLocalMetadataOutboxWorkerContext {
+    database: Database,
+    local_nfo: Option<LocalNfoMetadataStore>,
+    metadata_selection: Option<MetadataSelectionService>,
+    metadata_reidentify: Option<MetadataReidentifyService>,
+    home: Option<HomeService>,
+    user_events: UserEventHub,
+    resources: ResourceMetrics,
+    outbox_notify: Arc<Notify>,
+    image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
+
+async fn run_scan_local_metadata_outbox_worker(context: ScanLocalMetadataOutboxWorkerContext) {
+    let enricher = MetadataEnricher::new(context.database.clone())
+        .with_resource_metrics(context.resources.clone());
+    let enricher = match context.local_nfo.clone() {
+        Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+        None => enricher,
+    };
+    let mut nfo_tasks = JoinSet::new();
+    loop {
+        if nfo_tasks.len() >= MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT {
+            if let Some(Err(error)) = nfo_tasks.join_next().await {
+                tracing::error!(%error, "local metadata NFO worker task panicked");
+            }
+            continue;
+        }
+        match context
+            .database
+            .claim_next_scan_local_metadata_batch()
+            .await
+        {
+            Ok(Some(batch)) => {
+                process_scan_local_metadata_outbox_batch(
+                    &context,
+                    &enricher,
+                    &mut nfo_tasks,
+                    batch,
+                )
+                .await;
+            }
+            Ok(None) => {
+                match context
+                    .database
+                    .claim_next_scan_local_metadata_backfill_page(
+                        SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
+                    )
+                    .await
+                {
+                    Ok(Some(page)) => {
+                        process_scan_local_metadata_backfill_page(
+                            &context,
+                            &enricher,
+                            &mut nfo_tasks,
+                            page,
+                        )
+                        .await;
+                    }
+                    Ok(None) => wait_for_scan_local_metadata_work(&context, &mut nfo_tasks).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "local metadata backfill claim failed; retrying");
+                        tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
+                    }
                 }
-            });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "local metadata outbox claim failed; retrying");
+                tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
+            }
         }
     }
-    Ok(())
+}
+
+async fn process_scan_local_metadata_outbox_batch(
+    context: &ScanLocalMetadataOutboxWorkerContext,
+    enricher: &MetadataEnricher,
+    nfo_tasks: &mut JoinSet<String>,
+    batch: StoredScanLocalMetadataBatch,
+) {
+    let Some((batch_id, scan_job_id, source_snapshot, non_retryable_item_ids)) =
+        process_scan_local_metadata_batch(
+            &context.database,
+            enricher,
+            context.home.as_ref(),
+            &context.user_events,
+            batch,
+        )
+        .await
+    else {
+        return;
+    };
+    notify_local_metadata_images_waiter(&context.image_notifications, &scan_job_id);
+    let database = context.database.clone();
+    let enricher = enricher.clone();
+    let metadata_selection = context.metadata_selection.clone();
+    let metadata_reidentify = context.metadata_reidentify.clone();
+    let home = context.home.clone();
+    let user_events = context.user_events.clone();
+    nfo_tasks.spawn(async move {
+        let completion_context = LocalMetadataCompletionContext {
+            metadata_selection: metadata_selection.as_ref(),
+            metadata_reidentify: metadata_reidentify.as_ref(),
+            home: home.as_ref(),
+            user_events: &user_events,
+        };
+        finish_scan_local_metadata_batch(
+            &database,
+            &enricher,
+            completion_context,
+            &batch_id,
+            &scan_job_id,
+            source_snapshot,
+            &non_retryable_item_ids,
+        )
+        .await;
+        batch_id
+    });
+}
+
+async fn process_scan_local_metadata_backfill_page(
+    context: &ScanLocalMetadataOutboxWorkerContext,
+    enricher: &MetadataEnricher,
+    nfo_tasks: &mut JoinSet<String>,
+    page: StoredScanLocalMetadataBackfillPage,
+) {
+    match process_scan_local_metadata_backfill_images(
+        enricher,
+        context.home.as_ref(),
+        &context.user_events,
+        &page,
+    )
+    .await
+    {
+        Ok(source_snapshot) => {
+            let database = context.database.clone();
+            let enricher = enricher.clone();
+            let metadata_selection = context.metadata_selection.clone();
+            let metadata_reidentify = context.metadata_reidentify.clone();
+            let home = context.home.clone();
+            let user_events = context.user_events.clone();
+            let library_root_id = page.library_root_id.clone();
+            nfo_tasks.spawn(async move {
+                let completion_context = LocalMetadataCompletionContext {
+                    metadata_selection: metadata_selection.as_ref(),
+                    metadata_reidentify: metadata_reidentify.as_ref(),
+                    home: home.as_ref(),
+                    user_events: &user_events,
+                };
+                finish_scan_local_metadata_backfill_page(
+                    &database,
+                    &enricher,
+                    completion_context,
+                    page,
+                    source_snapshot,
+                )
+                .await;
+                library_root_id
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                library_root_id = %page.library_root_id,
+                %error,
+                "local metadata backfill image stage failed and will be retried"
+            );
+            fail_scan_local_metadata_backfill_page(&context.database, &page, &error, &[]).await;
+        }
+    }
+}
+
+async fn wait_for_scan_local_metadata_work(
+    context: &ScanLocalMetadataOutboxWorkerContext,
+    nfo_tasks: &mut JoinSet<String>,
+) {
+    if nfo_tasks.is_empty() {
+        tokio::select! {
+            _ = context.outbox_notify.notified() => {}
+            _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+        }
+    } else {
+        tokio::select! {
+            result = nfo_tasks.join_next() => {
+                if let Some(Err(error)) = result {
+                    tracing::error!(%error, "local metadata worker task panicked");
+                }
+            }
+            _ = context.outbox_notify.notified() => {}
+            _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+        }
+    }
+}
+
+struct LocalMetadataJobWorkerContext {
+    database: Database,
+    people: Option<PeopleService>,
+    local_nfo: Option<LocalNfoMetadataStore>,
+    metadata_selection: Option<MetadataSelectionService>,
+    metadata_reidentify: Option<MetadataReidentifyService>,
+    home: Option<HomeService>,
+    user_events: UserEventHub,
+    resources: ResourceMetrics,
+    target_root_validator: ScanJobService,
+    scan_job_id: String,
+    notify: Arc<Notify>,
+    stop_receiver: watch::Receiver<bool>,
+    #[cfg(test)]
+    idle_page_sender: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+async fn process_local_metadata_job_page(
+    context: &LocalMetadataJobWorkerContext,
+    enricher: &MetadataEnricher,
+    page: StoredScanJobMetadataPage,
+) {
+    let is_incremental_scan = page.job_type.as_deref() == Some("INCREMENTAL_SCAN");
+    let completeness_policy = metadata_auto_match_policy_for_scan_job_snapshot(
+        page.job_type.as_deref(),
+        page.auto_metadata_match,
+    );
+    if let Err(error) = context
+        .target_root_validator
+        .verify_manifest_postprocessing_target_roots(&context.scan_job_id)
+        .await
+    {
+        tracing::warn!(
+            scan_job_id = %context.scan_job_id,
+            %error,
+            "local metadata worker deferred targets because a manifest root changed"
+        );
+        if let Err(mark_error) = context
+            .database
+            .mark_pending_scan_job_metadata_targets_failed(&context.scan_job_id, &error.to_string())
+            .await
+        {
+            tracing::warn!(
+                scan_job_id = %context.scan_job_id,
+                %mark_error,
+                "local metadata worker could not defer root-mismatched targets"
+            );
+        }
+        context.notify.notify_waiters();
+        return;
+    }
+    match enricher
+        .enrich_scan_job_metadata_page(&context.scan_job_id, page)
+        .await
+    {
+        Ok(report) if report.items_processed > 0 => {
+            if is_incremental_scan
+                && !report.locally_enriched_item_ids.is_empty()
+                && let Err(error) = complete_local_metadata_completeness_for_item_ids(
+                    &context.database,
+                    context.metadata_selection.as_ref(),
+                    context.metadata_reidentify.as_ref(),
+                    LocalMetadataCompletenessTrigger::ScanJobPolicy(completeness_policy),
+                    &report.locally_enriched_item_ids,
+                    &context.user_events,
+                )
+                .await
+            {
+                tracing::warn!(
+                    scan_job_id = %context.scan_job_id,
+                    %error,
+                    "incremental local metadata completeness could not be saved"
+                );
+            }
+            if let Some(home) = &context.home {
+                home.invalidate_scan_batch().await;
+            }
+            context.notify.notify_waiters();
+        }
+        Ok(_) => {
+            if let Err(error) = context
+                .database
+                .mark_pending_scan_job_metadata_targets_failed(
+                    &context.scan_job_id,
+                    "local metadata source unavailable",
+                )
+                .await
+            {
+                tracing::warn!(
+                    scan_job_id = %context.scan_job_id,
+                    %error,
+                    "local metadata worker could not finish unavailable targets"
+                );
+            }
+            context.notify.notify_waiters();
+        }
+        Err(error) => {
+            tracing::warn!(
+                scan_job_id = %context.scan_job_id,
+                %error,
+                "local metadata worker failed; pending targets marked for retry"
+            );
+            if let Err(mark_error) = context
+                .database
+                .mark_pending_scan_job_metadata_targets_failed(
+                    &context.scan_job_id,
+                    &error.to_string(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    scan_job_id = %context.scan_job_id,
+                    %mark_error,
+                    "local metadata worker could not mark failed targets"
+                );
+            }
+            context.notify.notify_waiters();
+        }
+    }
+}
+
+async fn run_local_metadata_job_worker(context: LocalMetadataJobWorkerContext) {
+    let enricher = MetadataEnricher::new(context.database.clone())
+        .with_resource_metrics(context.resources.clone());
+    let enricher = match context.people.clone() {
+        Some(people) => enricher.with_people(people),
+        None => enricher,
+    };
+    let enricher = match context.local_nfo.clone() {
+        Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+        None => enricher,
+    };
+    let mut stop_receiver = context.stop_receiver.clone();
+    let mut loaded_lifecycle = false;
+    loop {
+        if *stop_receiver.borrow() {
+            return;
+        }
+        let page = match context
+            .database
+            .load_scan_job_metadata_page(
+                &context.scan_job_id,
+                i64::try_from(LOCAL_METADATA_BATCH_SIZE).unwrap_or(i64::MAX),
+            )
+            .await
+        {
+            Ok(page) => {
+                loaded_lifecycle = true;
+                page
+            }
+            Err(error) => {
+                tracing::warn!(
+                    scan_job_id = %context.scan_job_id,
+                    %error,
+                    "local metadata worker could not load job lifecycle and target page"
+                );
+                let fallback = if loaded_lifecycle {
+                    LOCAL_METADATA_JOB_REFRESH_FALLBACK
+                } else {
+                    LOCAL_METADATA_IDLE_FALLBACK
+                };
+                tokio::select! {
+                    changed = stop_receiver.changed() => {
+                        if changed.is_err() || *stop_receiver.borrow() {
+                            return;
+                        }
+                    }
+                    _ = context.notify.notified() => {}
+                    _ = tokio::time::sleep(fallback) => {}
+                }
+                continue;
+            }
+        };
+        let Some(job_status) = page.job_status.as_deref() else {
+            return;
+        };
+        if matches!(job_status, "FAILED" | "CANCELLED") {
+            return;
+        }
+        if page.has_pending {
+            process_local_metadata_job_page(&context, &enricher, page).await;
+            continue;
+        }
+        #[cfg(test)]
+        let _ = context.idle_page_sender.send(());
+        let notified = context.notify.notified();
+        tokio::select! {
+            changed = stop_receiver.changed() => {
+                if changed.is_err() || *stop_receiver.borrow() {
+                    return;
+                }
+            }
+            _ = notified => {}
+            _ = tokio::time::sleep(LOCAL_METADATA_JOB_REFRESH_FALLBACK) => {}
+        }
+    }
 }
 
 impl ScanJobService {
@@ -807,202 +1301,32 @@ impl ScanJobService {
         &self,
         scan_job_id: &str,
     ) -> LocalMetadataWorkerHandle {
-        let (stop, mut stop_receiver) = watch::channel(false);
+        let (stop, stop_receiver) = watch::channel(false);
         #[cfg(test)]
         let (idle_page_sender, idle_page_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let database = self.database.clone();
-        let people = self.people.clone();
-        let local_nfo = self.local_nfo.clone();
-        let metadata_selection = self.metadata_selection.clone();
-        let metadata_reidentify = self.metadata_reidentify.clone();
-        let home = self.home.clone();
-        let user_events = self.user_events.clone();
-        let resources = self.resources.clone();
-        let target_root_validator = self.clone();
         let scan_job_id = scan_job_id.to_owned();
         let notifications = Arc::clone(&self.metadata_notifications);
         let notify = Arc::new(Notify::new());
         if let Ok(mut registry) = notifications.lock() {
             registry.insert(scan_job_id.clone(), Arc::clone(&notify));
         }
-        let worker_job_id = scan_job_id.clone();
-        let task = tokio::spawn(async move {
-            let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources);
-            let enricher = match people {
-                Some(people) => enricher.with_people(people),
-                None => enricher,
-            };
-            let enricher = match local_nfo {
-                Some(local_nfo) => enricher.with_nfo_store(local_nfo),
-                None => enricher,
-            };
-
-            let mut loaded_lifecycle = false;
-            loop {
-                if *stop_receiver.borrow() {
-                    return;
-                }
-                let page = match database
-                    .load_scan_job_metadata_page(
-                        &worker_job_id,
-                        i64::try_from(LOCAL_METADATA_BATCH_SIZE).unwrap_or(i64::MAX),
-                    )
-                    .await
-                {
-                    Ok(page) => {
-                        loaded_lifecycle = true;
-                        page
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            scan_job_id = %worker_job_id,
-                            %error,
-                            "local metadata worker could not load job lifecycle and target page"
-                        );
-                        let fallback = if loaded_lifecycle {
-                            LOCAL_METADATA_JOB_REFRESH_FALLBACK
-                        } else {
-                            LOCAL_METADATA_IDLE_FALLBACK
-                        };
-                        tokio::select! {
-                            changed = stop_receiver.changed() => {
-                                if changed.is_err() || *stop_receiver.borrow() {
-                                    return;
-                                }
-                            }
-                            _ = notify.notified() => {}
-                            _ = tokio::time::sleep(fallback) => {}
-                        }
-                        continue;
-                    }
-                };
-                let Some(job_status) = page.job_status.as_deref() else {
-                    return;
-                };
-                if matches!(job_status, "FAILED" | "CANCELLED") {
-                    return;
-                }
-                let is_incremental_scan = page.job_type.as_deref() == Some("INCREMENTAL_SCAN");
-                let completeness_policy = metadata_auto_match_policy_for_scan_job_snapshot(
-                    page.job_type.as_deref(),
-                    page.auto_metadata_match,
-                );
-                if page.has_pending {
-                    if let Err(error) = target_root_validator
-                        .verify_manifest_postprocessing_target_roots(&worker_job_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            scan_job_id = %worker_job_id,
-                            %error,
-                            "local metadata worker deferred targets because a manifest root changed"
-                        );
-                        if let Err(mark_error) = database
-                            .mark_pending_scan_job_metadata_targets_failed(
-                                &worker_job_id,
-                                &error.to_string(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                scan_job_id = %worker_job_id,
-                                %mark_error,
-                                "local metadata worker could not defer root-mismatched targets"
-                            );
-                        }
-                        notify.notify_waiters();
-                        continue;
-                    }
-                    match enricher
-                        .enrich_scan_job_metadata_page(&worker_job_id, page)
-                        .await
-                    {
-                        Ok(report) if report.items_processed > 0 => {
-                            if is_incremental_scan
-                                && !report.locally_enriched_item_ids.is_empty()
-                                && let Err(error) =
-                                    complete_local_metadata_completeness_for_item_ids(
-                                        &database,
-                                        metadata_selection.as_ref(),
-                                        metadata_reidentify.as_ref(),
-                                        LocalMetadataCompletenessTrigger::ScanJobPolicy(
-                                            completeness_policy,
-                                        ),
-                                        &report.locally_enriched_item_ids,
-                                        &user_events,
-                                    )
-                                    .await
-                            {
-                                tracing::warn!(
-                                    scan_job_id = %worker_job_id,
-                                    %error,
-                                    "incremental local metadata completeness could not be saved"
-                                );
-                            }
-                            if let Some(home) = &home {
-                                home.invalidate_scan_batch().await;
-                            }
-                            notify.notify_waiters();
-                        }
-                        Ok(_) => {
-                            // A pending target with no locally readable source
-                            // cannot make progress. Mark it retryable so the
-                            // completion waiter cannot spin forever; a later
-                            // retry can reset FAILED targets after the source
-                            // becomes available.
-                            if let Err(error) = database
-                                .mark_pending_scan_job_metadata_targets_failed(
-                                    &worker_job_id,
-                                    "local metadata source unavailable",
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    scan_job_id = %worker_job_id,
-                                    %error,
-                                    "local metadata worker could not finish unavailable targets"
-                                );
-                            }
-                            notify.notify_waiters();
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                scan_job_id = %worker_job_id,
-                                %error,
-                                "local metadata worker failed; pending targets marked for retry"
-                            );
-                            if let Err(mark_error) = database
-                                .mark_pending_scan_job_metadata_targets_failed(
-                                    &worker_job_id,
-                                    &error.to_string(),
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    scan_job_id = %worker_job_id,
-                                    %mark_error,
-                                    "local metadata worker could not mark failed targets"
-                                );
-                            }
-                            notify.notify_waiters();
-                        }
-                    }
-                    continue;
-                }
-                #[cfg(test)]
-                let _ = idle_page_sender.send(());
-                let notified = notify.notified();
-                tokio::select! {
-                    changed = stop_receiver.changed() => {
-                        if changed.is_err() || *stop_receiver.borrow() {
-                            return;
-                        }
-                    }
-                    _ = notified => {}
-                    _ = tokio::time::sleep(LOCAL_METADATA_JOB_REFRESH_FALLBACK) => {}
-                }
-            }
-        });
+        let context = LocalMetadataJobWorkerContext {
+            database: self.database.clone(),
+            people: self.people.clone(),
+            local_nfo: self.local_nfo.clone(),
+            metadata_selection: self.metadata_selection.clone(),
+            metadata_reidentify: self.metadata_reidentify.clone(),
+            home: self.home.clone(),
+            user_events: self.user_events.clone(),
+            resources: self.resources.clone(),
+            target_root_validator: self.clone(),
+            scan_job_id: scan_job_id.clone(),
+            notify,
+            stop_receiver,
+            #[cfg(test)]
+            idle_page_sender,
+        };
+        let task = tokio::spawn(run_local_metadata_job_worker(context));
         LocalMetadataWorkerHandle {
             stop,
             task,
@@ -1137,87 +1461,6 @@ impl ScanJobService {
         Ok(true)
     }
 
-    pub async fn run_to_completion(
-        &self,
-        job_id: &str,
-        batch_size: usize,
-        probe: Option<MediaProbeService>,
-    ) -> Result<(), ScanJobError> {
-        self.run_to_completion_with_metadata_and_thumbnails(job_id, batch_size, probe, None, None)
-            .await
-    }
-
-    pub async fn run_to_completion_with_metadata(
-        &self,
-        job_id: &str,
-        batch_size: usize,
-        probe: Option<MediaProbeService>,
-        metadata: Option<MetadataReidentifyService>,
-    ) -> Result<(), ScanJobError> {
-        self.run_to_completion_with_metadata_and_thumbnails(
-            job_id, batch_size, probe, metadata, None,
-        )
-        .await
-    }
-
-    pub async fn run_to_completion_with_metadata_and_thumbnails(
-        &self,
-        job_id: &str,
-        batch_size: usize,
-        probe: Option<MediaProbeService>,
-        metadata: Option<MetadataReidentifyService>,
-        thumbnails: Option<ThumbnailService>,
-    ) -> Result<(), ScanJobError> {
-        if batch_size == 0 {
-            return Err(ScanJobError::InvalidBatchSize);
-        }
-        let Some(job) = self.database.find_scan_job(job_id).await? else {
-            // Library deletion cascades queued jobs. A stale worker wakeup after that
-            // cascade has nothing left to run and should finish quietly.
-            return Ok(());
-        };
-        let Some(_run_guard) = self.track_scan_job_run(job_id, &job.library_id) else {
-            self.cancel_running_job(job_id).await?;
-            return Ok(());
-        };
-        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
-            Some(
-                Arc::clone(&self.full_scan_queue)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ScanJobError::ScanLockClosed)?,
-            )
-        } else {
-            None
-        };
-        let result = self
-            .run_to_completion_with_metadata_and_thumbnails_inner(
-                job_id, batch_size, probe, metadata, thumbnails,
-            )
-            .await;
-        if result.is_err() {
-            match self.database.fail_scan_job_postprocessing(job_id).await {
-                Ok(true) => {
-                    self.record_event(
-                        job_id,
-                        "ERROR",
-                        "POSTPROCESSING_FAILED",
-                        "扫描后处理未完成，可在条件恢复后重试",
-                        "{}",
-                    )
-                    .await;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    self.flush_home_after_scan_terminal().await;
-                    return Err(error.into());
-                }
-            }
-            self.flush_home_after_scan_terminal().await;
-        }
-        result
-    }
-
     pub async fn start_local_metadata_outbox_worker(&self) -> Result<(), ScanJobError> {
         if self
             .local_metadata_outbox_worker_started
@@ -1263,153 +1506,18 @@ impl ScanJobService {
         let resources = self.resources.clone();
         let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
         let image_notifications = Arc::clone(&self.local_metadata_image_notifications);
-        tokio::spawn(async move {
-            let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources);
-            let enricher = match local_nfo {
-                Some(local_nfo) => enricher.with_nfo_store(local_nfo),
-                None => enricher,
-            };
-            let mut nfo_tasks = JoinSet::new();
-            loop {
-                if nfo_tasks.len() >= MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT {
-                    if let Some(Err(error)) = nfo_tasks.join_next().await {
-                        tracing::error!(%error, "local metadata NFO worker task panicked");
-                    }
-                    continue;
-                }
-                match database.claim_next_scan_local_metadata_batch().await {
-                    Ok(Some(batch)) => {
-                        if let Some((
-                            batch_id,
-                            scan_job_id,
-                            source_snapshot,
-                            non_retryable_item_ids,
-                        )) = process_scan_local_metadata_batch(
-                            &database,
-                            &enricher,
-                            home.as_ref(),
-                            &user_events,
-                            batch,
-                        )
-                        .await
-                        {
-                            notify_local_metadata_images_waiter(&image_notifications, &scan_job_id);
-                            let database = database.clone();
-                            let enricher = enricher.clone();
-                            let metadata_selection = metadata_selection.clone();
-                            let metadata_reidentify = metadata_reidentify.clone();
-                            let home = home.clone();
-                            let user_events = user_events.clone();
-                            nfo_tasks.spawn(async move {
-                                let context = LocalMetadataCompletionContext {
-                                    metadata_selection: metadata_selection.as_ref(),
-                                    metadata_reidentify: metadata_reidentify.as_ref(),
-                                    home: home.as_ref(),
-                                    user_events: &user_events,
-                                };
-                                finish_scan_local_metadata_batch(
-                                    &database,
-                                    &enricher,
-                                    context,
-                                    &batch_id,
-                                    &scan_job_id,
-                                    source_snapshot,
-                                    &non_retryable_item_ids,
-                                )
-                                .await;
-                                batch_id
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        match database
-                            .claim_next_scan_local_metadata_backfill_page(
-                                SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
-                            )
-                            .await
-                        {
-                            Ok(Some(page)) => {
-                                match process_scan_local_metadata_backfill_images(
-                                    &enricher,
-                                    home.as_ref(),
-                                    &user_events,
-                                    &page,
-                                )
-                                .await
-                                {
-                                    Ok(source_snapshot) => {
-                                        let database = database.clone();
-                                        let enricher = enricher.clone();
-                                        let metadata_selection = metadata_selection.clone();
-                                        let metadata_reidentify = metadata_reidentify.clone();
-                                        let home = home.clone();
-                                        let user_events = user_events.clone();
-                                        let library_root_id = page.library_root_id.clone();
-                                        nfo_tasks.spawn(async move {
-                                            let context = LocalMetadataCompletionContext {
-                                                metadata_selection: metadata_selection.as_ref(),
-                                                metadata_reidentify: metadata_reidentify.as_ref(),
-                                                home: home.as_ref(),
-                                                user_events: &user_events,
-                                            };
-                                            finish_scan_local_metadata_backfill_page(
-                                                &database,
-                                                &enricher,
-                                                context,
-                                                page,
-                                                source_snapshot,
-                                            )
-                                            .await;
-                                            library_root_id
-                                        });
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            library_root_id = %page.library_root_id,
-                                            %error,
-                                            "local metadata backfill image stage failed and will be retried"
-                                        );
-                                        fail_scan_local_metadata_backfill_page(
-                                            &database,
-                                            &page,
-                                            &error,
-                                            &[],
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                if nfo_tasks.is_empty() {
-                                    tokio::select! {
-                                        _ = outbox_notify.notified() => {}
-                                        _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
-                                    }
-                                } else {
-                                    tokio::select! {
-                                        result = nfo_tasks.join_next() => {
-                                            if let Some(Err(error)) = result {
-                                                tracing::error!(%error, "local metadata worker task panicked");
-                                            }
-                                        }
-                                        _ = outbox_notify.notified() => {}
-                                        _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "local metadata backfill claim failed; retrying");
-                                tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "local metadata outbox claim failed; retrying");
-                        tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
-                    }
-                }
-            }
-        });
+        let worker_context = ScanLocalMetadataOutboxWorkerContext {
+            database,
+            local_nfo,
+            metadata_selection,
+            metadata_reidentify,
+            home,
+            user_events,
+            resources,
+            outbox_notify,
+            image_notifications,
+        };
+        tokio::spawn(run_scan_local_metadata_outbox_worker(worker_context));
         Ok(())
     }
 }

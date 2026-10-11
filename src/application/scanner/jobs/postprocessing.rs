@@ -1,6 +1,97 @@
+use super::local_metadata::LocalMetadataWorkerHandle;
 use super::*;
 
+struct ScanPostprocessingOptions {
+    defer_local_metadata_worker: bool,
+    uses_local_metadata_outbox: bool,
+    created_items: usize,
+    probe: Option<MediaProbeService>,
+    metadata: Option<MetadataReidentifyService>,
+    thumbnails: Option<ThumbnailService>,
+}
+
 impl ScanJobService {
+    pub async fn run_to_completion(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+    ) -> Result<(), ScanJobError> {
+        self.run_to_completion_with_metadata_and_thumbnails(job_id, batch_size, probe, None, None)
+            .await
+    }
+
+    pub async fn run_to_completion_with_metadata(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+        metadata: Option<MetadataReidentifyService>,
+    ) -> Result<(), ScanJobError> {
+        self.run_to_completion_with_metadata_and_thumbnails(
+            job_id, batch_size, probe, metadata, None,
+        )
+        .await
+    }
+
+    pub async fn run_to_completion_with_metadata_and_thumbnails(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+        metadata: Option<MetadataReidentifyService>,
+        thumbnails: Option<ThumbnailService>,
+    ) -> Result<(), ScanJobError> {
+        if batch_size == 0 {
+            return Err(ScanJobError::InvalidBatchSize);
+        }
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            // Library deletion cascades queued jobs. A stale worker wakeup after that
+            // cascade has nothing left to run and should finish quietly.
+            return Ok(());
+        };
+        let Some(_run_guard) = self.track_scan_job_run(job_id, &job.library_id) else {
+            self.cancel_running_job(job_id).await?;
+            return Ok(());
+        };
+        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
+            Some(
+                Arc::clone(&self.full_scan_queue)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ScanJobError::ScanLockClosed)?,
+            )
+        } else {
+            None
+        };
+        let result = self
+            .run_to_completion_with_metadata_and_thumbnails_inner(
+                job_id, batch_size, probe, metadata, thumbnails,
+            )
+            .await;
+        if result.is_err() {
+            match self.database.fail_scan_job_postprocessing(job_id).await {
+                Ok(true) => {
+                    self.record_event(
+                        job_id,
+                        "ERROR",
+                        "POSTPROCESSING_FAILED",
+                        "扫描后处理未完成，可在条件恢复后重试",
+                        "{}",
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.flush_home_after_scan_terminal().await;
+                    return Err(error.into());
+                }
+            }
+            self.flush_home_after_scan_terminal().await;
+        }
+        result
+    }
+
     pub(in crate::application::scanner) async fn verify_manifest_postprocessing_target_roots(
         &self,
         job_id: &str,
@@ -144,21 +235,85 @@ impl ScanJobService {
         {
             tracing::warn!(job_id, %error, "local metadata outbox worker did not start");
         }
-        let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
+        let scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let mut local_metadata_worker =
             (!defer_local_metadata_worker).then(|| self.start_local_metadata_worker(job_id));
+        let (report, created_items, scan_permit) = match self
+            .run_scan_batches_until_terminal(job_id, batch_size, scan_permit)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                return Err(error);
+            }
+        };
+        if report.status != "COMPLETED" {
+            Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+            return Ok(());
+        }
+        let Some(completed_job) = self.database.find_scan_job(job_id).await? else {
+            if self.cancellation_requested_in_memory(job_id) {
+                Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                self.clear_cancellation_flag(job_id);
+                return Ok(());
+            }
+            Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+            return Err(ScanJobError::JobNotFound);
+        };
+        let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
+        if !incremental
+            && let Err(error) = self
+                .prepare_manifest_postprocessing_completion(
+                    job_id,
+                    defer_local_metadata_worker,
+                    uses_local_metadata_outbox,
+                    &mut local_metadata_worker,
+                )
+                .await
+        {
+            Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+            return Err(error);
+        }
+        drop(scan_permit);
+        if self
+            .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        let options = ScanPostprocessingOptions {
+            defer_local_metadata_worker,
+            uses_local_metadata_outbox,
+            created_items,
+            probe,
+            metadata,
+            thumbnails,
+        };
+        if incremental {
+            return self
+                .finish_incremental_scan_postprocessing(
+                    &completed_job,
+                    options,
+                    &mut local_metadata_worker,
+                )
+                .await;
+        }
+        self.finish_full_scan_postprocessing(&completed_job, options, &mut local_metadata_worker)
+            .await
+    }
+
+    async fn run_scan_batches_until_terminal(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        mut scan_permit: OwnedSemaphorePermit,
+    ) -> Result<(ScanBatchReport, usize, OwnedSemaphorePermit), ScanJobError> {
         let mut created_items = 0_usize;
         loop {
-            let report = match self
+            let report = self
                 .run_batch_with_failure_handling(job_id, batch_size, true)
-                .await
-            {
-                Ok(report) => report,
-                Err(error) => {
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    return Err(error);
-                }
-            };
+                .await?;
             if report.processed > 0
                 && !report.completed
                 && let Some(home) = &self.home
@@ -166,238 +321,311 @@ impl ScanJobService {
                 home.invalidate_scan_batch().await;
             }
             created_items = created_items.saturating_add(report.created_items);
-            if !report.completed {
-                if self.should_yield_to_realtime(job_id).await? {
-                    drop(scan_permit);
-                    scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
-                }
-                tokio::task::yield_now().await;
-                continue;
+            if report.completed {
+                return Ok((report, created_items, scan_permit));
             }
-            if report.status == "COMPLETED" {
-                let Some(completed_job) = self.database.find_scan_job(job_id).await? else {
-                    if self.cancellation_requested_in_memory(job_id) {
-                        Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                        self.clear_cancellation_flag(job_id);
-                        return Ok(());
-                    }
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    return Err(ScanJobError::JobNotFound);
-                };
-                let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
-                if !incremental && defer_local_metadata_worker {
-                    if let Err(error) = self
-                        .materialize_manifest_postprocessing_targets_unlocked(job_id)
-                        .await
-                    {
-                        Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                        return Err(error);
-                    }
-                    if let Err(error) = self
-                        .verify_manifest_postprocessing_target_roots(job_id)
-                        .await
-                    {
-                        Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                        return Err(error);
-                    }
-                    if !uses_local_metadata_outbox {
-                        local_metadata_worker = Some(self.start_local_metadata_worker(job_id));
-                    }
-                }
+            if self.should_yield_to_realtime(job_id).await? {
                 drop(scan_permit);
-                if self
-                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                    .await?
-                {
-                    return Ok(());
-                }
-                if incremental {
-                    if let Err(error) = self.wait_for_local_metadata(job_id).await {
-                        Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                        return Err(error);
-                    }
-                    if self
-                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    self.run_probe_after_scan(job_id, probe).await?;
-                    if self
-                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                    self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
-                        .await?;
-                    if self
-                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                    for target_type in ["SOURCE", "ITEM"] {
-                        self.database
-                            .skip_pending_scan_job_target_stage(job_id, target_type, "THUMBNAIL")
-                            .await?;
-                    }
-                    self.database
-                        .clear_completed_scan_job_targets(job_id)
-                        .await?;
-                    let strm_probe_scheduled = if completed_job.auto_metadata_match {
-                        if !uses_local_metadata_outbox
-                            && self.metadata_selection.is_none()
-                            && let Some(metadata) = metadata
-                        {
-                            self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
-                                .await;
-                        }
-                        if let Some(strm_probe) = self.strm_probe.clone() {
-                            self.schedule_strm_probe_after_incremental_scan(
-                                job_id,
-                                &completed_job.library_id,
-                                strm_probe,
-                            )
-                            .await
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    self.run_auto_library_cover_after_scan(job_id).await?;
-                    self.flush_home_after_scan_terminal().await;
-                    self.publish_media_added_event(&completed_job, created_items)
-                        .await;
-                    if !strm_probe_scheduled {
-                        self.database.clear_scan_job_paths(job_id).await?;
-                    }
-                    return Ok(());
-                }
-                if let Err(error) = self.database.retry_failed_scan_job_targets(job_id).await {
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    return Err(error.into());
-                }
-                if uses_local_metadata_outbox {
-                    for target_type in ["SOURCE", "ITEM"] {
-                        self.database
-                            .skip_pending_scan_job_target_stage(job_id, target_type, "METADATA")
-                            .await?;
-                    }
-                }
-                if let Err(error) = self.wait_for_local_metadata(job_id).await {
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    return Err(error);
-                }
-                if self
-                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                    .await?
-                {
-                    return Ok(());
-                }
-                Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                self.update_activity(job_id, Some("媒体探测"), "POSTPROCESSING")
-                    .await?;
-                if defer_local_metadata_worker {
-                    self.verify_manifest_postprocessing_target_roots(job_id)
-                        .await?;
-                }
-                self.run_probe_after_scan(job_id, probe).await?;
-                if self
-                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                    .await?
-                {
-                    return Ok(());
-                }
-                self.update_activity(job_id, Some("本地元数据"), "POSTPROCESSING")
-                    .await?;
-                if defer_local_metadata_worker {
-                    self.verify_manifest_postprocessing_target_roots(job_id)
-                        .await?;
-                }
-                self.run_metadata_after_scan(job_id).await?;
-                if self
-                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                    .await?
-                {
-                    return Ok(());
-                }
-                self.update_activity(job_id, Some("媒体库封面"), "POSTPROCESSING")
-                    .await?;
-                self.run_auto_library_cover_after_scan(job_id).await?;
-                if self
-                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                    .await?
-                {
-                    return Ok(());
-                }
-                self.update_activity(job_id, Some("视频缩略图"), "POSTPROCESSING")
-                    .await?;
-                if defer_local_metadata_worker {
-                    self.verify_manifest_postprocessing_target_roots(job_id)
-                        .await?;
-                }
-                if uses_local_metadata_outbox && thumbnails.is_some() {
-                    self.wait_for_local_metadata_images(job_id).await?;
-                    if self
-                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                self.run_thumbnails_after_scan(job_id, thumbnails).await?;
-                if self
-                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
-                    .await?
-                {
-                    return Ok(());
-                }
-                self.database
-                    .clear_completed_scan_job_targets(job_id)
-                    .await?;
-                let completed = self
-                    .database
-                    .complete_scan_job_postprocessing(job_id)
-                    .await?;
-                if !completed {
-                    if self.database.fail_scan_job_postprocessing(job_id).await? {
-                        self.record_event(
-                            job_id,
-                            "ERROR",
-                            "POSTPROCESSING_FAILED",
-                            "扫描后处理失败，可重试未完成目标",
-                            "{}",
-                        )
-                        .await;
-                    }
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    self.flush_home_after_scan_terminal().await;
-                    return Ok(());
-                }
-                if let Err(error) = self
-                    .database
-                    .cleanup_completed_scan_manifest_payloads()
-                    .await
-                {
-                    tracing::warn!(job_id, %error, "completed scan manifest payload cleanup failed");
-                }
-                self.database.spawn_removed_media_item_purge();
-                if completed_job.auto_metadata_match && !uses_local_metadata_outbox {
-                    if let Some(metadata) = metadata {
-                        self.schedule_online_metadata_after_scan(job_id, metadata)
-                            .await;
-                    }
-                }
-                self.flush_home_after_scan_terminal().await;
-                self.publish_media_added_event(&completed_job, created_items)
-                    .await;
+                scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
             }
-            Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn prepare_manifest_postprocessing_completion(
+        &self,
+        job_id: &str,
+        defer_local_metadata_worker: bool,
+        uses_local_metadata_outbox: bool,
+        local_metadata_worker: &mut Option<LocalMetadataWorkerHandle>,
+    ) -> Result<(), ScanJobError> {
+        if !defer_local_metadata_worker {
             return Ok(());
         }
+        self.materialize_manifest_postprocessing_targets_unlocked(job_id)
+            .await?;
+        self.verify_manifest_postprocessing_target_roots(job_id)
+            .await?;
+        if !uses_local_metadata_outbox {
+            *local_metadata_worker = Some(self.start_local_metadata_worker(job_id));
+        }
+        Ok(())
+    }
+
+    async fn finish_incremental_scan_postprocessing(
+        &self,
+        completed_job: &StoredScanJob,
+        options: ScanPostprocessingOptions,
+        local_metadata_worker: &mut Option<LocalMetadataWorkerHandle>,
+    ) -> Result<(), ScanJobError> {
+        let ScanPostprocessingOptions {
+            uses_local_metadata_outbox,
+            created_items,
+            probe,
+            metadata,
+            thumbnails,
+            ..
+        } = options;
+        let job_id = &completed_job.id;
+        if let Err(error) = self.wait_for_local_metadata(job_id).await {
+            Self::stop_local_metadata_worker(local_metadata_worker).await;
+            return Err(error);
+        }
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        Self::stop_local_metadata_worker(local_metadata_worker).await;
+        self.run_probe_after_scan(job_id, probe).await?;
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
+            .await?;
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        for target_type in ["SOURCE", "ITEM"] {
+            self.database
+                .skip_pending_scan_job_target_stage(job_id, target_type, "THUMBNAIL")
+                .await?;
+        }
+        self.database
+            .clear_completed_scan_job_targets(job_id)
+            .await?;
+        let strm_probe_scheduled = self
+            .schedule_incremental_completion_followups(
+                completed_job,
+                uses_local_metadata_outbox,
+                metadata,
+            )
+            .await;
+        self.run_auto_library_cover_after_scan(job_id).await?;
+        self.flush_home_after_scan_terminal().await;
+        self.publish_media_added_event(completed_job, created_items)
+            .await;
+        if !strm_probe_scheduled {
+            self.database.clear_scan_job_paths(job_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn schedule_incremental_completion_followups(
+        &self,
+        completed_job: &StoredScanJob,
+        uses_local_metadata_outbox: bool,
+        metadata: Option<MetadataReidentifyService>,
+    ) -> bool {
+        if !completed_job.auto_metadata_match {
+            return false;
+        }
+        if !uses_local_metadata_outbox
+            && self.metadata_selection.is_none()
+            && let Some(metadata) = metadata
+        {
+            self.schedule_online_metadata_after_incremental_scan(&completed_job.id, metadata)
+                .await;
+        }
+        if let Some(strm_probe) = self.strm_probe.clone() {
+            self.schedule_strm_probe_after_incremental_scan(
+                &completed_job.id,
+                &completed_job.library_id,
+                strm_probe,
+            )
+            .await
+        } else {
+            false
+        }
+    }
+
+    async fn finish_full_scan_postprocessing(
+        &self,
+        completed_job: &StoredScanJob,
+        options: ScanPostprocessingOptions,
+        local_metadata_worker: &mut Option<LocalMetadataWorkerHandle>,
+    ) -> Result<(), ScanJobError> {
+        let ScanPostprocessingOptions {
+            defer_local_metadata_worker,
+            uses_local_metadata_outbox,
+            created_items,
+            probe,
+            metadata,
+            thumbnails,
+        } = options;
+        let job_id = &completed_job.id;
+        if let Err(error) = self.database.retry_failed_scan_job_targets(job_id).await {
+            Self::stop_local_metadata_worker(local_metadata_worker).await;
+            return Err(error.into());
+        }
+        if uses_local_metadata_outbox {
+            self.skip_full_scan_metadata_targets(job_id).await?;
+        }
+        if let Err(error) = self.wait_for_local_metadata(job_id).await {
+            Self::stop_local_metadata_worker(local_metadata_worker).await;
+            return Err(error);
+        }
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        Self::stop_local_metadata_worker(local_metadata_worker).await;
+        if self
+            .run_full_scan_probe_and_metadata_stages(
+                job_id,
+                defer_local_metadata_worker,
+                probe,
+                local_metadata_worker,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        self.update_activity(job_id, Some("视频缩略图"), "POSTPROCESSING")
+            .await?;
+        if defer_local_metadata_worker {
+            self.verify_manifest_postprocessing_target_roots(job_id)
+                .await?;
+        }
+        if uses_local_metadata_outbox && thumbnails.is_some() {
+            self.wait_for_local_metadata_images(job_id).await?;
+            if self
+                .finish_cancellation_if_requested(job_id, local_metadata_worker)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        self.run_thumbnails_after_scan(job_id, thumbnails).await?;
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(());
+        }
+        self.complete_full_scan_postprocessing(
+            completed_job,
+            uses_local_metadata_outbox,
+            created_items,
+            metadata,
+            local_metadata_worker,
+        )
+        .await
+    }
+
+    async fn skip_full_scan_metadata_targets(&self, job_id: &str) -> Result<(), ScanJobError> {
+        for target_type in ["SOURCE", "ITEM"] {
+            self.database
+                .skip_pending_scan_job_target_stage(job_id, target_type, "METADATA")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn run_full_scan_probe_and_metadata_stages(
+        &self,
+        job_id: &str,
+        defer_local_metadata_worker: bool,
+        probe: Option<MediaProbeService>,
+        local_metadata_worker: &mut Option<LocalMetadataWorkerHandle>,
+    ) -> Result<bool, ScanJobError> {
+        self.update_activity(job_id, Some("媒体探测"), "POSTPROCESSING")
+            .await?;
+        if defer_local_metadata_worker {
+            self.verify_manifest_postprocessing_target_roots(job_id)
+                .await?;
+        }
+        self.run_probe_after_scan(job_id, probe).await?;
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(true);
+        }
+        self.update_activity(job_id, Some("本地元数据"), "POSTPROCESSING")
+            .await?;
+        if defer_local_metadata_worker {
+            self.verify_manifest_postprocessing_target_roots(job_id)
+                .await?;
+        }
+        self.run_metadata_after_scan(job_id).await?;
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(true);
+        }
+        self.update_activity(job_id, Some("媒体库封面"), "POSTPROCESSING")
+            .await?;
+        self.run_auto_library_cover_after_scan(job_id).await?;
+        Ok(false)
+    }
+
+    async fn complete_full_scan_postprocessing(
+        &self,
+        completed_job: &StoredScanJob,
+        uses_local_metadata_outbox: bool,
+        created_items: usize,
+        metadata: Option<MetadataReidentifyService>,
+        local_metadata_worker: &mut Option<LocalMetadataWorkerHandle>,
+    ) -> Result<(), ScanJobError> {
+        let job_id = &completed_job.id;
+        self.database
+            .clear_completed_scan_job_targets(job_id)
+            .await?;
+        let completed = self
+            .database
+            .complete_scan_job_postprocessing(job_id)
+            .await?;
+        if !completed {
+            if self.database.fail_scan_job_postprocessing(job_id).await? {
+                self.record_event(
+                    job_id,
+                    "ERROR",
+                    "POSTPROCESSING_FAILED",
+                    "扫描后处理失败，可重试未完成目标",
+                    "{}",
+                )
+                .await;
+            }
+            Self::stop_local_metadata_worker(local_metadata_worker).await;
+            self.flush_home_after_scan_terminal().await;
+            return Ok(());
+        }
+        if let Err(error) = self
+            .database
+            .cleanup_completed_scan_manifest_payloads()
+            .await
+        {
+            tracing::warn!(job_id, %error, "completed scan manifest payload cleanup failed");
+        }
+        self.database.spawn_removed_media_item_purge();
+        if completed_job.auto_metadata_match
+            && !uses_local_metadata_outbox
+            && let Some(metadata) = metadata
+        {
+            self.schedule_online_metadata_after_scan(job_id, metadata)
+                .await;
+        }
+        self.flush_home_after_scan_terminal().await;
+        self.publish_media_added_event(completed_job, created_items)
+            .await;
+        Ok(())
     }
 
     async fn run_auto_library_cover_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {

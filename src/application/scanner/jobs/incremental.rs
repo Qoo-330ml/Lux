@@ -47,53 +47,74 @@ impl ScanJobService {
         )
         .await?;
         if paths.is_empty() {
-            if self.database.finish_scan_job_if_idle(job_id).await? {
-                self.database
-                    .update_library_last_scan(&job.library_id)
-                    .await?;
-                self.record_event(job_id, "INFO", "JOB_COMPLETED", "局部扫描任务已完成", "{}")
-                    .await;
-                let completed_job = self.database.find_scan_job(job_id).await?;
-                self.publish_webhook_event(
-                    completed_job.as_ref().unwrap_or(&job),
-                    WebhookEventType::ScanCompleted,
-                    None,
-                )
-                .await;
-                self.clear_cancellation_flag(job_id);
-                return Ok(ScanBatchReport {
-                    status: "COMPLETED".to_owned(),
-                    processed: 0,
-                    created_items: 0,
-                    completed: true,
-                });
-            }
-            return Ok(ScanBatchReport {
-                status: "RUNNING".to_owned(),
-                processed: 0,
-                created_items: 0,
-                completed: false,
-            });
+            return self.finish_empty_incremental_scan_batch(&job).await;
         }
         let library = self
             .database
             .find_library(&job.library_id)
             .await?
             .ok_or(ScanJobError::LibraryNotFound)?;
-        let roots = self.database.list_library_roots(&job.library_id).await?;
-        let roots_by_id = roots
+        let roots_by_id = self
+            .database
+            .list_library_roots(&job.library_id)
+            .await?
             .into_iter()
             .map(|root| (root.id.clone(), root))
             .collect::<HashMap<_, _>>();
+        self.process_incremental_scan_paths(&job, &library.kind, &paths, &roots_by_id, cancellation)
+            .await
+    }
+
+    async fn finish_empty_incremental_scan_batch(
+        &self,
+        job: &StoredScanJob,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        if self.database.finish_scan_job_if_idle(&job.id).await? {
+            self.database
+                .update_library_last_scan(&job.library_id)
+                .await?;
+            self.record_event(&job.id, "INFO", "JOB_COMPLETED", "局部扫描任务已完成", "{}")
+                .await;
+            let completed_job = self.database.find_scan_job(&job.id).await?;
+            self.publish_webhook_event(
+                completed_job.as_ref().unwrap_or(job),
+                WebhookEventType::ScanCompleted,
+                None,
+            )
+            .await;
+            self.clear_cancellation_flag(&job.id);
+            return Ok(ScanBatchReport {
+                status: "COMPLETED".to_owned(),
+                processed: 0,
+                created_items: 0,
+                completed: true,
+            });
+        }
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed: 0,
+            created_items: 0,
+            completed: false,
+        })
+    }
+
+    async fn process_incremental_scan_paths(
+        &self,
+        job: &StoredScanJob,
+        library_kind: &str,
+        paths: &[StoredScanJobPath],
+        roots_by_id: &HashMap<String, StoredLibraryRoot>,
+        cancellation: &AtomicBool,
+    ) -> Result<ScanBatchReport, ScanJobError> {
         let mut created_items = 0_usize;
-        for path in &paths {
+        for path in paths {
             if cancellation.load(Ordering::Acquire) {
-                return self.cancel_running_job(job_id).await;
+                return self.cancel_running_job(&job.id).await;
             }
             let created = match self
                 .process_incremental_path(
-                    &library.kind,
-                    &job,
+                    library_kind,
+                    job,
                     path,
                     roots_by_id.get(&path.library_root_id),
                     cancellation,
@@ -103,13 +124,13 @@ impl ScanJobService {
                 Ok(created) => created,
                 Err(error) => {
                     self.database
-                        .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
+                        .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
                         .await?;
-                    self.record_event(job_id, "ERROR", error.code(), "局部扫描任务失败", "{}")
+                    self.record_event(&job.id, "ERROR", error.code(), "局部扫描任务失败", "{}")
                         .await;
-                    let failed_job = self.database.find_scan_job(job_id).await?;
+                    let failed_job = self.database.find_scan_job(&job.id).await?;
                     self.publish_webhook_event(
-                        failed_job.as_ref().unwrap_or(&job),
+                        failed_job.as_ref().unwrap_or(job),
                         WebhookEventType::ScanFailed,
                         Some(error.code()),
                     )
@@ -119,10 +140,10 @@ impl ScanJobService {
             };
             created_items = created_items.saturating_add(created);
             if cancellation.load(Ordering::Acquire) {
-                return self.cancel_running_job(job_id).await;
+                return self.cancel_running_job(&job.id).await;
             }
             self.database
-                .mark_scan_job_path_processed(job_id, &path.library_root_id, &path.relative_path)
+                .mark_scan_job_path_processed(&job.id, &path.library_root_id, &path.relative_path)
                 .await?;
         }
         let processed = paths.len();
@@ -131,12 +152,12 @@ impl ScanJobService {
             .saturating_add(i64::try_from(processed).unwrap_or(i64::MAX));
         self.database
             .update_scan_job_progress(
-                job_id,
+                &job.id,
                 paths.last().map(|path| path.relative_path.as_str()),
                 next_count,
             )
             .await?;
-        self.record_event(job_id, "INFO", "BATCH_COMPLETED", "局部扫描批次完成", "{}")
+        self.record_event(&job.id, "INFO", "BATCH_COMPLETED", "局部扫描批次完成", "{}")
             .await;
         Ok(ScanBatchReport {
             status: "RUNNING".to_owned(),
