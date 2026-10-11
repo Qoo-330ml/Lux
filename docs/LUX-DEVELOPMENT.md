@@ -10253,6 +10253,113 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`、本文档。
 
+### 阶段 24：扫描应用服务模块化与流程简化
+
+本阶段只整理 `application::scanner` 内部实现，不改变 HTTP/Emby 合同、数据库 schema/SQL 事务、扫描状态与错误码、批次大小、并发上限、工作流版本或运行时副作用顺序。`scanner` 根模块保留稳定的公开路径与薄 facade；子模块按文件处理、任务生命周期、Manifest、reconciliation、增量扫描、本地 metadata worker 和后处理划分。文件系统 descriptor/stat/STRM 安全访问继续由现有 `scanner/manifest.rs` 承担。
+
+各任务最多预计修改 5 个文件，逐项独立验证和提交。实现中按增量移动代码，不引入通用 pipeline/dispatcher 抽象，不合并事务、不新增数据库状态读取；只有现有回归不能表达关键行为时才补充行为测试。扫描服务公开类型和 `crate::application::scanner::*` 调用路径由 facade re-export 保持。
+
+#### LUX-477：拆分 LibraryScanner 文件处理实现
+
+范围：把 `LibraryScanner` 的扫描/文件准备实现与文件名解析、混合库分类职责移入有界子模块。公开的 `LibraryScanner`、解析器和指纹 API 继续从 `application::scanner` 导出；内部跨模块方法使用最小可见性。纯移动，不改变扫描、归并、路径校验、探测或写入行为。
+
+验收：
+
+- [ ] `scanner.rs` 不再承载完整的 `LibraryScanner` 实现和文件名/混合库分类实现。
+- [ ] `LibraryScanner`、`ParsedMovieFilename`、`ParsedEpisodeFilename`、`parse_movie_filename`、`parse_episode_filename` 和 `compute_file_fingerprint` 保持现有公开路径与签名。
+- [ ] 电影、剧集、混合库、文件移动、版本归并和 STRM 路径行为由既有测试覆盖且通过。
+
+验证：`cargo test --locked --test scanner --test series_scanner --test mixed_scanner`、`cargo test --locked --lib scanner::tests`、fmt 检查和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/names.rs`、本文档。
+
+#### LUX-478：隔离扫描任务 facade 与单元测试
+
+范围：将 `ScanJobService` 共享状态、生命周期 guard 和稳定公开任务类型归入 `scanner/jobs`，把 scanner 内联单测移至 `scanner/tests.rs`。根模块只 re-export 公开合同并组合子模块，不复制锁、Notify、取消标记或状态注册表。
+
+验收：
+
+- [ ] `ScanJobService`、`ScanJob`、`ScanJobError`、`ScanBatchReport`、`IncrementalScanChange` 与 `LocalMetadataRefreshAccepted` 的现有导出路径不变。
+- [ ] 活动任务 guard、删除 fencing、取消标志和 worker 通知仍共享同一组 `Arc` 状态。
+- [ ] 所有既有 scanner 单测仍在 `application::scanner::tests` 名称空间下运行。
+
+验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test shutdown_jobs --test scanning_jobs`、fmt 检查和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/tests.rs`、本文档。
+
+#### LUX-479：拆分 Manifest 扫描阶段
+
+范围：分别移动 Manifest 目录发现与文件系统观察、差异计算/批次应用实现。保留 workflow 2/3、lite discovery、持久化 frontier、根身份确认、批次事务、取消与重试路径；文件描述符和受限 STRM 读取仍由既有 `scanner/manifest.rs` 实现。
+
+验收：
+
+- [ ] runner 只根据已持久化阶段选择 discovery、diff、apply 或 indexed completion，不内嵌目录处理算法。
+- [ ] 根被替换/卸载、目录观察改变、并发增量索引、批次提交失败、取消/恢复与 workflow 2 兼容语义保持。
+- [ ] 所有 Manifest 定向回归及 scanner 单测通过。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test scanned_metadata`、scanner library tests、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/manifest_discovery.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+#### LUX-480：拆分 reconciliation 与增量扫描
+
+范围：将旧持久化 reconciliation 与实时/定向增量扫描编排分别移入所属任务子模块。保持发现快照、根不可用保护、删除确认、同路径更新、增量路径队列和并发协调行为。
+
+验收：
+
+- [ ] reconciliation 和 incremental 算法从 runner 中分离，阶段状态由现有数据库记录驱动。
+- [ ] 根离线、扫描期间根替换、文件身份变化、reconciliation 重试和实时扫描抢占回归保持。
+- [ ] 不新增 whole-library request path 或无界后台工作。
+
+验证：`cargo test --locked --test scanning_jobs --test watch --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/incremental.rs`、本文档。
+
+#### LUX-481：抽离本地元数据 outbox worker
+
+范围：把本地 metadata batch/backfill 辅助状态、outbox worker、每任务 worker、完成 waiter 与 completeness 协调放入独立模块。保持 source identity 快照、策略快照、批次顺序、重试和 Notify/fallback 语义。
+
+验收：
+
+- [ ] 扫描编排只调用 worker 的明确入口，不持有 worker 循环和队列细节。
+- [ ] NFO/图片失败可重试、取消终结、源变化拒绝旧结果、父级 metadata 补缺和 worker 关闭行为保持。
+- [ ] 不将在线 provider 请求移入扫描请求路径；FILL_MISSING 仍由现有后台 worker 处理。
+
+验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs`、`cargo test --locked --lib scanner::tests`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+#### LUX-482：拆分任务生命周期与扫描后处理
+
+范围：将创建/取消/重试/运行 fencing 与扫描完成后的 probe、metadata、thumbnail、cover、事件发布拆入独立职责模块。索引完成与后处理仍保持两个阶段；后处理继续释放共享扫描锁并使用现有有界 worker。
+
+验收：
+
+- [ ] lifecycle 负责任务状态转换与锁；postprocessing 负责已有后处理调用，不互相复制状态。
+- [ ] 增量与全量扫描的完成、取消、失败重试、锁释放、Home 刷新、Webhook/用户事件顺序保持。
+- [ ] 相关定向测试通过，文件职责与模块可见性记录清楚。
+
+验证：`cargo test --locked --test scanning_jobs --test shutdown_jobs --test scanned_metadata --test watch`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/lifecycle.rs`、`src/application/scanner/jobs/postprocessing.rs`、本文档。
+
+#### LUX-483：简化扫描长编排函数并关闭阶段 24
+
+范围：在模块边界稳定后，整理 `run_reconciliation_file_batch`、`run_movie_reconciliation_file_batch`、Manifest diff/apply 与全量/增量完成编排，将已有步骤提取成命名清楚的准备、校验、提交和发布操作。只重排现有控制流，不改变事务、取消检查、错误传播和副作用顺序。
+
+验收：
+
+- [ ] 单个编排函数目标不超过 150 行；超出时需在实现记录说明其单一职责与保留理由。
+- [ ] `scanner.rs` 只保留 facade、共享 API 和路由 re-export，目标不超过 600 行；生产子模块按职责保持可审阅规模。
+- [ ] 全量 Rust 完成门通过：build、all-targets tests、fmt、all-targets/all-features Clippy；扫描定向目标通过。
+- [ ] 模块边界记录更新；阶段门由项目所有者确认后再进入后续阶段。
+
+验证：Toshiba 挂载检查后设置共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行全部扫描定向目标与 `cargo test --locked --all-targets`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，记录 `uname -m`。不得以本机 ARM 结果推断 NAS/x86 性能。
+
+预计文件：`src/application/scanner/jobs/runner.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/postprocessing.rs`、`tests/scanning_jobs.rs`、本文档。
+
+依赖：无。明确不做：Storage/API 重构、schema/SQL 修改、新后台 worker、新扫描状态、新性能承诺或部署。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
