@@ -6,10 +6,47 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LibraryPage, libraryItemTypeFilter } from "../src/features/library/LibraryPage";
+import { useUserEvents } from "../src/features/activity/useUserEvents";
 import { api } from "../src/lib/api/client";
 import type { LibrariesResponse } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+class FakeUserEventSource {
+  static instances: FakeUserEventSource[] = [];
+  private listeners = new Map<string, Set<(event: Event) => void>>();
+
+  constructor(readonly url: string) {
+    FakeUserEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject | null) {
+    if (!listener) return;
+    const handlers = this.listeners.get(type) ?? new Set<(event: Event) => void>();
+    handlers.add(typeof listener === "function" ? listener : (event) => listener.handleEvent(event));
+    this.listeners.set(type, handlers);
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null) {
+    if (!listener) return;
+    const handlers = this.listeners.get(type);
+    if (!handlers) return;
+    const handler = typeof listener === "function" ? listener : (event: Event) => listener.handleEvent(event);
+    handlers.delete(handler);
+  }
+
+  close() {}
+
+  emit(type: string, data: string) {
+    const event = new MessageEvent(type, { data });
+    for (const handler of this.listeners.get(type) ?? []) handler(event);
+  }
+}
+
+function ProgressiveLibraryPage() {
+  useUserEvents();
+  return createElement(LibraryPage);
+}
 
 describe("libraryItemTypeFilter", () => {
   it("shows only series at the root of a series library", () => {
@@ -130,6 +167,69 @@ describe("LibraryPage infinite scroll", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container?.querySelector("a[aria-label='打开文件夹 Trips']")).toBeTruthy());
     });
+  });
+
+  it("renders a newly indexed item and its poster after a scan invalidation", async () => {
+    vi.stubGlobal("EventSource", FakeUserEventSource);
+    FakeUserEventSource.instances = [];
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "scan-library", name: "扫描中的电影", kind: "MOVIE" }],
+    });
+    let libraryItemRequestCount = 0;
+    const libraryItems = vi.spyOn(api, "libraryItems").mockImplementation(async () => {
+      libraryItemRequestCount += 1;
+      if (libraryItemRequestCount === 1) {
+        return { items: [], page: 1, pageSize: 24, total: 0 };
+      }
+      return {
+        items: [{
+          id: "scan-movie-1",
+          title: "扫描中出现的电影",
+          itemType: "MOVIE",
+          imageTags: { poster: "scan-poster-v1" },
+        }],
+        page: 1,
+        pageSize: 24,
+        total: 1,
+      };
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/scan-library"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(ProgressiveLibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    expect(api.libraries).toHaveBeenCalled();
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.textContent).toContain("0 项内容"));
+    });
+    expect(container.textContent).not.toContain("扫描中出现的电影");
+    expect(FakeUserEventSource.instances).toHaveLength(1);
+    expect(FakeUserEventSource.instances[0].url).toBe("/api/v1/events");
+
+    await act(async () => {
+      FakeUserEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "home" }));
+      await vi.waitFor(() => expect(container?.textContent).toContain("扫描中出现的电影"));
+    });
+
+    expect(libraryItems).toHaveBeenCalledTimes(2);
+    expect(container.querySelector<HTMLImageElement>(".lux-media-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/scan-movie-1/images/poster?tag=scan-poster-v1");
   });
 
   it("shows the library name in the browser tab title", async () => {

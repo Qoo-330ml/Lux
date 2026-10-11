@@ -1,7 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::SocketAddr,
     path::PathBuf,
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 use axum::{
     Router,
     body::Body,
-    extract::{Path as AxumPath, State as AxumState},
+    extract::{ConnectInfo, Path as AxumPath, State as AxumState},
     response::Response,
     routing::get,
 };
@@ -25,7 +28,6 @@ use luxd::{
         candidates::MetadataSelectionService,
         images::ImageWriteService,
         libraries::LibraryService,
-        nfo::LocalNfoMetadataStore,
         probe::{FfprobeRunner, MediaProbeService},
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::{LibraryScanner, ScanJobService},
@@ -44,7 +46,8 @@ use luxd::{
     observability::resources::ResourceMetrics,
     storage::Database,
 };
-use reqwest::header::{COOKIE, SET_COOKIE};
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tracing::{
@@ -60,6 +63,223 @@ const FOREGROUND_REQUESTS: usize = 50;
 const INCREMENTAL_FILES: usize = 100;
 const METADATA_BENCHMARK_ITEMS: usize = 32;
 const POOL_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
+const POSTER_API_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const POSTER_API_PROBE_MAX_REQUESTS: usize = 20;
+const POSTER_API_PROBE_MAX_DURATION: Duration = Duration::from_secs(5);
+const POSTER_API_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const POSTER_CATALOG_PAGE_SIZE: i64 = 100;
+static NEXT_PERFORMANCE_PROBE_REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
+static ISOLATED_LOADGEN_CHILDREN: OnceLock<Mutex<BTreeMap<String, PersistentLoadgenChild>>> =
+    OnceLock::new();
+
+struct PersistentLoadgenChild {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PersistentLoadgenChild {
+    fn spawn(executable: PathBuf) -> std::io::Result<Self> {
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "isolated_performance_loadgen_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("loadgen child did not expose its input pipe"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("loadgen child did not expose its output pipe"))?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn request(&mut self, input: &str) -> std::io::Result<String> {
+        self.stdin.write_all(input.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if self.stdout.read_line(&mut line)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "isolated loadgen child closed its output before returning a result",
+                ));
+            }
+            if let Some((_, result)) = line.split_once("LUX_PERF_LOADGEN_RESULT:") {
+                return Ok(result.trim().to_owned());
+            }
+        }
+    }
+}
+
+struct IsolatedLoadgenChildGuard {
+    origin: String,
+}
+
+impl IsolatedLoadgenChildGuard {
+    fn new(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            origin: isolated_loadgen_origin(url)?,
+        })
+    }
+}
+
+impl Drop for IsolatedLoadgenChildGuard {
+    fn drop(&mut self) {
+        let Some(children) = ISOLATED_LOADGEN_CHILDREN.get() else {
+            return;
+        };
+        let Ok(mut children) = children.lock() else {
+            return;
+        };
+        let Some(mut child) = children.remove(&self.origin) else {
+            return;
+        };
+        drop(child.stdin);
+        let mut trailing_output = String::new();
+        let _ = child.stdout.read_to_string(&mut trailing_output);
+        let _ = child.child.wait();
+    }
+}
+
+fn isolated_loadgen_origin(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let parsed_url = reqwest::Url::parse(url)?;
+    if parsed_url.scheme() != "http"
+        || !matches!(
+            parsed_url.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+        )
+    {
+        return Err("isolated loadgen only accepts local HTTP test servers".into());
+    }
+    Ok(parsed_url.origin().ascii_serialization())
+}
+
+fn catalog_item_with_poster(
+    body: &serde_json::Value,
+    expected_item_id: &str,
+) -> Option<(String, String)> {
+    body.get("items")?.as_array()?.iter().find_map(|item| {
+        let item_id = item.get("id")?.as_str()?;
+        if item_id != expected_item_id {
+            return None;
+        }
+        let poster_tag = item.get("imageTags")?.get("poster")?.as_str()?;
+        if item_id.trim().is_empty() || poster_tag.trim().is_empty() {
+            return None;
+        }
+        Some((item_id.to_owned(), poster_tag.to_owned()))
+    })
+}
+
+fn catalog_page_contains_item(body: &serde_json::Value, expected_item_id: &str) -> bool {
+    body.get("items")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("id").and_then(serde_json::Value::as_str) == Some(expected_item_id)
+            })
+        })
+}
+
+fn catalog_poster_page_for_movie_position(position: i64) -> Option<i64> {
+    (position > 0).then_some((position - 1) / POSTER_CATALOG_PAGE_SIZE + 1)
+}
+
+fn scan_job_state_is_active(status: &str, phase: &str) -> bool {
+    matches!(status, "PENDING" | "QUEUED" | "RUNNING")
+        || (status == "COMPLETED" && phase == "POSTPROCESSING")
+}
+
+#[test]
+fn scan_activity_includes_pending_jobs_and_excludes_terminal_idle_jobs() {
+    assert!(scan_job_state_is_active("PENDING", "IDLE"));
+    assert!(scan_job_state_is_active("QUEUED", "IDLE"));
+    assert!(scan_job_state_is_active("RUNNING", "IDLE"));
+    assert!(scan_job_state_is_active("COMPLETED", "POSTPROCESSING"));
+    assert!(!scan_job_state_is_active("COMPLETED", "IDLE"));
+    assert!(!scan_job_state_is_active("FAILED", "POSTPROCESSING"));
+}
+
+#[test]
+fn catalog_poster_probe_selects_an_item_with_a_poster_tag() {
+    image::load_from_memory(METADATA_BENCHMARK_PNG)
+        .expect("benchmark poster fixture must decode as an image");
+    let body = json!({
+        "items": [
+            {"id": "no-poster", "imageTags": {"poster": null}},
+            {"id": "", "imageTags": {"poster": "ignored-empty-item"}},
+            {"id": "movie-1", "imageTags": {"poster": "poster-tag-1"}},
+            {"id": "movie-2", "imageTags": {"poster": "poster-tag-2"}}
+        ]
+    });
+    assert_eq!(
+        catalog_item_with_poster(&body, "movie-1"),
+        Some(("movie-1".to_owned(), "poster-tag-1".to_owned()))
+    );
+    assert!(catalog_item_with_poster(&json!({"items": []}), "movie-1").is_none());
+}
+
+#[test]
+fn catalog_poster_probe_uses_the_page_containing_the_ranked_movie() {
+    assert_eq!(catalog_poster_page_for_movie_position(1), Some(1));
+    assert_eq!(catalog_poster_page_for_movie_position(100), Some(1));
+    assert_eq!(catalog_poster_page_for_movie_position(101), Some(2));
+    assert_eq!(catalog_poster_page_for_movie_position(10_000), Some(100));
+    assert_eq!(catalog_poster_page_for_movie_position(0), None);
+}
+
+#[test]
+fn catalog_poster_probe_selects_the_indexed_item_from_its_page() {
+    let body = json!({
+        "items": [
+            {"id": "other-movie", "imageTags": {"poster": "other-poster"}},
+            {"id": "indexed-movie", "imageTags": {"poster": "indexed-poster"}}
+        ]
+    });
+    assert_eq!(
+        catalog_item_with_poster(&body, "indexed-movie"),
+        Some(("indexed-movie".to_owned(), "indexed-poster".to_owned()))
+    );
+    assert!(catalog_page_contains_item(&body, "indexed-movie"));
+    assert!(!catalog_page_contains_item(&body, "not-on-this-page"));
+    assert!(catalog_item_with_poster(&body, "not-on-this-page").is_none());
+}
+
+#[derive(Debug, Default)]
+struct CatalogPosterApiProbe {
+    local_poster_index_observed: bool,
+    catalog_page: Option<i64>,
+    catalog_item_visible_ms: Option<u128>,
+    catalog_rank_lookup_count: usize,
+    catalog_list_request_count: usize,
+    poster_endpoint_request_count: usize,
+    item_id: Option<String>,
+    poster_tag: Option<String>,
+    poster_tag_visible_ms: Option<u128>,
+    poster_visible_ms: Option<u128>,
+    poster_endpoint_latency_ms: Option<u128>,
+    content_type: Option<String>,
+    body_bytes: Option<usize>,
+    body_decoded_as_image: bool,
+    last_error: Option<String>,
+}
 
 #[derive(Clone, Copy)]
 struct CatalogPageExpectation {
@@ -292,9 +512,9 @@ async fn wait_for_fixture_catalog_page(
 const METADATA_BENCHMARK_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
-    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
-    0x42, 0x60, 0x82,
+    0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
 ];
 type ScanStageSample = (u64, u64, u64, u64);
 
@@ -1825,7 +2045,9 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
         .await
     });
     let base_url = format!("http://{address}");
+    let _loadgen_child_guard = IsolatedLoadgenChildGuard::new(&base_url)?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
         .build()?;
     let login = client
@@ -1841,7 +2063,6 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
         "lux_session={}",
         cookie_value(login.headers(), "lux_session")
     );
-
     let scanner = LibraryScanner::new(database.clone());
     statement_counts.reset();
     let first_started = Instant::now();
@@ -2251,7 +2472,9 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         .await
     });
     let base_url = format!("http://{address}");
+    let _loadgen_child_guard = IsolatedLoadgenChildGuard::new(&base_url)?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
         .build()?;
     let login = client
@@ -2267,7 +2490,6 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "lux_session={}",
         cookie_value(login.headers(), "lux_session")
     );
-
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     let postgres_wal_before = if backend == "postgres" {
@@ -2629,6 +2851,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             catalog_page_expectation,
         )
         .await?;
+    let catalog_list_first_request_ms = catalog_list_first_request_sample.elapsed_ms;
     let catalog_list_first_request_sql_latency_window = statement_counts.take_query_latency_values(
         "catalog_list_first_request",
         true,
@@ -2644,12 +2867,12 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             catalog_page_expectation,
         )
         .await?;
+    let catalog_list_warm_page_ms = get_request_elapsed_ms(&catalog_list_warm_page_samples);
     let catalog_list_warm_sql_latency_window = statement_counts.take_query_latency_values(
         "catalog_list_warm_parallel_requests",
         true,
         "SQLx events observed during the 50 concurrent requests in this warmed catalog-page batch; global instrumentation may include concurrent background SQL.",
     );
-
     statement_counts.reset();
     let rescan_job = jobs.create_movie_scan_job(library.id).await?;
     let rescan_started = Instant::now();
@@ -2862,16 +3085,25 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "rescanAndRequestWindowMs": rescan_and_request_window_ms,
             "foregroundRequestCount": FOREGROUND_REQUESTS,
             "foregroundP95Ms": foreground_p95_ms,
+            "foregroundHttpRequestProfile": get_request_profile(&foreground_samples),
             "foregroundPoolPressure": foreground_pool_pressure,
             "catalogListP95Ms": catalog_list_p95_ms,
+            "catalogListHttpRequestProfile": get_request_profile(&catalog_list_samples),
             "catalogListPoolPressure": catalog_list_pool_pressure,
             "catalogListFirstRequestMs": catalog_list_first_request_ms,
             "catalogListFirstRequestPoolPressure": catalog_list_first_request_pool_pressure,
+            "catalogListFirstRequestHttpRequestProfile":
+                get_request_profile(std::slice::from_ref(&catalog_list_first_request_sample)),
             "catalogListFirstRequestSqlLatencyWindow":
                 catalog_list_first_request_sql_latency_window,
+            "catalogListWarmupRequestCount": catalog_list_warmup_page_samples.len(),
+            "catalogListWarmupHttpRequestProfile":
+                get_request_profile(&catalog_list_warmup_page_samples),
             "catalogListWarmP50Ms": percentile(&catalog_list_warm_page_ms, 50),
             "catalogListWarmP95Ms": percentile(&catalog_list_warm_page_ms, 95),
             "catalogListWarmRequestCount": catalog_list_warm_page_ms.len(),
+            "catalogListWarmHttpRequestProfile":
+                get_request_profile(&catalog_list_warm_page_samples),
             "catalogListWarmPoolPressure": catalog_list_warm_pool_pressure,
             "catalogListWarmPageSqlLatencyWindow": catalog_list_warm_sql_latency_window,
             "unchangedRescanMs": rescan_ms,
@@ -3010,7 +3242,9 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .await
     });
     let base_url = format!("http://{address}");
+    let _loadgen_child_guard = IsolatedLoadgenChildGuard::new(&base_url)?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
         .build()?;
     let login = client
@@ -3022,13 +3256,20 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .send()
         .await?;
     assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let csrf_token = cookie_value(login.headers(), "lux_csrf");
     let cookies = format!(
-        "lux_session={}",
+        "lux_session={}; lux_csrf={csrf_token}",
         cookie_value(login.headers(), "lux_session")
     );
-    let jobs = ScanJobService::new(database.clone())
-        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
-    let scan_job = jobs.create_movie_scan_job(library.id).await?;
+    let catalog_connection_warmup_samples = measure_get_request_samples_with_probe(
+        &client,
+        &format!("{base_url}/api/v1/libraries"),
+        &cookies,
+        "LUX-304 catalog connection warmup",
+        FOREGROUND_REQUESTS,
+        false,
+    )
+    .await?;
     let scan_started = Instant::now();
     let scan_worker = jobs.clone();
     let scan_job_id = scan_job.id.clone();
@@ -3167,7 +3408,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let catalog_timing_report = request_timing_report(&catalog_timings, 0, scan_end_ns);
     let scan_finished_queue_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
-        &scan_job.id,
+        &scan_job_id,
         &library.id.to_string(),
         job_id_placeholder,
         queue_library_id_placeholder,
@@ -3198,7 +3439,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     };
     let scan_finished_queue_after_api_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
-        &scan_job.id,
+        &scan_job_id,
         &library.id.to_string(),
         job_id_placeholder,
         queue_library_id_placeholder,
@@ -3249,7 +3490,10 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         drained_catalog_expectation,
     )
     .await?;
+    let catalog_list_after_queue_ms = get_request_elapsed_ms(&catalog_list_after_queue_samples);
     let catalog_list_after_queue_p95_ms = percentile(&catalog_list_after_queue_ms, 95);
+    let catalog_list_after_queue_http_profile =
+        get_request_profile(&catalog_list_after_queue_samples);
     let online_fill_missing_job_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM metadata_reidentify_jobs
          WHERE library_id = {library_id_placeholder} AND mode = 'FILL_MISSING'"
@@ -3258,7 +3502,11 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     .fetch_one(database.pool())
     .await?;
     assert_eq!(online_fill_missing_job_count, 0);
-    assert!(scan_running_at_api_start);
+    assert!(
+        scan_active_at_api_start,
+        "scan job was not active after the admin scan API returned: status={:?}, phase={:?}",
+        initial_scan_job_state.0, initial_scan_job_state.1
+    );
     assert!(first_item_visible_ms <= scan_job_completion_ms);
     assert_eq!(
         local_poster_queue_final_snapshot.poster_item_count(),
@@ -3270,6 +3518,15 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         first_poster_indexed_ms <= scan_job_completion_ms,
         "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
     );
+    let poster_api_visible_before_scan_completion = poster_api_probe
+        .poster_visible_ms
+        .is_some_and(|elapsed_ms| elapsed_ms <= scan_job_completion_ms);
+    if require_detached_poster_queue {
+        assert!(
+            poster_api_visible_before_scan_completion,
+            "a poster visible through the authenticated catalog and poster APIs was not returned before scan completion: probe={poster_api_probe:?}, first item visible={first_item_visible_ms} ms, first poster indexed={first_poster_indexed_ms} ms, scan completion={scan_job_completion_ms} ms"
+        );
+    }
     if require_detached_poster_queue {
         assert!(
             scan_job_completion_ms < local_poster_queue_ms,
@@ -3285,11 +3542,36 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "databaseBackend": backend,
             "fileCount": file_count,
             "directoryCount": directory_count,
+            "posterQueueMode": "detached_batches",
             "scanJobCompletionMs": scan_job_completion_ms,
             "firstItemVisibleMs": first_item_visible_ms,
             "firstCatalogRequestMs": first_catalog_request_ms,
             "firstCatalogVisibleTotal": first_catalog_visible_total,
             "firstPosterIndexedMs": first_poster_indexed_ms,
+            "catalogPosterApiProbe": {
+                "probeIntervalMs": POSTER_API_PROBE_INTERVAL.as_millis(),
+                "maxCatalogListRequests": POSTER_API_PROBE_MAX_REQUESTS,
+                "maxProbeDurationMs": POSTER_API_PROBE_MAX_DURATION.as_millis(),
+                "requestTimeoutMs": POSTER_API_PROBE_REQUEST_TIMEOUT.as_millis(),
+                "localPosterIndexObserved": poster_api_probe.local_poster_index_observed,
+                "catalogPage": poster_api_probe.catalog_page,
+                "catalogItemVisibleMs": poster_api_probe.catalog_item_visible_ms,
+                "catalogRankLookupCount": poster_api_probe.catalog_rank_lookup_count,
+                "catalogListRequestCount": poster_api_probe.catalog_list_request_count,
+                "posterEndpointRequestCount": poster_api_probe.poster_endpoint_request_count,
+                "itemId": poster_api_probe.item_id,
+                "posterTag": poster_api_probe.poster_tag,
+                "posterTagVisibleMs": poster_api_probe.poster_tag_visible_ms,
+                "posterVisibleMs": poster_api_probe.poster_visible_ms,
+                "posterEndpointLatencyMs": poster_api_probe.poster_endpoint_latency_ms,
+                "contentType": poster_api_probe.content_type,
+                "bodyBytes": poster_api_probe.body_bytes,
+                "bodyDecodedAsImage": poster_api_probe.body_decoded_as_image,
+                "lastError": poster_api_probe.last_error,
+                "posterVisibleBeforeScanCompletion": poster_api_visible_before_scan_completion,
+                "backgroundTrafficDuringScan": true,
+                "includedInCatalogListP95": false,
+            },
             "catalogListP95DuringScanMs": catalog_list_p95_ms,
             "catalogListP95RequestsStartedDuringScanMs": catalog_timing_report["startedDuringScanP95Ms"],
             "catalogListRequestTiming": catalog_timing_report,
@@ -3316,7 +3598,8 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
                 scan_finished_queue_after_api_snapshot.report(file_count),
             "catalogListP95AfterPosterQueueMs": catalog_list_after_queue_p95_ms,
             "catalogListAfterPosterQueueRequestCount": catalog_list_after_queue_ms.len(),
-            "scanRunningAtApiStart": scan_running_at_api_start,
+            "catalogListAfterPosterQueueHttpRequestProfile": catalog_list_after_queue_http_profile,
+            "scanActiveAtApiStart": scan_active_at_api_start,
             "localPosterQueueCompleteMs": local_poster_queue_ms,
             "localPosterQueueFirstObservedCompleteMs": local_poster_queue_observed_ns / 1_000_000,
             "localPosterQueueObservationIntervalMs": 100,
@@ -3887,15 +4170,23 @@ async fn measure_timed_get_requests(
     for _ in 0..FOREGROUND_REQUESTS {
         let client = client.clone();
         let url = url.to_owned();
+        let request_path = request_path.clone();
+        let request_id = format!(
+            "lux-perf-{}-{}",
+            std::process::id(),
+            NEXT_PERFORMANCE_PROBE_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
         let cookies = cookies.to_owned();
         requests.push(tokio::spawn(async move {
             let started = Instant::now();
-            let response = client
-                .get(url)
-                .header(COOKIE, cookies)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut request = client.get(url).header(COOKIE, cookies);
+            if probe_enabled {
+                request = request
+                    .header("x-request-id", request_id.as_str())
+                    .header("x-lux-performance-probe", "v1");
+            }
+            let response = request.send().await.map_err(|error| error.to_string())?;
+            let response_headers_us = started.elapsed().as_micros();
             let status = response.status();
             let body = response.bytes().await.map_err(|error| error.to_string())?;
             let timing = RequestTiming {
