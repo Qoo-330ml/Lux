@@ -1,6 +1,7 @@
 use super::*;
 
 mod incremental;
+pub(in crate::application::scanner) mod local_metadata;
 mod manifest_discovery;
 mod manifest_index;
 mod reconciliation;
@@ -32,26 +33,6 @@ pub struct ScanJobService {
     pub(super) local_metadata_outbox_worker_started: Arc<AtomicBool>,
     pub(super) local_metadata_outbox_notify: Arc<Notify>,
     pub(super) lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
-}
-
-pub(super) struct LocalMetadataWorkerHandle {
-    pub(super) stop: watch::Sender<bool>,
-    pub(super) task: JoinHandle<()>,
-    pub(super) job_id: String,
-    pub(super) notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    #[cfg(test)]
-    pub(super) idle_page_receiver: tokio::sync::mpsc::UnboundedReceiver<()>,
-}
-
-pub(super) fn notify_local_metadata_images_waiter(
-    notifications: &Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    scan_job_id: &str,
-) {
-    if let Ok(registry) = notifications.lock()
-        && let Some(notify) = registry.get(scan_job_id)
-    {
-        notify.notify_one();
-    }
 }
 
 #[derive(Default)]

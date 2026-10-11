@@ -10329,13 +10329,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 扫描编排只调用 worker 的明确入口，不持有 worker 循环和队列细节。
-- [ ] NFO/图片失败可重试、取消终结、源变化拒绝旧结果、父级 metadata 补缺和 worker 关闭行为保持。
-- [ ] 不将在线 provider 请求移入扫描请求路径；FILL_MISSING 仍由现有后台 worker 处理。
+- [x] 扫描编排只调用 worker 的明确入口，不持有 worker 循环和队列细节。
+- [ ] NFO/图片失败可重试、取消终结、源变化拒绝旧结果、父级 metadata 补缺和 worker 关闭行为保持；series 不可读海报用例仍有基线失败，见结果记录。
+- [x] 不将在线 provider 请求移入扫描请求路径；FILL_MISSING 仍由现有后台 worker 处理。
 
 验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs`、`cargo test --locked --lib scanner::tests`、fmt 和 build。
 
-预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+结果（2026-10-12）：local metadata 的 batch/backfill/completeness helpers、单任务 worker、outbox worker、等待器、取消收尾及 refresh 实现移入 `jobs/local_metadata.rs`；outbox worker 从 incremental 模块抽出，scanner facade 保留稳定服务 API 与 worker 调用入口。`scanned_metadata` 23 项、`scanning_jobs` 81 项、scanner 单测 41 项通过（1 项按要求忽略）；`scanned_series_metadata` 2 项通过，`unreadable_series_poster_keeps_local_image_batch_retryable` 失败。该失败在本分支与干净基线 `01f0c9e4` 上均可复现，错误为 batch `COMPLETED` 而预期 `FAILED`，本次纯移动未改变该行为；因此相关重试验收暂未勾选。`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 4,355 行减至 3,195 行，`jobs/local_metadata.rs` 为 1,415 行；未把在线 provider 请求移入扫描路径，也未增加后台队列。
 
 #### LUX-482：拆分任务生命周期与扫描后处理
 
