@@ -81,7 +81,7 @@ impl Database {
             .map(|_| changed)
     }
 
-    pub(in crate::storage::repository) async fn record_scan_job_targets_in_transaction(
+    pub(in crate::storage::repository::jobs::scan) async fn record_scan_job_targets_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,
@@ -206,7 +206,7 @@ impl Database {
             .map(|_| changed)
     }
 
-    pub(in crate::storage::repository) async fn record_scan_job_sidecar_targets_in_transaction(
+    pub(in crate::storage::repository::jobs::scan) async fn record_scan_job_sidecar_targets_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,
@@ -268,7 +268,7 @@ impl Database {
         Ok(changed)
     }
 
-    pub(in crate::storage::repository::jobs) async fn record_scan_job_removed_targets_in_transaction(
+    pub(in crate::storage::repository::jobs::scan) async fn record_scan_job_removed_targets_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,
@@ -341,7 +341,7 @@ impl Database {
         Ok(())
     }
 
-    pub(in crate::storage::repository) async fn record_scan_job_removed_targets_for_entry_ids_in_transaction(
+    pub(in crate::storage::repository::jobs::scan) async fn record_scan_job_removed_targets_for_entry_ids_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,

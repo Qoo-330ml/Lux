@@ -113,7 +113,7 @@ impl Database {
         Ok(false)
     }
 
-    pub(in crate::storage::repository) async fn enqueue_manifest_local_metadata_refs_in_transaction(
+    pub(in crate::storage::repository::jobs) async fn enqueue_manifest_local_metadata_refs_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,

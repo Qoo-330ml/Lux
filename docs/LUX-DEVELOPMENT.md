@@ -10908,6 +10908,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：`jobs.rs` 缩至模块 wiring 与必要共享 imports/exports；restore 方法迁入 `media_sources.rs`，legacy scan error code 迁入 `shutdown.rs`。调用方法名保持。shutdown、build、fmt 与 diff 检查通过。
 
+#### LUX-517：收窄事务内存储 helper 可见范围
+
+范围：把 local metadata outbox、LIKE escaping 和 scan target/removal transaction helper 限制在实际调用的 `jobs` 或 `jobs::scan` 子树。保持可供同层 repository tests 使用的 jobs 范围。
+
+验收：
+
+- [x] 不再有 jobs helper 使用整个 `storage::repository` 的事务内可见权限。
+- [x] discovery/reconciliation/apply 与 jobs repository tests 的调用仍可解析。
+- [x] build、jobs 单测、fmt 和 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/local_metadata/sources.rs`、`src/storage/jobs/local_metadata/batches.rs`、`src/storage/jobs/scan/targets.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo build --locked`、`cargo test --locked --lib storage::repository::jobs::tests`、fmt 和 `git diff --check`，并搜索 repository 范围 helper 与所有调用点。
+
+结果（2026-10-12）：LIKE escaping 和 Manifest outbox helper 缩至 `jobs`；scan target、sidecar、removal transaction helpers 缩至 `jobs::scan`。jobs repository tests 与 scanner/reconciliation/manifest 调用点仍在可见树内；build、jobs 单测、fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

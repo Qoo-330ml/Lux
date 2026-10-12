@@ -3,7 +3,7 @@ use super::*;
 // One item ID per bind keeps source freshness checks below SQLite's conservative limit.
 const SCAN_LOCAL_METADATA_SOURCE_IDENTITY_BATCH_SIZE: usize = 500;
 
-pub(in crate::storage::repository) fn escape_sql_like_pattern(value: &str) -> String {
+pub(in crate::storage::repository::jobs) fn escape_sql_like_pattern(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('%', "\\%")
