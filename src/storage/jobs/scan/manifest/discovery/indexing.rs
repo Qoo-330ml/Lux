@@ -1,19 +1,33 @@
 use super::*;
 
+pub(super) struct ManifestDiscoveryIndexingInput<'a> {
+    pub(super) workflow_version: i64,
+    pub(super) job_status: &'a str,
+    pub(super) cancel_requested: i64,
+    pub(super) library_id: &'a str,
+    pub(super) generation: &'a str,
+    pub(super) positive_indexes: &'a [&'a NewScanManifestPositiveIndex],
+    pub(super) entries: &'a [&'a NewScanManifestEntry],
+    pub(super) local_metadata_sequence_start: Option<i64>,
+}
+
 impl Database {
     pub(super) async fn apply_manifest_discovery_indexes_and_metadata<'a>(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
         chunk: &NewScanManifestDiscoveryChunk<'_>,
-        workflow_version: i64,
-        job_status: &str,
-        cancel_requested: i64,
-        library_id: &str,
-        generation: &str,
-        positive_indexes: &'a [&'a NewScanManifestPositiveIndex],
-        entries: &'a [&'a NewScanManifestEntry],
-        local_metadata_sequence_start: Option<i64>,
+        input: ManifestDiscoveryIndexingInput<'a>,
     ) -> Result<(ManifestDiscoveryPositiveIndexResult<'a>, bool), StorageError> {
+        let ManifestDiscoveryIndexingInput {
+            workflow_version,
+            job_status,
+            cancel_requested,
+            library_id,
+            generation,
+            positive_indexes,
+            entries,
+            local_metadata_sequence_start,
+        } = input;
         if !matches!(workflow_version, 2 | 3) && !positive_indexes.is_empty() {
             return Err(StorageError::Conflict(
                 "legacy manifest cannot receive streamed positive indexes".to_owned(),

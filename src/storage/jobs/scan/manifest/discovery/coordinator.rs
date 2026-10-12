@@ -2,6 +2,7 @@ use super::*;
 use super::{
     checkpoint::{ManifestDiscoveryCheckpointInput, ManifestDiscoverySequenceReservations},
     counters::ManifestDiscoveryCountersInput,
+    indexing::ManifestDiscoveryIndexingInput,
     input::ManifestDiscoveryInput,
     state::ManifestDiscoveryStateSnapshot,
 };
@@ -189,14 +190,16 @@ impl Database {
             .apply_manifest_discovery_indexes_and_metadata(
                 transaction,
                 chunk,
-                workflow_version,
-                &job_status,
-                cancel_requested,
-                &library_id,
-                &generation,
-                &positive_indexes,
-                &entries,
-                reservations.local_metadata_sequence_start,
+                ManifestDiscoveryIndexingInput {
+                    workflow_version,
+                    job_status: &job_status,
+                    cancel_requested,
+                    library_id: &library_id,
+                    generation: &generation,
+                    positive_indexes: &positive_indexes,
+                    entries: &entries,
+                    local_metadata_sequence_start: reservations.local_metadata_sequence_start,
+                },
             )
             .await?;
 
