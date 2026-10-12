@@ -10556,6 +10556,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：两项 local metadata source/identity 方法、来源身份批次上限与 LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`；原 `Database` 签名保持。因 LIKE 转义还用于 jobs 内另一个既有目录查询，由 local metadata 根按 repository 子树 re-export 同一 helper。核对了 scanner、metadata application 和 jobs tests 调用点。身份单测 1 项、`metadata_paths` 8 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-495：拆分 metadata reidentify 生命周期和 item 队列
+
+范围：新增 `jobs/metadata_reidentify`，将 job 创建/查询/取消/重试/活动状态移入 `lifecycle.rs`，将目标查询、领取、item 完成与失败恢复移入 `items.rs`。现有 application、API 与 storage `Database` 调用保持。
+
+验收：
+
+- [x] metadata reidentify job 状态与 item 领取/结算实现不再位于 `jobs.rs`。
+- [x] job 和 item 状态、取消竞态、retry/active 查询及 API 返回映射保持。
+- [x] reidentify、metadata cancel 与 metadata API 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --test reidentify --test metadata_cancel --test metadata_api`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/metadata_reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/jobs/metadata_reidentify/items.rs`、本文档。
+
+结果（2026-10-12）：15 个 reidentify job 创建/查询/状态方法移入 `lifecycle.rs`，8 个 item 查询、领取、完成及失败恢复方法移入 `items.rs`；优先级 SQL 片段放在新子树根，供 FILL_MISSING 后续复用。原 `Database` 签名保持。`metadata_api` 9 项、`metadata_cancel` 3 项、`reidentify` 20 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
