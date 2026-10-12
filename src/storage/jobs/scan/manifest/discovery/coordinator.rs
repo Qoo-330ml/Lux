@@ -108,14 +108,11 @@ impl Database {
         Ok(result)
     }
 
-    async fn commit_manifest_discovery_transaction<'slice, 'data>(
+    async fn commit_manifest_discovery_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
-        input: ManifestDiscoveryInput<'slice, 'data>,
-    ) -> Result<ManifestDiscoveryCommitResult, StorageError>
-    where
-        'data: 'slice,
-    {
+        input: ManifestDiscoveryInput<'_, '_>,
+    ) -> Result<ManifestDiscoveryCommitResult, StorageError> {
         let ManifestDiscoveryInput {
             chunk,
             child_directories,
