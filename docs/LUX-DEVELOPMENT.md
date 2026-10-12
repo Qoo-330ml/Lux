@@ -10764,6 +10764,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：Manifest/job 状态读取改为单个 `ManifestDiscoveryStateSnapshot`，目录 frontier upsert 与完成更新分别迁入独立步骤；两者均复用 coordinator 持有的 transaction，SQL、bind 顺序、批次上限、冲突策略、lite mode 计数和诊断阶段位置保持。取消回归 1 passed，bounded directory batch 回归 1 passed；`cargo build --locked`、fmt 和 `git diff --check` 通过。`commit_scan_manifest_discovery_chunks` 及其应用层调用点未改名。
 
+#### LUX-508：提取 Manifest root checkpoint 与 observation 写入
+
+范围：将 root checkpoint 的目录/文件计数及 observation/local metadata sequence 预留，以及 observation 的分批写入迁入私有 discovery 子模块。继续由 coordinator 持有同一 transaction，并保留诊断计时边界。
+
+验收：
+
+- [x] workflow v2/v3 的 observation sequence 连续且与 root 高水位一致；legacy observation 的逐路径 sequence 语义保持。
+- [x] local metadata batch sequence 预留与大目录 bounded batch 行为保持。
+- [x] SQL/bind 顺序、批次上限、错误检查顺序和 diagnostics 计时边界保持；相关回归与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/checkpoint.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs full_scan_manifest_persists_discovery_and_reobservations_without_directory_work_queue`、`cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：root checkpoint 序号预留与 observation 批量写入移入 `discovery/checkpoint.rs`，原事务仍由 coordinator 创建、提交；SQL 和 bind 顺序、legacy/v2/v3 序号算法、批次大小和计时边界保持。目录计数转换仍在 frontier completion 前执行。observation 高水位回归 1 passed，大目录/local metadata sequence 回归 1 passed；fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

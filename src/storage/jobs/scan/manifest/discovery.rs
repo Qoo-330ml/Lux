@@ -7,6 +7,10 @@ use input::ManifestDiscoveryInput;
 #[path = "discovery/frontier.rs"]
 mod frontier;
 
+#[path = "discovery/checkpoint.rs"]
+mod checkpoint;
+use checkpoint::ManifestDiscoveryCheckpointInput;
+
 #[path = "discovery/state.rs"]
 mod state;
 use state::ManifestDiscoveryStateSnapshot;
@@ -219,89 +223,24 @@ impl Database {
         } else {
             entries.clone()
         };
-        let observation_count_i64 = if matches!(workflow_version, 2 | 3) {
-            i64::try_from(observation_entries.len()).map_err(|_| {
-                StorageError::Conflict("manifest observation count overflow".to_owned())
-            })?
-        } else {
-            0
-        };
-        let reserved_local_batch_sequence_count = if workflow_version == 3 {
-            i64::try_from(
-                positive_indexes
-                    .len()
-                    .div_ceil(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES),
+        let reservations = self
+            .checkpoint_manifest_discovery_root(
+                &mut transaction,
+                ManifestDiscoveryCheckpointInput {
+                    chunk,
+                    workflow_version,
+                    discovery_mode: &discovery_mode,
+                    lite_mode,
+                    observation_entry_count: observation_entries.len(),
+                    positive_index_count: positive_indexes.len(),
+                    inserted_directory_count_i64,
+                    inserted_file_count: inserted_file_count_i64,
+                    child_directory_count: child_directories.len(),
+                    completed_directory_count,
+                    completed_directory_input_count: completed_directories.len(),
+                },
             )
-            .map_err(|_| StorageError::Conflict("local metadata batch count overflow".to_owned()))?
-        } else {
-            0
-        };
-        let root_sequence_increment = observation_count_i64
-            .checked_add(reserved_local_batch_sequence_count)
-            .ok_or_else(|| StorageError::Conflict("manifest root sequence overflow".into()))?;
-        let discovered_directory_count_i64 = if lite_mode {
-            i64::try_from(child_directories.len()).map_err(|_| {
-                StorageError::Conflict("manifest directory count overflow".to_owned())
-            })?
-        } else {
-            inserted_directory_count_i64
-        };
-        let completed_directory_count_for_root = if lite_mode {
-            i64::try_from(completed_directories.len()).map_err(|_| {
-                StorageError::Conflict("manifest directory count overflow".to_owned())
-            })?
-        } else {
-            completed_directory_count
-        };
-        let last_sequence = self
-            .query_scalar::<i64>(
-                "UPDATE scan_manifest_roots
-                 SET state = CASE WHEN ? = 'LITE' THEN 'SCANNING'
-                     WHEN NOT EXISTS (
-                         SELECT 1 FROM scan_manifest_directories
-                         WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'
-                     ) THEN 'COMPLETE' ELSE 'SCANNING' END,
-                     started_at = COALESCE(started_at, unixepoch()),
-                     finished_at = CASE WHEN ? = 'LITE' THEN finished_at
-                         WHEN NOT EXISTS (
-                         SELECT 1 FROM scan_manifest_directories
-                         WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'
-                     ) THEN COALESCE(finished_at, unixepoch()) ELSE finished_at END,
-                     directory_count = directory_count + ?,
-                     completed_directory_count = completed_directory_count + ?,
-                     observed_file_count = observed_file_count + ?,
-                     next_observation_sequence = next_observation_sequence + ?,
-                     updated_at = unixepoch()
-                 WHERE manifest_id = ? AND library_root_id = ?
-                   AND state IN ('PENDING', 'SCANNING')
-                   AND EXISTS (
-                       SELECT 1 FROM scan_manifests
-                       WHERE id = ? AND state = 'DISCOVERING'
-                   )
-                 RETURNING next_observation_sequence",
-            )
-            .bind(&discovery_mode)
-            .bind(chunk.manifest_id)
-            .bind(chunk.library_root_id)
-            .bind(&discovery_mode)
-            .bind(chunk.manifest_id)
-            .bind(chunk.library_root_id)
-            .bind(discovered_directory_count_i64)
-            .bind(completed_directory_count_for_root)
-            .bind(inserted_file_count_i64)
-            .bind(root_sequence_increment)
-            .bind(chunk.manifest_id)
-            .bind(chunk.library_root_id)
-            .bind(chunk.manifest_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .ok_or_else(|| {
-                StorageError::Conflict("manifest root is not available for discovery".to_owned())
-            })?;
+            .await?;
         record_manifest_storage_stage(
             "root_checkpoint",
             root_checkpoint_started,
@@ -313,30 +252,8 @@ impl Database {
             inserted_file_count,
             completed_directories.len(),
         );
-        let observation_sequence_start = if observation_count_i64 > 0 {
-            Some(
-                last_sequence
-                    .checked_sub(root_sequence_increment)
-                    .and_then(|sequence| sequence.checked_add(1))
-                    .ok_or_else(|| {
-                        StorageError::Conflict("manifest observation sequence overflow".to_owned())
-                    })?,
-            )
-        } else {
-            None
-        };
-        let local_metadata_sequence_start = if reserved_local_batch_sequence_count > 0 {
-            Some(
-                last_sequence
-                    .checked_sub(reserved_local_batch_sequence_count)
-                    .and_then(|sequence| sequence.checked_add(1))
-                    .ok_or_else(|| {
-                        StorageError::Conflict("local metadata batch sequence overflow".to_owned())
-                    })?,
-            )
-        } else {
-            None
-        };
+        let observation_sequence_start = reservations.observation_sequence_start;
+        let local_metadata_sequence_start = reservations.local_metadata_sequence_start;
 
         let observation_batch_size = if matches!(workflow_version, 2 | 3) {
             super::manifest_path_query_chunk_size(self.backend())
@@ -344,101 +261,14 @@ impl Database {
             80
         };
         let observation_started = Instant::now();
-        let mut observation_offset = 0_i64;
-        for entry_chunk in observation_entries.chunks(observation_batch_size) {
-            if entry_chunk.is_empty() {
-                continue;
-            }
-            if let Some(sequence_start) = observation_sequence_start {
-                let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", entry_chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "WITH incoming (
-                         relative_path, observation_sequence, entry_kind, size,
-                         modified_at, device, inode, fingerprint
-                     ) AS (VALUES {values})
-                     INSERT INTO scan_manifest_entries (
-                         manifest_id, library_root_id, relative_path, observation_sequence,
-                         entry_kind, size, modified_at, device, inode, fingerprint, observed_at
-                     )
-                     SELECT ?, ?, relative_path, observation_sequence, entry_kind, size,
-                            modified_at, device, inode, fingerprint, unixepoch()
-                     FROM incoming"
-                );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
-                for entry in entry_chunk {
-                    let sequence =
-                        sequence_start
-                            .checked_add(observation_offset)
-                            .ok_or_else(|| {
-                                StorageError::Conflict(
-                                    "manifest observation sequence overflow".to_owned(),
-                                )
-                            })?;
-                    observation_offset = observation_offset.saturating_add(1);
-                    statement = statement
-                        .bind(entry.relative_path.as_str())
-                        .bind(sequence)
-                        .bind(entry.entry_kind.as_str())
-                        .bind(entry.size)
-                        .bind(entry.modified_at)
-                        .bind(entry.device)
-                        .bind(entry.inode)
-                        .bind(entry.fingerprint.as_slice());
-                }
-                statement = statement
-                    .bind(chunk.manifest_id)
-                    .bind(chunk.library_root_id);
-                statement
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            } else {
-                let selects = std::iter::repeat_n(
-                    "SELECT ?, ?, ?,
-                            (SELECT COALESCE(MAX(observation_sequence), 0) + 1
-                             FROM scan_manifest_entries
-                             WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ?),
-                            ?, ?, ?, ?, ?, ?, unixepoch()",
-                    entry_chunk.len(),
-                )
-                .collect::<Vec<_>>()
-                .join(" UNION ALL ");
-                let query = format!(
-                    "INSERT INTO scan_manifest_entries (
-                         manifest_id, library_root_id, relative_path, observation_sequence,
-                         entry_kind, size, modified_at, device, inode, fingerprint, observed_at
-                     ) {selects}"
-                );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
-                for entry in entry_chunk {
-                    statement = statement
-                        .bind(chunk.manifest_id)
-                        .bind(chunk.library_root_id)
-                        .bind(entry.relative_path.as_str())
-                        .bind(chunk.manifest_id)
-                        .bind(chunk.library_root_id)
-                        .bind(entry.relative_path.as_str())
-                        .bind(entry.entry_kind.as_str())
-                        .bind(entry.size)
-                        .bind(entry.modified_at)
-                        .bind(entry.device)
-                        .bind(entry.inode)
-                        .bind(entry.fingerprint.as_slice());
-                }
-                statement
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            }
-        }
+        self.insert_manifest_discovery_observations(
+            &mut transaction,
+            chunk,
+            &observation_entries,
+            observation_batch_size,
+            observation_sequence_start,
+        )
+        .await?;
         record_manifest_storage_stage(
             "manifest_observation_insert",
             observation_started,
