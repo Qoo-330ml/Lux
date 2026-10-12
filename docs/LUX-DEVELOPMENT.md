@@ -10418,15 +10418,31 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 根目录存储实现不再位于 `jobs.rs`。
-- [ ] 既有 `Database` 调用点和路由调用无需改名，根目录删除与扫描游标行为保持。
-- [ ] library deletion、storage 和 jobs 单测通过；fmt/build 与 `git diff --check` 通过。
+- [x] 根目录存储实现不再位于 `jobs.rs`。
+- [x] 既有 `Database` 调用点和路由调用无需改名，根目录删除与扫描游标行为保持。
+- [x] library deletion、storage 和 jobs 单测通过；fmt/build 与 `git diff --check` 通过。
 
 验证：确认 `/Volumes/Toshiba` 已挂载后使用共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::repository::jobs::tests`、`cargo test --locked --test storage --test library_deletion`、`cargo fmt --all -- --check`、`cargo build --locked` 及 `git diff --check`。
 
 预计文件：`src/storage/jobs.rs`、`src/storage/library_roots.rs`、`src/storage/repository.rs`、本文档。
 
 结果（2026-10-12）：library root 的 13 个 `Database` 方法移入 `storage/library_roots.rs`，原方法名、签名和 repository 内调用路径保持。核对了 API、application、storage 和 tests 的所有同名调用。基线与迁移后 jobs 单测均为 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项与 `library_deletion` 1 项均通过；fmt 和 `git diff --check` 通过。
+
+#### LUX-487：拆分字幕存储操作
+
+范围：将外部字幕定位、字幕流查询与字幕记录更新从 `jobs.rs` 移入 `storage/subtitles.rs`。保留现有 Emby/Lux DTO 映射和 SQL 语义，不改变播放或字幕路由合同。
+
+验收：
+
+- [x] 字幕存储方法不再位于 `jobs.rs`，`Database` 方法签名保持。
+- [x] Emby 与 Lux 字幕查询/更新调用点保持原方法名和响应映射。
+- [x] 字幕集成测试、fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test subtitles`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/subtitles.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：字幕定位、轨道分页与外部字幕更新移入 `storage/subtitles.rs`，`Database` 方法名和返回映射保持。核对了 Emby/Lux media handlers、管理员 handler 与 storage tests 的原调用点；`subtitles` 1 项回归通过，fmt 和 `git diff --check` 通过。
 
 ## 28. 参考资料
 
