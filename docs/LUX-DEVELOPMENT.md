@@ -10620,6 +10620,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：7 个 incremental path 入队、分页、处理、ID 查询与清理方法及 100 路径批次上限移入 `scan/incremental.rs`。application/watch/storage 调用仍使用原 `Database` 方法。增量队列 storage 单测 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-499：拆分 scan postprocessing target 存储
+
+范围：将 scan target 和 sidecar target 登记、metadata/thumbnail 阶段分页、完成/失败/重试状态移入 `jobs/scan/targets.rs`。为 Manifest apply 与 reconciliation 共用的事务 helper 保持 repository 子树可见；侧车目录裁剪与 SQL 构造随目标模块迁移并保持现有查询边界。
+
+验收：
+
+- [x] scan job target 持久化和 worker page 查询不再位于 `jobs.rs`。
+- [x] metadata/thumbnail 状态、removed target 优先级、sidecar 路径范围和事务调用保持。
+- [x] query-count、sidecar 与扫描后处理回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs --test scanned_metadata`、相关 repository target/query-count 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/targets.rs`、本文档。
+
+结果（2026-10-12）：21 个 scan target 写入、分页、metadata/thumbnail 状态及查询方法和 sidecar helper 移入 `scan/targets.rs`；Application/API 的 `Database` 调用保持。target/outbox、reconciliation 与 Manifest apply 共用的事务 helper 暂限 repository 子树可见，后续调用方迁移后再收窄。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；target 单查询与 sidecar 多目录查询各 1 项通过；`scanned_metadata` 串行 23 项、`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。两目标合并运行时 FIFO 海报用例超过 60 秒；单独运行 1 项和 `scanned_metadata -- --test-threads=1` 全部 23 项均通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
