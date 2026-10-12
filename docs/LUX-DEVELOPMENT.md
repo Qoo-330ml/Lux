@@ -10940,6 +10940,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：媒体索引/targets/restore 阶段移入 `reconciliation/batch.rs`；`commit_reconciliation_batch_in_transaction` 缩至 110 行，仍是唯一 transaction owner。mixed batch 与失败回滚重试回归各 1 passed；fmt 与 diff 检查通过。
 
+#### LUX-519：拆分 Manifest 创建与 retry 生命周期事务
+
+范围：将 full-scan Manifest root 初始化、legacy retry target 迁移和 DISCOVERING retry root reset 提取为事务内步骤。创建/重试 coordinator 继续独占 transaction begin/commit。
+
+验收：
+
+- [x] `create_full_scan_manifest_job` 与 `prepare_scan_manifest_retry` 方法名/签名及 validation/error 顺序保持。
+- [x] root registration、legacy target copy、lite/persisted retry SQL 与 transaction 顺序保持。
+- [x] 创建幂等与 DISCOVERING frontier resume 回归通过；事务协调函数不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/state.rs`、`src/storage/jobs/scan/manifest/state/transactions.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs full_scan_manifest_indexes_safe_positive_batches_during_discovery`、`cargo test --locked --test scanning_jobs shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：Manifest full-scan root registration/legacy target copy 与 DISCOVERING retry reset 移入 state transaction 子模块；外层方法保留 transaction owner。full scan/LITE 与 persisted frontier resume 回归各 1 passed；fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
