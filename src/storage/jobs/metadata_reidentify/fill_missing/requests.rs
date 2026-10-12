@@ -1,9 +1,11 @@
 use super::*;
 
+type FillMissingRequestSnapshot = (Option<Vec<u8>>, String);
+
 pub(super) struct FillMissingRequestState {
     active_by_item: HashMap<String, ActiveFillMissingItem>,
     deferred_by_snapshot: HashMap<(String, Option<Vec<u8>>, String), DeferredFillMissingRetryState>,
-    deferred_snapshots_by_item: HashMap<String, Vec<(Option<Vec<u8>>, String)>>,
+    deferred_snapshots_by_item: HashMap<String, Vec<FillMissingRequestSnapshot>>,
 }
 
 pub(super) struct FillMissingRequestPlan {
@@ -22,7 +24,7 @@ impl Database {
         let mut active_by_item = HashMap::with_capacity(requests.len());
         let mut deferred_by_snapshot = HashMap::with_capacity(requests.len());
         let mut deferred_snapshots_by_item =
-            HashMap::<String, Vec<(Option<Vec<u8>>, String)>>::new();
+            HashMap::<String, Vec<FillMissingRequestSnapshot>>::new();
         let lock_clause = if self.backend == DatabaseBackend::Postgres {
             " FOR UPDATE OF jobs, job_items"
         } else {
