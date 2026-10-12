@@ -10844,6 +10844,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：delta dispatch/CAS 阶段移入事务内 helper，状态结果与 paths/update payload 显式返回给 coordinator；同一 batch transaction 继续负责后续 delta state、targets 与 job progress。incremental CAS、450 项 bounded apply、cancel/resume 三项均 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 名称/签名不变。
 
+#### LUX-513：提取 Manifest apply finalization
+
+范围：将 delta state/error CASE 更新、metadata target/removal side effects、manifest/job progress checkpoint 移入 finalizer。transaction 仍由 `commit_scan_manifest_delta_batch` 创建并提交。
+
+验收：
+
+- [x] delta state/error CASE bind 顺序、affected-row guard、attempt count 与 batch 边界不变。
+- [x] NEW/CHANGED/sidecar/removal targets、removed media refresh 与 applied/processed counters 保持。
+- [x] cancel/resume 与 bounded apply 回归通过；只有入口持有 transaction 的 commit 权。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、`cargo test --locked --test scanning_jobs cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta persistence、target/removal side effects 与 progress checkpoint 移入 finalizer；CASE placeholders 和绑定顺序未改，取消检查仍在 job progress UPDATE，transaction commit 仍仅在入口。bounded apply 与 cancel/resume 均 1 passed；fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
