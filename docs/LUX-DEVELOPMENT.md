@@ -10652,6 +10652,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：15 个 reconciliation snapshot/discovery/批次提交/root page 方法移入 `scan/reconciliation.rs`。reconciliation 的 filesystem restore、media removal refresh 与 target 登记继续调用其原 transaction helper；外部 `Database` 方法名保持。reconciliation 原子性单测 1 项、`mixed_scanner` 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-501：拆分 Manifest 创建与状态存储
+
+范围：建立 `jobs/scan/manifest` 子树，将 Manifest 创建、读取、root 状态、diff-ready/apply/indexed 转换、结束与 retry fencing 移入 `manifest/state.rs`。原方法名、manifest workflow/state 值与 CAS 条件保持。
+
+验收：
+
+- [x] Manifest 创建/状态实现不再位于 `jobs.rs`。
+- [x] workflow 2/3、root 状态、cancel fencing、retry 与 status transition 条件保持。
+- [x] Manifest 创建原子性、恢复/重试扫描回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::scan_manifest_creation_is_atomic_and_idempotent`、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/state.rs`、本文档。
+
+结果（2026-10-12）：15 个 Manifest 创建、查询、root 状态、transition、finish 与 retry 方法，以及状态校验 helper 移入 `scan/manifest/state.rs`。原 Database 签名与 workflow 2/3、cancel/root fencing 保持。Manifest 原子创建单测 1 项和 `scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

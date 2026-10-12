@@ -1,0 +1,1143 @@
+use super::*;
+
+fn valid_scan_manifest_transition(expected: &str, next: &str) -> bool {
+    matches!(
+        (expected, next),
+        ("DISCOVERING", "READY_TO_DIFF" | "FAILED" | "CANCELLED")
+            | ("READY_TO_DIFF", "APPLYING" | "FAILED" | "CANCELLED")
+            | ("APPLYING", "INDEXED" | "FAILED" | "CANCELLED")
+            | ("INDEXED", "POSTPROCESSING" | "COMPLETED" | "FAILED")
+            | ("POSTPROCESSING", "COMPLETED" | "FAILED" | "CANCELLED")
+    )
+}
+
+fn validate_scan_manifest(manifest: &NewScanManifest<'_>) -> Result<i64, StorageError> {
+    let root_count = i64::try_from(manifest.roots.len())
+        .map_err(|_| StorageError::Conflict("manifest root count overflow".to_owned()))?;
+    let mut unique_roots = std::collections::HashSet::with_capacity(manifest.roots.len());
+    if manifest
+        .roots
+        .iter()
+        .any(|root| !unique_roots.insert(root.library_root_id))
+    {
+        return Err(StorageError::Conflict(
+            "manifest root list contains duplicates".to_owned(),
+        ));
+    }
+    Ok(root_count)
+}
+
+impl Database {
+    #[cfg(test)]
+    pub(crate) async fn create_scan_manifest(
+        &self,
+        manifest: &NewScanManifest<'_>,
+    ) -> Result<(), StorageError> {
+        let root_count = validate_scan_manifest(manifest)?;
+
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let existing: Option<(String, String)> = self
+            .query_as("SELECT id, library_id FROM scan_manifests WHERE job_id = ?")
+            .bind(manifest.job_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some((existing_id, existing_library_id)) = existing {
+            if existing_id != manifest.id || existing_library_id != manifest.library_id {
+                return Err(StorageError::Conflict(
+                    "scan job is already associated with a different manifest".to_owned(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        }
+
+        let created = self
+            .query(
+                "INSERT INTO scan_manifests (id, job_id, library_id, state, root_count)
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', ?
+                 FROM scan_jobs sj
+                 WHERE sj.id = ? AND sj.library_id = ?
+                   AND sj.job_type = 'RECONCILE_LIBRARY'
+                   AND sj.status IN ('PENDING', 'RUNNING')",
+            )
+            .bind(manifest.id)
+            .bind(root_count)
+            .bind(manifest.job_id)
+            .bind(manifest.library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if created.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest must reference an existing full-scan job in the same library".to_owned(),
+            ));
+        }
+
+        for root in manifest.roots {
+            let created_root = self
+                .query(
+                    "INSERT INTO scan_manifest_roots (
+                         manifest_id, library_root_id, state, directory_count
+                     )
+                     SELECT ?, lr.id, 'PENDING', 1
+                     FROM library_roots lr
+                     WHERE lr.id = ? AND lr.library_id = ?",
+                )
+                .bind(manifest.id)
+                .bind(root.library_root_id)
+                .bind(manifest.library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if created_root.rows_affected() != 1 {
+                return Err(StorageError::Conflict(format!(
+                    "library root {} does not belong to the manifest library",
+                    root.library_root_id
+                )));
+            }
+            self.query(
+                "INSERT INTO scan_manifest_directories (
+                     manifest_id, library_root_id, relative_path, state
+                 ) VALUES (?, ?, '', 'PENDING')",
+            )
+            .bind(manifest.id)
+            .bind(root.library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        self.query(
+            "UPDATE scan_manifests
+             SET discovered_directory_count = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(root_count)
+        .bind(manifest.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn create_full_scan_manifest_job(
+        &self,
+        id: &str,
+        generation: &str,
+        auto_metadata_match: bool,
+        manifest: &NewScanManifest<'_>,
+        legacy_retry_job_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if manifest.job_id != id {
+            return Err(StorageError::Conflict(
+                "manifest job id does not match the scan job".to_owned(),
+            ));
+        }
+        let root_count = validate_scan_manifest(manifest)?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "INSERT INTO scan_jobs (
+                id, library_id, job_type, status, generation, total_count,
+                discovery_completed, auto_metadata_match
+             ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', ?, 0, 0, ?)",
+        )
+        .bind(id)
+        .bind(manifest.library_id)
+        .bind(generation)
+        .bind(database_flag(auto_metadata_match))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let created_manifest = self
+            .query(
+                "INSERT INTO scan_manifests (
+                     id, job_id, library_id, state, workflow_version,
+                     discovery_format_version, discovery_mode, root_count,
+                     postprocessing_targets_ready
+                 )
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 3, 3, 'LITE', ?, 0
+                 FROM scan_jobs sj
+                 WHERE sj.id = ? AND sj.library_id = ?
+                   AND sj.job_type = 'RECONCILE_LIBRARY' AND sj.status = 'PENDING'",
+            )
+            .bind(manifest.id)
+            .bind(root_count)
+            .bind(id)
+            .bind(manifest.library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if created_manifest.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest must reference its new full-scan job".to_owned(),
+            ));
+        }
+        for root in manifest.roots {
+            let created_root = self
+                .query(
+                    "INSERT INTO scan_manifest_roots (
+                         manifest_id, library_root_id, state, directory_count,
+                         postprocessing_target_stage
+                     )
+                     SELECT ?, lr.id, 'PENDING', 1, 'NEW'
+                     FROM library_roots lr
+                     WHERE lr.id = ? AND lr.library_id = ?",
+                )
+                .bind(manifest.id)
+                .bind(root.library_root_id)
+                .bind(manifest.library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if created_root.rows_affected() != 1 {
+                return Err(StorageError::Conflict(format!(
+                    "library root {} does not belong to the manifest library",
+                    root.library_root_id
+                )));
+            }
+            self.query(
+                "INSERT INTO scan_manifest_directories (
+                     manifest_id, library_root_id, relative_path, state
+                 ) VALUES (?, ?, '', 'PENDING')",
+            )
+            .bind(manifest.id)
+            .bind(root.library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.query(
+            "UPDATE scan_manifests
+             SET discovered_directory_count = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(root_count)
+        .bind(manifest.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if let Some(legacy_job_id) = legacy_retry_job_id {
+            self.query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, target_type, target_id, source_id, item_id, change_kind,
+                        CASE WHEN probe_state IN ('PENDING', 'FAILED')
+                             THEN 'PENDING' ELSE probe_state END,
+                        CASE WHEN metadata_state IN ('PENDING', 'FAILED')
+                             THEN 'PENDING' ELSE metadata_state END,
+                        CASE WHEN thumbnail_state IN ('PENDING', 'FAILED')
+                             THEN 'PENDING' ELSE thumbnail_state END
+                 FROM scan_job_targets
+                 WHERE job_id = ?
+                   AND (probe_state IN ('PENDING', 'FAILED')
+                        OR metadata_state IN ('PENDING', 'FAILED')
+                        OR thumbnail_state IN ('PENDING', 'FAILED'))
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(id)
+            .bind(legacy_job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'SOURCE', source.id, source.id, source.item_id, 'CHANGED',
+                        'PENDING', 'SKIPPED', 'SKIPPED'
+                 FROM reconciliation_scan_entries legacy
+                 JOIN filesystem_entries entry
+                   ON entry.library_root_id = legacy.library_root_id
+                  AND entry.relative_path = legacy.relative_path
+                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
+                 WHERE legacy.job_id = ? AND legacy.entry_type = 'FILE'
+                   AND legacy.status = 'PENDING' AND entry.is_missing = 0
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(id)
+            .bind(legacy_job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'ITEM', source.item_id, source.item_id, 'CHANGED',
+                        'SKIPPED', 'PENDING', 'PENDING'
+                 FROM reconciliation_scan_entries legacy
+                 JOIN filesystem_entries entry
+                   ON entry.library_root_id = legacy.library_root_id
+                  AND entry.relative_path = legacy.relative_path
+                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
+                 WHERE legacy.job_id = ? AND legacy.entry_type = 'FILE'
+                   AND legacy.status = 'PENDING' AND entry.is_missing = 0
+                 GROUP BY source.item_id
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(id)
+            .bind(legacy_job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query("DELETE FROM scan_job_targets WHERE job_id = ?")
+                .bind(legacy_job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query("DELETE FROM reconciliation_scan_entries WHERE job_id = ?")
+                .bind(legacy_job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    #[allow(dead_code)] // LUX-266 uses this to resume and report manifest progress.
+    pub(crate) async fn get_scan_manifest(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredScanManifest>, StorageError> {
+        self.query(
+            "SELECT id, job_id, library_id, state, workflow_version, discovery_format_version,
+                    discovery_mode,
+                    root_count,
+                    discovered_directory_count, completed_directory_count,
+                    observed_file_count, unchanged_count, add_count, change_count, remove_count,
+                    reappeared_count, applied_delta_count, postprocessing_targets_ready
+             FROM scan_manifests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredScanManifest {
+                id: row.get("id"),
+                job_id: row.get("job_id"),
+                library_id: row.get("library_id"),
+                state: row.get("state"),
+                workflow_version: row.get("workflow_version"),
+                discovery_format_version: row.get("discovery_format_version"),
+                discovery_mode: row.get("discovery_mode"),
+                root_count: row.get("root_count"),
+                discovered_directory_count: row.get("discovered_directory_count"),
+                completed_directory_count: row.get("completed_directory_count"),
+                observed_file_count: row.get("observed_file_count"),
+                unchanged_count: row.get("unchanged_count"),
+                add_count: row.get("add_count"),
+                change_count: row.get("change_count"),
+                remove_count: row.get("remove_count"),
+                reappeared_count: row.get("reappeared_count"),
+                applied_delta_count: row.get("applied_delta_count"),
+                postprocessing_targets_ready: row.get::<i64, _>("postprocessing_targets_ready")
+                    != 0,
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn get_scan_manifest_by_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredScanManifest>, StorageError> {
+        self.query(
+            "SELECT id, job_id, library_id, state, workflow_version, discovery_format_version,
+                    discovery_mode,
+                    root_count,
+                    discovered_directory_count, completed_directory_count,
+                    observed_file_count, unchanged_count, add_count, change_count, remove_count,
+                    reappeared_count, applied_delta_count, postprocessing_targets_ready
+             FROM scan_manifests WHERE job_id = ?",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredScanManifest {
+                id: row.get("id"),
+                job_id: row.get("job_id"),
+                library_id: row.get("library_id"),
+                state: row.get("state"),
+                workflow_version: row.get("workflow_version"),
+                discovery_format_version: row.get("discovery_format_version"),
+                discovery_mode: row.get("discovery_mode"),
+                root_count: row.get("root_count"),
+                discovered_directory_count: row.get("discovered_directory_count"),
+                completed_directory_count: row.get("completed_directory_count"),
+                observed_file_count: row.get("observed_file_count"),
+                unchanged_count: row.get("unchanged_count"),
+                add_count: row.get("add_count"),
+                change_count: row.get("change_count"),
+                remove_count: row.get("remove_count"),
+                reappeared_count: row.get("reappeared_count"),
+                applied_delta_count: row.get("applied_delta_count"),
+                postprocessing_targets_ready: row.get::<i64, _>("postprocessing_targets_ready")
+                    != 0,
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn get_scan_manifest_postprocessing_state_by_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredScanManifestPostprocessingState>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT manifest.id AS manifest_id,
+                        manifest.workflow_version,
+                        manifest.discovery_format_version,
+                        root.library_root_id,
+                        library_root.canonical_path,
+                        root.postprocessing_target_stage,
+                        root.postprocessing_target_cursor,
+                        observed.device,
+                        observed.inode,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM filesystem_entries entry
+                            WHERE entry.library_root_id = root.library_root_id
+                              AND entry.last_seen_generation = job.generation
+                              AND entry.entry_kind = 'FILE'
+                              AND entry.last_seen_change_kind = root.postprocessing_target_stage
+                              AND entry.relative_path > COALESCE(root.postprocessing_target_cursor, '')
+                        ) THEN 1 ELSE 0 END AS has_stage_rows,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM filesystem_entries entry
+                            WHERE entry.library_root_id = root.library_root_id
+                              AND entry.last_seen_generation = job.generation
+                              AND entry.entry_kind = 'FILE'
+                              AND entry.last_seen_change_kind IN ('NEW', 'CHANGED', 'SIDECAR')
+                        ) THEN 1 ELSE 0 END AS has_positive_rows
+                 FROM scan_manifests manifest
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 LEFT JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
+                 LEFT JOIN library_roots library_root ON library_root.id = root.library_root_id
+                 LEFT JOIN scan_manifest_entries observed
+                   ON observed.manifest_id = root.manifest_id
+                  AND observed.library_root_id = root.library_root_id
+                  AND observed.relative_path = ''
+                  AND observed.observation_sequence = (
+                      SELECT MAX(latest.observation_sequence)
+                      FROM scan_manifest_entries latest
+                      WHERE latest.manifest_id = root.manifest_id
+                        AND latest.library_root_id = root.library_root_id
+                        AND latest.relative_path = ''
+                  )
+                 WHERE manifest.job_id = ?
+                 ORDER BY root.library_root_id",
+            )
+            .bind(job_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let mut state: Option<StoredScanManifestPostprocessingState> = None;
+        for row in rows {
+            let Some(manifest_id) = row.get::<Option<String>, _>("manifest_id") else {
+                continue;
+            };
+            let current_state =
+                state.get_or_insert_with(|| StoredScanManifestPostprocessingState {
+                    manifest_id,
+                    workflow_version: row.get("workflow_version"),
+                    discovery_format_version: row.get("discovery_format_version"),
+                    roots: Vec::new(),
+                });
+            let Some(library_root_id) = row.get::<Option<String>, _>("library_root_id") else {
+                continue;
+            };
+            current_state
+                .roots
+                .push(StoredScanManifestPostprocessingRoot {
+                    library_root_id,
+                    canonical_path: row.get("canonical_path"),
+                    expected_device: row.get("device"),
+                    expected_inode: row.get("inode"),
+                    target_stage: row.get("postprocessing_target_stage"),
+                    target_cursor: row.get("postprocessing_target_cursor"),
+                    has_stage_rows: row.get::<i64, _>("has_stage_rows") != 0,
+                    has_positive_rows: row.get::<i64, _>("has_positive_rows") != 0,
+                });
+        }
+        Ok(state)
+    }
+
+    pub(crate) async fn list_scan_manifest_postprocessing_roots(
+        &self,
+        manifest_id: &str,
+    ) -> Result<Vec<StoredScanManifestPostprocessingRoot>, StorageError> {
+        self.query(
+            "SELECT root.library_root_id, library_root.canonical_path,
+                    root.postprocessing_target_stage, root.postprocessing_target_cursor,
+                    observed.device, observed.inode,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM filesystem_entries entry
+                        WHERE entry.library_root_id = root.library_root_id
+                          AND entry.last_seen_generation = job.generation
+                          AND entry.entry_kind = 'FILE'
+                          AND entry.last_seen_change_kind = root.postprocessing_target_stage
+                          AND entry.relative_path > COALESCE(root.postprocessing_target_cursor, '')
+                    ) THEN 1 ELSE 0 END AS has_stage_rows,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM filesystem_entries entry
+                        JOIN scan_jobs job ON job.id = manifest.job_id
+                        WHERE entry.library_root_id = root.library_root_id
+                          AND entry.last_seen_generation = job.generation
+                          AND entry.entry_kind = 'FILE'
+                          AND entry.last_seen_change_kind IN ('NEW', 'CHANGED', 'SIDECAR')
+                    ) THEN 1 ELSE 0 END AS has_positive_rows
+             FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             JOIN scan_jobs job ON job.id = manifest.job_id
+             JOIN library_roots library_root ON library_root.id = root.library_root_id
+             LEFT JOIN scan_manifest_entries observed
+               ON observed.manifest_id = root.manifest_id
+              AND observed.library_root_id = root.library_root_id
+              AND observed.relative_path = ''
+              AND observed.observation_sequence = (
+                  SELECT MAX(latest.observation_sequence)
+                  FROM scan_manifest_entries latest
+                  WHERE latest.manifest_id = root.manifest_id
+                    AND latest.library_root_id = root.library_root_id
+                    AND latest.relative_path = ''
+              )
+             WHERE root.manifest_id = ?
+             ORDER BY root.library_root_id",
+        )
+        .bind(manifest_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredScanManifestPostprocessingRoot {
+                    library_root_id: row.get("library_root_id"),
+                    canonical_path: row.get("canonical_path"),
+                    target_stage: row.get("postprocessing_target_stage"),
+                    target_cursor: row.get("postprocessing_target_cursor"),
+                    expected_device: row.get("device"),
+                    expected_inode: row.get("inode"),
+                    has_stage_rows: row.get::<i64, _>("has_stage_rows") != 0,
+                    has_positive_rows: row.get::<i64, _>("has_positive_rows") != 0,
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_scan_manifest_root_unavailable(
+        &self,
+        manifest_id: &str,
+        library_root_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET state = 'UNAVAILABLE', error = 'filesystem root could not be read',
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE manifest_id = ? AND library_root_id = ?
+               AND state IN ('PENDING', 'SCANNING', 'COMPLETE', 'INCOMPLETE')",
+        )
+        .bind(manifest_id)
+        .bind(library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE library_roots
+             SET is_available = 0, last_checked_at = unixepoch(),
+                 unavailable_since = COALESCE(unavailable_since, unixepoch())
+             WHERE id = ?",
+        )
+        .bind(library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifest_directories
+             SET state = 'FAILED', error = 'filesystem root could not be read',
+                 updated_at = unixepoch()
+             WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'",
+        )
+        .bind(manifest_id)
+        .bind(library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn get_scan_manifest_root_identity(
+        &self,
+        manifest_id: &str,
+        library_root_id: &str,
+    ) -> Result<Option<(String, Option<i64>, Option<i64>)>, StorageError> {
+        self.query_as(
+            "SELECT root.state, observed.device, observed.inode
+             FROM scan_manifest_roots root
+             LEFT JOIN scan_manifest_entries observed
+               ON observed.manifest_id = root.manifest_id
+              AND observed.library_root_id = root.library_root_id
+              AND observed.relative_path = ''
+              AND observed.observation_sequence = (
+                  SELECT MAX(latest.observation_sequence)
+                  FROM scan_manifest_entries latest
+                  WHERE latest.manifest_id = root.manifest_id
+                    AND latest.library_root_id = root.library_root_id
+                    AND latest.relative_path = ''
+              )
+             WHERE root.manifest_id = ? AND root.library_root_id = ?",
+        )
+        .bind(manifest_id)
+        .bind(library_root_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_manifest_root_discovery_baselines(
+        &self,
+        manifest_id: &str,
+    ) -> Result<Vec<(String, String, bool)>, StorageError> {
+        self.query_as(
+            "SELECT root.library_root_id, root.state,
+                    CAST(CASE
+                    WHEN root.state IN ('COMPLETE', 'UNAVAILABLE') THEN 0
+                    WHEN EXISTS (
+                        SELECT 1 FROM filesystem_entries entry
+                        WHERE entry.library_root_id = root.library_root_id
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS has_filesystem_entries
+             FROM scan_manifest_roots root
+             WHERE root.manifest_id = ?
+             ORDER BY root.library_root_id",
+        )
+        .bind(manifest_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows: Vec<(String, String, i64)>| {
+            rows.into_iter()
+                .map(|(root_id, state, has_filesystem_entries)| {
+                    (root_id, state, has_filesystem_entries != 0)
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_lite_scan_manifest_roots(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET state = 'COMPLETE', finished_at = COALESCE(finished_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE manifest_id = ? AND state = 'SCANNING'",
+        )
+        .bind(manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifest_directories
+             SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
+             WHERE manifest_id = ? AND relative_path = '' AND state <> 'COMPLETE'",
+        )
+        .bind(manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn finish_scan_manifest_discovery(
+        &self,
+        manifest_id: &str,
+        job_id: &str,
+    ) -> Result<i64, StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let pending_directories: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_manifest_directories
+                 WHERE manifest_id = ? AND state = 'PENDING'",
+            )
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let pending_roots: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_manifest_roots
+                 WHERE manifest_id = ? AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+            )
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if pending_directories != 0 || pending_roots != 0 {
+            return Err(StorageError::Conflict(
+                "manifest discovery cannot complete while frontier or roots remain unresolved"
+                    .to_owned(),
+            ));
+        }
+        let discovered_file_count: i64 = self
+            .query_scalar("SELECT observed_file_count FROM scan_manifests WHERE id = ?")
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let processed_count: i64 = self
+            .query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let total_count = discovered_file_count.max(processed_count);
+        let job_update = self
+            .query(
+                "UPDATE scan_jobs
+             SET discovery_completed = 1, total_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
+            )
+            .bind(total_count)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if job_update.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "scan job is no longer accepting manifest discovery completion".to_owned(),
+            ));
+        }
+        let manifest_update = self
+            .query(
+                "UPDATE scan_manifests
+             SET state = 'READY_TO_DIFF', updated_at = unixepoch()
+             WHERE id = ? AND state = 'DISCOVERING'",
+            )
+            .bind(manifest_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if manifest_update.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest is no longer accepting discovery completion".to_owned(),
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(total_count)
+    }
+
+    pub(crate) async fn finish_scan_manifest(
+        &self,
+        job_id: &str,
+        next_state: &str,
+    ) -> Result<(), StorageError> {
+        if !matches!(next_state, "FAILED" | "CANCELLED") {
+            return Err(StorageError::Conflict(
+                "invalid manifest terminal state".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE scan_manifests
+             SET resume_state = state, state = ?, updated_at = unixepoch()
+             WHERE job_id = ? AND state IN (
+                 'DISCOVERING', 'READY_TO_DIFF', 'APPLYING', 'INDEXED', 'POSTPROCESSING'
+             )",
+        )
+        .bind(next_state)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET state = 'INCOMPLETE', error = 'scan did not complete this root',
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+               AND state IN ('PENDING', 'SCANNING')",
+        )
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    #[allow(dead_code)] // Lifecycle owners use this compare-and-swap in LUX-266 onward.
+    pub(crate) async fn transition_scan_manifest_state(
+        &self,
+        id: &str,
+        expected_state: &str,
+        next_state: &str,
+    ) -> Result<bool, StorageError> {
+        if expected_state == next_state {
+            return Ok(false);
+        }
+        if !valid_scan_manifest_transition(expected_state, next_state) {
+            return Err(StorageError::Conflict(
+                "invalid scan manifest state transition".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE scan_manifests
+                 SET state = ?, updated_at = unixepoch(),
+                     indexed_at = CASE WHEN ? = 'INDEXED'
+                         THEN COALESCE(indexed_at, unixepoch()) ELSE indexed_at END,
+                     completed_at = CASE WHEN ? = 'COMPLETED'
+                         THEN COALESCE(completed_at, unixepoch()) ELSE completed_at END
+                 WHERE id = ? AND state = ?",
+            )
+            .bind(next_state)
+            .bind(next_state)
+            .bind(next_state)
+            .bind(id)
+            .bind(expected_state)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn prepare_scan_manifest_retry(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let manifest: Option<(String, Option<String>, i64, i64, String)> = self
+            .query_as(
+                "SELECT state, resume_state, workflow_version,
+                        discovery_format_version, discovery_mode
+                 FROM scan_manifests WHERE job_id = ?",
+            )
+            .bind(job_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((state, resume_state, workflow_version, discovery_format_version, discovery_mode)) =
+            manifest
+        else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(None);
+        };
+
+        let stage = match state.as_str() {
+            "DISCOVERING" | "READY_TO_DIFF" | "APPLYING" | "INDEXED" | "POSTPROCESSING" => {
+                state.clone()
+            }
+            "FAILED" | "CANCELLED" => match resume_state.as_deref() {
+                Some(
+                    stage @ ("DISCOVERING" | "READY_TO_DIFF" | "APPLYING" | "INDEXED"
+                    | "POSTPROCESSING"),
+                ) => {
+                    let restored = self
+                        .query(
+                            "UPDATE scan_manifests
+                             SET state = ?, resume_state = NULL, error = NULL,
+                                 updated_at = unixepoch()
+                             WHERE job_id = ? AND state = ? AND resume_state = ?",
+                        )
+                        .bind(stage)
+                        .bind(job_id)
+                        .bind(&state)
+                        .bind(stage)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    if restored.rows_affected() != 1 {
+                        return Err(StorageError::Conflict(
+                            "scan manifest checkpoint changed while preparing retry".to_owned(),
+                        ));
+                    }
+                    stage.to_owned()
+                }
+                _ => "RESET_REQUIRED".to_owned(),
+            },
+            "COMPLETED" => "COMPLETED".to_owned(),
+            _ => {
+                return Err(StorageError::Conflict(
+                    "scan manifest has an unsupported retry state".to_owned(),
+                ));
+            }
+        };
+
+        if stage == "DISCOVERING" {
+            if is_lite_manifest_discovery(
+                workflow_version,
+                discovery_format_version,
+                &discovery_mode,
+            ) {
+                self.query(
+                    "UPDATE scan_manifest_directories
+                     SET state = 'PENDING', error = NULL, updated_at = unixepoch()
+                     WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                       AND relative_path = ''",
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.query(
+                    "UPDATE scan_manifest_roots
+                     SET state = 'PENDING', error = NULL, finished_at = NULL,
+                         updated_at = unixepoch()
+                     WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                       AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            } else {
+                self.query(
+                    "UPDATE scan_manifest_directories
+                 SET state = 'PENDING', error = NULL, updated_at = unixepoch()
+                 WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                   AND state IN ('SCANNING', 'FAILED')",
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.query(
+                    "UPDATE scan_manifest_roots
+                 SET state = CASE WHEN EXISTS (
+                         SELECT 1 FROM scan_manifest_directories directory
+                         WHERE directory.manifest_id = scan_manifest_roots.manifest_id
+                           AND directory.library_root_id = scan_manifest_roots.library_root_id
+                           AND directory.state = 'PENDING'
+                     ) THEN 'SCANNING' ELSE 'COMPLETE' END,
+                     error = NULL, finished_at = NULL, updated_at = unixepoch()
+                 WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                   AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(stage))
+    }
+
+    pub(crate) async fn has_unready_manifest_target_materialization_for_library(
+        &self,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1
+                 FROM scan_jobs job
+                 JOIN scan_manifests manifest ON manifest.job_id = job.id
+                 WHERE job.library_id = ? AND job.job_type = 'RECONCILE_LIBRARY'
+                   AND job.status = 'COMPLETED' AND job.scan_phase = 'POSTPROCESSING'
+                   AND manifest.workflow_version IN (2, 3)
+                   AND manifest.discovery_format_version = 3
+                   AND manifest.postprocessing_targets_ready = 0
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}

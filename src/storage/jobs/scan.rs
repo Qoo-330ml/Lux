@@ -10,6 +10,8 @@ mod incremental;
 
 #[path = "scan/lifecycle.rs"]
 mod lifecycle;
+#[path = "scan/manifest.rs"]
+mod manifest;
 
 pub(super) use targets::prune_sidecar_directories;
 #[cfg(test)]
