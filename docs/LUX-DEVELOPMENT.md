@@ -10796,6 +10796,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：presence CAS/ledger 与 counters/cancel fence 分别迁入独立子模块；SQL、bind 顺序、backend 分支、failure rollback 和 stage diagnostics 统计保持。大目录两次扫描的 generation presence 回归 1 passed，取消回归 1 passed；fmt 与 `git diff --check` 通过。
 
+#### LUX-510：收敛 Manifest discovery coordinator
+
+范围：把 `commit_scan_manifest_discovery_chunks` 整理为短事务编排函数，已提取的阶段通过私有子步骤串接。保留同一 transaction 的创建/提交边界与现有 `Database` 调用面。
+
+验收：
+
+- [x] 事务协调函数不超过 150 行；transaction 仍只在 coordinator 开启和提交。
+- [x] repository、application、API/main route 引用的 storage 方法名与签名不变。
+- [x] 端到端 bounded scan、阶段 diagnostics 和 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/indexing.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt、`git diff --check`，并搜索所有 `commit_scan_manifest_discovery_chunk(s)` repository/application 调用点。
+
+结果（2026-10-12）：`commit_manifest_discovery_transaction` 为 149 行，transaction 仍由 `commit_scan_manifest_discovery_chunks` 单点创建和提交；路径查询、index/outbox 与 observation 子步骤独立。bounded full scan 回归 1 passed；格式和 diff 检查通过。搜索确认 application/scanner 与 storage tests 仍引用相同 `commit_scan_manifest_discovery_chunk(s)` 方法。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
