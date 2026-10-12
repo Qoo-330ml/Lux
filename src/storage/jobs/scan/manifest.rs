@@ -1,4 +1,7 @@
 use super::*;
+#[path = "manifest/apply.rs"]
+mod apply;
+
 #[path = "manifest/diff.rs"]
 mod diff;
 

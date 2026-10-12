@@ -10716,6 +10716,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：10 个 Manifest directory/root baseline/removal candidate/diff/insert delta 方法与 diff batch limit 移入 `scan/manifest/diff.rs`。unchanged 与 ADD/CHANGE/REAPPEARED/REMOVE 判定、root completeness、movie variant identity 和原查询顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-505：拆分 Manifest delta apply
+
+范围：将 pending delta 分页/删除计数与 delta batch apply 移入 `scan/manifest/apply.rs`，apply page limit 随方法归属迁移。job/manifest/root 检查、filesystem/media mutation、target 更新和进度仍在一个原 transaction 中。
+
+验收：
+
+- [x] Manifest apply 实现及分页上限不再位于 `jobs.rs`。
+- [x] active job/cancel fencing、delta CAS、索引和 removal 原子提交、进度计数与返回结果保持。
+- [x] delta rollback、并发增量冲突与批次上限回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/apply.rs`、本文档。
+
+结果（2026-10-12）：Manifest pending delta 读取、applied removal 计数和单批 delta apply 移入 `scan/manifest/apply.rs`；apply page limit 随模块迁移。active job/cancel fencing、delta CAS、filesystem/media mutations、target writes 与 progress checkpoint 仍在原 transaction。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
