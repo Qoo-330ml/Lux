@@ -4,6 +4,7 @@ use super::{
     counters::ManifestDiscoveryCountersInput,
     indexing::ManifestDiscoveryIndexingInput,
     input::ManifestDiscoveryInput,
+    presence::ManifestPresenceLedgerInput,
     state::ManifestDiscoveryStateSnapshot,
 };
 
@@ -207,12 +208,14 @@ impl Database {
         let presence_ledger_path_count = self
             .update_manifest_presence_ledger(
                 transaction,
-                chunk,
-                discovery_format_version,
-                &generation,
-                &seen_filesystem_entries,
-                &file_counts.file_paths,
-                &mut positive_result.indexed_paths,
+                ManifestPresenceLedgerInput {
+                    chunk,
+                    discovery_format_version,
+                    generation: &generation,
+                    seen_filesystem_entries: &seen_filesystem_entries,
+                    file_paths: &file_counts.file_paths,
+                    indexed_paths: &mut positive_result.indexed_paths,
+                },
             )
             .await?;
         record_manifest_storage_stage(

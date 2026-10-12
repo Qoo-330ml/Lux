@@ -1,16 +1,34 @@
 use super::*;
 
+pub(super) struct ManifestPresenceLedgerInput<'input, 'data>
+where
+    'data: 'input,
+{
+    pub(super) chunk: &'input NewScanManifestDiscoveryChunk<'data>,
+    pub(super) discovery_format_version: i64,
+    pub(super) generation: &'input str,
+    pub(super) seen_filesystem_entries: &'input [&'data NewScanManifestSeenFilesystemEntry],
+    pub(super) file_paths: &'input [&'data str],
+    pub(super) indexed_paths: &'input mut Vec<&'data str>,
+}
+
 impl Database {
-    pub(super) async fn update_manifest_presence_ledger<'a>(
+    pub(super) async fn update_manifest_presence_ledger<'input, 'data>(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
-        chunk: &NewScanManifestDiscoveryChunk<'_>,
-        discovery_format_version: i64,
-        generation: &str,
-        seen_filesystem_entries: &[&NewScanManifestSeenFilesystemEntry],
-        file_paths: &[&'a str],
-        indexed_paths: &mut Vec<&'a str>,
-    ) -> Result<usize, StorageError> {
+        input: ManifestPresenceLedgerInput<'input, 'data>,
+    ) -> Result<usize, StorageError>
+    where
+        'data: 'input,
+    {
+        let ManifestPresenceLedgerInput {
+            chunk,
+            discovery_format_version,
+            generation,
+            seen_filesystem_entries,
+            file_paths,
+            indexed_paths,
+        } = input;
         let mut ledger_paths = Vec::new();
         let mut successfully_seen_paths = std::collections::HashSet::new();
         if discovery_format_version == 3 && !seen_filesystem_entries.is_empty() {
