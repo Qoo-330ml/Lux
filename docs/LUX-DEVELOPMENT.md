@@ -10253,6 +10253,760 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`、本文档。
 
+### 阶段 24：扫描应用服务模块化与流程简化
+
+本阶段只整理 `application::scanner` 内部实现，不改变 HTTP/Emby 合同、数据库 schema/SQL 事务、扫描状态与错误码、批次大小、并发上限、工作流版本或运行时副作用顺序。`scanner` 根模块保留稳定的公开路径与薄 facade；子模块按文件处理、任务生命周期、Manifest、reconciliation、增量扫描、本地 metadata worker 和后处理划分。文件系统 descriptor/stat/STRM 安全访问继续由现有 `scanner/manifest.rs` 承担。
+
+各任务最多预计修改 5 个文件，逐项独立验证和提交。实现中按增量移动代码，不引入通用 pipeline/dispatcher 抽象，不合并事务、不新增数据库状态读取；只有现有回归不能表达关键行为时才补充行为测试。扫描服务公开类型和 `crate::application::scanner::*` 调用路径由 facade re-export 保持。
+
+#### LUX-477：拆分 LibraryScanner 文件处理实现
+
+范围：把 `LibraryScanner` 的扫描/文件准备实现与文件名解析、混合库分类职责移入有界子模块。公开的 `LibraryScanner`、解析器和指纹 API 继续从 `application::scanner` 导出；内部跨模块方法使用最小可见性。纯移动，不改变扫描、归并、路径校验、探测或写入行为。
+
+验收：
+
+- [x] `scanner.rs` 不再承载完整的 `LibraryScanner` 实现和文件名/混合库分类实现。
+- [x] `LibraryScanner`、`ParsedMovieFilename`、`ParsedEpisodeFilename`、`parse_movie_filename`、`parse_episode_filename` 和 `compute_file_fingerprint` 保持现有公开路径与签名。
+- [x] 电影、剧集、混合库、文件移动、版本归并和 STRM 路径行为由既有测试覆盖且通过。
+
+验证：`cargo test --locked --test scanner --test series_scanner --test mixed_scanner`、`cargo test --locked --lib scanner::tests`、fmt 检查和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/names.rs`、本文档。
+
+结果（2026-10-12）：`LibraryScanner` 扫描实现、文件准备、文件名解析与混合库分类移入 `scanner/library.rs`、`scanner/library/prepare.rs` 和 `scanner/names.rs`；文件遍历和受限 STRM 读取留在 library 模块。根模块通过 re-export 保持现有公开路径。scanner 根从约 15,151 行减至 11,701 行，拆出的文件处理模块分别约 2,070、900 和 511 行。scanner library tests 41 passed、1 ignored；`scanner`、`series_scanner`、`mixed_scanner` 集成目标 30 项通过；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。该任务只移动实现并调整子树内可见性，不声称运行时性能变化。
+
+#### LUX-478：隔离扫描任务 facade 与单元测试
+
+范围：将 `ScanJobService` 共享状态、生命周期 guard 和稳定公开任务类型归入 `scanner/jobs`，把 scanner 内联单测移至 `scanner/tests.rs`。根模块只 re-export 公开合同并组合子模块，不复制锁、Notify、取消标记或状态注册表。
+
+验收：
+
+- [x] `ScanJobService`、`ScanJob`、`ScanJobError`、`ScanBatchReport`、`IncrementalScanChange` 与 `LocalMetadataRefreshAccepted` 的现有导出路径不变。
+- [x] 活动任务 guard、删除 fencing、取消标志和 worker 通知仍共享同一组 `Arc` 状态。
+- [x] 所有既有 scanner 单测仍在 `application::scanner::tests` 名称空间下运行。
+
+验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test shutdown_jobs --test scanning_jobs`、fmt 检查和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/tests.rs`、本文档。
+
+结果（2026-10-12）：`ScanJobService` 状态、运行/删除 guard、worker handle 与公开任务 DTO/error 移至 `scanner/jobs/mod.rs`，scanner 单测移至 `scanner/tests.rs`，根模块 re-export 保持类型路径及 `scanner::tests` 测试路径。取消与删除协调仍共享原 `Arc` 注册表、通知和标志。scanner library tests 41 passed、1 ignored；`scanning_jobs` 81/81、`shutdown_jobs` 1/1 通过；fmt 与 `git diff --check` 通过。剩余 runner 和各扫描阶段仍在 `scanner.rs`，后续任务继续拆分。
+
+#### LUX-479：拆分 Manifest 扫描阶段
+
+范围：分别移动 Manifest 目录发现与文件系统观察、差异计算/批次应用实现。保留 workflow 2/3、lite discovery、持久化 frontier、根身份确认、批次事务、取消与重试路径；文件描述符和受限 STRM 读取仍由既有 `scanner/manifest.rs` 实现。
+
+验收：
+
+- [x] runner 只根据已持久化阶段选择 discovery、diff、apply 或 indexed completion，不内嵌目录处理算法。
+- [x] 根被替换/卸载、目录观察改变、并发增量索引、批次提交失败、取消/恢复与 workflow 2 兼容语义保持。
+- [x] 所有 Manifest 定向回归及 scanner 单测通过。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test scanned_metadata`、scanner library tests、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/manifest_discovery.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+结果（2026-10-12）：Manifest 目录发现、受观察保护的批次提交与 lite discovery 移入 `jobs/manifest_discovery.rs`；差异计算、批次应用、postprocessing target materialization 和 indexed completion 移入 `jobs/manifest_index.rs`。runner 仍按持久化 Manifest 状态选择阶段，workflow 兼容判断、批次大小和调用顺序保持原样；底层 descriptor/stat/STRM 安全访问仍在 `scanner/manifest.rs`。定向集成测试 `scanned_metadata` 23 项、`scanner` 18 项、`scanning_jobs` 81 项通过；scanner library tests 41 项通过、1 项按要求忽略；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 8,756 行减至 6,353 行，两个 Manifest 阶段模块分别 1,436 行和 973 行。仅验证本地行为，无运行时性能结论。
+
+#### LUX-480：拆分 reconciliation 与增量扫描
+
+范围：将旧持久化 reconciliation 与实时/定向增量扫描编排分别移入所属任务子模块。保持发现快照、根不可用保护、删除确认、同路径更新、增量路径队列和并发协调行为。
+
+验收：
+
+- [x] reconciliation 和 incremental 算法从 runner 中分离，阶段状态由现有数据库记录驱动。
+- [x] 根离线、扫描期间根替换、文件身份变化、reconciliation 重试和实时扫描抢占回归保持。
+- [x] 不新增 whole-library request path 或无界后台工作。
+
+验证：`cargo test --locked --test scanning_jobs --test watch --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/incremental.rs`、本文档。
+
+结果（2026-10-12）：持久化 reconciliation 的目录发现、文件批次、指纹与缺失确认移入 `jobs/reconciliation.rs`；实时/定向增量批次及媒体/sidecar 处理移入 `jobs/incremental.rs`。root runner 保留既有任务读取与阶段路由，未增加整库请求路径、后台队列或工作单元。定向集成目标 `mixed_scanner` 1 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 6,353 行减至 4,355 行，两个新模块分别 1,470 行和 534 行；扫描和并发语义由原有回归覆盖，不据此推断性能变化。
+
+#### LUX-481：抽离本地元数据 outbox worker
+
+范围：把本地 metadata batch/backfill 辅助状态、outbox worker、每任务 worker、完成 waiter 与 completeness 协调放入独立模块。保持 source identity 快照、策略快照、批次顺序、重试和 Notify/fallback 语义。
+
+验收：
+
+- [x] 扫描编排只调用 worker 的明确入口，不持有 worker 循环和队列细节。
+- [x] NFO/图片失败可重试、取消终结、源变化拒绝旧结果、父级 metadata 补缺和 worker 关闭行为保持；series 不可读海报用例通过。
+- [x] 不将在线 provider 请求移入扫描请求路径；FILL_MISSING 仍由现有后台 worker 处理。
+
+验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs`、`cargo test --locked --lib scanner::tests`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+结果（2026-10-12）：local metadata 的 batch/backfill/completeness helpers、单任务 worker、outbox worker、等待器、取消收尾及 refresh 实现移入 `jobs/local_metadata.rs`；outbox worker 从 incremental 模块抽出，scanner facade 保留稳定服务 API 与 worker 调用入口。`scanned_metadata` 23 项、`scanning_jobs` 81 项、scanner 单测 41 项通过（1 项按要求忽略）。海报失败用例原先用无序 `LIMIT 1` 读取批次；同一任务可同时包含已完成批次和图片失败批次，因此测试有时读到正常行。现改为按图片错误选取失败批次并用同一 batch ID 验证重试，重复运行通过；无需修改扫描逻辑。`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 4,355 行减至 3,195 行，`jobs/local_metadata.rs` 为 1,415 行；未把在线 provider 请求移入扫描路径，也未增加后台队列。
+
+#### LUX-482：拆分任务生命周期与扫描后处理
+
+范围：将创建/取消/重试/运行 fencing 与扫描完成后的 probe、metadata、thumbnail、cover、事件发布拆入独立职责模块。索引完成与后处理仍保持两个阶段；后处理继续释放共享扫描锁并使用现有有界 worker。
+
+验收：
+
+- [x] lifecycle 负责任务状态转换与锁；postprocessing 负责已有后处理调用，不互相复制状态。
+- [x] 增量与全量扫描的完成、取消、失败重试、锁释放、Home 刷新、Webhook/用户事件顺序保持。
+- [x] 相关定向测试通过，文件职责与模块可见性记录清楚。
+
+验证：`cargo test --locked --test scanning_jobs --test shutdown_jobs --test scanned_metadata --test watch`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/lifecycle.rs`、`src/application/scanner/jobs/postprocessing.rs`、本文档。
+
+结果（2026-10-12）：任务创建、取消/重试、run fencing、状态查询与失败收尾移入 `jobs/lifecycle.rs`；后处理执行体、扫描锁协调、probe、metadata、thumbnail、cover 与 webhook 发布移入 `jobs/postprocessing.rs`。`run_to_completion*` 公开入口仍与每任务 worker/run guard 协调放在 `jobs/local_metadata.rs`，并调用 postprocessing 执行体；`ScanJobService` 公开方法路径与签名保持不变。索引完成和后处理仍由既有 `scan_phase` 分离，后处理仍在现有有界 worker 中释放共享扫描锁。定向集成目标 `scanned_metadata` 23 项、`scanning_jobs` 81 项、`shutdown_jobs` 1 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 3,195 行降至 826 行；lifecycle 与 postprocessing 模块分别 1,323 行和 1,078 行。未改状态、事件或副作用顺序，也未据此作性能结论。
+
+#### LUX-483：收口 scanner facade 与 reconciliation helper
+
+范围：把 scanner 根模块残留、同时供 `LibraryScanner` 与 reconciliation 使用的 batch/task helper 归入 `scanner/library.rs`，跨模块调用使用 scanner 内部最小可见性；根模块只保留 facade、稳定共享类型、错误/API 与 re-export。`lifecycle.rs` 已承载扫描批次 runner，本任务不再新增重复 runner 模块。只移动实现，不改行为。
+
+验收：
+
+- [x] `scanner.rs` 不超过 600 行，电影/剧集文件解析和 fingerprint 等公开路径保持不变。
+- [x] library/reconciliation 共用的 task/result helper 位于 `library` 模块，未改变扫描批次、事务或错误传播。
+- [x] scanner 单测、scanning_jobs 定向回归、fmt 和 build 通过。
+
+验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test scanning_jobs --test scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/jobs/reconciliation.rs`、本文档。
+
+结果（2026-10-12）：电影/剧集并发扫描与 reconciliation 共用的 task/result 类型和 JoinSet 收集 helper 从根模块移入 `scanner/library.rs`，reconciliation 通过 scanner 子树内受限可见性调用。根模块为 557 行，保留 facade、稳定共享 DTO/error、文件 fingerprint API 与 re-export；不新增与 `jobs/lifecycle.rs` 重叠的 runner。scanner 单测 41 项通过（1 项按要求忽略），`scanner` 18 项、`scanning_jobs` 81 项通过；build、fmt 和 `git diff --check` 通过。纯移动，无行为或性能结论。
+
+#### LUX-484：简化 reconciliation 与 Manifest 编排
+
+范围：整理 `run_reconciliation_file_batch`、`run_movie_reconciliation_file_batch`、Manifest diff/apply，将已有准备、根与文件身份校验、事务提交和事件发布步骤提取成有名操作。只重排现有控制流，不改变事务、取消检查、错误传播和副作用顺序。
+
+验收：
+
+- [x] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [x] 根离线/替换、同路径更新、并发增量索引、提交失败、删除确认与 workflow 2 兼容语义保持。
+- [x] 相关定向测试通过。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+结果（2026-10-12）：reconciliation 文件批次拆为 entry 分类、regular 扫描、并发文件准备和逐根提交；movie 路径另拆为 quick/sidecar、同目录分组扫描、准备和提交。Manifest diff/apply 拆为持久化 delta、根身份校验、准备、删除确认与事务提交步骤。相关方法均不超过 150 行，未改每根事务、root fencing、取消检查、增量冲突处理、删除确认或事件顺序。定向集成目标 `mixed_scanner` 1 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项全部通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-485：简化扫描完成编排并关闭阶段 24
+
+范围：整理增量批次与全量/增量完成、取消收尾和后处理编排，将已有步骤提取成明确的准备、校验、提交和发布操作。保持索引完成与后处理两个阶段；不改变事务、锁释放、取消、错误传播、worker 上限及事件顺序。
+
+验收：
+
+- [x] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [x] 增量/全量成功、取消、失败重试、共享扫描锁释放、Home 刷新与 webhook/用户事件顺序保持。
+- [x] 全量 Rust 完成门通过：build、all-targets tests、fmt、all-targets/all-features Clippy；扫描定向目标通过。
+- [x] 模块边界记录更新；进入下一阶段前仍须项目所有者确认。
+
+验证：Toshiba 挂载检查后设置共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行扫描定向目标与 `cargo test --locked --all-targets`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，记录 `uname -m`。不得以本机 ARM 结果推断 NAS/x86 性能。
+
+预计文件：`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/postprocessing.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+结果（2026-10-12）：incremental batch 与空队列完成拆为路径处理、终结状态更新；`run_to_completion*` 公共入口和 run guard 移到 postprocessing，主循环拆为扫描批次循环、Manifest target 准备、增量收尾和全量 probe/metadata/cover/thumbnail/completion 阶段。局部 worker 与 outbox loop 拆为单页/单批处理和等待入口；NFO 并发上限、批次优先级、通知与 fallback 顺序保持。相关 orchestration 方法均不超过 150 行。扫描定向集成 `mixed_scanner` 1 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项、`shutdown_jobs` 1 项、`watch` 5 项通过（合计 143 项）；scanner 单测 41 项通过、1 项按要求忽略。海报失败用例的多批次选择误差已修正，重复 5 次及全目标测试通过。全目标完成门的原阻塞来自 `6d5b758c` 合并时未完整整合的性能请求探针：`tests/performance.rs` 引用了缺失变量、函数和批次初始化。现恢复到合并前可编译的基准 harness；原有基准测试仍保留并保持显式忽略，未运行性能矩阵，也不据此声称性能结果。`cargo test --locked --all-targets`、`cargo build --locked`、fmt、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 全部通过。机器为 `arm64`，不得外推 NAS/x86 性能。阶段24的代码与全量 Rust 完成门已通过；下一阶段仍须项目所有者确认。
+
+依赖：无。明确不做：Storage/API 重构、schema/SQL 修改、新后台 worker、新扫描状态、新性能承诺或部署。
+
+### 阶段 25：共享存储层 jobs 职责拆分与事务编排重构
+
+本阶段以阶段 24 完成版本 `b08bdcf4` 为基线，整理 `src/storage/jobs.rs` 的共享存储职责。继续使用 `Database` 的现有方法作为内部调用面，保持方法签名、存储导出路径、SQL、批次大小、状态转换、错误和提交语义。先将根目录、字幕、文件系统条目、媒体源与关机处理迁入所属 storage 模块，再按 scan/Manifest、reconciliation、增量扫描、本地 metadata、metadata reidentify、STRM probe 分拆 jobs。最后整理 Manifest discovery/apply、diff 和 FILL_MISSING 大函数。每个 LUX 任务最多预计修改 5 个文件，逐个完成、验证并独立提交。
+
+阶段验收：`jobs.rs` 只保留模块声明和需要稳定的导出，目标不超过 200 行；事务编排函数目标不超过 150 行，纯 SQL 阶段超出时须在结果中说明。跨步骤的子函数沿用调用方的 `&mut Transaction<'_, Any>`；不得在步骤内另开事务或改变锁顺序、SQL/绑定顺序、计数、批次边界及取消 fencing。保留 `storage::repository::jobs::tests` 测试名称空间。对文件和函数的移动须检查 repository 内调用点、application/storage 调用点与实际路由引用；`Database` 现有方法名和路由合同不变。
+
+#### LUX-486：拆分媒体库根目录存储操作
+
+范围：将 library root 的增删查、扫描游标和可用性操作从 `jobs.rs` 移入 `storage/library_roots.rs`。保留 `Database` 方法签名、SQL、删除清理范围及路径调用点。
+
+验收：
+
+- [x] 根目录存储实现不再位于 `jobs.rs`。
+- [x] 既有 `Database` 调用点和路由调用无需改名，根目录删除与扫描游标行为保持。
+- [x] library deletion、storage 和 jobs 单测通过；fmt/build 与 `git diff --check` 通过。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后使用共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::repository::jobs::tests`、`cargo test --locked --test storage --test library_deletion`、`cargo fmt --all -- --check`、`cargo build --locked` 及 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/library_roots.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：library root 的 13 个 `Database` 方法移入 `storage/library_roots.rs`，原方法名、签名和 repository 内调用路径保持。核对了 API、application、storage 和 tests 的所有同名调用。基线与迁移后 jobs 单测均为 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项与 `library_deletion` 1 项均通过；fmt 和 `git diff --check` 通过。
+
+#### LUX-487：拆分字幕存储操作
+
+范围：将外部字幕定位、字幕流查询与字幕记录更新从 `jobs.rs` 移入 `storage/subtitles.rs`。保留现有 Emby/Lux DTO 映射和 SQL 语义，不改变播放或字幕路由合同。
+
+验收：
+
+- [x] 字幕存储方法不再位于 `jobs.rs`，`Database` 方法签名保持。
+- [x] Emby 与 Lux 字幕查询/更新调用点保持原方法名和响应映射。
+- [x] 字幕集成测试、fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test subtitles`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/subtitles.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：字幕定位、轨道分页与外部字幕更新移入 `storage/subtitles.rs`，`Database` 方法名和返回映射保持。核对了 Emby/Lux media handlers、管理员 handler 与 storage tests 的原调用点；`subtitles` 1 项回归通过，fmt 和 `git diff --check` 通过。
+
+#### LUX-488：拆分文件系统条目存储操作
+
+范围：将 filesystem entry 查询、移动、批量 observed/restore 与 missing 状态更新移入 `storage/filesystem.rs`。文件系统状态变化仍使用现有的事务入口；reconciliation 对事务内恢复 helper 的调用保持同一事务。
+
+验收：
+
+- [x] 文件系统条目操作不再位于 `jobs.rs`，事务内 helper 可见性限于 storage 子树。
+- [x] 路径、inode、seen/missing 状态和 reconciliation 批次确认语义保持。
+- [x] storage、媒体库/媒体删除与 jobs 单测通过；fmt/build、`git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test storage --test media_deletion --test library_deletion`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/filesystem.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：15 个 filesystem entry 查询/移动/观察/缺失状态方法移入 `storage/filesystem.rs`。reconciliation 调用的批量 restore 和 missing-path helper 仅开放到 repository 子树；媒体移除刷新仍复用 jobs 中的原事务 helper。核对了 API、application、storage 与 tests 调用点。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项、`media_deletion` 1 项、`library_deletion` 1 项通过；fmt 和 `git diff --check` 通过。
+
+#### LUX-489：拆分媒体源存储操作
+
+范围：将媒体源查询、重分配、探测状态、原子删除及关联媒体条目移除/恢复移入 `storage/media_sources.rs`。删除、恢复及 removal refresh 继续接收并使用原事务；媒体源删除批量上限与其回归保持在所属模块。
+
+验收：
+
+- [x] 媒体源写入/删除和关联媒体状态维护不再位于 `jobs.rs`。
+- [x] `Database` 方法名、批量边界、默认来源约束、级联 item 清理和回滚语义保持。
+- [x] 媒体源原子删除单测、媒体删除与 storage 集成测试、fmt/build 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test media_deletion --test storage`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/media_sources.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：媒体源查询、STRM/variant 更新、item 重分配、探测状态、恢复、删除与关联媒体移除操作移入 `storage/media_sources.rs`；删除批次上限随模块迁移，单测仍从 jobs 测试入口使用该合同。原子事务和批次常量保持。核对了应用层删除、扫描、catalog 与 `storage/media.rs` 的方法调用。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`media_deletion` 1 项及 `storage` 52 项通过；fmt 与 `git diff --check` 通过。
+
+#### LUX-490：隔离 storage jobs 单元测试
+
+范围：将 `jobs.rs` 末尾的内联单测迁入 `storage/jobs/tests.rs`，由根模块使用路径属性声明。测试名称空间和测试体保持，允许继续访问其父模块中的私有测试辅助函数。
+
+验收：
+
+- [x] 所有 jobs 内联单测位于独立测试文件中，路径仍为 `storage::repository::jobs::tests`。
+- [x] 测试导入所用的媒体源删除批次上限继续指向 owning module。
+- [x] 单测数量、忽略项和结果与迁移前一致；fmt、build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --lib storage::repository::jobs::tests`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/tests.rs`、本文档。
+
+结果（2026-10-12）：1,200 余行 jobs 单测从 `jobs.rs` 移入 `jobs/tests.rs`，以 `#[path]` 保持原测试名称空间及私有测试 helper 访问。迁移前后均为 14 passed、1 项 PostgreSQL 用例 ignored；fmt 和 `git diff --check` 通过。
+
+#### LUX-491：拆分 STRM probe 与关机取消存储逻辑
+
+范围：将 STRM probe job 的创建、领取、查询、进度、取消与终结操作移入 `jobs/strm_probe.rs`；将覆盖多类后台 job 的统一关机取消移入 `jobs/shutdown.rs`。关机取消事务与提交后 legacy scan event 顺序保持。
+
+验收：
+
+- [x] STRM probe persistence 与关机取消不再位于 `jobs.rs`。
+- [x] `Database` 方法签名、取消 fencing、关机错误码、单事务更新及提交后事件写入顺序保持。
+- [x] STRM、shutdown 与 jobs 单测通过，fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --test strm_probe --test strm_probe_api --test shutdown_jobs` 与 jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/strm_probe.rs`、`src/storage/jobs/shutdown.rs`、本文档。
+
+结果（2026-10-12）：11 个 STRM job 方法移入 `jobs/strm_probe.rs`；原子关机取消方法和错误码移入 `jobs/shutdown.rs`。核对了 main shutdown、管理员列表与 application probe 的调用路径。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`shutdown_jobs` 1 项、`strm_probe` 2 项、`strm_probe_api` 1 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-492：拆分本地 metadata backfill 存储
+
+范围：将 backfill page DTO、页大小限制与 root 注册、领取、完成、失败和中断恢复方法迁入 `jobs/local_metadata/backfill.rs`。`StoredScanLocalMetadataBackfillPage` 继续通过 repository 的现有 crate 内导出供 application 使用；本地 metadata item 排除序列化 helper 留在 local metadata 根模块供批次与 backfill 共用。
+
+验收：
+
+- [x] backfill 数据类型、限制与方法不再由 `jobs.rs` 实现。
+- [x] repository 现有 DTO 导出路径、游标 fencing、页大小与重试/恢复状态保持。
+- [x] backfill root 幂等和有界可恢复分页回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::tests::scan_local_metadata_backfill_roots_register_in_one_query`、`cargo test --locked --lib storage::repository::tests::progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/backfill.rs`、本文档。
+
+结果（2026-10-12）：backfill DTO、page size、排除项校验 helper 和 8 个 root/分页/完成/失败/恢复方法移入 `jobs/local_metadata/backfill.rs`；本地 metadata 根复用排除项序列化，repository 继续通过 `jobs::StoredScanLocalMetadataBackfillPage` 导出原 DTO。backfill root 幂等与有界分页/重试/中断恢复各 1 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-493：拆分本地 metadata 批次与 outbox 存储
+
+范围：将 local metadata batch 的创建、领取、完成、失败、取消、重试、分页和 Manifest outbox 写入移入 `jobs/local_metadata/batches.rs`。outbox transaction helper 仅对 repository 子树可见，Manifest discovery 继续传入并复用其原 transaction。
+
+验收：
+
+- [x] 本地 metadata batch/outbox 方法及批次限制常量不再位于 `jobs.rs`。
+- [x] application、Manifest 和原 jobs 单测继续使用相同 `Database` 方法与事务入口。
+- [x] outbox 有界批量和查询次数回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --lib storage::repository::jobs::tests::manifest_local_metadata_outbox_inserts_three_batches_with_one_query`、jobs 其余单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/batches.rs`、本文档。
+
+结果（2026-10-12）：15 个 local metadata batch/outbox 方法移入 `jobs/local_metadata/batches.rs`；写入批次限制归入 owning module，source 上限和错误长度限制留在 local metadata 根供其调用者共享。Manifest outbox transaction helper 限定 repository 子树可见，Manifest 调用仍复用原事务。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanning_jobs` 81 项全部通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-494：拆分本地 metadata 来源读取
+
+范围：将扫描 metadata source 列表、当前来源 identity 检查及 SQL LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`。分页、来源身份批次大小和查询过滤保持。
+
+验收：
+
+- [x] source 查询与 identity 校验不再位于 `jobs.rs`。
+- [x] scanner 与 metadata application 的 `Database` 调用签名及来源筛选结果保持。
+- [x] 来源身份单测、metadata path 与扫描 metadata 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::local_metadata_completeness_reuses_current_source_identities_and_expands_episode_hierarchy`、`cargo test --locked --test metadata_paths --test scanned_metadata --test scanned_series_metadata`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/sources.rs`、本文档。
+
+结果（2026-10-12）：两项 local metadata source/identity 方法、来源身份批次上限与 LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`；原 `Database` 签名保持。因 LIKE 转义还用于 jobs 内另一个既有目录查询，由 local metadata 根按 repository 子树 re-export 同一 helper。核对了 scanner、metadata application 和 jobs tests 调用点。身份单测 1 项、`metadata_paths` 8 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-495：拆分 metadata reidentify 生命周期和 item 队列
+
+范围：新增 `jobs/metadata_reidentify`，将 job 创建/查询/取消/重试/活动状态移入 `lifecycle.rs`，将目标查询、领取、item 完成与失败恢复移入 `items.rs`。现有 application、API 与 storage `Database` 调用保持。
+
+验收：
+
+- [x] metadata reidentify job 状态与 item 领取/结算实现不再位于 `jobs.rs`。
+- [x] job 和 item 状态、取消竞态、retry/active 查询及 API 返回映射保持。
+- [x] reidentify、metadata cancel 与 metadata API 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --test reidentify --test metadata_cancel --test metadata_api`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/metadata_reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/jobs/metadata_reidentify/items.rs`、本文档。
+
+结果（2026-10-12）：15 个 reidentify job 创建/查询/状态方法移入 `lifecycle.rs`，8 个 item 查询、领取、完成及失败恢复方法移入 `items.rs`；优先级 SQL 片段放在新子树根，供 FILL_MISSING 后续复用。原 `Database` 签名保持。`metadata_api` 9 项、`metadata_cancel` 3 项、`reidentify` 20 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-496：拆分 FILL_MISSING 去重与请求合并
+
+范围：将 FILL_MISSING job/item 去重、快照比较、队列合并与重试登记移入 `jobs/metadata_reidentify/fill_missing.rs`。把 `lock_media_items_for_update` 作为共享事务工具移入 repository。传入的 transaction、item 排序/锁定顺序、job 容量和请求快照规则保持。
+
+验收：
+
+- [x] FILL_MISSING 创建/合并实现及私有辅助状态类型不再位于 `jobs.rs`。
+- [x] metadata 写入继续共享同一 sorted item lock helper，方法签名与 transaction 调用保持。
+- [x] 去重、队列容量、请求快照、重试退避与 metadata 原子性回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 FILL_MISSING repository 单测、`cargo test --locked --test reidentify --test metadata_cancel`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/metadata_reidentify.rs`、`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：FILL_MISSING 请求快照、排队 job 合并、容量复用、item 插入与去重辅助状态移入 `metadata_reidentify/fill_missing.rs`。`lock_media_items_for_update` 移入 repository 事务工具，保留 ID 排序、去重、分批和 PostgreSQL `FOR UPDATE` 顺序；metadata application 与 fill_missing 继续使用同一方法。队列合并 2 项、请求快照退避 1 项、metadata 原子性 1 项、`reidentify` 20 项、`metadata_cancel` 3 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-497：拆分 scan job 生命周期
+
+范围：将 scan job 创建、查找/列表、活动状态、领取/进度、取消、终结和 postprocessing 状态迁入 `jobs/scan/lifecycle.rs`。现有 application/API/repository 调用使用同一 `Database` 方法。
+
+验收：
+
+- [x] scan job lifecycle 实现不再位于 `jobs.rs`。
+- [x] 状态筛选、取消 fencing、完成/后处理重试及管理端列表行为保持。
+- [x] scanning/shutdown 集成测试、fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs --test shutdown_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/lifecycle.rs`、本文档。
+
+结果（2026-10-12）：scan job 创建、自动匹配设置、查询/list/active、claim/progress、取消、完成、postprocessing 状态与重试等生命周期方法移入 `scan/lifecycle.rs`。外部 `Database` 方法签名及管理端/application 调用不变。`scanning_jobs` 81 项与 `shutdown_jobs` 1 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-498：拆分增量扫描路径队列
+
+范围：将 incremental path 的单条/批量入队、计数刷新、待处理分页、已处理标记、item ID 读取及队列清理移入 `jobs/scan/incremental.rs`。保留路径去重、处理顺序与每批限制。
+
+验收：
+
+- [x] 增量路径队列与状态存储不再位于 `jobs.rs`。
+- [x] `Database` 方法、队列容量/批次上限、删除及重试行为保持。
+- [x] scanning/watch 与 incremental storage 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs --test watch`、增量 storage 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/incremental.rs`、本文档。
+
+结果（2026-10-12）：7 个 incremental path 入队、分页、处理、ID 查询与清理方法及 100 路径批次上限移入 `scan/incremental.rs`。application/watch/storage 调用仍使用原 `Database` 方法。增量队列 storage 单测 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-499：拆分 scan postprocessing target 存储
+
+范围：将 scan target 和 sidecar target 登记、metadata/thumbnail 阶段分页、完成/失败/重试状态移入 `jobs/scan/targets.rs`。为 Manifest apply 与 reconciliation 共用的事务 helper 保持 repository 子树可见；侧车目录裁剪与 SQL 构造随目标模块迁移并保持现有查询边界。
+
+验收：
+
+- [x] scan job target 持久化和 worker page 查询不再位于 `jobs.rs`。
+- [x] metadata/thumbnail 状态、removed target 优先级、sidecar 路径范围和事务调用保持。
+- [x] query-count、sidecar 与扫描后处理回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs --test scanned_metadata`、相关 repository target/query-count 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/targets.rs`、本文档。
+
+结果（2026-10-12）：21 个 scan target 写入、分页、metadata/thumbnail 状态及查询方法和 sidecar helper 移入 `scan/targets.rs`；Application/API 的 `Database` 调用保持。target/outbox、reconciliation 与 Manifest apply 共用的事务 helper 暂限 repository 子树可见，后续调用方迁移后再收窄。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；target 单查询与 sidecar 多目录查询各 1 项通过；`scanned_metadata` 串行 23 项、`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。两目标合并运行时 FIFO 海报用例超过 60 秒；单独运行 1 项和 `scanned_metadata -- --test-threads=1` 全部 23 项均通过。
+
+#### LUX-500：拆分 reconciliation 存储
+
+范围：将 reconciliation snapshot 读取、目录发现、文件批次事务、缺失确认、root page 完成与存在状态查询移入 `jobs/scan/reconciliation.rs`。共用 target/filesystem/media-source helper 沿用原 transaction；不改变根可用性 fencing 和重试 checkpoint。
+
+验收：
+
+- [x] reconciliation 存储方法不再位于 `jobs.rs`。
+- [x] root 丢失保护、批次回滚、文件确认/缺失计数、checkpoint 与 target 登记仍在原事务中。
+- [x] reconciliation 原子性单测和扫描集成回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::repository_tests::reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_entries`、`cargo test --locked --test scanning_jobs --test mixed_scanner --test watch`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/reconciliation.rs`、本文档。
+
+结果（2026-10-12）：15 个 reconciliation snapshot/discovery/批次提交/root page 方法移入 `scan/reconciliation.rs`。reconciliation 的 filesystem restore、media removal refresh 与 target 登记继续调用其原 transaction helper；外部 `Database` 方法名保持。reconciliation 原子性单测 1 项、`mixed_scanner` 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-501：拆分 Manifest 创建与状态存储
+
+范围：建立 `jobs/scan/manifest` 子树，将 Manifest 创建、读取、root 状态、diff-ready/apply/indexed 转换、结束与 retry fencing 移入 `manifest/state.rs`。原方法名、manifest workflow/state 值与 CAS 条件保持。
+
+验收：
+
+- [x] Manifest 创建/状态实现不再位于 `jobs.rs`。
+- [x] workflow 2/3、root 状态、cancel fencing、retry 与 status transition 条件保持。
+- [x] Manifest 创建原子性、恢复/重试扫描回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::scan_manifest_creation_is_atomic_and_idempotent`、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/state.rs`、本文档。
+
+结果（2026-10-12）：15 个 Manifest 创建、查询、root 状态、transition、finish 与 retry 方法，以及状态校验 helper 移入 `scan/manifest/state.rs`。原 Database 签名与 workflow 2/3、cancel/root fencing 保持。Manifest 原子创建单测 1 项和 `scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-502：拆分 Manifest 后处理目标分页
+
+范围：将 Manifest postprocessing target page materialization、空页完成和事务内 target insert 移入 `scan/manifest/targets.rs`。保留 item target precedence、root identity checkpoint、cursor 和 target 写入的同事务边界。Manifest discovery 目录与 diff candidate 查询在其所属子模块迁移。
+
+验收：
+
+- [x] Manifest postprocessing target 物化与游标实现不再位于 `jobs.rs`。
+- [x] 新旧 target 优先级、page limit、cursor CAS 和 root replacement fencing 保持。
+- [x] target 回滚/续页与扫描集成回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、`cargo test --locked --lib storage::repository::jobs::tests`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/targets.rs`、本文档。
+
+结果（2026-10-12）：Manifest postprocessing target page、empty page 完成、事务内 target insert 及 page range DTO 移入 `scan/manifest/targets.rs`。cursor、root fencing、target precedence 和 transaction ownership 保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-503：拆分 Manifest discovery 与正向索引
+
+范围：将 discovery chunk 校验、frontier/observations、presence ledger、计数提交和正向媒体索引分别归入 `manifest/discovery.rs`、`manifest/indexes.rs`。两步继续共享本次 database transaction；本任务只移动步骤，不拆其内部大函数。
+
+验收：
+
+- [x] Manifest discovery 与正向索引实现不再位于 `jobs.rs`。
+- [x] observations、filesystem/media indexes、local metadata outbox、presence ledger、manifest/job counters 仍在原事务按原顺序提交。
+- [x] discovery 取消/去重、正向索引、outbox rollback 和 scanning integration 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/indexes.rs`、本文档。
+
+结果（2026-10-12）：Manifest discovery commit/chunk 与正向媒体索引步骤移入 `manifest/discovery.rs`、`manifest/indexes.rs`；共享发现结果类型与 file identity helper 放在 Manifest 根。discovery、index、sidecar targets 与 local metadata outbox 继续复用同一 transaction，顺序及 progress/checkpoint 更新保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-504：拆分 Manifest 差异计算和读取
+
+范围：将 Manifest 目录/文件系统基线、removal candidates、差异状态计算与 delta 写入移入 `manifest/diff.rs`。差异顺序、root completeness 条件和 retryable state 保持。
+
+验收：
+
+- [x] Manifest diff/query 方法与差异批次常量不再位于 `jobs.rs`。
+- [x] unchanged、ADD/CHANGE/REAPPEARED/REMOVE 分类、movie identity 检查和 root completeness 条件保持。
+- [x] Manifest diff、root 离线/替换和扫描回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/diff.rs`、本文档。
+
+结果（2026-10-12）：10 个 Manifest directory/root baseline/removal candidate/diff/insert delta 方法与 diff batch limit 移入 `scan/manifest/diff.rs`。unchanged 与 ADD/CHANGE/REAPPEARED/REMOVE 判定、root completeness、movie variant identity 和原查询顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-505：拆分 Manifest delta apply
+
+范围：将 pending delta 分页/删除计数与 delta batch apply 移入 `scan/manifest/apply.rs`，apply page limit 随方法归属迁移。job/manifest/root 检查、filesystem/media mutation、target 更新和进度仍在一个原 transaction 中。
+
+验收：
+
+- [x] Manifest apply 实现及分页上限不再位于 `jobs.rs`。
+- [x] active job/cancel fencing、delta CAS、索引和 removal 原子提交、进度计数与返回结果保持。
+- [x] delta rollback、并发增量冲突与批次上限回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/apply.rs`、本文档。
+
+结果（2026-10-12）：Manifest pending delta 读取、applied removal 计数和单批 delta apply 移入 `scan/manifest/apply.rs`；apply page limit 随模块迁移。active job/cancel fencing、delta CAS、filesystem/media mutations、target writes 与 progress checkpoint 仍在原 transaction。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-506：抽离 Manifest discovery 输入校验
+
+范围：把多 chunk 输入合并、跨 job/root 检查、路径/entry 校验、positive/unchanged/seen 路径唯一性和 baseline 校验移入 `manifest/discovery/input.rs`。结果带回已验证的借用数据和查找集合供原事务编排使用。
+
+验收：
+
+- [x] discovery coordinator 只接收已完成结构校验的输入，非法与空输入在打开事务前返回。
+- [x] 错误类型/原因及检查顺序保持，输入顺序、去重规则和 collection 内容保持。
+- [x] 既有 Manifest 输入/取消回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/input.rs`、本文档。
+
+结果（2026-10-12）：chunk 合并、path/entry 验证、positive/unchanged/seen 身份唯一性及 baseline 检查移入 `ManifestDiscoveryInput::collect`。invalid/empty 输入仍在开启 transaction 前返回，原错误原因和检查顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-507：提取 Manifest discovery 状态与 frontier 步骤
+
+范围：把同一事务中的 Manifest/job state snapshot 与目录 frontier upsert 提取为具名 storage 步骤。主方法继续持有并传递原 `Transaction`，保留 stage diagnostics 的触发位置。
+
+验收：
+
+- [x] 单次状态读取仍返回同一 workflow/root/job/cancel snapshot。
+- [x] 目录 frontier 的 chunk size、冲突处理、lite mode 跳过及插入计数语义保持。
+- [x] frontier 取消/重试和 bounded directory batch 回归通过；fmt/build 与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/state.rs`、`src/storage/jobs/scan/manifest/discovery/frontier.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::manifest_discovery_chunk_does_not_complete_directory_after_cancel_request`、`cargo test --locked --test scanning_jobs manifest_frontier_batches_handle_long_and_small_directories`、`cargo build --locked`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：Manifest/job 状态读取改为单个 `ManifestDiscoveryStateSnapshot`，目录 frontier upsert 与完成更新分别迁入独立步骤；两者均复用 coordinator 持有的 transaction，SQL、bind 顺序、批次上限、冲突策略、lite mode 计数和诊断阶段位置保持。取消回归 1 passed，bounded directory batch 回归 1 passed；`cargo build --locked`、fmt 和 `git diff --check` 通过。`commit_scan_manifest_discovery_chunks` 及其应用层调用点未改名。
+
+#### LUX-508：提取 Manifest root checkpoint 与 observation 写入
+
+范围：将 root checkpoint 的目录/文件计数及 observation/local metadata sequence 预留，以及 observation 的分批写入迁入私有 discovery 子模块。继续由 coordinator 持有同一 transaction，并保留诊断计时边界。
+
+验收：
+
+- [x] workflow v2/v3 的 observation sequence 连续且与 root 高水位一致；legacy observation 的逐路径 sequence 语义保持。
+- [x] local metadata batch sequence 预留与大目录 bounded batch 行为保持。
+- [x] SQL/bind 顺序、批次上限、错误检查顺序和 diagnostics 计时边界保持；相关回归与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/checkpoint.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs full_scan_manifest_persists_discovery_and_reobservations_without_directory_work_queue`、`cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：root checkpoint 序号预留与 observation 批量写入移入 `discovery/checkpoint.rs`，原事务仍由 coordinator 创建、提交；SQL 和 bind 顺序、legacy/v2/v3 序号算法、批次大小和计时边界保持。目录计数转换仍在 frontier completion 前执行。observation 高水位回归 1 passed，大目录/local metadata sequence 回归 1 passed；fmt 与 `git diff --check` 通过。
+
+#### LUX-509：提取 Manifest presence ledger 与 counters checkpoint
+
+范围：将 format-3 generation presence CAS、seen-path ledger upsert 和 manifest/job counters checkpoint 拆为私有步骤。保持 filesystem row 的 ID/path/fingerprint CAS、Postgres/SQLite 更新路径、job cancel fencing 与同事务提交。
+
+验收：
+
+- [x] unchanged filesystem entry 仍按 generation 更新；不匹配的 ID/path/fingerprint 不计为 seen。
+- [x] positive-index paths 与 seen generation paths 仍从 presence ledger 排除，其余路径按原批次 upsert。
+- [x] manifest/job counters、取消 fencing、诊断计数与事务失败回滚语义保持；相关回归与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/jobs/scan/manifest/discovery/counters.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、`cargo test --locked --lib storage::repository::jobs::tests::manifest_discovery_chunk_does_not_complete_directory_after_cancel_request`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：presence CAS/ledger 与 counters/cancel fence 分别迁入独立子模块；SQL、bind 顺序、backend 分支、failure rollback 和 stage diagnostics 统计保持。大目录两次扫描的 generation presence 回归 1 passed，取消回归 1 passed；fmt 与 `git diff --check` 通过。
+
+#### LUX-510：收敛 Manifest discovery coordinator
+
+范围：把 `commit_scan_manifest_discovery_chunks` 整理为短事务编排函数，已提取的阶段通过私有子步骤串接。保留同一 transaction 的创建/提交边界与现有 `Database` 调用面。
+
+验收：
+
+- [x] 事务协调函数不超过 150 行；transaction 仍只在 coordinator 开启和提交。
+- [x] repository、application、API/main route 引用的 storage 方法名与签名不变。
+- [x] 端到端 bounded scan、阶段 diagnostics 和 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/indexing.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt、`git diff --check`，并搜索所有 `commit_scan_manifest_discovery_chunk(s)` repository/application 调用点。
+
+结果（2026-10-12）：`commit_manifest_discovery_transaction` 为 149 行，transaction 仍由 `commit_scan_manifest_discovery_chunks` 单点创建和提交；路径查询、index/outbox 与 observation 子步骤独立。bounded full scan 回归 1 passed；格式和 diff 检查通过。搜索确认 application/scanner 与 storage tests 仍引用相同 `commit_scan_manifest_discovery_chunk(s)` 方法。
+
+#### LUX-511：提取 Manifest apply guard 与 ADD preparation
+
+范围：将 delta apply 的 active job/manifest/root 状态读取、ADD observation 验证、filesystem entry claim 与首次 movie/episode materialization 移入私有 preparation 步骤。保持校验顺序和共享 apply transaction。
+
+验收：
+
+- [x] active job、manifest state、root state 查询及冲突文案/次序保持。
+- [x] ADD 只 claim 有完整 observation 且 root complete 的路径；未 claim 的媒体不 materialize。
+- [x] requested bounded transaction batch 与 incremental ADD race 回归通过；storage 方法签名不变。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/prepare.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_add_conflicts_with_incremental_entry_claimed_after_diff`、`cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：apply preparation 提取事务内 active-state 检查、root 查询、四类路径映射、ADD observation 校验、filesystem claim 及首次 media insert；Delta 循环仍消费原 claim set。ADD race 1 passed，450 项 bounded apply 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 对外方法名/签名保持。
+
+#### LUX-512：提取 Manifest delta apply CAS 阶段
+
+范围：将单条 ADD/CHANGE/REAPPEARED/REMOVE dispatch 与 filesystem CAS 操作从事务入口移入 `apply/deltas.rs`，返回 delta 状态和后续副作用所需路径集合。继续由原方法持有 transaction。
+
+验收：
+
+- [x] ADD claim、change/reappear baseline/fingerprint CAS、remove CAS 与冲突/unstable 分类保持。
+- [x] delta 更新的输入顺序、计数和 batch 上限不变；helper 不另开/提交 transaction。
+- [x] newer incremental write、bounded apply 和取消后恢复回归通过；storage 调用面不变。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/deltas.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry`、`cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、`cargo test --locked --test scanning_jobs cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta dispatch/CAS 阶段移入事务内 helper，状态结果与 paths/update payload 显式返回给 coordinator；同一 batch transaction 继续负责后续 delta state、targets 与 job progress。incremental CAS、450 项 bounded apply、cancel/resume 三项均 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 名称/签名不变。
+
+#### LUX-513：提取 Manifest apply finalization
+
+范围：将 delta state/error CASE 更新、metadata target/removal side effects、manifest/job progress checkpoint 移入 finalizer。transaction 仍由 `commit_scan_manifest_delta_batch` 创建并提交。
+
+验收：
+
+- [x] delta state/error CASE bind 顺序、affected-row guard、attempt count 与 batch 边界不变。
+- [x] NEW/CHANGED/sidecar/removal targets、removed media refresh 与 applied/processed counters 保持。
+- [x] cancel/resume 与 bounded apply 回归通过；只有入口持有 transaction 的 commit 权。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、`cargo test --locked --test scanning_jobs cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta persistence、target/removal side effects 与 progress checkpoint 移入 finalizer；CASE placeholders 和绑定顺序未改，取消检查仍在 job progress UPDATE，transaction commit 仍仅在入口。bounded apply 与 cancel/resume 均 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-514：拆分 Manifest diff completion 查询
+
+范围：把 `finish_scan_manifest_diff` 中按 lite/v2/v3/legacy 分支统计 remaining changes，以及 legacy unchanged count 的查询提取到 `diff/finish.rs`。主方法保留 state transition、job progress/cancel fence 和 transaction commit。
+
+验收：
+
+- [x] 四种 workflow/version 路径及 SQL bind 顺序、remaining-change 条件不变。
+- [x] 未完成变化时仍不推进 `APPLYING`；成功 completion 仍要求 `RUNNING AND cancel_requested = 0`。
+- [x] legacy observation 与 v3/LITE 大目录回归通过；completion coordinator 不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_uses_latest_directory_observation_when_diffing_file_paths`、`cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：remaining-change 与 unchanged 统计查询移入 `diff/finish.rs`，`finish_scan_manifest_diff` 协调函数缩至 104 行；UPDATE 顺序、transaction guard、cancel fence 和 commit 位置保持。observation regression 与 v3/LITE 大目录两次扫描均 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-515：拆分 FILL_MISSING request reconciliation
+
+范围：将 active/deferred request snapshot 查询、输入快照分类和 queued/deferred/job 更新分为状态读取、纯计划与持久化步骤。保留调用方 transaction 和现有存储方法签名。
+
+验收：
+
+- [x] Postgres row lock、100 项 query/update chunk、request fingerprint/capabilities 匹配语义不变。
+- [x] 自动 retry/deferred suppression、obsolete snapshot consumption、queued completed-item reopen 与 processed count 下调保持。
+- [x] 剩余请求仍经现有 100-item job coalescing/256-item insert 路径；retry 与 running request 回归通过。
+
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/fill_missing/requests.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::repository_tests::automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_scoped`、`cargo test --locked --lib storage::repository::repository_tests::changed_local_fill_request_during_running_item_is_not_lost`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：request state load、request matching plan 和批量持久化分别成为私有步骤，`enqueue_or_update_fill_missing_requests_in_transaction` 收敛为短编排入口；锁子句、SQL/bind 顺序和 transaction ownership 保持。retry snapshot 与 running request 两项均 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-516：清理 jobs 根模块残留
+
+范围：将 `restore_media_item` 移入媒体源 storage owner，将 legacy scan 重试错误码常量移入 shutdown owner。`jobs.rs` 只保留 jobs 模块 wiring、共享 imports/exports 与原测试入口。
+
+验收：
+
+- [x] `jobs.rs` 不再包含 `Database` 实现或业务常量，长度低于 200 行。
+- [x] `restore_media_item`、legacy scan error code 和全部调用签名/引用保持。
+- [x] shutdown 回归、crate build、fmt 与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/media_sources.rs`、`src/storage/jobs/shutdown.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test shutdown_jobs`、`cargo build --locked`、fmt、`git diff --check`，并搜索 `restore_media_item` 与 legacy error code 的所有引用。
+
+结果（2026-10-12）：`jobs.rs` 缩至模块 wiring 与必要共享 imports/exports；restore 方法迁入 `media_sources.rs`，legacy scan error code 迁入 `shutdown.rs`。调用方法名保持。shutdown、build、fmt 与 diff 检查通过。
+
+#### LUX-517：收窄事务内存储 helper 可见范围
+
+范围：把 local metadata outbox、LIKE escaping 和 scan target/removal transaction helper 限制在实际调用的 `jobs` 或 `jobs::scan` 子树。保持可供同层 repository tests 使用的 jobs 范围。
+
+验收：
+
+- [x] 不再有 jobs helper 使用整个 `storage::repository` 的事务内可见权限。
+- [x] discovery/reconciliation/apply 与 jobs repository tests 的调用仍可解析。
+- [x] build、jobs 单测、fmt 和 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/local_metadata/sources.rs`、`src/storage/jobs/local_metadata/batches.rs`、`src/storage/jobs/scan/targets.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo build --locked`、`cargo test --locked --lib storage::repository::jobs::tests`、fmt 和 `git diff --check`，并搜索 repository 范围 helper 与所有调用点。
+
+结果（2026-10-12）：LIKE escaping 和 Manifest outbox helper 缩至 `jobs`；scan target、sidecar、removal transaction helpers 缩至 `jobs::scan`。jobs repository tests 与 scanner/reconciliation/manifest 调用点仍在可见树内；build、jobs 单测、fmt 与 diff 检查通过。
+
+#### LUX-518：缩短 reconciliation batch 事务协调函数
+
+范围：将 pending path 过滤、movie/episode 索引、NEW/CHANGED/sidecar target 写入和 seen filesystem entry 恢复迁入事务内 batch helper。外层 coordinator 继续持有唯一 transaction。
+
+验收：
+
+- [x] reconciliation `Database` 公共方法名/签名不变；事务仍由 batch coordinator 开始并提交。
+- [x] 文件索引、target 和 restore 更新保持原顺序，均复用调用方 transaction。
+- [x] mixed reconciliation、失败回滚重试回归通过；事务协调函数不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/reconciliation.rs`、`src/storage/jobs/scan/reconciliation/batch.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs mixed_reconciliation_batches_known_media_and_keeps_unresolved`、`cargo test --locked --test scanning_jobs reconciliation_batch_rolls_back_index_and_retries_all_pending_files`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：媒体索引/targets/restore 阶段移入 `reconciliation/batch.rs`；`commit_reconciliation_batch_in_transaction` 缩至 110 行，仍是唯一 transaction owner。mixed batch 与失败回滚重试回归各 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-519：拆分 Manifest 创建与 retry 生命周期事务
+
+范围：将 full-scan Manifest root 初始化、legacy retry target 迁移和 DISCOVERING retry root reset 提取为事务内步骤。创建/重试 coordinator 继续独占 transaction begin/commit。
+
+验收：
+
+- [x] `create_full_scan_manifest_job` 与 `prepare_scan_manifest_retry` 方法名/签名及 validation/error 顺序保持。
+- [x] root registration、legacy target copy、lite/persisted retry SQL 与 transaction 顺序保持。
+- [x] 创建幂等与 DISCOVERING frontier resume 回归通过；事务协调函数不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/state.rs`、`src/storage/jobs/scan/manifest/state/transactions.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs full_scan_manifest_indexes_safe_positive_batches_during_discovery`、`cargo test --locked --test scanning_jobs shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：Manifest full-scan root registration/legacy target copy 与 DISCOVERING retry reset 移入 state transaction 子模块；外层方法保留 transaction owner。full scan/LITE 与 persisted frontier resume 回归各 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-520：拆分 Manifest delta 幂等批次写入
+
+范围：将一组 delta 的 baseline conflict 检查、bounded row insert 和 kind 计数提取为 transaction 内 helper。外层 `insert_scan_manifest_deltas` 保留 payload 校验、每个 transaction batch 的 READY_TO_DIFF 锁、counter 更新和提交。
+
+验收：
+
+- [x] root/path 唯一性、delta payload 校验、retry baseline equality 与错误语义不变。
+- [x] inner insert chunk、outer transaction batch 和 ADD/CHANGE/REMOVE/REAPPEARED 计数/绑定顺序不变。
+- [x] 同输入幂等重试、冲突 baseline rollback 和 malformed payload 回归通过；外层 coordinator 不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/insert.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::scan_manifest_creation_is_atomic_and_idempotent`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta row verification/insert 与分类计数迁入单批 helper；外层方法缩至 101 行并继续逐 outer batch 独立 commit。幂等 retry、baseline conflict、malformed ADD 回归通过；fmt 与 diff 检查通过。
+
+#### LUX-521：Stage25 最终集成与调用合同审计
+
+范围：运行项目完整检查门，并对 jobs 根长度、事务 coordinator 长度、storage `Database` 方法签名和 application/API/main 调用面做最终审计；把 Manifest discovery transaction coordinator 的内部 lifetime 声明收敛到不超过 150 行。
+
+验收：
+
+- [x] `jobs.rs` 小于 200 行；Stage25 事务 coordinators 不超过 150 行，或在结果中说明 SQL 阶段例外。
+- [x] 基线中的 storage 方法名/签名无丢失或变化；`src/api`、`src/application`、`src/main.rs` 没有因本阶段产生的路由/调用改动。
+- [x] `./scripts/check-all.sh` 全部通过，`git diff --check` 通过，本任务未修改原工作区。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`web/tests/home-page.test.tsx`、本文档。
+
+验证：先确认 Toshiba 挂载，然后以 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `./scripts/check-all.sh`；补充方法签名/调用点 diff、`uname -m` 和 git 状态检查。
+
+结果（2026-10-12）：`jobs.rs` 28 行；`commit_manifest_discovery_transaction` 完整声明块 150 行（函数体 146 行）。此前收敛的 reconciliation、Manifest diff、delta insert、create/retry coordinator 也均不超过 150 行。基线 `b08bdcf4` 的 186 个 storage `Database` 方法在当前模块均存在且签名一致；`src/api`、`src/application`、`src/main.rs` 相对基线无改动；本机 `arm64`。首次最终门禁中的 Rust build、840 个单元测试（20 个按配置忽略）、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 检查、两个 Python 检查和冻结锁文件安装通过；Web gate 在 Vitest `home-page.test.tsx` 的 5 个异步 carousel 断言失败（75/76 文件、576/581 tests）。该文件单独运行 17/17 通过，Web 与基线无差异，且此前一次完整 Web suite 通过 581/581、Web build 通过；首次门禁时第三项验收暂未勾选，后续修复和复验见补记。`git diff --check` 通过。
+
+补记（2026-10-12）：统一将 `home-page.test.tsx` 的异步 UI 等待窗口设为 3 秒，并将轮播点击测试从固定 450ms 睡眠改为等待目标 dot 的 `aria-current` 状态，避免并行测试负载下默认 1 秒等待不足。定向 HomePage 测试 17/17 通过；随后 `./scripts/check-all.sh` 全部通过，包括 840 个 Rust 单元测试、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 与 Python 检查、冻结锁文件安装、Web Node 136/136、Vitest 581/581 和 Web production build。本任务未修改原工作区文件；该工作区的 `test` HEAD 在本轮执行期间从 `bc9fd6ee` 前进到 `dcda7345`，现存未提交和未跟踪文件仍保留。
+
+#### LUX-522：确保阻塞 metadata 测试总能释放 FIFO
+
+范围：修正 scanned-metadata integration tests 的阻塞 NFO/poster FIFO 清理边界。先保存 NFO 解锁前的观测结果，再无论查询成功或失败都释放 FIFO；poster fixture 通过 guard 在提前返回时写入并移除 FIFO，避免 Tokio runtime shutdown 等待阻塞 reader。
+
+验收：
+
+- [x] snapshot 查询失败时也执行 FIFO release，Tokio runtime shutdown 不再遗留阻塞 reader。
+- [x] scan 已在 NFO 解锁前结束时不重复 poll JoinHandle；未结束时仍在释放后等待 scan。
+- [x] poster 阻塞与取消用例在正常和提前退出路径都释放 FIFO，失败断言不会卡住测试进程。
+- [x] 独立阻塞 NFO 回归通过，原有 poster-before-NFO 与 scan-before-NFO 断言保留。
+
+预计文件：`tests/scanned_metadata.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanned_metadata manifest_scan_indexes_poster_while_local_nfo_is_blocked`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：snapshot queries 改为先收集结果，随后总是释放 FIFO，再传播查询错误；通过 timeout 结果避免对已完成 JoinHandle 二次 poll。poster 阻塞/取消测试共用释放 guard，在 `Drop` 中打开读写 FIFO、写入 fixture 并移除路径。独立 NFO 用例通过；完整 `scanned_metadata` 23 passed、`scanning_jobs` 81 passed，fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
