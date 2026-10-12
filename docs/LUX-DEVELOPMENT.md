@@ -10492,6 +10492,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：1,200 余行 jobs 单测从 `jobs.rs` 移入 `jobs/tests.rs`，以 `#[path]` 保持原测试名称空间及私有测试 helper 访问。迁移前后均为 14 passed、1 项 PostgreSQL 用例 ignored；fmt 和 `git diff --check` 通过。
 
+#### LUX-491：拆分 STRM probe 与关机取消存储逻辑
+
+范围：将 STRM probe job 的创建、领取、查询、进度、取消与终结操作移入 `jobs/strm_probe.rs`；将覆盖多类后台 job 的统一关机取消移入 `jobs/shutdown.rs`。关机取消事务与提交后 legacy scan event 顺序保持。
+
+验收：
+
+- [x] STRM probe persistence 与关机取消不再位于 `jobs.rs`。
+- [x] `Database` 方法签名、取消 fencing、关机错误码、单事务更新及提交后事件写入顺序保持。
+- [x] STRM、shutdown 与 jobs 单测通过，fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --test strm_probe --test strm_probe_api --test shutdown_jobs` 与 jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/strm_probe.rs`、`src/storage/jobs/shutdown.rs`、本文档。
+
+结果（2026-10-12）：11 个 STRM job 方法移入 `jobs/strm_probe.rs`；原子关机取消方法和错误码移入 `jobs/shutdown.rs`。核对了 main shutdown、管理员列表与 application probe 的调用路径。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`shutdown_jobs` 1 项、`strm_probe` 2 项、`strm_probe_api` 1 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
