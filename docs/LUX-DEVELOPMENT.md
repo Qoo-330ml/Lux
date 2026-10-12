@@ -10732,6 +10732,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：Manifest pending delta 读取、applied removal 计数和单批 delta apply 移入 `scan/manifest/apply.rs`；apply page limit 随模块迁移。active job/cancel fencing、delta CAS、filesystem/media mutations、target writes 与 progress checkpoint 仍在原 transaction。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-506：抽离 Manifest discovery 输入校验
+
+范围：把多 chunk 输入合并、跨 job/root 检查、路径/entry 校验、positive/unchanged/seen 路径唯一性和 baseline 校验移入 `manifest/discovery/input.rs`。结果带回已验证的借用数据和查找集合供原事务编排使用。
+
+验收：
+
+- [x] discovery coordinator 只接收已完成结构校验的输入，非法与空输入在打开事务前返回。
+- [x] 错误类型/原因及检查顺序保持，输入顺序、去重规则和 collection 内容保持。
+- [x] 既有 Manifest 输入/取消回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/input.rs`、本文档。
+
+结果（2026-10-12）：chunk 合并、path/entry 验证、positive/unchanged/seen 身份唯一性及 baseline 检查移入 `ManifestDiscoveryInput::collect`。invalid/empty 输入仍在开启 transaction 前返回，原错误原因和检查顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

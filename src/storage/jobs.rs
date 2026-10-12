@@ -10,6 +10,8 @@ use local_metadata::escape_sql_like_pattern;
 #[path = "jobs/scan.rs"]
 mod scan;
 #[cfg(test)]
+use scan::prune_sidecar_directories;
+#[cfg(test)]
 use scan::sidecar_target_query;
 #[path = "jobs/shutdown.rs"]
 mod shutdown;
