@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -86,12 +86,24 @@ export function MediaDetailPage() {
       : isEpisode
         ? item.data?.parentId ?? undefined
         : undefined;
-  const episodes = useQuery({
+  const episodes = useInfiniteQuery({
     queryKey: queryKeys.children(episodeSeriesId ?? itemId, "EPISODE", episodeSeasonId),
-    queryFn: () => api.children(episodeSeriesId ?? itemId, { itemType: "EPISODE", seasonId: episodeSeasonId }),
+    queryFn: ({ pageParam }) => api.children(episodeSeriesId ?? itemId, {
+      page: pageParam,
+      itemType: "EPISODE",
+      seasonId: episodeSeasonId,
+    }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      const page = lastPage.page ?? 1;
+      const pageSize = lastPage.pageSize ?? 100;
+      const total = lastPage.total ?? 0;
+      return page * pageSize < total ? page + 1 : undefined;
+    },
     enabled: Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
+  const episodeItems = episodes.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const episodeQueryEnabled = Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode);
   const episodeLookupPending = (isSeries && seasons.isPending) || (episodes.isPending && episodeQueryEnabled);
   const sources = item.data?.mediaSources ?? [];
@@ -103,7 +115,7 @@ export function MediaDetailPage() {
     setSelectedSubtitleStreamIndex(defaultStreamIndex(source, "SUBTITLE"));
   }, [source?.id]);
   const nextPlayableEpisodeId = !source && (isSeries || isSeason)
-    ? selectNextPlayableEpisode(episodes.data?.items ?? [])?.id
+    ? selectNextPlayableEpisode(episodeItems)?.id
     : undefined;
 
   useEffect(() => {
@@ -397,9 +409,15 @@ export function MediaDetailPage() {
             {isSeries ? (
               singleSeason ? (
                 <SeasonEpisodes
-                  episodes={episodes.data?.items ?? []}
+                  episodes={episodeItems}
+                  total={episodes.data?.pages[0]?.total}
                   seasonNumber={singleSeason.parentIndexNumber}
                   episodesPending={episodes.isPending}
+                  hasNextPage={episodes.hasNextPage}
+                  isFetchingNextPage={episodes.isFetchingNextPage}
+                  isFetchNextPageError={episodes.isFetchNextPageError}
+                  error={episodes.error}
+                  onLoadMore={() => void episodes.fetchNextPage()}
                 />
               ) : (
                 <SeriesChildren
@@ -408,8 +426,8 @@ export function MediaDetailPage() {
                 />
               )
             ) : null}
-            {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
-            {isEpisode ? <EpisodeRail episodes={episodes.data?.items ?? []} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+            {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
+            {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
           </div>
           <div className="lux-detail-cast">
             <MediaCast actors={media.actors ?? []} />
@@ -831,20 +849,55 @@ function SeriesChildren({
   );
 }
 
-function SeasonEpisodes({ episodes, seasonNumber, episodesPending }: { episodes: MediaItem[]; seasonNumber?: number | null; episodesPending: boolean }) {
+function SeasonEpisodes({
+  episodes,
+  total,
+  seasonNumber,
+  episodesPending,
+  hasNextPage,
+  isFetchingNextPage,
+  isFetchNextPageError,
+  error,
+  onLoadMore,
+}: {
+  episodes: MediaItem[];
+  total?: number;
+  seasonNumber?: number | null;
+  episodesPending: boolean;
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+  isFetchNextPageError: boolean;
+  error: Error | null;
+  onLoadMore: () => void;
+}) {
   return (
     <section className="lux-season-episodes" aria-labelledby="season-episodes-heading">
       <div className="lux-section-heading">
         <h2 id="season-episodes-heading">单集</h2>
-        <span>{episodes.length} 集</span>
+        <span>{total ?? episodes.length} 集</span>
       </div>
       {episodesPending ? <p className="lux-muted-copy">正在加载单集…</p> : null}
+      {error && !isFetchNextPageError ? <p className="lux-error-copy" role="alert">单集加载失败：{error.message}</p> : null}
       {!episodesPending && episodes.length ? (
         <div className="lux-season-episode-list" role="list">
           {episodes.map((episode, index) => <SeasonEpisodeRow episode={episode} seasonNumber={seasonNumber} fallbackNumber={index + 1} key={episode.id} />)}
         </div>
       ) : null}
-      {!episodesPending && !episodes.length ? <p className="lux-muted-copy">这个季度还没有可播放的单集。</p> : null}
+      {isFetchNextPageError ? <p className="lux-error-copy" role="alert">加载更多单集失败：{error?.message || "请重试"}</p> : null}
+      {!episodesPending && !episodes.length && !error ? <p className="lux-muted-copy">这个季度还没有可播放的单集。</p> : null}
+      {hasNextPage ? (
+        <div className="lux-person-works-actions">
+          <button
+            className="lux-button lux-button-secondary"
+            type="button"
+            data-action="load-more-episodes"
+            onClick={onLoadMore}
+            disabled={isFetchingNextPage}
+          >
+            {isFetchingNextPage ? "加载中…" : isFetchNextPageError ? "重试加载" : `加载更多单集（${Math.max(0, (total ?? episodes.length) - episodes.length)} 集）`}
+          </button>
+        </div>
+      ) : null}
     </section>
   );
 }
