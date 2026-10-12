@@ -1,4 +1,6 @@
 use super::*;
+#[path = "manifest/diff.rs"]
+mod diff;
 
 #[derive(Default)]
 struct ManifestDiscoveryPositiveIndexResult<'a> {

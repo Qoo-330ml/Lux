@@ -10700,6 +10700,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：Manifest discovery commit/chunk 与正向媒体索引步骤移入 `manifest/discovery.rs`、`manifest/indexes.rs`；共享发现结果类型与 file identity helper 放在 Manifest 根。discovery、index、sidecar targets 与 local metadata outbox 继续复用同一 transaction，顺序及 progress/checkpoint 更新保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-504：拆分 Manifest 差异计算和读取
+
+范围：将 Manifest 目录/文件系统基线、removal candidates、差异状态计算与 delta 写入移入 `manifest/diff.rs`。差异顺序、root completeness 条件和 retryable state 保持。
+
+验收：
+
+- [x] Manifest diff/query 方法与差异批次常量不再位于 `jobs.rs`。
+- [x] unchanged、ADD/CHANGE/REAPPEARED/REMOVE 分类、movie identity 检查和 root completeness 条件保持。
+- [x] Manifest diff、root 离线/替换和扫描回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/diff.rs`、本文档。
+
+结果（2026-10-12）：10 个 Manifest directory/root baseline/removal candidate/diff/insert delta 方法与 diff batch limit 移入 `scan/manifest/diff.rs`。unchanged 与 ADD/CHANGE/REAPPEARED/REMOVE 判定、root completeness、movie variant identity 和原查询顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
