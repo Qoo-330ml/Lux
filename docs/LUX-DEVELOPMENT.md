@@ -10956,6 +10956,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：Manifest full-scan root registration/legacy target copy 与 DISCOVERING retry reset 移入 state transaction 子模块；外层方法保留 transaction owner。full scan/LITE 与 persisted frontier resume 回归各 1 passed；fmt 与 diff 检查通过。
 
+#### LUX-520：拆分 Manifest delta 幂等批次写入
+
+范围：将一组 delta 的 baseline conflict 检查、bounded row insert 和 kind 计数提取为 transaction 内 helper。外层 `insert_scan_manifest_deltas` 保留 payload 校验、每个 transaction batch 的 READY_TO_DIFF 锁、counter 更新和提交。
+
+验收：
+
+- [x] root/path 唯一性、delta payload 校验、retry baseline equality 与错误语义不变。
+- [x] inner insert chunk、outer transaction batch 和 ADD/CHANGE/REMOVE/REAPPEARED 计数/绑定顺序不变。
+- [x] 同输入幂等重试、冲突 baseline rollback 和 malformed payload 回归通过；外层 coordinator 不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/insert.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::scan_manifest_creation_is_atomic_and_idempotent`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta row verification/insert 与分类计数迁入单批 helper；外层方法缩至 101 行并继续逐 outer batch 独立 commit。幂等 retry、baseline conflict、malformed ADD 回归通过；fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
