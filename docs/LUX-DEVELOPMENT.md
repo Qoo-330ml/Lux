@@ -10540,6 +10540,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：15 个 local metadata batch/outbox 方法移入 `jobs/local_metadata/batches.rs`；写入批次限制归入 owning module，source 上限和错误长度限制留在 local metadata 根供其调用者共享。Manifest outbox transaction helper 限定 repository 子树可见，Manifest 调用仍复用原事务。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanning_jobs` 81 项全部通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-494：拆分本地 metadata 来源读取
+
+范围：将扫描 metadata source 列表、当前来源 identity 检查及 SQL LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`。分页、来源身份批次大小和查询过滤保持。
+
+验收：
+
+- [x] source 查询与 identity 校验不再位于 `jobs.rs`。
+- [x] scanner 与 metadata application 的 `Database` 调用签名及来源筛选结果保持。
+- [x] 来源身份单测、metadata path 与扫描 metadata 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::local_metadata_completeness_reuses_current_source_identities_and_expands_episode_hierarchy`、`cargo test --locked --test metadata_paths --test scanned_metadata --test scanned_series_metadata`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/sources.rs`、本文档。
+
+结果（2026-10-12）：两项 local metadata source/identity 方法、来源身份批次上限与 LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`；原 `Database` 签名保持。因 LIKE 转义还用于 jobs 内另一个既有目录查询，由 local metadata 根按 repository 子树 re-export 同一 helper。核对了 scanner、metadata application 和 jobs tests 调用点。身份单测 1 项、`metadata_paths` 8 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

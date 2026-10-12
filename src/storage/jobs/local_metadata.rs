@@ -8,6 +8,9 @@ mod backfill;
 pub(crate) use backfill::StoredScanLocalMetadataBackfillPage;
 #[path = "local_metadata/batches.rs"]
 mod batches;
+#[path = "local_metadata/sources.rs"]
+mod sources;
+pub(super) use sources::escape_sql_like_pattern;
 
 fn parse_scan_local_metadata_non_retryable_item_ids(
     value: &str,
