@@ -10974,33 +10974,36 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-521：Stage25 最终集成与调用合同审计
 
-范围：运行项目完整检查门，并对 jobs 根长度、事务 coordinator 长度、storage `Database` 方法签名和 application/API/main 调用面做最终审计。
+范围：运行项目完整检查门，并对 jobs 根长度、事务 coordinator 长度、storage `Database` 方法签名和 application/API/main 调用面做最终审计；把 Manifest discovery transaction coordinator 的内部 lifetime 声明收敛到不超过 150 行。
 
 验收：
 
-- [ ] `jobs.rs` 小于 200 行；Stage25 事务 coordinators 不超过 150 行，或在结果中说明 SQL 阶段例外。
-- [ ] 基线中的 storage 方法名/签名无丢失或变化；`src/api`、`src/application`、`src/main.rs` 没有因本阶段产生的路由/调用改动。
+- [x] `jobs.rs` 小于 200 行；Stage25 事务 coordinators 不超过 150 行，或在结果中说明 SQL 阶段例外。
+- [x] 基线中的 storage 方法名/签名无丢失或变化；`src/api`、`src/application`、`src/main.rs` 没有因本阶段产生的路由/调用改动。
 - [ ] `./scripts/check-all.sh` 全部通过，`git diff --check` 通过，原工作区保持不变。
 
-预计文件：本文档。
+预计文件：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、本文档。
 
 验证：先确认 Toshiba 挂载，然后以 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `./scripts/check-all.sh`；补充方法签名/调用点 diff、`uname -m` 和 git 状态检查。
 
-#### LUX-522：确保阻塞 NFO 测试总能释放 FIFO
+结果（2026-10-12）：`jobs.rs` 28 行；`commit_manifest_discovery_transaction` 完整声明块 150 行（函数体 146 行）。此前收敛的 reconciliation、Manifest diff、delta insert、create/retry coordinator 也均不超过 150 行。基线 `b08bdcf4` 的 186 个 storage `Database` 方法在当前模块均存在且签名一致；`src/api`、`src/application`、`src/main.rs` 相对基线无改动；本机 `arm64`。最终 `check-all.sh` 的 Rust build、840 个单元测试（20 个按配置忽略）、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 检查、两个 Python 检查和冻结锁文件安装通过。Web gate 在 Vitest `home-page.test.tsx` 的 5 个异步 carousel 断言失败（75/76 文件、576/581 tests）；该文件单独运行 17/17 通过，Web 与基线无差异，且先前一次完整 Web suite 通过 581/581、Web build 通过。由于完整聚合 Web gate 未稳定通过，第三项验收保持未勾选；`git diff --check` 通过，原工作区未改动。
 
-范围：修正 scanned-metadata integration test 的阻塞 FIFO 清理边界。先保存 NFO 解锁前的观测结果，再无论查询成功或失败都释放 FIFO；只对仍未完成的 scan handle 执行 await。
+#### LUX-522：确保阻塞 metadata 测试总能释放 FIFO
+
+范围：修正 scanned-metadata integration tests 的阻塞 NFO/poster FIFO 清理边界。先保存 NFO 解锁前的观测结果，再无论查询成功或失败都释放 FIFO；poster fixture 通过 guard 在提前返回时写入并移除 FIFO，避免 Tokio runtime shutdown 等待阻塞 reader。
 
 验收：
 
 - [x] snapshot 查询失败时也执行 FIFO release，Tokio runtime shutdown 不再遗留阻塞 reader。
 - [x] scan 已在 NFO 解锁前结束时不重复 poll JoinHandle；未结束时仍在释放后等待 scan。
+- [x] poster 阻塞与取消用例在正常和提前退出路径都释放 FIFO，失败断言不会卡住测试进程。
 - [x] 独立阻塞 NFO 回归通过，原有 poster-before-NFO 与 scan-before-NFO 断言保留。
 
 预计文件：`tests/scanned_metadata.rs`、本文档。
 
 验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanned_metadata manifest_scan_indexes_poster_while_local_nfo_is_blocked`、fmt 和 `git diff --check`。
 
-结果（2026-10-12）：snapshot queries 改为先收集结果，随后总是释放 FIFO，再传播查询错误；通过 timeout 结果避免对已完成 JoinHandle 二次 poll。阻塞 NFO 回归 1 passed，fmt 与 diff 检查通过。
+结果（2026-10-12）：snapshot queries 改为先收集结果，随后总是释放 FIFO，再传播查询错误；通过 timeout 结果避免对已完成 JoinHandle 二次 poll。poster 阻塞/取消测试共用释放 guard，在 `Drop` 中打开读写 FIFO、写入 fixture 并移除路径。独立 NFO 用例通过；完整 `scanned_metadata` 23 passed、`scanning_jobs` 81 passed，fmt 与 diff 检查通过。
 
 ## 28. 参考资料
 
