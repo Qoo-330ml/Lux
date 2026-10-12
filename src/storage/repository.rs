@@ -31,6 +31,8 @@ mod emby_migration;
 #[path = "jobs.rs"]
 mod jobs;
 pub(crate) use jobs::StoredScanLocalMetadataBackfillPage;
+#[path = "filesystem.rs"]
+mod filesystem;
 #[path = "library.rs"]
 mod library;
 #[path = "library_roots.rs"]

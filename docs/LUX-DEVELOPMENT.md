@@ -10444,6 +10444,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：字幕定位、轨道分页与外部字幕更新移入 `storage/subtitles.rs`，`Database` 方法名和返回映射保持。核对了 Emby/Lux media handlers、管理员 handler 与 storage tests 的原调用点；`subtitles` 1 项回归通过，fmt 和 `git diff --check` 通过。
 
+#### LUX-488：拆分文件系统条目存储操作
+
+范围：将 filesystem entry 查询、移动、批量 observed/restore 与 missing 状态更新移入 `storage/filesystem.rs`。文件系统状态变化仍使用现有的事务入口；reconciliation 对事务内恢复 helper 的调用保持同一事务。
+
+验收：
+
+- [x] 文件系统条目操作不再位于 `jobs.rs`，事务内 helper 可见性限于 storage 子树。
+- [x] 路径、inode、seen/missing 状态和 reconciliation 批次确认语义保持。
+- [x] storage、媒体库/媒体删除与 jobs 单测通过；fmt/build、`git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test storage --test media_deletion --test library_deletion`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/filesystem.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：15 个 filesystem entry 查询/移动/观察/缺失状态方法移入 `storage/filesystem.rs`。reconciliation 调用的批量 restore 和 missing-path helper 仅开放到 repository 子树；媒体移除刷新仍复用 jobs 中的原事务 helper。核对了 API、application、storage 与 tests 调用点。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项、`media_deletion` 1 项、`library_deletion` 1 项通过；fmt 和 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
