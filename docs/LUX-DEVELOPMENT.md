@@ -10828,6 +10828,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：apply preparation 提取事务内 active-state 检查、root 查询、四类路径映射、ADD observation 校验、filesystem claim 及首次 media insert；Delta 循环仍消费原 claim set。ADD race 1 passed，450 项 bounded apply 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 对外方法名/签名保持。
 
+#### LUX-512：提取 Manifest delta apply CAS 阶段
+
+范围：将单条 ADD/CHANGE/REAPPEARED/REMOVE dispatch 与 filesystem CAS 操作从事务入口移入 `apply/deltas.rs`，返回 delta 状态和后续副作用所需路径集合。继续由原方法持有 transaction。
+
+验收：
+
+- [x] ADD claim、change/reappear baseline/fingerprint CAS、remove CAS 与冲突/unstable 分类保持。
+- [x] delta 更新的输入顺序、计数和 batch 上限不变；helper 不另开/提交 transaction。
+- [x] newer incremental write、bounded apply 和取消后恢复回归通过；storage 调用面不变。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/deltas.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry`、`cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、`cargo test --locked --test scanning_jobs cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta dispatch/CAS 阶段移入事务内 helper，状态结果与 paths/update payload 显式返回给 coordinator；同一 batch transaction 继续负责后续 delta state、targets 与 job progress。incremental CAS、450 项 bounded apply、cancel/resume 三项均 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 名称/签名不变。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
