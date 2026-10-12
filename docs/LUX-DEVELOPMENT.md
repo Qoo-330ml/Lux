@@ -10860,6 +10860,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：delta persistence、target/removal side effects 与 progress checkpoint 移入 finalizer；CASE placeholders 和绑定顺序未改，取消检查仍在 job progress UPDATE，transaction commit 仍仅在入口。bounded apply 与 cancel/resume 均 1 passed；fmt 与 diff 检查通过。
 
+#### LUX-514：拆分 Manifest diff completion 查询
+
+范围：把 `finish_scan_manifest_diff` 中按 lite/v2/v3/legacy 分支统计 remaining changes，以及 legacy unchanged count 的查询提取到 `diff/finish.rs`。主方法保留 state transition、job progress/cancel fence 和 transaction commit。
+
+验收：
+
+- [x] 四种 workflow/version 路径及 SQL bind 顺序、remaining-change 条件不变。
+- [x] 未完成变化时仍不推进 `APPLYING`；成功 completion 仍要求 `RUNNING AND cancel_requested = 0`。
+- [x] legacy observation 与 v3/LITE 大目录回归通过；completion coordinator 不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_uses_latest_directory_observation_when_diffing_file_paths`、`cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：remaining-change 与 unchanged 统计查询移入 `diff/finish.rs`，`finish_scan_manifest_diff` 协调函数缩至 104 行；UPDATE 顺序、transaction guard、cancel fence 和 commit 位置保持。observation regression 与 v3/LITE 大目录两次扫描均 1 passed；fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
