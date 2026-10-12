@@ -10588,6 +10588,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：FILL_MISSING 请求快照、排队 job 合并、容量复用、item 插入与去重辅助状态移入 `metadata_reidentify/fill_missing.rs`。`lock_media_items_for_update` 移入 repository 事务工具，保留 ID 排序、去重、分批和 PostgreSQL `FOR UPDATE` 顺序；metadata application 与 fill_missing 继续使用同一方法。队列合并 2 项、请求快照退避 1 项、metadata 原子性 1 项、`reidentify` 20 项、`metadata_cancel` 3 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-497：拆分 scan job 生命周期
+
+范围：将 scan job 创建、查找/列表、活动状态、领取/进度、取消、终结和 postprocessing 状态迁入 `jobs/scan/lifecycle.rs`。现有 application/API/repository 调用使用同一 `Database` 方法。
+
+验收：
+
+- [x] scan job lifecycle 实现不再位于 `jobs.rs`。
+- [x] 状态筛选、取消 fencing、完成/后处理重试及管理端列表行为保持。
+- [x] scanning/shutdown 集成测试、fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs --test shutdown_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/lifecycle.rs`、本文档。
+
+结果（2026-10-12）：scan job 创建、自动匹配设置、查询/list/active、claim/progress、取消、完成、postprocessing 状态与重试等生命周期方法移入 `scan/lifecycle.rs`。外部 `Database` 方法签名及管理端/application 调用不变。`scanning_jobs` 81 项与 `shutdown_jobs` 1 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
