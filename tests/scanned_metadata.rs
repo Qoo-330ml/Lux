@@ -770,63 +770,93 @@ async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
     let scan_jobs = jobs.clone();
     let mut scan = tokio::spawn(async move { scan_jobs.run_to_completion(&job_id, 1, None).await });
 
-    let poster_visible_before_nfo = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let poster_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM item_images
-                 WHERE item_images.local_path LIKE '%01 Fast NFO (2024)/poster.jpg'
-                   AND item_images.image_type = 'POSTER'",
-            )
-            .fetch_one(database.pool())
-            .await?;
-            let local_batch_running: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM scan_local_metadata_batches
-                 WHERE job_id = ? AND status = 'RUNNING'",
-            )
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-            if poster_count > 0 && local_batch_running > 0 {
-                return Ok::<_, sqlx::Error>(true);
+    let observations = async {
+        let poster_visible_before_nfo = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let poster_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM item_images
+                     WHERE item_images.local_path LIKE '%01 Fast NFO (2024)/poster.jpg'
+                       AND item_images.image_type = 'POSTER'",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                let local_batch_running: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM scan_local_metadata_batches
+                     WHERE job_id = ? AND status = 'RUNNING'",
+                )
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+                if poster_count > 0 && local_batch_running > 0 {
+                    return Ok::<_, sqlx::Error>(true);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or(Ok(false))?;
+        })
+        .await
+        .unwrap_or(Ok(false))?;
 
-    let queue_state: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM scan_local_metadata_batches
-         WHERE job_id = ? GROUP BY status ORDER BY status",
-    )
-    .bind(&job.id)
-    .fetch_all(database.pool())
-    .await?;
-    let scan_state: (String, String) =
-        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-    let image_paths: Vec<(String, String)> = sqlx::query_as(
-        "SELECT item_images.image_type, item_images.local_path FROM item_images
-         JOIN media_items ON media_items.id = item_images.item_id
-         ORDER BY media_items.sort_title LIMIT 10",
-    )
-    .fetch_all(database.pool())
-    .await?;
-    let early_claim_states: Vec<String> =
-        sqlx::query_scalar("SELECT state FROM test_local_metadata_claim_states")
-            .fetch_all(database.pool())
-            .await?;
-    let scan_finished_before_nfo_unblocked =
-        tokio::time::timeout(Duration::from_secs(30), &mut scan)
-            .await
-            .is_ok();
+        let queue_state: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM scan_local_metadata_batches
+             WHERE job_id = ? GROUP BY status ORDER BY status",
+        )
+        .bind(&job.id)
+        .fetch_all(database.pool())
+        .await?;
+        let scan_state: (String, String) =
+            sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        let image_paths: Vec<(String, String)> = sqlx::query_as(
+            "SELECT item_images.image_type, item_images.local_path FROM item_images
+             JOIN media_items ON media_items.id = item_images.item_id
+             ORDER BY media_items.sort_title LIMIT 10",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        let early_claim_states: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM test_local_metadata_claim_states")
+                .fetch_all(database.pool())
+                .await?;
+        let scan_finished_before_nfo_unblocked =
+            tokio::time::timeout(Duration::from_secs(30), &mut scan)
+                .await
+                .is_ok();
 
-    // Release the NFO read whether the assertion passes or fails, so the worker can exit.
-    tokio::fs::write(&nfo_path, b"<movie><title>Slow NFO</title></movie>").await?;
-    if !scan_finished_before_nfo_unblocked {
-        scan.await??;
+        Ok::<_, Box<dyn std::error::Error>>((
+            poster_visible_before_nfo,
+            queue_state,
+            scan_state,
+            image_paths,
+            early_claim_states,
+            scan_finished_before_nfo_unblocked,
+        ))
+    }
+    .await;
+    // Release the FIFO before propagating any snapshot-query error so a blocking
+    // NFO reader cannot hold Tokio runtime shutdown open.
+    let nfo_release = tokio::fs::write(&nfo_path, b"<movie><title>Slow NFO</title></movie>").await;
+    let scan_finished_before_nfo_unblocked = observations
+        .as_ref()
+        .map(|snapshot| snapshot.5)
+        .unwrap_or(false);
+    let scan_result = if scan_finished_before_nfo_unblocked {
+        None
+    } else {
+        Some(scan.await)
+    };
+    let (
+        poster_visible_before_nfo,
+        queue_state,
+        scan_state,
+        image_paths,
+        early_claim_states,
+        scan_finished_before_nfo_unblocked,
+    ) = observations?;
+    nfo_release?;
+    if let Some(scan_result) = scan_result {
+        scan_result??;
     }
     wait_for_local_metadata_batches(&database, &job.id).await?;
 

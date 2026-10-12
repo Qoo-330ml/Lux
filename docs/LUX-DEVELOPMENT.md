@@ -10972,6 +10972,36 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：delta row verification/insert 与分类计数迁入单批 helper；外层方法缩至 101 行并继续逐 outer batch 独立 commit。幂等 retry、baseline conflict、malformed ADD 回归通过；fmt 与 diff 检查通过。
 
+#### LUX-521：Stage25 最终集成与调用合同审计
+
+范围：运行项目完整检查门，并对 jobs 根长度、事务 coordinator 长度、storage `Database` 方法签名和 application/API/main 调用面做最终审计。
+
+验收：
+
+- [ ] `jobs.rs` 小于 200 行；Stage25 事务 coordinators 不超过 150 行，或在结果中说明 SQL 阶段例外。
+- [ ] 基线中的 storage 方法名/签名无丢失或变化；`src/api`、`src/application`、`src/main.rs` 没有因本阶段产生的路由/调用改动。
+- [ ] `./scripts/check-all.sh` 全部通过，`git diff --check` 通过，原工作区保持不变。
+
+预计文件：本文档。
+
+验证：先确认 Toshiba 挂载，然后以 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `./scripts/check-all.sh`；补充方法签名/调用点 diff、`uname -m` 和 git 状态检查。
+
+#### LUX-522：确保阻塞 NFO 测试总能释放 FIFO
+
+范围：修正 scanned-metadata integration test 的阻塞 FIFO 清理边界。先保存 NFO 解锁前的观测结果，再无论查询成功或失败都释放 FIFO；只对仍未完成的 scan handle 执行 await。
+
+验收：
+
+- [x] snapshot 查询失败时也执行 FIFO release，Tokio runtime shutdown 不再遗留阻塞 reader。
+- [x] scan 已在 NFO 解锁前结束时不重复 poll JoinHandle；未结束时仍在释放后等待 scan。
+- [x] 独立阻塞 NFO 回归通过，原有 poster-before-NFO 与 scan-before-NFO 断言保留。
+
+预计文件：`tests/scanned_metadata.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanned_metadata manifest_scan_indexes_poster_while_local_nfo_is_blocked`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：snapshot queries 改为先收集结果，随后总是释放 FIFO，再传播查询错误；通过 timeout 结果避免对已完成 JoinHandle 二次 poll。阻塞 NFO 回归 1 passed，fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
