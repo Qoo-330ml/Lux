@@ -10980,13 +10980,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 - [x] `jobs.rs` 小于 200 行；Stage25 事务 coordinators 不超过 150 行，或在结果中说明 SQL 阶段例外。
 - [x] 基线中的 storage 方法名/签名无丢失或变化；`src/api`、`src/application`、`src/main.rs` 没有因本阶段产生的路由/调用改动。
-- [ ] `./scripts/check-all.sh` 全部通过，`git diff --check` 通过，原工作区保持不变。
+- [x] `./scripts/check-all.sh` 全部通过，`git diff --check` 通过，本任务未修改原工作区。
 
-预计文件：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、本文档。
+预计文件：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`web/tests/home-page.test.tsx`、本文档。
 
 验证：先确认 Toshiba 挂载，然后以 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `./scripts/check-all.sh`；补充方法签名/调用点 diff、`uname -m` 和 git 状态检查。
 
-结果（2026-10-12）：`jobs.rs` 28 行；`commit_manifest_discovery_transaction` 完整声明块 150 行（函数体 146 行）。此前收敛的 reconciliation、Manifest diff、delta insert、create/retry coordinator 也均不超过 150 行。基线 `b08bdcf4` 的 186 个 storage `Database` 方法在当前模块均存在且签名一致；`src/api`、`src/application`、`src/main.rs` 相对基线无改动；本机 `arm64`。最终 `check-all.sh` 的 Rust build、840 个单元测试（20 个按配置忽略）、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 检查、两个 Python 检查和冻结锁文件安装通过。Web gate 在 Vitest `home-page.test.tsx` 的 5 个异步 carousel 断言失败（75/76 文件、576/581 tests）；该文件单独运行 17/17 通过，Web 与基线无差异，且先前一次完整 Web suite 通过 581/581、Web build 通过。由于完整聚合 Web gate 未稳定通过，第三项验收保持未勾选；`git diff --check` 通过，原工作区未改动。
+结果（2026-10-12）：`jobs.rs` 28 行；`commit_manifest_discovery_transaction` 完整声明块 150 行（函数体 146 行）。此前收敛的 reconciliation、Manifest diff、delta insert、create/retry coordinator 也均不超过 150 行。基线 `b08bdcf4` 的 186 个 storage `Database` 方法在当前模块均存在且签名一致；`src/api`、`src/application`、`src/main.rs` 相对基线无改动；本机 `arm64`。首次最终门禁中的 Rust build、840 个单元测试（20 个按配置忽略）、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 检查、两个 Python 检查和冻结锁文件安装通过；Web gate 在 Vitest `home-page.test.tsx` 的 5 个异步 carousel 断言失败（75/76 文件、576/581 tests）。该文件单独运行 17/17 通过，Web 与基线无差异，且此前一次完整 Web suite 通过 581/581、Web build 通过；首次门禁时第三项验收暂未勾选，后续修复和复验见补记。`git diff --check` 通过。
+
+补记（2026-10-12）：统一将 `home-page.test.tsx` 的异步 UI 等待窗口设为 3 秒，并将轮播点击测试从固定 450ms 睡眠改为等待目标 dot 的 `aria-current` 状态，避免并行测试负载下默认 1 秒等待不足。定向 HomePage 测试 17/17 通过；随后 `./scripts/check-all.sh` 全部通过，包括 840 个 Rust 单元测试、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 与 Python 检查、冻结锁文件安装、Web Node 136/136、Vitest 581/581 和 Web production build。本任务未修改原工作区文件；该工作区的 `test` HEAD 在本轮执行期间从 `bc9fd6ee` 前进到 `dcda7345`，现存未提交和未跟踪文件仍保留。
 
 #### LUX-522：确保阻塞 metadata 测试总能释放 FIFO
 
