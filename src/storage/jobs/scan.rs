@@ -1,4 +1,7 @@
 use super::*;
+#[path = "scan/reconciliation.rs"]
+mod reconciliation;
+
 #[path = "scan/targets.rs"]
 mod targets;
 

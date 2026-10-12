@@ -10636,6 +10636,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：21 个 scan target 写入、分页、metadata/thumbnail 状态及查询方法和 sidecar helper 移入 `scan/targets.rs`；Application/API 的 `Database` 调用保持。target/outbox、reconciliation 与 Manifest apply 共用的事务 helper 暂限 repository 子树可见，后续调用方迁移后再收窄。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；target 单查询与 sidecar 多目录查询各 1 项通过；`scanned_metadata` 串行 23 项、`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。两目标合并运行时 FIFO 海报用例超过 60 秒；单独运行 1 项和 `scanned_metadata -- --test-threads=1` 全部 23 项均通过。
 
+#### LUX-500：拆分 reconciliation 存储
+
+范围：将 reconciliation snapshot 读取、目录发现、文件批次事务、缺失确认、root page 完成与存在状态查询移入 `jobs/scan/reconciliation.rs`。共用 target/filesystem/media-source helper 沿用原 transaction；不改变根可用性 fencing 和重试 checkpoint。
+
+验收：
+
+- [x] reconciliation 存储方法不再位于 `jobs.rs`。
+- [x] root 丢失保护、批次回滚、文件确认/缺失计数、checkpoint 与 target 登记仍在原事务中。
+- [x] reconciliation 原子性单测和扫描集成回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::repository_tests::reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_entries`、`cargo test --locked --test scanning_jobs --test mixed_scanner --test watch`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/reconciliation.rs`、本文档。
+
+结果（2026-10-12）：15 个 reconciliation snapshot/discovery/批次提交/root page 方法移入 `scan/reconciliation.rs`。reconciliation 的 filesystem restore、media removal refresh 与 target 登记继续调用其原 transaction helper；外部 `Database` 方法名保持。reconciliation 原子性单测 1 项、`mixed_scanner` 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
