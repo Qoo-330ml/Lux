@@ -10460,6 +10460,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：15 个 filesystem entry 查询/移动/观察/缺失状态方法移入 `storage/filesystem.rs`。reconciliation 调用的批量 restore 和 missing-path helper 仅开放到 repository 子树；媒体移除刷新仍复用 jobs 中的原事务 helper。核对了 API、application、storage 与 tests 调用点。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项、`media_deletion` 1 项、`library_deletion` 1 项通过；fmt 和 `git diff --check` 通过。
 
+#### LUX-489：拆分媒体源存储操作
+
+范围：将媒体源查询、重分配、探测状态、原子删除及关联媒体条目移除/恢复移入 `storage/media_sources.rs`。删除、恢复及 removal refresh 继续接收并使用原事务；媒体源删除批量上限与其回归保持在所属模块。
+
+验收：
+
+- [x] 媒体源写入/删除和关联媒体状态维护不再位于 `jobs.rs`。
+- [x] `Database` 方法名、批量边界、默认来源约束、级联 item 清理和回滚语义保持。
+- [x] 媒体源原子删除单测、媒体删除与 storage 集成测试、fmt/build 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test media_deletion --test storage`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/media_sources.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：媒体源查询、STRM/variant 更新、item 重分配、探测状态、恢复、删除与关联媒体移除操作移入 `storage/media_sources.rs`；删除批次上限随模块迁移，单测仍从 jobs 测试入口使用该合同。原子事务和批次常量保持。核对了应用层删除、扫描、catalog 与 `storage/media.rs` 的方法调用。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`media_deletion` 1 项及 `storage` 52 项通过；fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -33,6 +33,9 @@ mod jobs;
 pub(crate) use jobs::StoredScanLocalMetadataBackfillPage;
 #[path = "filesystem.rs"]
 mod filesystem;
+#[path = "media_sources.rs"]
+mod media_sources;
+
 #[path = "library.rs"]
 mod library;
 #[path = "library_roots.rs"]
