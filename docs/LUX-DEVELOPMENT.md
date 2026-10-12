@@ -10812,6 +10812,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：`commit_manifest_discovery_transaction` 为 149 行，transaction 仍由 `commit_scan_manifest_discovery_chunks` 单点创建和提交；路径查询、index/outbox 与 observation 子步骤独立。bounded full scan 回归 1 passed；格式和 diff 检查通过。搜索确认 application/scanner 与 storage tests 仍引用相同 `commit_scan_manifest_discovery_chunk(s)` 方法。
 
+#### LUX-511：提取 Manifest apply guard 与 ADD preparation
+
+范围：将 delta apply 的 active job/manifest/root 状态读取、ADD observation 验证、filesystem entry claim 与首次 movie/episode materialization 移入私有 preparation 步骤。保持校验顺序和共享 apply transaction。
+
+验收：
+
+- [x] active job、manifest state、root state 查询及冲突文案/次序保持。
+- [x] ADD 只 claim 有完整 observation 且 root complete 的路径；未 claim 的媒体不 materialize。
+- [x] requested bounded transaction batch 与 incremental ADD race 回归通过；storage 方法签名不变。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/prepare.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_add_conflicts_with_incremental_entry_claimed_after_diff`、`cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：apply preparation 提取事务内 active-state 检查、root 查询、四类路径映射、ADD observation 校验、filesystem claim 及首次 media insert；Delta 循环仍消费原 claim set。ADD race 1 passed，450 项 bounded apply 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 对外方法名/签名保持。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
