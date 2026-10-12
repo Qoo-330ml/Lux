@@ -10876,6 +10876,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：remaining-change 与 unchanged 统计查询移入 `diff/finish.rs`，`finish_scan_manifest_diff` 协调函数缩至 104 行；UPDATE 顺序、transaction guard、cancel fence 和 commit 位置保持。observation regression 与 v3/LITE 大目录两次扫描均 1 passed；fmt 与 diff 检查通过。
 
+#### LUX-515：拆分 FILL_MISSING request reconciliation
+
+范围：将 active/deferred request snapshot 查询、输入快照分类和 queued/deferred/job 更新分为状态读取、纯计划与持久化步骤。保留调用方 transaction 和现有存储方法签名。
+
+验收：
+
+- [x] Postgres row lock、100 项 query/update chunk、request fingerprint/capabilities 匹配语义不变。
+- [x] 自动 retry/deferred suppression、obsolete snapshot consumption、queued completed-item reopen 与 processed count 下调保持。
+- [x] 剩余请求仍经现有 100-item job coalescing/256-item insert 路径；retry 与 running request 回归通过。
+
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/fill_missing/requests.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::repository_tests::automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_scoped`、`cargo test --locked --lib storage::repository::repository_tests::changed_local_fill_request_during_running_item_is_not_lost`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：request state load、request matching plan 和批量持久化分别成为私有步骤，`enqueue_or_update_fill_missing_requests_in_transaction` 收敛为短编排入口；锁子句、SQL/bind 顺序和 transaction ownership 保持。retry snapshot 与 running request 两项均 1 passed；fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
