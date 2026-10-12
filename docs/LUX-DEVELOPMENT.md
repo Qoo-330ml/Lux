@@ -10604,6 +10604,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：scan job 创建、自动匹配设置、查询/list/active、claim/progress、取消、完成、postprocessing 状态与重试等生命周期方法移入 `scan/lifecycle.rs`。外部 `Database` 方法签名及管理端/application 调用不变。`scanning_jobs` 81 项与 `shutdown_jobs` 1 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-498：拆分增量扫描路径队列
+
+范围：将 incremental path 的单条/批量入队、计数刷新、待处理分页、已处理标记、item ID 读取及队列清理移入 `jobs/scan/incremental.rs`。保留路径去重、处理顺序与每批限制。
+
+验收：
+
+- [x] 增量路径队列与状态存储不再位于 `jobs.rs`。
+- [x] `Database` 方法、队列容量/批次上限、删除及重试行为保持。
+- [x] scanning/watch 与 incremental storage 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs --test watch`、增量 storage 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/incremental.rs`、本文档。
+
+结果（2026-10-12）：7 个 incremental path 入队、分页、处理、ID 查询与清理方法及 100 路径批次上限移入 `scan/incremental.rs`。application/watch/storage 调用仍使用原 `Database` 方法。增量队列 storage 单测 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
