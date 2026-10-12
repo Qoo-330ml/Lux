@@ -10780,6 +10780,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：root checkpoint 序号预留与 observation 批量写入移入 `discovery/checkpoint.rs`，原事务仍由 coordinator 创建、提交；SQL 和 bind 顺序、legacy/v2/v3 序号算法、批次大小和计时边界保持。目录计数转换仍在 frontier completion 前执行。observation 高水位回归 1 passed，大目录/local metadata sequence 回归 1 passed；fmt 与 `git diff --check` 通过。
 
+#### LUX-509：提取 Manifest presence ledger 与 counters checkpoint
+
+范围：将 format-3 generation presence CAS、seen-path ledger upsert 和 manifest/job counters checkpoint 拆为私有步骤。保持 filesystem row 的 ID/path/fingerprint CAS、Postgres/SQLite 更新路径、job cancel fencing 与同事务提交。
+
+验收：
+
+- [x] unchanged filesystem entry 仍按 generation 更新；不匹配的 ID/path/fingerprint 不计为 seen。
+- [x] positive-index paths 与 seen generation paths 仍从 presence ledger 排除，其余路径按原批次 upsert。
+- [x] manifest/job counters、取消 fencing、诊断计数与事务失败回滚语义保持；相关回归与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/jobs/scan/manifest/discovery/counters.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、`cargo test --locked --lib storage::repository::jobs::tests::manifest_discovery_chunk_does_not_complete_directory_after_cancel_request`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：presence CAS/ledger 与 counters/cancel fence 分别迁入独立子模块；SQL、bind 顺序、backend 分支、failure rollback 和 stage diagnostics 统计保持。大目录两次扫描的 generation presence 回归 1 passed，取消回归 1 passed；fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
