@@ -10508,6 +10508,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：11 个 STRM job 方法移入 `jobs/strm_probe.rs`；原子关机取消方法和错误码移入 `jobs/shutdown.rs`。核对了 main shutdown、管理员列表与 application probe 的调用路径。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`shutdown_jobs` 1 项、`strm_probe` 2 项、`strm_probe_api` 1 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-492：拆分本地 metadata backfill 存储
+
+范围：将 backfill page DTO、页大小限制与 root 注册、领取、完成、失败和中断恢复方法迁入 `jobs/local_metadata/backfill.rs`。`StoredScanLocalMetadataBackfillPage` 继续通过 repository 的现有 crate 内导出供 application 使用；本地 metadata item 排除序列化 helper 留在 local metadata 根模块供批次与 backfill 共用。
+
+验收：
+
+- [x] backfill 数据类型、限制与方法不再由 `jobs.rs` 实现。
+- [x] repository 现有 DTO 导出路径、游标 fencing、页大小与重试/恢复状态保持。
+- [x] backfill root 幂等和有界可恢复分页回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::tests::scan_local_metadata_backfill_roots_register_in_one_query`、`cargo test --locked --lib storage::repository::tests::progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/backfill.rs`、本文档。
+
+结果（2026-10-12）：backfill DTO、page size、排除项校验 helper 和 8 个 root/分页/完成/失败/恢复方法移入 `jobs/local_metadata/backfill.rs`；本地 metadata 根复用排除项序列化，repository 继续通过 `jobs::StoredScanLocalMetadataBackfillPage` 导出原 DTO。backfill root 幂等与有界分页/重试/中断恢复各 1 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
