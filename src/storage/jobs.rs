@@ -23,29 +23,6 @@ mod strm_probe;
 pub(crate) use super::media_sources::MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE;
 use std::{collections::HashMap, time::Instant};
 
-impl Database {
-    pub(crate) const LEGACY_SCAN_REQUIRES_NEW_MANIFEST: &'static str =
-        "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
-}
-
-impl Database {
-    pub(crate) async fn restore_media_item(&self, item_id: &str) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE media_items
-             SET removed_at = NULL, updated_at = unixepoch()
-             WHERE id = ?",
-        )
-        .bind(item_id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-}
-
 #[cfg(test)]
 #[path = "jobs/tests.rs"]
 mod tests;

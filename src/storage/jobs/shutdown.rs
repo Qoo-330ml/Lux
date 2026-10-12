@@ -3,6 +3,9 @@ const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 use super::*;
 
 impl Database {
+    pub(crate) const LEGACY_SCAN_REQUIRES_NEW_MANIFEST: &'static str =
+        "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
+
     /// Marks every unfinished persistent background job as cancelled.
     ///
     /// This is deliberately one transaction so startup and shutdown never

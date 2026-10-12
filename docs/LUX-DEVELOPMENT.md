@@ -10892,6 +10892,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：request state load、request matching plan 和批量持久化分别成为私有步骤，`enqueue_or_update_fill_missing_requests_in_transaction` 收敛为短编排入口；锁子句、SQL/bind 顺序和 transaction ownership 保持。retry snapshot 与 running request 两项均 1 passed；fmt 与 diff 检查通过。
 
+#### LUX-516：清理 jobs 根模块残留
+
+范围：将 `restore_media_item` 移入媒体源 storage owner，将 legacy scan 重试错误码常量移入 shutdown owner。`jobs.rs` 只保留 jobs 模块 wiring、共享 imports/exports 与原测试入口。
+
+验收：
+
+- [x] `jobs.rs` 不再包含 `Database` 实现或业务常量，长度低于 200 行。
+- [x] `restore_media_item`、legacy scan error code 和全部调用签名/引用保持。
+- [x] shutdown 回归、crate build、fmt 与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/media_sources.rs`、`src/storage/jobs/shutdown.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test shutdown_jobs`、`cargo build --locked`、fmt、`git diff --check`，并搜索 `restore_media_item` 与 legacy error code 的所有引用。
+
+结果（2026-10-12）：`jobs.rs` 缩至模块 wiring 与必要共享 imports/exports；restore 方法迁入 `media_sources.rs`，legacy scan error code 迁入 `shutdown.rs`。调用方法名保持。shutdown、build、fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

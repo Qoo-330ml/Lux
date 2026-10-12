@@ -3,6 +3,22 @@ pub(crate) const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
 use super::*;
 
 impl Database {
+    pub(crate) async fn restore_media_item(&self, item_id: &str) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_items
+             SET removed_at = NULL, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Filesystem entry ids of the media sources (video / STRM files) below the given library
     /// root directories, at any depth.
     ///
