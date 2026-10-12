@@ -10748,6 +10748,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：chunk 合并、path/entry 验证、positive/unchanged/seen 身份唯一性及 baseline 检查移入 `ManifestDiscoveryInput::collect`。invalid/empty 输入仍在开启 transaction 前返回，原错误原因和检查顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-507：提取 Manifest discovery 状态与 frontier 步骤
+
+范围：把同一事务中的 Manifest/job state snapshot 与目录 frontier upsert 提取为具名 storage 步骤。主方法继续持有并传递原 `Transaction`，保留 stage diagnostics 的触发位置。
+
+验收：
+
+- [x] 单次状态读取仍返回同一 workflow/root/job/cancel snapshot。
+- [x] 目录 frontier 的 chunk size、冲突处理、lite mode 跳过及插入计数语义保持。
+- [x] frontier 取消/重试和 bounded directory batch 回归通过；fmt/build 与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/state.rs`、`src/storage/jobs/scan/manifest/discovery/frontier.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::manifest_discovery_chunk_does_not_complete_directory_after_cancel_request`、`cargo test --locked --test scanning_jobs manifest_frontier_batches_handle_long_and_small_directories`、`cargo build --locked`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：Manifest/job 状态读取改为单个 `ManifestDiscoveryStateSnapshot`，目录 frontier upsert 与完成更新分别迁入独立步骤；两者均复用 coordinator 持有的 transaction，SQL、bind 顺序、批次上限、冲突策略、lite mode 计数和诊断阶段位置保持。取消回归 1 passed，bounded directory batch 回归 1 passed；`cargo build --locked`、fmt 和 `git diff --check` 通过。`commit_scan_manifest_discovery_chunks` 及其应用层调用点未改名。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

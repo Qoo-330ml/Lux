@@ -4,6 +4,13 @@ use super::*;
 mod input;
 use input::ManifestDiscoveryInput;
 
+#[path = "discovery/frontier.rs"]
+mod frontier;
+
+#[path = "discovery/state.rs"]
+mod state;
+use state::ManifestDiscoveryStateSnapshot;
+
 fn manifest_positive_file_path(file: &NewScanManifestIndexedFile) -> &str {
     match file {
         NewScanManifestIndexedFile::Movie(file) => &file.relative_path,
@@ -70,7 +77,7 @@ impl Database {
             child_directories.len(),
         );
         let manifest_state_started = Instant::now();
-        let (
+        let ManifestDiscoveryStateSnapshot {
             workflow_version,
             discovery_format_version,
             discovery_mode,
@@ -78,70 +85,21 @@ impl Database {
             generation,
             job_status,
             cancel_requested,
-        ): (i64, i64, String, String, String, String, i64) = self
-            .query_as(
-                "SELECT manifest.workflow_version, manifest.discovery_format_version,
-                        manifest.discovery_mode, manifest.library_id, job.generation,
-                        job.status, job.cancel_requested
-                 FROM scan_manifests manifest
-                 JOIN scan_jobs job ON job.id = manifest.job_id
-                 WHERE manifest.id = ? AND manifest.state = 'DISCOVERING'
-                   AND job.id = ?",
-            )
-            .bind(chunk.manifest_id)
-            .bind(chunk.job_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let lite_mode =
-            is_lite_manifest_discovery(workflow_version, discovery_format_version, &discovery_mode);
+            lite_mode,
+        } = self
+            .load_manifest_discovery_state_snapshot(&mut transaction, chunk)
+            .await?;
 
         record_manifest_storage_stage("manifest_state_check", manifest_state_started, 1, 0, 0);
         let directory_frontier_started = Instant::now();
-        let mut inserted_directory_count = 0_u64;
-        let directory_chunks = if lite_mode {
-            Vec::new()
-        } else {
-            child_directories
-                .chunks(SCAN_DML_CHUNK_SIZE)
-                .collect::<Vec<_>>()
-        };
-        for paths in directory_chunks {
-            if paths.is_empty() {
-                continue;
-            }
-            let values = std::iter::repeat_n("(?, ?, ?, 'PENDING')", paths.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "INSERT INTO scan_manifest_directories (
-                     manifest_id, library_root_id, relative_path, state
-                 ) VALUES {values}
-                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for path in paths {
-                statement = statement
-                    .bind(chunk.manifest_id)
-                    .bind(chunk.library_root_id)
-                    .bind(*path);
-            }
-            let result = statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            inserted_directory_count = inserted_directory_count
-                .checked_add(result.rows_affected())
-                .ok_or_else(|| {
-                    StorageError::Conflict("manifest directory count overflow".to_owned())
-                })?;
-        }
+        let inserted_directory_count = self
+            .insert_manifest_directory_frontier(
+                &mut transaction,
+                chunk,
+                &child_directories,
+                lite_mode,
+            )
+            .await?;
         record_manifest_storage_stage(
             "directory_frontier_insert",
             directory_frontier_started,
@@ -232,46 +190,14 @@ impl Database {
         let inserted_directory_count_i64 = i64::try_from(inserted_directory_count)
             .map_err(|_| StorageError::Conflict("manifest directory count overflow".to_owned()))?;
         let directory_frontier_completion_started = Instant::now();
-        let mut completed_directory_count = 0_i64;
-        let completed_directory_chunks = if lite_mode {
-            Vec::new()
-        } else {
-            completed_directories
-                .chunks(SCAN_DML_CHUNK_SIZE)
-                .collect::<Vec<_>>()
-        };
-        for directories in completed_directory_chunks {
-            let placeholders = std::iter::repeat_n("?", directories.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "UPDATE scan_manifest_directories
-                 SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
-                 WHERE manifest_id = ? AND library_root_id = ? AND state <> 'COMPLETE'
-                   AND relative_path IN ({placeholders})"
-            );
-            let mut statement = self
-                .query(sqlx::AssertSqlSafe(query))
-                .bind(chunk.manifest_id)
-                .bind(chunk.library_root_id);
-            for directory in directories {
-                statement = statement.bind(*directory);
-            }
-            let completed = statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            completed_directory_count = completed_directory_count
-                .checked_add(i64::try_from(completed.rows_affected()).map_err(|_| {
-                    StorageError::Conflict("manifest directory count overflow".to_owned())
-                })?)
-                .ok_or_else(|| {
-                    StorageError::Conflict("manifest directory count overflow".to_owned())
-                })?;
-        }
+        let completed_directory_count = self
+            .complete_manifest_directory_frontier(
+                &mut transaction,
+                chunk,
+                &completed_directories,
+                lite_mode,
+            )
+            .await?;
         record_manifest_storage_stage(
             "directory_frontier_completion",
             directory_frontier_completion_started,
