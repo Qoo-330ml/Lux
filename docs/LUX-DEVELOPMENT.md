@@ -10406,6 +10406,28 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：无。明确不做：Storage/API 重构、schema/SQL 修改、新后台 worker、新扫描状态、新性能承诺或部署。
 
+### 阶段 25：共享存储层 jobs 职责拆分与事务编排重构
+
+本阶段以阶段 24 完成版本 `b08bdcf4` 为基线，整理 `src/storage/jobs.rs` 的共享存储职责。继续使用 `Database` 的现有方法作为内部调用面，保持方法签名、存储导出路径、SQL、批次大小、状态转换、错误和提交语义。先将根目录、字幕、文件系统条目、媒体源与关机处理迁入所属 storage 模块，再按 scan/Manifest、reconciliation、增量扫描、本地 metadata、metadata reidentify、STRM probe 分拆 jobs。最后整理 Manifest discovery/apply、diff 和 FILL_MISSING 大函数。每个 LUX 任务最多预计修改 5 个文件，逐个完成、验证并独立提交。
+
+阶段验收：`jobs.rs` 只保留模块声明和需要稳定的导出，目标不超过 200 行；事务编排函数目标不超过 150 行，纯 SQL 阶段超出时须在结果中说明。跨步骤的子函数沿用调用方的 `&mut Transaction<'_, Any>`；不得在步骤内另开事务或改变锁顺序、SQL/绑定顺序、计数、批次边界及取消 fencing。保留 `storage::repository::jobs::tests` 测试名称空间。对文件和函数的移动须检查 repository 内调用点、application/storage 调用点与实际路由引用；`Database` 现有方法名和路由合同不变。
+
+#### LUX-486：拆分媒体库根目录存储操作
+
+范围：将 library root 的增删查、扫描游标和可用性操作从 `jobs.rs` 移入 `storage/library_roots.rs`。保留 `Database` 方法签名、SQL、删除清理范围及路径调用点。
+
+验收：
+
+- [ ] 根目录存储实现不再位于 `jobs.rs`。
+- [ ] 既有 `Database` 调用点和路由调用无需改名，根目录删除与扫描游标行为保持。
+- [ ] library deletion、storage 和 jobs 单测通过；fmt/build 与 `git diff --check` 通过。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后使用共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::repository::jobs::tests`、`cargo test --locked --test storage --test library_deletion`、`cargo fmt --all -- --check`、`cargo build --locked` 及 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/library_roots.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：library root 的 13 个 `Database` 方法移入 `storage/library_roots.rs`，原方法名、签名和 repository 内调用路径保持。核对了 API、application、storage 和 tests 的所有同名调用。基线与迁移后 jobs 单测均为 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项与 `library_deletion` 1 项均通过；fmt 和 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
