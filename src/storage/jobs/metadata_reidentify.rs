@@ -1,4 +1,7 @@
 use super::*;
+#[path = "metadata_reidentify/fill_missing.rs"]
+mod fill_missing;
+
 #[path = "metadata_reidentify/items.rs"]
 mod items;
 

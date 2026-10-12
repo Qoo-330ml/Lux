@@ -10572,6 +10572,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：15 个 reidentify job 创建/查询/状态方法移入 `lifecycle.rs`，8 个 item 查询、领取、完成及失败恢复方法移入 `items.rs`；优先级 SQL 片段放在新子树根，供 FILL_MISSING 后续复用。原 `Database` 签名保持。`metadata_api` 9 项、`metadata_cancel` 3 项、`reidentify` 20 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-496：拆分 FILL_MISSING 去重与请求合并
+
+范围：将 FILL_MISSING job/item 去重、快照比较、队列合并与重试登记移入 `jobs/metadata_reidentify/fill_missing.rs`。把 `lock_media_items_for_update` 作为共享事务工具移入 repository。传入的 transaction、item 排序/锁定顺序、job 容量和请求快照规则保持。
+
+验收：
+
+- [x] FILL_MISSING 创建/合并实现及私有辅助状态类型不再位于 `jobs.rs`。
+- [x] metadata 写入继续共享同一 sorted item lock helper，方法签名与 transaction 调用保持。
+- [x] 去重、队列容量、请求快照、重试退避与 metadata 原子性回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 FILL_MISSING repository 单测、`cargo test --locked --test reidentify --test metadata_cancel`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/metadata_reidentify.rs`、`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：FILL_MISSING 请求快照、排队 job 合并、容量复用、item 插入与去重辅助状态移入 `metadata_reidentify/fill_missing.rs`。`lock_media_items_for_update` 移入 repository 事务工具，保留 ID 排序、去重、分批和 PostgreSQL `FOR UPDATE` 顺序；metadata application 与 fill_missing 继续使用同一方法。队列合并 2 项、请求快照退避 1 项、metadata 原子性 1 项、`reidentify` 20 项、`metadata_cancel` 3 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

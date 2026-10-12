@@ -532,6 +532,40 @@ impl Database {
         Ok(transaction)
     }
 
+    pub(crate) async fn lock_media_items_for_update(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if self.backend != DatabaseBackend::Postgres || item_ids.is_empty() {
+            return Ok(());
+        }
+        let mut unique_ids = item_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        for chunk in unique_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id FROM media_items
+                 WHERE id IN ({placeholders}) ORDER BY id FOR UPDATE"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     pub async fn test_configuration(
         configuration: &DatabaseConfiguration,
     ) -> Result<(), StorageError> {
