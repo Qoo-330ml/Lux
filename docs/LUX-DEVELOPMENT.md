@@ -10924,6 +10924,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：LIKE escaping 和 Manifest outbox helper 缩至 `jobs`；scan target、sidecar、removal transaction helpers 缩至 `jobs::scan`。jobs repository tests 与 scanner/reconciliation/manifest 调用点仍在可见树内；build、jobs 单测、fmt 与 diff 检查通过。
 
+#### LUX-518：缩短 reconciliation batch 事务协调函数
+
+范围：将 pending path 过滤、movie/episode 索引、NEW/CHANGED/sidecar target 写入和 seen filesystem entry 恢复迁入事务内 batch helper。外层 coordinator 继续持有唯一 transaction。
+
+验收：
+
+- [x] reconciliation `Database` 公共方法名/签名不变；事务仍由 batch coordinator 开始并提交。
+- [x] 文件索引、target 和 restore 更新保持原顺序，均复用调用方 transaction。
+- [x] mixed reconciliation、失败回滚重试回归通过；事务协调函数不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/reconciliation.rs`、`src/storage/jobs/scan/reconciliation/batch.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs mixed_reconciliation_batches_known_media_and_keeps_unresolved`、`cargo test --locked --test scanning_jobs reconciliation_batch_rolls_back_index_and_retries_all_pending_files`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：媒体索引/targets/restore 阶段移入 `reconciliation/batch.rs`；`commit_reconciliation_batch_in_transaction` 缩至 110 行，仍是唯一 transaction owner。mixed batch 与失败回滚重试回归各 1 passed；fmt 与 diff 检查通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
