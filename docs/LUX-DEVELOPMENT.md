@@ -10668,6 +10668,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：15 个 Manifest 创建、查询、root 状态、transition、finish 与 retry 方法，以及状态校验 helper 移入 `scan/manifest/state.rs`。原 Database 签名与 workflow 2/3、cancel/root fencing 保持。Manifest 原子创建单测 1 项和 `scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-502：拆分 Manifest 后处理目标分页
+
+范围：将 Manifest postprocessing target page materialization、空页完成和事务内 target insert 移入 `scan/manifest/targets.rs`。保留 item target precedence、root identity checkpoint、cursor 和 target 写入的同事务边界。Manifest discovery 目录与 diff candidate 查询在其所属子模块迁移。
+
+验收：
+
+- [x] Manifest postprocessing target 物化与游标实现不再位于 `jobs.rs`。
+- [x] 新旧 target 优先级、page limit、cursor CAS 和 root replacement fencing 保持。
+- [x] target 回滚/续页与扫描集成回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、`cargo test --locked --lib storage::repository::jobs::tests`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/targets.rs`、本文档。
+
+结果（2026-10-12）：Manifest postprocessing target page、empty page 完成、事务内 target insert 及 page range DTO 移入 `scan/manifest/targets.rs`。cursor、root fencing、target precedence 和 transaction ownership 保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
