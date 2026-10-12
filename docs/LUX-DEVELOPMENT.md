@@ -10476,6 +10476,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：媒体源查询、STRM/variant 更新、item 重分配、探测状态、恢复、删除与关联媒体移除操作移入 `storage/media_sources.rs`；删除批次上限随模块迁移，单测仍从 jobs 测试入口使用该合同。原子事务和批次常量保持。核对了应用层删除、扫描、catalog 与 `storage/media.rs` 的方法调用。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`media_deletion` 1 项及 `storage` 52 项通过；fmt 与 `git diff --check` 通过。
 
+#### LUX-490：隔离 storage jobs 单元测试
+
+范围：将 `jobs.rs` 末尾的内联单测迁入 `storage/jobs/tests.rs`，由根模块使用路径属性声明。测试名称空间和测试体保持，允许继续访问其父模块中的私有测试辅助函数。
+
+验收：
+
+- [x] 所有 jobs 内联单测位于独立测试文件中，路径仍为 `storage::repository::jobs::tests`。
+- [x] 测试导入所用的媒体源删除批次上限继续指向 owning module。
+- [x] 单测数量、忽略项和结果与迁移前一致；fmt、build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --lib storage::repository::jobs::tests`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/tests.rs`、本文档。
+
+结果（2026-10-12）：1,200 余行 jobs 单测从 `jobs.rs` 移入 `jobs/tests.rs`，以 `#[path]` 保持原测试名称空间及私有测试 helper 访问。迁移前后均为 14 passed、1 项 PostgreSQL 用例 ignored；fmt 和 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
