@@ -1,8 +1,13 @@
 use super::*;
+
+pub(super) const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
+const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 #[path = "local_metadata/backfill.rs"]
 mod backfill;
 
 pub(crate) use backfill::StoredScanLocalMetadataBackfillPage;
+#[path = "local_metadata/batches.rs"]
+mod batches;
 
 fn parse_scan_local_metadata_non_retryable_item_ids(
     value: &str,

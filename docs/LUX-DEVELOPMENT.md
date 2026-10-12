@@ -10524,6 +10524,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：backfill DTO、page size、排除项校验 helper 和 8 个 root/分页/完成/失败/恢复方法移入 `jobs/local_metadata/backfill.rs`；本地 metadata 根复用排除项序列化，repository 继续通过 `jobs::StoredScanLocalMetadataBackfillPage` 导出原 DTO。backfill root 幂等与有界分页/重试/中断恢复各 1 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-493：拆分本地 metadata 批次与 outbox 存储
+
+范围：将 local metadata batch 的创建、领取、完成、失败、取消、重试、分页和 Manifest outbox 写入移入 `jobs/local_metadata/batches.rs`。outbox transaction helper 仅对 repository 子树可见，Manifest discovery 继续传入并复用其原 transaction。
+
+验收：
+
+- [x] 本地 metadata batch/outbox 方法及批次限制常量不再位于 `jobs.rs`。
+- [x] application、Manifest 和原 jobs 单测继续使用相同 `Database` 方法与事务入口。
+- [x] outbox 有界批量和查询次数回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --lib storage::repository::jobs::tests::manifest_local_metadata_outbox_inserts_three_batches_with_one_query`、jobs 其余单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/batches.rs`、本文档。
+
+结果（2026-10-12）：15 个 local metadata batch/outbox 方法移入 `jobs/local_metadata/batches.rs`；写入批次限制归入 owning module，source 上限和错误长度限制留在 local metadata 根供其调用者共享。Manifest outbox transaction helper 限定 repository 子树可见，Manifest 调用仍复用原事务。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanning_jobs` 81 项全部通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
