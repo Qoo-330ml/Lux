@@ -10684,6 +10684,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：Manifest postprocessing target page、empty page 完成、事务内 target insert 及 page range DTO 移入 `scan/manifest/targets.rs`。cursor、root fencing、target precedence 和 transaction ownership 保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
 
+#### LUX-503：拆分 Manifest discovery 与正向索引
+
+范围：将 discovery chunk 校验、frontier/observations、presence ledger、计数提交和正向媒体索引分别归入 `manifest/discovery.rs`、`manifest/indexes.rs`。两步继续共享本次 database transaction；本任务只移动步骤，不拆其内部大函数。
+
+验收：
+
+- [x] Manifest discovery 与正向索引实现不再位于 `jobs.rs`。
+- [x] observations、filesystem/media indexes、local metadata outbox、presence ledger、manifest/job counters 仍在原事务按原顺序提交。
+- [x] discovery 取消/去重、正向索引、outbox rollback 和 scanning integration 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/indexes.rs`、本文档。
+
+结果（2026-10-12）：Manifest discovery commit/chunk 与正向媒体索引步骤移入 `manifest/discovery.rs`、`manifest/indexes.rs`；共享发现结果类型与 file identity helper 放在 Manifest 根。discovery、index、sidecar targets 与 local metadata outbox 继续复用同一 transaction，顺序及 progress/checkpoint 更新保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
