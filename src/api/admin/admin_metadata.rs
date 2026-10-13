@@ -146,22 +146,6 @@ impl MetadataRefreshRequestMode {
     }
 }
 
-async fn schedule_admin_metadata_job(
-    reidentify: &crate::application::reidentify::MetadataReidentifyService,
-    job: &crate::application::reidentify::MetadataReidentifyJob,
-) -> Result<(), crate::application::reidentify::MetadataDispatchError> {
-    if job.mode == crate::application::reidentify::MetadataRefreshMode::FillMissing.as_str() {
-        reidentify.enqueue_fill_missing_job(job).await?;
-    } else {
-        let worker = reidentify.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
-        });
-    }
-    Ok(())
-}
-
 fn metadata_dispatch_unavailable(
     headers: &HeaderMap,
     job_id: &str,
@@ -284,7 +268,7 @@ pub(crate) async fn admin_start_library_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+    if let Err(error) = reidentify.dispatch_job(&job).await {
         return metadata_dispatch_unavailable(&headers, &job.id, error);
     }
     record_audit_event(
@@ -344,7 +328,7 @@ pub(crate) async fn admin_start_library_metadata_refresh(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+    if let Err(error) = reidentify.dispatch_job(&job).await {
         return metadata_dispatch_unavailable(&headers, &job.id, error);
     }
     record_audit_event(
@@ -499,11 +483,9 @@ pub(crate) async fn admin_start_metadata_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let worker = reidentify.clone();
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        worker.run(&job_id).await;
-    });
+    if let Err(error) = reidentify.dispatch_job(&job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,
@@ -732,7 +714,7 @@ pub(crate) async fn admin_retry_metadata_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    if let Err(error) = schedule_admin_metadata_job(reidentify, &job).await {
+    if let Err(error) = reidentify.dispatch_job(&job).await {
         return metadata_dispatch_unavailable(&headers, &job.id, error);
     }
     record_audit_event(
@@ -1530,7 +1512,7 @@ pub(crate) async fn admin_start_item_metadata_refresh(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+    if let Err(error) = reidentify.dispatch_job(&job).await {
         return metadata_dispatch_unavailable(&headers, &job.id, error);
     }
     record_audit_event(
