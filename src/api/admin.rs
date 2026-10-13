@@ -32,6 +32,8 @@ pub(super) use admin_metadata::{
 pub(super) use admin_plugins::*;
 #[path = "admin/admin_emby_migration.rs"]
 mod admin_emby_migration;
+#[path = "admin/admin_scheduled_tasks.rs"]
+mod admin_scheduled_tasks;
 pub(super) use admin_emby_migration::emby_migration_error;
 
 pub(super) fn api_routes() -> Router<AppState> {
@@ -116,27 +118,6 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route(
-            "/api/v1/admin/scheduled-tasks",
-            get(admin_list_scheduled_tasks).put(admin_upsert_scheduled_task),
-        )
-        .route(
-            "/api/v1/admin/scheduled-tasks/run",
-            post(admin_run_scheduled_task),
-        )
-        .route(
-            "/api/v1/admin/scheduled-task-plans",
-            get(admin_list_scheduled_task_plans).post(admin_create_scheduled_task_plan),
-        )
-        .route(
-            "/api/v1/admin/scheduled-task-plans/{plan_id}",
-            patch(admin_update_scheduled_task_plan).delete(admin_delete_scheduled_task_plan),
-        )
-        .route(
-            "/api/v1/admin/scheduled-task-plans/{plan_id}/run",
-            post(admin_run_scheduled_task_plan),
-        )
-        .route("/api/v1/admin/task-activity", get(admin_list_task_activity))
-        .route(
             "/api/v1/admin/notification-destinations",
             get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
         )
@@ -189,4 +170,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_metadata::api_routes())
         .merge(admin_plugins::api_routes())
         .merge(admin_emby_migration::api_routes())
+        .merge(admin_scheduled_tasks::api_routes())
 }
