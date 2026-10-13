@@ -1,8 +1,8 @@
 use super::*;
 
-#[path = "admin_handlers.rs"]
-mod admin_handlers;
-pub(super) use admin_handlers::*;
+#[path = "admin/admin_common.rs"]
+mod admin_common;
+pub(super) use admin_common::*;
 #[path = "admin/admin_users.rs"]
 mod admin_users;
 pub(super) use admin_users::user_json;
