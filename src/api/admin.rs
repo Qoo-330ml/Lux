@@ -32,91 +32,18 @@ pub(super) use admin_metadata::{
 pub(super) use admin_plugins::*;
 #[path = "admin/admin_emby_migration.rs"]
 mod admin_emby_migration;
+#[path = "admin/admin_jobs.rs"]
+mod admin_jobs;
 #[path = "admin/admin_scheduled_tasks.rs"]
 mod admin_scheduled_tasks;
 pub(super) use admin_emby_migration::emby_migration_error;
+pub(super) use admin_jobs::{
+    AdminJobsQuery, AdminLogExportQuery, scan_job_json, scan_job_json_from_storage,
+    spawn_library_scan, strm_probe_error,
+};
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/v1/admin/libraries/{library_id}/scan",
-            post(admin_start_scan),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/scan-path",
-            post(admin_start_library_path_scan),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/reconcile",
-            post(admin_start_scan),
-        )
-        .route(
-            "/api/v1/admin/jobs/{job_id}/cancel",
-            post(admin_cancel_scan),
-        )
-        .route("/api/v1/admin/jobs/{job_id}/retry", post(admin_retry_scan))
-        .route("/api/v1/admin/jobs/{job_id}", get(admin_get_job))
-        .route(
-            "/api/v1/admin/strm-probe-jobs",
-            get(admin_list_strm_probe_jobs).post(admin_start_strm_probe),
-        )
-        .route(
-            "/api/v1/admin/strm-probe-jobs/{job_id}",
-            get(admin_get_strm_probe_job),
-        )
-        .route(
-            "/api/v1/admin/strm-probe-jobs/{job_id}/cancel",
-            post(admin_cancel_strm_probe),
-        )
-        .route(
-            "/api/v1/admin/strm-probe-jobs/{job_id}/retry",
-            post(admin_retry_strm_probe),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/chapter-detection",
-            post(admin_start_chapter_detection),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs",
-            get(admin_list_chapter_detection_jobs),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs/{job_id}",
-            get(admin_get_chapter_detection_job),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs/{job_id}/cancel",
-            post(admin_cancel_chapter_detection),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs/{job_id}/retry",
-            post(admin_retry_chapter_detection),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/danmaku/match",
-            post(admin_start_danmaku_match),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs",
-            get(admin_list_danmaku_match_jobs),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs/{job_id}",
-            get(admin_get_danmaku_match_job),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs/{job_id}/cancel",
-            post(admin_cancel_danmaku_match),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs/{job_id}/retry",
-            post(admin_retry_danmaku_match),
-        )
-        .route(
-            "/api/v1/admin/jobs/{job_id}/events",
-            get(admin_list_job_events),
-        )
-        .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route(
             "/api/v1/admin/notification-destinations",
             get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
@@ -171,4 +98,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_plugins::api_routes())
         .merge(admin_emby_migration::api_routes())
         .merge(admin_scheduled_tasks::api_routes())
+        .merge(admin_jobs::api_routes())
 }
