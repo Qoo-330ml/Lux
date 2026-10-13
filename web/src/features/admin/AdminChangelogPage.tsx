@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.24",
+    date: "2026-10-13",
+    sections: [
+      { kind: "changed", items: [
+        "移动端首页“我的媒体库”卡片宽度随屏幕尺寸收窄，保留单行横向滚动，改善窄屏浏览体验。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.23",
     date: "2026-10-13",
     sections: [
