@@ -628,9 +628,14 @@ pub(crate) async fn admin_merge_items(
     let Some(service) = state.item_merge.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let result = match service
-        .merge(&request.primary_item_id, &request.item_ids)
-        .await
+    let result = match crate::application::admin_media_mutations::merge_media_items(
+        service,
+        state.home.as_ref(),
+        state.catalog.as_ref(),
+        &request.primary_item_id,
+        &request.item_ids,
+    )
+    .await
     {
         Ok(result) => result,
         Err(StorageError::Conflict(message)) => {
@@ -644,10 +649,6 @@ pub(crate) async fn admin_merge_items(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    crate::application::admin_cache::invalidate_media_catalog(
-        state.home.as_ref(),
-        state.catalog.as_ref(),
-    );
     record_audit_event(
         &state,
         &headers,

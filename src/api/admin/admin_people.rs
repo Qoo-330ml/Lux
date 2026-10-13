@@ -213,7 +213,7 @@ pub(crate) async fn admin_queue_people_index_rebuild(
         "{}",
     )
     .await;
-    state.rebuild_people_index().await;
+    people.schedule_person_index_rebuild();
     (
         StatusCode::ACCEPTED,
         Json(json!({ "job": people_index_rebuild_job_json(&job) })),

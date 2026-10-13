@@ -239,7 +239,14 @@ pub(crate) async fn delete_media_item(
     let Some(deletion) = state.deletion.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let report = match deletion.delete(item_id, source_id).await {
+    let report = match crate::application::admin_media_mutations::delete_media_item(
+        deletion,
+        state.home.as_ref(),
+        item_id,
+        source_id,
+    )
+    .await
+    {
         Ok(report) => report,
         Err(MediaDeleteError::ItemNotFound) => {
             return api_error(
@@ -272,7 +279,6 @@ pub(crate) async fn delete_media_item(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    crate::application::admin_cache::invalidate_home(state.home.as_ref());
     let audit_target = if report.source_ids.len() == 1 {
         ("media_source", report.source_ids[0].as_str())
     } else {
