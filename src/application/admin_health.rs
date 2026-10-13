@@ -11,7 +11,7 @@ use tokio::{fs, io::AsyncWriteExt, process::Command, sync::Mutex as AsyncMutex};
 use crate::{
     application::libraries::LibraryService,
     config::DatabaseBackend,
-    observability::resources::ResourceSnapshot,
+    observability::resources::{ResourceMetrics, ResourceSnapshot},
     storage::{Database, DatabasePoolSnapshot},
 };
 
@@ -95,6 +95,12 @@ pub struct AdminHealthReport {
     libraries: Vec<AdminHealthLibrary>,
 }
 
+impl AdminHealthReport {
+    pub fn schema_version(&self) -> i64 {
+        self.schema_version
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct AdminHealthRuntime {
     seconds: u64,
@@ -154,13 +160,14 @@ pub async fn admin_health_report(
     database: &Database,
     config_dir: Option<&Path>,
     libraries: Option<&LibraryService>,
-    resources: ResourceSnapshot,
+    resources: &ResourceMetrics,
     probe_cache: &AdminHealthProbeCache,
 ) -> Result<AdminHealthReport, AdminHealthError> {
     let schema_version = database
         .schema_version()
         .await
         .map_err(|_| AdminHealthError::DatabaseUnavailable)?;
+    let resources = resources.snapshot().await;
     let database_pool = database.pool_snapshot();
     let probes = probe_cache
         .get_or_probe(|| async {

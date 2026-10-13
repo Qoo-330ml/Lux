@@ -22,7 +22,7 @@ pub(crate) async fn admin_health_payload(state: &AppState) -> Result<Value, Stat
         database,
         state.config_dir.as_deref(),
         state.libraries.as_ref(),
-        state.resources.snapshot().await,
+        &state.resources,
         &state.admin_health_probe_cache,
     )
     .await
