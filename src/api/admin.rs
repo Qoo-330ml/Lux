@@ -6,6 +6,9 @@ pub(super) use admin_handlers::*;
 #[path = "admin/admin_users.rs"]
 mod admin_users;
 pub(super) use admin_users::user_json;
+#[path = "admin/admin_settings.rs"]
+mod admin_settings;
+pub(super) use admin_settings::*;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -333,19 +336,6 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route("/api/v1/admin/task-activity", get(admin_list_task_activity))
         .route(
-            "/api/v1/admin/settings",
-            get(admin_settings).patch(admin_update_settings),
-        )
-        .route(
-            "/api/v1/admin/api-key",
-            get(admin_get_api_key).delete(admin_revoke_api_key),
-        )
-        .route("/api/v1/admin/api-key/rotate", post(admin_rotate_api_key))
-        .route(
-            "/api/v1/admin/settings/network-proxy/test",
-            post(admin_test_network_proxy),
-        )
-        .route(
             "/api/v1/admin/notification-destinations",
             get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
         )
@@ -391,4 +381,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/admin/logs/export", get(admin_export_logs))
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .merge(admin_users::api_routes())
+        .merge(admin_settings::api_routes())
 }
