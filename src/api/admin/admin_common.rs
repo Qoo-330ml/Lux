@@ -189,23 +189,6 @@ pub(crate) async fn normalize_lux_api_key_query(request: Request<Body>, next: Ne
     next.run(request).await
 }
 
-pub(crate) async fn probe_directory_writable(path: &FsPath) -> bool {
-    let probe_path = path.join(format!(".lux-health-probe-{}", uuid::Uuid::now_v7()));
-    let payload = [0_u8; 4096];
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe_path)
-            .await?;
-        file.write_all(&payload).await?;
-        file.sync_all().await
-    }
-    .await;
-    let _ = fs::remove_file(probe_path).await;
-    result.is_ok()
-}
-
 pub(crate) fn api_error(
     headers: &HeaderMap,
     status: StatusCode,
