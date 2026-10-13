@@ -700,7 +700,7 @@ pub(crate) async fn admin_upsert_scheduled_task(
         )
         .into_response();
     }
-    if owner_type == "GLOBAL" {
+    let (owner, target_owner) = if owner_type == "GLOBAL" {
         if !request.owner_id.trim().eq_ignore_ascii_case("global") {
             return api_error(
                 &headers,
@@ -710,152 +710,45 @@ pub(crate) async fn admin_upsert_scheduled_task(
             )
             .into_response();
         }
-        if is_global_strm || is_global_danmaku {
-            let Some(database) = state.database.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
-            match database
-                .find_scheduled_task_config("GLOBAL", "global", &task_type)
-                .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return api_error(
-                        &headers,
-                        StatusCode::NOT_FOUND,
-                        lux::ApiErrorCode::NotFound,
-                        "任务尚未注册",
-                    )
-                    .into_response();
-                }
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            }
-            let Some(schedule) = request
-                .schedule
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return api_error(
-                    &headers,
-                    StatusCode::BAD_REQUEST,
-                    lux::ApiErrorCode::InvalidRequest,
-                    if is_global_strm {
-                        "STRM 媒体信息任务必须保留 Cron 执行计划"
-                    } else {
-                        "弹幕匹配任务必须保留 Cron 执行计划"
-                    },
-                )
-                .into_response();
-            };
-            let Some(plugins) = state.plugins.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
-            let result = if is_global_strm {
-                plugins.update_media_info_schedule(schedule).await
-            } else {
-                plugins.update_danmaku_schedule(schedule).await
-            };
-            if let Err(error) = result {
-                return plugin_error(&headers, error);
-            }
-            let task = match database
-                .find_scheduled_task_config("GLOBAL", "global", &task_type)
-                .await
-            {
-                Ok(Some(task)) => task,
-                Ok(None) => {
-                    return api_error(
-                        &headers,
-                        StatusCode::NOT_FOUND,
-                        lux::ApiErrorCode::NotFound,
-                        "任务尚未注册",
-                    )
-                    .into_response();
-                }
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            record_audit_event(
-                &state,
-                &headers,
-                "SCHEDULE_UPDATED",
-                Some("scheduled_task"),
-                Some(&format!("global:{task_type}")),
-                "{}",
-            )
-            .await;
-            return (
-                StatusCode::OK,
-                Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
-            )
-                .into_response();
-        }
-        let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
-        let schedule = if enabled {
-            request.schedule.as_deref().map(str::trim)
-        } else {
-            None
-        };
-        let Some(database) = state.database.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let task = match database
-            .upsert_scheduled_task_config("GLOBAL", "global", &task_type, schedule, enabled)
-            .await
+        (
+            crate::application::admin_scheduled_tasks::ScheduledTaskOwner::Global,
+            "global".to_owned(),
+        )
+    } else {
+        let library_id = match request
+            .owner_id
+            .trim()
+            .parse::<crate::domain::ids::LibraryId>()
         {
-            Ok(Some(task)) => task,
-            Ok(None) => {
-                return api_error(
+            Ok(id) => id,
+            Err(error) => {
+                return library_error(
                     &headers,
-                    StatusCode::NOT_FOUND,
-                    lux::ApiErrorCode::NotFound,
-                    "任务尚未注册",
-                )
-                .into_response();
+                    LibraryServiceError::InvalidLibraryId(error.to_string()),
+                );
             }
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-        let target_id = format!("global:{task_type}");
-        record_audit_event(
-            &state,
-            &headers,
-            "SCHEDULE_UPDATED",
-            Some("scheduled_task"),
-            Some(&target_id),
-            "{}",
+        (
+            crate::application::admin_scheduled_tasks::ScheduledTaskOwner::Library(library_id),
+            library_id.to_string(),
         )
-        .await;
-        return (
-            StatusCode::OK,
-            Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
-        )
-            .into_response();
-    }
-    let library_id = match request
-        .owner_id
-        .trim()
-        .parse::<crate::domain::ids::LibraryId>()
+    };
+    let update = crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdate {
+        owner,
+        task_type: task_type.clone(),
+        schedule: request.schedule,
+        is_enabled: request.is_enabled,
+    };
+    let task = match crate::application::admin_scheduled_tasks::update_scheduled_task_config(
+        state.database.as_ref(),
+        state.libraries.as_ref(),
+        state.plugins.as_ref(),
+        update,
+    )
+    .await
     {
-        Ok(id) => id,
-        Err(error) => {
-            return library_error(
-                &headers,
-                LibraryServiceError::InvalidLibraryId(error.to_string()),
-            );
-        }
-    };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match database
-        .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
-        .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+        Ok(task) => task,
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::TaskNotRegistered) => {
             return api_error(
                 &headers,
                 StatusCode::NOT_FOUND,
@@ -864,176 +757,56 @@ pub(crate) async fn admin_upsert_scheduled_task(
             )
             .into_response();
         }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
-    let schedule = if enabled {
-        request.schedule.map(|value| value.trim().to_owned())
-    } else {
-        None
-    };
-    if let Some(schedule) = schedule.as_deref()
-        && validate_cron(schedule).is_err()
-    {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "Cron 执行计划无效",
-        )
-        .into_response();
-    }
-    let mut settings = LibrarySettingsPatch::default();
-    match task_type.as_str() {
-        "RECONCILIATION_SCAN" => settings.reconciliation_schedule = Some(schedule),
-        "METADATA_PARSE" => settings.metadata_schedule = Some(schedule),
-        "AUTO_LIBRARY_COVER" => {
-            let task = match database
-                .upsert_scheduled_task_config(
-                    "LIBRARY",
-                    &library_id.to_string(),
-                    &task_type,
-                    schedule.as_deref(),
-                    enabled,
-                )
-                .await
-            {
-                Ok(Some(task)) => task,
-                Ok(None) => {
-                    return api_error(
-                        &headers,
-                        StatusCode::NOT_FOUND,
-                        lux::ApiErrorCode::NotFound,
-                        "任务尚未注册",
-                    )
-                    .into_response();
-                }
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            let target_id = format!("{}:{}", library_id, task_type);
-            record_audit_event(
-                &state,
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::ChapterPluginNotRegistered) => {
+            return api_error(
                 &headers,
-                "SCHEDULE_UPDATED",
-                Some("scheduled_task"),
-                Some(&target_id),
-                "{}",
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "片头片尾检测任务插件未注册",
             )
-            .await;
-            return (
-                StatusCode::OK,
-                Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
-            )
-                .into_response();
+            .into_response();
         }
-        "CHAPTER_DETECTION" => {
-            let Some(schedule) = schedule.as_deref() else {
-                return api_error(
-                    &headers,
-                    StatusCode::BAD_REQUEST,
-                    lux::ApiErrorCode::InvalidRequest,
-                    "片头片尾检测任务必须保留 Cron 执行计划",
-                )
-                .into_response();
-            };
-            let plugin_id = match database
-                .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
-                .await
-            {
-                Ok(Some(task)) => match task.plugin_id {
-                    Some(plugin_id) => plugin_id,
-                    None => {
-                        return api_error(
-                            &headers,
-                            StatusCode::NOT_FOUND,
-                            lux::ApiErrorCode::NotFound,
-                            "片头片尾检测任务插件未注册",
-                        )
-                        .into_response();
-                    }
-                },
-                Ok(None) => {
-                    return api_error(
-                        &headers,
-                        StatusCode::NOT_FOUND,
-                        lux::ApiErrorCode::NotFound,
-                        "片头片尾检测任务插件未注册",
-                    )
-                    .into_response();
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::RequiredSchedule(required)) => {
+            let message = match required {
+                crate::application::admin_scheduled_tasks::RequiredScheduledTaskSchedule::StrmMediaInfo => {
+                    "STRM 媒体信息任务必须保留 Cron 执行计划"
                 }
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            let Some(plugins) = state.plugins.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
-            if let Err(error) = plugins
-                .update_chapter_detector_schedule(&plugin_id, schedule)
-                .await
-            {
-                return plugin_error(&headers, error);
-            }
-            let task = match database
-                .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
-                .await
-            {
-                Ok(Some(task)) => task,
-                Ok(None) => {
-                    return api_error(
-                        &headers,
-                        StatusCode::NOT_FOUND,
-                        lux::ApiErrorCode::NotFound,
-                        "任务尚未注册",
-                    )
-                    .into_response();
+                crate::application::admin_scheduled_tasks::RequiredScheduledTaskSchedule::DanmakuMatch => {
+                    "弹幕匹配任务必须保留 Cron 执行计划"
                 }
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                crate::application::admin_scheduled_tasks::RequiredScheduledTaskSchedule::ChapterDetection => {
+                    "片头片尾检测任务必须保留 Cron 执行计划"
+                }
             };
-            let target_id = format!("{}:{}", library_id, task_type);
-            record_audit_event(
-                &state,
-                &headers,
-                "SCHEDULE_UPDATED",
-                Some("scheduled_task"),
-                Some(&target_id),
-                "{}",
-            )
-            .await;
-            return (
-                StatusCode::OK,
-                Json(json!({ "scheduledTask": scheduled_task_json(&task) })),
-            )
-                .into_response();
-        }
-        _ => {
             return api_error(
                 &headers,
                 StatusCode::BAD_REQUEST,
                 lux::ApiErrorCode::InvalidRequest,
-                "任务类型无效",
+                message,
             )
             .into_response();
         }
-    }
-    if let Err(error) = libraries.update_settings(library_id, settings).await {
-        return library_error(&headers, error);
-    }
-    let task = match database
-        .find_scheduled_task_config("LIBRARY", &library_id.to_string(), &task_type)
-        .await
-    {
-        Ok(Some(task)) => task,
-        Ok(None) => {
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::InvalidSchedule) => {
             return api_error(
                 &headers,
-                StatusCode::NOT_FOUND,
-                lux::ApiErrorCode::NotFound,
-                "任务尚未注册",
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "Cron 执行计划无效",
             )
             .into_response();
         }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::ServiceUnavailable)
+        | Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::StorageUnavailable) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::Library(error)) => {
+            return library_error(&headers, error);
+        }
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::Plugin(error)) => {
+            return plugin_error(&headers, error);
+        }
     };
-    let target_id = format!("{}:{}", library_id, task_type);
+    let target_id = format!("{target_owner}:{task_type}");
     record_audit_event(
         &state,
         &headers,

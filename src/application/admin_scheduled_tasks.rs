@@ -1,9 +1,211 @@
 use serde_json::Value;
 
 use crate::{
-    application::{schedule::validate_cron, scheduled_tasks::ScheduledTaskService},
-    storage::{Database, StorageError, StoredScheduledTaskPlan},
+    application::{
+        libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch},
+        plugins::{PluginService, PluginServiceError},
+        schedule::{DANMAKU_MATCH_TASK_TYPE, STRM_MEDIA_INFO_TASK_TYPE, validate_cron},
+        scheduled_tasks::ScheduledTaskService,
+    },
+    domain::ids::LibraryId,
+    storage::{Database, StorageError, StoredScheduledTaskConfig, StoredScheduledTaskPlan},
 };
+
+pub(crate) enum ScheduledTaskOwner {
+    Global,
+    Library(LibraryId),
+}
+
+pub(crate) struct ScheduledTaskConfigUpdate {
+    pub owner: ScheduledTaskOwner,
+    pub task_type: String,
+    pub schedule: Option<String>,
+    pub is_enabled: Option<bool>,
+}
+
+pub(crate) enum ScheduledTaskConfigUpdateError {
+    TaskNotRegistered,
+    ChapterPluginNotRegistered,
+    RequiredSchedule(RequiredScheduledTaskSchedule),
+    InvalidSchedule,
+    ServiceUnavailable,
+    StorageUnavailable,
+    Library(LibraryServiceError),
+    Plugin(PluginServiceError),
+}
+
+pub(crate) enum RequiredScheduledTaskSchedule {
+    StrmMediaInfo,
+    DanmakuMatch,
+    ChapterDetection,
+}
+
+pub(crate) async fn update_scheduled_task_config(
+    database: Option<&Database>,
+    libraries: Option<&LibraryService>,
+    plugins: Option<&PluginService>,
+    request: ScheduledTaskConfigUpdate,
+) -> Result<StoredScheduledTaskConfig, ScheduledTaskConfigUpdateError> {
+    match request.owner {
+        ScheduledTaskOwner::Global => {
+            let is_strm = request.task_type == STRM_MEDIA_INFO_TASK_TYPE;
+            let is_danmaku = request.task_type == DANMAKU_MATCH_TASK_TYPE;
+            if is_strm || is_danmaku {
+                let database =
+                    database.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+                match database
+                    .find_scheduled_task_config("GLOBAL", "global", &request.task_type)
+                    .await
+                    .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+                {
+                    Some(_) => {}
+                    None => return Err(ScheduledTaskConfigUpdateError::TaskNotRegistered),
+                }
+                let Some(schedule) = request
+                    .schedule
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    return Err(ScheduledTaskConfigUpdateError::RequiredSchedule(
+                        if is_strm {
+                            RequiredScheduledTaskSchedule::StrmMediaInfo
+                        } else {
+                            RequiredScheduledTaskSchedule::DanmakuMatch
+                        },
+                    ));
+                };
+                let plugins = plugins.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+                let update = if is_strm {
+                    plugins.update_media_info_schedule(schedule).await
+                } else {
+                    plugins.update_danmaku_schedule(schedule).await
+                };
+                update.map_err(ScheduledTaskConfigUpdateError::Plugin)?;
+                return database
+                    .find_scheduled_task_config("GLOBAL", "global", &request.task_type)
+                    .await
+                    .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+                    .ok_or(ScheduledTaskConfigUpdateError::TaskNotRegistered);
+            }
+
+            let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
+            let schedule = if enabled {
+                request.schedule.as_deref().map(str::trim)
+            } else {
+                None
+            };
+            let database = database.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+            database
+                .upsert_scheduled_task_config(
+                    "GLOBAL",
+                    "global",
+                    &request.task_type,
+                    schedule,
+                    enabled,
+                )
+                .await
+                .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+                .ok_or(ScheduledTaskConfigUpdateError::TaskNotRegistered)
+        }
+        ScheduledTaskOwner::Library(library_id) => {
+            let libraries = libraries.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+            let database = database.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+            let library_id_text = library_id.to_string();
+            match database
+                .find_scheduled_task_config("LIBRARY", &library_id_text, &request.task_type)
+                .await
+                .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+            {
+                Some(_) => {}
+                None => return Err(ScheduledTaskConfigUpdateError::TaskNotRegistered),
+            }
+            let enabled = request.is_enabled.unwrap_or(request.schedule.is_some());
+            let schedule = if enabled {
+                request
+                    .schedule
+                    .as_ref()
+                    .map(|value| value.trim().to_owned())
+            } else {
+                None
+            };
+            if schedule
+                .as_deref()
+                .is_some_and(|schedule| validate_cron(schedule).is_err())
+            {
+                return Err(ScheduledTaskConfigUpdateError::InvalidSchedule);
+            }
+            let mut settings = LibrarySettingsPatch::default();
+            match request.task_type.as_str() {
+                "RECONCILIATION_SCAN" => {
+                    settings.reconciliation_schedule = Some(schedule);
+                    libraries
+                        .update_settings(library_id, settings)
+                        .await
+                        .map_err(ScheduledTaskConfigUpdateError::Library)?;
+                    fetch_library_scheduled_task(database, &library_id_text, &request.task_type)
+                        .await
+                }
+                "METADATA_PARSE" => {
+                    settings.metadata_schedule = Some(schedule);
+                    libraries
+                        .update_settings(library_id, settings)
+                        .await
+                        .map_err(ScheduledTaskConfigUpdateError::Library)?;
+                    fetch_library_scheduled_task(database, &library_id_text, &request.task_type)
+                        .await
+                }
+                "AUTO_LIBRARY_COVER" => database
+                    .upsert_scheduled_task_config(
+                        "LIBRARY",
+                        &library_id_text,
+                        &request.task_type,
+                        schedule.as_deref(),
+                        enabled,
+                    )
+                    .await
+                    .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+                    .ok_or(ScheduledTaskConfigUpdateError::TaskNotRegistered),
+                "CHAPTER_DETECTION" => {
+                    let Some(schedule) = schedule.as_deref() else {
+                        return Err(ScheduledTaskConfigUpdateError::RequiredSchedule(
+                            RequiredScheduledTaskSchedule::ChapterDetection,
+                        ));
+                    };
+                    let task = database
+                        .find_scheduled_task_config("LIBRARY", &library_id_text, &request.task_type)
+                        .await
+                        .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+                        .ok_or(ScheduledTaskConfigUpdateError::TaskNotRegistered)?;
+                    let plugin_id = task
+                        .plugin_id
+                        .ok_or(ScheduledTaskConfigUpdateError::ChapterPluginNotRegistered)?;
+                    let plugins =
+                        plugins.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+                    plugins
+                        .update_chapter_detector_schedule(&plugin_id, schedule)
+                        .await
+                        .map_err(ScheduledTaskConfigUpdateError::Plugin)?;
+                    fetch_library_scheduled_task(database, &library_id_text, &request.task_type)
+                        .await
+                }
+                _ => Err(ScheduledTaskConfigUpdateError::TaskNotRegistered),
+            }
+        }
+    }
+}
+
+async fn fetch_library_scheduled_task(
+    database: &Database,
+    library_id: &str,
+    task_type: &str,
+) -> Result<StoredScheduledTaskConfig, ScheduledTaskConfigUpdateError> {
+    database
+        .find_scheduled_task_config("LIBRARY", library_id, task_type)
+        .await
+        .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+        .ok_or(ScheduledTaskConfigUpdateError::TaskNotRegistered)
+}
 
 pub(crate) struct ScheduledTaskPlanCreate {
     pub task_type: String,
