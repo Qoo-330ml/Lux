@@ -32,6 +32,9 @@ pub(super) use admin_metadata::{
 pub(super) use admin_plugins::*;
 #[path = "admin/admin_emby_migration.rs"]
 mod admin_emby_migration;
+#[path = "admin/admin_health.rs"]
+mod admin_health;
+pub(super) use admin_health::admin_health_payload;
 #[path = "admin/admin_jobs.rs"]
 mod admin_jobs;
 #[path = "admin/admin_logs_events.rs"]
@@ -50,7 +53,6 @@ pub(super) use admin_logs_events::{
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/admin/health", get(admin_health))
         .route(
             "/api/v1/admin/database-diagnostics",
             get(admin_database_diagnostics_status),
@@ -76,4 +78,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_jobs::api_routes())
         .merge(admin_webhooks::api_routes())
         .merge(admin_logs_events::api_routes())
+        .merge(admin_health::api_routes())
 }
