@@ -189,207 +189,138 @@ pub(crate) async fn admin_list_task_activity(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let mut activities = Vec::new();
-    let scan_jobs = match database.list_scan_jobs_for_activity(100).await {
-        Ok(jobs) => jobs,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    activities.extend(scan_jobs.iter().map(|job| {
-        json!({
-            "id": job.id,
+    let activities =
+        match crate::application::admin_task_activity::list_admin_task_activity(database).await {
+            Ok(activities) => activities,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    Json(json!({
+        "activities": activities.iter().map(admin_task_activity_json).collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+fn admin_task_activity_json(
+    activity: &crate::application::admin_task_activity::AdminTaskActivity,
+) -> Value {
+    use crate::application::admin_task_activity::AdminTaskActivity;
+
+    match activity {
+        AdminTaskActivity::Scan {
+            id,
+            task_type,
+            library_id,
+            status,
+            processed_count,
+            total_count,
+            discovery_completed,
+            cancel_requested,
+            current_item,
+            scan_phase,
+        } => json!({
+            "id": id,
             "kind": "scan",
-            "taskType": job.job_type,
-            "libraryId": job.library_id,
-            "status": job.status,
-            "processedCount": job.processed_count,
-            "totalCount": job.total_count,
-            "discoveryCompleted": job.discovery_completed,
-            "cancelRequested": job.cancel_requested,
-            "currentItem": job.current_item,
-            "scanPhase": job.scan_phase,
-        })
-    }));
-    let metadata_jobs = match database
-        .list_metadata_reidentify_jobs_for_activity(100)
-        .await
-    {
-        Ok(jobs) => jobs,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let metadata_labels = match database
-        .list_current_metadata_reidentify_items(
-            &metadata_jobs
-                .iter()
-                .map(|job| job.id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .await
-    {
-        Ok(items) => activity_item_labels(items),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    activities.extend(metadata_jobs.iter().map(|job| {
-        json!({
-            "id": job.id,
+            "taskType": task_type,
+            "libraryId": library_id,
+            "status": status,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+            "discoveryCompleted": discovery_completed,
+            "cancelRequested": cancel_requested,
+            "currentItem": current_item,
+            "scanPhase": scan_phase,
+        }),
+        AdminTaskActivity::Metadata {
+            id,
+            task_type,
+            library_id,
+            status,
+            processed_count,
+            total_count,
+            cancel_requested,
+            current_item,
+        } => json!({
+            "id": id,
             "kind": "metadata",
-            "taskType": job.mode,
-            "libraryId": job.library_id,
-            "status": job.status,
-            "processedCount": job.processed_count,
-            "totalCount": job.total_count,
-            "cancelRequested": job.cancel_requested,
-            "currentItem": metadata_labels.get(&job.id),
-        })
-    }));
-
-    for status in ["PENDING", "RUNNING"] {
-        let strm_jobs = match database.list_strm_probe_jobs(Some(status), 0, 100).await {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(strm_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "strm",
-                "taskType": "STRM_MEDIA_INFO",
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-                "cancelRequested": job.cancel_requested,
-            })
-        }));
-
-        let chapter_jobs = match database
-            .list_chapter_detection_jobs(Some(status), 0, 100)
-            .await
-        {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        let chapter_labels = match database
-            .list_current_chapter_detection_items(
-                &chapter_jobs
-                    .iter()
-                    .map(|job| job.id.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .await
-        {
-            Ok(items) => activity_item_labels(items),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(chapter_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "chapter",
-                "taskType": "CHAPTER_DETECTION",
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-                "cancelRequested": job.cancel_requested,
-                "currentItem": chapter_labels.get(&job.id),
-            })
-        }));
-
-        let danmaku_jobs = match database.list_danmaku_match_jobs(Some(status), 0, 100).await {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        let danmaku_labels = match database
-            .list_current_danmaku_match_items(
-                &danmaku_jobs
-                    .iter()
-                    .map(|job| job.id.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .await
-        {
-            Ok(items) => activity_item_labels(items),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(danmaku_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "danmaku",
-                "taskType": "DANMAKU_MATCH",
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-                "cancelRequested": job.cancel_requested,
-                "currentItem": danmaku_labels.get(&job.id),
-            })
-        }));
-
-        let library_cover_jobs = match database.list_library_cover_jobs(Some(status), 0, 100).await
-        {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(library_cover_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "cover",
-                "taskType": "AUTO_LIBRARY_COVER",
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-            })
-        }));
+            "taskType": task_type,
+            "libraryId": library_id,
+            "status": status,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+            "cancelRequested": cancel_requested,
+            "currentItem": current_item,
+        }),
+        AdminTaskActivity::Strm {
+            id,
+            library_id,
+            status,
+            processed_count,
+            total_count,
+            cancel_requested,
+        } => json!({
+            "id": id,
+            "kind": "strm",
+            "taskType": "STRM_MEDIA_INFO",
+            "libraryId": library_id,
+            "status": status,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+            "cancelRequested": cancel_requested,
+        }),
+        AdminTaskActivity::Chapter {
+            id,
+            library_id,
+            status,
+            processed_count,
+            total_count,
+            cancel_requested,
+            current_item,
+        } => json!({
+            "id": id,
+            "kind": "chapter",
+            "taskType": "CHAPTER_DETECTION",
+            "libraryId": library_id,
+            "status": status,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+            "cancelRequested": cancel_requested,
+            "currentItem": current_item,
+        }),
+        AdminTaskActivity::Danmaku {
+            id,
+            library_id,
+            status,
+            processed_count,
+            total_count,
+            cancel_requested,
+            current_item,
+        } => json!({
+            "id": id,
+            "kind": "danmaku",
+            "taskType": "DANMAKU_MATCH",
+            "libraryId": library_id,
+            "status": status,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+            "cancelRequested": cancel_requested,
+            "currentItem": current_item,
+        }),
+        AdminTaskActivity::Cover {
+            id,
+            library_id,
+            status,
+            processed_count,
+            total_count,
+        } => json!({
+            "id": id,
+            "kind": "cover",
+            "taskType": "AUTO_LIBRARY_COVER",
+            "libraryId": library_id,
+            "status": status,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+        }),
     }
-    activities.sort_by(|left, right| {
-        right["status"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(left["status"].as_str().unwrap_or_default())
-            .then_with(|| {
-                left["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .cmp(right["id"].as_str().unwrap_or_default())
-            })
-    });
-    Json(json!({ "activities": activities })).into_response()
-}
-
-fn activity_item_labels(
-    items: Vec<(String, crate::storage::StoredJobActivityItem)>,
-) -> std::collections::HashMap<String, String> {
-    items
-        .into_iter()
-        .map(|(job_id, item)| (job_id, activity_item_label(&item)))
-        .collect()
-}
-
-fn activity_item_label(item: &crate::storage::StoredJobActivityItem) -> String {
-    if item.item_type != "EPISODE" {
-        return item.title.clone();
-    }
-    let series_title = item
-        .series_title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-        .unwrap_or(item.title.as_str());
-    let episode_number = item.episode_number.map(|number| format!("E{number:02}"));
-    let season_number = item.season_number.map(|number| format!("S{number:02}"));
-    let season_episode = match (season_number, episode_number) {
-        (Some(season), Some(episode)) => Some(format!("{season}{episode}")),
-        (Some(season), None) => Some(season),
-        (None, Some(episode)) => Some(episode),
-        (None, None) => None,
-    };
-    [
-        Some(series_title.to_owned()),
-        season_episode,
-        Some(item.title.clone()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ")
 }
 
 pub(crate) async fn admin_list_scheduled_tasks(
