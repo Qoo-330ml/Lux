@@ -748,9 +748,14 @@ impl MetadataReidentifyService {
                 .search_and_store(item_id, query, year, &scraper.provider)
                 .await
             {
-                Ok(page) if !page.items.is_empty() => return Ok(page),
-                Ok(page) => {
+                Ok(page) if !page.items.is_empty() => {
                     last_page = Some(page);
+                    last_attempt_failed = false;
+                }
+                Ok(page) => {
+                    if last_page.is_none() {
+                        last_page = Some(page);
+                    }
                     last_attempt_failed = false;
                 }
                 Err(MetadataCandidateError::Scraper(error)) => {
@@ -772,6 +777,9 @@ impl MetadataReidentifyService {
             ));
         }
         if last_attempt_failed {
+            if let Some(page) = last_page.filter(|page| !page.items.is_empty()) {
+                return Ok(page);
+            }
             if let Some(error) = last_scraper_error {
                 return Err(MetadataCandidateError::Scraper(error));
             }

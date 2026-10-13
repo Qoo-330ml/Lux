@@ -76,6 +76,14 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
     }
   }
 
+  const candidatesByProvider = new Map<string, AdminMetadataCandidate[]>();
+  for (const candidate of candidates) {
+    const provider = candidate.provider || "元数据刮削器";
+    const providerCandidates = candidatesByProvider.get(provider) ?? [];
+    providerCandidates.push(candidate);
+    candidatesByProvider.set(provider, providerCandidates);
+  }
+
   return (
     <div className="lux-media-editor-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="lux-media-editor lux-identifier-editor" role="dialog" aria-modal="true" aria-labelledby="lux-identifier-title">
@@ -97,7 +105,14 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
           {loading || searching ? <div className="lux-image-result-state"><LoaderCircle className="lux-spin" size={21} /> 正在读取候选…</div> : null}
           {!loading && !searching && !candidates.length ? <div className="lux-image-result-state">没有候选结果，请调整名称或年份后重新搜索。</div> : null}
           <div className="lux-identifier-list">
-            {candidates.map((candidate) => <CandidateCard key={candidate.id} candidate={candidate} selecting={selecting} onSelect={select} />)}
+            {Array.from(candidatesByProvider, ([provider, providerCandidates]) => (
+              <section className="lux-identifier-source-group" key={provider}>
+                <div className="lux-identifier-source-heading"><span>来源：{provider}</span><small>{providerCandidates.length} 个</small></div>
+                <div className="lux-identifier-source-candidates">
+                  {providerCandidates.map((candidate) => <CandidateCard key={candidate.id} candidate={candidate} selecting={selecting} onSelect={select} />)}
+                </div>
+              </section>
+            ))}
           </div>
         </div>
       </section>
