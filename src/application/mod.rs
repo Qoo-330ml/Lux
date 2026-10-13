@@ -9,6 +9,7 @@ pub(crate) mod admin_library_settings;
 pub(crate) mod admin_media_mutations;
 pub(crate) mod admin_people;
 pub(crate) mod admin_scan_jobs;
+pub(crate) mod admin_scheduled_tasks;
 pub(crate) mod admin_task_activity;
 pub(crate) mod admin_user_access;
 pub mod candidates;
