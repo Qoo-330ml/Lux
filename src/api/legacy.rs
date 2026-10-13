@@ -77,7 +77,7 @@ use crate::{
         libraries::{LibraryService, LibraryServiceError, LibrarySettingsPatch, LibraryView},
         library_covers::{LibraryCoverError, LibraryCoverService, MAX_LIBRARY_COVER_BYTES},
         metadata::MetadataField,
-        network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
+        network_diagnostics::{NetworkDiagnostics, NetworkProbeResult},
         nfo::{
             LocalNfoDetails, LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService,
             NfoWriteError, NfoWriteService,
@@ -90,7 +90,6 @@ use crate::{
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::{ScraperProvider, ScraperResolver},
-        settings::{read_network_proxy_url_async, write_network_proxy_url},
         strm_playback::{StrmPlaybackError, StrmPlaybackResolver},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
@@ -110,10 +109,7 @@ use crate::{
     },
     config::{Config, DatabaseConfiguration, PostgresConnection},
     library::{LibraryKind, LibraryRecord, LibraryRootRecord, LibraryScraper, LibraryScraperRole},
-    network::{
-        RemoteAccessPolicy, normalize_proxy_url, proxy_url_from_env, proxy_url_has_credentials,
-        redact_proxy_url,
-    },
+    network::RemoteAccessPolicy,
     observability::{
         logs::{LogDateRange, LogExport, LogExportError, LogStore, export_logs},
         resources::ResourceMetrics,

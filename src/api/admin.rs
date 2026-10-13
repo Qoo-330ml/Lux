@@ -12,7 +12,7 @@ mod admin_users;
 pub(super) use admin_users::user_json;
 #[path = "admin/admin_settings.rs"]
 mod admin_settings;
-pub(super) use admin_settings::{
+pub(super) use crate::application::settings::{
     MediaStrategySettings, read_media_strategy_settings, validate_media_strategy,
 };
 #[path = "admin/admin_libraries.rs"]
@@ -20,7 +20,6 @@ mod admin_libraries;
 pub(super) use admin_libraries::{
     RefreshLocalMetadataRequest, ScanPathRequest, default_realtime_watch_enabled,
     deserialize_optional_optional, library_cover_url, library_error, library_json,
-    validate_scraper_selection,
 };
 #[path = "admin/admin_items.rs"]
 mod admin_items;
