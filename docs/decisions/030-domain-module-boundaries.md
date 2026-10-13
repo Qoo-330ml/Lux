@@ -19,22 +19,34 @@ exceed 20,000 lines:
   image resources, and index recovery.
 
 The size makes ownership and review difficult and increases the amount of code considered by
-incremental compilation. A split must preserve the current HTTP and storage contracts. The
-project must remain one Rust process with the existing SQLite/PostgreSQL abstraction, and this
-maintenance task must not change public models, migrations, or dependencies.
+incremental compilation. `src/api/admin_handlers.rs` also grew to nearly 10,000 lines, combining
+unrelated administrator domains and their application orchestration. A split must preserve the
+current HTTP and storage contracts. The project must remain one Rust process with the existing
+SQLite/PostgreSQL abstraction, and this maintenance task must not change public models, migrations,
+or dependencies.
 
 ## Decision
 
 Use thin facade modules with explicit domain children:
 
 - `api` keeps `AppState`, shared middleware/error helpers, route composition, and stable re-exports;
-  domain children own admin, Emby, media, playback, and user handlers.
+  domain children own admin, Emby, media, playback, and user handlers. The administrator facade
+  `admin.rs` explicitly merges domain routers and re-exports shared helpers and DTOs for existing
+  callers. Its `admin/` children own user, library, item, metadata, people, plugin, Emby migration,
+  job, scheduled-task, settings, webhook, log/event, health, dashboard, and database-diagnostic
+  routes. Shared administrator protocol helpers stay in `admin_common.rs`.
 - `storage` keeps `Database`, shared records, backend helpers, and stable re-exports;
   domain children own catalog, jobs, library, media, metadata, notifications, people, sessions,
   and users repositories. The Emby migration repository remains an explicitly named compatibility
   child alongside them.
 - `application::people` keeps the public People types and service construction;
   child modules own relationship/matching, metadata, assets, and index-rebuild/recovery logic.
+- Multi-service administrator workflows, cross-table or cross-job aggregation, cache invalidation,
+  plugin synchronization, and domain worker startup live in domain-focused `application::admin_*`
+  use cases. API handlers remain protocol adapters: they extract and validate requests, enforce
+  HTTP authentication/CSRF, map results to DTOs and responses, and keep SSE protocol loops in the
+  API layer. Application use cases accept domain inputs and explicit service dependencies; they do
+  not accept Axum types or `AppState`.
 
 Children may use private shared helpers through explicit `pub(super)` or `pub(crate)` boundaries.
 No `include!`-based textual partitioning is used: each child is a real Rust module with a named
@@ -74,3 +86,12 @@ first release; deployment and transaction costs would be disproportionate to thi
   implementation.
 - File boundaries alone do not guarantee faster builds; compile-time impact must be measured after
   the split rather than assumed.
+
+## Administrator API implementation
+
+The administrator router is composed explicitly by `src/api/admin.rs`; each domain child owns its
+route bindings, handlers, DTOs, and mappings. Existing internal callers continue to import shared
+helpers and DTOs through that facade. The split preserves the baseline route and method map,
+including Axum's implicit `HEAD` behavior for `GET` routes. This is an organizational boundary:
+HTTP paths, serialization, authorization, errors, limits, and side effects remain governed by the
+existing API contract.

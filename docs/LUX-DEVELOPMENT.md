@@ -11060,11 +11060,11 @@ application 不接收 Axum 类型或 `AppState`，不直接生成 HTTP 响应。
 
 验收：
 
-- [ ] 管理员路由由领域子模块持有，并经 `admin.rs` 的显式稳定 re-export 组合；110 个基线路径及其方法（包括 Axum GET 隐含的 HEAD）均保留。
-- [ ] `admin_handlers.rs` 删除；API handler 不再直接编排多服务用例、数据库查询聚合或启动领域 worker。SSE writer/heartbeat 留在 API 协议适配。
-- [ ] application 用例使用领域输入/结果与显式依赖，不接收 HTTP 类型或 `AppState`；所有原调用方的 helper/DTO 兼容路径仍可编译。
-- [ ] 序列化、鉴权、错误响应、部分成功、审计、事件发布、任务调度、缓存失效与资源限制保持原行为。
-- [ ] 领域回归、全部 Rust 集成测试、完整项目检查通过；API 和 ADR 模块边界文档已更新。
+- [x] 管理员路由由领域子模块持有，并经 `admin.rs` 的显式稳定 re-export 组合；110 个基线路径及其方法（包括 Axum GET 隐含的 HEAD）均保留。
+- [x] `admin_handlers.rs` 删除；API handler 不再直接编排多服务用例、数据库查询聚合或启动领域 worker。SSE writer/heartbeat 留在 API 协议适配。
+- [x] application 用例使用领域输入/结果与显式依赖，不接收 HTTP 类型或 `AppState`；所有原调用方的 helper/DTO 兼容路径仍可编译。
+- [x] 序列化、鉴权、错误响应、部分成功、审计、事件发布、任务调度、缓存失效与资源限制保持原行为。
+- [x] 领域回归、全部 Rust 集成测试、完整项目检查通过；API 和 ADR 模块边界文档已更新。
 
 计划文件：`src/api/admin.rs`、`src/api/admin_handlers.rs` 及按上述领域新建的 `src/api/admin/` 子模块；
 `src/api/legacy.rs`、`users.rs`、`media.rs`、`playback.rs`、`emby_handlers.rs`、`emby_catalog.rs`、
@@ -11075,6 +11075,18 @@ application 不接收 Axum 类型或 `AppState`，不直接生成 HTTP 响应。
 fmt 与 `git diff --check`，独立提交。完成时运行 `./scripts/check-all.sh`，以及 all-targets Rust、
 Clippy、Web 测试和构建质量门；Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。记录本机架构，
 不从 ARM 检查推断 NAS/x86 性能。
+
+实施结果（2026-10-13）：删除 9,956 行管理员 handler 单体，按用户、媒体库、媒体条目、元数据、人物、
+插件、Emby 迁移、后台任务、计划任务、设置、Webhook、日志/事件、健康、仪表盘和数据库诊断拆成领域
+子模块；`admin.rs` 显式组合子路由并重导出兼容 helper/DTO。跨服务编排、查询聚合、缓存失效、插件同步
+和领域 worker 启动迁入 `application::admin_*`。与 `origin/test` 基线对照，110 个路径、128 个显式方法
+绑定及包含隐式 HEAD 的 179 个路径/方法组合均一致。
+
+验证结果：相关定向测试 30/30 通过；`./scripts/check-all.sh` 全部通过，其中 Rust 111 个测试目标共
+1,536 passed、0 failed、42 ignored（library 840 passed、20 ignored），fmt、all-features Clippy、shell
+语法、Python 3/3 与 2/2、冻结 lockfile 安装、Node 137/137、Vitest 583/583 及 Web production build
+均通过。本机架构为 `arm64`，未据此推断 NAS/x86 性能。此前两次全量重跑分别遇到未修改区域的 NFO actor
+credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 all-targets 与 check-all 完整运行均通过。
 
 ## 28. 参考资料
 
