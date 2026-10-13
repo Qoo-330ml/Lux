@@ -9,35 +9,12 @@ pub(super) use admin_users::user_json;
 #[path = "admin/admin_settings.rs"]
 mod admin_settings;
 pub(super) use admin_settings::*;
+#[path = "admin/admin_libraries.rs"]
+mod admin_libraries;
+pub(super) use admin_libraries::*;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/v1/admin/libraries",
-            get(admin_list_libraries).post(admin_create_library),
-        )
-        .route("/api/v1/admin/directories", get(admin_list_directories))
-        .route(
-            "/api/v1/admin/libraries/{library_id}",
-            patch(admin_update_library).delete(admin_delete_library),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/cover",
-            put(admin_update_library_cover)
-                .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/cover/auto",
-            post(admin_run_auto_library_cover),
-        )
-        .route(
-            "/api/v1/admin/library-cover-jobs",
-            get(admin_list_library_cover_jobs),
-        )
-        .route(
-            "/api/v1/admin/library-cover-jobs/{job_id}",
-            get(admin_get_library_cover_job),
-        )
         .route(
             "/api/v1/admin/people/index-rebuild",
             get(admin_list_people_index_rebuild),
@@ -216,14 +193,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_refresh_collection),
         )
         .route(
-            "/api/v1/admin/libraries/{library_id}/roots",
-            post(admin_add_library_root),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/roots/{root_id}",
-            delete(admin_delete_library_root),
-        )
-        .route(
             "/api/v1/admin/libraries/{library_id}/scan",
             post(admin_start_scan),
         )
@@ -382,4 +351,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/admin/logs", get(admin_list_logs))
         .merge(admin_users::api_routes())
         .merge(admin_settings::api_routes())
+        .merge(admin_libraries::api_routes())
 }
