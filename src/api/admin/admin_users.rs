@@ -327,56 +327,16 @@ pub(crate) async fn admin_set_library_access(
         )
         .into_response();
     };
-    let user_exists = match database.user_exists(&user_id).await {
-        Ok(exists) => exists,
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "数据库暂时不可用",
-            )
-            .into_response();
-        }
-    };
-    if !user_exists {
-        return api_error(
-            &headers,
-            StatusCode::NOT_FOUND,
-            lux::ApiErrorCode::NotFound,
-            "用户不存在",
-        )
-        .into_response();
-    }
-    let library_exists = match database.library_exists(&library_id).await {
-        Ok(exists) => exists,
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "数据库暂时不可用",
-            )
-            .into_response();
-        }
-    };
-    if !library_exists {
-        return api_error(
-            &headers,
-            StatusCode::NOT_FOUND,
-            lux::ApiErrorCode::NotFound,
-            "媒体库不存在",
-        )
-        .into_response();
-    }
-    match database
-        .set_user_library_access(&user_id, &library_id, request.can_view)
-        .await
+    match crate::application::admin_user_access::set_library_access(
+        database,
+        state.home.as_ref(),
+        &user_id,
+        &library_id,
+        request.can_view,
+    )
+    .await
     {
         Ok(()) => {
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
             record_audit_event(
                 &state,
                 &headers,
@@ -396,7 +356,25 @@ pub(crate) async fn admin_set_library_access(
             }))
             .into_response()
         }
-        Err(_) => api_error(
+        Err(crate::application::admin_user_access::SetLibraryAccessError::UserNotFound) => {
+            api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response()
+        }
+        Err(crate::application::admin_user_access::SetLibraryAccessError::LibraryNotFound) => {
+            api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response()
+        }
+        Err(crate::application::admin_user_access::SetLibraryAccessError::Storage) => api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,

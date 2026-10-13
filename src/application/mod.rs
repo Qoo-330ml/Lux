@@ -7,6 +7,7 @@ pub mod admin_health;
 pub(crate) mod admin_job_workers;
 pub(crate) mod admin_scan_jobs;
 pub(crate) mod admin_task_activity;
+pub(crate) mod admin_user_access;
 pub mod candidates;
 pub mod catalog;
 pub mod chapter_detector;
