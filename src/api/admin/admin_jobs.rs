@@ -1368,9 +1368,3 @@ pub(crate) fn strm_probe_error(headers: &HeaderMap, error: StrmProbeError) -> Re
         StrmProbeError::Plugin(error) => plugin_error(headers, error),
     }
 }
-
-#[derive(Deserialize, Default)]
-pub(crate) struct AdminLogExportQuery {
-    pub(crate) from: Option<String>,
-    pub(crate) to: Option<String>,
-}

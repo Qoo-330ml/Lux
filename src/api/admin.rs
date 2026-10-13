@@ -34,14 +34,18 @@ pub(super) use admin_plugins::*;
 mod admin_emby_migration;
 #[path = "admin/admin_jobs.rs"]
 mod admin_jobs;
+#[path = "admin/admin_logs_events.rs"]
+mod admin_logs_events;
 #[path = "admin/admin_scheduled_tasks.rs"]
 mod admin_scheduled_tasks;
 #[path = "admin/admin_webhooks.rs"]
 mod admin_webhooks;
 pub(super) use admin_emby_migration::emby_migration_error;
 pub(super) use admin_jobs::{
-    AdminJobsQuery, AdminLogExportQuery, scan_job_json, scan_job_json_from_storage,
-    spawn_library_scan, strm_probe_error,
+    AdminJobsQuery, scan_job_json, scan_job_json_from_storage, spawn_library_scan, strm_probe_error,
+};
+pub(super) use admin_logs_events::{
+    playback_activity_event_type, record_activity_event, record_audit_event,
 };
 
 pub(super) fn api_routes() -> Router<AppState> {
@@ -60,11 +64,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_export_database_diagnostics),
         )
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
-        .route("/api/v1/admin/events", get(admin_events))
-        .route("/api/v1/events", get(user_events))
-        .route("/api/v1/admin/audit", get(admin_list_audit))
-        .route("/api/v1/admin/logs/export", get(admin_export_logs))
-        .route("/api/v1/admin/logs", get(admin_list_logs))
         .merge(admin_users::api_routes())
         .merge(admin_settings::api_routes())
         .merge(admin_libraries::api_routes())
@@ -76,4 +75,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_scheduled_tasks::api_routes())
         .merge(admin_jobs::api_routes())
         .merge(admin_webhooks::api_routes())
+        .merge(admin_logs_events::api_routes())
 }
