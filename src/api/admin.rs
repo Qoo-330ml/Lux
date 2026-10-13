@@ -30,49 +30,12 @@ pub(super) use admin_metadata::{
     MetadataCandidateFailureKind, metadata_candidate_error, metadata_candidate_failure_kind,
 };
 pub(super) use admin_plugins::*;
+#[path = "admin/admin_emby_migration.rs"]
+mod admin_emby_migration;
+pub(super) use admin_emby_migration::emby_migration_error;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/v1/admin/emby-migration/test",
-            post(admin_test_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/source-users",
-            get(admin_list_emby_migration_source_users),
-        )
-        .route(
-            "/api/v1/admin/emby-migration",
-            get(admin_list_emby_migrations).post(admin_create_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}",
-            get(admin_get_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/cancel",
-            post(admin_cancel_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/retry",
-            post(admin_retry_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/users",
-            get(admin_list_emby_migration_users),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/matches",
-            get(admin_list_emby_migration_matches),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/imports",
-            get(admin_list_emby_migration_imports),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/person-favorites",
-            get(admin_list_emby_migration_person_favorites),
-        )
         .route(
             "/api/v1/admin/libraries/{library_id}/scan",
             post(admin_start_scan),
@@ -225,4 +188,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_people::api_routes())
         .merge(admin_metadata::api_routes())
         .merge(admin_plugins::api_routes())
+        .merge(admin_emby_migration::api_routes())
 }
