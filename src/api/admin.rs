@@ -15,21 +15,11 @@ pub(super) use admin_libraries::*;
 #[path = "admin/admin_items.rs"]
 mod admin_items;
 pub(super) use admin_items::*;
+#[path = "admin/admin_people.rs"]
+mod admin_people;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/v1/admin/people/index-rebuild",
-            get(admin_list_people_index_rebuild),
-        )
-        .route(
-            "/api/v1/admin/people/index-rebuild/{library_id}",
-            post(admin_queue_people_index_rebuild),
-        )
-        .route(
-            "/api/v1/admin/people/index-rebuild/{library_id}/cancel",
-            post(admin_cancel_people_index_rebuild),
-        )
         .route("/api/v1/admin/plugins", get(admin_list_plugins))
         .route(
             "/api/v1/admin/notification-providers",
@@ -120,30 +110,6 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/metadata/pending",
             get(admin_list_pending_metadata),
-        )
-        .route(
-            "/api/v1/admin/people/matches",
-            get(admin_list_pending_person_matches),
-        )
-        .route(
-            "/api/v1/admin/people/matches/{candidate_id}/confirm",
-            post(admin_confirm_person_match),
-        )
-        .route(
-            "/api/v1/admin/people/matches/{candidate_id}/reject",
-            post(admin_reject_person_match),
-        )
-        .route(
-            "/api/v1/admin/people/matches/{candidate_id}/undo",
-            post(admin_undo_person_match),
-        )
-        .route(
-            "/api/v1/admin/people/{person_id}/split",
-            post(admin_split_person_identity),
-        )
-        .route(
-            "/api/v1/admin/people/{person_id}/locks",
-            post(admin_set_person_field_locks),
         )
         .route(
             "/api/v1/admin/metadata/reidentify",
@@ -339,4 +305,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_settings::api_routes())
         .merge(admin_libraries::api_routes())
         .merge(admin_items::api_routes())
+        .merge(admin_people::api_routes())
 }
