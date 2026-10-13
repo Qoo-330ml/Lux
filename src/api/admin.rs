@@ -3,6 +3,9 @@ use super::*;
 #[path = "admin_handlers.rs"]
 mod admin_handlers;
 pub(super) use admin_handlers::*;
+#[path = "admin/admin_users.rs"]
+mod admin_users;
+pub(super) use admin_users::user_json;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -132,18 +135,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_list_emby_migration_person_favorites),
         )
         .route(
-            "/api/v1/admin/users",
-            get(admin_list_users).post(admin_create_user),
-        )
-        .route(
-            "/api/v1/admin/users/{user_id}",
-            patch(admin_update_user).delete(admin_delete_user),
-        )
-        .route(
-            "/api/v1/admin/users/{user_id}/libraries",
-            get(admin_list_user_library_access),
-        )
-        .route(
             "/api/v1/admin/metadata/pending",
             get(admin_list_pending_metadata),
         )
@@ -228,10 +219,6 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/libraries/{library_id}/roots/{root_id}",
             delete(admin_delete_library_root),
-        )
-        .route(
-            "/api/v1/admin/users/{user_id}/libraries/{library_id}",
-            patch(admin_set_library_access),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/scan",
@@ -403,4 +390,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs/export", get(admin_export_logs))
         .route("/api/v1/admin/logs", get(admin_list_logs))
+        .merge(admin_users::api_routes())
 }
