@@ -35,6 +35,9 @@ mod admin_emby_migration;
 #[path = "admin/admin_health.rs"]
 mod admin_health;
 pub(super) use admin_health::admin_health_payload;
+#[path = "admin/admin_dashboard.rs"]
+mod admin_dashboard;
+pub(super) use admin_dashboard::DEFAULT_SERVER_NAME;
 #[path = "admin/admin_database_diagnostics.rs"]
 mod admin_database_diagnostics;
 #[path = "admin/admin_jobs.rs"]
@@ -55,7 +58,6 @@ pub(super) use admin_logs_events::{
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .merge(admin_users::api_routes())
         .merge(admin_settings::api_routes())
         .merge(admin_libraries::api_routes())
@@ -70,4 +72,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_logs_events::api_routes())
         .merge(admin_health::api_routes())
         .merge(admin_database_diagnostics::api_routes())
+        .merge(admin_dashboard::api_routes())
 }
