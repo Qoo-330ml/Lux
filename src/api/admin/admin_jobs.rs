@@ -476,60 +476,33 @@ pub(crate) async fn admin_start_chapter_detection(
     let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
         return chapter_detection_error(&headers, ChapterDetectionError::LibraryNotFound);
     };
-    let Some(service) = state.chapter_detection.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let defaults = ChapterDetectionOptions::default();
-    let plugin_id = request
-        .plugin_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID);
-    let configured_options = if let Some(plugins) = state.plugins.as_ref() {
-        match plugins.chapter_detector_settings(plugin_id).await {
-            Ok(settings) => Some(ChapterDetectionOptions {
-                concurrency: settings.concurrency,
-                intro_window_seconds: settings.intro_window_seconds,
-                credits_window_seconds: settings.credits_window_seconds,
-                match_threshold: settings.match_threshold,
-                force_refresh: false,
-            }),
-            Err(
-                PluginServiceError::InvalidConfig
-                | PluginServiceError::UnknownPlugin(_)
-                | PluginServiceError::Unavailable(_),
-            ) => None,
-            Err(error) => {
-                return chapter_detection_error(&headers, ChapterDetectionError::Plugin(error));
-            }
-        }
-    } else {
-        None
-    };
-    let configured_options = configured_options.unwrap_or(defaults);
-    let options = ChapterDetectionOptions {
-        concurrency: request
-            .concurrency
-            .unwrap_or(configured_options.concurrency),
-        intro_window_seconds: request
-            .intro_window_seconds
-            .unwrap_or(configured_options.intro_window_seconds),
-        credits_window_seconds: request
-            .credits_window_seconds
-            .unwrap_or(configured_options.credits_window_seconds),
-        match_threshold: request
-            .match_threshold
-            .unwrap_or(configured_options.match_threshold),
+    let overrides = crate::application::admin_job_workers::ChapterDetectionOverrides {
+        concurrency: request.concurrency,
+        intro_window_seconds: request.intro_window_seconds,
+        credits_window_seconds: request.credits_window_seconds,
+        match_threshold: request.match_threshold,
         force_refresh: request.force_refresh,
     };
-    let job = match crate::application::admin_job_workers::start_chapter_detection_job(
-        service, library_id, plugin_id, options,
+    let job = match crate::application::admin_job_workers::start_admin_chapter_detection_job(
+        state.chapter_detection.as_ref(),
+        state.plugins.as_ref(),
+        library_id,
+        request.plugin_id.as_deref(),
+        overrides,
     )
     .await
     {
         Ok(job) => job,
-        Err(error) => return chapter_detection_error(&headers, error),
+        Err(
+            crate::application::admin_job_workers::AdminChapterDetectionError::ServiceUnavailable,
+        ) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(crate::application::admin_job_workers::AdminChapterDetectionError::Detection(
+            error,
+        )) => {
+            return chapter_detection_error(&headers, error);
+        }
     };
     record_audit_event(
         &state,

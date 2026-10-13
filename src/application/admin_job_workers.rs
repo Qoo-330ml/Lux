@@ -5,11 +5,26 @@ use crate::{
             ChapterDetectionService,
         },
         danmaku::{DanmakuMatchJob, DanmakuService, DanmakuServiceError},
+        plugins::{PluginService, PluginServiceError},
         strm_probe::{StrmProbeError, StrmProbeJob, StrmProbeService},
     },
     domain::ids::LibraryId,
 };
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ChapterDetectionOverrides {
+    pub(crate) concurrency: Option<i64>,
+    pub(crate) intro_window_seconds: Option<i64>,
+    pub(crate) credits_window_seconds: Option<i64>,
+    pub(crate) match_threshold: Option<u32>,
+    pub(crate) force_refresh: bool,
+}
+
+pub(crate) enum AdminChapterDetectionError {
+    ServiceUnavailable,
+    Detection(ChapterDetectionError),
+}
 
 #[derive(Clone, Copy)]
 enum StrmProbeLog {
@@ -83,6 +98,61 @@ pub(crate) async fn start_chapter_detection_job(
         .await?;
     spawn_chapter_detection_job(service, &job, false);
     Ok(job)
+}
+
+pub(crate) async fn start_admin_chapter_detection_job(
+    service: Option<&ChapterDetectionService>,
+    plugins: Option<&PluginService>,
+    library_id: LibraryId,
+    requested_plugin_id: Option<&str>,
+    overrides: ChapterDetectionOverrides,
+) -> Result<ChapterDetectionJob, AdminChapterDetectionError> {
+    let service = service.ok_or(AdminChapterDetectionError::ServiceUnavailable)?;
+    let plugin_id = requested_plugin_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::application::chapter_detector::DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID);
+    let configured_options = match plugins {
+        Some(plugins) => match plugins.chapter_detector_settings(plugin_id).await {
+            Ok(settings) => Some(ChapterDetectionOptions {
+                concurrency: settings.concurrency,
+                intro_window_seconds: settings.intro_window_seconds,
+                credits_window_seconds: settings.credits_window_seconds,
+                match_threshold: settings.match_threshold,
+                force_refresh: false,
+            }),
+            Err(
+                PluginServiceError::InvalidConfig
+                | PluginServiceError::UnknownPlugin(_)
+                | PluginServiceError::Unavailable(_),
+            ) => None,
+            Err(error) => {
+                return Err(AdminChapterDetectionError::Detection(
+                    ChapterDetectionError::Plugin(error),
+                ));
+            }
+        },
+        None => None,
+    }
+    .unwrap_or_default();
+    let options = ChapterDetectionOptions {
+        concurrency: overrides
+            .concurrency
+            .unwrap_or(configured_options.concurrency),
+        intro_window_seconds: overrides
+            .intro_window_seconds
+            .unwrap_or(configured_options.intro_window_seconds),
+        credits_window_seconds: overrides
+            .credits_window_seconds
+            .unwrap_or(configured_options.credits_window_seconds),
+        match_threshold: overrides
+            .match_threshold
+            .unwrap_or(configured_options.match_threshold),
+        force_refresh: overrides.force_refresh,
+    };
+    start_chapter_detection_job(service, library_id, plugin_id, options)
+        .await
+        .map_err(AdminChapterDetectionError::Detection)
 }
 
 pub(crate) async fn retry_chapter_detection_job(
