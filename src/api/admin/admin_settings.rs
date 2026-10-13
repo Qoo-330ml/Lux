@@ -671,59 +671,53 @@ pub(crate) async fn admin_update_settings(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     }
-    match database
-        .set_server_settings(
-            percent,
-            minimum_ticks,
-            &media_strategy_json,
+    if crate::application::settings::write_admin_settings(
+        database,
+        state.home.as_ref(),
+        state.plugins.as_ref(),
+        crate::application::settings::AdminSettingsWrite {
+            resume_played_percent: percent,
+            resume_min_ticks: minimum_ticks,
+            media_strategy_json: &media_strategy_json,
             force_admin_library_order,
-            &login_background_source,
-        )
-        .await
+            login_background_source: &login_background_source,
+            server_name: &server_name,
+            refresh_login_background: login_background_source_changed
+                && login_background_plugin_id(&login_background_source).is_some(),
+        },
+    )
+    .await
+    .is_err()
     {
-        Ok(()) => {
-            if login_background_source_changed
-                && login_background_plugin_id(&login_background_source).is_some()
-                && let Some(plugins) = state.plugins.as_ref()
-            {
-                plugins.request_login_background_refresh();
-            }
-            if database.set_server_name(&server_name).await.is_err() {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
-            let login_background_source_status = if let Some(plugins) = state.plugins.as_ref() {
-                plugins
-                    .login_background_source_status(&login_background_source)
-                    .await
-            } else if login_background_plugin_id(&login_background_source).is_some() {
-                "PLUGIN_UNAVAILABLE".to_owned()
-            } else {
-                "READY".to_owned()
-            };
-            record_audit_event(
-                &state,
-                &headers,
-                "SETTINGS_UPDATED",
-                Some("settings"),
-                None,
-                &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks},"forceAdminLibraryOrder":{force_admin_library_order},"loginBackgroundSource":"{login_background_source}"}}"#),
-            )
-            .await;
-            Json(json!({
-                "serverName": server_name,
-                "resumePlayedPercent": percent,
-                "resumeMinTicks": minimum_ticks,
-                "forceAdminLibraryOrder": force_admin_library_order,
-                "loginBackgroundSource": login_background_source,
-                "loginBackgroundSourceStatus": login_background_source_status,
-                "mediaStrategy": media_strategy,
-                "networkProxy": network_proxy_settings(&state).await,
-            }))
-            .into_response()
-        }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    let login_background_source_status = if let Some(plugins) = state.plugins.as_ref() {
+        plugins
+            .login_background_source_status(&login_background_source)
+            .await
+    } else if login_background_plugin_id(&login_background_source).is_some() {
+        "PLUGIN_UNAVAILABLE".to_owned()
+    } else {
+        "READY".to_owned()
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "SETTINGS_UPDATED",
+        Some("settings"),
+        None,
+        &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks},"forceAdminLibraryOrder":{force_admin_library_order},"loginBackgroundSource":"{login_background_source}"}}"#),
+    )
+    .await;
+    Json(json!({
+        "serverName": server_name,
+        "resumePlayedPercent": percent,
+        "resumeMinTicks": minimum_ticks,
+        "forceAdminLibraryOrder": force_admin_library_order,
+        "loginBackgroundSource": login_background_source,
+        "loginBackgroundSourceStatus": login_background_source_status,
+        "mediaStrategy": media_strategy,
+        "networkProxy": network_proxy_settings(&state).await,
+    }))
+    .into_response()
 }

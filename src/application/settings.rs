@@ -1,11 +1,56 @@
 use std::{io::Write, path::Path};
 
+use crate::{
+    application::{home::HomeService, plugins::PluginService},
+    storage::Database,
+};
 use tokio::fs;
 
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
 pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
 pub const LOGIN_BACKGROUND_PLUGIN_SOURCE_PREFIX: &str = "PLUGIN:";
+
+pub(crate) struct AdminSettingsWrite<'a> {
+    pub(crate) resume_played_percent: i64,
+    pub(crate) resume_min_ticks: i64,
+    pub(crate) media_strategy_json: &'a str,
+    pub(crate) force_admin_library_order: bool,
+    pub(crate) login_background_source: &'a str,
+    pub(crate) server_name: &'a str,
+    pub(crate) refresh_login_background: bool,
+}
+
+pub(crate) async fn write_admin_settings(
+    database: &Database,
+    home: Option<&HomeService>,
+    plugins: Option<&PluginService>,
+    settings: AdminSettingsWrite<'_>,
+) -> Result<(), ()> {
+    database
+        .set_server_settings(
+            settings.resume_played_percent,
+            settings.resume_min_ticks,
+            settings.media_strategy_json,
+            settings.force_admin_library_order,
+            settings.login_background_source,
+        )
+        .await
+        .map_err(|_| ())?;
+    if settings.refresh_login_background
+        && let Some(plugins) = plugins
+    {
+        plugins.request_login_background_refresh();
+    }
+    database
+        .set_server_name(settings.server_name)
+        .await
+        .map_err(|_| ())?;
+    if let Some(home) = home {
+        home.invalidate();
+    }
+    Ok(())
+}
 
 pub fn is_valid_login_background_source(value: &str) -> bool {
     matches!(
