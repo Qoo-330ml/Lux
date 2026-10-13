@@ -9,12 +9,20 @@ use crate::{
     },
     domain::ids::LibraryId,
 };
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 enum StrmProbeLog {
     Admin,
     Configured,
     Retried,
+}
+
+pub(crate) fn dispatch_emby_migration_job(
+    service: Arc<crate::application::emby_migration_service::EmbyMigrationService>,
+    job_id: String,
+) {
+    service.spawn(job_id);
 }
 
 pub(crate) async fn start_admin_strm_probe_jobs(

@@ -116,7 +116,10 @@ pub(crate) async fn admin_create_emby_migration(
     match service.create_job(&actor.id.to_string(), request).await {
         Ok(job) => {
             let job_id = job.id.clone();
-            service.clone().spawn(job_id.clone());
+            crate::application::admin_job_workers::dispatch_emby_migration_job(
+                service.clone(),
+                job_id.clone(),
+            );
             record_audit_event(
                 &state,
                 &headers,
@@ -226,7 +229,10 @@ pub(crate) async fn admin_retry_emby_migration(
     };
     match service.resume_job(&job_id).await {
         Ok(true) => {
-            service.clone().spawn(job_id.clone());
+            crate::application::admin_job_workers::dispatch_emby_migration_job(
+                service.clone(),
+                job_id.clone(),
+            );
             (
                 StatusCode::ACCEPTED,
                 Json(json!({ "jobId": job_id, "status": "ACCEPTED" })),

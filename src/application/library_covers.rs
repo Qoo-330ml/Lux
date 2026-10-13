@@ -138,6 +138,34 @@ impl LibraryCoverService {
         self.create_job(library_id, true).await
     }
 
+    pub async fn dispatch_manual_job(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<LibraryCoverJob, LibraryCoverError> {
+        let job = self.create_manual_job(library_id).await?;
+        let worker = self.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            match worker.run_job(&job_id).await {
+                Ok(AutoLibraryCoverResult::Generated) => {
+                    tracing::info!(job_id = %job_id, "manual automatic library cover generation completed");
+                }
+                Ok(
+                    AutoLibraryCoverResult::ExistingCover
+                    | AutoLibraryCoverResult::BelowThreshold
+                    | AutoLibraryCoverResult::TaskNotRegistered
+                    | AutoLibraryCoverResult::AlreadyHandled,
+                ) => {
+                    tracing::info!(job_id = %job_id, "manual automatic library cover generation skipped");
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = %job_id, %error, "manual automatic library cover generation failed");
+                }
+            }
+        });
+        Ok(job)
+    }
+
     async fn create_job(
         &self,
         library_id: LibraryId,

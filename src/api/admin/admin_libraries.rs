@@ -724,20 +724,13 @@ pub(crate) async fn admin_run_auto_library_cover(
             );
         }
     };
-    let Some(database) = state.database.as_ref() else {
+    let library_id_text = library_id.to_string();
+    let Some(covers) = state.library_covers.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_id_text = library_id.to_string();
-    match database
-        .find_scheduled_task_config(
-            "LIBRARY",
-            &library_id_text,
-            crate::application::library_covers::AUTO_LIBRARY_COVER_TASK_TYPE,
-        )
-        .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    let job = match covers.dispatch_manual_job(library_id).await {
+        Ok(job) => job,
+        Err(LibraryCoverError::TaskNotRegistered) => {
             return api_error(
                 &headers,
                 StatusCode::NOT_FOUND,
@@ -746,34 +739,8 @@ pub(crate) async fn admin_run_auto_library_cover(
             )
             .into_response();
         }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let Some(covers) = state.library_covers.clone() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let job = match covers.create_manual_job(library_id).await {
-        Ok(job) => job,
         Err(error) => return library_cover_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        match covers.run_job(&job_id).await {
-            Ok(crate::application::library_covers::AutoLibraryCoverResult::Generated) => {
-                tracing::info!(job_id = %job_id, "manual automatic library cover generation completed");
-            }
-            Ok(
-                crate::application::library_covers::AutoLibraryCoverResult::ExistingCover
-                | crate::application::library_covers::AutoLibraryCoverResult::BelowThreshold
-                | crate::application::library_covers::AutoLibraryCoverResult::TaskNotRegistered
-                | crate::application::library_covers::AutoLibraryCoverResult::AlreadyHandled,
-            ) => {
-                tracing::info!(job_id = %job_id, "manual automatic library cover generation skipped");
-            }
-            Err(error) => {
-                tracing::warn!(job_id = %job_id, %error, "manual automatic library cover generation failed");
-            }
-        }
-    });
     record_audit_event(
         &state,
         &headers,
