@@ -4,10 +4,6 @@ pub(super) fn api_routes() -> Router<AppState> {
     Router::new().route("/api/v1/admin/dashboard", get(admin_dashboard))
 }
 
-pub(crate) const DEFAULT_SERVER_NAME: &str = "Lux Server";
-const DASHBOARD_ACTIVITY_LIMIT: i64 = 24;
-const DASHBOARD_PLAYBACK_LIMIT: usize = 24;
-
 pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -15,65 +11,59 @@ pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppS
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let health = match admin_health_payload(&state).await {
-        Ok(health) => health,
-        Err(status) => return status.into_response(),
-    };
-    let server_name = match database.server_name().await {
-        Ok(Some(name)) if !name.trim().is_empty() => name,
-        Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let stats = match database.dashboard_stats().await {
-        Ok(stats) => stats,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let sessions = match database.list_playback_sessions(None, None).await {
-        Ok(sessions) => sessions,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let users = match UserStore::new(database.clone()) {
-        Ok(users) => match users.list_users().await {
-            Ok(users) => users,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let snapshot = match crate::application::admin_dashboard::load_admin_dashboard(
+        database,
+        state.config_dir.as_deref(),
+        &state.resources,
+        crate::application::admin_dashboard::AdminDashboardServices {
+            libraries: state.libraries.as_ref(),
+            catalog: state.catalog.as_ref(),
+            ip_location: state.ip_location.as_ref(),
+            health_probe_cache: &state.admin_health_probe_cache,
         },
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let activity = match database
-        .list_activity_events(DASHBOARD_ACTIVITY_LIMIT)
-        .await
+    )
+    .await
     {
-        Ok(events) => {
-            let series_by_event_id = match dashboard_activity_series_metadata(&state, &events).await
-            {
-                Ok(series) => series,
-                Err(status) => return status.into_response(),
-            };
-            events
-                .iter()
-                .map(|event| {
-                    dashboard_activity_json(
-                        event,
-                        state.ip_location.as_ref(),
-                        series_by_event_id.get(&event.id),
-                    )
-                })
-                .collect::<Vec<_>>()
-        }
+        Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let now_playing = match dashboard_playback_json(&state, &sessions, &users).await {
-        Ok(sessions) => sessions,
-        Err(status) => return status.into_response(),
+    let health = match serde_json::to_value(&snapshot.health) {
+        Ok(health) => health,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let activity = snapshot
+        .activity
+        .iter()
+        .map(|activity| {
+            dashboard_activity_json(
+                &activity.event,
+                activity.remote_ip_location.as_ref(),
+                activity.series.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let now_playing = snapshot
+        .now_playing
+        .iter()
+        .map(|playback| {
+            dashboard_playback_item_json(
+                &playback.session,
+                &playback.item,
+                playback.series.as_ref(),
+                &playback.user_name,
+                playback.remote_ip_location.as_ref(),
+                playback.web_session.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "server": {
-            "name": server_name,
+            "name": snapshot.server_name,
             "version": VERSION,
             "commit": COMMIT,
-            "schemaVersion": health["schemaVersion"],
+            "schemaVersion": snapshot.schema_version,
         },
-        "stats": dashboard_stats_json(&stats),
+        "stats": dashboard_stats_json(&snapshot.stats),
         "health": health,
         "nowPlaying": now_playing,
         "activity": activity,
@@ -87,92 +77,6 @@ pub(crate) fn dashboard_stats_json(stats: &DashboardStats) -> Value {
         "seriesCount": stats.series_count,
         "userCount": stats.user_count,
     })
-}
-
-pub(crate) async fn dashboard_playback_json(
-    state: &AppState,
-    sessions: &[StoredPlaybackSession],
-    users: &[UserRecord],
-) -> Result<Vec<Value>, StatusCode> {
-    let Some(catalog) = state.catalog.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let user_names = users
-        .iter()
-        .map(|user| (user.id.to_string(), user.display_name.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let principal = AccessPrincipal::new(crate::domain::ids::UserId::new(), true);
-    let sessions = sessions
-        .iter()
-        .take(DASHBOARD_PLAYBACK_LIMIT)
-        .collect::<Vec<_>>();
-    let web_play_session_ids = sessions
-        .iter()
-        .filter(|session| {
-            session.play_session_id.starts_with("lux-emby:")
-                || session.play_session_id.starts_with("lux-web:")
-        })
-        .map(|session| session.play_session_id.clone())
-        .collect::<Vec<_>>();
-    let Some(database) = state.database.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let web_sessions = database
-        .find_web_playback_sessions_for_playbacks(&web_play_session_ids)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .into_iter()
-        .map(|session| (session.play_session_id.clone(), session))
-        .collect::<HashMap<_, _>>();
-    let item_ids = sessions
-        .iter()
-        .map(|session| session.item_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let items_by_id = catalog
-        .find_items(principal, &item_ids)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let series_ids = items_by_id
-        .values()
-        .filter(|item| item.item_type == "EPISODE")
-        .filter_map(|item| item.series_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let series_by_id = catalog
-        .find_items(principal, &series_ids)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut values = Vec::new();
-    for session in sessions {
-        let Some(item) = items_by_id.get(&session.item_id) else {
-            continue;
-        };
-        let series = item
-            .series_id
-            .as_deref()
-            .and_then(|series_id| series_by_id.get(series_id));
-        let remote_ip_location = session.remote_ip.as_deref().and_then(|remote_ip| {
-            state
-                .ip_location
-                .as_ref()
-                .and_then(|service| service.cached_or_schedule(remote_ip))
-        });
-        values.push(dashboard_playback_item_json(
-            session,
-            item,
-            series,
-            user_names
-                .get(&session.user_id)
-                .map(String::as_str)
-                .unwrap_or("未知账户"),
-            remote_ip_location.as_ref(),
-            web_sessions.get(&session.play_session_id),
-        ));
-    }
-    Ok(values)
 }
 
 pub(crate) fn dashboard_playback_item_json(
@@ -321,15 +225,12 @@ pub(crate) fn dashboard_source_json(source: &CatalogSource) -> Value {
 
 pub(crate) fn dashboard_activity_json(
     event: &crate::storage::StoredActivityEvent,
-    ip_location: Option<&IpLocationService>,
-    series: Option<&DashboardActivitySeriesMetadata>,
+    remote_ip_location: Option<&IpLocation>,
+    series: Option<&crate::application::admin_dashboard::DashboardActivitySeries>,
 ) -> Value {
     let metadata =
         serde_json::from_str::<Value>(&event.metadata_json).unwrap_or_else(|_| json!({}));
     let remote_ip = metadata.get("remoteIp").and_then(Value::as_str);
-    let remote_ip_location = remote_ip.and_then(|remote_ip| {
-        ip_location.and_then(|service| service.cached_or_schedule(remote_ip))
-    });
     json!({
         "id": event.id,
         "userId": event.actor_user_id,
@@ -343,76 +244,7 @@ pub(crate) fn dashboard_activity_json(
         "targetSeriesSeasonCount": series.and_then(|series| series.season_count),
         "metadata": metadata,
         "remoteIp": remote_ip,
-        "remoteIpLocation": remote_ip_location
-            .as_ref()
-            .map(dashboard_ip_location_json),
+        "remoteIpLocation": remote_ip_location.map(dashboard_ip_location_json),
         "createdAt": event.created_at,
     })
-}
-
-pub(crate) struct DashboardActivitySeriesMetadata {
-    title: String,
-    season_number: Option<i64>,
-    season_count: Option<i64>,
-}
-
-async fn dashboard_activity_series_metadata(
-    state: &AppState,
-    events: &[crate::storage::StoredActivityEvent],
-) -> Result<HashMap<String, DashboardActivitySeriesMetadata>, StatusCode> {
-    let Some(catalog) = state.catalog.as_ref() else {
-        return Ok(HashMap::new());
-    };
-    let item_ids = events
-        .iter()
-        .filter(|event| event.target_type.as_deref() == Some("media_item"))
-        .filter_map(|event| event.target_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if item_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let principal = AccessPrincipal::new(crate::domain::ids::UserId::new(), true);
-    let items_by_id = catalog
-        .find_items(principal, &item_ids)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let series_ids = items_by_id
-        .values()
-        .filter(|item| item.item_type == "EPISODE")
-        .filter_map(|item| item.series_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let series_by_id = catalog
-        .find_items(principal, &series_ids)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-
-    Ok(events
-        .iter()
-        .filter_map(|event| {
-            let item = event
-                .target_id
-                .as_deref()
-                .and_then(|item_id| items_by_id.get(item_id))?;
-            if item.item_type != "EPISODE" {
-                return None;
-            }
-            let series = item
-                .series_id
-                .as_deref()
-                .and_then(|series_id| series_by_id.get(series_id))?;
-            Some((
-                event.id.clone(),
-                DashboardActivitySeriesMetadata {
-                    title: series.title.clone(),
-                    season_number: item.season_number,
-                    season_count: series.season_count,
-                },
-            ))
-        })
-        .collect())
 }

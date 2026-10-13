@@ -1,5 +1,6 @@
 pub mod access;
 pub(crate) mod actor_enrichment;
+pub mod admin_dashboard;
 pub mod admin_events;
 pub mod admin_health;
 pub mod candidates;

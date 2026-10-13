@@ -30,14 +30,13 @@ pub(super) use admin_metadata::{
     MetadataCandidateFailureKind, metadata_candidate_error, metadata_candidate_failure_kind,
 };
 pub(super) use admin_plugins::*;
+#[path = "admin/admin_dashboard.rs"]
+mod admin_dashboard;
 #[path = "admin/admin_emby_migration.rs"]
 mod admin_emby_migration;
 #[path = "admin/admin_health.rs"]
 mod admin_health;
-pub(super) use admin_health::admin_health_payload;
-#[path = "admin/admin_dashboard.rs"]
-mod admin_dashboard;
-pub(super) use admin_dashboard::DEFAULT_SERVER_NAME;
+pub(super) use crate::application::admin_dashboard::DEFAULT_SERVER_NAME;
 #[path = "admin/admin_database_diagnostics.rs"]
 mod admin_database_diagnostics;
 #[path = "admin/admin_jobs.rs"]
