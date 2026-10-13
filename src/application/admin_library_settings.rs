@@ -22,6 +22,15 @@ pub(crate) enum DeleteLibraryError {
     Scan(ScanJobError),
 }
 
+pub(crate) struct CreateLibraryInput<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: LibraryKind,
+    pub(crate) realtime_watch_enabled: bool,
+    pub(crate) scrapers: &'a [LibraryScraper],
+    pub(crate) chapter_source_id: Option<&'a str>,
+    pub(crate) realtime_metadata_auto_match_enabled: bool,
+}
+
 pub(crate) async fn delete_library(
     libraries: &LibraryService,
     scan_jobs: Option<&ScanJobService>,
@@ -68,21 +77,16 @@ pub(crate) async fn create_library(
     libraries: &LibraryService,
     home: Option<&HomeService>,
     plugins: Option<&PluginService>,
-    name: &str,
-    kind: LibraryKind,
-    realtime_watch_enabled: bool,
-    scrapers: &[LibraryScraper],
-    chapter_source_id: Option<&str>,
-    realtime_metadata_auto_match_enabled: bool,
+    input: CreateLibraryInput<'_>,
 ) -> Result<LibraryRecord, LibrarySettingsWriteError> {
     let library = libraries
         .create_library_with_scrapers_and_chapter_source(
-            name,
-            kind,
-            realtime_watch_enabled,
-            scrapers,
-            chapter_source_id,
-            realtime_metadata_auto_match_enabled,
+            input.name,
+            input.kind,
+            input.realtime_watch_enabled,
+            input.scrapers,
+            input.chapter_source_id,
+            input.realtime_metadata_auto_match_enabled,
         )
         .await
         .map_err(LibrarySettingsWriteError::Library)?;

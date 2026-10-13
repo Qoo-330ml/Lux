@@ -63,13 +63,13 @@ pub(crate) struct DashboardActivitySeries {
 
 #[derive(Debug)]
 pub(crate) enum AdminDashboardError {
-    HealthUnavailable,
-    ServerNameUnavailable,
-    StatisticsUnavailable,
-    PlaybackSessionsUnavailable,
-    UsersUnavailable,
-    ActivityUnavailable,
-    CatalogUnavailable,
+    Health,
+    ServerName,
+    Statistics,
+    PlaybackSessions,
+    Users,
+    Activity,
+    Catalog,
 }
 
 pub(crate) async fn load_admin_dashboard(
@@ -86,12 +86,12 @@ pub(crate) async fn load_admin_dashboard(
         services.health_probe_cache,
     )
     .await
-    .map_err(|_| AdminDashboardError::HealthUnavailable)?;
+    .map_err(|_| AdminDashboardError::Health)?;
     let schema_version = health.schema_version();
     let server_name = match database
         .server_name()
         .await
-        .map_err(|_| AdminDashboardError::ServerNameUnavailable)?
+        .map_err(|_| AdminDashboardError::ServerName)?
     {
         Some(name) if !name.trim().is_empty() => name,
         _ => DEFAULT_SERVER_NAME.to_owned(),
@@ -99,20 +99,20 @@ pub(crate) async fn load_admin_dashboard(
     let stats = database
         .dashboard_stats()
         .await
-        .map_err(|_| AdminDashboardError::StatisticsUnavailable)?;
+        .map_err(|_| AdminDashboardError::Statistics)?;
     let sessions = database
         .list_playback_sessions(None, None)
         .await
-        .map_err(|_| AdminDashboardError::PlaybackSessionsUnavailable)?;
+        .map_err(|_| AdminDashboardError::PlaybackSessions)?;
     let users = UserStore::new(database.clone())
-        .map_err(|_| AdminDashboardError::UsersUnavailable)?
+        .map_err(|_| AdminDashboardError::Users)?
         .list_users()
         .await
-        .map_err(|_| AdminDashboardError::UsersUnavailable)?;
+        .map_err(|_| AdminDashboardError::Users)?;
     let events = database
         .list_activity_events(DASHBOARD_ACTIVITY_LIMIT)
         .await
-        .map_err(|_| AdminDashboardError::ActivityUnavailable)?;
+        .map_err(|_| AdminDashboardError::Activity)?;
     let activity_series = dashboard_activity_series_metadata(services.catalog, &events).await?;
     let activity = events
         .into_iter()
@@ -183,7 +183,7 @@ async fn dashboard_playback_data(
     let web_sessions = database
         .find_web_playback_sessions_for_playbacks(&web_play_session_ids)
         .await
-        .map_err(|_| AdminDashboardError::PlaybackSessionsUnavailable)?
+        .map_err(|_| AdminDashboardError::PlaybackSessions)?
         .into_iter()
         .map(|session| (session.play_session_id.clone(), session))
         .collect::<HashMap<_, _>>();
@@ -196,7 +196,7 @@ async fn dashboard_playback_data(
     let items_by_id = catalog
         .find_items(principal, &item_ids)
         .await
-        .map_err(|_| AdminDashboardError::CatalogUnavailable)?;
+        .map_err(|_| AdminDashboardError::Catalog)?;
     let series_ids = items_by_id
         .values()
         .filter(|item| item.item_type == "EPISODE")
@@ -207,7 +207,7 @@ async fn dashboard_playback_data(
     let series_by_id = catalog
         .find_items(principal, &series_ids)
         .await
-        .map_err(|_| AdminDashboardError::CatalogUnavailable)?;
+        .map_err(|_| AdminDashboardError::Catalog)?;
     let mut values = Vec::new();
     for session in sessions {
         let Some(item) = items_by_id.get(&session.item_id) else {
@@ -257,7 +257,7 @@ async fn dashboard_activity_series_metadata(
     let items_by_id = catalog
         .find_items(principal, &item_ids)
         .await
-        .map_err(|_| AdminDashboardError::CatalogUnavailable)?;
+        .map_err(|_| AdminDashboardError::Catalog)?;
     let series_ids = items_by_id
         .values()
         .filter(|item| item.item_type == "EPISODE")
@@ -268,7 +268,7 @@ async fn dashboard_activity_series_metadata(
     let series_by_id = catalog
         .find_items(principal, &series_ids)
         .await
-        .map_err(|_| AdminDashboardError::CatalogUnavailable)?;
+        .map_err(|_| AdminDashboardError::Catalog)?;
 
     Ok(events
         .iter()

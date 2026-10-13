@@ -393,12 +393,14 @@ pub(crate) async fn admin_create_library(
         libraries,
         state.home.as_ref(),
         state.plugins.as_ref(),
-        &request.name,
-        kind,
-        request.realtime_watch_enabled,
-        &scrapers,
-        request.chapter_source_id.as_deref(),
-        request.realtime_metadata_auto_match_enabled,
+        crate::application::admin_library_settings::CreateLibraryInput {
+            name: &request.name,
+            kind,
+            realtime_watch_enabled: request.realtime_watch_enabled,
+            scrapers: &scrapers,
+            chapter_source_id: request.chapter_source_id.as_deref(),
+            realtime_metadata_auto_match_enabled: request.realtime_metadata_auto_match_enabled,
+        },
     )
     .await
     {
