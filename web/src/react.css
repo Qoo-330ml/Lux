@@ -517,6 +517,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 @media (max-width: 700px) {
   .lux-person-detail-page { width: 92%; box-sizing: border-box; padding-top: 0; }
   .lux-library-rail { display: flex; width: max-content; min-width: 100%; }
+  .lux-library-card { flex: 0 0 min(170px, 52vw); }
   .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
   .lux-person-detail-copy h1 { font-size: 2.2rem; }

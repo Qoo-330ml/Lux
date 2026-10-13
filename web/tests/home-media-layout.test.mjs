@@ -62,15 +62,17 @@ test("homepage library cards use a compact adaptive grid", () => {
   assert.match(mediaSource, /className="lux-continue-card"/);
 });
 
-test("homepage library cards use one horizontal row with the shared scroll buttons on mobile", () => {
+test("homepage library cards stay compact in one horizontal row with shared scroll buttons on mobile", () => {
   const mobileRules = stylesheet.match(/@media \(max-width: 700px\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
   const mobileLibraryRule = mobileRules.match(/\.lux-library-rail\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileLibraryCardRule = mobileRules.match(/\.lux-library-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const libraryCardRule = stylesheet.match(/\.lux-library-card\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(homeSource, /<HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">/);
   assert.match(mobileLibraryRule, /display:\s*flex/);
   assert.match(mobileLibraryRule, /width:\s*max-content/);
   assert.match(mobileLibraryRule, /min-width:\s*100%/);
+  assert.match(mobileLibraryCardRule, /flex:\s*0 0 min\(170px,\s*52vw\)/);
   assert.match(libraryCardRule, /flex:\s*0 0 235px/);
 });
 
