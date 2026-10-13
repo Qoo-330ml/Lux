@@ -11008,6 +11008,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-12）：snapshot queries 改为先收集结果，随后总是释放 FIFO，再传播查询错误；通过 timeout 结果避免对已完成 JoinHandle 二次 poll。poster 阻塞/取消测试共用释放 guard，在 `Drop` 中打开读写 FIFO、写入 fixture 并移除路径。独立 NFO 用例通过；完整 `scanned_metadata` 23 passed、`scanning_jobs` 81 passed，fmt 与 diff 检查通过。
 
+#### LUX-523：移动端首页媒体库单行滚动
+
+范围：首页“我的媒体库”在桌面端继续使用现有自适应网格；移动端改为单行横向滚动，并复用“继续观看”的左右滚动按钮。
+
+验收：
+
+- [x] 桌面端网格布局和卡片尺寸保持不变。
+- [x] 移动端媒体库卡片保持在同一行，可通过左右按钮分段滚动，也保留触控横向滚动。
+- [x] 仅一个媒体库或滚动到边界时，不显示不可用方向的按钮。
+
+预计文件：`web/src/react.css`、`web/tests/home-media-layout.test.mjs`、本文档。
+
+验证：运行定向布局测试、完整 Web 测试和 Web 构建；执行 `git diff --check`。
+
+结果（2026-10-13）：移动端媒体库沿用 `HorizontalScrollRail` 的左右按钮并保持 235px 卡片单行滚动；桌面自适应网格不变。定向布局测试 6/6、Web Node 测试 137/137、Vitest 583/583、Web 构建和 `git diff --check` 通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

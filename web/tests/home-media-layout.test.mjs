@@ -4,6 +4,7 @@ import test from "node:test";
 
 const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
 const mediaSource = readFileSync(new URL("../src/features/home/media.tsx", import.meta.url), "utf8");
+const homeSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
 
 test("home media actions are hidden until the poster is hovered and sit in its lower-right corner", () => {
   const actionsRule = stylesheet.match(/\.lux-media-art-shell\s*>\s*\.lux-media-actions\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -59,6 +60,18 @@ test("homepage library cards use a compact adaptive grid", () => {
   const continueCardRule = stylesheet.match(/\.lux-continue-card\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.match(continueCardRule, /flex:\s*0 0 280px/);
   assert.match(mediaSource, /className="lux-continue-card"/);
+});
+
+test("homepage library cards use one horizontal row with the shared scroll buttons on mobile", () => {
+  const mobileRules = stylesheet.match(/@media \(max-width: 700px\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const mobileLibraryRule = mobileRules.match(/\.lux-library-rail\s*\{([^}]*)\}/)?.[1] ?? "";
+  const libraryCardRule = stylesheet.match(/\.lux-library-card\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(homeSource, /<HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">/);
+  assert.match(mobileLibraryRule, /display:\s*flex/);
+  assert.match(mobileLibraryRule, /width:\s*max-content/);
+  assert.match(mobileLibraryRule, /min-width:\s*100%/);
+  assert.match(libraryCardRule, /flex:\s*0 0 235px/);
 });
 
 test("continue-watching titles shrink before the remaining-time label", () => {
