@@ -141,8 +141,20 @@ impl LibraryCoverService {
     pub async fn dispatch_manual_job(
         &self,
         library_id: LibraryId,
-    ) -> Result<LibraryCoverJob, LibraryCoverError> {
-        let job = self.create_manual_job(library_id).await?;
+    ) -> Result<LibraryCoverJob, ManualLibraryCoverDispatchError> {
+        let library_id_text = library_id.to_string();
+        let task = self
+            .database
+            .find_scheduled_task_config("LIBRARY", &library_id_text, AUTO_LIBRARY_COVER_TASK_TYPE)
+            .await
+            .map_err(|_| ManualLibraryCoverDispatchError::StorageUnavailable)?;
+        if task.is_none() {
+            return Err(ManualLibraryCoverDispatchError::TaskNotRegistered);
+        }
+        let job = self
+            .create_manual_job(library_id)
+            .await
+            .map_err(ManualLibraryCoverDispatchError::Job)?;
         let worker = self.clone();
         let job_id = job.id.clone();
         tokio::spawn(async move {
@@ -654,6 +666,12 @@ pub enum LibraryCoverError {
     },
     ImageWrite(ImageWriteError),
     Storage(StorageError),
+}
+
+pub enum ManualLibraryCoverDispatchError {
+    TaskNotRegistered,
+    StorageUnavailable,
+    Job(LibraryCoverError),
 }
 
 impl fmt::Display for LibraryCoverError {

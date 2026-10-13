@@ -738,7 +738,9 @@ pub(crate) async fn admin_run_auto_library_cover(
     };
     let job = match covers.dispatch_manual_job(library_id).await {
         Ok(job) => job,
-        Err(LibraryCoverError::TaskNotRegistered) => {
+        Err(
+            crate::application::library_covers::ManualLibraryCoverDispatchError::TaskNotRegistered,
+        ) => {
             return api_error(
                 &headers,
                 StatusCode::NOT_FOUND,
@@ -747,7 +749,12 @@ pub(crate) async fn admin_run_auto_library_cover(
             )
             .into_response();
         }
-        Err(error) => return library_cover_error(&headers, error),
+        Err(
+            crate::application::library_covers::ManualLibraryCoverDispatchError::StorageUnavailable,
+        ) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(crate::application::library_covers::ManualLibraryCoverDispatchError::Job(error)) => {
+            return library_cover_error(&headers, error);
+        }
     };
     record_audit_event(
         &state,
