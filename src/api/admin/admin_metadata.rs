@@ -879,26 +879,13 @@ pub(crate) async fn admin_list_item_images(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match database.find_media_item_metadata(&item_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::NOT_FOUND,
-                lux::ApiErrorCode::NotFound,
-                "媒体条目不存在",
-            )
-            .into_response();
-        }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let Some(images) = state.image_writes.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match images.list_item_images(&item_id).await {
+    match crate::application::admin_media_mutations::list_admin_item_images(
+        state.database.as_ref(),
+        state.image_writes.as_ref(),
+        &item_id,
+    )
+    .await
+    {
         Ok(images) => Json(json!({
             "images": images.iter().map(|image| json!({
                 "id": image.id,
@@ -911,7 +898,21 @@ pub(crate) async fn admin_list_item_images(
             })).collect::<Vec<_>>()
         }))
         .into_response(),
-        Err(error) => image_write_error(&headers, error),
+        Err(crate::application::admin_media_mutations::AdminItemImageListError::Unavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(crate::application::admin_media_mutations::AdminItemImageListError::ItemNotFound) => {
+            api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体条目不存在",
+            )
+            .into_response()
+        }
+        Err(crate::application::admin_media_mutations::AdminItemImageListError::Image(error)) => {
+            image_write_error(&headers, error)
+        }
     }
 }
 
