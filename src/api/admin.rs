@@ -67,19 +67,79 @@ pub(super) use admin_logs_events::{
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .merge(admin_users::api_routes())
-        .merge(admin_settings::api_routes())
-        .merge(admin_libraries::api_routes())
-        .merge(admin_items::api_routes())
-        .merge(admin_people::api_routes())
-        .merge(admin_metadata::api_routes())
-        .merge(admin_plugins::api_routes())
-        .merge(admin_emby_migration::api_routes())
-        .merge(admin_scheduled_tasks::api_routes())
-        .merge(admin_jobs::api_routes())
-        .merge(admin_webhooks::api_routes())
-        .merge(admin_logs_events::api_routes())
-        .merge(admin_health::api_routes())
-        .merge(admin_database_diagnostics::api_routes())
-        .merge(admin_dashboard::api_routes())
+        .merge(users_routes())
+        .merge(settings_routes())
+        .merge(libraries_routes())
+        .merge(items_routes())
+        .merge(people_routes())
+        .merge(metadata_routes())
+        .merge(plugins_routes())
+        .merge(emby_migration_routes())
+        .merge(scheduled_tasks_routes())
+        .merge(jobs_routes())
+        .merge(webhooks_routes())
+        .merge(logs_events_routes())
+        .merge(health_routes())
+        .merge(database_diagnostics_routes())
+        .merge(dashboard_routes())
+}
+
+pub(super) fn users_routes() -> Router<AppState> {
+    admin_users::api_routes()
+}
+
+pub(super) fn settings_routes() -> Router<AppState> {
+    admin_settings::api_routes()
+}
+
+pub(super) fn libraries_routes() -> Router<AppState> {
+    admin_libraries::api_routes()
+}
+
+pub(super) fn items_routes() -> Router<AppState> {
+    admin_items::api_routes()
+}
+
+pub(super) fn people_routes() -> Router<AppState> {
+    admin_people::api_routes()
+}
+
+pub(super) fn metadata_routes() -> Router<AppState> {
+    admin_metadata::api_routes()
+}
+
+pub(super) fn plugins_routes() -> Router<AppState> {
+    admin_plugins::api_routes()
+}
+
+pub(super) fn emby_migration_routes() -> Router<AppState> {
+    admin_emby_migration::api_routes()
+}
+
+pub(super) fn scheduled_tasks_routes() -> Router<AppState> {
+    admin_scheduled_tasks::api_routes()
+}
+
+pub(super) fn jobs_routes() -> Router<AppState> {
+    admin_jobs::api_routes()
+}
+
+pub(super) fn webhooks_routes() -> Router<AppState> {
+    admin_webhooks::api_routes()
+}
+
+pub(super) fn logs_events_routes() -> Router<AppState> {
+    admin_logs_events::api_routes()
+}
+
+pub(super) fn health_routes() -> Router<AppState> {
+    admin_health::api_routes()
+}
+
+pub(super) fn database_diagnostics_routes() -> Router<AppState> {
+    admin_database_diagnostics::api_routes()
+}
+
+pub(super) fn dashboard_routes() -> Router<AppState> {
+    admin_dashboard::api_routes()
 }
