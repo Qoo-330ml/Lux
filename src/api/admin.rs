@@ -15,8 +15,18 @@ pub(super) use admin_libraries::*;
 #[path = "admin/admin_items.rs"]
 mod admin_items;
 pub(super) use admin_items::*;
+#[path = "admin/admin_metadata.rs"]
+mod admin_metadata;
 #[path = "admin/admin_people.rs"]
 mod admin_people;
+pub(super) use admin_metadata::{
+    ItemImageSearchRequest, ItemImageSelectRequest, MetadataCandidateQuery, image_candidate_error,
+    image_candidate_json, image_write_error, item_image_json, metadata_write_error,
+};
+#[cfg(test)]
+pub(super) use admin_metadata::{
+    MetadataCandidateFailureKind, metadata_candidate_error, metadata_candidate_failure_kind,
+};
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -108,61 +118,12 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_list_emby_migration_person_favorites),
         )
         .route(
-            "/api/v1/admin/metadata/pending",
-            get(admin_list_pending_metadata),
-        )
-        .route(
-            "/api/v1/admin/metadata/reidentify",
-            get(admin_list_metadata_reidentify).post(admin_start_metadata_reidentify),
-        )
-        .route(
-            "/api/v1/admin/metadata/confirm",
-            post(admin_confirm_metadata),
-        )
-        .route("/api/v1/admin/items/merge", post(admin_merge_items))
-        .route(
-            "/api/v1/admin/metadata/reidentify/{job_id}",
-            get(admin_get_metadata_reidentify).post(admin_retry_metadata_reidentify),
-        )
-        .route(
-            "/api/v1/admin/metadata/reidentify/{job_id}/cancel",
-            post(admin_cancel_metadata_reidentify),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/identify/candidates",
-            get(admin_list_item_candidates).post(admin_search_item_candidates),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/identify/candidates/{candidate_id}/select",
-            post(admin_select_candidate),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/images",
-            get(admin_list_item_images),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/images/{image_id}",
-            delete(admin_delete_item_image),
-        )
-        .route(
             "/api/v1/admin/libraries/{library_id}/scan",
             post(admin_start_scan),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/scan-path",
             post(admin_start_library_path_scan),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/refresh-local-metadata",
-            post(admin_refresh_library_local_metadata),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/reidentify",
-            post(admin_start_library_reidentify),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/metadata/refresh",
-            post(admin_start_library_metadata_refresh),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/reconcile",
@@ -306,4 +267,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_libraries::api_routes())
         .merge(admin_items::api_routes())
         .merge(admin_people::api_routes())
+        .merge(admin_metadata::api_routes())
 }

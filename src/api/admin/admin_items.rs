@@ -8,10 +8,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_start_item_scan),
         )
         .route(
-            "/api/v1/admin/items/{item_id}/metadata/refresh",
-            post(admin_start_item_metadata_refresh),
-        )
-        .route(
             "/api/v1/admin/items/{item_id}/subtitles/{stream_index}",
             patch(admin_update_item_subtitle),
         )
@@ -112,68 +108,6 @@ pub(crate) async fn admin_start_item_scan(
     (
         StatusCode::ACCEPTED,
         Json(json!({ "job": scan_job_json(&job) })),
-    )
-        .into_response()
-}
-
-pub(crate) async fn admin_start_item_metadata_refresh(
-    headers: HeaderMap,
-    Path(item_id): Path<String>,
-    State(state): State<AppState>,
-    Json(request): Json<MetadataRefreshRequest>,
-) -> Response {
-    if let Err(response) = require_admin(&headers, &state, true).await {
-        return response;
-    }
-    let Ok(item_id) = item_id.parse::<crate::domain::ids::ItemId>() else {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "媒体条目 ID 无效",
-        )
-        .into_response();
-    };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刷新服务尚未配置",
-        )
-        .into_response();
-    };
-    let mode = request.mode.application_mode();
-    let job = match reidentify
-        .create_item_refresh_job(&item_id.to_string(), mode)
-        .await
-    {
-        Ok(job) => job,
-        Err(error) => return metadata_reidentify_error(&headers, error),
-    };
-    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
-        return metadata_dispatch_unavailable(&headers, &job.id, error);
-    }
-    record_audit_event(
-        &state,
-        &headers,
-        "METADATA_REFRESH_STARTED",
-        Some("item"),
-        Some(&item_id.to_string()),
-        &format!(
-            r#"{{"jobId":"{}","mode":"{}"}}"#,
-            job.id,
-            request.mode.as_str()
-        ),
-    )
-    .await;
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "totalCount": job.total_count,
-            "mode": request.mode.as_str(),
-            "job": metadata_reidentify_job_json(&job),
-        })),
     )
         .into_response()
 }
