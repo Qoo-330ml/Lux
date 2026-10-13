@@ -57,6 +57,109 @@ fn migration_versions_are_unique_per_backend() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+#[tokio::test]
+async fn sqlite_media_item_timestamps_upgrade_handles_legacy_and_new_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?;
+        if version.is_some_and(|version| version <= 125) {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration filename")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("media-item-timestamps-upgrade.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+
+    let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(schema_version, 125);
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('timestamp-library', 'Legacy', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('legacy-item', 'timestamp-library', 'MOVIE', 'Legacy', 'legacy', 'LOCAL_CONFIRMED')",
+    )
+    .execute(&pool)
+    .await?;
+    let migration_started_at: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(&pool)
+        .await?;
+
+    fs::copy(
+        source_dir.join("0126_emby_item_timestamps.sql"),
+        migration_dir.join("0126_emby_item_timestamps.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+
+    let legacy_updated_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'legacy-item'")
+            .fetch_one(&pool)
+            .await?;
+    let migration_finished_at: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(&pool)
+        .await?;
+    assert!((migration_started_at..=migration_finished_at).contains(&legacy_updated_at));
+
+    let index_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_media_items_updated_at'
+         )",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(index_exists, 1);
+
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('new-item', 'timestamp-library', 'MOVIE', 'New', 'new', 'LOCAL_CONFIRMED')",
+    )
+    .execute(&pool)
+    .await?;
+    let new_updated_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'new-item'")
+            .fetch_one(&pool)
+            .await?;
+    assert!(new_updated_at >= migration_started_at);
+
+    pool.close().await;
+    Ok(())
+}
+
 #[test]
 fn postgres_migration_0158_preserves_legacy_media_chapters_version() {
     let legacy = include_str!("../migrations-postgres/0158_media_info_chapters.sql");

@@ -211,7 +211,9 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 
 媒体条目 DTO 的 `DateCreated` 来自 `media_items.added_at`，`DateLastSaved` 和 `DateModified` 来自
 `media_items.updated_at`；带 `Fields` 时仍遵循字段选择。数据库迁移 `0126_emby_item_timestamps` 为旧库补充
-`updated_at` 和索引，元数据/NFO 写入、扫描恢复/移除、层级修复及合集/版本关系更新会同步刷新该值。
+`updated_at` 和索引。SQLite 的 `ALTER TABLE ... ADD COLUMN` 不允许动态默认表达式，因此迁移使用常量哨兵值、
+回填既有媒体行，并通过插入触发器为省略时间戳的新行设置当前 Unix 时间；元数据/NFO 写入、扫描恢复/移除、
+层级修复及合集/版本关系更新会同步刷新该值。
 
 自动化证据：`tests/emby_incremental_refresh.rs`、`tests/emby_auth.rs`、`tests/sessions.rs`、
 `tests/catalog.rs`，以及存储层 `recommended_catalog_rows_use_rating_median_for_missing_ratings` 回归。
