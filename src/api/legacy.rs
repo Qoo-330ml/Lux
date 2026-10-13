@@ -58,10 +58,7 @@ use crate::{
             CatalogError, CatalogFilter, CatalogItem, CatalogPage, CatalogService, CatalogSort,
             CatalogSource, normalize_search_like_query, normalize_search_query,
         },
-        chapter_detector::{
-            ChapterDetectionError, ChapterDetectionOptions, ChapterDetectionService,
-            DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID,
-        },
+        chapter_detector::{ChapterDetectionError, ChapterDetectionService},
         collections::{CollectionError, CollectionService},
         database_diagnostics::DatabaseDiagnosticsService,
         directory_browser::{DirectoryBrowserError, list_directories},
