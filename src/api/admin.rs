@@ -1,406 +1,144 @@
 use super::*;
 
-#[path = "admin_handlers.rs"]
-mod admin_handlers;
-pub(super) use admin_handlers::*;
+#[path = "admin/admin_common.rs"]
+mod admin_common;
+pub(super) use admin_common::{
+    api_error, build_cookie, lux_api_key_from_headers, normalize_lux_api_key_query, request_cookie,
+    require_admin, require_admin_web_session, resolve_shared_admin_api_key,
+    secure_cookie_for_request, user_avatar_error,
+};
+#[path = "admin/admin_users.rs"]
+mod admin_users;
+pub(super) use admin_users::user_json;
+#[path = "admin/admin_settings.rs"]
+mod admin_settings;
+pub(super) use crate::application::settings::{
+    MediaStrategySettings, read_media_strategy_settings, validate_media_strategy,
+};
+#[path = "admin/admin_libraries.rs"]
+mod admin_libraries;
+pub(super) use admin_libraries::{
+    RefreshLocalMetadataRequest, ScanPathRequest, default_realtime_watch_enabled,
+    deserialize_optional_optional, library_cover_url, library_error, library_json,
+};
+#[path = "admin/admin_items.rs"]
+mod admin_items;
+pub(super) use admin_items::delete_media_item;
+#[path = "admin/admin_metadata.rs"]
+mod admin_metadata;
+#[path = "admin/admin_people.rs"]
+mod admin_people;
+#[path = "admin/admin_plugins.rs"]
+mod admin_plugins;
+pub(super) use admin_metadata::{
+    ItemImageSearchRequest, ItemImageSelectRequest, MetadataCandidateQuery, image_candidate_error,
+    image_candidate_json, image_write_error, item_image_json, metadata_write_error,
+};
+#[cfg(test)]
+pub(super) use admin_metadata::{
+    MetadataCandidateFailureKind, metadata_candidate_error, metadata_candidate_failure_kind,
+};
+pub(super) use admin_plugins::plugin_error;
+#[path = "admin/admin_dashboard.rs"]
+mod admin_dashboard;
+#[path = "admin/admin_emby_migration.rs"]
+mod admin_emby_migration;
+#[path = "admin/admin_health.rs"]
+mod admin_health;
+pub(super) use crate::application::admin_dashboard::DEFAULT_SERVER_NAME;
+#[path = "admin/admin_database_diagnostics.rs"]
+mod admin_database_diagnostics;
+#[path = "admin/admin_jobs.rs"]
+mod admin_jobs;
+#[path = "admin/admin_logs_events.rs"]
+mod admin_logs_events;
+#[path = "admin/admin_scheduled_tasks.rs"]
+mod admin_scheduled_tasks;
+#[path = "admin/admin_webhooks.rs"]
+mod admin_webhooks;
+pub(super) use admin_emby_migration::emby_migration_error;
+pub(super) use admin_jobs::{
+    AdminJobsQuery, scan_job_json, scan_job_json_from_storage, spawn_library_scan, strm_probe_error,
+};
+pub(super) use admin_logs_events::{
+    playback_activity_event_type, record_activity_event, record_audit_event,
+};
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/v1/admin/libraries",
-            get(admin_list_libraries).post(admin_create_library),
-        )
-        .route("/api/v1/admin/directories", get(admin_list_directories))
-        .route(
-            "/api/v1/admin/libraries/{library_id}",
-            patch(admin_update_library).delete(admin_delete_library),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/cover",
-            put(admin_update_library_cover)
-                .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/cover/auto",
-            post(admin_run_auto_library_cover),
-        )
-        .route(
-            "/api/v1/admin/library-cover-jobs",
-            get(admin_list_library_cover_jobs),
-        )
-        .route(
-            "/api/v1/admin/library-cover-jobs/{job_id}",
-            get(admin_get_library_cover_job),
-        )
-        .route(
-            "/api/v1/admin/people/index-rebuild",
-            get(admin_list_people_index_rebuild),
-        )
-        .route(
-            "/api/v1/admin/people/index-rebuild/{library_id}",
-            post(admin_queue_people_index_rebuild),
-        )
-        .route(
-            "/api/v1/admin/people/index-rebuild/{library_id}/cancel",
-            post(admin_cancel_people_index_rebuild),
-        )
-        .route("/api/v1/admin/plugins", get(admin_list_plugins))
-        .route(
-            "/api/v1/admin/notification-providers",
-            get(admin_list_notification_providers),
-        )
-        .route(
-            "/api/v1/admin/chapter-sources",
-            get(admin_list_chapter_sources),
-        )
-        .route(
-            "/api/v1/admin/plugins/installed",
-            get(admin_list_installed_plugins),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/install",
-            post(admin_install_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/update",
-            post(admin_update_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}",
-            delete(admin_uninstall_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/enabled",
-            patch(admin_update_plugin_enabled),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/config",
-            put(admin_update_plugin_config),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/config/image/{field_key}",
-            put(admin_upload_plugin_config_image).layer(DefaultBodyLimit::max(
-                crate::application::login_background_assets::MAX_LOGIN_BACKGROUND_ASSET_BYTES,
-            )),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/run",
-            post(admin_run_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugin-store",
-            get(admin_plugin_store).put(admin_update_plugin_store),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/test",
-            post(admin_test_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/source-users",
-            get(admin_list_emby_migration_source_users),
-        )
-        .route(
-            "/api/v1/admin/emby-migration",
-            get(admin_list_emby_migrations).post(admin_create_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}",
-            get(admin_get_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/cancel",
-            post(admin_cancel_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/retry",
-            post(admin_retry_emby_migration),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/users",
-            get(admin_list_emby_migration_users),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/matches",
-            get(admin_list_emby_migration_matches),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/imports",
-            get(admin_list_emby_migration_imports),
-        )
-        .route(
-            "/api/v1/admin/emby-migration/{job_id}/person-favorites",
-            get(admin_list_emby_migration_person_favorites),
-        )
-        .route(
-            "/api/v1/admin/users",
-            get(admin_list_users).post(admin_create_user),
-        )
-        .route(
-            "/api/v1/admin/users/{user_id}",
-            patch(admin_update_user).delete(admin_delete_user),
-        )
-        .route(
-            "/api/v1/admin/users/{user_id}/libraries",
-            get(admin_list_user_library_access),
-        )
-        .route(
-            "/api/v1/admin/metadata/pending",
-            get(admin_list_pending_metadata),
-        )
-        .route(
-            "/api/v1/admin/people/matches",
-            get(admin_list_pending_person_matches),
-        )
-        .route(
-            "/api/v1/admin/people/matches/{candidate_id}/confirm",
-            post(admin_confirm_person_match),
-        )
-        .route(
-            "/api/v1/admin/people/matches/{candidate_id}/reject",
-            post(admin_reject_person_match),
-        )
-        .route(
-            "/api/v1/admin/people/matches/{candidate_id}/undo",
-            post(admin_undo_person_match),
-        )
-        .route(
-            "/api/v1/admin/people/{person_id}/split",
-            post(admin_split_person_identity),
-        )
-        .route(
-            "/api/v1/admin/people/{person_id}/locks",
-            post(admin_set_person_field_locks),
-        )
-        .route(
-            "/api/v1/admin/metadata/reidentify",
-            get(admin_list_metadata_reidentify).post(admin_start_metadata_reidentify),
-        )
-        .route(
-            "/api/v1/admin/metadata/confirm",
-            post(admin_confirm_metadata),
-        )
-        .route("/api/v1/admin/items/merge", post(admin_merge_items))
-        .route(
-            "/api/v1/admin/metadata/reidentify/{job_id}",
-            get(admin_get_metadata_reidentify).post(admin_retry_metadata_reidentify),
-        )
-        .route(
-            "/api/v1/admin/metadata/reidentify/{job_id}/cancel",
-            post(admin_cancel_metadata_reidentify),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/identify/candidates",
-            get(admin_list_item_candidates).post(admin_search_item_candidates),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/identify/candidates/{candidate_id}/select",
-            post(admin_select_candidate),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/images",
-            get(admin_list_item_images),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/images/{image_id}",
-            delete(admin_delete_item_image),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/scan",
-            post(admin_start_item_scan),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/metadata/refresh",
-            post(admin_start_item_metadata_refresh),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/subtitles/{stream_index}",
-            patch(admin_update_item_subtitle),
-        )
-        .route("/api/v1/admin/items/{item_id}", delete(admin_delete_item))
-        .route(
-            "/api/v1/admin/items/{item_id}/collection/refresh",
-            post(admin_refresh_collection),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/roots",
-            post(admin_add_library_root),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/roots/{root_id}",
-            delete(admin_delete_library_root),
-        )
-        .route(
-            "/api/v1/admin/users/{user_id}/libraries/{library_id}",
-            patch(admin_set_library_access),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/scan",
-            post(admin_start_scan),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/scan-path",
-            post(admin_start_library_path_scan),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/refresh-local-metadata",
-            post(admin_refresh_library_local_metadata),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/reidentify",
-            post(admin_start_library_reidentify),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/metadata/refresh",
-            post(admin_start_library_metadata_refresh),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/reconcile",
-            post(admin_start_scan),
-        )
-        .route(
-            "/api/v1/admin/jobs/{job_id}/cancel",
-            post(admin_cancel_scan),
-        )
-        .route("/api/v1/admin/jobs/{job_id}/retry", post(admin_retry_scan))
-        .route("/api/v1/admin/jobs/{job_id}", get(admin_get_job))
-        .route(
-            "/api/v1/admin/strm-probe-jobs",
-            get(admin_list_strm_probe_jobs).post(admin_start_strm_probe),
-        )
-        .route(
-            "/api/v1/admin/strm-probe-jobs/{job_id}",
-            get(admin_get_strm_probe_job),
-        )
-        .route(
-            "/api/v1/admin/strm-probe-jobs/{job_id}/cancel",
-            post(admin_cancel_strm_probe),
-        )
-        .route(
-            "/api/v1/admin/strm-probe-jobs/{job_id}/retry",
-            post(admin_retry_strm_probe),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/chapter-detection",
-            post(admin_start_chapter_detection),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs",
-            get(admin_list_chapter_detection_jobs),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs/{job_id}",
-            get(admin_get_chapter_detection_job),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs/{job_id}/cancel",
-            post(admin_cancel_chapter_detection),
-        )
-        .route(
-            "/api/v1/admin/chapter-detection-jobs/{job_id}/retry",
-            post(admin_retry_chapter_detection),
-        )
-        .route(
-            "/api/v1/admin/libraries/{library_id}/danmaku/match",
-            post(admin_start_danmaku_match),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs",
-            get(admin_list_danmaku_match_jobs),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs/{job_id}",
-            get(admin_get_danmaku_match_job),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs/{job_id}/cancel",
-            post(admin_cancel_danmaku_match),
-        )
-        .route(
-            "/api/v1/admin/danmaku/match-jobs/{job_id}/retry",
-            post(admin_retry_danmaku_match),
-        )
-        .route(
-            "/api/v1/admin/jobs/{job_id}/events",
-            get(admin_list_job_events),
-        )
-        .route("/api/v1/admin/jobs", get(admin_list_jobs))
-        .route(
-            "/api/v1/admin/scheduled-tasks",
-            get(admin_list_scheduled_tasks).put(admin_upsert_scheduled_task),
-        )
-        .route(
-            "/api/v1/admin/scheduled-tasks/run",
-            post(admin_run_scheduled_task),
-        )
-        .route(
-            "/api/v1/admin/scheduled-task-plans",
-            get(admin_list_scheduled_task_plans).post(admin_create_scheduled_task_plan),
-        )
-        .route(
-            "/api/v1/admin/scheduled-task-plans/{plan_id}",
-            patch(admin_update_scheduled_task_plan).delete(admin_delete_scheduled_task_plan),
-        )
-        .route(
-            "/api/v1/admin/scheduled-task-plans/{plan_id}/run",
-            post(admin_run_scheduled_task_plan),
-        )
-        .route("/api/v1/admin/task-activity", get(admin_list_task_activity))
-        .route(
-            "/api/v1/admin/settings",
-            get(admin_settings).patch(admin_update_settings),
-        )
-        .route(
-            "/api/v1/admin/api-key",
-            get(admin_get_api_key).delete(admin_revoke_api_key),
-        )
-        .route("/api/v1/admin/api-key/rotate", post(admin_rotate_api_key))
-        .route(
-            "/api/v1/admin/settings/network-proxy/test",
-            post(admin_test_network_proxy),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations",
-            get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations/{destination_id}",
-            get(admin_get_webhook_destination)
-                .patch(admin_update_webhook_destination)
-                .delete(admin_delete_webhook_destination),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations/{destination_id}/test",
-            post(admin_test_webhook_destination),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations/{destination_id}/rotate-secret",
-            post(admin_rotate_webhook_secret),
-        )
-        .route(
-            "/api/v1/admin/notification-deliveries",
-            get(admin_list_webhook_deliveries),
-        )
-        .route(
-            "/api/v1/admin/notification-deliveries/{delivery_id}/retry",
-            post(admin_retry_webhook_delivery),
-        )
-        .route("/api/v1/admin/health", get(admin_health))
-        .route(
-            "/api/v1/admin/database-diagnostics",
-            get(admin_database_diagnostics_status),
-        )
-        .route(
-            "/api/v1/admin/database-diagnostics/run",
-            post(admin_start_database_diagnostics),
-        )
-        .route(
-            "/api/v1/admin/database-diagnostics/export",
-            get(admin_export_database_diagnostics),
-        )
-        .route("/api/v1/admin/dashboard", get(admin_dashboard))
-        .route("/api/v1/admin/events", get(admin_events))
-        .route("/api/v1/events", get(user_events))
-        .route("/api/v1/admin/audit", get(admin_list_audit))
-        .route("/api/v1/admin/logs/export", get(admin_export_logs))
-        .route("/api/v1/admin/logs", get(admin_list_logs))
+        .merge(users_routes())
+        .merge(settings_routes())
+        .merge(libraries_routes())
+        .merge(items_routes())
+        .merge(people_routes())
+        .merge(metadata_routes())
+        .merge(plugins_routes())
+        .merge(emby_migration_routes())
+        .merge(scheduled_tasks_routes())
+        .merge(jobs_routes())
+        .merge(webhooks_routes())
+        .merge(logs_events_routes())
+        .merge(health_routes())
+        .merge(database_diagnostics_routes())
+        .merge(dashboard_routes())
+}
+
+pub(super) fn users_routes() -> Router<AppState> {
+    admin_users::api_routes()
+}
+
+pub(super) fn settings_routes() -> Router<AppState> {
+    admin_settings::api_routes()
+}
+
+pub(super) fn libraries_routes() -> Router<AppState> {
+    admin_libraries::api_routes()
+}
+
+pub(super) fn items_routes() -> Router<AppState> {
+    admin_items::api_routes()
+}
+
+pub(super) fn people_routes() -> Router<AppState> {
+    admin_people::api_routes()
+}
+
+pub(super) fn metadata_routes() -> Router<AppState> {
+    admin_metadata::api_routes()
+}
+
+pub(super) fn plugins_routes() -> Router<AppState> {
+    admin_plugins::api_routes()
+}
+
+pub(super) fn emby_migration_routes() -> Router<AppState> {
+    admin_emby_migration::api_routes()
+}
+
+pub(super) fn scheduled_tasks_routes() -> Router<AppState> {
+    admin_scheduled_tasks::api_routes()
+}
+
+pub(super) fn jobs_routes() -> Router<AppState> {
+    admin_jobs::api_routes()
+}
+
+pub(super) fn webhooks_routes() -> Router<AppState> {
+    admin_webhooks::api_routes()
+}
+
+pub(super) fn logs_events_routes() -> Router<AppState> {
+    admin_logs_events::api_routes()
+}
+
+pub(super) fn health_routes() -> Router<AppState> {
+    admin_health::api_routes()
+}
+
+pub(super) fn database_diagnostics_routes() -> Router<AppState> {
+    admin_database_diagnostics::api_routes()
+}
+
+pub(super) fn dashboard_routes() -> Router<AppState> {
+    admin_dashboard::api_routes()
 }

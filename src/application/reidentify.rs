@@ -661,6 +661,22 @@ impl MetadataReidentifyService {
             .await
     }
 
+    pub async fn dispatch_job(
+        &self,
+        job: &MetadataReidentifyJob,
+    ) -> Result<(), MetadataDispatchError> {
+        if job.mode == MetadataRefreshMode::FillMissing.as_str() {
+            self.enqueue_fill_missing_job(job).await?;
+        } else {
+            let worker = self.clone();
+            let job_id = job.id.clone();
+            tokio::spawn(async move {
+                worker.run(&job_id).await;
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) async fn enqueue_fill_missing_job_id(
         &self,
         job_id: &str,

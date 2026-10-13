@@ -717,6 +717,23 @@ async fn admin_can_run_registered_auto_library_cover_task_manually()
     assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
     let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
 
+    let unregistered_missing_library = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/00000000-0000-0000-0000-000000000000/cover/auto"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(
+        unregistered_missing_library.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        unregistered_missing_library.json::<Value>().await?["error"]["message"],
+        "自动媒体库封面任务尚未注册"
+    );
+
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)

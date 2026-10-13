@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
 use crate::application::{
     plugin_protocol::{PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginMediaInfoTarget},
     probe::{media_probe_result_from_rpc, parse_media_info_json},
@@ -483,22 +482,7 @@ pub(super) async fn emby_refresh_item(
         Err(ScanJobError::LibraryNotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let worker = scan_jobs.clone();
-    let job_id = job.id.clone();
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = worker
-            .run_to_completion_with_metadata_and_thumbnails(
-                &job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
+    spawn_emby_scan_job(&state, job.id.clone());
     record_audit_event(
         &state,
         &headers,
@@ -786,23 +770,18 @@ fn emby_matching_root<'a>(
 }
 
 fn spawn_emby_scan_job(state: &AppState, job_id: String) {
-    let Some(scan_jobs) = state.scan_jobs.clone() else {
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return;
     };
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = scan_jobs
-            .run_to_completion_with_metadata_and_thumbnails(
-                &job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
+    crate::application::admin_scan_jobs::spawn_scan_job_worker(
+        scan_jobs,
+        &job_id,
+        crate::application::admin_scan_jobs::ScanWorkerServices {
+            probe: state.probe.clone(),
+            metadata: state.metadata_reidentify.clone(),
+            thumbnails: state.thumbnails.clone(),
+        },
+    );
 }
 
 #[derive(Deserialize, Default)]

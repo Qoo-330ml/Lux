@@ -91,6 +91,12 @@ pub struct MigrationJobView {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MigrationJobPageView {
+    pub jobs: Vec<MigrationJobView>,
+    pub total: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationUserLinkView {
@@ -573,6 +579,16 @@ impl EmbyMigrationService {
             .into_iter()
             .map(MigrationJobView::from)
             .collect())
+    }
+
+    pub async fn list_job_page(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<MigrationJobPageView, EmbyMigrationServiceError> {
+        let jobs = self.list_jobs(offset, limit).await?;
+        let total = self.count_jobs().await?;
+        Ok(MigrationJobPageView { jobs, total })
     }
 
     pub async fn count_jobs(&self) -> Result<i64, EmbyMigrationServiceError> {
