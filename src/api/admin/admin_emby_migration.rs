@@ -158,17 +158,13 @@ pub(crate) async fn admin_list_emby_migrations(
     let Some(service) = state.emby_migration.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let jobs = match service.list_jobs(offset, limit).await {
-        Ok(jobs) => jobs,
-        Err(error) => return emby_migration_error(&headers, error),
-    };
-    let total = match service.count_jobs().await {
-        Ok(total) => total,
+    let page = match service.list_job_page(offset, limit).await {
+        Ok(page) => page,
         Err(error) => return emby_migration_error(&headers, error),
     };
     Json(json!({
-        "jobs": jobs,
-        "total": total,
+        "jobs": page.jobs,
+        "total": page.total,
         "page": offset / limit + 1,
         "pageSize": limit,
     }))
