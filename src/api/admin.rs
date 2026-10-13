@@ -19,6 +19,8 @@ pub(super) use admin_items::*;
 mod admin_metadata;
 #[path = "admin/admin_people.rs"]
 mod admin_people;
+#[path = "admin/admin_plugins.rs"]
+mod admin_plugins;
 pub(super) use admin_metadata::{
     ItemImageSearchRequest, ItemImageSelectRequest, MetadataCandidateQuery, image_candidate_error,
     image_candidate_json, image_write_error, item_image_json, metadata_write_error,
@@ -27,56 +29,10 @@ pub(super) use admin_metadata::{
 pub(super) use admin_metadata::{
     MetadataCandidateFailureKind, metadata_candidate_error, metadata_candidate_failure_kind,
 };
+pub(super) use admin_plugins::*;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/admin/plugins", get(admin_list_plugins))
-        .route(
-            "/api/v1/admin/notification-providers",
-            get(admin_list_notification_providers),
-        )
-        .route(
-            "/api/v1/admin/chapter-sources",
-            get(admin_list_chapter_sources),
-        )
-        .route(
-            "/api/v1/admin/plugins/installed",
-            get(admin_list_installed_plugins),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/install",
-            post(admin_install_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/update",
-            post(admin_update_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}",
-            delete(admin_uninstall_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/enabled",
-            patch(admin_update_plugin_enabled),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/config",
-            put(admin_update_plugin_config),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/config/image/{field_key}",
-            put(admin_upload_plugin_config_image).layer(DefaultBodyLimit::max(
-                crate::application::login_background_assets::MAX_LOGIN_BACKGROUND_ASSET_BYTES,
-            )),
-        )
-        .route(
-            "/api/v1/admin/plugins/{plugin_id}/run",
-            post(admin_run_plugin),
-        )
-        .route(
-            "/api/v1/admin/plugin-store",
-            get(admin_plugin_store).put(admin_update_plugin_store),
-        )
         .route(
             "/api/v1/admin/emby-migration/test",
             post(admin_test_emby_migration),
@@ -268,4 +224,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_items::api_routes())
         .merge(admin_people::api_routes())
         .merge(admin_metadata::api_routes())
+        .merge(admin_plugins::api_routes())
 }
