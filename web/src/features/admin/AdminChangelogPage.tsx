@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.25",
+    date: "2026-10-13",
+    sections: [
+      { kind: "changed", items: [
+        "管理员 API 按业务领域拆分，并将跨服务编排迁入 application 层；保留现有 HTTP 路径和兼容调用边界，提升代码可维护性。",
+        "Web 静态服务默认只提供构建产物；移除构建产物缺失时回退提供旧版源码的行为，并将仍由历史测试使用的旧实现隔离到测试 fixture。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.24",
     date: "2026-10-13",
     sections: [
