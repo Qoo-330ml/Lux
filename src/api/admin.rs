@@ -36,6 +36,8 @@ mod admin_emby_migration;
 mod admin_jobs;
 #[path = "admin/admin_scheduled_tasks.rs"]
 mod admin_scheduled_tasks;
+#[path = "admin/admin_webhooks.rs"]
+mod admin_webhooks;
 pub(super) use admin_emby_migration::emby_migration_error;
 pub(super) use admin_jobs::{
     AdminJobsQuery, AdminLogExportQuery, scan_job_json, scan_job_json_from_storage,
@@ -44,32 +46,6 @@ pub(super) use admin_jobs::{
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/v1/admin/notification-destinations",
-            get(admin_list_webhook_destinations).post(admin_create_webhook_destination),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations/{destination_id}",
-            get(admin_get_webhook_destination)
-                .patch(admin_update_webhook_destination)
-                .delete(admin_delete_webhook_destination),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations/{destination_id}/test",
-            post(admin_test_webhook_destination),
-        )
-        .route(
-            "/api/v1/admin/notification-destinations/{destination_id}/rotate-secret",
-            post(admin_rotate_webhook_secret),
-        )
-        .route(
-            "/api/v1/admin/notification-deliveries",
-            get(admin_list_webhook_deliveries),
-        )
-        .route(
-            "/api/v1/admin/notification-deliveries/{delivery_id}/retry",
-            post(admin_retry_webhook_delivery),
-        )
         .route("/api/v1/admin/health", get(admin_health))
         .route(
             "/api/v1/admin/database-diagnostics",
@@ -99,4 +75,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_emby_migration::api_routes())
         .merge(admin_scheduled_tasks::api_routes())
         .merge(admin_jobs::api_routes())
+        .merge(admin_webhooks::api_routes())
 }
