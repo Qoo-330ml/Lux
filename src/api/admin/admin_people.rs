@@ -103,22 +103,12 @@ pub(crate) async fn admin_list_people_index_rebuild(
         )
         .into_response();
     };
-    let total = match people.count_person_index_rebuild_jobs().await {
-        Ok(total) => total,
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "人物索引任务暂时不可用",
-            )
-            .into_response();
-        }
-    };
-    match people.list_person_index_rebuild_jobs(offset, limit).await {
-        Ok(jobs) => Json(json!({
-            "jobs": jobs.iter().map(people_index_rebuild_job_json).collect::<Vec<_>>(),
-            "total": total,
+    match crate::application::admin_people::list_person_index_rebuild_jobs(people, offset, limit)
+        .await
+    {
+        Ok(page) => Json(json!({
+            "jobs": page.jobs.iter().map(people_index_rebuild_job_json).collect::<Vec<_>>(),
+            "total": page.total,
             "page": offset / limit + 1,
             "pageSize": limit,
         }))
@@ -150,7 +140,7 @@ pub(crate) async fn admin_queue_people_index_rebuild(
         )
         .into_response();
     };
-    let library_id = library_id.to_string();
+    let library_id_string = library_id.to_string();
     let Some(people) = state.people.as_ref() else {
         return api_error(
             &headers,
@@ -160,20 +150,20 @@ pub(crate) async fn admin_queue_people_index_rebuild(
         )
         .into_response();
     };
-    match people.queue_person_index_rebuild(&library_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            if let Ok(Some(job)) = people.get_person_index_rebuild_job(&library_id).await
-                && job.status == "RUNNING"
-            {
-                return api_error(
-                    &headers,
-                    StatusCode::CONFLICT,
-                    lux::ApiErrorCode::InvalidRequest,
-                    "人物索引重建正在运行",
-                )
-                .into_response();
-            }
+    let job = match crate::application::admin_people::queue_person_index_rebuild(people, library_id)
+        .await
+    {
+        Ok(job) => job,
+        Err(crate::application::admin_people::PersonIndexRebuildRequestError::AlreadyRunning) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "人物索引重建正在运行",
+            )
+            .into_response();
+        }
+        Err(crate::application::admin_people::PersonIndexRebuildRequestError::LibraryNotFound) => {
             return api_error(
                 &headers,
                 StatusCode::NOT_FOUND,
@@ -182,19 +172,7 @@ pub(crate) async fn admin_queue_people_index_rebuild(
             )
             .into_response();
         }
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "人物索引任务暂时不可用",
-            )
-            .into_response();
-        }
-    }
-    let job = match people.get_person_index_rebuild_job(&library_id).await {
-        Ok(Some(job)) => job,
-        Ok(None) | Err(_) => {
+        Err(crate::application::admin_people::PersonIndexRebuildRequestError::Unavailable) => {
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -209,11 +187,11 @@ pub(crate) async fn admin_queue_people_index_rebuild(
         &headers,
         "PEOPLE_INDEX_REBUILD_QUEUED",
         Some("library"),
-        Some(&library_id),
+        Some(&library_id_string),
         "{}",
     )
     .await;
-    people.schedule_person_index_rebuild();
+    crate::application::admin_people::start_person_index_rebuild(people);
     (
         StatusCode::ACCEPTED,
         Json(json!({ "job": people_index_rebuild_job_json(&job) })),
@@ -238,7 +216,7 @@ pub(crate) async fn admin_cancel_people_index_rebuild(
         )
         .into_response();
     };
-    let library_id = library_id.to_string();
+    let library_id_string = library_id.to_string();
     let Some(people) = state.people.as_ref() else {
         return api_error(
             &headers,
@@ -248,45 +226,38 @@ pub(crate) async fn admin_cancel_people_index_rebuild(
         )
         .into_response();
     };
-    match people.cancel_person_index_rebuild(&library_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return api_error(
-                &headers,
-                StatusCode::CONFLICT,
-                lux::ApiErrorCode::InvalidRequest,
-                "没有可取消的人物索引重建任务",
-            )
-            .into_response();
-        }
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "人物索引任务暂时不可用",
-            )
-            .into_response();
-        }
-    }
-    let job = match people.get_person_index_rebuild_job(&library_id).await {
-        Ok(Some(job)) => job,
-        Ok(None) | Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "人物索引任务暂时不可用",
-            )
-            .into_response();
-        }
-    };
+    let job =
+        match crate::application::admin_people::cancel_person_index_rebuild(people, library_id)
+            .await
+        {
+            Ok(job) => job,
+            Err(
+                crate::application::admin_people::PersonIndexRebuildCancelError::NotCancellable,
+            ) => {
+                return api_error(
+                    &headers,
+                    StatusCode::CONFLICT,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "没有可取消的人物索引重建任务",
+                )
+                .into_response();
+            }
+            Err(crate::application::admin_people::PersonIndexRebuildCancelError::Unavailable) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "人物索引任务暂时不可用",
+                )
+                .into_response();
+            }
+        };
     record_audit_event(
         &state,
         &headers,
         "PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED",
         Some("library"),
-        Some(&library_id),
+        Some(&library_id_string),
         "{}",
     )
     .await;
