@@ -37,7 +37,7 @@ test("legacy home renders each library shelf and hides generic recently added", 
     json: async () => responses[requestIndex++] ?? {},
   });
 
-  await import(`../src/app.mjs?home-test=${Date.now()}`);
+  await import(`./fixtures/legacy-web/app.mjs?home-test=${Date.now()}`);
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(document.querySelectorAll(".library-rail [data-library]").length, 2);

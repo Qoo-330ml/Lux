@@ -704,6 +704,9 @@ pnpm --dir web exec playwright test
 cargo run --bin luxd
 pnpm --dir web dev
 
+本地开发时由 Vite（`http://127.0.0.1:5173`）提供 React Web 页面；Rust 服务只从 `web/dist` 或显式配置的
+`LUX_WEB_DIR` 提供静态文件。需要从 Rust 服务同源访问 Web 页面时，先运行 `pnpm --dir web build`。
+
 # Docker
 docker compose build
 docker compose up
@@ -11039,6 +11042,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 验证：运行定向布局测试、完整 Web 测试和 Web 构建；执行 `git diff --check`。
 
 结果（2026-10-13）：移动端卡片设置为 `min(170px, 52vw)`，窄屏更窄、桌面仍为 235px。定向布局测试 6/6，完整 Web 测试和构建通过。
+
+#### LUX-525：移除旧 Web 源码目录 fallback
+
+范围：Rust 静态服务默认只提供 `web/dist`，并继续支持显式 `LUX_WEB_DIR`；不再因构建产物缺失而把 `web/src` 当作旧版站点提供。将仍被历史测试导入的旧 JavaScript 实现隔离到 `web/tests/fixtures/legacy-web/`，更新测试引用；清理旧 HTML、CSS 与空入口文件。
+
+验收：
+
+- [x] 默认静态根目录固定为 `web/dist`；未设置 `LUX_WEB_DIR` 时不再读取或服务 `web/src`。
+- [x] 旧 JavaScript 仅从测试 fixture 被显式导入，React 生产入口不依赖它。
+- [x] 旧 HTML、CSS 和空 `index.mjs` 不再留在应用源码目录；浏览器标题检查只覆盖当前入口。
+
+预计文件：`src/api/legacy.rs`、`web/src/app.mjs`、`web/src/request-options.mjs`、`web/src/admin-navigation.mjs`、`web/src/index.html`、`web/src/styles.css`、`web/src/index.mjs`、`web/tests/home-legacy.test.mjs`、`web/tests/setup-page.test.tsx`、`web/tests/request-options.test.mjs`、`web/tests/admin-navigation.test.mjs`、`web/tests/browser-title.test.mjs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR` 运行 `cargo build --locked`；运行 Web 单测和构建；执行 `git diff --check`。
+
+进度（2026-10-13）：静态根目录与 fixture 清理已完成。`cargo build --locked`、`cargo fmt --all -- --check`、all-targets/all-features Clippy、TypeScript 检查、Vite production build 和 `git diff --check` 通过。Web 自动化测试未运行；`pnpm build` 在尝试清理依赖目录时因无交互终端中止，随后直接运行现有 `tsc` 与 Vite 可执行文件完成构建检查。Web 测试门仍待执行。
 
 ## 28. 参考资料
 

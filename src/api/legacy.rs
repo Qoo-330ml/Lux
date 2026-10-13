@@ -1043,12 +1043,7 @@ fn web_root() -> PathBuf {
         return PathBuf::from(directory);
     }
 
-    let dist = FsPath::new("web/dist");
-    if dist.join("index.html").is_file() {
-        dist.to_path_buf()
-    } else {
-        FsPath::new("web/src").to_path_buf()
-    }
+    FsPath::new("web/dist").to_path_buf()
 }
 
 async fn web_logo() -> Response {
