@@ -12,6 +12,9 @@ pub(super) use admin_settings::*;
 #[path = "admin/admin_libraries.rs"]
 mod admin_libraries;
 pub(super) use admin_libraries::*;
+#[path = "admin/admin_items.rs"]
+mod admin_items;
+pub(super) use admin_items::*;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -176,23 +179,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             delete(admin_delete_item_image),
         )
         .route(
-            "/api/v1/admin/items/{item_id}/scan",
-            post(admin_start_item_scan),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/metadata/refresh",
-            post(admin_start_item_metadata_refresh),
-        )
-        .route(
-            "/api/v1/admin/items/{item_id}/subtitles/{stream_index}",
-            patch(admin_update_item_subtitle),
-        )
-        .route("/api/v1/admin/items/{item_id}", delete(admin_delete_item))
-        .route(
-            "/api/v1/admin/items/{item_id}/collection/refresh",
-            post(admin_refresh_collection),
-        )
-        .route(
             "/api/v1/admin/libraries/{library_id}/scan",
             post(admin_start_scan),
         )
@@ -352,4 +338,5 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_users::api_routes())
         .merge(admin_settings::api_routes())
         .merge(admin_libraries::api_routes())
+        .merge(admin_items::api_routes())
 }
