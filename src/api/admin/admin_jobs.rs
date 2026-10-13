@@ -297,19 +297,11 @@ pub(crate) async fn admin_start_strm_probe(
     let Some(service) = state.strm_probe.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let jobs = match service.create_configured_jobs().await {
-        Ok(jobs) => jobs,
-        Err(error) => return strm_probe_error(&headers, error),
-    };
-    for job in &jobs {
-        let worker = service.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = worker.run(&job_id).await {
-                tracing::error!(job_id = %job_id, %error, "STRM probe job stopped");
-            }
-        });
-    }
+    let jobs =
+        match crate::application::admin_job_workers::start_admin_strm_probe_jobs(service).await {
+            Ok(jobs) => jobs,
+            Err(error) => return strm_probe_error(&headers, error),
+        };
     let operation_id = jobs
         .first()
         .map(|job| job.operation_id.clone())
@@ -438,17 +430,11 @@ pub(crate) async fn admin_retry_strm_probe(
     let Some(service) = state.strm_probe.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match service.retry(&job_id).await {
-        Ok(job) => job,
-        Err(error) => return strm_probe_error(&headers, error),
-    };
-    let worker = service.clone();
-    let new_job_id = job.id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = worker.run(&new_job_id).await {
-            tracing::error!(job_id = %new_job_id, %error, "retried STRM probe job stopped");
-        }
-    });
+    let job =
+        match crate::application::admin_job_workers::retry_strm_probe_job(service, &job_id).await {
+            Ok(job) => job,
+            Err(error) => return strm_probe_error(&headers, error),
+        };
     record_audit_event(
         &state,
         &headers,
@@ -537,20 +523,14 @@ pub(crate) async fn admin_start_chapter_detection(
             .unwrap_or(configured_options.match_threshold),
         force_refresh: request.force_refresh,
     };
-    let job = match service
-        .create_library_job(library_id, plugin_id, options)
-        .await
+    let job = match crate::application::admin_job_workers::start_chapter_detection_job(
+        service, library_id, plugin_id, options,
+    )
+    .await
     {
         Ok(job) => job,
         Err(error) => return chapter_detection_error(&headers, error),
     };
-    let worker = service.clone();
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = worker.run(&job_id).await {
-            tracing::error!(job_id = %job_id, %error, "chapter detection job stopped");
-        }
-    });
     record_audit_event(
         &state,
         &headers,
@@ -671,17 +651,13 @@ pub(crate) async fn admin_retry_chapter_detection(
     let Some(service) = state.chapter_detection.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match service.retry(&job_id).await {
-        Ok(job) => job,
-        Err(error) => return chapter_detection_error(&headers, error),
-    };
-    let worker = service.clone();
-    let new_job_id = job.id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = worker.run(&new_job_id).await {
-            tracing::error!(job_id = %new_job_id, %error, "retried chapter detection job stopped");
-        }
-    });
+    let job =
+        match crate::application::admin_job_workers::retry_chapter_detection_job(service, &job_id)
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => return chapter_detection_error(&headers, error),
+        };
     record_audit_event(
         &state,
         &headers,
@@ -780,20 +756,17 @@ pub(crate) async fn admin_start_danmaku_match(
     let Some(service) = state.danmaku.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match service
-        .create_job(library_id, request.concurrency, request.overwrite)
-        .await
+    let job = match crate::application::admin_job_workers::start_danmaku_match_job(
+        service,
+        library_id,
+        request.concurrency,
+        request.overwrite,
+    )
+    .await
     {
         Ok(job) => job,
         Err(error) => return danmaku_service_error(&headers, error),
     };
-    let worker = service.clone();
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = worker.run(&job_id).await {
-            tracing::error!(job_id = %job_id, %error, "danmaku match job stopped");
-        }
-    });
     record_audit_event(
         &state,
         &headers,
@@ -911,17 +884,12 @@ pub(crate) async fn admin_retry_danmaku_match(
     let Some(service) = state.danmaku.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match service.retry(&job_id).await {
+    let job = match crate::application::admin_job_workers::retry_danmaku_match_job(service, &job_id)
+        .await
+    {
         Ok(job) => job,
         Err(error) => return danmaku_service_error(&headers, error),
     };
-    let worker = service.clone();
-    let new_job_id = job.id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = worker.run(&new_job_id).await {
-            tracing::error!(job_id = %new_job_id, %error, "retried danmaku match job stopped");
-        }
-    });
     record_audit_event(
         &state,
         &headers,

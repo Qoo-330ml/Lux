@@ -627,19 +627,14 @@ pub(crate) async fn admin_run_plugin(
     let Some(service) = state.strm_probe.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let jobs = match service.create_configured_jobs().await {
+    let jobs = match crate::application::admin_job_workers::start_configured_strm_probe_jobs(
+        service,
+    )
+    .await
+    {
         Ok(jobs) => jobs,
         Err(error) => return strm_probe_error(&headers, error),
     };
-    for job in &jobs {
-        let worker = service.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = worker.run(&job_id).await {
-                tracing::error!(job_id = %job_id, %error, "configured STRM probe job stopped");
-            }
-        });
-    }
     let operation_id = jobs
         .first()
         .map(|job| job.operation_id.clone())
