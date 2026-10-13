@@ -1,5 +1,14 @@
 use super::*;
-use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
+
+fn scan_worker_services(
+    state: &AppState,
+) -> crate::application::admin_scan_jobs::ScanWorkerServices {
+    crate::application::admin_scan_jobs::ScanWorkerServices {
+        probe: state.probe.clone(),
+        metadata: state.metadata_reidentify.clone(),
+        thumbnails: state.thumbnails.clone(),
+    }
+}
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -104,7 +113,13 @@ pub(crate) async fn admin_start_scan(
     let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match scan_jobs.create_movie_scan_job(library_id).await {
+    let job = match crate::application::admin_scan_jobs::start_movie_scan_job(
+        scan_jobs,
+        library_id,
+        scan_worker_services(&state),
+    )
+    .await
+    {
         Ok(job) => job,
         Err(ScanJobError::LibraryNotFound) => {
             return api_error(
@@ -126,22 +141,6 @@ pub(crate) async fn admin_start_scan(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let worker = scan_jobs.clone();
-    let job_id = job.id.clone();
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = worker
-            .run_to_completion_with_metadata_and_thumbnails(
-                &job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
     let target_id = job.id.clone();
     record_audit_event(
         &state,
@@ -189,9 +188,14 @@ pub(crate) async fn admin_start_library_path_scan(
     let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match scan_jobs
-        .create_path_scan_job(library_id, request.root_id.as_deref(), &request.path)
-        .await
+    let job = match crate::application::admin_scan_jobs::start_path_scan_job(
+        scan_jobs,
+        library_id,
+        request.root_id.as_deref(),
+        &request.path,
+        scan_worker_services(&state),
+    )
+    .await
     {
         Ok(job) => job,
         Err(ScanJobError::LibraryNotFound) => {
@@ -216,22 +220,6 @@ pub(crate) async fn admin_start_library_path_scan(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let worker = scan_jobs.clone();
-    let job_id = job.id.clone();
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = worker
-            .run_to_completion_with_metadata_and_thumbnails(
-                &job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
     let target_id = job.id.clone();
     record_audit_event(
         &state,
@@ -262,31 +250,12 @@ pub(crate) async fn spawn_library_scan(
     let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return Ok(None);
     };
-    let job = match scan_jobs
-        .create_movie_scan_job_with_metadata(library_id, false)
-        .await
-    {
-        Ok(job) => job,
-        Err(ScanJobError::AlreadyActive(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let worker = scan_jobs.clone();
-    let job_id = job.id.clone();
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = worker
-            .run_to_completion_with_metadata_and_thumbnails(
-                &job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
-    Ok(Some(job))
+    crate::application::admin_scan_jobs::start_library_scan(
+        scan_jobs,
+        library_id,
+        scan_worker_services(state),
+    )
+    .await
 }
 
 pub(crate) async fn admin_cancel_scan(
@@ -1165,7 +1134,13 @@ pub(crate) async fn admin_retry_scan(
     let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match scan_jobs.retry(&job_id).await {
+    let job = match crate::application::admin_scan_jobs::retry_scan_job(
+        scan_jobs,
+        &job_id,
+        scan_worker_services(&state),
+    )
+    .await
+    {
         Ok(job) => job,
         Err(ScanJobError::JobNotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(ScanJobError::AlreadyActive(_)) => {
@@ -1180,22 +1155,6 @@ pub(crate) async fn admin_retry_scan(
         Err(ScanJobError::LibraryNotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let worker = scan_jobs.clone();
-    let new_job_id = job.id.clone();
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = worker
-            .run_to_completion_with_metadata_and_thumbnails(
-                &new_job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
     record_audit_event(
         &state,
         &headers,

@@ -1,5 +1,4 @@
 use super::*;
-use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -48,7 +47,17 @@ pub(crate) async fn admin_start_item_scan(
     let Some(scan_jobs) = state.scan_jobs.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let job = match scan_jobs.create_item_folder_scan_job(&item_id).await {
+    let job = match crate::application::admin_scan_jobs::start_item_folder_scan_job(
+        scan_jobs,
+        &item_id,
+        crate::application::admin_scan_jobs::ScanWorkerServices {
+            probe: state.probe.clone(),
+            metadata: state.metadata_reidentify.clone(),
+            thumbnails: state.thumbnails.clone(),
+        },
+    )
+    .await
+    {
         Ok(job) => job,
         Err(ScanJobError::ItemNotFound) => {
             return api_error(
@@ -79,22 +88,6 @@ pub(crate) async fn admin_start_item_scan(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let worker = scan_jobs.clone();
-    let job_id = job.id.clone();
-    let probe = state.probe.clone();
-    let metadata = state.metadata_reidentify.clone();
-    let thumbnails = state.thumbnails.clone();
-    tokio::spawn(async move {
-        let _ = worker
-            .run_to_completion_with_metadata_and_thumbnails(
-                &job_id,
-                BACKGROUND_SCAN_BATCH_SIZE,
-                probe,
-                metadata,
-                thumbnails,
-            )
-            .await;
-    });
     let target_id = job.id.clone();
     record_audit_event(
         &state,
