@@ -272,9 +272,7 @@ pub(crate) async fn delete_media_item(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    if let Some(home) = state.home.as_ref() {
-        home.invalidate();
-    }
+    crate::application::admin_cache::invalidate_home(state.home.as_ref());
     let audit_target = if report.source_ids.len() == 1 {
         ("media_source", report.source_ids[0].as_str())
     } else {

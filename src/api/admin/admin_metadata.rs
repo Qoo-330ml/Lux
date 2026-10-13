@@ -644,11 +644,10 @@ pub(crate) async fn admin_merge_items(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if let Some(home) = state.home.as_ref() {
-        home.invalidate();
-    } else if let Some(catalog) = state.catalog.as_ref() {
-        catalog.invalidate_library_pages();
-    }
+    crate::application::admin_cache::invalidate_media_catalog(
+        state.home.as_ref(),
+        state.catalog.as_ref(),
+    );
     record_audit_event(
         &state,
         &headers,
