@@ -389,26 +389,20 @@ pub(crate) async fn admin_create_library(
     {
         return response;
     }
-    match libraries
-        .create_library_with_scrapers_and_chapter_source(
-            &request.name,
-            kind,
-            request.realtime_watch_enabled,
-            &scrapers,
-            request.chapter_source_id.as_deref(),
-            request.realtime_metadata_auto_match_enabled,
-        )
-        .await
+    match crate::application::admin_library_settings::create_library(
+        libraries,
+        state.home.as_ref(),
+        state.plugins.as_ref(),
+        &request.name,
+        kind,
+        request.realtime_watch_enabled,
+        &scrapers,
+        request.chapter_source_id.as_deref(),
+        request.realtime_metadata_auto_match_enabled,
+    )
+    .await
     {
         Ok(library) => {
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
-            if let Some(plugins) = state.plugins.as_ref()
-                && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
-            {
-                return plugin_error(&headers, error);
-            }
             let library_id = library.id.to_string();
             record_audit_event(
                 &state,
@@ -428,7 +422,14 @@ pub(crate) async fn admin_create_library(
             )
                 .into_response()
         }
-        Err(error) => library_error(&headers, error),
+        Err(crate::application::admin_library_settings::LibrarySettingsWriteError::Library(
+            error,
+        )) => library_error(&headers, error),
+        Err(
+            crate::application::admin_library_settings::LibrarySettingsWriteError::ChapterSchedule(
+                error,
+            ),
+        ) => plugin_error(&headers, error),
     }
 }
 
@@ -553,16 +554,16 @@ pub(crate) async fn admin_update_library(
         scan_concurrency: request.scan_concurrency,
         probe_concurrency: request.probe_concurrency,
     };
-    match libraries.update_settings(library_id, settings).await {
+    match crate::application::admin_library_settings::update_library_settings(
+        libraries,
+        state.home.as_ref(),
+        state.plugins.as_ref(),
+        library_id,
+        settings,
+    )
+    .await
+    {
         Ok(view) => {
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
-            if let Some(plugins) = state.plugins.as_ref()
-                && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
-            {
-                return plugin_error(&headers, error);
-            }
             let target_id = library_id.to_string();
             record_audit_event(
                 &state,
@@ -581,7 +582,14 @@ pub(crate) async fn admin_update_library(
             )
                 .into_response()
         }
-        Err(error) => library_error(&headers, error),
+        Err(crate::application::admin_library_settings::LibrarySettingsWriteError::Library(
+            error,
+        )) => library_error(&headers, error),
+        Err(
+            crate::application::admin_library_settings::LibrarySettingsWriteError::ChapterSchedule(
+                error,
+            ),
+        ) => plugin_error(&headers, error),
     }
 }
 
@@ -790,11 +798,15 @@ pub(crate) async fn admin_delete_library_root(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match libraries.delete_root(library_id, root_id).await {
+    match crate::application::admin_library_settings::delete_library_root(
+        libraries,
+        state.home.as_ref(),
+        library_id,
+        root_id,
+    )
+    .await
+    {
         Ok(()) => {
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
             let target_id = root_id.to_string();
             record_audit_event(
                 &state,
@@ -831,63 +843,44 @@ pub(crate) async fn admin_delete_library(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let _deletion_guard = if let Some(scan_jobs) = state.scan_jobs.as_ref() {
-        match scan_jobs.prepare_library_deletion(library_id).await {
-            Ok(guard) => Some(guard),
-            Err(ScanJobError::Storage(error)) => {
-                return library_error(&headers, LibraryServiceError::Storage(error));
-            }
-            Err(error) => {
-                tracing::error!(library_id = %library_id, %error, "failed to prepare library deletion");
-                return api_error(
-                    &headers,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    lux::ApiErrorCode::DatabaseUnavailable,
-                    "媒体库删除准备失败",
-                )
-                .into_response();
-            }
+    let _deletion_guard = match crate::application::admin_library_settings::delete_library(
+        libraries,
+        state.scan_jobs.as_ref(),
+        state.plugins.as_ref(),
+        state.home.as_ref(),
+        library_id,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(crate::application::admin_library_settings::DeleteLibraryError::Library(error)) => {
+            return library_error(&headers, error);
         }
-    } else {
-        None
-    };
-    match libraries.delete_library(library_id).await {
-        Ok(()) => {
-            if let Some(plugins) = state.plugins.as_ref()
-                && let Err(error) = plugins.prune_media_info_library_ids().await
-            {
-                tracing::error!(
-                    library_id = %library_id,
-                    %error,
-                    "library deleted but STRM media-info plugin configuration could not be pruned"
-                );
-            }
-            if let Some(plugins) = state.plugins.as_ref()
-                && let Err(error) = plugins.prune_danmaku_library_ids().await
-            {
-                tracing::error!(
-                    library_id = %library_id,
-                    %error,
-                    "library deleted but danmaku plugin configuration could not be pruned"
-                );
-            }
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
-            let target_id = library_id.to_string();
-            record_audit_event(
-                &state,
+        Err(crate::application::admin_library_settings::DeleteLibraryError::Scan(
+            ScanJobError::Storage(error),
+        )) => return library_error(&headers, LibraryServiceError::Storage(error)),
+        Err(crate::application::admin_library_settings::DeleteLibraryError::Scan(error)) => {
+            tracing::error!(library_id = %library_id, %error, "failed to prepare library deletion");
+            return api_error(
                 &headers,
-                "LIBRARY_DELETED",
-                Some("library"),
-                Some(&target_id),
-                "{}",
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "媒体库删除准备失败",
             )
-            .await;
-            StatusCode::NO_CONTENT.into_response()
+            .into_response();
         }
-        Err(error) => library_error(&headers, error),
-    }
+    };
+    let target_id = library_id.to_string();
+    record_audit_event(
+        &state,
+        &headers,
+        "LIBRARY_DELETED",
+        Some("library"),
+        Some(&target_id),
+        "{}",
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub(crate) async fn admin_add_library_root(
@@ -917,11 +910,15 @@ pub(crate) async fn admin_add_library_root(
         )
         .into_response();
     };
-    match libraries.add_root(library_id, &request.path).await {
+    match crate::application::admin_library_settings::add_library_root(
+        libraries,
+        state.home.as_ref(),
+        library_id,
+        &request.path,
+    )
+    .await
+    {
         Ok(result) => {
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
-            }
             let target_id = library_id.to_string();
             record_audit_event(
                 &state,
