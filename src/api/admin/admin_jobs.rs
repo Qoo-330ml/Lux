@@ -1050,12 +1050,19 @@ pub(crate) async fn admin_list_job_events(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match database.find_scan_job(&job_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    let file_events = match crate::application::admin_scan_jobs::list_admin_scan_job_events(
+        state.database.as_ref(),
+        state.config_dir.as_deref(),
+        &job_id,
+        level.as_deref(),
+        event_code.as_deref(),
+        offset,
+        limit,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(crate::application::admin_scan_jobs::AdminScanJobEventsError::NotFound) => {
             return api_error(
                 &headers,
                 StatusCode::NOT_FOUND,
@@ -1064,23 +1071,9 @@ pub(crate) async fn admin_list_job_events(
             )
             .into_response();
         }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let Some(config_dir) = state.config_dir.as_deref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let file_events = match crate::observability::logs::LogStore::new(config_dir)
-        .list_scan_job_events(
-            &job_id,
-            level.as_deref(),
-            event_code.as_deref(),
-            offset,
-            limit,
-        )
-        .await
-    {
-        Ok(events) => events,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(crate::application::admin_scan_jobs::AdminScanJobEventsError::Unavailable) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     Json(json!({
         "events": file_events.1.iter().map(scan_job_event_json).collect::<Vec<_>>(),

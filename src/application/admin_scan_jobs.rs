@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::{
     application::{
         probe::MediaProbeService,
@@ -6,7 +8,36 @@ use crate::{
         thumbnails::ThumbnailService,
     },
     domain::ids::LibraryId,
+    observability::logs::{LogStore, ScanJobLogEvent},
+    storage::Database,
 };
+
+pub(crate) enum AdminScanJobEventsError {
+    NotFound,
+    Unavailable,
+}
+
+pub(crate) async fn list_admin_scan_job_events(
+    database: Option<&Database>,
+    config_dir: Option<&Path>,
+    job_id: &str,
+    level: Option<&str>,
+    event_code: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<(i64, Vec<ScanJobLogEvent>), AdminScanJobEventsError> {
+    let database = database.ok_or(AdminScanJobEventsError::Unavailable)?;
+    match database.find_scan_job(job_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(AdminScanJobEventsError::NotFound),
+        Err(_) => return Err(AdminScanJobEventsError::Unavailable),
+    }
+    let config_dir = config_dir.ok_or(AdminScanJobEventsError::Unavailable)?;
+    LogStore::new(config_dir)
+        .list_scan_job_events(job_id, level, event_code, offset, limit)
+        .await
+        .map_err(|_| AdminScanJobEventsError::Unavailable)
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanWorkerServices {
