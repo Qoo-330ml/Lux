@@ -136,6 +136,39 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
     assert_eq!(database.schema_version().await?, 173);
+    let global_collection_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN (
+               'collection_item_references', 'collection_work_items',
+               'collection_work_sources', 'collection_sync_outbox',
+               'global_collection_work_references', 'user_collection_source_preferences'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(global_collection_tables, 6);
+    let rootless_system_collection_library: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM libraries library
+         WHERE library.id = '00000000-0000-7000-8000-000000000538'
+           AND library.kind = 'MIXED'
+           AND library.system_kind = 'COLLECTIONS'
+           AND NOT EXISTS (
+               SELECT 1 FROM library_roots root WHERE root.library_id = library.id
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(rootless_system_collection_library, 1);
+    let nfo_collection_reference_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'media_items'
+           AND column_name = 'nfo_collection_reference_key'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(nfo_collection_reference_column, 1);
     let dispatch_source_default: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_schema = current_schema()
