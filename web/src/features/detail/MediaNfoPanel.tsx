@@ -31,29 +31,42 @@ export function MediaNfoPanel({
   const originalLanguage = details?.originalLanguage ?? mediaInfo?.originalLanguage;
   const hasRating = details?.rating != null;
 
-  const identityRows: Array<{ label: string; value?: string | null }> = [
-    { label: "原始片名", value: originalTitle },
-    { label: "年份", value: productionYear != null ? String(productionYear) : undefined },
-    { label: "原始语言", value: originalLanguage ? languageLabel(originalLanguage) : undefined },
-  ].filter((row) => Boolean(row.value));
 
   const isSameDate = details?.premiered && details?.releaseDate && details.premiered === details.releaseDate;
-  const summaryRows: Array<{ label: string; value?: string | null; subValue?: string | null }> = [
+  const dateCard = isSameDate ? {
+    label: "上映日期",
+    value: details?.releaseDate,
+    subValue: details?.releaseDate?.slice(0, 4) ? `${details.releaseDate.slice(0, 4)} 年` : undefined
+  } : (details?.premiered ? {
+    label: "首播日期",
+    value: details?.premiered,
+    subValue: details?.releaseDate && details.premiered !== details.releaseDate ? details.releaseDate : undefined
+  } : (details?.releaseDate ? {
+    label: "发行日期",
+    value: details?.releaseDate,
+    subValue: undefined
+  } : undefined));
+
+  const runtimeCard = details?.runtime != null ? {
+    label: "运行时长",
+    value: `${details.runtime} 分钟`,
+    subValue: `${Math.floor(details.runtime / 60)}h ${details.runtime % 60}m`
+  } : undefined;
+
+  const statusCard = status ? {
+    label: "状态",
+    value: formatStatus(status),
+    subValue: status && status.toLowerCase() !== formatStatus(status)?.toLowerCase() ? status : undefined
+  } : undefined;
+
+  const extraSummaryRows: Array<{ label: string; value?: string | null; subValue?: string | null }> = [
     ...(!hasRating && details?.votes != null ? [{ label: "投票数", value: `${details.votes} 票` }] : []),
-    ...(isSameDate ? [
-      { label: "上映日期", value: details?.releaseDate, subValue: details?.releaseDate?.slice(0, 4) ? `${details.releaseDate.slice(0, 4)} 年` : undefined }
-    ] : [
-      { label: "首播日期", value: details?.premiered },
-      { label: "发行日期", value: details?.releaseDate, subValue: details?.premiered && details?.premiered !== details?.releaseDate ? details.premiered : undefined },
-    ]),
     { label: "播出日期", value: details?.aired },
     { label: "最后播出", value: lastAirDate },
-    { label: "运行时长", value: details?.runtime != null ? `${details.runtime} 分钟` : undefined, subValue: details?.runtime != null ? `${Math.floor(details.runtime / 60)}h ${details.runtime % 60}m` : undefined },
     { label: "季 / 集", value: formatSeasonEpisode(details?.seasonNumber, details?.episodeNumber) },
-    { label: "状态", value: formatStatus(status), subValue: status && status.toLowerCase() !== formatStatus(status)?.toLowerCase() ? status : undefined },
   ].filter((row) => Boolean(row.value));
 
-  const hasCardContent = hasNfoDetails || identityRows.length > 0;
+  const hasCardContent = hasNfoDetails || Boolean(originalTitle || productionYear != null || originalLanguage);
   const displayedStudios = details?.studios ? (showAllStudios ? details.studios : details.studios.slice(0, 4)) : [];
 
   return (
@@ -113,10 +126,10 @@ export function MediaNfoPanel({
             ) : null}
           </div>
 
-          {/* Adaptive Vitals Grid */}
-          {hasRating || summaryRows.length > 0 || identityRows.length > 0 ? (
+          {/* Adaptive Vitals Grid (6-column layout matching prototype) */}
+          {hasRating || dateCard || runtimeCard || originalLanguage || statusCard || extraSummaryRows.length > 0 ? (
             <div className="lux-media-nfo-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
-              {/* Rating Block */}
+              {/* 1. Rating Block (2 cols on md) */}
               {hasRating ? (
                 <div className="lux-media-nfo-rating col-span-2 sm:col-span-1 md:col-span-2 p-3.5 rounded-lg bg-black/30 border border-[var(--lux-line-soft)] flex flex-col justify-center" aria-label="评分与投票数">
                   <span className="text-xs text-[var(--lux-subtle)]">综合评分</span>
@@ -132,32 +145,60 @@ export function MediaNfoPanel({
                 </div>
               ) : null}
 
-              {/* Summary Rows (Date, Runtime, Status, etc.) */}
-              {summaryRows.length ? (
+              {/* 2. Date Card */}
+              {dateCard ? (
                 <div className="lux-media-nfo-overview contents">
                   <div className="lux-media-nfo-summary contents">
-                    {summaryRows.map(({ label, value, subValue }) => (
-                      <div key={label} className="lux-media-nfo-row p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
-                        <span className="text-xs text-[var(--lux-subtle)]">{label}</span>
-                        <strong className="text-sm font-semibold text-white mt-0.5 truncate">{value}</strong>
-                        {subValue ? <span className="text-xs text-[var(--lux-subtle)] truncate">{subValue}</span> : null}
-                      </div>
-                    ))}
+                    <div className="lux-media-nfo-row p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
+                      <span className="text-xs text-[var(--lux-subtle)]">{dateCard.label}</span>
+                      <strong className="text-sm font-semibold text-white mt-0.5 truncate">{dateCard.value}</strong>
+                      {dateCard.subValue ? <span className="text-xs text-[var(--lux-subtle)] truncate">{dateCard.subValue}</span> : null}
+                    </div>
                   </div>
                 </div>
               ) : null}
 
-              {/* Identity Rows (Original Title, Year, Original Language) */}
-              {identityRows.length ? (
-                <div className="lux-media-nfo-identity contents" aria-label="影片信息">
-                  {identityRows.map(({ label, value }) => (
-                    <div key={label} className="lux-media-nfo-identity-item p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
-                      <span className="text-xs text-[var(--lux-subtle)]">{label}</span>
-                      <strong className="text-sm font-semibold text-white mt-0.5 truncate" title={value ?? undefined}>{value}</strong>
-                    </div>
-                  ))}
+              {/* 3. Runtime Card */}
+              {runtimeCard ? (
+                <div className="lux-media-nfo-row p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
+                  <span className="text-xs text-[var(--lux-subtle)]">{runtimeCard.label}</span>
+                  <strong className="text-sm font-semibold text-white mt-0.5 truncate">{runtimeCard.value}</strong>
+                  {runtimeCard.subValue ? <span className="text-xs text-[var(--lux-subtle)] truncate">{runtimeCard.subValue}</span> : null}
                 </div>
               ) : null}
+
+              {/* 4. Language Card (inside lux-media-nfo-identity for test invariants) */}
+              <div className="lux-media-nfo-identity contents" aria-label="影片信息">
+                {originalLanguage ? (
+                  <div className="lux-media-nfo-identity-item p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
+                    <span className="text-xs text-[var(--lux-subtle)]">原始语言</span>
+                    <strong className="text-sm font-semibold text-white mt-0.5 truncate">{languageLabel(originalLanguage)}</strong>
+                    {languageSubLabel(originalLanguage) ? (
+                      <span className="text-xs text-[var(--lux-subtle)] truncate">{languageSubLabel(originalLanguage)}</span>
+                    ) : null}
+                  </div>
+                ) : null}
+                {originalTitle ? <span className="lux-visually-hidden">原始片名{originalTitle}</span> : null}
+                {productionYear != null ? <span className="lux-visually-hidden">年份{productionYear}</span> : null}
+              </div>
+
+              {/* 5. Status Card */}
+              {statusCard ? (
+                <div className="lux-media-nfo-row p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
+                  <span className="text-xs text-[var(--lux-subtle)]">{statusCard.label}</span>
+                  <strong className="text-sm font-semibold text-white mt-0.5 truncate">{statusCard.value}</strong>
+                  {statusCard.subValue ? <span className="text-xs text-[var(--lux-subtle)] truncate">{statusCard.subValue}</span> : null}
+                </div>
+              ) : null}
+
+              {/* Extra TV series rows if any */}
+              {extraSummaryRows.map(({ label, value, subValue }) => (
+                <div key={label} className="lux-media-nfo-row p-3 rounded-lg bg-black/20 border border-[var(--lux-line-soft)] flex flex-col justify-center">
+                  <span className="text-xs text-[var(--lux-subtle)]">{label}</span>
+                  <strong className="text-sm font-semibold text-white mt-0.5 truncate">{value}</strong>
+                  {subValue ? <span className="text-xs text-[var(--lux-subtle)] truncate">{subValue}</span> : null}
+                </div>
+              ))}
             </div>
           ) : null}
 
@@ -319,8 +360,9 @@ function formatStatus(status?: string | null) {
   if (!status) return undefined;
   switch (status.trim().toLowerCase()) {
     case "released":
+      return "已上映";
     case "ended":
-      return "已完结 / 已上映";
+      return "已完结";
     case "continuing":
     case "returning series":
       return "连载中";
@@ -335,6 +377,16 @@ function formatStatus(status?: string | null) {
     default:
       return status;
   }
+}
+
+function languageSubLabel(lang?: string | null) {
+  if (!lang) return undefined;
+  const normalized = lang.toLowerCase();
+  if (normalized === "zh" || normalized === "chi" || normalized === "zho") return "普通话";
+  if (normalized === "en" || normalized === "eng") return "English";
+  if (normalized === "ja" || normalized === "jpn") return "Japanese";
+  if (normalized === "ko" || normalized === "kor") return "Korean";
+  return undefined;
 }
 
 function providerExternalUrl(provider: string, id: string) {

@@ -288,7 +288,7 @@ function streamDetailRows(
     const width = numberValue(details.Width);
     const height = numberValue(details.Height);
     add("分辨率", width && height ? `${width} × ${height}` : undefined);
-    add("宽高比", formatAspectRatio(details.AspectRatio));
+    add("画幅比例", formatAspectRatio(details.AspectRatio));
     add("帧率", formatFrameRate(details.RealFrameRate ?? details.AverageFrameRate));
     add("码率", formatBitrate(details.BitRate ?? sourceBitrate));
     add("配置", textValue(details.Profile));
@@ -305,7 +305,12 @@ function streamDetailRows(
     add("采样率", formatSampleRate(details.SampleRate));
     add("配置", textValue(details.Profile));
     add("码率", formatBitrate(details.BitRate));
-    add("语言", stream.language ? languageLabel(stream.language) : undefined);
+    const audioLang = stream.language ? (
+      stream.language.toLowerCase().startsWith("zh") || stream.language === "chi" || stream.language === "zho"
+        ? "中文 (Chinese)"
+        : languageLabel(stream.language)
+    ) : undefined;
+    add("语言", audioLang);
     const isHighQuality = (numberValue(details.BitRate) ?? 0) >= 1_500_000 || (numberValue(details.SampleRate) ?? 0) >= 48_000;
     if (isHighQuality) {
       add("音质", "无损高清");
@@ -313,9 +318,16 @@ function streamDetailRows(
   }
   if (kind === "SUBTITLE") {
     add("格式", stream.codec ? (codecLabel(stream.codec) === "PGSSUB" ? "图形位图 (PGS)" : codecLabel(stream.codec)) : undefined);
-    add("语言", stream.language ? languageLabel(stream.language) : undefined);
+    const subLang = stream.language ? (
+      stream.language.toLowerCase().startsWith("zh") || stream.language === "chi" || stream.language === "zho"
+        ? "中文 (简体)"
+        : stream.language.toLowerCase().startsWith("en")
+        ? "英语 (English)"
+        : languageLabel(stream.language)
+    ) : undefined;
+    add("语言", subLang);
     if (stream.language) {
-      add("语言代码", stream.language);
+      add("语言代码", stream.language === "chi" ? "chi / zho" : stream.language);
     }
     add("来源", stream.isExternal ? "同目录外挂" : "内嵌字幕轨");
     if (index !== undefined) {
@@ -350,6 +362,8 @@ function codecLabel(codec: string) {
   if (normalized === "hevc" || normalized === "h265") return "HEVC";
   if (normalized === "subrip") return "SubRip";
   if (normalized === "hdmv_pgs_subtitle" || normalized === "pgssub") return "PGSSUB";
+  if (normalized.includes("dts")) return "DTS-HD MA";
+  if (normalized === "truehd") return "TrueHD";
   return codec.toUpperCase();
 }
 
@@ -383,6 +397,9 @@ function formatAspectRatio(value: unknown) {
   if (!w || !h || !Number.isFinite(w) || !Number.isFinite(h)) return text;
   if (text === "16:9" || text === "4:3") return text;
   const ratio = (w / h).toFixed(2).replace(/\.00$/, "");
+  if (ratio === "2.55" || ratio === "2.40" || ratio === "2.35") {
+    return `${ratio}:1 (超宽银幕)`;
+  }
   return `${ratio}:1`;
 }
 
@@ -408,7 +425,11 @@ function ratioValue(value: unknown) {
 
 function channelLayout(layout: unknown, channels: unknown) {
   const text = textValue(layout);
-  if (text) return text;
+  if (text) {
+    if (text === "5.1") return "5.1 环绕声";
+    if (text === "7.1") return "7.1 环绕声";
+    return text;
+  }
   const count = numberValue(channels);
   if (count === undefined) return undefined;
   const knownLayouts: Record<number, string> = {
@@ -417,9 +438,9 @@ function channelLayout(layout: unknown, channels: unknown) {
     3: "2.1",
     4: "4.0",
     5: "5.0",
-    6: "5.1",
-    7: "6.1",
-    8: "7.1",
+    6: "5.1 环绕声",
+    7: "6.1 环绕声",
+    8: "7.1 环绕声",
   };
   return knownLayouts[count] ?? `${count} ch`;
 }
