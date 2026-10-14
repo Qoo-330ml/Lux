@@ -227,6 +227,30 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .ok_or("missing user direct stream URL")?;
     assert!(!user_direct_url.contains(&admin_api_key));
 
+    let mixed_header_playback = client
+        .get(format!(
+            "http://{address}/Items/{remote_item_id}/PlaybackInfo"
+        ))
+        .header("X-Lux-Api-Key", &admin_api_key)
+        .query(&[
+            ("X-Emby-Token", token.as_str()),
+            ("api_key", admin_api_key.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(mixed_header_playback.status(), reqwest::StatusCode::OK);
+    let mixed_header_body = mixed_header_playback.json::<Value>().await?;
+    let mixed_direct_url = mixed_header_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing selected-token stream URL")?;
+    let mixed_direct_url = url::Url::parse(&format!("http://{address}{mixed_direct_url}"))?;
+    assert!(
+        mixed_direct_url
+            .query_pairs()
+            .any(|(name, value)| name == "api_key" && value == token)
+    );
+    assert!(!mixed_direct_url.as_str().contains(&admin_api_key));
+
     let popcorn_detail = client
         .get(format!(
             "http://{address}/emby/Users/{user_id}/Items/{remote_item_id}?Fields=ShareLevel"

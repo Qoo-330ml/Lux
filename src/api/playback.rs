@@ -1049,9 +1049,11 @@ async fn standard_emby_playback_api_key(
     query_api_key: Option<&str>,
     state: &AppState,
 ) -> Option<String> {
-    // X-Lux-Api-Key is the shared Lux management credential, not a user
-    // identity that an external Emby proxy can safely receive.
-    let token = if headers.contains_key("X-Lux-Api-Key") {
+    // A normalized Emby credential is authoritative even when an unused Lux
+    // key header is present. Without normalization, preserve the legacy guard.
+    let token = if headers.contains_key("X-Lux-Api-Key")
+        && !headers.contains_key(super::emby::NORMALIZED_CREDENTIAL_HEADER)
+    {
         None
     } else {
         emby_token_from_headers(headers).or_else(|| {
