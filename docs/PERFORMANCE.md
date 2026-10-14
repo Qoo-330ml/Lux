@@ -166,6 +166,22 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 | 2026-09-30 | `edb28dbb`（`uname -m=arm64`） | `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/run-metadata-performance.sh`（release，连续 3 次） | 32/32 条目均成功；耗时 599–662ms，中位数 608ms；吞吐 48.3–53.4 条/秒；每次 32 次 search/bundle，图片 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms` 范围 `{bundle:3–4,image_download:0,image_download_queue:0,image_write:26–33,image_write_queue:0,item_total:92–129,nfo_write:30–37,queue_claim:5–8,queue_wait:5–8,search:3}`；`imageBytes=1876` | 仅本机 ARM64/SQLite、32 条固定夹具和 adapter stub；没有匹配改动前的同机 A/B，不据此声称吞吐提升；不代表 NAS/x86_64 或独立 PostgreSQL 的 CPU/延迟 |
 | 2026-09-30 | `a420389f`（`uname -m=arm64`） | `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/run-metadata-performance.sh`（release，连续 3 次） | 32/32 条目均成功；耗时 568–633ms，中位数 584ms；吞吐 50.5–56.3 条/秒，中位数 54.8；每次 32 次 search/bundle，图片 28 条可用、4 条明确不可用、1 次临时重试、scraper 重试为 0；`stageP95Ms` 范围 `{bundle:3–4,image_download:0,image_download_queue:0,image_write:24–28,image_write_queue:0,item_total:86–213,nfo_write:27–36,queue_claim:5–7,queue_wait:5–7,search:3–4}`；`imageBytes=1876` | 仅本机 ARM64/SQLite、32 条固定夹具和 adapter stub；本基准不运行持久化 provider cache 或 `ScraperPluginClient`，不测真实插件、PostgreSQL、NAS/x86_64 或容器 CPU；没有严格同机 A/B，不据此声称 CPU 降幅或吞吐提升 |
 
+### LUX-531 固定延迟 FILL_MISSING 并发矩阵
+
+`./scripts/run-metadata-performance.sh concurrency` 使用真实 `MetadataReidentifyService::run` job worker、SQLite 或 `LUX_PERF_BACKEND=postgres` 选择的 storage 路径，以及进程内 adapter stub。每档使用 96 个相同电影 fixture；默认每次 provider 调用固定等待 100ms（可用 `LUX_METADATA_BENCHMARK_PROVIDER_DELAY_MS` 调整，范围 1–5000ms），仅发起本地 stub 调用，不访问 TMDb。JSON 结果包含构建版本、Rust 版本、架构、数据库 backend、固定配置、逐 item 耗时、逐 provider 调用耗时、并发峰值、阶段 p95 和错误/取消计数。成功吞吐只计算 `COMPLETED` 且无 item error 的项目。
+
+2026-10-14 本机连续运行 3 次；`uname -m=arm64`，Rust target architecture `aarch64`，Lux `0.5.25`，`rustc 1.97.1`，SQLite，基准输出中的 HEAD 为 `42e36ce3`（运行时包含未提交的 LUX-531 工作树改动）。每轮各档均为 96/96 成功、0 失败、0 取消、192 次 provider 调用，观测峰值分别精确达到 4/8/12，且没有超过档位。
+
+| worker 档位 | items/s 中位数（范围） | job 总耗时中位数（范围） | 成功项 p50 中位数（范围） | 成功项 p95 中位数（范围） | queue wait p95 中位数（范围） |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 16.45（16.43–16.63） | 5,835ms（5,773–5,843） | 233.1ms（230.9–235.1） | 255.6ms（254.6–263.2） | 3ms（3–5） |
+| 8 | 29.57（27.40–31.14） | 3,247ms（3,083–3,503） | 248.3ms（236.3–268.2） | 323.5ms（305.7–334.7） | 12ms（6–16） |
+| 12 | 35.75（34.25–36.86） | 2,685ms（2,604–2,803） | 301.4ms（269.9–324.0） | 378.1ms（375.6–400.6） | 17ms（16–23） |
+
+stub 单次调用实测 p50 约 101.4–102.0ms、p95 约 102.6–103.5ms，和固定 100ms 等待相符。SQLite 下 12 路相较 8 路吞吐中位数约高 21%，但成功项 p95 约高 17%，queue wait p95 也更高；这些数据呈现本机写锁/存储争用下的收益与尾延迟代价，不能外推到 PostgreSQL 或 NAS。基准不测 TMDb 响应时间、限流策略、插件 cache、远程图片下载或真实网络吞吐；不得把 stub 吞吐解读为上游请求速率。PostgreSQL 选择路径已实现，但本机未安装 `postgres`/`psql`/`pg_isready` 且没有可用服务，本次未运行 PostgreSQL 档位。默认线上并发仍为 4，本任务没有调整它。
+
+LUX-532 默认继续使用 4，`LUX_METADATA_CONCURRENCY` 可在 1–12 之间配置，硬上限为 12。4 是已有 SQLite 基线；PostgreSQL 缺少测量证据，所以本次不提高默认，也不把 8/12 档的 SQLite 吞吐当成跨后端建议值。设置解析在进程内只进行一次，semaphore 与 worker limit 使用同一值；无效输入回退到 4 并告警，整数越界夹到边界并告警。
+
 本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
 
 ## 本地 NFO page 运行指标
@@ -1193,7 +1209,13 @@ SQL/pool/lock 观测也没有分离出单一根因。rescan 并发请求窗口�
 
 1k 两组明确验证每 job 最多 100 项、所有 item `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL，scan/local 均在 provider 放行前完成。10k SQLite 快照为 scan `COMPLETED/IDLE`，local 15 批完成、31 批待处理、4 批运行；online 39 QUEUED+1 RUNNING。`local_metadata_completeness` 在持久化后等待 `enqueue_fill_missing_job_id`，该方法最终等待容量 32 channel 的 `sender.reserve().await`；provider 阻塞导致队列满，背压传回本地 worker。失败的 online 时延保持 unavailable，poster 矩阵中的 `onlineFillMissingJobCount=0` 仅表示该 fixture 禁止在线调度。
 
-该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。已报告此规格冲突，按 AGENTS.md 在修订公共调度/存储边界前等待项目所有者选择。建议自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用有界通知/分页异步领取；保留管理员请求背压和完成等待合同，禁止按 job 无界 spawn。该建议尚未实施。
+该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。2026-10-14 项目所有者授权按自动/显式来源分流解决冲突：自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用合并唤醒和分页领取；保留管理员/计划入口的显式提交背压和完成等待合同，禁止按 job 无界 spawn。上段是决策时点快照；原失败样本保持 unavailable，不计作在线刮削耗时。
+
+#### LUX-528–530 自动补缺队列实现状态
+
+2026-10-14 完成追加式来源字段、自动/显式 job 分流和持久化自动队列 drain。每库 dispatcher 通过容量为 1 的合并唤醒通道触发，按创建时间分页领取、每页最多 100 条并串行运行自动 QUEUED job；显式入口仍使用容量 32 的背压队列，自动 completion waiter 有界为每库 32。扫描的 `ScanCompleted`/`JOB_COMPLETED` 时序未改变。
+
+回归在 provider gate 阻塞期间验证本地 completeness worker 与 scan 可继续完成，并在放行后有序排空 108 个自动 job 及 drain 期间新增的 job；另覆盖显式队列背压、取消、panic、shutdown、重启恢复和来源隔离。`application::reidentify::tests::` 39/39、扫描 dispatch 1/1、SQLite 来源/分页合同 1/1、串行 `tests/reidentify.rs` 21/21 通过。该 fixture 验证持久队列和调度合同，不测上游吞吐或真实刮削时延；PostgreSQL live runtime 仍待可用服务。原 10k 失败快照保留，阶段 23 A/B 性能门未通过。
 
 #### 质量门与证据
 

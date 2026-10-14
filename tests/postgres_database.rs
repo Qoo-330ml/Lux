@@ -135,7 +135,23 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 168);
+    assert_eq!(database.schema_version().await?, 169);
+    let dispatch_source_default: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'metadata_reidentify_jobs'
+           AND column_name = 'dispatch_source'
+           AND column_default LIKE '%EXPLICIT%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(dispatch_source_default, 1);
+    let automatic_queue_index: bool = sqlx::query_scalar(
+        "SELECT to_regclass('idx_metadata_reidentify_jobs_automatic_queue') IS NOT NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(automatic_queue_index);
     let relation_checksum_is_nullable: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_schema = current_schema()
@@ -691,10 +707,25 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
             .fetch_one(&migration_pool)
             .await?;
         assert_eq!(deployed_version, 160);
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (
+                 id, status, processed_count, total_count, mode, library_id, job_scope
+             ) VALUES ('legacy-dispatch-source', 'QUEUED', 0, 0,
+                       'FILL_MISSING', NULL, 'ITEMS')",
+        )
+        .execute(&migration_pool)
+        .await?;
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 168);
+        assert_eq!(upgraded_database.schema_version().await?, 169);
+        let legacy_dispatch_source: String = sqlx::query_scalar(
+            "SELECT dispatch_source FROM metadata_reidentify_jobs
+             WHERE id = 'legacy-dispatch-source'",
+        )
+        .fetch_one(upgraded_database.pool())
+        .await?;
+        assert_eq!(legacy_dispatch_source, "EXPLICIT");
         upgraded_database.close().await;
         Ok(())
     }
@@ -808,7 +839,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 168);
+    assert_eq!(database.schema_version().await?, 169);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2113,7 +2144,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 168);
+    assert_eq!(database.schema_version().await?, 169);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)

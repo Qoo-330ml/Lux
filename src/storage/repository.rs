@@ -31,6 +31,14 @@ mod emby_migration;
 #[path = "jobs.rs"]
 mod jobs;
 pub(crate) use jobs::StoredScanLocalMetadataBackfillPage;
+// This internal contract is consumed by the immediately following LUX-534 API task.
+#[allow(dead_code)]
+#[path = "pipeline_activity.rs"]
+mod pipeline_activity;
+pub(crate) use pipeline_activity::{
+    StoredLibraryPipelineActivity, StoredLibraryPipelineActivityPage, StoredPipelineStageActivity,
+    StoredPipelineStageKind, StoredPipelineStatusCounts,
+};
 #[path = "filesystem.rs"]
 mod filesystem;
 #[path = "media_sources.rs"]

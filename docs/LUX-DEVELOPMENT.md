@@ -11113,6 +11113,166 @@ Clippy、Web 测试和构建质量门；Cargo 命令使用 `/Volumes/Toshiba/myw
 均通过。本机架构为 `arm64`，未据此推断 NAS/x86 性能。此前两次全量重跑分别遇到未修改区域的 NFO actor
 credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 all-targets 与 check-all 完整运行均通过。
 
+### 阶段 27：自动刮削排队、吞吐基准与库级进度
+
+本阶段先修正 workflow 3 自动补缺持久化后仍等待容量 32 dispatcher channel 的合同冲突，再测量并调整在线刮削并发，最后为管理员提供只读的库级入库进度。自动来源与管理员/计划任务显式来源必须在持久化状态中区分；自动 worker 不等待内存队列容量，显式入口保留已有背压、完成 receiver、取消与每库串行语义。不得使用无界队列或按 job 无界 spawn。
+
+每个任务一次只处理一个 LUX 编号，先写失败回归，再做最小实现并定向验证。该阶段不改扫描索引、Manifest 删除/完成语义或 `ScanCompleted`/`JOB_COMPLETED`/Webhook/Emby 合同，不批量提交刮削写库，不放宽阶段 23 的 5% 性能门。所有本机性能记录标明 ARM64 和 SQLite/PostgreSQL 配置，不外推 FNOS/NAS/x86。
+
+#### LUX-527：修订自动 FILL_MISSING dispatcher 合同
+
+范围：记录自动本地补缺与管理员/计划任务显式提交的分离合同。持久化 `QUEUED` 自动 job 是自动调度来源；每库 dispatcher 通过有界唤醒与分页领取自动工作。自动本地 worker 不等待队列容量或 provider 完成；显式入口仍保留当前容量背压与完成等待。旧 job 升级后不推断来源。扫描任务状态、索引完成事件和 webhook 时序保持不变。
+
+验收：
+
+- [x] ADR-046、任务规格与阶段 23 阻塞记录明确同一调度策略如何同时满足 LUX-303 和 LUX-424。
+- [x] 决策明确禁止无界内存队列、每 job task fan-out、自动工作并入显式 job，以及改变扫描完成语义。
+- [x] 本决策增量只修改文档；阶段 23 性能门维持开放，后续 LUX-530 实现包含超过 32 个 job 的阻塞 provider 排空回归。
+
+预计文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/046-progressive-scan-and-missing-metadata.md`、`docs/PERFORMANCE.md`、`docs/STAGE-23-GATE-REVIEW-2026-10-09.md`。
+
+验证：核对 LUX-303/LUX-424 原合同、现有失败快照与旧 job 升级边界；运行 `git diff --check`。本任务仅记录决策，不声称运行时修复或阶段门通过。
+
+实施结果（2026-10-14）：ADR-046 明确自动补缺以持久化 QUEUED job 为工作队列，合并唤醒和有界分页领取满足 LUX-303 的本地 worker 不等待要求；容量 32 的显式 dispatcher 背压与完成等待仍满足 LUX-424，自动和显式来源不混合。LUX-528–530 随后完成来源字段、持久队列 drain 与超过 32 个自动 job 的回归；保留原 10k 失败快照，阶段 23 双后端 5% 性能门仍开放。
+
+#### LUX-528：持久化补缺 job 来源字段
+
+范围：追加 SQLite/PostgreSQL migration，为 FILL_MISSING job 保存内部调度来源。新旧/显式 job 默认显式来源，自动来源仅由后续任务设置；升级不得推断已有 job 的历史来源，公开 DTO/API 不增加来源字段。
+
+验收：
+
+- [x] SQLite migration 可从空库运行且能从当前 schema 升级；PostgreSQL migration 与其语义一致，已发布 migration checksum 不变。
+- [x] 既有 job 获得显式来源默认值，来源字段有必要索引且不出现在 API DTO。
+- [x] SQLite 空库与旧数据升级回归通过；PostgreSQL bootstrap/旧 schema regression 验证默认值和 partial index，并在本机服务可用时运行 ignored target（本机无服务，执行情况见结果）。
+
+预计文件：`migrations/0169_metadata_reidentify_dispatch_source.sql`、`migrations-postgres/0169_metadata_reidentify_dispatch_source.sql`、`tests/storage.rs`、`tests/postgres_database.rs`、本文档。
+
+验证：`tests/storage.rs` SQLite migration targets；本机 PostgreSQL 可用时运行 `tests/postgres_database.rs` bootstrap migration target；`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+实施结果（2026-10-14）：追加 SQLite/PostgreSQL 0169 migration，`dispatch_source` 默认 `EXPLICIT` 并限制为 `EXPLICIT/AUTOMATIC`；部分索引只收录未取消的自动 FILL_MISSING QUEUED job。SQLite 旧 schema 记录保留原状态并读到显式默认值，空库能建立字段和索引；已发布 migration 未改。`cargo test --locked --test storage` 53/53 通过，格式检查与 diff 检查通过。PostgreSQL bootstrap 回归已补默认值和索引断言，但本机没有 Docker daemon 或 PostgreSQL server，`--include-ignored` 运行因 `PoolTimedOut` 未能验证数据库执行；该服务端运行限制在阶段 27 最终记录中保留。
+
+#### LUX-529：自动与显式补缺事务分流
+
+范围：本地 completeness 事务创建的 job 设置自动来源，只合并到同库、同来源自动 job；显式创建与管理员重试设置显式来源。保留活跃 item 去重、单 job 100 项边界、状态/计数和事务原子性。
+
+验收：
+
+- [x] 自动完整性事务不会扩展显式 job；显式 job 不会被自动合并逻辑重分类。
+- [x] 显式 create/retry 保持显式来源；自动 job 去重/合并、item 状态、总数与回滚语义正确。
+- [x] 覆盖两个来源的 SQLite 存储合同和 PostgreSQL 事务合同；来源字段不出现在 API DTO。
+
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/fill_missing/requests.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、`tests/admin_health.rs`、`tests/danmaku.rs`、`tests/scanning_jobs.rs`、`tests/scanner.rs`、`tests/ready_version.rs`、本文档。上述 health、danmaku、scan 与 version 测试同步 0169 migration 后的 schema version。
+
+验证：存储 repository library tests、PostgreSQL FILL_MISSING transaction contract、fmt 与 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
+
+实施结果（2026-10-14）：自动补缺只更新/合并自动来源 job；显式 queued/running/deferred item 会阻止自动计划改写请求快照或消耗 provider retry，管理员 retry 将 job 转为显式来源。SQLite 来源隔离和扫描 dispatch 回归通过；PostgreSQL 合同回归已加入但执行因本机 `PoolTimedOut` 未能连接。`cargo build --locked`、all-features Clippy、fmt 与 diff 检查通过。`cargo test --all-targets` 被现有 HLS generation 用例的 `Superseded` unwrap 阻断；跳过该用例后，catalog 集成用例复现 HTTP 502，另一个 catalog 集成用例超过 60 秒未结束。0169 schema 版本相关集成断言已统一更新为 169。
+
+#### LUX-530：自动补缺使用有界唤醒与持久队列 drain
+
+范围：每库 dispatcher 保留单 runner 与显式 job 的有界 channel；自动来源通过合并唤醒通知触发持久队列 drain。dispatcher 只分页拉取并领取自动来源 `QUEUED` job，按创建顺序串行运行；自动提交即使存在 32 个以上待处理 job 也立即返回，不丢唤醒、不重复执行。显式提交仍等待既有 channel 容量并获得 completion receiver。
+
+验收：
+
+- [x] provider 被 gate 阻塞且自动队列超过 32 个 job 时，本地完整性 worker 与 scan 可完成；放行 provider 后自动 job 全部按每库单 runner 排空。
+- [x] 显式提交在 channel 满时仍呈现原背压/completion receiver 语义；自动工作不提前领取显式 job。
+- [x] 覆盖唤醒合并/竞态、自动 job 合并、取消、dispatcher shutdown、worker panic 恢复及重启后的 QUEUED job drain；不产生无界内存或 task fan-out。
+- [x] SQLite 与 PostgreSQL 均有存储领取合同测试；保留 `ScanCompleted`/`JOB_COMPLETED` 与扫描进度时序。
+
+预计文件：`src/application/reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：先运行自动 dispatch/慢 provider regression 和 `tests/reidentify.rs`、扫描 metadata targets；阶段实现完成时运行 Rust 全目标与 all-features Clippy。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+实施结果（2026-10-14）：自动来源改走每库容量为 1 的合并 mpsc 唤醒通道，显式来源继续使用容量 32 的背压队列；dispatcher 每次最多读取 100 条持久 QUEUED 自动 job，按 created_at/id 顺序串行处理，满页或失败后继续 drain/retry。自动 completion waiter 上限为每库 32。回归覆盖 provider gate 下 108 条及并发新增 job 的有序排空、显式队列已满时自动提交立即返回、显式与自动唤醒同时就绪、未 settled job 的 completion 保留、取消、panic、shutdown、重启恢复，以及本地 metadata worker 不阻塞 scan。
+
+定向验证：`application::reidentify::tests::` 39/39，扫描 dispatch 回归 1/1，SQLite 来源/分页合同 1/1，串行 `tests/reidentify.rs` 21/21；`cargo build --locked`、fmt 与 all-features Clippy 通过。最终 `cargo test --locked --all-targets` 的单元部分 850 passed、21 ignored；integration 执行到 `libraries_api` 时有一项在默认并行下返回 `DATABASE_UNAVAILABLE`，该项单独通过且 `libraries_api -- --test-threads=1` 13/13。PostgreSQL 合同测试已编译但未执行：本机 Docker daemon 不可用、没有 PostgreSQL 监听端口或 `pg_isready`。`web_static` 依赖 Web 构建产物，在生成本地 `web/dist` 后通过；生成产物未纳入变更。
+
+#### LUX-531：增加固定延迟的刮削并发基准
+
+范围：为现有 metadata pipeline benchmark 增加可控的 stub provider 延迟和并发矩阵，至少测 4/8/12 个 worker、固定 item 数与固定每次 provider 调用延迟，记录 items/s、p50/p95 单项耗时、job 总耗时与配置。benchmark 使用真实 job worker 和当前 SQLite/PostgreSQL storage 路径；网络请求保持 stub，不访问 TMDb。
+
+验收：
+
+- [x] 同一 fixture/延迟/数据库参数可重复运行，测量结果包含有效性检查、版本/架构与逐项原始数据；SQLite 连跑 3 次并记录完整结果范围，PostgreSQL 参数路径已实现。
+- [x] 并发 sweep 每档独立设置，记录峰值与 queue wait；SQLite 各档峰值精确达到 4/8/12 且不超限；成功吞吐过滤失败/取消项。
+- [x] `scripts/run-metadata-performance.sh` 支持 `concurrency`/`legacy` 选择；性能记录明确区分固定延迟 stub 与真实上游时延。
+- [x] 本任务仅增加测量和 feature-gated benchmark seam；生产默认并发仍为 4，没有宣称真实 TMDb 速率。
+
+预计文件：`tests/performance.rs`、`scripts/run-metadata-performance.sh`、`docs/PERFORMANCE.md`、本文档。为使 8/12 路档位走真实 FILL_MISSING worker 而不提前开放运行时配置，允许增加仅由 benchmark Cargo feature 暴露的并发注入 seam（`Cargo.toml`、`src/application/reidentify.rs`）；该 seam 不进入默认构建。
+
+验证：Toshiba 挂载检查后以共享 target 运行指定 ignored performance target；另运行 fmt 和 diff 检查。禁止将本机 ARM64 结果外推至 NAS/x86。
+
+实施结果（2026-10-14）：新增 `performance-benchmarks` feature 仅供 ignored benchmark 注入 4/8/12 worker 和收集真实 `item_total` 样本，默认构建不包含 seam。新基准每档使用 96 项、每次 stub provider 调用固定 100ms、SQLite 真实 storage 与真实 FILL_MISSING job worker；脚本保留 `legacy` LUX-200 入口，并允许通过 `LUX_PERF_BACKEND=postgres` 选择 PostgreSQL。SQLite 连续 3 轮各档均 96/96 成功，0 失败/取消，192 次 provider 调用；4/8/12 路 items/s 中位数为 16.45/29.57/35.75，成功项 p95 中位数为 255.6/323.5/378.1ms，完整范围见 `docs/PERFORMANCE.md`。默认值未改。测试 target、legacy target、默认 build、fmt、all-features Clippy 与 diff 检查通过。PostgreSQL benchmark 本机未运行：未发现 `postgres`、`psql`、`pg_isready` 或可用服务；其连接配置路径已实现但后端耗时仍待实测。本机为 ARM64，结果不外推 NAS/x86。
+
+#### LUX-532：可配置且有界的 FILL_MISSING 并发
+
+范围：依据 LUX-531 的固定延迟矩阵为在线 FILL_MISSING 增加 `LUX_METADATA_CONCURRENCY` 启动期配置与绝对上限；默认值和上限写入性能/部署说明。保留全局 semaphore、每库串行 dispatcher、resource metrics 降档、取消响应和 DB 后端资源差异。无效/超范围值采用安全 clamp 并发出不含 secret 的配置告警。决策：LUX-531 只完成 SQLite 矩阵，PostgreSQL 尚无可用服务；因此默认仍为 4，不基于单一后端把默认提高到 8/12，绝对上限为 12，等待双后端实测后再决定是否提高默认。
+
+验收：
+
+- [x] env 未设置、有效边界、0、负数/非整数、超过上限均有解析回归；configured limit 在进程内由 OnceLock 初始化一次，并保存在 service 实例，避免 semaphore 与 worker limit 不一致。
+- [x] 默认 4、绝对上限 12；PostgreSQL 未实测时保持默认。resource metrics 继续接收 configured limit，现有压力测试覆盖降档规则，worker loop 每轮重新读取并可恢复。
+- [x] 两个并行 library job 共用 global semaphore；集成测试在 unset 默认 4 与 env=1 下通过；其它 metadata 模式仍遵循原后端建议值和进程级限制。
+- [x] 更新性能/兼容文档并注明 PostgreSQL 基准待测；没有宣称未经上游验证的 TMDb 请求速率。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`、本文档。
+
+验证：Rust parser/worker 测试、`tests/reidentify.rs` 与相关 metadata 集成 target、build/fmt/all-features Clippy；Toshiba 挂载检查与共享 target 必须满足。
+
+实施结果（2026-10-14）：`LUX_METADATA_CONCURRENCY` 采用缺省 4、支持 1–12、超过范围 clamp 到边界，非整数回退缺省；对非法/越界值发 warning，但不记录原始 env 内容。configured limit 在进程内 OnceLock 一次读取，并保存在每个 MetadataReidentifyService 实例；同一个 OnceLock 同时创建全局 FILL_MISSING semaphore，配置不会动态重读。资源 pressure 路径、每库 dispatcher 和取消不变。定向 reidentify 单测 42/42，通过；`LUX_METADATA_CONCURRENCY=1` 与 env unset 两种环境下，跨两个库的进程级 FILL_MISSING worker 集成各通过 1/1。默认 SQLite build、fmt、all-features Clippy 与 diff 检查通过。默认值依据 SQLite 4 路基线保持 4；PostgreSQL 没有可用服务，未测也未提高默认值。部署配置见 `docs/COMPATIBILITY.md`，性能依据见 `docs/PERFORMANCE.md`。
+
+#### LUX-533：存储层聚合库级入库阶段
+
+范围：只读聚合启用媒体库的扫描索引、Manifest/local metadata、probe、thumbnail、自动 FILL_MISSING 持久化状态，返回按库分页的内部快照和最近活动时间。只读现有表，不新建通用 pipeline 表，不改 worker 执行路径、单项状态或扫描完成语义。SQL 先限制到最多 50 个启用库，再在数据库内分组计数；不把 item 行载入应用层，不读取路径、媒体标题、来源凭据或上游错误文本。阶段运行状态只能依据已持久化的 job/target 状态与 scan job 当前阶段推导，缺少对应记录时返回无计划/空闲，不合成进度。各 stage 计数只在本 stage 内解释，底层分别按 scan job、local metadata batch/backfill/legacy target、probe target/STRM probe job、thumbnail target、自动 metadata job 计数，不跨 stage 求和，也不据此估算 ETA。扫描驱动的 NFO/probe/thumbnail 若没有逐项 RUNNING 状态，用 scan job 当前阶段计一个运行中的驱动任务；未完成的 target 仍留在 queued。
+
+验收：
+
+- [x] storage 返回每库各阶段的 queued/running/completed/failed/cancelled 计数、是否有计划和最近活动时间；索引阶段与后台阶段独立，在线 FILL_MISSING 不计入扫描索引。
+- [x] 页大小拒绝或限制到 50；聚合只访问所选启用库，有界 SQL 完成计数，不读取 item 全表到应用层，也不触发 provider/filesystem。
+- [x] SQLite fixture 覆盖无任务、Manifest 后处理、local metadata batches/backfill、自动刮削、混合阶段、失败/取消与库移除；PostgreSQL 合同测试使用代表性五阶段 fixture 执行共享聚合 SQL。
+- [x] 类型只包含库标识/显示名、阶段状态计数和时间；不含媒体标题、路径、凭据、错误文本或 scan activity 的 current item。
+
+预计文件（5 个）：`src/storage/repository.rs`、新建 `src/storage/pipeline_activity.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：storage repository 定向回归与 PostgreSQL 合同；`cargo build --locked`、fmt、all-features Clippy 和 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
+
+实施结果（2026-10-14）：存储层以单条分页聚合查询返回五个阶段的状态计数和最近活动时间，只把启用库当前页（最多 50 个）的聚合结果带回应用；状态计数保留阶段本身的持久化单位，不合并成整体百分比。SQLite 定向回归 2/2 通过，覆盖分页、禁用/移除库、扫描后处理、metadata batch/backfill、probe/STRM、thumbnail、自动/显式 FILL_MISSING 与失败/取消；测试确认不回传媒体标题。build、all-target/all-features Clippy、fmt 与 diff 检查通过。增加了运行 PostgreSQL 共享查询的忽略测试并编译通过；尝试启动一次性 PostgreSQL 16 容器，但当前网络访问 Docker Hub 失败（registry 请求返回 EOF），因此该数据库运行证据仍待有 PostgreSQL 服务的环境补齐。
+
+#### LUX-534：提供只读库级入库阶段 API
+
+范围：增加管理员读取接口 `GET /api/v1/admin/library-pipeline-activity?page=1&pageSize=20`，将 LUX-533 storage 快照序列化为 `libraries` 与分页元数据。每页最多 50 个启用库；`pageSize` 缺省 20，页码从 1 开始。每库返回 `libraryId`、`libraryName`、各 stage 的 `planned`、五类状态计数及 `recentActivityAt`。只增加 Lux 管理 API，不改已有 task activity、Emby、ScanCompleted、Webhook DTO 或任务执行路径。
+
+验收：
+
+- [x] admin 鉴权、分页边界、空页和错误映射符合现有 API 约定，响应只包含 storage 阶段契约允许的字段。
+- [x] 集成测试覆盖两个库并行、各阶段混合状态、取消/失败、禁用或移除库、无任务和超过 50 库分页；不会序列化媒体标题、路径、凭据或错误内容。
+- [x] compatibility 文档记录 endpoint、分页和字段语义；复用 LUX-533 的共享 PostgreSQL storage query contract，不做第二次全表读取。
+
+预计文件（5 个）：`src/application/admin_task_activity.rs`、`src/api/admin/admin_scheduled_tasks.rs`、`tests/libraries_api.rs`、`docs/COMPATIBILITY.md`、本文档。
+
+验证：`tests/libraries_api.rs` 定向目标、build/fmt/all-features Clippy 与 diff 检查；Toshiba 挂载检查并使用共享 target。
+
+实施结果（2026-10-14）：新增只读管理员 endpoint，默认页大小 20、最大 50、页码从 1 开始；沿用管理员鉴权，分页非法返回 400，数据库/服务不可用返回 503。应用层把 storage snapshot 映射到固定五阶段 API shape，不增加第二次读取。`tests/libraries_api.rs` 14/14 通过，包含未授权、51 库分页、空页、无计划阶段、混合 queued/running/completed/failed/cancelled、禁用/移除库排除和敏感字段不回传；build、all-features Clippy、fmt 与 diff 检查通过。API 字段和 Unix epoch 秒时间语义已记入 `docs/COMPATIBILITY.md`。PostgreSQL live contract 仍受 LUX-533 中记录的 Docker Hub 网络限制影响。
+
+#### LUX-535：管理员活动视图展示库级入库阶段
+
+范围：在现有管理员活动弹层中以媒体库为组展示 LUX-534 API 结果，清楚区分索引和后台 NFO、probe、thumbnail、刮削进度；支持无计划阶段、长任务与失败项。复用现有活动入口，不改变桌面/移动 shell 的触发方式。
+
+验收：
+
+- [x] 多库并行时各库独立显示阶段与计数；扫描索引完成后仍显示未结束的后台阶段。
+- [x] 无任务、纯后台处理、部分失败、完成、分页/刷新与 API 错误均有 Web 回归。
+- [x] 视图不把阶段总计伪装成精确 ETA；ARIA 状态与进度值准确，长库名和窄视口不造成横向溢出。
+
+预计文件（5 个）：`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、本文档。
+
+验证：定向 Web 测试、完整 Web 测试与 production build。阶段 27 全部任务完成后，运行该阶段门、更新性能/兼容记录并停在项目所有者确认点；阶段 23 原有 5% A/B 性能门仍按其规格单独开放。
+
+实施结果（2026-10-14）：管理员活动弹层按库显示五个阶段的计划状态、队列/运行/完成/失败/取消计数和最近活动时间；索引结束后仍保留后续后台阶段。弹层打开时每 5 秒刷新，支持手动刷新、每页 5 个媒体库、阶段展开、无计划/无任务状态和不暴露原始错误的重试。没有合成百分比或 ETA。`tests/scan-activity.test.tsx` 覆盖并行媒体库、纯后台处理、无计划、部分失败、全阶段完成、分页/刷新和 API 错误。浏览器用 mock API 在 375×812 验证长库名和阶段展开；视口和文档宽度均为 375px，弹层内容纵向滚动。
+
+验证结果：目标测试 10/10、production build、定向浏览器检查和 `git diff --check` 通过。完整 `pnpm test` 的 Node 检查 137/137 通过；默认并行 Vitest 全量运行中，`tests/home-page.test.tsx` 的 5 个轮播用例失败，其余 583/588 通过。单 worker Vitest 全量运行中，另有 `tests/library-page.test.ts` 的 1 个排序恢复断言失败，其余 587/588 通过；这两个失败文件分别单独运行均为 17/17 通过，显示全量运行结果不稳定。阶段 23 的 A/B 性能门仍开放；LUX-533 PostgreSQL live query 受 Docker Hub EOF 阻塞，尚未取得 PostgreSQL runtime 证据。
+
+阶段 27 阶段门（2026-10-14）：在 Toshiba 挂载、`arm64` 环境下，通过 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `scripts/check-all.sh`。Cargo build、fmt、all-target/all-feature Clippy、shell 语法、两组 Python 工具测试均通过；`cargo test --locked --all-targets` 在 lib target 停止，854 通过、1 失败、22 ignored。失败 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation` 在隔离重跑时仍因 `Superseded` 失败，位于本阶段未修改的 HLS 播放代码。Web frozen-lockfile install 和 production build 通过；完整 Web 测试波动详见 LUX-535 结果。PostgreSQL live query 未验证，阶段 23 的 5% A/B 门仍开放。本阶段按门停在项目所有者确认点，不将失败检查记为通过。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

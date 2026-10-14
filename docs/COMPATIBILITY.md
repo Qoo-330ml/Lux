@@ -14,6 +14,22 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-532 在线 FILL_MISSING 并发配置
+
+服务启动时读取 `LUX_METADATA_CONCURRENCY`，仅控制在线 `FILL_MISSING`。默认值为 4，硬上限为 12；可用范围是 1–12。未设置或空字符串使用默认值，0 和负数夹到 1，超过 12 夹到 12，非整数回退到默认值。无效或越界配置会记录有效 worker 数和硬上限，不记录原始环境变量值。该值在进程内只解析一次，并同时决定全局 semaphore 容量与 worker 请求上限；重启服务后才会采用新值。
+
+所有媒体库和 FILL_MISSING job 共用此进程级上限；同库 dispatcher 仍按原规则串行。ResourceMetrics 可在 configured limit 内动态降档，并在压力缓解后重新升档。其它 metadata 模式仍沿用 SQLite/PostgreSQL 各自的既有 worker 建议值与 16 路进程级 semaphore。
+
+LUX-531 目前只完成 SQLite 固定延迟矩阵，PostgreSQL 路径尚未实测，因此默认保留 4；12 是支持的硬上限，不代表已批准把默认调高，也不代表 TMDb 允许的请求速率。后续调整默认值前需完成 PostgreSQL 对照测量。
+
+## LUX-534 管理员库级入库阶段 API
+
+Lux 管理 API 新增 `GET /api/v1/admin/library-pipeline-activity`，沿用现有管理员鉴权。查询参数 `page` 默认 `1`，`pageSize` 默认 `20`；页码从 1 开始，页大小仅接受 1–50。无效页码、页大小或 offset 溢出返回 `400`；合法的空页返回 `200`、空 `libraries` 和真实 `totalLibraries`。数据库不可用时返回 `503`。
+
+成功响应顶层包含 `page`、`pageSize`、`totalLibraries` 和 `libraries`。每个库包含 `libraryId`、`libraryName` 与按固定顺序排列的五个 `stages`：`INDEX`、`LOCAL_METADATA`、`PROBE`、`THUMBNAIL`、`AUTOMATIC_METADATA`。每个阶段包含 `planned`、`statusCounts`（`queued`、`running`、`completed`、`failed`、`cancelled`）和 `recentActivityAt`。时间为 Unix epoch 秒；无持久化活动时返回 `null`。阶段计数使用各自底层作业/批次/target 的持久化单位，不能跨阶段求和或换算为整体百分比/ETA。
+
+聚合只返回当前页启用媒体库的阶段摘要；响应不包含媒体标题、文件路径、凭据、上游错误文本或 scan activity 的 `currentItem`。本接口独立于已有 `/api/v1/admin/task-activity`，不改变 Emby、ScanCompleted 或 Webhook DTO。
+
 ## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
 
 Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有

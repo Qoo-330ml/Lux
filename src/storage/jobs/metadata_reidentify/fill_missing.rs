@@ -4,6 +4,9 @@ use crate::storage::MetadataFillMissingRequest;
 #[path = "fill_missing/requests.rs"]
 mod request_flow;
 
+const FILL_MISSING_DISPATCH_SOURCE_EXPLICIT: &str = "EXPLICIT";
+const FILL_MISSING_DISPATCH_SOURCE_AUTOMATIC: &str = "AUTOMATIC";
+
 struct ActiveFillMissingItem {
     job_id: String,
     job_status: String,
@@ -25,6 +28,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
+        dispatch_source: &str,
         requests: &[MetadataFillMissingRequest],
     ) -> Result<Vec<String>, StorageError> {
         if requests.is_empty() {
@@ -42,6 +46,7 @@ impl Database {
             "SELECT id, total_count
              FROM metadata_reidentify_jobs
              WHERE library_id = ? AND mode = 'FILL_MISSING'
+               AND dispatch_source = ?
                AND status = 'QUEUED' AND cancel_requested = 0 AND total_count < 100
              ORDER BY created_at, id
              LIMIT ?{lock_clause}"
@@ -49,6 +54,7 @@ impl Database {
         let queued_jobs = self
             .query_as::<(String, i64)>(sqlx::AssertSqlSafe(query))
             .bind(library_id)
+            .bind(dispatch_source)
             .bind(i64::try_from(remaining.len()).unwrap_or(i64::MAX))
             .fetch_all(&mut **transaction)
             .await
@@ -89,12 +95,13 @@ impl Database {
             let job_id = Uuid::now_v7().to_string();
             self.query(
                 "INSERT INTO metadata_reidentify_jobs (
-                     id, status, total_count, mode, library_id, job_scope
-                 ) VALUES (?, 'QUEUED', ?, 'FILL_MISSING', ?, 'ITEMS')",
+                     id, status, total_count, mode, library_id, job_scope, dispatch_source
+                 ) VALUES (?, 'QUEUED', ?, 'FILL_MISSING', ?, 'ITEMS', ?)",
             )
             .bind(&job_id)
             .bind(i64::try_from(chunk.len()).unwrap_or(i64::MAX))
             .bind(library_id)
+            .bind(dispatch_source)
             .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -196,13 +203,16 @@ impl Database {
                     automatic_retry_count: 0,
                 })
                 .collect::<Vec<_>>();
-            self.enqueue_fill_missing_jobs_in_transaction(&mut transaction, library_id, &requests)
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    StorageError::Conflict("fill-missing job was not created".to_owned())
-                })?
+            self.enqueue_fill_missing_jobs_in_transaction(
+                &mut transaction,
+                library_id,
+                FILL_MISSING_DISPATCH_SOURCE_EXPLICIT,
+                &requests,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| StorageError::Conflict("fill-missing job was not created".to_owned()))?
         };
         transaction
             .commit()

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
+    env, fmt,
     future::Future,
     sync::{
         Arc, Mutex, OnceLock,
@@ -38,17 +38,104 @@ use crate::{
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
-const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 4;
+const METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT: usize = 4;
+const METADATA_FILL_MISSING_MAX_WORKER_LIMIT: usize = 12;
+const METADATA_FILL_MISSING_CONCURRENCY_ENV: &str = "LUX_METADATA_CONCURRENCY";
 const METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY: usize = 32;
+const METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT: usize = 32;
 const METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+const METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE: i64 = 100;
+const METADATA_FILL_MISSING_AUTO_DISPATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 
+#[cfg(feature = "performance-benchmarks")]
+#[doc(hidden)]
+pub type MetadataBenchmarkItemTimings = Arc<Mutex<Vec<(String, u128)>>>;
+
 static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static METADATA_FILL_MISSING_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static METADATA_FILL_MISSING_CONFIGURED_WORKER_LIMIT: OnceLock<usize> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataConcurrencySettingSource {
+    Unset,
+    Explicit,
+    Clamped,
+    Invalid,
+}
+
+fn parse_metadata_fill_missing_concurrency(
+    configured: Option<&str>,
+) -> (usize, MetadataConcurrencySettingSource) {
+    let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (
+            METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT,
+            MetadataConcurrencySettingSource::Unset,
+        );
+    };
+    match value.parse::<i128>() {
+        Ok(parsed) => {
+            let limit = parsed.clamp(1, METADATA_FILL_MISSING_MAX_WORKER_LIMIT as i128);
+            let source = if parsed == limit {
+                MetadataConcurrencySettingSource::Explicit
+            } else {
+                MetadataConcurrencySettingSource::Clamped
+            };
+            (limit as usize, source)
+        }
+        Err(_)
+            if value.strip_prefix('-').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            (1, MetadataConcurrencySettingSource::Clamped)
+        }
+        Err(_)
+            if {
+                let digits = value.strip_prefix('+').unwrap_or(value);
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            } =>
+        {
+            (
+                METADATA_FILL_MISSING_MAX_WORKER_LIMIT,
+                MetadataConcurrencySettingSource::Clamped,
+            )
+        }
+        Err(_) => (
+            METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT,
+            MetadataConcurrencySettingSource::Invalid,
+        ),
+    }
+}
+
+fn metadata_fill_missing_configured_worker_limit() -> usize {
+    *METADATA_FILL_MISSING_CONFIGURED_WORKER_LIMIT.get_or_init(|| {
+        let configured = env::var(METADATA_FILL_MISSING_CONCURRENCY_ENV).ok();
+        metadata_fill_missing_worker_limit_from_setting(configured.as_deref())
+    })
+}
+
+fn metadata_fill_missing_worker_limit_from_setting(configured: Option<&str>) -> usize {
+    let (limit, source) = parse_metadata_fill_missing_concurrency(configured);
+    match source {
+        MetadataConcurrencySettingSource::Clamped => tracing::warn!(
+            worker_limit = limit,
+            hard_limit = METADATA_FILL_MISSING_MAX_WORKER_LIMIT,
+            "LUX_METADATA_CONCURRENCY was outside the supported range and has been clamped"
+        ),
+        MetadataConcurrencySettingSource::Invalid => tracing::warn!(
+            worker_limit = limit,
+            hard_limit = METADATA_FILL_MISSING_MAX_WORKER_LIMIT,
+            "LUX_METADATA_CONCURRENCY was invalid and the default worker limit will be used"
+        ),
+        MetadataConcurrencySettingSource::Unset | MetadataConcurrencySettingSource::Explicit => {}
+    }
+    limit
+}
 
 fn metadata_global_permits() -> Arc<Semaphore> {
     METADATA_GLOBAL_PERMITS
@@ -58,7 +145,11 @@ fn metadata_global_permits() -> Arc<Semaphore> {
 
 fn metadata_fill_missing_global_permits() -> Arc<Semaphore> {
     METADATA_FILL_MISSING_GLOBAL_PERMITS
-        .get_or_init(|| Arc::new(Semaphore::new(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT)))
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                metadata_fill_missing_configured_worker_limit(),
+            ))
+        })
         .clone()
 }
 
@@ -97,6 +188,9 @@ pub struct MetadataReidentifyService {
     progress_events: MetadataProgressEventGate,
     worker_permits: Arc<Semaphore>,
     fill_missing_worker_permits: Arc<Semaphore>,
+    fill_missing_worker_limit: usize,
+    #[cfg(feature = "performance-benchmarks")]
+    benchmark_item_timings: Option<MetadataBenchmarkItemTimings>,
     fill_missing_dispatchers: Option<MetadataFillMissingDispatchers>,
     running_jobs: MetadataJobOwners,
     library_job_creation: Arc<AsyncMutex<()>>,
@@ -118,6 +212,7 @@ struct MetadataFillMissingDispatcherState {
 struct MetadataFillMissingDispatcher {
     sender: mpsc::Sender<String>,
     pending_jobs: Arc<Mutex<MetadataFillMissingPendingJobs>>,
+    automatic_wakeup: mpsc::Sender<()>,
     worker: JoinHandle<()>,
 }
 
@@ -171,40 +266,142 @@ impl Default for MetadataFillMissingDispatchers {
     }
 }
 
-async fn run_fill_missing_dispatcher_loop<F, Fut, R, RFut>(
+async fn run_fill_missing_dispatcher_loop<F, Fut, R, RFut, Q, QFut>(
     mut receiver: mpsc::Receiver<String>,
     pending_jobs: Arc<Mutex<MetadataFillMissingPendingJobs>>,
+    mut automatic_wakeup_receiver: mpsc::Receiver<()>,
+    automatic_wakeup_sender: mpsc::Sender<()>,
     mut run_job: F,
     mut recover_failed_job: R,
+    mut list_automatic_jobs: Q,
 ) where
     F: FnMut(String) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    Fut: Future<Output = bool> + Send + 'static,
     R: FnMut(String) -> RFut + Send + 'static,
     RFut: Future<Output = ()> + Send + 'static,
+    Q: FnMut() -> QFut + Send + 'static,
+    QFut: Future<Output = Result<Vec<String>, String>> + Send + 'static,
 {
     let mut wait_for_coalescing_window = true;
-    while let Some(job_id) = receiver.recv().await {
-        if wait_for_coalescing_window {
-            tokio::time::sleep(METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW).await;
+    loop {
+        tokio::select! {
+            maybe_job_id = receiver.recv() => {
+                let Some(job_id) = maybe_job_id else {
+                    break;
+                };
+                if wait_for_coalescing_window {
+                    tokio::time::sleep(METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW).await;
+                }
+                run_fill_missing_dispatcher_job(
+                    job_id.clone(),
+                    &mut run_job,
+                    &mut recover_failed_job,
+                )
+                .await;
+                let completion_sender = take_fill_missing_completion(&pending_jobs, &job_id);
+                wait_for_coalescing_window = receiver.is_empty();
+                if let Some(completion_sender) = completion_sender {
+                    let _ = completion_sender.send(());
+                }
+            }
+            automatic_wakeup = automatic_wakeup_receiver.recv() => {
+                if automatic_wakeup.is_none() {
+                    break;
+                }
+                if wait_for_coalescing_window {
+                    tokio::time::sleep(METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW).await;
+                }
+                match list_automatic_jobs().await {
+                    Ok(job_ids) if job_ids.is_empty() => {
+                        wait_for_coalescing_window = true;
+                    }
+                    Ok(job_ids) => {
+                        let page_is_full = job_ids.len() >= METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE as usize;
+                        let mut retry = false;
+                        for job_id in job_ids {
+                            let settled = run_fill_missing_dispatcher_job(
+                                job_id.clone(),
+                                &mut run_job,
+                                &mut recover_failed_job,
+                            )
+                            .await;
+                            if settled {
+                                let completion_sender =
+                                    take_fill_missing_completion(&pending_jobs, &job_id);
+                                if let Some(completion_sender) = completion_sender {
+                                    let _ = completion_sender.send(());
+                                }
+                            }
+                            if !settled {
+                                retry = true;
+                                break;
+                            }
+                        }
+                        if retry {
+                            tokio::time::sleep(METADATA_FILL_MISSING_AUTO_DISPATCH_RETRY_DELAY).await;
+                            let _ = automatic_wakeup_sender.try_send(());
+                            wait_for_coalescing_window = false;
+                        } else if page_is_full {
+                            let _ = automatic_wakeup_sender.try_send(());
+                            wait_for_coalescing_window = false;
+                        } else {
+                            wait_for_coalescing_window = true;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "automatic FILL_MISSING queue could not be drained");
+                        tokio::time::sleep(METADATA_FILL_MISSING_AUTO_DISPATCH_RETRY_DELAY).await;
+                        let _ = automatic_wakeup_sender.try_send(());
+                        wait_for_coalescing_window = false;
+                    }
+                }
+            }
         }
-        if let Err(error) = tokio::spawn(run_job(job_id.clone())).await {
+    }
+}
+
+fn signal_automatic_fill_missing_queue(
+    sender: &mpsc::Sender<()>,
+) -> Result<(), MetadataDispatchError> {
+    match sender.try_send(()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(())) => Err(MetadataDispatchError::QueueClosed),
+    }
+}
+
+fn take_fill_missing_completion(
+    pending_jobs: &Mutex<MetadataFillMissingPendingJobs>,
+    job_id: &str,
+) -> Option<oneshot::Sender<()>> {
+    let Ok(mut pending_jobs) = pending_jobs.lock() else {
+        return None;
+    };
+    pending_jobs.job_ids.remove(job_id);
+    pending_jobs.completion_senders.remove(job_id)
+}
+
+async fn run_fill_missing_dispatcher_job<F, Fut, R, RFut>(
+    job_id: String,
+    run_job: &mut F,
+    recover_failed_job: &mut R,
+) -> bool
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = bool> + Send + 'static,
+    R: FnMut(String) -> RFut,
+    RFut: Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(run_job(job_id.clone())).await {
+        Ok(settled) => settled,
+        Err(error) => {
             tracing::error!(
                 job_id,
                 worker_panicked = error.is_panic(),
                 worker_cancelled = error.is_cancelled(),
                 "FILL_MISSING dispatcher job runner stopped unexpectedly"
             );
-            recover_failed_job(job_id.clone()).await;
-        }
-        let completion_sender = if let Ok(mut pending_jobs) = pending_jobs.lock() {
-            pending_jobs.job_ids.remove(&job_id);
-            pending_jobs.completion_senders.remove(&job_id)
-        } else {
-            None
-        };
-        wait_for_coalescing_window = receiver.is_empty();
-        if let Some(completion_sender) = completion_sender {
-            let _ = completion_sender.send(());
+            recover_failed_job(job_id).await;
+            true
         }
     }
 }
@@ -241,55 +438,158 @@ fn dispatch_panic_outcome(cancel_requested: bool) -> (&'static str, Option<&'sta
 }
 
 impl MetadataFillMissingDispatchers {
+    async fn dispatcher_for_library(
+        &self,
+        service: MetadataReidentifyService,
+        library_id: &str,
+    ) -> Result<
+        (
+            mpsc::Sender<String>,
+            Arc<Mutex<MetadataFillMissingPendingJobs>>,
+            mpsc::Sender<()>,
+        ),
+        MetadataDispatchError,
+    > {
+        let mut state = self.state.lock().await;
+        if state.shutting_down {
+            return Err(MetadataDispatchError::ShuttingDown);
+        }
+        if let Some(dispatcher) = state.by_library.get(library_id) {
+            return Ok((
+                dispatcher.sender.clone(),
+                Arc::clone(&dispatcher.pending_jobs),
+                dispatcher.automatic_wakeup.clone(),
+            ));
+        }
+
+        let (sender, receiver) =
+            mpsc::channel::<String>(METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY);
+        let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+        let (automatic_wakeup, automatic_wakeup_receiver) = mpsc::channel(1);
+        let worker_pending_jobs = Arc::clone(&pending_jobs);
+        let worker_automatic_wakeup = automatic_wakeup.clone();
+        let worker_service = service.without_fill_missing_dispatchers();
+        let worker_run_service = worker_service.clone();
+        let worker_recovery_service = worker_service.clone();
+        let worker_queue_service = worker_service.clone();
+        let worker_library_id = library_id.to_owned();
+        let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
+            receiver,
+            worker_pending_jobs,
+            automatic_wakeup_receiver,
+            worker_automatic_wakeup,
+            move |job_id| {
+                let service = worker_run_service.clone();
+                async move {
+                    service.run(&job_id).await;
+                    match service.database.find_metadata_reidentify_job(&job_id).await {
+                        Ok(Some(job)) => job.status != "QUEUED",
+                        Ok(None) => true,
+                        Err(error) => {
+                            tracing::error!(job_id, %error, "metadata job status could not be checked after dispatch");
+                            false
+                        }
+                    }
+                }
+            },
+            move |job_id| {
+                let service = worker_recovery_service.clone();
+                async move { service.fail_panicked_dispatch_job(&job_id).await }
+            },
+            move || {
+                let service = worker_queue_service.clone();
+                let library_id = worker_library_id.clone();
+                async move {
+                    service
+                        .database
+                        .list_queued_automatic_fill_missing_job_ids(
+                            &library_id,
+                            None,
+                            None,
+                            METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE,
+                        )
+                        .await
+                        .map(|jobs| jobs.into_iter().map(|(job_id, _)| job_id).collect())
+                        .map_err(|error| error.to_string())
+                }
+            },
+        ));
+        state.by_library.insert(
+            library_id.to_owned(),
+            MetadataFillMissingDispatcher {
+                sender: sender.clone(),
+                pending_jobs: Arc::clone(&pending_jobs),
+                automatic_wakeup: automatic_wakeup.clone(),
+                worker,
+            },
+        );
+        Ok((sender, pending_jobs, automatic_wakeup))
+    }
+
+    async fn wake_automatic(
+        &self,
+        service: MetadataReidentifyService,
+        library_id: &str,
+    ) -> Result<(), MetadataDispatchError> {
+        let (sender, _, automatic_wakeup) =
+            self.dispatcher_for_library(service, library_id).await?;
+        let state = self.state.lock().await;
+        if state.shutting_down
+            || !state
+                .by_library
+                .get(library_id)
+                .is_some_and(|dispatcher| dispatcher.sender.same_channel(&sender))
+        {
+            return Err(MetadataDispatchError::ShuttingDown);
+        }
+        signal_automatic_fill_missing_queue(&automatic_wakeup)?;
+        Ok(())
+    }
+
     async fn enqueue(
         &self,
         service: MetadataReidentifyService,
         library_id: &str,
         job_id: &str,
+        automatic: bool,
     ) -> Result<Option<oneshot::Receiver<()>>, MetadataDispatchError> {
-        let (sender, pending_jobs, mut shutdown_watch) = {
-            let mut state = self.state.lock().await;
-            if state.shutting_down {
+        let (sender, pending_jobs, automatic_wakeup) =
+            self.dispatcher_for_library(service, library_id).await?;
+        if automatic {
+            let state = self.state.lock().await;
+            if state.shutting_down
+                || !state
+                    .by_library
+                    .get(library_id)
+                    .is_some_and(|dispatcher| dispatcher.sender.same_channel(&sender))
+            {
                 return Err(MetadataDispatchError::ShuttingDown);
             }
-            if let Some(dispatcher) = state.by_library.get(library_id) {
-                (
-                    dispatcher.sender.clone(),
-                    Arc::clone(&dispatcher.pending_jobs),
-                    self.shutdown_watch.subscribe(),
-                )
-            } else {
-                let (sender, receiver) =
-                    mpsc::channel::<String>(METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY);
-                let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
-                let worker_pending_jobs = Arc::clone(&pending_jobs);
-                let worker_service = service.without_fill_missing_dispatchers();
-                let worker_run_service = worker_service.clone();
-                let worker_recovery_service = worker_service.clone();
-                let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
-                    receiver,
-                    worker_pending_jobs,
-                    move |job_id| {
-                        let service = worker_run_service.clone();
-                        async move { service.run(&job_id).await }
-                    },
-                    move |job_id| {
-                        let service = worker_recovery_service.clone();
-                        async move { service.fail_panicked_dispatch_job(&job_id).await }
-                    },
-                ));
-                state.by_library.insert(
-                    library_id.to_owned(),
-                    MetadataFillMissingDispatcher {
-                        sender: sender.clone(),
-                        pending_jobs: Arc::clone(&pending_jobs),
-                        worker,
-                    },
-                );
-                (sender, pending_jobs, self.shutdown_watch.subscribe())
+            let completion_receiver = {
+                let mut pending = pending_jobs
+                    .lock()
+                    .map_err(|_| MetadataDispatchError::StateUnavailable)?;
+                if pending.job_ids.len() >= METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT
+                    || !pending.job_ids.insert(job_id.to_owned())
+                {
+                    None
+                } else {
+                    let (completion_sender, completion_receiver) = oneshot::channel();
+                    pending
+                        .completion_senders
+                        .insert(job_id.to_owned(), completion_sender);
+                    Some(completion_receiver)
+                }
+            };
+            if let Err(error) = signal_automatic_fill_missing_queue(&automatic_wakeup) {
+                let _ = take_fill_missing_completion(&pending_jobs, job_id);
+                return Err(error);
             }
-        };
+            drop(state);
+            return Ok(completion_receiver);
+        }
 
+        let mut shutdown_watch = self.shutdown_watch.subscribe();
         let permit = reserve_fill_missing_queue_capacity(&sender, &mut shutdown_watch).await?;
         let state = self.state.lock().await;
         if state.shutting_down
@@ -527,6 +827,9 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            fill_missing_worker_limit: metadata_fill_missing_configured_worker_limit(),
+            #[cfg(feature = "performance-benchmarks")]
+            benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
@@ -561,6 +864,9 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            fill_missing_worker_limit: metadata_fill_missing_configured_worker_limit(),
+            #[cfg(feature = "performance-benchmarks")]
+            benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
@@ -589,6 +895,9 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            fill_missing_worker_limit: metadata_fill_missing_configured_worker_limit(),
+            #[cfg(feature = "performance-benchmarks")]
+            benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
@@ -616,6 +925,38 @@ impl MetadataReidentifyService {
             .map(|resolver| resolver.with_resource_metrics(resources.clone()));
         self.resources = resources;
         self
+    }
+
+    #[cfg(feature = "performance-benchmarks")]
+    #[doc(hidden)]
+    pub fn with_fill_missing_concurrency_for_benchmark(
+        mut self,
+        concurrency: usize,
+    ) -> Result<Self, &'static str> {
+        if !matches!(concurrency, 4 | 8 | 12) {
+            return Err("benchmark concurrency must be one of 4, 8, or 12");
+        }
+        self.fill_missing_worker_limit = concurrency;
+        self.fill_missing_worker_permits = Arc::new(Semaphore::new(concurrency));
+        Ok(self)
+    }
+
+    #[cfg(feature = "performance-benchmarks")]
+    #[doc(hidden)]
+    pub fn with_item_timing_samples_for_benchmark(
+        mut self,
+        samples: MetadataBenchmarkItemTimings,
+    ) -> Self {
+        self.benchmark_item_timings = Some(samples);
+        self
+    }
+
+    fn worker_concurrency_limit(
+        &self,
+        backend: DatabaseBackend,
+        mode: MetadataRefreshMode,
+    ) -> usize {
+        metadata_worker_configured_concurrency(backend, mode, self.fill_missing_worker_limit)
     }
 
     pub fn with_webhooks(mut self, webhooks: WebhookService) -> Self {
@@ -760,7 +1101,24 @@ impl MetadataReidentifyService {
         {
             return Err(MetadataDispatchError::InvalidJob);
         }
-        dispatchers.enqueue(self.clone(), library_id, job_id).await
+        let dispatch_source = self
+            .database
+            .metadata_reidentify_job_dispatch_source(job_id)
+            .await
+            .map_err(|error| MetadataDispatchError::Storage(error.to_string()))?;
+        match dispatch_source.as_deref() {
+            Some("AUTOMATIC") => {
+                dispatchers
+                    .enqueue(self.clone(), library_id, job_id, true)
+                    .await
+            }
+            Some("EXPLICIT") => {
+                dispatchers
+                    .enqueue(self.clone(), library_id, job_id, false)
+                    .await
+            }
+            _ => Err(MetadataDispatchError::InvalidJob),
+        }
     }
 
     pub(crate) async fn search_item_candidates(
@@ -1075,7 +1433,7 @@ impl MetadataReidentifyService {
         let mut claim_failed = false;
         loop {
             let configured_concurrency =
-                metadata_worker_configured_concurrency(self.database.backend(), mode);
+                self.worker_concurrency_limit(self.database.backend(), mode);
             let concurrency = metadata_worker_concurrency(
                 self.resources
                     .metadata_concurrency(configured_concurrency)
@@ -1361,8 +1719,15 @@ impl MetadataReidentifyService {
             Ok(None) => Err(MetadataReidentifyError::ItemNotFound(item_id.to_owned())),
             Err(error) => Err(MetadataReidentifyError::Storage(error)),
         };
+        let item_elapsed = item_started.elapsed();
         self.resources
-            .record_metadata_stage("item_total", item_started.elapsed());
+            .record_metadata_stage("item_total", item_elapsed);
+        #[cfg(feature = "performance-benchmarks")]
+        if let Some(samples) = &self.benchmark_item_timings
+            && let Ok(mut samples) = samples.lock()
+        {
+            samples.push((item_id.to_owned(), item_elapsed.as_nanos()));
+        }
         match result {
             Ok(candidate_count) => {
                 let _ = self
@@ -2048,6 +2413,36 @@ impl MetadataReidentifyService {
     /// the last job finished, so run it in a background task.
     /// Returns how many library jobs were dispatched.
     pub async fn resume_interrupted_fill_missing_jobs(&self) -> Result<usize, StorageError> {
+        let mut automatic_library_cursor: Option<String> = None;
+        loop {
+            let library_ids = self
+                .database
+                .list_queued_automatic_fill_missing_library_ids(
+                    automatic_library_cursor.as_deref(),
+                    METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE,
+                )
+                .await?;
+            if library_ids.is_empty() {
+                break;
+            }
+            if let Some(dispatchers) = self.fill_missing_dispatchers.as_ref() {
+                for library_id in &library_ids {
+                    match dispatchers.wake_automatic(self.clone(), library_id).await {
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(
+                            library_id,
+                            %error,
+                            "persisted automatic metadata queue could not be woken"
+                        ),
+                    }
+                }
+            }
+            automatic_library_cursor = library_ids.last().cloned();
+            if library_ids.len() < METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE as usize {
+                break;
+            }
+        }
+
         let library_ids = self
             .database
             .list_libraries_with_interrupted_fill_missing_job()
@@ -2534,9 +2929,10 @@ fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
 fn metadata_worker_configured_concurrency(
     backend: DatabaseBackend,
     mode: MetadataRefreshMode,
+    fill_missing_limit: usize,
 ) -> usize {
     if matches!(mode, MetadataRefreshMode::FillMissing) {
-        METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT
+        fill_missing_limit
     } else {
         metadata_worker_default_concurrency(backend)
     }
@@ -2595,7 +2991,7 @@ fn deduplicate_item_ids_preserving_first_occurrence(item_ids: Vec<String>) -> Ve
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
         error::Error,
         io::{self, Write},
         sync::{Arc, Mutex},
@@ -2607,16 +3003,21 @@ mod tests {
     use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
     use super::{
-        AUTO_MATCH_MIN_SCORE, METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT,
-        METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage, MetadataCandidateView,
+        AUTO_MATCH_MIN_SCORE, METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE,
+        METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT, METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY,
+        METADATA_FILL_MISSING_MAX_WORKER_LIMIT, METADATA_GLOBAL_WORKER_LIMIT,
+        MetadataCandidatePage, MetadataCandidateView, MetadataConcurrencySettingSource,
+        MetadataFillMissingDispatcher, MetadataFillMissingDispatchers,
         MetadataFillMissingPendingJobs, MetadataJobOwners, MetadataRefreshMode,
         MetadataRequestPlan, acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
         candidate_count_for_page, deduplicate_item_ids_preserving_first_occurrence,
-        dispatch_panic_outcome, metadata_fill_missing_global_permits, metadata_global_permits,
-        metadata_reidentify_issue_diagnostic, metadata_request_plan_is_complete,
-        metadata_worker_concurrency, metadata_worker_configured_concurrency,
-        metadata_worker_default_concurrency, reserve_fill_missing_queue_capacity,
-        run_fill_missing_dispatcher_loop,
+        dispatch_panic_outcome, metadata_fill_missing_configured_worker_limit,
+        metadata_fill_missing_global_permits, metadata_fill_missing_worker_limit_from_setting,
+        metadata_global_permits, metadata_reidentify_issue_diagnostic,
+        metadata_request_plan_is_complete, metadata_worker_concurrency,
+        metadata_worker_configured_concurrency, metadata_worker_default_concurrency,
+        parse_metadata_fill_missing_concurrency, reserve_fill_missing_queue_capacity,
+        run_fill_missing_dispatcher_loop, signal_automatic_fill_missing_queue,
     };
     use crate::{
         application::{
@@ -3741,6 +4142,83 @@ mod tests {
     }
 
     #[test]
+    fn fill_missing_concurrency_defaults_and_accepts_supported_boundaries() {
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(None),
+            (4, MetadataConcurrencySettingSource::Unset)
+        );
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some(" 1 ")),
+            (1, MetadataConcurrencySettingSource::Explicit)
+        );
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some("12")),
+            (12, MetadataConcurrencySettingSource::Explicit)
+        );
+    }
+
+    #[test]
+    fn fill_missing_concurrency_clamps_invalid_and_out_of_range_values() {
+        for value in [Some("0"), Some("-2")] {
+            assert_eq!(
+                parse_metadata_fill_missing_concurrency(value),
+                (1, MetadataConcurrencySettingSource::Clamped)
+            );
+        }
+        for value in [
+            Some("13"),
+            Some("18446744073709551615"),
+            Some("999999999999999999999999999999999999999999999999999"),
+        ] {
+            assert_eq!(
+                parse_metadata_fill_missing_concurrency(value),
+                (12, MetadataConcurrencySettingSource::Clamped)
+            );
+        }
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some(
+                "-999999999999999999999999999999999999999999999999999"
+            )),
+            (1, MetadataConcurrencySettingSource::Clamped)
+        );
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some("not-a-number")),
+            (4, MetadataConcurrencySettingSource::Invalid)
+        );
+    }
+
+    #[test]
+    fn fill_missing_concurrency_warnings_do_not_log_raw_values() {
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CapturedTraceWriterFactory(Arc::clone(&captured_logs)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+
+        assert_eq!(
+            metadata_fill_missing_worker_limit_from_setting(Some("NOT_A_SECRET_SENTINEL")),
+            4
+        );
+        assert_eq!(
+            metadata_fill_missing_worker_limit_from_setting(Some("13")),
+            12
+        );
+
+        let logs = String::from_utf8_lossy(
+            &captured_logs
+                .lock()
+                .expect("captured log lock should be available"),
+        )
+        .to_string();
+        assert!(logs.contains("LUX_METADATA_CONCURRENCY was invalid"));
+        assert!(logs.contains("was outside the supported range and has been clamped"));
+        assert!(!logs.contains("NOT_A_SECRET_SENTINEL"));
+    }
+
+    #[test]
     fn metadata_worker_defaults_are_four_for_both_backends() {
         assert_eq!(
             metadata_worker_default_concurrency(DatabaseBackend::Sqlite),
@@ -3753,21 +4231,28 @@ mod tests {
     }
 
     #[test]
-    fn metadata_worker_mode_defaults_are_four_for_both_backends() {
+    fn metadata_worker_mode_limits_preserve_other_backend_defaults() {
+        let fill_missing_limit = metadata_fill_missing_configured_worker_limit();
         for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
             for mode in [
                 MetadataRefreshMode::Reidentify,
                 MetadataRefreshMode::FillMissing,
                 MetadataRefreshMode::FullRefresh,
             ] {
+                let expected = if matches!(mode, MetadataRefreshMode::FillMissing) {
+                    fill_missing_limit
+                } else {
+                    metadata_worker_default_concurrency(backend)
+                };
                 assert_eq!(
-                    metadata_worker_configured_concurrency(backend, mode),
-                    4,
+                    metadata_worker_configured_concurrency(backend, mode, fill_missing_limit),
+                    expected,
                     "unexpected default for {backend:?} in {mode:?} mode"
                 );
             }
         }
-        assert_eq!(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT, 4);
+        assert_eq!(METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT, 4);
+        assert_eq!(METADATA_FILL_MISSING_MAX_WORKER_LIMIT, 12);
     }
 
     #[test]
@@ -3782,9 +4267,10 @@ mod tests {
     fn fill_missing_worker_permits_are_process_global_and_hard_capped() {
         let first = metadata_fill_missing_global_permits();
         let second = metadata_fill_missing_global_permits();
+        let configured_limit = metadata_fill_missing_configured_worker_limit();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT, 4);
-        assert!(first.available_permits() <= METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT);
+        assert!(first.available_permits() <= configured_limit);
+        assert!(first.available_permits() <= METADATA_FILL_MISSING_MAX_WORKER_LIMIT);
     }
 
     #[tokio::test]
@@ -3868,9 +4354,12 @@ mod tests {
         let recovered = completed_tx;
         let job_starts = Arc::new(Mutex::new(Vec::new()));
         let run_job_starts = Arc::clone(&job_starts);
+        let (automatic_wakeup_sender, automatic_wakeup_receiver) = mpsc::channel(1);
         let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
             receiver,
             Arc::clone(&pending_jobs),
+            automatic_wakeup_receiver,
+            automatic_wakeup_sender,
             move |job_id| {
                 let completed = run_completed.clone();
                 let job_starts = Arc::clone(&run_job_starts);
@@ -3883,6 +4372,7 @@ mod tests {
                         panic!("injected dispatcher job panic");
                     }
                     let _ = completed.send(format!("ran:{job_id}"));
+                    true
                 }
             },
             move |job_id| {
@@ -3891,6 +4381,7 @@ mod tests {
                     let _ = recovered.send(format!("recovered:{job_id}"));
                 }
             },
+            || async { Ok(Vec::new()) },
         ));
 
         let observed = [
@@ -3943,6 +4434,448 @@ mod tests {
                 .job_ids
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_fill_missing_enqueue_bypasses_a_full_explicit_channel()
+    -> Result<(), Box<dyn Error>> {
+        const AUTOMATIC_JOB_COUNT: usize = METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY + 8;
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Automatic dispatch wake", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        for index in 0..AUTOMATIC_JOB_COUNT {
+            sqlx::query(
+                "INSERT INTO metadata_reidentify_jobs (
+                     id, status, total_count, mode, library_id, job_scope, dispatch_source
+                 ) VALUES (?, 'QUEUED', 1, 'FILL_MISSING', ?, 'LIBRARY', 'AUTOMATIC')",
+            )
+            .bind(format!("automatic-job-{index:03}"))
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let mut service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::unconfigured(),
+        );
+        let dispatchers = MetadataFillMissingDispatchers::default();
+        service.fill_missing_dispatchers = Some(dispatchers.clone());
+        let (sender, receiver) = mpsc::channel(METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY);
+        for index in 0..METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY {
+            sender
+                .send(format!("explicit-already-queued-{index}"))
+                .await
+                .expect("explicit queue should be open");
+        }
+        let (automatic_wakeup, mut automatic_wakeup_receiver) = mpsc::channel(1);
+        let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+        let worker = tokio::spawn(async move {
+            let _receiver = receiver;
+            std::future::pending::<()>().await;
+        });
+        dispatchers.state.lock().await.by_library.insert(
+            library_id,
+            MetadataFillMissingDispatcher {
+                sender: sender.clone(),
+                pending_jobs: Arc::clone(&pending_jobs),
+                automatic_wakeup: automatic_wakeup.clone(),
+                worker,
+            },
+        );
+
+        let completion_receiver_count = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut completion_receiver_count = 0;
+            for index in 0..AUTOMATIC_JOB_COUNT {
+                if service
+                    .enqueue_fill_missing_job_id(&format!("automatic-job-{index:03}"))
+                    .await?
+                    .is_some()
+                {
+                    completion_receiver_count += 1;
+                }
+            }
+            Ok::<_, super::MetadataDispatchError>(completion_receiver_count)
+        })
+        .await??;
+        assert_eq!(
+            completion_receiver_count,
+            super::METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT
+        );
+        assert_eq!(
+            pending_jobs
+                .lock()
+                .expect("pending jobs lock")
+                .job_ids
+                .len(),
+            super::METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT,
+            "automatic completion state stays bounded per library"
+        );
+        assert!(automatic_wakeup_receiver.try_recv().is_ok());
+        assert!(automatic_wakeup_receiver.try_recv().is_err());
+        assert!(sender.try_send("explicit-backpressure".to_owned()).is_err());
+
+        let workers = dispatchers.shutdown().await.expect("first shutdown");
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_resume_wakes_persisted_automatic_queued_jobs() -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let library_id: String =
+            sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::unconfigured(),
+        );
+        let job = service
+            .create_library_refresh_job(&library_id, super::MetadataRefreshMode::FillMissing)
+            .await?;
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs SET dispatch_source = 'AUTOMATIC' WHERE id = ?",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+        assert_eq!(service.resume_interrupted_fill_missing_jobs().await?, 0);
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = database
+                    .find_metadata_reidentify_job(&job.id)
+                    .await
+                    .expect("metadata job should remain readable")
+                    .expect("queued metadata job should remain persisted");
+                if job.status != "QUEUED" {
+                    break job.status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("startup recovery should drain the persisted automatic job");
+        assert_ne!(status, "QUEUED");
+        drop(service);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automatic_fill_missing_persistent_queue_drains_in_order_past_channel_capacity() {
+        const AUTOMATIC_JOB_COUNT: usize =
+            METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE as usize + 8;
+
+        let persistent_queue = Arc::new(Mutex::new(
+            (0..AUTOMATIC_JOB_COUNT)
+                .map(|index| format!("automatic-{index:03}"))
+                .collect::<VecDeque<_>>(),
+        ));
+        let (sender, receiver) = mpsc::channel(1);
+        let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let (completed_sender, mut completed_receiver) = mpsc::unbounded_channel();
+        let provider_gate = Arc::new(Semaphore::new(0));
+        let (automatic_wakeup_sender, automatic_wakeup_receiver) = mpsc::channel(1);
+        let list_queue = Arc::clone(&persistent_queue);
+        let run_queue = Arc::clone(&persistent_queue);
+        let run_gate = Arc::clone(&provider_gate);
+        let run_started = started_sender.clone();
+        let run_completed = completed_sender.clone();
+        let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
+            receiver,
+            Arc::clone(&pending_jobs),
+            automatic_wakeup_receiver,
+            automatic_wakeup_sender.clone(),
+            move |job_id| {
+                let queue = Arc::clone(&run_queue);
+                let gate = Arc::clone(&run_gate);
+                let started = run_started.clone();
+                let completed = run_completed.clone();
+                async move {
+                    if job_id == "automatic-000" {
+                        let _ = started.send(job_id.clone());
+                        if let Ok(permit) = gate.acquire().await {
+                            permit.forget();
+                        }
+                    }
+                    if job_id.starts_with("automatic-") {
+                        queue
+                            .lock()
+                            .expect("persistent queue lock")
+                            .retain(|queued| queued != &job_id);
+                    }
+                    let _ = completed.send(job_id);
+                    true
+                }
+            },
+            |_| async {},
+            move || {
+                let queue = Arc::clone(&list_queue);
+                async move {
+                    let page = queue
+                        .lock()
+                        .expect("persistent queue lock")
+                        .iter()
+                        .take(METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE as usize)
+                        .cloned()
+                        .collect();
+                    Ok(page)
+                }
+            },
+        ));
+        automatic_wakeup_sender
+            .try_send(())
+            .expect("automatic wake channel should be empty");
+        let started_job = tokio::time::timeout(Duration::from_secs(3), started_receiver.recv())
+            .await
+            .expect("first automatic job should reach the gated provider")
+            .expect("automatic job start should be recorded");
+        assert_eq!(started_job, "automatic-000");
+        assert_eq!(
+            persistent_queue
+                .lock()
+                .expect("persistent queue lock")
+                .len(),
+            AUTOMATIC_JOB_COUNT,
+            "the blocked first job remains persisted while the rest wait"
+        );
+        persistent_queue
+            .lock()
+            .expect("persistent queue lock")
+            .push_back("automatic-late".to_owned());
+        for _ in 0..10 {
+            let _ = automatic_wakeup_sender.try_send(());
+        }
+
+        provider_gate.add_permits(1);
+        let mut completed_automatic = Vec::with_capacity(AUTOMATIC_JOB_COUNT + 1);
+        for _ in 0..=AUTOMATIC_JOB_COUNT {
+            completed_automatic.push(
+                tokio::time::timeout(Duration::from_secs(3), completed_receiver.recv())
+                    .await
+                    .expect("dispatcher should keep draining the durable queue")
+                    .expect("automatic job completion should be recorded"),
+            );
+        }
+        let mut expected_automatic = (0..AUTOMATIC_JOB_COUNT)
+            .map(|index| format!("automatic-{index:03}"))
+            .collect::<Vec<_>>();
+        expected_automatic.push("automatic-late".to_owned());
+        assert_eq!(completed_automatic, expected_automatic);
+        assert!(
+            persistent_queue
+                .lock()
+                .expect("persistent queue lock")
+                .is_empty()
+        );
+
+        pending_jobs
+            .lock()
+            .expect("pending jobs lock")
+            .job_ids
+            .insert("explicit-job".to_owned());
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        pending_jobs
+            .lock()
+            .expect("pending jobs lock")
+            .completion_senders
+            .insert("explicit-job".to_owned(), completion_sender);
+        sender
+            .try_send("explicit-job".to_owned())
+            .expect("one explicit job fits while the provider is unblocked");
+        assert!(sender.try_send("second-explicit-job".to_owned()).is_err());
+        completion_receiver
+            .await
+            .expect("explicit completion is signaled after its run");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), completed_receiver.recv())
+                .await
+                .expect("explicit job should run")
+                .expect("explicit completion should be recorded"),
+            "explicit-job"
+        );
+        drop(sender);
+        worker
+            .await
+            .expect("dispatcher exits after explicit channel closes");
+    }
+
+    #[tokio::test]
+    async fn automatic_completion_waiter_is_retained_until_job_settles() {
+        let queue = Arc::new(Mutex::new(VecDeque::from(["automatic-retry".to_owned()])));
+        let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+        pending_jobs
+            .lock()
+            .expect("pending jobs lock")
+            .job_ids
+            .insert("automatic-retry".to_owned());
+        let (completion_sender, mut completion_receiver) = oneshot::channel();
+        pending_jobs
+            .lock()
+            .expect("pending jobs lock")
+            .completion_senders
+            .insert("automatic-retry".to_owned(), completion_sender);
+
+        let (sender, receiver) = mpsc::channel(1);
+        let (automatic_wakeup_sender, automatic_wakeup_receiver) = mpsc::channel(1);
+        let attempt_count = Arc::new(Mutex::new(0_usize));
+        let run_attempt_count = Arc::clone(&attempt_count);
+        let run_queue = Arc::clone(&queue);
+        let list_queue = Arc::clone(&queue);
+        let (attempt_sender, mut attempt_receiver) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
+            receiver,
+            Arc::clone(&pending_jobs),
+            automatic_wakeup_receiver,
+            automatic_wakeup_sender.clone(),
+            move |job_id| {
+                let attempt_count = Arc::clone(&run_attempt_count);
+                let queue = Arc::clone(&run_queue);
+                let attempt_sender = attempt_sender.clone();
+                async move {
+                    let attempt = {
+                        let mut count = attempt_count.lock().expect("attempt count lock");
+                        *count += 1;
+                        *count
+                    };
+                    let _ = attempt_sender.send(attempt);
+                    if attempt == 1 {
+                        return false;
+                    }
+                    queue
+                        .lock()
+                        .expect("persistent queue lock")
+                        .retain(|queued| queued != &job_id);
+                    true
+                }
+            },
+            |_| async {},
+            move || {
+                let queue = Arc::clone(&list_queue);
+                async move {
+                    Ok(queue
+                        .lock()
+                        .expect("persistent queue lock")
+                        .iter()
+                        .cloned()
+                        .collect())
+                }
+            },
+        ));
+
+        automatic_wakeup_sender
+            .try_send(())
+            .expect("automatic wake channel should be empty");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), attempt_receiver.recv())
+                .await
+                .expect("first provider attempt should run")
+                .expect("first provider attempt should be observed"),
+            1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut completion_receiver)
+                .await
+                .is_err(),
+            "a still-queued job must not publish completion"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), attempt_receiver.recv())
+                .await
+                .expect("queued provider attempt should be retried")
+                .expect("retry attempt should be observed"),
+            2
+        );
+        tokio::time::timeout(Duration::from_secs(1), &mut completion_receiver)
+            .await
+            .expect("completion should follow the settled retry")
+            .expect("completion sender should remain available");
+        assert!(queue.lock().expect("persistent queue lock").is_empty());
+
+        drop(sender);
+        worker.await.expect("dispatcher exits after channel closes");
+    }
+
+    #[tokio::test]
+    async fn automatic_signal_survives_when_explicit_queue_is_ready() {
+        let queue = Arc::new(Mutex::new(VecDeque::from(["automatic".to_owned()])));
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send("explicit".to_owned())
+            .expect("explicit queue should accept one job");
+        let (automatic_wakeup_sender, automatic_wakeup_receiver) = mpsc::channel(1);
+        automatic_wakeup_sender
+            .try_send(())
+            .expect("automatic signal channel should accept one wake");
+        let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+        let run_queue = Arc::clone(&queue);
+        let list_queue = Arc::clone(&queue);
+        let (completed_sender, mut completed_receiver) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
+            receiver,
+            pending_jobs,
+            automatic_wakeup_receiver,
+            automatic_wakeup_sender.clone(),
+            move |job_id| {
+                let queue = Arc::clone(&run_queue);
+                let completed = completed_sender.clone();
+                async move {
+                    if job_id == "automatic" {
+                        queue
+                            .lock()
+                            .expect("persistent queue lock")
+                            .retain(|queued| queued != &job_id);
+                    }
+                    let _ = completed.send(job_id);
+                    true
+                }
+            },
+            |_| async {},
+            move || {
+                let queue = Arc::clone(&list_queue);
+                async move {
+                    Ok(queue
+                        .lock()
+                        .expect("persistent queue lock")
+                        .iter()
+                        .cloned()
+                        .collect())
+                }
+            },
+        ));
+
+        let mut completed = Vec::with_capacity(2);
+        for _ in 0..2 {
+            completed.push(
+                tokio::time::timeout(Duration::from_secs(4), completed_receiver.recv())
+                    .await
+                    .expect("both ready queues should drain")
+                    .expect("job completion should be recorded"),
+            );
+        }
+        completed.sort();
+        assert_eq!(completed, vec!["automatic", "explicit"]);
+        assert!(queue.lock().expect("persistent queue lock").is_empty());
+
+        drop(sender);
+        worker
+            .await
+            .expect("dispatcher exits after explicit channel closes");
     }
 
     #[tokio::test]
@@ -4013,6 +4946,16 @@ mod tests {
         ));
         assert!(!super::dispatch_error_strands_queued_job(
             &Error::InvalidJob
+        ));
+    }
+
+    #[test]
+    fn automatic_wakeup_reports_a_closed_dispatcher_queue() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert!(matches!(
+            signal_automatic_fill_missing_queue(&sender),
+            Err(super::MetadataDispatchError::QueueClosed)
         ));
     }
 

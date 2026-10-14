@@ -6,6 +6,9 @@ rust-version = "1.94"
 description = "Lux personal media server"
 license-file = "LICENSE"
 
+[features]
+performance-benchmarks = []
+
 [dependencies]
 argon2 = "0.5.3"
 ab_glyph = "0.2"

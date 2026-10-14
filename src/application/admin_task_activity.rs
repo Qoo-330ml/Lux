@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::storage::{Database, StorageError, StoredJobActivityItem};
+use crate::storage::{
+    Database, StorageError, StoredJobActivityItem, StoredLibraryPipelineActivityPage,
+    StoredPipelineStageKind,
+};
 
 const ACTIVITY_JOB_LIMIT: i64 = 100;
 
@@ -257,4 +260,102 @@ fn activity_item_label(item: &StoredJobActivityItem) -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join(" · ")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AdminLibraryPipelineActivityPage {
+    pub(crate) page: i64,
+    pub(crate) page_size: i64,
+    pub(crate) total_libraries: i64,
+    pub(crate) libraries: Vec<AdminLibraryPipelineActivity>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AdminLibraryPipelineActivity {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) stages: Vec<AdminLibraryPipelineStageActivity>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AdminLibraryPipelineStageActivity {
+    pub(crate) kind: AdminLibraryPipelineStageKind,
+    pub(crate) planned: bool,
+    pub(crate) counts: AdminLibraryPipelineStatusCounts,
+    pub(crate) recent_activity_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminLibraryPipelineStageKind {
+    Index,
+    LocalMetadata,
+    Probe,
+    Thumbnail,
+    AutomaticMetadata,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdminLibraryPipelineStatusCounts {
+    pub(crate) queued: i64,
+    pub(crate) running: i64,
+    pub(crate) completed: i64,
+    pub(crate) failed: i64,
+    pub(crate) cancelled: i64,
+}
+
+pub(crate) async fn list_admin_library_pipeline_activity(
+    database: &Database,
+    page: i64,
+    page_size: i64,
+) -> Result<AdminLibraryPipelineActivityPage, StorageError> {
+    let stored = database
+        .list_library_pipeline_activity(page, page_size)
+        .await?;
+    Ok(map_library_pipeline_activity(stored))
+}
+
+fn map_library_pipeline_activity(
+    stored: StoredLibraryPipelineActivityPage,
+) -> AdminLibraryPipelineActivityPage {
+    AdminLibraryPipelineActivityPage {
+        page: stored.page,
+        page_size: stored.page_size,
+        total_libraries: stored.total_libraries,
+        libraries: stored
+            .libraries
+            .into_iter()
+            .map(|library| AdminLibraryPipelineActivity {
+                id: library.id,
+                name: library.name,
+                stages: library
+                    .stages
+                    .into_iter()
+                    .map(|stage| AdminLibraryPipelineStageActivity {
+                        kind: match stage.kind {
+                            StoredPipelineStageKind::Index => AdminLibraryPipelineStageKind::Index,
+                            StoredPipelineStageKind::LocalMetadata => {
+                                AdminLibraryPipelineStageKind::LocalMetadata
+                            }
+                            StoredPipelineStageKind::Probe => AdminLibraryPipelineStageKind::Probe,
+                            StoredPipelineStageKind::Thumbnail => {
+                                AdminLibraryPipelineStageKind::Thumbnail
+                            }
+                            StoredPipelineStageKind::AutomaticMetadata => {
+                                AdminLibraryPipelineStageKind::AutomaticMetadata
+                            }
+                        },
+                        planned: stage.planned,
+                        counts: AdminLibraryPipelineStatusCounts {
+                            queued: stage.counts.queued,
+                            running: stage.counts.running,
+                            completed: stage.counts.completed,
+                            failed: stage.counts.failed,
+                            cancelled: stage.counts.cancelled,
+                        },
+                        recent_activity_at: stage.recent_activity_at,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }

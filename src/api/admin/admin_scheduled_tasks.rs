@@ -23,11 +23,22 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_run_scheduled_task_plan),
         )
         .route("/api/v1/admin/task-activity", get(admin_list_task_activity))
+        .route(
+            "/api/v1/admin/library-pipeline-activity",
+            get(admin_list_library_pipeline_activity),
+        )
 }
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminScheduledTasksQuery {
+    pub(crate) page: Option<i64>,
+    pub(crate) page_size: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminLibraryPipelineActivityQuery {
     pub(crate) page: Option<i64>,
     pub(crate) page_size: Option<i64>,
 }
@@ -198,6 +209,98 @@ pub(crate) async fn admin_list_task_activity(
         "activities": activities.iter().map(admin_task_activity_json).collect::<Vec<_>>()
     }))
     .into_response()
+}
+
+pub(crate) async fn admin_list_library_pipeline_activity(
+    headers: HeaderMap,
+    Query(query): Query<AdminLibraryPipelineActivityQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.unwrap_or(20);
+    if !(1..=50).contains(&page_size) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "分页参数无效",
+        )
+        .into_response();
+    }
+    let (offset, page_size) = match page_params(Some(page), Some(page_size)) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let page = offset / page_size + 1;
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::admin_task_activity::list_admin_library_pipeline_activity(
+        database, page, page_size,
+    )
+    .await
+    {
+        Ok(activity) => Json(admin_library_pipeline_activity_json(&activity)).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+fn admin_library_pipeline_activity_json(
+    activity: &crate::application::admin_task_activity::AdminLibraryPipelineActivityPage,
+) -> Value {
+    use crate::application::admin_task_activity::{
+        AdminLibraryPipelineActivity, AdminLibraryPipelineStageActivity,
+    };
+
+    fn library_json(library: &AdminLibraryPipelineActivity) -> Value {
+        json!({
+            "libraryId": library.id,
+            "libraryName": library.name,
+            "stages": library.stages.iter().map(stage_json).collect::<Vec<_>>(),
+        })
+    }
+
+    fn stage_json(stage: &AdminLibraryPipelineStageActivity) -> Value {
+        use crate::application::admin_task_activity::AdminLibraryPipelineStageKind;
+
+        let stage_name = match stage.kind {
+            AdminLibraryPipelineStageKind::Index => "INDEX",
+            AdminLibraryPipelineStageKind::LocalMetadata => "LOCAL_METADATA",
+            AdminLibraryPipelineStageKind::Probe => "PROBE",
+            AdminLibraryPipelineStageKind::Thumbnail => "THUMBNAIL",
+            AdminLibraryPipelineStageKind::AutomaticMetadata => "AUTOMATIC_METADATA",
+        };
+        json!({
+            "stage": stage_name,
+            "planned": stage.planned,
+            "statusCounts": {
+                "queued": stage.counts.queued,
+                "running": stage.counts.running,
+                "completed": stage.counts.completed,
+                "failed": stage.counts.failed,
+                "cancelled": stage.counts.cancelled,
+            },
+            "recentActivityAt": stage.recent_activity_at,
+        })
+    }
+
+    json!({
+        "page": activity.page,
+        "pageSize": activity.page_size,
+        "totalLibraries": activity.total_libraries,
+        "libraries": activity.libraries.iter().map(library_json).collect::<Vec<_>>(),
+    })
 }
 
 fn admin_task_activity_json(

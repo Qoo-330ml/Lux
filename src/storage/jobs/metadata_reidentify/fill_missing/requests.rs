@@ -4,6 +4,7 @@ type FillMissingRequestSnapshot = (Option<Vec<u8>>, String);
 
 pub(super) struct FillMissingRequestState {
     active_by_item: HashMap<String, ActiveFillMissingItem>,
+    explicit_items: std::collections::HashSet<String>,
     deferred_by_snapshot: HashMap<(String, Option<Vec<u8>>, String), DeferredFillMissingRetryState>,
     deferred_snapshots_by_item: HashMap<String, Vec<FillMissingRequestSnapshot>>,
 }
@@ -22,6 +23,7 @@ impl Database {
         requests: &[MetadataFillMissingRequest],
     ) -> Result<FillMissingRequestState, StorageError> {
         let mut active_by_item = HashMap::with_capacity(requests.len());
+        let mut explicit_items = std::collections::HashSet::with_capacity(requests.len());
         let mut deferred_by_snapshot = HashMap::with_capacity(requests.len());
         let mut deferred_snapshots_by_item =
             HashMap::<String, Vec<FillMissingRequestSnapshot>>::new();
@@ -50,6 +52,7 @@ impl Database {
                 .join(" OR ");
             let query = format!(
                 "SELECT jobs.id AS job_id, jobs.status AS job_status,
+                        jobs.dispatch_source,
                         job_items.item_id, job_items.status AS item_status,
                         job_items.request_fingerprint,
                         job_items.request_capabilities_json,
@@ -101,12 +104,22 @@ impl Database {
                      AND job_items.item_id IN ({placeholders})
                  ) OR (
                      jobs.mode = 'FILL_MISSING'
+                     AND jobs.dispatch_source = 'AUTOMATIC'
                      AND jobs.status = 'DEFERRED'
                      AND jobs.cancel_requested = 0
                      AND job_items.status = 'FAILED'
                      AND job_items.error = 'SCRAPER_UNAVAILABLE'
                      AND job_items.automatic_retry_consumed = 0
                      AND ({deferred_snapshot_predicates})
+                 ) OR (
+                     jobs.mode = 'FILL_MISSING'
+                     AND jobs.dispatch_source = 'EXPLICIT'
+                     AND jobs.status = 'DEFERRED'
+                     AND jobs.cancel_requested = 0
+                     AND job_items.status = 'FAILED'
+                     AND job_items.error = 'SCRAPER_UNAVAILABLE'
+                     AND job_items.automatic_retry_consumed = 0
+                     AND job_items.item_id IN ({placeholders})
                  )
                  ORDER BY CASE WHEN jobs.status IN ('QUEUED', 'RUNNING') THEN 0 ELSE 1 END,
                           CASE WHEN job_items.status = 'RUNNING' THEN 0 ELSE 1 END,
@@ -122,6 +135,9 @@ impl Database {
                     statement = statement.bind(&request.capabilities_json);
                 }
             }
+            for request in batch {
+                statement = statement.bind(&request.item_id);
+            }
             for row in statement
                 .fetch_all(&mut **transaction)
                 .await
@@ -133,6 +149,11 @@ impl Database {
                 let job_id: String = row.get("job_id");
                 let item_id: String = row.get("item_id");
                 let job_status: String = row.get("job_status");
+                let dispatch_source: String = row.get("dispatch_source");
+                if dispatch_source == FILL_MISSING_DISPATCH_SOURCE_EXPLICIT {
+                    explicit_items.insert(item_id);
+                    continue;
+                }
                 if job_status == "DEFERRED" {
                     let fingerprint: Option<Vec<u8>> = row.get("request_fingerprint");
                     let capabilities: String = row.get("request_capabilities_json");
@@ -179,6 +200,7 @@ impl Database {
 
         Ok(FillMissingRequestState {
             active_by_item,
+            explicit_items,
             deferred_by_snapshot,
             deferred_snapshots_by_item,
         })
@@ -191,6 +213,7 @@ pub(super) fn plan_fill_missing_request_updates(
 ) -> FillMissingRequestPlan {
     let FillMissingRequestState {
         active_by_item,
+        explicit_items,
         deferred_by_snapshot,
         deferred_snapshots_by_item,
     } = state;
@@ -199,6 +222,9 @@ pub(super) fn plan_fill_missing_request_updates(
     let mut remaining = Vec::new();
     let mut consumed_deferred_retry_job_items = Vec::new();
     for request in requests {
+        if explicit_items.contains(&request.item_id) {
+            continue;
+        }
         if request.input_fingerprint.is_some()
             && let Some(snapshots) = deferred_snapshots_by_item.get(&request.item_id)
         {
@@ -380,7 +406,12 @@ impl Database {
             })?;
         }
 
-        self.enqueue_fill_missing_jobs_in_transaction(transaction, library_id, &remaining)
-            .await
+        self.enqueue_fill_missing_jobs_in_transaction(
+            transaction,
+            library_id,
+            FILL_MISSING_DISPATCH_SOURCE_AUTOMATIC,
+            &remaining,
+        )
+        .await
     }
 }

@@ -16,7 +16,7 @@
 |---|---|---|---|
 | 1 | 首批索引、local poster 早于 scan 完成；worker 与后续索引并行，Web 刷新 | `32c158ec` 的 1k/10k 双后端 poster 运行均有先后断言；LUX-469 FIFO/慢 NFO/新 poster 回归；`18b88888` 的组件回归验证 mock 空首页→home 通知→条目和 poster URL；未建模 scan lifecycle 或加载图片。 | **部分完成。** SQLite poster 各缺一轮；DOM 是静态组件 mock，不证明扫描 lifecycle、图片实际加载或浏览器/真实扫描端到端行为。 |
 | 2 | 首项/后段图片、慢 NFO、权限、不可用根、取消/重试、全量/增量竞态、扫描期间补图 | 最终 `scanned_metadata` 22/22、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81；LUX-469 测试映射保留于规格。 | **故障覆盖通过于冻结 SHA。** 这是本机 SQLite 自动化 fixture；后续修改需对应重验。 |
-| 3 | 缺失分类、策略、去重、无候选/失败冷却、执行前复查、保护本地/锁定数据 | `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 与新增空候选用例确认没有匹配时按 `LOW_CONFIDENCE` 完成，真实请求错误仍保持 `SCRAPER_UNAVAILABLE`。 | **空候选分类已修复。** 规模边界仍受 10k 自动调度与容量 32 队列背压影响，需先解决 LUX-424/LUX-303 合同冲突。 |
+| 3 | 缺失分类、策略、去重、无候选/失败冷却、执行前复查、保护本地/锁定数据 | `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 与新增空候选用例确认没有匹配时按 `LOW_CONFIDENCE` 完成，真实请求错误仍保持 `SCRAPER_UNAVAILABLE`。 | **队列合同冲突已由 LUX-527–530 解决。** 自动工作使用持久 QUEUED job 分页 drain；显式队列保留容量 32 背压。>32 工作排空回归已过，但这不是 10k 双后端性能证据，阶段 23 仍开放。 |
 | 4 | 双后端同 fixture、至少三轮；索引/首项/poster/local/online/p95/事务与队列/RSS；回退 ≤5% | 原始 48 行，3 对发现 Cargo 干扰并剔除；另有候选 `21c8dfc7` 的 1/24 有效配对记录在 `docs/PERFORMANCE.md`。 | **未通过。** 矩阵仍不完整；现有 p95 回退仅作风险信号，不作三轮结论。不得降低 5% 门槛或把复合 rescan/HTTP 窗口称为纯扫描耗时。 |
 | 5 | 索引、本地、在线分开计时 | LUX-462 harness 分别记录 scan、poster 队列和前台请求窗口；1k online fixture 触发 10 jobs/1000 items。 | **部分完成。** 10k SQLite provider 未放行时 local queue 超时；10k PostgreSQL 尚未运行。失败或未触发的样本保持 unavailable，不能记零。 |
 | 6 | 最终 Rust/Web 门、兼容/性能/架构记录、ARM 记录及所有者确认 | `32c158ec` build/fmt/Clippy/Rust 1514 passed、0 failed、36 ignored（110 目标）；原候选 Web Node132/Vitest561/build 通过。`0980dd36` 的 Web Node134/Vitest570/build 通过（Vitest 最终完整单 worker 重跑）。 | **阶段门未通过。** 新 revision 的 Rust/完整性能矩阵仍需最终重验；技术项未齐，不进入所有者关闭确认。仅 Mac ARM64，不外推部署、FNOS/NAS 或第三方客户端。 |
@@ -29,15 +29,16 @@ Web 复核保留一次默认并行全量的 5 个首页轮播失败；新增 DOM
 
 来源链：本地 completeness 已原子持久化缺失结果与 job，随后同步调用 `enqueue_fill_missing_job_id`；dispatcher 的 `sender.reserve().await` 等待容量 32 队列，provider 不释放就不消费后续队列，背压传回本地 worker。1k 仅 10 个 job，未达到这一容量边界。
 
-正式规格 LUX-424 明确要求满队列对扫描提交方背压；阶段 23/LUX-303 又要求独立在线任务不阻塞本地 worker。这两项在 10k fixture 上不能同时成立。按 **AGENTS.md / Source of truth**，在改变公共调度/存储边界前已报告并请求项目所有者选择。建议修订自动入口：QUEUED 数据库记录作为真实队列、每库 dispatcher 通过有界通知和分页异步领取，管理员/计划入口的背压与完成等待继续保留；不使用无界内存或逐 job spawn。该修订与实现尚未发生。
+正式规格 LUX-424 明确要求满队列对扫描提交方背压；阶段 23/LUX-303 又要求独立在线任务不阻塞本地 worker。这两项在 10k fixture 上不能同时成立。2026-10-14 项目所有者授权修订自动入口：QUEUED 数据库记录作为自动工作的真实队列、每库 dispatcher 通过合并唤醒和分页异步领取；管理员/计划入口的显式背压与完成等待继续保留；不使用无界内存或逐 job spawn。该决定登记为阶段 27/LUX-527；在本段决策快照写入时，来源标记与运行时实现尚未完成。原 10k 失败快照不变，阶段 23 性能门仍未通过。
+
+2026-10-14 后续状态：LUX-528–530 已交付来源 migration、自动/显式分流和有界持久队列 drain。阻塞 provider 回归验证本地 worker/scan 不等在线队列，并在放行后排空 108 个自动 job 及并发新增 job；取消、shutdown、恢复和显式背压也有覆盖。这个修复解除调度合同冲突，不替代 10k SQLite/PostgreSQL 性能矩阵、双后端三轮 A/B 或 5% 门槛；以上原始失败数据继续保留。
 
 ## 最短剩余清单
 
-1. 项目所有者选择上述冲突的合同；若采用建议，先补 >32-job、阻塞 provider 下 local drain 的失败回归，再最小修复；保留 dedupe、每库串行、shutdown、取消和完成通知语义。
-2. 在可用的采样窗口，以最终 revision、相同 scan/pool 配置完成 1k/10k × 两后端 × LUX-270/LUX-304 三轮配对，记录默认配置差异另作对照；拒绝受外部 Cargo 干扰的整个配对。补齐 10k online 矩阵。
-3. 对有效复测中仍超过 5% 的稳定回退做 phase/pool-acquire/HTTP/SQL 定位、调整和完整复测；不删跨终点慢请求，不把 null 当零。
-4. 最终源码重跑相关 Rust/Web 全门，更新精确 SHA、结果和兼容性记录；按全局完成标准补需要的真实用户流程验证。
-5. 技术项全部满足后，按 AGENTS.md Stage gates 等待项目所有者明确确认；当前不请求关闭、不进入下一阶段。
+1. 在可用的采样窗口，以最终 revision、相同 scan/pool 配置完成 1k/10k × 两后端 × LUX-270/LUX-304 三轮配对，记录默认配置差异另作对照；拒绝受外部 Cargo 干扰的整个配对。补齐 10k online 矩阵。
+2. 对有效复测中仍超过 5% 的稳定回退做 phase/pool-acquire/HTTP/SQL 定位、调整和完整复测；不删跨终点慢请求，不把 null 当零。
+3. 最终源码重跑相关 Rust/Web 全门，更新精确 SHA、结果和兼容性记录；按全局完成标准补需要的真实用户流程验证。
+4. 技术项全部满足后，按 AGENTS.md Stage gates 等待项目所有者明确确认；当前不请求关闭、不进入下一阶段。
 
 ## 持久证据与保留状态
 
