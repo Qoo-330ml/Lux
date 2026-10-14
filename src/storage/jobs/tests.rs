@@ -1221,8 +1221,8 @@ async fn reassigned_media_source_does_not_add_a_second_default_source()
 }
 
 #[tokio::test]
-async fn metadata_reidentify_job_reports_items_left_pending() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn metadata_reidentify_job_reports_items_left_pending()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -1242,9 +1242,11 @@ async fn metadata_reidentify_job_reports_items_left_pending() -> Result<(), Box<
         .await?;
     for (item_id, status) in [("done", "COMPLETED"), ("waiting", "PENDING")] {
         database
-            .query("INSERT INTO media_items (id, library_id, item_type, title, sort_title,
+            .query(
+                "INSERT INTO media_items (id, library_id, item_type, title, sort_title,
                  identification_status, has_available_source)
-                 VALUES (?, 'lib', 'MOVIE', 'Title', 'title', 'LOCAL_CONFIRMED', 1)")
+                 VALUES (?, 'lib', 'MOVIE', 'Title', 'title', 'LOCAL_CONFIRMED', 1)",
+            )
             .bind(item_id)
             .execute(database.pool())
             .await?;

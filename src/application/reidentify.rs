@@ -723,7 +723,10 @@ impl MetadataReidentifyService {
             .await
         {
             Ok(()) => {
-                tracing::warn!(job_id, "metadata job could not be dispatched and was failed");
+                tracing::warn!(
+                    job_id,
+                    "metadata job could not be dispatched and was failed"
+                );
                 self.publish_job_finished(job_id);
             }
             Err(error) => {
@@ -1212,21 +1215,19 @@ impl MetadataReidentifyService {
                     .metadata_reidentify_job_has_pending_items(job_id)
                     .await
                     .unwrap_or(true));
-        let (has_scraper_unavailable, has_failed_items) = if cancel_requested
-            || reconciliation_failed
-            || queue_incomplete
-        {
-            (Ok(false), Ok(false))
-        } else {
-            (
-                self.database
-                    .metadata_reidentify_job_has_item_error(job_id, "SCRAPER_UNAVAILABLE")
-                    .await,
-                self.database
-                    .metadata_reidentify_job_has_failed_items(job_id)
-                    .await,
-            )
-        };
+        let (has_scraper_unavailable, has_failed_items) =
+            if cancel_requested || reconciliation_failed || queue_incomplete {
+                (Ok(false), Ok(false))
+            } else {
+                (
+                    self.database
+                        .metadata_reidentify_job_has_item_error(job_id, "SCRAPER_UNAVAILABLE")
+                        .await,
+                    self.database
+                        .metadata_reidentify_job_has_failed_items(job_id)
+                        .await,
+                )
+            };
         let (status, error) = metadata_job_outcome(MetadataJobOutcomeInput {
             cancel_requested,
             reconciliation_failed,
@@ -2037,6 +2038,75 @@ impl MetadataReidentifyService {
         }
         self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(job_id).await
+    }
+
+    /// Starts one new library-wide FILL_MISSING job for every library whose
+    /// latest fill-missing job was cancelled by a shutdown. The cancelled job
+    /// instance is not resumed (ADR-034); already complete items are skipped
+    /// without a scraper request, so only the unfinished work is repeated.
+    /// Libraries are processed one after another and the call returns once
+    /// the last job finished, so run it in a background task.
+    /// Returns how many library jobs were dispatched.
+    pub async fn resume_interrupted_fill_missing_jobs(&self) -> Result<usize, StorageError> {
+        let library_ids = self
+            .database
+            .list_libraries_with_interrupted_fill_missing_job()
+            .await?;
+        let mut dispatched = 0;
+        for library_id in library_ids {
+            let has_scraper =
+                self.database
+                    .find_library(&library_id)
+                    .await?
+                    .is_some_and(|library| {
+                        library.is_enabled
+                            && library
+                                .scraper_id
+                                .as_deref()
+                                .is_some_and(|scraper_id| !scraper_id.trim().is_empty())
+                    });
+            if !has_scraper {
+                continue;
+            }
+            let job = match self
+                .create_library_refresh_job(&library_id, MetadataRefreshMode::FillMissing)
+                .await
+            {
+                Ok(job) => job,
+                Err(error) => {
+                    tracing::warn!(
+                        library_id,
+                        %error,
+                        "interrupted metadata scraping could not be requeued"
+                    );
+                    continue;
+                }
+            };
+            // Only one library-wide job may be active at a time, so wait for
+            // this one before creating the next library's job.
+            match self.enqueue_fill_missing_job(&job).await {
+                Ok(completion) => {
+                    dispatched += 1;
+                    if let Some(completion) = completion {
+                        let _ = completion.await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        library_id,
+                        %error,
+                        "interrupted metadata scraping could not be dispatched"
+                    );
+                }
+            }
+        }
+        if dispatched > 0 {
+            tracing::info!(
+                libraries = dispatched,
+                "requeued metadata scraping interrupted by the previous shutdown"
+            );
+        }
+        Ok(dispatched)
     }
 
     pub async fn active_job_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -3929,7 +3999,9 @@ mod tests {
     #[test]
     fn dispatch_failures_fail_queued_jobs_except_during_shutdown() {
         use super::MetadataDispatchError as Error;
-        assert!(super::dispatch_error_strands_queued_job(&Error::QueueClosed));
+        assert!(super::dispatch_error_strands_queued_job(
+            &Error::QueueClosed
+        ));
         assert!(super::dispatch_error_strands_queued_job(
             &Error::StateUnavailable
         ));
@@ -3939,7 +4011,9 @@ mod tests {
         assert!(!super::dispatch_error_strands_queued_job(
             &Error::ShuttingDown
         ));
-        assert!(!super::dispatch_error_strands_queued_job(&Error::InvalidJob));
+        assert!(!super::dispatch_error_strands_queued_job(
+            &Error::InvalidJob
+        ));
     }
 
     #[test]

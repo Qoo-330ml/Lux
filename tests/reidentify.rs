@@ -1175,6 +1175,45 @@ async fn fill_missing_empty_provider_search_is_low_confidence_not_unavailable()
 }
 
 #[tokio::test]
+async fn interrupted_fill_missing_work_is_requeued_once_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    sqlx::query("UPDATE libraries SET scraper_id = 'tmdb' WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let (tmdb, _tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), tmdb);
+    let interrupted = metadata.create_fill_missing_job(vec![item_id]).await?;
+    // Simulate the previous process exiting mid-scrape: startup cancels it.
+    assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 1);
+
+    assert_eq!(metadata.resume_interrupted_fill_missing_jobs().await?, 1);
+    assert_eq!(metadata.resume_interrupted_fill_missing_jobs().await?, 0);
+
+    let jobs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, status FROM metadata_reidentify_jobs
+         WHERE mode = 'FILL_MISSING' ORDER BY created_at, id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0], (interrupted.id.clone(), "CANCELLED".to_owned()));
+    assert_ne!(jobs[1].0, interrupted.id);
+
+    metadata.shutdown().await;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn fill_missing_episode_without_series_candidates_is_not_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;

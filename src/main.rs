@@ -156,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     app_state.rebuild_people_index().await;
     app_state.start_local_metadata_worker().await;
+    app_state.resume_interrupted_metadata_scraping();
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker();
