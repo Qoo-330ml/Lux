@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
+import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
@@ -56,7 +57,8 @@ export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" | 
       : undefined;
   if (!resolvedType) return undefined;
   const tag = item.imageTags?.[resolvedType];
-  const path = `/api/v1/items/${encodeURIComponent(item.id)}/images/${resolvedType}`;
+  const imageItemId = resolvedType === "poster" ? item.posterItemId ?? item.id : item.id;
+  const path = `/api/v1/items/${encodeURIComponent(imageItemId)}/images/${resolvedType}`;
   return tag ? `${path}?tag=${encodeURIComponent(tag)}` : path;
 }
 
@@ -97,6 +99,10 @@ export function remainingRuntimeLabel(item: MediaItem) {
 }
 
 export function EpisodeCount({ item }: { item: MediaItem }) {
+  if (item.itemType === "BOX_SET" && item.memberCount != null && Number.isFinite(item.memberCount) && item.memberCount >= 0) {
+    const label = `${item.memberCount} 部`;
+    return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
+  }
   if (item.itemType !== "SERIES" && item.itemType !== "SEASON") return null;
   if (item.episodeCount == null || !Number.isFinite(item.episodeCount) || item.episodeCount < 0) return null;
   const label = `${item.episodeCount} 集`;
@@ -117,7 +123,7 @@ function MediaPlaceholder({ item }: { item: MediaItem }) {
   );
 }
 
-export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; onSelectionChange?: (selected: boolean) => void }) {
+export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (selected: boolean) => void }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -159,7 +165,7 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
   }
 
   if (deleted) return null;
-  const detailHref = `/items/${item.id}${detailSearch ?? ""}`;
+  const detailHref = detailHrefOverride ?? `/items/${item.id}${detailSearch ?? ""}`;
   const isFolder = item.itemType === "FOLDER";
   const folderLabel = `打开文件夹 ${mediaTitle(item)}`;
 
@@ -176,7 +182,7 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
     <>
       <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
         <div className="lux-media-art-shell">
-          {selectionMode && !isFolder ? (
+          {selectionMode && !readOnly && !isFolder ? (
             <label className="lux-media-selection-control">
               <input
                 className="lux-media-selection-checkbox"
@@ -198,7 +204,7 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
               {!isFolder && progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
             </div>
           )}
-          {!isFolder ? <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} /> : null}
+          {!isFolder && !readOnly ? <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} /> : null}
         </div>
         {mediaCardLink(
           <div className="lux-media-copy">
@@ -299,6 +305,7 @@ export function positionLibraryActionMenu(
 }
 
 export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefetch?: () => void }) {
+  const isSystemCollection = library.id === GLOBAL_COLLECTION_LIBRARY_ID;
   const cardRef = useRef<HTMLElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
@@ -356,6 +363,7 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
   }
 
   function handleContextMenu(event: MouseEvent<HTMLElement>) {
+    if (isSystemCollection) return;
     event.preventDefault();
     openMenu({ left: event.clientX, top: event.clientY });
   }
@@ -393,13 +401,13 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
 
   return (
     <article ref={cardRef} className="lux-library-card" onContextMenu={handleContextMenu}>
-      <Link className="lux-library-card-link" to={`/libraries/${library.id}`} onMouseEnter={onPrefetch} onFocus={onPrefetch}>
+      <Link className="lux-library-card-link" to={`/libraries/${library.id}`} onMouseEnter={isSystemCollection ? undefined : onPrefetch} onFocus={isSystemCollection ? undefined : onPrefetch}>
         <span className="lux-library-card-cover">
-          {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
+          {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{isSystemCollection ? "▤" : library.kind === "SERIES" ? "▣" : "◈"}</span>}
         </span>
         <span className="lux-library-card-copy"><strong>{library.name}</strong></span>
       </Link>
-      <button
+      {!isSystemCollection ? <button
         ref={menuTriggerRef}
         className="lux-library-card-menu-trigger"
         type="button"
@@ -409,11 +417,11 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
         onClick={handleTriggerClick}
       >
         <MoreHorizontal size={18} aria-hidden="true" />
-      </button>
+      </button> : null}
       {actionNotice ? <p className="lux-library-card-action-feedback" role="status">{actionNotice}</p> : null}
       {actionError ? <p className="lux-library-card-action-feedback is-error" role="alert">{actionError}</p> : null}
       {pendingAction ? <span className="lux-visually-hidden" role="status">{pendingAction === "reidentify" ? "正在提交整库元数据匹配任务" : "正在提交扫描任务"}</span> : null}
-      {menuOpen ? createPortal(
+      {menuOpen && !isSystemCollection ? createPortal(
         <div
           ref={menuRef}
           className="lux-library-action-menu is-context"

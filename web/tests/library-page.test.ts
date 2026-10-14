@@ -853,4 +853,60 @@ describe("LibraryPage infinite scroll", () => {
     }));
     expect(container?.textContent).toContain("已合并 1 个其他版本");
   });
+
+  it("opens the virtual collection library with safe posters and read-only cards", async () => {
+    const collectionLibraryId = "00000000-0000-7000-8000-000000000538";
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: collectionLibraryId, name: "合集", kind: "MIXED" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{
+        id: "collection-1",
+        title: "飞驰人生",
+        itemType: "BOX_SET",
+        memberCount: 3,
+        posterItemId: "visible-movie-1",
+        imageTags: { poster: "visible-poster-tag" },
+      }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: [`/libraries/${collectionLibraryId}`] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(1));
+    });
+
+    expect(libraryItems).toHaveBeenCalledWith(collectionLibraryId, 1, "BOX_SET", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+    });
+    expect(container.querySelector<HTMLAnchorElement>(".lux-media-card-link")?.getAttribute("href"))
+      .toBe("/collections/collection-1");
+    expect(container.querySelector<HTMLImageElement>(".lux-media-art img")?.getAttribute("src"))
+      .toBe("/api/v1/items/visible-movie-1/images/poster?tag=visible-poster-tag");
+    expect(container.textContent).toContain("3 部");
+    expect(container.querySelector("button[aria-label='开启媒体库多选']")).toBeNull();
+    expect(container.querySelector(".lux-media-card-menu-trigger")).toBeNull();
+  });
 });

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api, type LibrarySortBy, type LibrarySortOrder } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library } from "../../lib/api/types";
 import { MediaCard, mediaTitle } from "../home/media";
 
@@ -116,9 +117,12 @@ function LibraryPageLoadingState({ libraryName }: { libraryName?: string }) {
 
 export function LibraryPage({ serverName }: { serverName?: string | null } = {}) {
   const { libraryId = "" } = useParams();
+  const isGlobalCollectionLibrary = libraryId === GLOBAL_COLLECTION_LIBRARY_ID;
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
-  const metadataStatus = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING" ? "PENDING" as const : undefined;
+  const metadataStatus = !isGlobalCollectionLibrary && searchParams.get("metadataStatus")?.toUpperCase() === "PENDING"
+    ? "PENDING" as const
+    : undefined;
   const [sortState, setSortState] = useState(() => ({
     libraryId,
     preference: readLibrarySortPreference(libraryId),
@@ -137,7 +141,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
   const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
-  const itemTypes = libraryItemTypeFilter(library?.kind);
+  const itemTypes = isGlobalCollectionLibrary ? "BOX_SET" : libraryItemTypeFilter(library?.kind);
   const confirmMetadata = useMutation({
     mutationFn: () => api.confirmAdminMetadata([...selectedIds]),
     onSuccess: (result) => {
@@ -292,9 +296,9 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       {isHomeVideos && folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
       <div className="lux-page-heading">
         <h1>{library?.name || "媒体库"}</h1>
-        <p>{metadataStatus ? `${total} 项待确认内容` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${total} 项内容` : `${total} 项内容`}</p>
+        <p>{metadataStatus ? `${total} 项待确认内容` : isGlobalCollectionLibrary ? `${total} 个系列 · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${total} 项内容` : `${total} 项内容`}</p>
       </div>
-      <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
+      {!isGlobalCollectionLibrary ? <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
         <button
           className="lux-button lux-button-secondary"
           type="button"
@@ -315,14 +319,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         {allSelectedPending ? <button className="lux-button lux-button-primary" type="button" data-action="batch-confirm-metadata" disabled={confirmMetadata.isPending} onClick={() => confirmMetadata.mutate()}>{confirmMetadata.isPending ? "确认中…" : "批量确认"}</button> : null}
         {confirmNotice ? <span className="lux-muted-copy" role="status">{confirmNotice}</span> : null}
         {confirmMetadata.error ? <span className="lux-error-copy" role="alert">{confirmMetadata.error.message}</span> : null}
-      </div>
-      <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
+      </div> : null}
+      {!isGlobalCollectionLibrary ? <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
         <div className="lux-library-sort-control"><span>元数据</span><LuxSelect value={metadataStatus ?? "ALL"} options={metadataOptions} onChange={changeMetadataStatus} aria-label="元数据状态" /></div>
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
-      </div>
+      </div> : null}
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} key={item.id} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
+        {loadedItems.map((item) => <MediaCard item={item} key={item.id} detailHref={isGlobalCollectionLibrary ? `/collections/${encodeURIComponent(item.id)}` : undefined} readOnly={isGlobalCollectionLibrary} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={!isGlobalCollectionLibrary && showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={!isGlobalCollectionLibrary && selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
       </div>
       {mergeOpen ? (
         <div className="lux-library-dialog-backdrop" role="presentation">
@@ -370,7 +374,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           </section>
         </div>
       ) : null}
-      {!loadedItems.length ? <div className="lux-empty-card"><span>{isHomeVideos && folderPath.length ? "此文件夹没有可浏览内容。" : "这个媒体库还没有内容。"}</span>{!(isHomeVideos && folderPath.length) ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
+      {!loadedItems.length ? <div className="lux-empty-card"><span>{isGlobalCollectionLibrary ? "当前没有可见的合集。" : isHomeVideos && folderPath.length ? "此文件夹没有可浏览内容。" : "这个媒体库还没有内容。"}</span>{!(isHomeVideos && folderPath.length) ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />
       {pages.isFetchingNextPage ? <p className="lux-muted-copy" role="status">正在加载更多…</p> : null}
       {pages.isFetchNextPageError ? (
