@@ -11292,6 +11292,16 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证结果：冻结锁文件安装通过；`media-detail.test.tsx` 32/32、`detail-layout.test.mjs` 29/29、完整 Web Node 137/137 与 Vitest 593/593、production build 通过。Toshiba 已挂载，本机 `arm64`；共享 target 下 `cargo build --locked`、`cargo fmt --all -- --check`、all-targets/all-features Clippy 通过。`git diff --check` 通过。未运行 Rust 行为测试，因为本任务不改 Rust 代码或合同。
 
+详情页视觉补充验收（2026-10-14）：
+
+- [x] “更多信息”面板在深色和浅色主题使用半透明表面及背景模糊，可透出页面图片。
+- [x] 媒体摘要、折叠标题和展开后的地址共用一个外框；“媒体源地址与技术详情”作为无框按钮显示。
+- [x] 展开时直接展示媒体源地址，并将复制按钮放在地址行最右侧；移除“媒体播放地址 (已安全收纳)”标签，折叠仍由原按钮控制。
+
+补充实现与回归文件（5 个）：`web/src/features/detail/MediaInfoPanel.tsx`、`web/src/react.css`、`web/tests/media-detail.test.tsx`、`web/tests/detail-layout.test.mjs`、`web/tests/light-theme-contrast.test.ts`。本文档作为独立文档增量更新。
+
+补充验证：冻结锁文件安装通过；媒体详情组件测试 32/32、详情布局检查 31/31、浅色主题测试 19/19；完整 Web 测试 Node 139/139、Vitest 593/593、production build 和 `git diff --check` 通过。浏览器本地预览确认剧照、半透明“更多信息”面板及媒体地址展开/收起和复制按钮位置。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
