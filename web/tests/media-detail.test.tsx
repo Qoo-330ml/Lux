@@ -1445,12 +1445,18 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.querySelector("details.lux-media-info-address")).toBeNull();
     const drawer = details?.querySelector<HTMLElement>("#media-url-drawer");
     const drawerToggle = details?.querySelector<HTMLButtonElement>('[aria-controls="media-url-drawer"]');
+    const mediaFileCard = details?.querySelector(".lux-media-file-facts");
     expect(drawer).not.toBeNull();
+    expect(drawer?.parentElement).toBe(mediaFileCard);
+    expect(drawerToggle?.classList.contains("lux-badge-pill")).toBe(false);
     expect(drawer?.hidden).toBe(true);
     expect(drawerToggle?.getAttribute("aria-expanded")).toBe("false");
     await act(async () => drawerToggle?.click());
     expect(drawer?.hidden).toBe(false);
     expect(drawerToggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(drawer?.textContent).not.toContain("媒体播放地址");
+    expect(drawer?.querySelector("#media-url-display")?.textContent).toBe("https://example.invalid/video.mkv");
+    expect(drawer?.querySelector("#media-url-display")?.nextElementSibling?.textContent).toContain("复制地址");
     await act(async () => drawerToggle?.click());
     expect(drawer?.hidden).toBe(true);
     expect(drawerToggle?.getAttribute("aria-expanded")).toBe("false");

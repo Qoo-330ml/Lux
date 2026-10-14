@@ -207,7 +207,7 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-badge-accent")).toContain("color: var(--lux-muted)");
     expect(lightThemeRule(".lux-media-nfo-collection-card")).toContain("background: rgba(28,28,34");
     expect(lightThemeRule(".lux-media-nfo-provider-badge strong")).toContain("color: var(--lux-text)");
-    expect(lightThemeRule("#media-url-display")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule(".lux-media-address-value")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-file-facts #fact-container")).toContain("color: var(--lux-muted)");
     expect(lightThemeRule(".lux-media-stream-badges span.is-default")).toContain("color: var(--lux-muted)");
   });

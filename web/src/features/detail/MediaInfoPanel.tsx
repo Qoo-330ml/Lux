@@ -104,85 +104,83 @@ export function MediaInfoContent({
       ) : null}
 
       {/* Quick Specs & File Facts Ribbon */}
-      <div className="lux-surface-panel lux-media-file-facts p-3.5 flex flex-wrap items-center justify-between gap-4 text-xs">
-        <div className="flex flex-wrap items-center gap-2.5">
-          {source.container ? (
-            <span id="fact-container" className="px-2 py-0.5 rounded bg-white/[0.06] text-white font-mono font-medium">
-              {source.container.toUpperCase()}
-            </span>
-          ) : null}
-          {formatBytes(source.size) ? (
-            <>
-              <span id="fact-size" className="text-[var(--lux-muted)]">{formatBytes(source.size)}</span>
-              <span className="text-[var(--lux-subtle)]">·</span>
-            </>
-          ) : null}
-          {formatBitrate(source.bitrate) ? (
-            <>
-              <span id="fact-bitrate" className="text-[var(--lux-muted)]">{formatBitrate(source.bitrate)}</span>
-              <span className="text-[var(--lux-subtle)]">·</span>
-            </>
-          ) : null}
-          {runtimeLabel(source.durationTicks) ? (
-            <>
-              <span id="fact-runtime" className="text-[var(--lux-muted)]">{runtimeLabel(source.durationTicks)}</span>
-              <span className="text-[var(--lux-subtle)]">·</span>
-            </>
-          ) : null}
-          {source.sourceKind ? (
-            <span id="fact-source-kind" className="text-[var(--lux-muted)]">
-              {source.sourceKind === "STRM_URL" ? "STRM 远程播放源" : "本地媒体文件"}
-            </span>
+      <div className="lux-surface-panel lux-media-file-facts p-3.5 text-xs">
+        <div className="lux-media-file-facts-summary">
+          <div className="flex flex-wrap items-center gap-2.5">
+            {source.container ? (
+              <span id="fact-container" className="px-2 py-0.5 rounded bg-white/[0.06] text-white font-mono font-medium">
+                {source.container.toUpperCase()}
+              </span>
+            ) : null}
+            {formatBytes(source.size) ? (
+              <>
+                <span id="fact-size" className="text-[var(--lux-muted)]">{formatBytes(source.size)}</span>
+                <span className="text-[var(--lux-subtle)]">·</span>
+              </>
+            ) : null}
+            {formatBitrate(source.bitrate) ? (
+              <>
+                <span id="fact-bitrate" className="text-[var(--lux-muted)]">{formatBitrate(source.bitrate)}</span>
+                <span className="text-[var(--lux-subtle)]">·</span>
+              </>
+            ) : null}
+            {runtimeLabel(source.durationTicks) ? (
+              <>
+                <span id="fact-runtime" className="text-[var(--lux-muted)]">{runtimeLabel(source.durationTicks)}</span>
+                <span className="text-[var(--lux-subtle)]">·</span>
+              </>
+            ) : null}
+            {source.sourceKind ? (
+              <span id="fact-source-kind" className="text-[var(--lux-muted)]">
+                {source.sourceKind === "STRM_URL" ? "STRM 远程播放源" : "本地媒体文件"}
+              </span>
+            ) : null}
+          </div>
+          {source.externalUrl && !collapseTechnicalDetails ? (
+            <button
+              type="button"
+              onClick={() => setShowAddress((prev) => !prev)}
+              aria-expanded={showAddress}
+              aria-controls="media-url-drawer"
+              className="lux-media-details-toggle"
+            >
+              <span>媒体源地址与技术详情</span>
+              <span id="url-drawer-chevron" className="text-[var(--lux-subtle)] transition-transform">
+                {showAddress ? "▲" : "▼"}
+              </span>
+            </button>
           ) : null}
         </div>
 
-        {source.externalUrl ? (
-          <button
-            type="button"
-            onClick={() => setShowAddress((prev) => !prev)}
-            aria-expanded={showAddress}
-            aria-controls="media-url-drawer"
-            className="lux-badge-pill hover:text-white cursor-pointer ml-auto sm:ml-0"
-          >
-            <span>媒体源地址与技术详情</span>
-            <span id="url-drawer-chevron" className="text-[var(--lux-subtle)] transition-transform">
-              {showAddress ? "▲" : "▼"}
-            </span>
-          </button>
-        ) : null}
-      </div>
-
-      {/* Collapsible Technical URL Drawer */}
-      {source.externalUrl ? (
-        collapseTechnicalDetails ? (
-          <details className="lux-media-info-address">
-            <summary>媒体地址</summary>
-            <code>{source.externalUrl}</code>
-          </details>
-        ) : (
+        {source.externalUrl && !collapseTechnicalDetails ? (
           <div
             id="media-url-drawer"
             hidden={!showAddress}
-            className="lux-surface-panel p-4 space-y-2.5 bg-black/40 lux-media-info-address"
+            className="lux-media-address-row"
           >
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-[var(--lux-subtle)]">媒体播放地址 (已安全收纳)</span>
-              <button
-                type="button"
-                onClick={handleCopyUrl}
-                className="text-xs text-[var(--lux-silver-accent)] hover:underline flex items-center gap-1 cursor-pointer"
-              >
-                {copied ? "已复制" : "复制地址"}
-              </button>
-            </div>
-            <div
+            <code
               id="media-url-display"
-              className="p-2.5 rounded bg-black/60 border border-[var(--lux-line-soft)] font-mono text-xs text-[var(--lux-muted)] break-all select-all"
+              className="lux-media-address-value"
             >
-              <code>{source.externalUrl}</code>
-            </div>
+              {source.externalUrl}
+            </code>
+            <button
+              type="button"
+              onClick={handleCopyUrl}
+              className="lux-media-address-copy"
+            >
+              {copied ? "已复制" : "复制地址"}
+            </button>
           </div>
-        )
+        ) : null}
+      </div>
+
+      {/* Optional native disclosure variant for compact embedding contexts. */}
+      {source.externalUrl && collapseTechnicalDetails ? (
+        <details className="lux-media-info-address">
+          <summary>媒体地址</summary>
+          <code>{source.externalUrl}</code>
+        </details>
       ) : null}
 
       {/* LUX NATIVE HORIZONTAL SCROLL RAIL (精修版横向排列) */}

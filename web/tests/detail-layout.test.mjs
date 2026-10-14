@@ -179,6 +179,30 @@ test("media cast has no separator line", () => {
   assert.doesNotMatch(castRule, /border-top/);
 });
 
+test("media metadata surface shows the page image through in both themes", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const darkPanelRule = stylesheet.match(/\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const lightPanelRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(darkPanelRule, /background:\s*rgba\(22,\s*22,\s*25,\s*\.5\)/);
+  assert.match(darkPanelRule, /backdrop-filter:\s*blur\(12px\)/);
+  assert.match(lightPanelRule, /background:\s*rgba\(255,\s*255,\s*255,\s*\.5\)/);
+});
+
+test("media file address and summary share one surface with an unboxed toggle", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const fileFactsRule = stylesheet.match(/^\.lux-media-file-facts\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const addressRule = stylesheet.match(/^\.lux-media-address-row\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const toggleRule = stylesheet.match(/^\.lux-media-details-toggle\s*\{([^}]*)\}/m)?.[1] ?? "";
+
+  assert.match(fileFactsRule, /display:\s*grid/);
+  assert.match(addressRule, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/);
+  assert.match(addressRule, /border-top:\s*1px solid/);
+  assert.doesNotMatch(addressRule, /border:\s*1px solid/);
+  assert.match(toggleRule, /border:\s*0/);
+  assert.match(toggleRule, /background:\s*transparent/);
+});
+
 test("series seasons follow the cast without a separator line", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const seriesChildrenRule = stylesheet.match(/\.lux-series-children(?:,\s*\.lux-season-episodes,\s*\.lux-episode-rail)?\s*\{([^}]*)\}/)?.[1] ?? "";
