@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="500" viewBox="0 0 500 500" fill="none">
+  <defs>
+    <!-- Facet 1: Top facet gradient -->
+    <linearGradient id="luxTopFacet" x1="175" y1="25" x2="385" y2="205" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="60%" stop-color="#EEF2F8" />
+      <stop offset="100%" stop-color="#DCE2EC" />
+    </linearGradient>
+    <!-- Facet 2: Left vertical pillar gradient -->
+    <linearGradient id="luxLeftFacet" x1="110" y1="95" x2="110" y2="475" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC" />
+      <stop offset="50%" stop-color="#E2E8F0" />
+      <stop offset="100%" stop-color="#CBD5E1" />
+    </linearGradient>
+    <!-- Facet 3: Bottom-right play arrow facet gradient -->
+    <linearGradient id="luxBottomFacet" x1="185" y1="425" x2="445" y2="225" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#CBD5E1" />
+      <stop offset="60%" stop-color="#E2E8F0" />
+      <stop offset="100%" stop-color="#F8FAFC" />
+    </linearGradient>
+  </defs>
+  <g id="lux-origami-prism-logo">
+    <!-- Top Slanted Facet -->
+    <path fill="url(#luxTopFacet)" d="M 175 25 L 435 165 L 325 235 L 305 225 L 65 85 Z" />
+    <!-- Left Vertical Facet -->
+    <path fill="url(#luxLeftFacet)" d="M 55 95 L 165 165 L 165 475 L 55 385 Z" />
+    <!-- Bottom Right Facet -->
+    <path fill="url(#luxBottomFacet)" d="M 445 185 L 435 325 L 185 475 L 185 345 Z" />
+  </g>
+</svg>

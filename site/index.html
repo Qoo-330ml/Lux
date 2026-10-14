@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lux — 面向 NAS 的个人媒体服务端</title>
+  <meta name="description" content="Lux 用 Rust 重写媒体服务端：低内存、大库不卡顿，兼容 Emby 第三方客户端（VidHub、SenPlayer、Infuse 等）。">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <meta property="og:title" content="Lux — 面向 NAS 的个人媒体服务端">
+  <meta property="og:description" content="Rust 编写，大库不卡顿，兼容 Emby 第三方客户端。">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#top"><img src="assets/logo-white.svg" alt="" width="26" height="26"><span>Lux</span></a>
+    <nav>
+      <a href="#why">为什么</a>
+      <a href="#features">特性</a>
+      <a href="#screens">截图</a>
+      <a href="#start">快速开始</a>
+      <a href="docs.html">配置教程</a>
+      <a class="gh" href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="wall" aria-hidden="true"><img src="assets/posters/p01.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p02.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p03.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p04.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p05.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p06.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p07.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p08.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p09.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p10.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p11.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p12.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p13.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p14.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p15.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p16.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p17.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p18.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p19.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p20.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p21.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p22.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p23.jpg" alt="" loading="lazy" width="360" height="540"><img src="assets/posters/p24.jpg" alt="" loading="lazy" width="360" height="540"></div>
+      <img class="hero-logo" src="assets/logo-white.svg" alt="Lux" width="120" height="120">
+      <h1>大库也不卡的<br><span class="grad">个人媒体服务端</span></h1>
+      <p class="lead">Lux 用 Rust 编写，专为 NAS 设计。内存占用低、加载快、可诊断，并兼容 Emby 第三方客户端——换掉服务端，不用换播放器。</p>
+      <div class="cta">
+        <a class="btn primary" href="#start">快速开始</a>
+        <a class="btn" href="docs.html">配置教程</a>
+        <a class="btn" href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+      </div>
+      <p class="hint">Docker 一行部署 · 默认 SQLite · 可选 PostgreSQL</p>
+      <figure class="hero-shot">
+        <img src="assets/shot-library.jpg" alt="Lux 媒体库" width="1600" height="1000" fetchpriority="high">
+      </figure>
+    </section>
+
+    <section id="why" class="section">
+      <h2>为什么做 Lux</h2>
+      <p class="sub">Emby 的第三方客户端生态很好，但媒体库一大，服务端就成了负担。Lux 只解决这一件事。</p>
+      <div class="cols">
+        <div class="card"><h3>低占用</h3><p>单个 Rust 进程 + SQLite，后台任务并发有界，不会因为一次扫库吃光 NAS 的内存。</p></div>
+        <div class="card"><h3>加载快</h3><p>用户请求不做全库扫描、不调 TMDb、不跑 ffprobe；这些都在后台任务里完成。</p></div>
+        <div class="card"><h3>不换播放器</h3><p>兼容大部分 Emby 接口，VidHub、SenPlayer、Infuse 等客户端直接连接。</p></div>
+        <div class="card"><h3>纯粹本地</h3><p>不做订阅、不做下载，只做本地媒体管理——本地 NFO 与图片优先。</p></div>
+      </div>
+    </section>
+
+    <section id="features" class="section alt">
+      <h2>特性</h2>
+      <div class="grid">
+        <div class="feat"><h3>多库多根路径</h3><p>电影、电视剧、混合库；一个媒体库可配置多个根路径。</p></div>
+        <div class="feat"><h3>增量扫描</h3><p>基于文件事件；任务可暂停、恢复、取消与重试。</p></div>
+        <div class="feat"><h3>元数据管理</h3><p>NFO 与图片优先，候选匹配、字段锁定、图片管理、原子写回。</p></div>
+        <div class="feat"><h3>直放与外挂字幕</h3><p>本地直放、Range 请求、外挂字幕、多版本/多媒体源选择。</p></div>
+        <div class="feat"><h3>.strm 支持</h3><p>支持外部播放地址，播放路径不会主动探测或代理远程媒体。</p></div>
+        <div class="feat"><h3>Lux Web 与管理台</h3><p>首页、浏览、搜索、继续观看、收藏，以及完整的管理控制台。</p></div>
+        <div class="feat"><h3>用户与权限</h3><p>用户、会话、媒体库 ACL、下载权限、审计事件与结构化日志。</p></div>
+        <div class="feat"><h3>SQLite / PostgreSQL</h3><p>默认 <code>/config/lux.db</code>，也可接入外部 PostgreSQL。</p></div>
+        <div class="feat"><h3>插件运行时</h3><p>独立进程插件：TMDb、媒体探测、IP 归属地等能力。</p></div>
+      </div>
+      <p class="note">Lux 暂不支持 Web 播放（浏览器解码能力有限），请配合第三方 Emby 客户端播放。</p>
+    </section>
+
+    <section id="screens" class="section">
+      <h2>实机截图</h2>
+      <div class="shots">
+        <figure><img src="assets/shot-home.jpg" alt="Lux 首页" loading="lazy" width="1600" height="1000"><figcaption>首页</figcaption></figure>
+        <figure><img src="assets/shot-detail.jpg" alt="Lux 详情页" loading="lazy" width="1600" height="1000"><figcaption>详情页</figcaption></figure>
+        <figure><img src="assets/shot-admin.jpg" alt="Lux 管理控制台" loading="lazy" width="1600" height="1000"><figcaption>管理控制台</figcaption></figure>
+        <figure><img src="assets/shot-login.jpg" alt="Lux 登录页" loading="lazy" width="1600" height="1000"><figcaption>登录页</figcaption></figure>
+      </div>
+      <p class="note">截图来自 Lux v0.5.25 实际运行界面，使用演示数据。</p>
+    </section>
+
+    <section id="start" class="section alt">
+      <h2>快速开始</h2>
+      <p class="sub">需要 Docker Engine 与 Docker Compose v2。</p>
+      <div class="code">
+        <button class="copy" type="button" data-copy="compose">复制</button>
+<pre id="compose"><code>services:
+  lux:
+    image: pdzhou/lux:latest
+    container_name: lux
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw   # 数据库、插件、配置、日志（必须持久化）
+      - ./media:/media:rw     # 媒体库（NFO/图片写回需要读写）
+    restart: unless-stopped</code></pre>
+      </div>
+      <div class="code small">
+        <button class="copy" type="button" data-copy="up">复制</button>
+<pre id="up"><code>docker compose up -d</code></pre>
+      </div>
+      <p class="sub">打开 <code>http://localhost:8097/</code>，按引导选择数据库并创建第一个管理员。首次初始化建议只在局域网完成，之后再通过 HTTPS 反向代理或 Tailscale 对外访问。</p>
+      <p class="links"><a href="docs.html">图文配置教程（建库、刮削、连接客户端、反代）</a> · <a href="https://github.com/Qoo-330ml/Lux#readme" rel="noopener">完整文档</a> · <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/DEPLOYMENT.md" rel="noopener">部署指南</a> · <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/COMPATIBILITY.md" rel="noopener">兼容性</a> · <a href="https://hub.docker.com/r/pdzhou/lux" rel="noopener">Docker Hub</a></p>
+    </section>
+
+    <section class="section license">
+      <h2>授权说明</h2>
+      <p>Lux 为<strong>源码可见、非商业授权</strong>，不是 OSI 认可的开源项目。允许用于源码审查、安全审计、教育、测试和其他非商业用途；商业使用需版权所有者另行书面许可。完整条款见 <a href="https://github.com/Qoo-330ml/Lux/blob/main/LICENSE" rel="noopener">LICENSE</a>。</p>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>© Lux</span>
+    <a href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+    <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/CHANGELOG.md" rel="noopener">更新日志</a>
+  </footer>
+
+  <script src="main.js" defer></script>
+</body>
+</html>
