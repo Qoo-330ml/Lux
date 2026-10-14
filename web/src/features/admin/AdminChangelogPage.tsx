@@ -29,6 +29,7 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "fixed", items: [
         "修复元数据任务未处理完全部项目时误报成功、无法派发时长期排队，以及服务重启后中断任务未恢复的问题。",
         "修复 SQLite 0126 时间戳迁移无法兼容已发布数据库升级的问题。",
+        "删除媒体源时清理同目录同名的 NFO、字幕、弹幕 XML 和 -mediainfo.json 旁车；媒体文件已被外部删除时仍会校验媒体库根目录后清理，并保留其他版本的旁车文件。",
       ] },
     ],
   },
