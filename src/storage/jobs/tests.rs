@@ -1219,3 +1219,59 @@ async fn reassigned_media_source_does_not_add_a_second_default_source()
     assert_eq!(b_defaults, ["source-3"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn metadata_reidentify_job_reports_items_left_pending() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO metadata_reidentify_jobs (id, status, mode)
+             VALUES ('job', 'RUNNING', 'FILL_MISSING')",
+        )
+        .execute(database.pool())
+        .await?;
+    for (item_id, status) in [("done", "COMPLETED"), ("waiting", "PENDING")] {
+        database
+            .query("INSERT INTO media_items (id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source)
+                 VALUES (?, 'lib', 'MOVIE', 'Title', 'title', 'LOCAL_CONFIRMED', 1)")
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                 VALUES ('job', ?, ?)",
+            )
+            .bind(item_id)
+            .bind(status)
+            .execute(database.pool())
+            .await?;
+    }
+    assert!(
+        database
+            .metadata_reidentify_job_has_pending_items("job")
+            .await?
+    );
+    database
+        .query("UPDATE metadata_reidentify_job_items SET status = 'COMPLETED'")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .metadata_reidentify_job_has_pending_items("job")
+            .await?
+    );
+    database.close().await;
+    Ok(())
+}
