@@ -5630,6 +5630,338 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_global_collection_cards_page(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        let visible_source = |work_item_id: &str| {
+            format!(
+                "EXISTS (
+                    SELECT 1 FROM collection_work_sources cws
+                    JOIN media_items source_item ON source_item.id = cws.source_item_id
+                    JOIN libraries source_library
+                      ON source_library.id = source_item.library_id AND source_library.is_enabled = 1
+                    WHERE cws.work_item_id = {work_item_id}
+                      AND source_item.item_type = 'MOVIE'
+                      AND source_item.removed_at IS NULL
+                      AND source_item.has_available_source = 1
+                      AND (? = 1 OR NOT EXISTS (
+                          SELECT 1 FROM user_library_access any_visible_library
+                          WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
+                      ) OR EXISTS (
+                          SELECT 1 FROM user_library_access visible_library
+                          WHERE visible_library.user_id = ?
+                            AND visible_library.library_id = source_item.library_id
+                            AND visible_library.can_view = 1
+                      ))
+                )"
+            )
+        };
+        let visible_collection_filter = visible_source("visible_member.item_id");
+        let total = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(DISTINCT collection.id)
+                 FROM collections collection
+                 JOIN media_items collection_item ON collection_item.id = collection.item_id
+                 JOIN collection_items visible_member ON visible_member.collection_id = collection.id
+                 WHERE collection.library_id = ?
+                   AND collection_item.item_type = 'BOX_SET'
+                   AND collection_item.removed_at IS NULL
+                   AND collection_item.has_available_source = 1
+                   AND {visible_collection_filter}"
+            )))
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let visible_member_count = visible_source("member.item_id");
+        let visible_fallback_poster = |poster_column: &str| {
+            format!(
+                "(
+                    SELECT {poster_column}
+                    FROM collection_items fallback_member
+                    JOIN collection_work_sources fallback_source
+                      ON fallback_source.work_item_id = fallback_member.item_id
+                    JOIN media_items source_item ON source_item.id = fallback_source.source_item_id
+                    JOIN libraries source_library
+                      ON source_library.id = source_item.library_id AND source_library.is_enabled = 1
+                    JOIN item_images poster
+                      ON poster.item_id = source_item.id AND poster.image_type = 'POSTER'
+                    JOIN media_items work_item ON work_item.id = fallback_member.item_id
+                    WHERE fallback_member.collection_id = collection.id
+                      AND source_item.item_type = 'MOVIE'
+                      AND source_item.removed_at IS NULL
+                      AND source_item.has_available_source = 1
+                      AND (? = 1 OR NOT EXISTS (
+                          SELECT 1 FROM user_library_access any_visible_library
+                          WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
+                      ) OR EXISTS (
+                          SELECT 1 FROM user_library_access visible_library
+                          WHERE visible_library.user_id = ?
+                            AND visible_library.library_id = source_item.library_id
+                            AND visible_library.can_view = 1
+                      ))
+                    ORDER BY fallback_member.sort_order, work_item.sort_title,
+                             work_item.id, source_library.name, source_item.id,
+                             poster.image_index, poster.id
+                    LIMIT 1
+                )"
+            )
+        };
+        let query = format!(
+            "SELECT collection.item_id, collection_item.title,
+                    (SELECT COUNT(DISTINCT member.item_id)
+                     FROM collection_items member
+                     WHERE member.collection_id = collection.id
+                       AND {visible_member_count}) AS member_count,
+                    (SELECT id FROM item_images
+                     WHERE item_id = collection.item_id AND image_type = 'POSTER'
+                     ORDER BY image_index, id LIMIT 1) AS collection_poster_tag,
+                    {} AS fallback_poster_item_id,
+                    {} AS fallback_poster_image_tag
+             FROM collections collection
+             JOIN media_items collection_item ON collection_item.id = collection.item_id
+             WHERE collection.library_id = ?
+               AND collection_item.item_type = 'BOX_SET'
+               AND collection_item.removed_at IS NULL
+               AND collection_item.has_available_source = 1
+               AND EXISTS (
+                   SELECT 1 FROM collection_items visible_member
+                   WHERE visible_member.collection_id = collection.id
+                     AND {}
+               )
+             ORDER BY collection_item.sort_title, collection.item_id
+             LIMIT ? OFFSET ?",
+            visible_fallback_poster("source_item.id"),
+            visible_fallback_poster("poster.id"),
+            visible_collection_filter,
+        );
+        let mut rows = self
+            .query(sqlx::AssertSqlSafe(query))
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id);
+        rows = rows.bind(limit).bind(offset);
+        let rows = rows
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let cards = rows
+            .into_iter()
+            .map(|row| {
+                let collection_poster_tag: Option<String> = row.get("collection_poster_tag");
+                let fallback_poster_item_id: Option<String> = row.get("fallback_poster_item_id");
+                let fallback_poster_image_tag: Option<String> =
+                    row.get("fallback_poster_image_tag");
+                StoredGlobalCollection {
+                    item_id: row.get("item_id"),
+                    title: row.get("title"),
+                    member_count: row.get("member_count"),
+                    poster_item_id: collection_poster_tag
+                        .as_ref()
+                        .map(|_| row.get("item_id"))
+                        .or(fallback_poster_item_id),
+                    poster_image_tag: collection_poster_tag.or(fallback_poster_image_tag),
+                }
+            })
+            .collect();
+        Ok((cards, total))
+    }
+
+    pub(crate) async fn list_global_collection_member_ids_page(
+        &self,
+        collection_item_id: &str,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        let visible_source = "EXISTS (
+                SELECT 1 FROM collection_work_sources cws
+                JOIN media_items source_item ON source_item.id = cws.source_item_id
+                JOIN libraries source_library
+                  ON source_library.id = source_item.library_id AND source_library.is_enabled = 1
+                WHERE cws.work_item_id = member.item_id
+                  AND source_item.item_type = 'MOVIE'
+                  AND source_item.removed_at IS NULL
+                  AND source_item.has_available_source = 1
+                  AND (? = 1 OR NOT EXISTS (
+                      SELECT 1 FROM user_library_access any_visible_library
+                      WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
+                  ) OR EXISTS (
+                      SELECT 1 FROM user_library_access visible_library
+                      WHERE visible_library.user_id = ?
+                        AND visible_library.library_id = source_item.library_id
+                        AND visible_library.can_view = 1
+                  ))
+            )";
+        let base_query = format!(
+            "FROM collection_items member
+             JOIN collections collection ON collection.id = member.collection_id
+             JOIN media_items collection_item ON collection_item.id = collection.item_id
+             JOIN collection_work_items work ON work.work_item_id = member.item_id
+             JOIN media_items work_item ON work_item.id = member.item_id
+             WHERE collection.item_id = ?
+               AND collection.library_id = ?
+               AND collection_item.item_type = 'BOX_SET'
+               AND collection_item.removed_at IS NULL
+               AND collection_item.has_available_source = 1
+               AND {visible_source}"
+        );
+        let count = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(DISTINCT member.item_id) {base_query}"
+            )))
+            .bind(collection_item_id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id);
+        let total = count
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let rows = self
+            .query(sqlx::AssertSqlSafe(format!(
+                "SELECT member.item_id {base_query}
+                 ORDER BY member.sort_order, work_item.sort_title, member.item_id
+                 LIMIT ? OFFSET ?"
+            )))
+            .bind(collection_item_id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id);
+        let rows = rows
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((
+            rows.into_iter().map(|row| row.get("item_id")).collect(),
+            total,
+        ))
+    }
+
+    pub(crate) async fn list_global_collection_sources_for_works(
+        &self,
+        work_item_ids: &[String],
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<StoredGlobalCollectionSource>, StorageError> {
+        if work_item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let work_placeholders = std::iter::repeat_n("?", work_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT source_work.work_item_id, source_item.id AS source_item_id,
+                    source_item.library_id, source_library.name AS library_name,
+                    source_item.title, media_source.id AS media_source_id,
+                    media_source.edition_name, media_source.quality_label, media_source.container,
+                    user_state.last_played_at,
+                    (SELECT id FROM item_images
+                     WHERE item_id = source_item.id AND image_type = 'POSTER'
+                     ORDER BY image_index, id LIMIT 1) AS poster_image_tag
+             FROM collection_work_sources source_work
+             JOIN media_items source_item ON source_item.id = source_work.source_item_id
+             JOIN libraries source_library
+               ON source_library.id = source_item.library_id AND source_library.is_enabled = 1
+             LEFT JOIN media_sources media_source
+               ON media_source.item_id = source_item.id
+              AND (
+                  media_source.filesystem_entry_id IS NULL
+                  OR EXISTS (
+                      SELECT 1 FROM filesystem_entries source_file
+                      WHERE source_file.id = media_source.filesystem_entry_id
+                        AND source_file.is_missing = 0
+                  )
+              )
+             LEFT JOIN user_item_state user_state
+               ON user_state.item_id = source_item.id AND user_state.user_id = ?
+             WHERE source_work.work_item_id IN ({work_placeholders})
+               AND source_item.item_type = 'MOVIE'
+               AND source_item.removed_at IS NULL
+               AND source_item.has_available_source = 1
+               AND (? = 1 OR NOT EXISTS (
+                   SELECT 1 FROM user_library_access any_visible_library
+                   WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
+               ) OR EXISTS (
+                   SELECT 1 FROM user_library_access visible_library
+                   WHERE visible_library.user_id = ?
+                     AND visible_library.library_id = source_item.library_id
+                     AND visible_library.can_view = 1
+               ))
+             ORDER BY source_work.work_item_id,
+                      CASE WHEN user_state.last_played_at IS NULL THEN 1 ELSE 0 END,
+                      user_state.last_played_at DESC,
+                      source_library.name, source_item.id,
+                      media_source.is_default DESC, media_source.id"
+        );
+        let mut rows = self.query(sqlx::AssertSqlSafe(query)).bind(user_id);
+        for work_item_id in work_item_ids {
+            rows = rows.bind(work_item_id);
+        }
+        rows = rows
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id);
+        let rows = rows
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| StoredGlobalCollectionSource {
+                work_item_id: row.get("work_item_id"),
+                source_item_id: row.get("source_item_id"),
+                library_id: row.get("library_id"),
+                library_name: row.get("library_name"),
+                title: row.get("title"),
+                media_source_id: row.get("media_source_id"),
+                edition_name: row.get("edition_name"),
+                quality_label: row.get("quality_label"),
+                container: row.get("container"),
+                last_played_at: row.get("last_played_at"),
+                poster_image_tag: row.get("poster_image_tag"),
+            })
+            .collect())
+    }
+
     /// Rebuild one global collection and its logical movie works in one transaction.
     /// The outbox generation lock prevents a concurrent reference change from being lost.
     pub(crate) async fn sync_global_collection(
@@ -8028,6 +8360,224 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(system_library_exists, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_collection_reads_filter_members_and_copies_by_accessible_library()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let visible_library = libraries
+            .create_library("Visible Movies", LibraryKind::Movie, false)
+            .await?;
+        let hidden_library = libraries
+            .create_library("Hidden Movies", LibraryKind::Movie, false)
+            .await?;
+        let empty_library = libraries
+            .create_library("Empty Movies", LibraryKind::Movie, false)
+            .await?;
+        let users = crate::auth::users::UserStore::new(database.clone())?;
+        let viewer = users
+            .create_user(
+                "collection-viewer",
+                "Collection Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        database
+            .set_user_library_access(
+                &viewer.id.to_string(),
+                &visible_library.id.to_string(),
+                true,
+            )
+            .await?;
+
+        for (item_id, library_id, movie_id, collection_id, collection_title, year) in [
+            (
+                "visible-alpha-one",
+                visible_library.id.to_string(),
+                "movie-one",
+                "series-alpha",
+                "Alpha Collection",
+                2020,
+            ),
+            (
+                "hidden-alpha-one",
+                hidden_library.id.to_string(),
+                "movie-one",
+                "series-alpha",
+                "Alpha Collection",
+                2020,
+            ),
+            (
+                "hidden-alpha-two",
+                hidden_library.id.to_string(),
+                "movie-two",
+                "series-alpha",
+                "Alpha Collection",
+                2021,
+            ),
+            (
+                "visible-beta-one",
+                visible_library.id.to_string(),
+                "movie-three",
+                "series-beta",
+                "Beta Collection",
+                2022,
+            ),
+            (
+                "visible-beta-two",
+                visible_library.id.to_string(),
+                "movie-four",
+                "series-beta",
+                "Beta Collection",
+                2023,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, production_year,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'ONLINE_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library_id)
+            .bind(item_id)
+            .bind(item_id.to_lowercase())
+            .bind(year)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO collection_item_references (
+                     item_id, movie_provider, movie_provider_id, collection_provider,
+                     collection_provider_id, collection_title, sort_order
+                 ) VALUES (?, 'tmdb', ?, 'tmdb', ?, ?, ?)",
+            )
+            .bind(item_id)
+            .bind(movie_id)
+            .bind(collection_id)
+            .bind(collection_title)
+            .bind(year)
+            .execute(database.pool())
+            .await?;
+        }
+        for job in database.list_pending_global_collection_syncs(10).await? {
+            database
+                .sync_global_collection(
+                    &job.collection_provider,
+                    &job.collection_provider_id,
+                    job.generation,
+                )
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+             VALUES ('visible-alpha-poster', 'visible-alpha-one', 'POSTER', 0, '/visible.jpg'),
+                    ('hidden-alpha-poster', 'hidden-alpha-two', 'POSTER', 0, '/hidden.jpg')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, last_played_at)
+             VALUES (?, 'visible-alpha-one', 10), (?, 'hidden-alpha-one', 20)",
+        )
+        .bind(viewer.id.to_string())
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let (first_page, first_total) = database
+            .list_global_collection_cards_page(&viewer.id.to_string(), false, 0, 1)
+            .await?;
+        assert_eq!(first_total, 2);
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].title, "Alpha Collection");
+        assert_eq!(first_page[0].member_count, 1);
+        assert_eq!(
+            first_page[0].poster_item_id.as_deref(),
+            Some("visible-alpha-one")
+        );
+        assert_eq!(
+            first_page[0].poster_image_tag.as_deref(),
+            Some("visible-alpha-poster")
+        );
+        let (second_page, second_total) = database
+            .list_global_collection_cards_page(&viewer.id.to_string(), false, 1, 1)
+            .await?;
+        assert_eq!(second_total, 2);
+        assert_eq!(second_page[0].title, "Beta Collection");
+        assert_eq!(second_page[0].member_count, 2);
+
+        let (alpha_member_ids, alpha_total) = database
+            .list_global_collection_member_ids_page(
+                &first_page[0].item_id,
+                &viewer.id.to_string(),
+                false,
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(alpha_total, 1);
+        let sources = database
+            .list_global_collection_sources_for_works(
+                &alpha_member_ids,
+                &viewer.id.to_string(),
+                false,
+            )
+            .await?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_item_id, "visible-alpha-one");
+        assert_eq!(sources[0].library_id, visible_library.id.to_string());
+        assert_eq!(sources[0].last_played_at, Some(10));
+        assert_eq!(
+            sources[0].poster_image_tag.as_deref(),
+            Some("visible-alpha-poster")
+        );
+
+        let isolated_user = users
+            .create_user(
+                "collection-isolated",
+                "Collection Isolated",
+                "test password",
+                false,
+            )
+            .await?;
+        database
+            .set_user_library_access(
+                &isolated_user.id.to_string(),
+                &empty_library.id.to_string(),
+                true,
+            )
+            .await?;
+        let (hidden_cards, hidden_total) = database
+            .list_global_collection_cards_page(&isolated_user.id.to_string(), false, 0, 10)
+            .await?;
+        assert!(hidden_cards.is_empty());
+        assert_eq!(hidden_total, 0);
+        let (_, hidden_members_total) = database
+            .list_global_collection_member_ids_page(
+                &first_page[0].item_id,
+                &isolated_user.id.to_string(),
+                false,
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(hidden_members_total, 0);
+        let (admin_cards, admin_total) = database
+            .list_global_collection_cards_page(&viewer.id.to_string(), true, 0, 10)
+            .await?;
+        assert_eq!(admin_total, 2);
+        assert_eq!(admin_cards[0].member_count, 2);
         Ok(())
     }
 
