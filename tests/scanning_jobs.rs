@@ -3561,6 +3561,91 @@ async fn manifest_scan_queues_attachment_changes_without_reprobing_unchanged_vid
 }
 
 #[tokio::test]
+async fn manifest_scan_queues_attachment_removal_only_after_root_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Removal Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Removal.Movie.2024.mkv"), b"video").await?;
+    let subtitle_path = "Removal Movie (2024)/Removal.Movie.2024.en.srt";
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let moved_root = temp_dir.path().join("Movies-unmounted");
+    tokio::fs::rename(&root, &moved_root).await?;
+    let unavailable = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&unavailable.id, 100, None).await?;
+    let unavailable_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unavailable.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unavailable_events, 0);
+    let root_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&unavailable.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(root_state, "UNAVAILABLE");
+
+    tokio::fs::rename(&moved_root, &root).await?;
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_event: (String, String) = sqlx::query_as(
+        "SELECT relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND library_root_id = ?",
+    )
+    .bind(&removed.id)
+    .bind(root_record.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        removed_event,
+        (subtitle_path.to_owned(), "REMOVE".to_owned())
+    );
+    let missing: i64 = sqlx::query_scalar(
+        "SELECT is_missing FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing, 1);
+    let removal_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&removed.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(removal_targets, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_commits_positive_manifest_indexes_during_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

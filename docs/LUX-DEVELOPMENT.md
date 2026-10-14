@@ -11336,7 +11336,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 #### LUX-539：增量扫描发现外挂字幕和媒体信息文件
 
-范围：将外挂字幕与 `*-mediainfo.json` 纳入增量文件发现，按具体路径登记 ADD、CHANGE、REMOVE。仅文件状态或 fingerprint 确实变化时排队；未知 JSON、未变化文件不排队。这是 LUX-538 文件队列的增量发现切片。现有 NFO/图片/XML/EDL 处理暂沿原消费者路径，后续 LUX-542 会将有定义的消费者迁到按文件处理并移除目录级重复调度。
+范围：将外挂字幕与 `*-mediainfo.json` 纳入增量文件发现，按具体路径登记 ADD、CHANGE、REMOVE。仅文件状态或 fingerprint 确实变化时排队；未知 JSON、未变化文件不排队。这是 LUX-538 文件队列的增量发现切片。现有 NFO/图片/XML/EDL 处理暂沿原消费者路径，后续 LUX-543 会将有定义的消费者迁到按文件处理并移除目录级重复调度。
 
 验收：
 
@@ -11363,21 +11363,35 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证：Manifest 定向扫描作业回归、build、fmt、all-features Clippy 与 diff 检查。
 
-#### LUX-541：持久 reconciliation 登记精确文件变化
+#### LUX-541：Manifest 确认删除登记精确文件变化
 
-范围：让 Manifest 的确认删除及持久 reconciliation 发现外挂字幕与 `*-mediainfo.json`，并在文件状态确认与文件事件队列提交时使用同一事务。删除事件只有在 root 可用且缺失确认成功后登记。
+范围：让 Manifest 的确认删除为外挂字幕与 `*-mediainfo.json` 登记精确 REMOVE 事件，并在文件状态更新与队列提交时使用同一事务。Reconciliation 由 LUX-542 单独接入。
 
 验收：
 
-- [ ] Manifest 和 reconciliation 对新增、变化及确认删除的字幕和媒体信息文件按精确路径及 root 入队；未变化路径不入队。
+- [ ] Manifest 只在 root 可用且缺失 fencing 确认成功后按精确路径及 root 登记 REMOVE；未确认缺失、不可用 root 不登记事件。
+- [ ] Manifest delta 状态与 REMOVE 队列事件在同一事务提交，取消、重试和恢复不会丢失已提交事件。
+- [ ] 被删除附件不会触发同目录其他媒体的 metadata/thumbnail target，也不改未变化视频状态。
+
+预计代码文件（3 个）：`src/application/scanner/jobs/manifest_index.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
+
+验证：Manifest removal 定向扫描作业回归、build、fmt、all-features Clippy 与 diff 检查。
+
+#### LUX-542：持久 reconciliation 登记精确文件变化
+
+范围：让持久 reconciliation 发现外挂字幕与 `*-mediainfo.json`，并为新增、变化和确认删除登记精确文件事件。应用层将 ADD/CHANGE 类型随批次传入 storage；事件与 filesystem 状态在同一事务提交。删除事件只有在 root 可用且二次缺失确认成功后登记。
+
+验收：
+
+- [ ] reconciliation 对新增、变化及确认删除的字幕和媒体信息文件按精确路径及 root 入队；未变化路径不入队。
 - [ ] 取消、重试和恢复不丢失已提交事件；不可用 root 或无法确认的缺失不登记 REMOVE。
-- [ ] reconciliation 使用与增量扫描、Manifest 相同的文件分类和 change kind 语义，且不重新探测未变化视频。
+- [ ] 使用与增量扫描和 Manifest 相同的分类、change kind 语义，且不重新探测未变化视频。
 
-预计代码文件（5 个）：`src/application/scanner/jobs/manifest_index.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`src/storage/jobs/scan/reconciliation.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
+预计代码文件（4 个）：`src/application/scanner/jobs/reconciliation.rs`、`src/storage/repository.rs`、`src/storage/jobs/scan/reconciliation.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
-验证：Manifest removal 与持久 reconciliation 定向扫描作业回归、build、fmt、all-features Clippy 与 diff 检查。
+验证：持久 reconciliation 定向扫描作业回归、build、fmt、all-features Clippy 与 diff 检查。
 
-#### LUX-542：按文件变化同步依赖数据
+#### LUX-543：按文件变化同步依赖数据
 
 范围：消费旁车文件队列并按类型更新依赖数据。外挂字幕只增删/更新对应外部轨道；媒体信息 JSON 只更新实际依赖它的 STRM/来源信息；NFO、图片、danmaku XML 只更新各自结果。视频本身未变时保留内嵌轨道和技术信息。失败保留上次有效结果，处理成功后完成精确文件队列项。
 
@@ -11388,7 +11402,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 - [ ] 同目录多媒体、文件改名、相同路径内容变化、重复扫描、无效文件、文件删除和扫描取消/恢复都有覆盖；旧库可由全量扫描修复。
 - [ ] worker 使用有界批处理和输入版本检查，旧任务不能覆盖更新文件结果；数据库变化兼容 SQLite 与 PostgreSQL。
 
-预计文件：实施前按 LUX-538 至 LUX-541 的最终 worker/存储边界拆成不超过 5 个文件的可提交增量。
+预计文件：实施前按 LUX-538 至 LUX-542 的最终 worker/存储边界拆成不超过 5 个文件的可提交增量。
 
 验证：字幕、扫描、媒体信息、NFO/图片与 danmaku 对应的最窄集成目标；完整 Rust 完成检查、兼容性记录和 diff 检查。不得以定向测试替代规格要求的完成门。
 
