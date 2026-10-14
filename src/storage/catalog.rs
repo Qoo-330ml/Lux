@@ -8103,15 +8103,21 @@ mod tests {
         let mut pending = database.list_pending_global_collection_syncs(10).await?;
         assert_eq!(pending.len(), 1);
         let job = pending.pop().ok_or("expected one collection sync job")?;
-        assert!(
-            database
-                .sync_global_collection(
-                    &job.collection_provider,
-                    &job.collection_provider_id,
-                    job.generation,
-                )
-                .await?
+        let first_database = database.clone();
+        let second_database = database.clone();
+        let (first_sync, second_sync) = tokio::join!(
+            first_database.sync_global_collection(
+                &job.collection_provider,
+                &job.collection_provider_id,
+                job.generation,
+            ),
+            second_database.sync_global_collection(
+                &job.collection_provider,
+                &job.collection_provider_id,
+                job.generation,
+            )
         );
+        assert_eq!((first_sync?, second_sync?), (true, false));
         let collection_id: String = sqlx::query_scalar(
             "SELECT id FROM collections
              WHERE library_id = ? AND provider = 'tmdb' AND provider_id = 'series-1'",
@@ -8220,6 +8226,57 @@ mod tests {
         assert_eq!(restored.1, original_collection_item_id);
         assert_eq!(restored.2, 2);
         assert_eq!(restored_work_ids, original_work_ids);
+
+        sqlx::query(
+            "UPDATE collection_item_references
+             SET collection_provider_id = 'series-2', collection_title = 'Series Two'
+             WHERE item_id = 'movie-c'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query("UPDATE media_items SET removed_at = NULL WHERE id = 'movie-b'")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "UPDATE collection_item_references
+             SET collection_provider_id = 'series-2', collection_title = 'Series Two'
+             WHERE item_id = 'movie-b'",
+        )
+        .execute(database.pool())
+        .await?;
+        let correction_jobs = database.list_pending_global_collection_syncs(10).await?;
+        assert_eq!(correction_jobs.len(), 2);
+        for job in correction_jobs {
+            assert!(
+                database
+                    .sync_global_collection(
+                        &job.collection_provider,
+                        &job.collection_provider_id,
+                        job.generation,
+                    )
+                    .await?
+            );
+        }
+        let old_series_members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM collection_items WHERE collection_id = ?")
+                .bind(&collection_id)
+                .fetch_one(database.pool())
+                .await?;
+        let corrected_series_counts: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM collections
+                  WHERE library_id = ? AND provider = 'tmdb' AND provider_id = 'series-2'),
+                 (SELECT COUNT(*) FROM collection_items member
+                  JOIN collections collection ON collection.id = member.collection_id
+                  WHERE collection.library_id = ?
+                    AND collection.provider = 'tmdb' AND collection.provider_id = 'series-2')",
+        )
+        .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+        .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(old_series_members, 0);
+        assert_eq!(corrected_series_counts, (1, 2));
         Ok(())
     }
 
