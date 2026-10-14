@@ -203,7 +203,9 @@ TMDb 插件的 `originalLanguageEnabled` 默认关闭。启用后，电影/剧�
 Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 Emby token/API key 可删除媒体源；
 `MediaSourceId` 用于选择版本，省略时沿用 Lux 管理删除服务的整条目语义，成功返回 `204`。普通用户
 返回 `403`，未知条目或媒体源返回 `404`。媒体详情 DTO 的 `CanDelete` 与该服务器管理权限保持一致，
-不会再固定返回 `false`。这只是协议回归证据，尚未据此宣称任一目标客户端的真实删除 UI 已实测。
+不会再固定返回 `false`。删除会清理同目录同 basename 的 NFO、字幕和弹幕 XML，以及 `.strm` 的
+`-mediainfo.json` 旁车；即使媒体文件已被外部删除，仍会在根路径校验通过后清理这些旁车。这只是协议回归证据，
+尚未据此宣称任一目标客户端的真实删除 UI 已实测。
 
 ## Emby 增量同步状态兼容合同
 
