@@ -3836,6 +3836,38 @@ async fn incremental_scan_syncs_only_the_changed_danmaku_xml_result()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(metadata_state, "LOCAL_CONFIRMED");
+
+    tokio::fs::write(root.join(xml_path), valid_xml).await?;
+    let full_rescan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&full_rescan.id, 100, None).await?;
+    let full_rescan_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&full_rescan.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(full_rescan_event, ("ADD".to_owned(), "DONE".to_owned()));
+    let full_rescan_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&full_rescan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(full_rescan_targets, 0);
+    let full_rescan_track: (Option<Vec<u8>>, String) =
+        sqlx::query_as("SELECT fingerprint, status FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(full_rescan_track.0.is_some());
+    assert_eq!(full_rescan_track.1, "READY");
+    let final_metadata_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_metadata_state, "LOCAL_CONFIRMED");
     Ok(())
 }
 

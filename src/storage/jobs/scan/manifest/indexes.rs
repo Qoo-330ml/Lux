@@ -424,7 +424,11 @@ pub(super) fn is_file_change_only_sidecar_path(relative_path: &str) -> bool {
         .file_name()
         .and_then(|file_name| file_name.to_str())
         .is_some_and(|file_name| file_name.to_ascii_lowercase().ends_with("-mediainfo.json"));
-    is_external_subtitle || is_media_info
+    let is_danmaku_xml = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"));
+    is_external_subtitle || is_media_info || is_danmaku_xml
 }
 
 fn record_manifest_file_change_applied<'a>(
