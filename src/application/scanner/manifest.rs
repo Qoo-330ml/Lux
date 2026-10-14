@@ -30,9 +30,8 @@ use super::{
     LibraryScanner, MANIFEST_STREAMED_ENTRY_BATCH_SIZE, MAX_STRM_TARGET_BYTES,
     ManifestFilenameInput, MixedClassification, PreparedManifestFilename, ScannerError,
     infer_sibling_movie_variant_suffix, is_strm_file, is_supported_movie_file,
-    is_supported_sidecar_file, manifest_entry_observation, manifest_entry_observation_from_stat,
-    movie_folder_provider_ids, prepare_manifest_filename,
-    prepare_manifest_filename_with_variant_suffix,
+    manifest_entry_observation, manifest_entry_observation_from_stat, movie_folder_provider_ids,
+    prepare_manifest_filename, prepare_manifest_filename_with_variant_suffix,
 };
 
 pub(super) struct ManifestDirectoryBatch {
@@ -549,7 +548,7 @@ impl ManifestDirectoryReader {
             if !(is_directory
                 || is_regular_file
                     && (is_supported_movie_file(Path::new(name))
-                        || is_supported_sidecar_file(Path::new(name))))
+                        || super::library::is_supported_incremental_sidecar_file(Path::new(name))))
             {
                 continue;
             }
@@ -1471,7 +1470,8 @@ pub(super) async fn prepare_manifest_observation(
     }
     let path = root_path.join(&observed.relative_path);
     let is_media = is_supported_movie_file(Path::new(&observed.relative_path));
-    let is_sidecar = is_supported_sidecar_file(Path::new(&observed.relative_path));
+    let is_sidecar =
+        super::library::is_supported_incremental_sidecar_file(Path::new(&observed.relative_path));
     if !is_media && !is_sidecar {
         return ManifestDeltaPreparation::Unstable { delta_id };
     }
@@ -1762,7 +1762,8 @@ impl ManifestDirectoryReader {
             })?;
             if !(file_type.is_dir()
                 || file_type.is_file()
-                    && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
+                    && (is_supported_movie_file(&path)
+                        || super::library::is_supported_incremental_sidecar_file(&path)))
             {
                 continue;
             }

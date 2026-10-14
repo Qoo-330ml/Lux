@@ -1,5 +1,6 @@
 use super::deltas::ManifestDeltaApplyOutcome;
 use super::*;
+use std::path::Path;
 
 impl Database {
     pub(super) async fn finalize_manifest_delta_batch<'data>(
@@ -18,6 +19,42 @@ impl Database {
             removed_media_entry_ids,
             delta_updates,
         } = outcome;
+
+        let mut file_change_events = Vec::new();
+        for path in &changed_sidecar_paths {
+            if !super::super::indexes::is_file_change_only_sidecar_path(path) {
+                continue;
+            }
+            let delta = batch
+                .deltas
+                .iter()
+                .find(|delta| delta.relative_path == *path)
+                .ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest sidecar event has no matching delta".to_owned(),
+                    )
+                })?;
+            let change_kind = if matches!(delta.delta_kind.as_str(), "ADD" | "REAPPEARED") {
+                "ADD"
+            } else {
+                "CHANGE"
+            };
+            file_change_events.push((path.as_str(), change_kind));
+        }
+        file_change_events.extend(
+            removed_sidecar_paths
+                .iter()
+                .filter(|path| super::super::indexes::is_file_change_only_sidecar_path(path))
+                .map(|path| (path.as_str(), "REMOVE")),
+        );
+        self.record_manifest_file_changes_in_transaction(
+            transaction,
+            batch.job_id,
+            batch.library_root_id,
+            &file_change_events,
+        )
+        .await?;
+
         for chunk in delta_updates.chunks(SCAN_MANIFEST_DELTA_BATCH_SIZE) {
             let state_cases = std::iter::repeat_n("WHEN ? THEN ?", chunk.len())
                 .collect::<Vec<_>>()
@@ -82,7 +119,15 @@ impl Database {
                 )
                 .await?;
         }
-        for paths in [&changed_sidecar_paths, &removed_sidecar_paths] {
+        let legacy_changed_sidecar_paths = changed_sidecar_paths
+            .iter()
+            .filter(|path| !super::super::indexes::is_file_change_only_sidecar_path(path))
+            .collect::<Vec<_>>();
+        let legacy_removed_sidecar_paths = removed_sidecar_paths
+            .iter()
+            .filter(|path| !super::super::indexes::is_file_change_only_sidecar_path(path))
+            .collect::<Vec<_>>();
+        for paths in [&legacy_changed_sidecar_paths, &legacy_removed_sidecar_paths] {
             let directories = prune_sidecar_directories(
                 paths
                     .iter()
