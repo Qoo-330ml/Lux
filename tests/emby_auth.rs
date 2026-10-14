@@ -1113,6 +1113,20 @@ async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts
     let client = reqwest::Client::new();
     let invalid = "invalid-test-credential";
     for prefix in ["", "/emby"] {
+        // Public discovery and password login do not authenticate with query tokens.
+        let public = client
+            .get(format!("http://{address}{prefix}/System/Info/Public"))
+            .query(&[("api_key", invalid), ("api_key", invalid)])
+            .send()
+            .await?;
+        assert_eq!(public.status(), reqwest::StatusCode::OK);
+        let password_login = client
+            .post(format!("http://{address}{prefix}/Users/AuthenticateByName"))
+            .query(&[("api_key", invalid), ("api_key", invalid)])
+            .json(&json!({"Username": "Viewer", "Pw": "viewer password"}))
+            .send()
+            .await?;
+        assert_eq!(password_login.status(), reqwest::StatusCode::OK);
         for (label, query, expected) in [
             (
                 "same values",
