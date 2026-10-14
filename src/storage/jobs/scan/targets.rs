@@ -51,6 +51,171 @@ pub(in crate::storage::repository::jobs) fn sidecar_target_query(values: &str) -
 }
 
 impl Database {
+    // These durable queue operations are wired into scanner dispatch in LUX-539.
+    #[allow(dead_code)]
+    pub(crate) async fn record_scan_job_file_change(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+        change_kind: &str,
+    ) -> Result<bool, StorageError> {
+        let path = Path::new(relative_path);
+        if relative_path.trim().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(StorageError::Conflict(
+                "invalid scan file change path".to_owned(),
+            ));
+        }
+        if !matches!(change_kind, "ADD" | "CHANGE" | "REMOVE") {
+            return Err(StorageError::Conflict(
+                "invalid scan file change kind".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "INSERT INTO scan_job_file_changes (
+                     job_id, library_root_id, relative_path, change_kind
+                 ) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(job_id, library_root_id, relative_path) DO UPDATE SET
+                     change_kind = excluded.change_kind,
+                     processing_state = 'PENDING', error = NULL,
+                     revision = scan_job_file_changes.revision + 1,
+                     updated_at = unixepoch()
+                 WHERE scan_job_file_changes.change_kind <> excluded.change_kind
+                    OR scan_job_file_changes.processing_state <> 'PENDING'
+                    OR scan_job_file_changes.error IS NOT NULL",
+            )
+            .bind(job_id)
+            .bind(library_root_id)
+            .bind(relative_path)
+            .bind(change_kind)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn list_pending_scan_job_file_changes(
+        &self,
+        job_id: &str,
+        after: Option<&StoredScanJobPath>,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJobPath>, StorageError> {
+        let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
+        let rows = if let Some(after) = after {
+            self.query(
+                "SELECT library_root_id, relative_path, change_kind, revision
+                 FROM scan_job_file_changes
+                 WHERE job_id = ? AND processing_state = 'PENDING'
+                   AND (relative_path > ?
+                        OR (relative_path = ? AND library_root_id > ?))
+                 ORDER BY relative_path, library_root_id
+                 LIMIT ?",
+            )
+            .bind(job_id)
+            .bind(&after.relative_path)
+            .bind(&after.relative_path)
+            .bind(&after.library_root_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query(
+                "SELECT library_root_id, relative_path, change_kind, revision
+                 FROM scan_job_file_changes
+                 WHERE job_id = ? AND processing_state = 'PENDING'
+                 ORDER BY relative_path, library_root_id
+                 LIMIT ?",
+            )
+            .bind(job_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| StoredScanJobPath {
+                library_root_id: row.get("library_root_id"),
+                relative_path: row.get("relative_path"),
+                change_kind: row.get("change_kind"),
+                file_change_revision: Some(row.get("revision")),
+            })
+            .collect())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn requeue_running_scan_job_file_changes(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_job_file_changes
+             SET processing_state = 'PENDING', error = NULL, updated_at = unixepoch()
+             WHERE job_id = ? AND processing_state = 'RUNNING'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn set_scan_job_file_change_state(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+        revision: i64,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if !matches!(state, "PENDING" | "RUNNING" | "DONE" | "FAILED" | "SKIPPED") {
+            return Err(StorageError::Conflict(
+                "invalid scan file change state".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE scan_job_file_changes
+                 SET processing_state = ?, error = ?, updated_at = unixepoch()
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ?
+                   AND (processing_state <> ? OR error IS DISTINCT FROM ?)",
+            )
+            .bind(state)
+            .bind(error)
+            .bind(job_id)
+            .bind(library_root_id)
+            .bind(relative_path)
+            .bind(revision)
+            .bind(state)
+            .bind(error)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub(crate) async fn record_scan_job_targets(
         &self,
         job_id: &str,

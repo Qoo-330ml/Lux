@@ -28,7 +28,8 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         self.query(
-            "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation, ms.item_id,
+            "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation,
+                    fe.is_missing, ms.item_id,
                     CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                         AS parent_identity_key,
                     item.item_type AS item_type,
@@ -67,7 +68,8 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation, ms.item_id,
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation,
+                        fe.is_missing, ms.item_id,
                         CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                             AS parent_identity_key,
                         item.item_type AS item_type,
@@ -129,7 +131,8 @@ impl Database {
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         let rows = self
             .query(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation, ms.item_id,
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation,
+                        fe.is_missing, ms.item_id,
                         CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                             AS parent_identity_key,
                         item.item_type AS item_type,

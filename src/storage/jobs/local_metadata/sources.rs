@@ -15,6 +15,23 @@ impl Database {
         &self,
         filesystem_entry_ids: &[String],
     ) -> Result<Vec<StoredScanLocalMetadataSource>, StorageError> {
+        self.list_scan_local_metadata_sources_inner(filesystem_entry_ids, false)
+            .await
+    }
+
+    pub(crate) async fn list_scan_local_metadata_sources_for_file_change(
+        &self,
+        filesystem_entry_ids: &[String],
+    ) -> Result<Vec<StoredScanLocalMetadataSource>, StorageError> {
+        self.list_scan_local_metadata_sources_inner(filesystem_entry_ids, true)
+            .await
+    }
+
+    async fn list_scan_local_metadata_sources_inner(
+        &self,
+        filesystem_entry_ids: &[String],
+        include_missing_directory_anchors: bool,
+    ) -> Result<Vec<StoredScanLocalMetadataSource>, StorageError> {
         let mut referenced_directories = Vec::new();
         let mut seen_directories = std::collections::HashSet::new();
         for entry_ids in filesystem_entry_ids.chunks(SCAN_DML_CHUNK_SIZE) {
@@ -24,10 +41,15 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", entry_ids.len())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let entry_filter = if include_missing_directory_anchors {
+                "entry_kind = 'FILE'"
+            } else {
+                "entry_kind = 'FILE' AND is_missing = 0"
+            };
             let query = format!(
                 "SELECT DISTINCT library_root_id, relative_path
                  FROM filesystem_entries
-                 WHERE id IN ({placeholders}) AND entry_kind = 'FILE' AND is_missing = 0"
+                 WHERE id IN ({placeholders}) AND {entry_filter}"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for entry_id in entry_ids {

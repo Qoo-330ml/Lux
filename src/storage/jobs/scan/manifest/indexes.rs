@@ -153,7 +153,11 @@ impl Database {
                             changed_sidecar_paths.push(positive.relative_path.clone());
                         }
                     }
-                    record_manifest_positive_applied(&mut result, positive);
+                    if is_file_change_only_sidecar_path(&positive.relative_path) {
+                        record_manifest_file_change_applied(&mut result, positive);
+                    } else {
+                        record_manifest_positive_applied(&mut result, positive);
+                    }
                 }
                 "CHANGE" | "REAPPEARED" => {
                     let Some(filesystem_entry_id) = positive.base_filesystem_entry_id.as_deref()
@@ -247,7 +251,11 @@ impl Database {
                                 .await?;
                             if applied {
                                 changed_sidecar_paths.push(positive.relative_path.clone());
-                                record_manifest_positive_applied(&mut result, positive);
+                                if is_file_change_only_sidecar_path(&positive.relative_path) {
+                                    record_manifest_file_change_applied(&mut result, positive);
+                                } else {
+                                    record_manifest_positive_applied(&mut result, positive);
+                                }
                             }
                         }
                     }
@@ -283,8 +291,40 @@ impl Database {
             0,
         );
 
+        let mut file_change_events = Vec::new();
+        for path in &changed_sidecar_paths {
+            if !is_file_change_only_sidecar_path(path) {
+                continue;
+            }
+            let positive = positives
+                .iter()
+                .find(|positive| positive.relative_path == *path)
+                .ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest sidecar event has no matching positive index".to_owned(),
+                    )
+                })?;
+            let change_kind = if matches!(positive.delta_kind.as_str(), "ADD" | "REAPPEARED") {
+                "ADD"
+            } else {
+                "CHANGE"
+            };
+            file_change_events.push((path.as_str(), change_kind));
+        }
+        self.record_manifest_file_changes_in_transaction(
+            transaction,
+            job_id,
+            library_root_id,
+            &file_change_events,
+        )
+        .await?;
+
+        let legacy_changed_sidecar_paths = changed_sidecar_paths
+            .iter()
+            .filter(|path| !is_file_change_only_sidecar_path(path))
+            .collect::<Vec<_>>();
         let sidecar_directories = prune_sidecar_directories(
-            changed_sidecar_paths
+            legacy_changed_sidecar_paths
                 .iter()
                 .filter_map(|path| {
                     Path::new(path)
@@ -317,5 +357,112 @@ impl Database {
             sidecar_directories.len(),
         );
         Ok(result)
+    }
+
+    pub(super) async fn record_manifest_file_changes_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        library_root_id: &str,
+        changes: &[(&str, &str)],
+    ) -> Result<bool, StorageError> {
+        if changes.is_empty() {
+            return Ok(false);
+        }
+        let chunk_size = (super::manifest_path_query_chunk_size(self.backend()) / 4).max(1);
+        let mut changed = false;
+        for chunk in changes.chunks(chunk_size) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO scan_job_file_changes (
+                     job_id, library_root_id, relative_path, change_kind
+                 ) VALUES {values}
+                 ON CONFLICT(job_id, library_root_id, relative_path) DO UPDATE SET
+                     change_kind = excluded.change_kind,
+                     processing_state = 'PENDING', error = NULL,
+                     revision = scan_job_file_changes.revision + 1,
+                     updated_at = unixepoch()
+                 WHERE scan_job_file_changes.change_kind <> excluded.change_kind
+                    OR scan_job_file_changes.processing_state <> 'PENDING'
+                    OR scan_job_file_changes.error IS NOT NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (relative_path, change_kind) in chunk {
+                statement = statement
+                    .bind(job_id)
+                    .bind(library_root_id)
+                    .bind(relative_path)
+                    .bind(change_kind);
+            }
+            let result = statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            changed |= result.rows_affected() > 0;
+        }
+        Ok(changed)
+    }
+}
+
+pub(super) fn is_file_change_only_sidecar_path(relative_path: &str) -> bool {
+    let path = Path::new(relative_path);
+    let is_external_subtitle = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup"
+            )
+        });
+    let is_media_info = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.to_ascii_lowercase().ends_with("-mediainfo.json"));
+    let is_danmaku_xml = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"));
+    let is_nfo = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"));
+    let is_image = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp"
+            )
+        });
+    let is_unconsumed_edl = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("edl"));
+    is_external_subtitle
+        || is_media_info
+        || is_danmaku_xml
+        || is_nfo
+        || is_image
+        || is_unconsumed_edl
+}
+
+fn record_manifest_file_change_applied<'a>(
+    result: &mut ManifestDiscoveryPositiveIndexResult<'a>,
+    positive: &'a NewScanManifestPositiveIndex,
+) {
+    result.indexed_paths.push(positive.relative_path.as_str());
+    result.applied_count = result.applied_count.saturating_add(1);
+    match positive.delta_kind.as_str() {
+        "ADD" => result.add_count = result.add_count.saturating_add(1),
+        "CHANGE" => result.change_count = result.change_count.saturating_add(1),
+        "REAPPEARED" => result.reappeared_count = result.reappeared_count.saturating_add(1),
+        _ => {}
     }
 }

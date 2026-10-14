@@ -16,6 +16,7 @@ struct ReconciliationFileBatchState {
     changed_paths_by_root: HashMap<String, Vec<String>>,
     new_paths_by_root: HashMap<String, Vec<String>>,
     changed_sidecar_paths_by_root: HashMap<String, Vec<String>>,
+    file_change_events_by_root: HashMap<String, Vec<(String, String)>>,
     new_works_by_root: HashMap<String, Vec<ReconciliationScanWork>>,
     root_has_existing_index: HashMap<String, bool>,
     quick_seen_entry_ids: HashMap<String, Vec<String>>,
@@ -53,6 +54,7 @@ struct MovieReconciliationFileBatchState {
     changed_paths_by_root: HashMap<String, Vec<String>>,
     new_paths_by_root: HashMap<String, Vec<String>>,
     changed_sidecar_paths_by_root: HashMap<String, Vec<String>>,
+    file_change_events_by_root: HashMap<String, Vec<(String, String)>>,
     quick_seen_entry_ids: HashMap<String, Vec<String>>,
     missing_paths_by_root: HashMap<String, Vec<String>>,
     new_files: Vec<(
@@ -140,7 +142,8 @@ impl ScanJobService {
             })?;
             if !(file_type.is_dir()
                 || file_type.is_file()
-                    && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
+                    && (is_supported_movie_file(&path)
+                        || super::super::library::is_supported_incremental_sidecar_file(&path)))
             {
                 continue;
             }
@@ -630,11 +633,28 @@ impl ScanJobService {
             .get(&entry.relative_path)
             .is_some_and(|existing| existing.last_seen_generation == job.generation);
         if changed || target_needs_recovery {
-            state
-                .changed_sidecar_paths_by_root
-                .entry(root.id.clone())
-                .or_default()
-                .push(entry.relative_path.clone());
+            if super::super::library::is_file_change_only_sidecar(path) {
+                let change_kind = if target_needs_recovery
+                    || existing_entries
+                        .get(&entry.relative_path)
+                        .is_some_and(|existing| !existing.is_missing)
+                {
+                    "CHANGE"
+                } else {
+                    "ADD"
+                };
+                state
+                    .file_change_events_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push((entry.relative_path.clone(), change_kind.to_owned()));
+            } else {
+                state
+                    .changed_sidecar_paths_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
+            }
         } else {
             state
                 .quick_seen_entry_ids
@@ -1049,6 +1069,10 @@ impl ScanJobService {
                     .changed_sidecar_paths_by_root
                     .get(&root.id)
                     .map_or(&[][..], Vec::as_slice),
+                file_change_events: state
+                    .file_change_events_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
             };
             let (confirmed, inserted) = self.commit_reconciliation_root_batch(&batch).await?;
             // Keep the root-level confirmation count authoritative when the storage batch skips stale entries.
@@ -1121,9 +1145,20 @@ impl ScanJobService {
                     .filter(|path| is_supported_movie_file(Path::new(path)))
                     .cloned()
                     .collect::<Vec<_>>();
+                let removed_file_change_paths = confirmed_missing_paths
+                    .iter()
+                    .filter(|path| {
+                        super::super::library::is_file_change_only_sidecar(Path::new(path))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let removed_sidecar_paths = confirmed_missing_paths
                     .iter()
-                    .filter(|path| is_supported_sidecar_file(Path::new(path)))
+                    .filter(|path| {
+                        super::super::library::is_supported_incremental_sidecar_file(Path::new(
+                            path,
+                        )) && !super::super::library::is_file_change_only_sidecar(Path::new(path))
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 if !confirmed_missing_paths.is_empty() {
@@ -1135,8 +1170,11 @@ impl ScanJobService {
                                     &root.id,
                                     &job.generation,
                                     &confirmed_missing_paths,
-                                    &removed_media_paths,
-                                    &removed_sidecar_paths,
+                                    (
+                                        &removed_media_paths,
+                                        &removed_sidecar_paths,
+                                        &removed_file_change_paths,
+                                    ),
                                 )
                                 .await?,
                         )
@@ -1466,11 +1504,28 @@ impl ScanJobService {
             .get(&entry.relative_path)
             .is_some_and(|existing| existing.last_seen_generation == job.generation);
         if changed || target_needs_recovery {
-            state
-                .changed_sidecar_paths_by_root
-                .entry(root.id.clone())
-                .or_default()
-                .push(entry.relative_path.clone());
+            if super::super::library::is_file_change_only_sidecar(path) {
+                let change_kind = if target_needs_recovery
+                    || existing_entries
+                        .get(&entry.relative_path)
+                        .is_some_and(|existing| !existing.is_missing)
+                {
+                    "CHANGE"
+                } else {
+                    "ADD"
+                };
+                state
+                    .file_change_events_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push((entry.relative_path.clone(), change_kind.to_owned()));
+            } else {
+                state
+                    .changed_sidecar_paths_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
+            }
         } else {
             state
                 .quick_seen_entry_ids
@@ -1729,6 +1784,10 @@ impl ScanJobService {
                     .map_or(&[][..], Vec::as_slice),
                 sidecar_paths: state
                     .changed_sidecar_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                file_change_events: state
+                    .file_change_events_by_root
                     .get(&root.id)
                     .map_or(&[][..], Vec::as_slice),
             };

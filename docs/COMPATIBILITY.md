@@ -30,6 +30,12 @@ Lux 管理 API 新增 `GET /api/v1/admin/library-pipeline-activity`，沿用现�
 
 聚合只返回当前页启用媒体库的阶段摘要；响应不包含媒体标题、文件路径、凭据、上游错误文本或 scan activity 的 `currentItem`。本接口独立于已有 `/api/v1/admin/task-activity`，不改变 Emby、ScanCompleted 或 Webhook DTO。
 
+## LUX-538–543 入库后文件变化同步（2026-10-15）
+
+入库后的文件变化以独立 `scan_job_file_changes` 队列持久化，按 root 与相对路径合并 ADD、CHANGE、REMOVE；事件不复用媒体项 metadata、媒体源 probe 或 thumbnail 状态。增量扫描、Manifest 全量扫描和持久 reconciliation 使用相同分类与 change kind。外挂字幕只更新对应外部轨道；`*-mediainfo.json` 只更新其 STRM 媒体源；NFO、图片和 danmaku XML 各自更新对应本地结果。视频文件 fingerprint 未变时保留内嵌轨道及技术信息；EDL 目前无消费者，作为 no-op 完成，不生成 metadata/thumbnail 任务。
+
+自动化证据：`tests/scanning_jobs.rs` 87/87、`tests/storage.rs` 54/54、`tests/ready_version.rs` 2/2 通过，覆盖扫描发现、确认删除、局部结果同步、不探测未变化视频、队列 revision CAS、合并、稳定分页和运行项恢复。SQLite 与 PostgreSQL 0170 migrations 的结构合同测试通过；另有 PostgreSQL 队列 revision/恢复合同测试，但它标记为需要 disposable local PostgreSQL，本次没有运行，因为本机 PostgreSQL/OrbStack Docker daemon 不可用。最终全量 `cargo test --locked --all-targets` 的 lib target 为 855 passed、2 failed、23 ignored：未修改的 NFO actor-credit 时序用例与 HLS `Superseded` 竞争用例失败；NFO 隔离重跑通过，HLS 隔离运行结果有通过和失败两种。全量命令因此未运行后续 integration targets；上述相关 integration targets 已分别通过。不能据此记录完整 Rust gate 通过，也不代表部署后媒体库或 PostgreSQL runtime 已验证。
+
 ## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
 
 Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有

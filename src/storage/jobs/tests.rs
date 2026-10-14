@@ -45,6 +45,150 @@ async fn manifest_local_metadata_outbox_conflicts_are_validated_on_postgres()
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable local PostgreSQL database"]
+async fn scan_job_file_change_queue_is_revision_safe_on_postgres()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = DatabaseConfiguration::Postgres(PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .unwrap_or_else(|_| "55432".into())
+            .parse()?,
+        database: std::env::var("POSTGRES_TEST_DATABASE")?,
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".into()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")?,
+        ssl_mode: "disable".into(),
+    });
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let library_id = format!("file-change-library-{suffix}");
+    let root_id = format!("file-change-root-{suffix}");
+    let job_id = format!("file-change-job-{suffix}");
+    let relative_path = "Movie (2025)/Movie.en.srt";
+
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+        .bind(&library_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (?, ?, '/media/file-change-test', '/media/file-change-test', 1, 0)",
+        )
+        .bind(&root_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES (?, ?, 'INCREMENTAL_SCAN', 'RUNNING', 'file-change-test')",
+        )
+        .bind(&job_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    assert!(
+        database
+            .record_scan_job_file_change(&job_id, &root_id, relative_path, "ADD")
+            .await?
+    );
+    let first = database
+        .list_pending_scan_job_file_changes(&job_id, None, 10)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("initial file change was not queued")?;
+    let first_revision = first.file_change_revision.ok_or("missing revision")?;
+    assert!(
+        database
+            .set_scan_job_file_change_state(
+                &job_id,
+                &root_id,
+                relative_path,
+                first_revision,
+                "RUNNING",
+                None,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .record_scan_job_file_change(&job_id, &root_id, relative_path, "CHANGE")
+            .await?
+    );
+    let updated = database
+        .list_pending_scan_job_file_changes(&job_id, None, 10)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("updated file change was not requeued")?;
+    let updated_revision = updated.file_change_revision.ok_or("missing revision")?;
+    assert!(updated_revision > first_revision);
+    assert!(
+        !database
+            .set_scan_job_file_change_state(
+                &job_id,
+                &root_id,
+                relative_path,
+                first_revision,
+                "DONE",
+                None,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .set_scan_job_file_change_state(
+                &job_id,
+                &root_id,
+                relative_path,
+                updated_revision,
+                "RUNNING",
+                None,
+            )
+            .await?
+    );
+    database
+        .requeue_running_scan_job_file_changes(&job_id)
+        .await?;
+    let resumed = database
+        .list_pending_scan_job_file_changes(&job_id, None, 10)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("running file change was not recovered")?;
+    assert!(
+        database
+            .set_scan_job_file_change_state(
+                &job_id,
+                &root_id,
+                relative_path,
+                resumed.file_change_revision.ok_or("missing revision")?,
+                "DONE",
+                None,
+            )
+            .await?
+    );
+
+    database
+        .query("DELETE FROM libraries WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    database.close().await;
+    Ok(())
+}
+
 async fn assert_manifest_local_metadata_outbox_batches(
     database: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -278,7 +278,7 @@ impl ScanJobService {
             }
             let path = root_path.join(&observation.relative_path);
             let is_media = is_supported_movie_file(&path);
-            let is_sidecar = is_supported_sidecar_file(&path);
+            let is_sidecar = super::super::library::is_supported_incremental_sidecar_file(&path);
             let baseline = baselines.get(&observation.relative_path);
             if let Some(baseline) = baseline {
                 if baseline.entry_kind != "FILE" {

@@ -1,6 +1,253 @@
 use super::*;
 
 impl Database {
+    pub(crate) async fn list_media_sources_for_external_subtitle(
+        &self,
+        library_root_id: &str,
+        relative_directory: &str,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        let directory = relative_directory.trim_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let escaped_prefix = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let direct_children = format!("{escaped_prefix}%");
+        let nested_children = format!("{escaped_prefix}%/%");
+        let rows = self
+            .query(
+                "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                        lr.canonical_path AS root_path, fe.relative_path
+                 FROM media_sources ms
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                   AND mi.removed_at IS NULL
+                   AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                   AND fe.relative_path LIKE ? ESCAPE '\\'
+                   AND fe.relative_path NOT LIKE ? ESCAPE '\\'
+                 ORDER BY fe.relative_path, ms.id",
+            )
+            .bind(library_root_id)
+            .bind(direct_children)
+            .bind(nested_children)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            })
+            .collect())
+    }
+
+    pub(crate) async fn apply_scan_external_subtitle_file_change(
+        &self,
+        job_id: &str,
+        change: &StoredScanJobPath,
+        tracks: &[StoredSubtitleStream],
+    ) -> Result<bool, StorageError> {
+        let Some(revision) = change.file_change_revision else {
+            return Err(StorageError::Conflict(
+                "scan file change is missing its revision".to_owned(),
+            ));
+        };
+        if !matches!(change.change_kind.as_str(), "ADD" | "CHANGE" | "REMOVE") {
+            return Err(StorageError::Conflict(
+                "invalid scan file change kind".to_owned(),
+            ));
+        }
+        if tracks.iter().any(|track| {
+            !track.is_external
+                || track.stream_type != "SUBTITLE"
+                || track.external_path.as_deref() != Some(change.relative_path.as_str())
+        }) {
+            return Err(StorageError::Conflict(
+                "invalid external subtitle file update".to_owned(),
+            ));
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let current = self
+            .query_scalar::<i64>(
+                "SELECT 1 FROM scan_job_file_changes
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ? AND processing_state = 'RUNNING'
+                 LIMIT 1",
+            )
+            .bind(job_id)
+            .bind(&change.library_root_id)
+            .bind(&change.relative_path)
+            .bind(revision)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !current {
+            return Ok(false);
+        }
+
+        if change.change_kind == "REMOVE" {
+            for track in tracks {
+                self.query(
+                    "DELETE FROM media_streams
+                     WHERE media_source_id = ? AND stream_type = 'SUBTITLE'
+                       AND is_external = 1 AND external_path = ?",
+                )
+                .bind(&track.media_source_id)
+                .bind(&change.relative_path)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        } else {
+            for track in tracks {
+                if track.is_default {
+                    self.query(
+                        "UPDATE media_streams
+                         SET is_default = 0, updated_at = unixepoch()
+                         WHERE media_source_id = ? AND stream_type = 'SUBTITLE'
+                           AND is_external = 1",
+                    )
+                    .bind(&track.media_source_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                }
+                let existing = self
+                    .query(
+                        "SELECT id FROM media_streams
+                         WHERE media_source_id = ? AND stream_type = 'SUBTITLE'
+                           AND is_external = 1 AND external_path = ?
+                         ORDER BY stream_index LIMIT 1",
+                    )
+                    .bind(&track.media_source_id)
+                    .bind(&change.relative_path)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                if let Some(existing) = existing {
+                    self.query(
+                        "UPDATE media_streams
+                         SET codec = ?, language = ?, title = ?,
+                             is_default = ?, is_forced = ?, updated_at = unixepoch()
+                         WHERE id = ?",
+                    )
+                    .bind(&track.codec)
+                    .bind(&track.language)
+                    .bind(&track.title)
+                    .bind(database_flag(track.is_default))
+                    .bind(database_flag(track.is_forced))
+                    .bind(existing.get::<String, _>("id"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                } else {
+                    let stream_index = self
+                        .query_scalar::<i64>(
+                            "SELECT COALESCE(MAX(stream_index), -1) + 1
+                             FROM media_streams WHERE media_source_id = ?",
+                        )
+                        .bind(&track.media_source_id)
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    self.query(
+                        "INSERT INTO media_streams (
+                             id, media_source_id, stream_index, stream_type, codec,
+                             language, title, details_json, external_path,
+                             is_external, is_default, is_forced
+                         ) VALUES (?, ?, ?, 'SUBTITLE', ?, ?, ?, NULL, ?, 1, ?, ?)",
+                    )
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(&track.media_source_id)
+                    .bind(stream_index)
+                    .bind(&track.codec)
+                    .bind(&track.language)
+                    .bind(&track.title)
+                    .bind(&change.relative_path)
+                    .bind(database_flag(track.is_default))
+                    .bind(database_flag(track.is_forced))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                }
+            }
+        }
+
+        let completed = self
+            .query(
+                "UPDATE scan_job_file_changes
+                 SET processing_state = 'DONE', error = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ? AND processing_state = 'RUNNING'",
+            )
+            .bind(job_id)
+            .bind(&change.library_root_id)
+            .bind(&change.relative_path)
+            .bind(revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1;
+        if !completed {
+            return Ok(false);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn find_external_subtitle(
         &self,
         item_id: &str,

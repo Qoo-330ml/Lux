@@ -602,6 +602,30 @@ where
     collect_local_images(paths, Some(media_stem))
 }
 
+fn push_changed_local_image_candidate(
+    candidates: &mut Vec<(String, LocalImage)>,
+    item_id: &str,
+    image_type: ImageType,
+    path: &Path,
+) {
+    if item_id.is_empty()
+        || candidates.iter().any(|(existing_item_id, existing)| {
+            existing_item_id == item_id
+                && existing.image_type == image_type
+                && existing.path == path
+        })
+    {
+        return;
+    }
+    candidates.push((
+        item_id.to_owned(),
+        LocalImage {
+            image_type,
+            path: path.to_owned(),
+        },
+    ));
+}
+
 fn collect_local_images<I, P>(paths: I, media_stem: Option<&str>) -> Vec<LocalImage>
 where
     I: IntoIterator<Item = P>,
@@ -1561,6 +1585,199 @@ impl MetadataEnricher {
         Ok(ScanLocalMetadataImageBatch { report, sources })
     }
 
+    pub(crate) async fn index_scan_local_metadata_file_change_image(
+        &self,
+        source_snapshot: &[StoredScanLocalMetadataSource],
+        image_path: &Path,
+        remove: bool,
+    ) -> Result<usize, MetadataError> {
+        let mut candidates = Vec::<(String, LocalImage)>::new();
+        for source in source_snapshot {
+            let root = Path::new(&source.root_path);
+            let media_path = root.join(&source.relative_path);
+            match source.item_type.as_str() {
+                "MOVIE" | "VIDEO" => {
+                    if let Some(media_stem) =
+                        media_path.file_stem().and_then(|value| value.to_str())
+                        && let Some(image_type) = image_type_for_media(image_path, media_stem)
+                            .or_else(|| image_type_for(image_path))
+                    {
+                        push_changed_local_image_candidate(
+                            &mut candidates,
+                            &source.item_id,
+                            image_type,
+                            image_path,
+                        );
+                    }
+                }
+                "EPISODE" => {
+                    let Some(series_dir) = series_directory(root, &source.relative_path) else {
+                        continue;
+                    };
+                    let season_number = source.season_number.unwrap_or_default();
+                    let season_dir = media_path.parent().unwrap_or(&series_dir);
+                    let image_parent = image_path.parent();
+                    let one_path = [image_path.to_owned()];
+                    if image_parent == Some(series_dir.as_path())
+                        && let Some(series_id) = source.series_id.as_deref()
+                    {
+                        for image in find_series_images(&one_path, None) {
+                            push_changed_local_image_candidate(
+                                &mut candidates,
+                                series_id,
+                                image.image_type,
+                                &image.path,
+                            );
+                        }
+                        if is_prefixed_season_image(image_path, season_number) {
+                            for image in find_series_images(&one_path, Some(season_number)) {
+                                if let Some(season_id) = source.season_id.as_deref() {
+                                    push_changed_local_image_candidate(
+                                        &mut candidates,
+                                        season_id,
+                                        image.image_type,
+                                        &image.path,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if image_parent == Some(season_dir)
+                        && let Some(season_id) = source.season_id.as_deref()
+                    {
+                        for image in find_series_images(&one_path, Some(season_number)) {
+                            push_changed_local_image_candidate(
+                                &mut candidates,
+                                season_id,
+                                image.image_type,
+                                &image.path,
+                            );
+                        }
+                    }
+                    if image_parent == media_path.parent() {
+                        for image in find_episode_images(&one_path, &media_path) {
+                            push_changed_local_image_candidate(
+                                &mut candidates,
+                                &source.item_id,
+                                image.image_type,
+                                &image.path,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut item_ids = candidates
+            .iter()
+            .map(|(item_id, _)| item_id.clone())
+            .collect::<Vec<_>>();
+        item_ids.sort_unstable();
+        item_ids.dedup();
+        let indexed_images = self.database.list_item_images_by_ids(&item_ids).await?;
+        if remove {
+            let mut removed_count = 0_usize;
+            let changed_path = image_path.to_string_lossy();
+            for (item_id, image) in candidates {
+                let existing = indexed_images
+                    .get(&item_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for indexed in existing.iter().filter(|indexed| {
+                    indexed.source == "LOCAL"
+                        && indexed.image_type == image.image_type.as_str()
+                        && indexed.local_path == changed_path
+                }) {
+                    if self
+                        .database
+                        .delete_item_image(&item_id, &indexed.id)
+                        .await?
+                    {
+                        removed_count = removed_count.saturating_add(1);
+                    }
+                }
+            }
+            return Ok(removed_count);
+        }
+
+        let mut inserts_by_item = BTreeMap::<String, ItemImageBatchInsert>::new();
+        for (item_id, image) in candidates {
+            let indexed = indexed_images
+                .get(&item_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if image.image_type == ImageType::Thumb
+                && indexed.iter().any(|existing| {
+                    existing.image_type.eq_ignore_ascii_case("FANART")
+                        && Path::new(&existing.local_path) == image.path
+                })
+            {
+                continue;
+            }
+            let prepared =
+                prepare_local_image(image.clone())
+                    .await
+                    .map_err(|error| MetadataError::Io {
+                        path: error.path,
+                        source: error.error,
+                    })?;
+            let local_path = prepared.image.path.to_string_lossy().into_owned();
+            let existing = indexed.iter().find(|existing| {
+                existing.source == "LOCAL"
+                    && existing.image_type == image.image_type.as_str()
+                    && existing.local_path == local_path
+            });
+            let image_index = existing.map_or_else(
+                || {
+                    if image.image_type == ImageType::Fanart {
+                        indexed
+                            .iter()
+                            .filter(|existing| {
+                                existing.source == "LOCAL"
+                                    && existing.image_type == image.image_type.as_str()
+                            })
+                            .map(|existing| existing.image_index)
+                            .max()
+                            .unwrap_or(-1)
+                            .saturating_add(1)
+                    } else {
+                        0
+                    }
+                },
+                |existing| existing.image_index,
+            );
+            let insert =
+                inserts_by_item
+                    .entry(item_id.clone())
+                    .or_insert_with(|| ItemImageBatchInsert {
+                        item_id: item_id.clone(),
+                        images: Vec::new(),
+                        clear_poster_fallback: false,
+                    });
+            insert.clear_poster_fallback |=
+                matches!(image.image_type, ImageType::Poster | ImageType::Thumb);
+            insert.images.push(ItemImageInsert {
+                image_type: image.image_type.as_str().to_owned(),
+                image_index,
+                local_path,
+                file_size: prepared.file_size,
+                width: prepared.dimensions.map(|(width, _)| width),
+                height: prepared.dimensions.map(|(_, height)| height),
+                content_tag: prepared.content_tag,
+                source: "LOCAL".to_owned(),
+                source_url: None,
+            });
+        }
+        self.database
+            .insert_item_images_batch_at_indices(&inserts_by_item.into_values().collect::<Vec<_>>())
+            .await
+            .map_err(MetadataError::Storage)
+    }
+
     async fn index_scan_local_movie_image_page(
         &self,
         sources: &[StoredMediaSourcePath],
@@ -1593,7 +1810,7 @@ impl MetadataEnricher {
         let item_count = source_snapshot.len();
         let started = Instant::now();
         let result = self
-            .enrich_scan_local_metadata_batch_nfo_inner(source_snapshot, excluded_item_ids)
+            .enrich_scan_local_metadata_batch_nfo_inner(source_snapshot, excluded_item_ids, None)
             .await;
         let complete = result
             .as_ref()
@@ -1607,10 +1824,37 @@ impl MetadataEnricher {
         result
     }
 
+    pub(crate) async fn enrich_scan_local_metadata_file_change_nfo(
+        &self,
+        source_snapshot: Vec<StoredScanLocalMetadataSource>,
+        changed_nfo_path: &Path,
+    ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
+        let item_count = source_snapshot.len();
+        let started = Instant::now();
+        let result = self
+            .enrich_scan_local_metadata_batch_nfo_inner(
+                source_snapshot,
+                &[],
+                Some(changed_nfo_path),
+            )
+            .await;
+        let complete = result
+            .as_ref()
+            .is_ok_and(|batch| batch.report.failed_item_ids.is_empty());
+        self.resources.record_metadata_batch(
+            "local_nfo_file_change",
+            item_count,
+            started.elapsed(),
+            complete,
+        );
+        result
+    }
+
     async fn enrich_scan_local_metadata_batch_nfo_inner(
         &self,
         source_snapshot: Vec<StoredScanLocalMetadataSource>,
         excluded_item_ids: &[String],
+        changed_nfo_path: Option<&Path>,
     ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
         let excluded_item_ids = excluded_item_ids
             .iter()
@@ -1641,6 +1885,28 @@ impl MetadataEnricher {
             nfo_snapshot
                 .deferred_metadata_updates
                 .identity_conflict_gate = Some(Arc::clone(gate));
+        }
+        if let Some(changed_nfo_path) = changed_nfo_path {
+            let affected_item_ids = nfo_snapshot
+                .nfo_paths_by_item
+                .iter()
+                .filter(|(_, nfo_path)| nfo_path.as_path() == changed_nfo_path)
+                .map(|(item_id, _)| item_id.clone())
+                .collect::<HashSet<_>>();
+            nfo_snapshot
+                .nfo_paths_by_item
+                .retain(|item_id, _| affected_item_ids.contains(item_id));
+            sources.retain(|source| {
+                affected_item_ids.contains(&source.item_id)
+                    || source
+                        .series_id
+                        .as_ref()
+                        .is_some_and(|series_id| affected_item_ids.contains(series_id))
+                    || source
+                        .season_id
+                        .as_ref()
+                        .is_some_and(|season_id| affected_item_ids.contains(season_id))
+            });
         }
         let mut metadata_item_ids = nfo_snapshot
             .nfo_paths_by_item

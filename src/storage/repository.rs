@@ -1579,6 +1579,9 @@ pub(crate) struct StoredScanJobPath {
     pub(crate) library_root_id: String,
     pub(crate) relative_path: String,
     pub(crate) change_kind: String,
+    // The file-change worker consumes this only in LUX-539; normal scan paths have no revision.
+    #[allow(dead_code)]
+    pub(crate) file_change_revision: Option<i64>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -1633,6 +1636,7 @@ pub(crate) struct ReconciliationBatchCommit<'a> {
     pub(crate) new_paths: &'a [String],
     pub(crate) changed_paths: &'a [String],
     pub(crate) sidecar_paths: &'a [String],
+    pub(crate) file_change_events: &'a [(String, String)],
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1725,6 +1729,7 @@ fn stored_scan_job_path(row: sqlx::any::AnyRow) -> StoredScanJobPath {
         library_root_id: row.get("library_root_id"),
         relative_path: row.get("relative_path"),
         change_kind: row.get("change_kind"),
+        file_change_revision: None,
     }
 }
 
@@ -1800,6 +1805,7 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) last_seen_generation: String,
+    pub(crate) is_missing: bool,
     pub(crate) item_id: Option<String>,
     pub(crate) parent_identity_key: Option<String>,
     pub(crate) item_type: Option<String>,
@@ -1832,6 +1838,7 @@ fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
         relative_path: row.get("relative_path"),
         fingerprint: row.get("fingerprint"),
         last_seen_generation: row.get("last_seen_generation"),
+        is_missing: row.get::<i64, _>("is_missing") != 0,
         item_id: row.get("item_id"),
         parent_identity_key: row.get("parent_identity_key"),
         item_type: row.get("item_type"),
