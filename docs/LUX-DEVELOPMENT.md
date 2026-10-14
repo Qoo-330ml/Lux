@@ -11273,6 +11273,21 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 阶段 27 阶段门（2026-10-14）：在 Toshiba 挂载、`arm64` 环境下，通过 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `scripts/check-all.sh`。Cargo build、fmt、all-target/all-feature Clippy、shell 语法、两组 Python 工具测试均通过；`cargo test --locked --all-targets` 在 lib target 停止，854 通过、1 失败、22 ignored。失败 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation` 在隔离重跑时仍因 `Superseded` 失败，位于本阶段未修改的 HLS 播放代码。Web frozen-lockfile install 和 production build 通过；完整 Web 测试波动详见 LUX-535 结果。PostgreSQL live query 未验证，阶段 23 的 5% A/B 门仍开放。本阶段按门停在项目所有者确认点，不将失败检查记为通过。
 
+#### LUX-536：在媒体详情展示剧照
+
+范围：电影详情与剧级电视剧详情读取现有条目图片中的 `FANART`、`THUMB`、`WALLPAPER`，作为“剧照”横向图片栏，放在“演职人员”之后、“更多信息”之前。季、集及其他条目类型不展示剧照；海报、LOGO 等其他图片类型不进入剧照栏。无符合类型的图片时隐藏该栏。
+
+验收：
+
+- [ ] 电影与剧级电视剧详情展示该条目全部 FANART、THUMB、WALLPAPER 图片，按图片类型和索引稳定排序。
+- [ ] 季、集、普通视频及其他条目不展示剧照；其他图片类型不会混入；无匹配图片时不渲染空栏。
+- [ ] 桌面和移动布局中，“剧照”都位于演职人员之后、更多信息之前；图片有可访问的替代文本，并使用延迟加载。
+- [ ] 详情页回归覆盖支持的条目类型、过滤规则、空数据和分区顺序；Web 测试与生产构建通过。
+
+预计文件（5 个）：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/detail/MediaStills.tsx`、`web/src/react.css`、`web/tests/media-detail.test.tsx`、本文档。
+
+验证：运行 `web/tests/media-detail.test.tsx` 定向测试、完整 Web 测试及 production build；执行 `git diff --check`。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
