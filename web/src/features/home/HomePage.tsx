@@ -76,9 +76,16 @@ export function HomePage({ user }: { user: LuxUser }) {
     recommended: carousel.data?.recommended ?? [],
     continueWatching,
   });
+  const heroIsLoading = slides.length === 0 && (
+    carousel.isPending || carousel.isFetching ||
+    librariesQuery.isPending || librariesQuery.isFetching ||
+    continueWatchingQuery.isPending || continueWatchingQuery.isFetching
+  );
+  const showEmptyHero = slides.length === 0 && !heroIsLoading &&
+    carousel.isSuccess && librariesQuery.isSuccess && continueWatchingQuery.isSuccess;
   return (
     <div className="lux-home">
-      <HeroCarousel items={slides} continueWatching={continueWatching} />
+      <HeroCarousel items={slides} continueWatching={continueWatching} isLoading={heroIsLoading} showEmptyState={showEmptyHero} />
       {carousel.error && !carousel.data ? (
         <div className="lux-editor-error" role="status">
           精选轮播加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void carousel.refetch()}>重试</button>
@@ -173,7 +180,12 @@ function HomeLatestRail({
   return <MediaRail title={title} items={items ?? []} linkTo={`/libraries/${library.id}`} />;
 }
 
-function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continueWatching: MediaItem[] }) {
+function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
+  items: MediaItem[];
+  continueWatching: MediaItem[];
+  isLoading: boolean;
+  showEmptyState: boolean;
+}) {
   const [activeIndex, setActiveIndex] = useState(0);
   const slideKey = items.map((item) => item.id).join("|");
 
@@ -206,30 +218,32 @@ function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continu
   const goTo = (index: number) => setActiveIndex((index + items.length) % items.length);
 
   return (
-    <section className="lux-hero" aria-label="精选媒体轮播" aria-roledescription="carousel">
+    <section className="lux-hero" aria-label="精选媒体轮播" aria-roledescription="carousel" aria-busy={isLoading}>
       <AnimatePresence initial={false}>
         {image ? <motion.img key={`backdrop-${item?.id}`} className="lux-hero-backdrop" src={image} alt="" decoding="async" fetchPriority="high" initial={{ opacity: 0, scale: 1.04 }} animate={{ opacity: 1, scale: 1.015 }} exit={{ opacity: 0 }} transition={{ duration: 0.55, ease: "easeOut" }} /> : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
       </AnimatePresence>
       <div className="lux-hero-overlay" />
       <AnimatePresence initial={false} mode="wait">
-        <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
-          <h1 className={titleClassName}>
-            {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} decoding="async" /> : <span className="lux-hero-title-text">{title}</span>}
-          </h1>
-          <div className="lux-hero-meta">
-            {item?.productionYear ? <span>{item.productionYear}</span> : null}
-            {item?.itemType ? <span>{mediaTypeLabel(item.itemType)}</span> : null}
-            {runtimeLabel(item?.runtimeTicks) ? <span>{runtimeLabel(item?.runtimeTicks)}</span> : null}
-          </div>
-          <p>{item?.overview || "在属于你的空间里，继续观看收藏的电影与剧集。"}</p>
-          <div className="lux-hero-action-row">
-            <div className="lux-hero-actions">
-              <Link className="lux-button lux-button-large lux-button-primary" to={playbackHref}><Play size={17} fill="currentColor" /> {item ? playbackLabel : "浏览媒体库"}</Link>
-              {item ? <Link className="lux-button lux-button-large lux-button-glass" to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
+        {item || showEmptyState ? (
+          <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
+            <h1 className={titleClassName}>
+              {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} decoding="async" /> : <span className="lux-hero-title-text">{title}</span>}
+            </h1>
+            <div className="lux-hero-meta">
+              {item?.productionYear ? <span>{item.productionYear}</span> : null}
+              {item?.itemType ? <span>{mediaTypeLabel(item.itemType)}</span> : null}
+              {runtimeLabel(item?.runtimeTicks) ? <span>{runtimeLabel(item?.runtimeTicks)}</span> : null}
             </div>
-            {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
-          </div>
-        </motion.div>
+            <p>{item?.overview || "在属于你的空间里，继续观看收藏的电影与剧集。"}</p>
+            <div className="lux-hero-action-row">
+              <div className="lux-hero-actions">
+                <Link className="lux-button lux-button-large lux-button-primary" to={playbackHref}><Play size={17} fill="currentColor" /> {item ? playbackLabel : "浏览媒体库"}</Link>
+                {item ? <Link className="lux-button lux-button-large lux-button-glass" to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
+              </div>
+              {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
+            </div>
+          </motion.div>
+        ) : null}
       </AnimatePresence>
     </section>
   );
