@@ -11304,6 +11304,21 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 补充验证：冻结锁文件安装通过；媒体详情组件测试 32/32、详情布局检查 31/31、浅色主题测试 19/19；完整 Web 测试 Node 139/139、Vitest 593/593、production build 和 `git diff --check` 通过。浏览器本地预览确认剧照、半透明“更多信息”面板及媒体地址展开/收起和复制按钮位置。
 
+#### LUX-537：对齐 Emby 鉴权凭据优先级与重复 query 行为
+
+范围：根据官方 Emby 4.10.1.0 原生 ARM64 临时实例实测，在 Emby 路由入口统一选择凭据，避免不同令牌 query 名称映射到同一 Serde 字段而返回 400。标准优先级为 HTTP `X-Emby-Token`、query `X-Emby-Token`、authorization 的 `Token`、HTTP `X-MediaBrowser-Token`、query `api_key`；非空无效高优先级凭据不回退。Lux 已有扩展仅在标准来源均为空时回退。保留现有 principal、管理员权限、媒体库 ACL 和签名播放票据规则；不改变原生 `/api/v1`。
+
+验收：
+
+- [ ] 不同 query 来源同时存在时按优先级选择，与顺序及值是否相同无关；不再因 Serde alias 冲突返回 400。
+- [ ] 高优先级无效返回 401；普通用户 token 与管理员 API key 同时存在时不得提升权限。
+- [ ] 被选中的同名 query 出现多次时返回 401；更高优先级有效来源覆盖低优先级重复 query。
+- [ ] 根路径与 `/emby`、详情/列表/图片/PlaybackInfo/媒体入口使用相同提取规则；非鉴权参数保留原编码、顺序与既有重复参数语义。
+- [ ] Lux query `apiKey`/`X-MediaBrowser-Token` 与历史扩展 header 继续作为低优先级回退，原生 API 不变。
+- [ ] 自动化回归、Rust 完成检查与兼容文档记录完成；不声称 NanShare/Hills 部署后的实机链路已验证。
+
+预计代码增量文件：`src/api/emby.rs`、`src/api/emby_credentials.rs`、`tests/emby_auth.rs`、`tests/strm.rs`。规格与兼容记录作为独立文档增量。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
