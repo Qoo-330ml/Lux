@@ -8,6 +8,7 @@ import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaCast } from "./MediaCast";
 import { MediaNfoPanel } from "./MediaNfoPanel";
+import { MediaStills } from "./MediaStills";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
@@ -159,6 +160,7 @@ export function MediaDetailPage() {
     ?? (seriesImageFallback ? imageUrl(seriesImageFallback, "fanart") ?? imageUrl(seriesImageFallback) : undefined);
   const poster = posterUrlWithFallback(media, seriesImageFallback);
   const detailKind = isVideo ? "video" : isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
+  const showStills = media.itemType === "MOVIE" || media.itemType === "SERIES";
   const detailTitle = isSeries || (!isSeason && !isEpisode)
     ? mediaTitle(media)
     : mediaTitle(seriesContext.data ?? media);
@@ -432,6 +434,7 @@ export function MediaDetailPage() {
           <div className="lux-detail-cast">
             <MediaCast actors={media.actors ?? []} />
           </div>
+          {showStills ? <MediaStills images={itemImages.data?.images ?? []} title={detailTitle} /> : null}
           <div className="lux-detail-nfo">
             <MediaNfoPanel
               details={localNfo}

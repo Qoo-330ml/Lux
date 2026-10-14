@@ -9,6 +9,7 @@ import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
+import type { ItemImage, MediaItem } from "../src/lib/api/types";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -41,6 +42,120 @@ describe("MediaDetailPage series hierarchy", () => {
     if (root) act(() => root?.unmount());
     container?.remove();
     vi.restoreAllMocks();
+  });
+
+  async function renderDetail(item: MediaItem, images: ItemImage[] = []) {
+    if (root) act(() => root?.unmount());
+    container?.remove();
+    vi.spyOn(api, "item").mockResolvedValue(item);
+    vi.mocked(api.itemImages).mockResolvedValue({ images });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 100 });
+
+    const rendered = document.createElement("div");
+    container = rendered;
+    document.body.append(rendered);
+    root = createRoot(rendered);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[`/items/${item.id}`]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    return rendered;
+  }
+
+  function mediaImage(itemId: string, id: string, imageType: string, imageIndex = 0): ItemImage {
+    return {
+      id,
+      itemId,
+      imageType,
+      imageIndex,
+      url: `/api/v1/items/${itemId}/images/${id}`,
+    };
+  }
+
+  function detailItem(id: string, itemType: string): MediaItem {
+    return {
+      id,
+      title: "剧照测试条目",
+      itemType,
+      actors: [{ id: "person-1", name: "演员甲" }],
+      mediaSources: [{ id: "source-1", isDefault: true, container: "mkv" }],
+    };
+  }
+
+  it("shows all still image types for movies in a stable order between cast and more information", async () => {
+    const itemId = "movie-stills";
+    const rendered = await renderDetail(detailItem(itemId, "MOVIE"), [
+      mediaImage(itemId, "wallpaper-0", "WALLPAPER"),
+      mediaImage(itemId, "poster-0", "POSTER"),
+      mediaImage(itemId, "fanart-1", "fanart", 1),
+      mediaImage(itemId, "thumb-0", "THUMB"),
+      mediaImage(itemId, "fanart-0", "FANART", 0),
+      mediaImage(itemId, "logo-0", "LOGO"),
+    ]);
+
+    const gallery = rendered.querySelector(".lux-detail-stills");
+    const images = [...(gallery?.querySelectorAll<HTMLImageElement>("img") ?? [])];
+    expect(images.map((image) => image.getAttribute("src"))).toEqual([
+      `/api/v1/items/${itemId}/images/fanart-0`,
+      `/api/v1/items/${itemId}/images/fanart-1`,
+      `/api/v1/items/${itemId}/images/thumb-0`,
+      `/api/v1/items/${itemId}/images/wallpaper-0`,
+    ]);
+    expect(images.every((image, index) => image.alt === `剧照测试条目 剧照 ${index + 1}`)).toBe(true);
+    expect(images.every((image) => image.getAttribute("loading") === "lazy")).toBe(true);
+
+    const cast = rendered.querySelector(".lux-media-cast");
+    const moreInfo = rendered.querySelector(".lux-media-nfo");
+    expect(gallery?.querySelector("h2")?.textContent).toBe("剧照");
+    expect(cast && gallery && (cast.compareDocumentPosition(gallery) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+    expect(gallery && moreInfo && (gallery.compareDocumentPosition(moreInfo) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+  });
+
+  it("shows stills on series details", async () => {
+    const itemId = "series-stills";
+    const rendered = await renderDetail(detailItem(itemId, "SERIES"), [
+      mediaImage(itemId, "series-fanart", "FANART"),
+    ]);
+
+    expect(rendered.querySelector(".lux-detail-stills img")?.getAttribute("src"))
+      .toBe(`/api/v1/items/${itemId}/images/series-fanart`);
+  });
+
+  it("does not show stills on seasons, episodes, videos, or other item types", async () => {
+    for (const itemType of ["SEASON", "EPISODE", "VIDEO", "BOX_SET"]) {
+      const itemId = `excluded-${itemType.toLowerCase()}`;
+      const rendered = await renderDetail(detailItem(itemId, itemType), [
+        mediaImage(itemId, "fanart-0", "FANART"),
+      ]);
+
+      expect(rendered.querySelector(".lux-detail-stills"), itemType).toBeNull();
+    }
+  });
+
+  it("hides the stills section when there are no supported images", async () => {
+    const itemId = "movie-no-stills";
+    const noImages = await renderDetail(detailItem(itemId, "MOVIE"));
+    expect(noImages.querySelector(".lux-detail-stills")).toBeNull();
+
+    const posterOnly = await renderDetail(detailItem(itemId, "MOVIE"), [
+      mediaImage(itemId, "poster-0", "POSTER"),
+      mediaImage(itemId, "logo-0", "LOGO"),
+    ]);
+    expect(posterOnly.querySelector(".lux-detail-stills")).toBeNull();
   });
 
   it("presents HomeVideos entries as regular videos with playback, NFO, and manual metadata editing", async () => {

@@ -409,6 +409,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-content { width: 92%; min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 .lux-detail-sections { display: flex; flex-direction: column; }
 .lux-detail-cast { order: 1; }
+.lux-detail-stills { order: 2; }
 .lux-detail-nfo { order: 2; }
 .lux-detail-hierarchy { order: 3; }
 .lux-hero-actions > .lux-media-actions { position: relative; top: auto; right: auto; align-self: center; }
@@ -475,6 +476,14 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-cast-link strong, .lux-media-cast-link > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lux-media-cast-link strong { color: rgba(255,255,255,.86); font-size: .8rem; font-weight: 600; }
 .lux-media-cast-link > span { margin-top: 5px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-detail-stills { max-width: none; min-width: 0; margin-top: 64px; padding-top: 24px; }
+.lux-media-stills-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
+.lux-media-stills-heading h2 { margin: 0; color: #fff; font-size: 1rem; font-weight: 650; }
+.lux-media-stills-heading > span { color: var(--lux-subtle); font-size: .72rem; }
+.lux-media-stills-rail { margin-top: 22px; }
+.lux-media-stills-list { display: flex; gap: 16px; width: max-content; min-width: 100%; margin: 0; padding: 0 2px 12px; list-style: none; }
+.lux-media-stills-card { flex: 0 0 clamp(260px, 32vw, 420px); min-width: 0; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 12px; background: rgba(0,0,0,.28); }
+.lux-media-stills-card img { display: block; width: 100%; height: 100%; object-fit: cover; }
 
 .lux-person-detail-page { max-width: 1040px; margin: 0 auto; padding: 8px 0 72px; }
 .lux-person-back { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; color: var(--lux-subtle); background: transparent; text-decoration: none; font: inherit; font-size: .82rem; cursor: pointer; }
@@ -2005,6 +2014,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-hierarchy > .lux-series-children, .lux-detail-hierarchy > .lux-season-episodes, .lux-detail-hierarchy > .lux-episode-rail { margin-top: 0; padding-top: 0; }
   .lux-detail-cast { order: 2; }
   .lux-media-cast { margin-top: 32px; padding-top: 12px; }
+  .lux-detail-stills { order: 3; margin-top: 32px; padding-top: 12px; }
   .lux-detail-nfo { order: 3; }
   .lux-season-episode-row { grid-template-columns: minmax(120px, 36vw) minmax(0, 1fr); gap: 12px; }
   .lux-season-episode-arrow { display: none; }
@@ -2731,6 +2741,8 @@ html[data-lux-theme="light"] .lux-media-cast-heading h2 { color: var(--lux-text)
 html[data-lux-theme="light"] .lux-media-cast-avatar { border-color: var(--lux-line); background: rgba(255,255,255,.72); box-shadow: 0 8px 20px rgba(30,30,38,.12); }
 html[data-lux-theme="light"] .lux-media-cast-placeholder-icon { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-media-cast-card strong { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-media-stills-heading h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-media-stills-card { border-color: var(--lux-line); background: rgba(255,255,255,.72); }
 html[data-lux-theme="light"] .lux-media-info-heading h2 { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-media-info-row { background: rgba(255,255,255,.58); }
 html[data-lux-theme="light"] .lux-media-info-row > strong { color: var(--lux-text); }
