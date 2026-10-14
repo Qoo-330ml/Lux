@@ -15,6 +15,21 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.1",
+    date: "2026-10-14",
+    sections: [
+      { kind: "added", items: [
+        "电影和剧集详情页新增剧照横向浏览区，展示 FANART、THUMB、WALLPAPER 类型的图片，并按类型和序号稳定排序；没有支持的剧照时不显示空区域。",
+      ] },
+      { kind: "changed", items: [
+        "调整媒体详情信息与技术信息的布局，并改善详情页卡片在浅色主题下的表面和层次表现。",
+      ] },
+      { kind: "fixed", items: [
+        "修复详情页浅色主题下元数据、评分、合集和媒体轨道信息卡片的显示问题，并改善外部信息折叠区的交互与可访问性。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.0",
     date: "2026-10-14",
     sections: [
