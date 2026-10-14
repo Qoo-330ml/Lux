@@ -11257,13 +11257,19 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 多库并行时各库独立显示阶段与计数；扫描索引完成后仍显示未结束的后台阶段。
-- [ ] 无任务、纯后台处理、部分失败、完成、分页/刷新与 API 错误均有 Web 回归。
-- [ ] 视图不把阶段总计伪装成精确 ETA；ARIA 状态与进度值准确，长库名和窄视口不造成横向溢出。
+- [x] 多库并行时各库独立显示阶段与计数；扫描索引完成后仍显示未结束的后台阶段。
+- [x] 无任务、纯后台处理、部分失败、完成、分页/刷新与 API 错误均有 Web 回归。
+- [x] 视图不把阶段总计伪装成精确 ETA；ARIA 状态与进度值准确，长库名和窄视口不造成横向溢出。
 
 预计文件（5 个）：`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、本文档。
 
 验证：定向 Web 测试、完整 Web 测试与 production build。阶段 27 全部任务完成后，运行该阶段门、更新性能/兼容记录并停在项目所有者确认点；阶段 23 原有 5% A/B 性能门仍按其规格单独开放。
+
+实施结果（2026-10-14）：管理员活动弹层按库显示五个阶段的计划状态、队列/运行/完成/失败/取消计数和最近活动时间；索引结束后仍保留后续后台阶段。弹层打开时每 5 秒刷新，支持手动刷新、每页 5 个媒体库、阶段展开、无计划/无任务状态和不暴露原始错误的重试。没有合成百分比或 ETA。`tests/scan-activity.test.tsx` 覆盖并行媒体库、纯后台处理、无计划、部分失败、全阶段完成、分页/刷新和 API 错误。浏览器用 mock API 在 375×812 验证长库名和阶段展开；视口和文档宽度均为 375px，弹层内容纵向滚动。
+
+验证结果：目标测试 10/10、production build、定向浏览器检查和 `git diff --check` 通过。完整 `pnpm test` 的 Node 检查 137/137 通过；默认并行 Vitest 全量运行中，`tests/home-page.test.tsx` 的 5 个轮播用例失败，其余 583/588 通过。单 worker Vitest 全量运行中，另有 `tests/library-page.test.ts` 的 1 个排序恢复断言失败，其余 587/588 通过；这两个失败文件分别单独运行均为 17/17 通过，显示全量运行结果不稳定。阶段 23 的 A/B 性能门仍开放；LUX-533 PostgreSQL live query 受 Docker Hub EOF 阻塞，尚未取得 PostgreSQL runtime 证据。
+
+阶段 27 阶段门（2026-10-14）：在 Toshiba 挂载、`arm64` 环境下，通过 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `scripts/check-all.sh`。Cargo build、fmt、all-target/all-feature Clippy、shell 语法、两组 Python 工具测试均通过；`cargo test --locked --all-targets` 在 lib target 停止，854 通过、1 失败、22 ignored。失败 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation` 在隔离重跑时仍因 `Superseded` 失败，位于本阶段未修改的 HLS 播放代码。Web frozen-lockfile install 和 production build 通过；完整 Web 测试波动详见 LUX-535 结果。PostgreSQL live query 未验证，阶段 23 的 5% A/B 门仍开放。本阶段按门停在项目所有者确认点，不将失败检查记为通过。
 
 ## 28. 参考资料
 
