@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { MediaSource, MediaStream } from "../../lib/api/types";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { mediaTypeLabel, runtimeLabel } from "../home/media";
@@ -32,16 +33,13 @@ export type MediaInfoPanelProps = {
   includeSourceRow?: boolean;
   compactSummary?: boolean;
   collapseTechnicalDetails?: boolean;
+  showHeader?: boolean;
 };
 
 export function MediaInfoPanel(props: MediaInfoPanelProps) {
   return (
-    <section className="lux-media-info" aria-labelledby="media-info-heading">
-      <div className="lux-media-info-heading">
-        <h2 id="media-info-heading">媒体信息</h2>
-        <span>{props.source.streams?.length ? `${props.source.streams.length} 条媒体轨` : "暂无轨道信息"}</span>
-      </div>
-      <MediaInfoContent {...props} />
+    <section className="lux-media-info space-y-4" aria-labelledby="media-info-heading">
+      <MediaInfoContent {...props} showHeader />
     </section>
   );
 }
@@ -56,13 +54,13 @@ export function MediaInfoContent({
   includeMetadataRows = true,
   includeOriginalLanguage = true,
   includeSourceRow = true,
-  compactSummary = false,
   collapseTechnicalDetails = false,
+  showHeader = true,
 }: MediaInfoPanelProps) {
+  const [showAddress, setShowAddress] = useState(false);
+  const [copied, setCopied] = useState(false);
+
   const streams = source.streams ?? [];
-  const streamGroups = ["VIDEO", "AUDIO", "SUBTITLE"]
-    .map((type) => ({ type, streams: streams.filter((stream) => stream.type?.toUpperCase() === type) }))
-    .filter((group) => group.streams.length);
   const compactSummaryValues = [
     mediaTypeLabel(itemType),
     includeSourceRow ? (source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件") : undefined,
@@ -70,29 +68,89 @@ export function MediaInfoContent({
     addedAtLabel,
   ].filter((value): value is string => Boolean(value));
 
+  const handleCopyUrl = () => {
+    if (!source.externalUrl) return;
+    navigator.clipboard.writeText(source.externalUrl).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
   return (
-    <>
-      {compactSummary ? (
-        <div className="lux-media-file-summary is-compact" aria-label="媒体文件摘要">
-          {compactSummaryValues.map((value, index) => <span key={`${value}-${index}`}>{value}</span>)}
-          {includeMetadataRows ? <>
-            <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
-            <InfoRow label="状态" value={status ?? undefined} />
-            {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
-          </> : null}
+    <div className="space-y-4">
+      {showHeader ? (
+        <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 border-b border-[var(--lux-line-soft)] pb-3">
+          <div className="flex items-baseline gap-3">
+            <div className="lux-media-nfo-media-heading">
+              <h3 id="media-file-heading" className="text-xl md:text-2xl font-bold text-white tracking-tight">媒体文件</h3>
+            </div>
+            {compactSummaryValues.length ? (
+              <span id="media-source-pill" className="lux-media-file-summary is-compact text-xs text-[var(--lux-subtle)]">
+                {compactSummaryValues.join(" · ")}
+                {includeMetadataRows ? (
+                  <>
+                    <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
+                    <InfoRow label="状态" value={status ?? undefined} />
+                    {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
+                  </>
+                ) : null}
+              </span>
+            ) : null}
+          </div>
+          <span id="media-stream-count-badge" className="text-xs text-[var(--lux-subtle)]">
+            {streams.length ? `${streams.length} 条媒体轨` : "暂无轨道信息"}
+          </span>
         </div>
-      ) : (
-        <div className="lux-media-file-summary">
-          <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
-          {includeMetadataRows ? <>
-            <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
-            <InfoRow label="状态" value={status ?? undefined} />
-            {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
-          </> : null}
-          {includeSourceRow ? <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} /> : null}
-          <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
+      ) : null}
+
+      {/* Quick Specs & File Facts Ribbon */}
+      <div className="lux-surface-panel lux-media-file-facts p-3.5 flex flex-wrap items-center justify-between gap-4 text-xs">
+        <div className="flex flex-wrap items-center gap-2.5">
+          {source.container ? (
+            <span id="fact-container" className="px-2 py-0.5 rounded bg-white/[0.06] text-white font-mono font-medium">
+              {source.container.toUpperCase()}
+            </span>
+          ) : null}
+          {formatBytes(source.size) ? (
+            <>
+              <span id="fact-size" className="text-[var(--lux-muted)]">{formatBytes(source.size)}</span>
+              <span className="text-[var(--lux-subtle)]">·</span>
+            </>
+          ) : null}
+          {formatBitrate(source.bitrate) ? (
+            <>
+              <span id="fact-bitrate" className="text-[var(--lux-muted)]">{formatBitrate(source.bitrate)}</span>
+              <span className="text-[var(--lux-subtle)]">·</span>
+            </>
+          ) : null}
+          {runtimeLabel(source.durationTicks) ? (
+            <>
+              <span id="fact-runtime" className="text-[var(--lux-muted)]">{runtimeLabel(source.durationTicks)}</span>
+              <span className="text-[var(--lux-subtle)]">·</span>
+            </>
+          ) : null}
+          {source.sourceKind ? (
+            <span id="fact-source-kind" className="text-[var(--lux-muted)]">
+              {source.sourceKind === "STRM_URL" ? "STRM 远程播放源" : "本地媒体文件"}
+            </span>
+          ) : null}
         </div>
-      )}
+
+        {source.externalUrl ? (
+          <button
+            type="button"
+            onClick={() => setShowAddress((prev) => !prev)}
+            className="lux-badge-pill hover:text-white cursor-pointer ml-auto sm:ml-0"
+          >
+            <span>媒体源地址与技术详情</span>
+            <span id="url-drawer-chevron" className="text-[var(--lux-subtle)] transition-transform">
+              {showAddress ? "▲" : "▼"}
+            </span>
+          </button>
+        ) : null}
+      </div>
+
+      {/* Collapsible Technical URL Drawer */}
       {source.externalUrl ? (
         collapseTechnicalDetails ? (
           <details className="lux-media-info-address">
@@ -100,74 +158,114 @@ export function MediaInfoContent({
             <code>{source.externalUrl}</code>
           </details>
         ) : (
-          <div className="lux-media-nfo-row lux-media-info-address">
-            <span>媒体地址</span>
-            <code>{source.externalUrl}</code>
+          <div
+            id="media-url-drawer"
+            className={`lux-surface-panel p-4 space-y-2.5 bg-black/40 lux-media-info-address ${showAddress ? "" : "hidden"}`}
+          >
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-[var(--lux-subtle)]">媒体播放地址 (已安全收纳)</span>
+              <button
+                type="button"
+                onClick={handleCopyUrl}
+                className="text-xs text-[var(--lux-silver-accent)] hover:underline flex items-center gap-1 cursor-pointer"
+              >
+                {copied ? "已复制" : "复制地址"}
+              </button>
+            </div>
+            <div
+              id="media-url-display"
+              className="p-2.5 rounded bg-black/60 border border-[var(--lux-line-soft)] font-mono text-xs text-[var(--lux-muted)] break-all select-all"
+            >
+              <code>{source.externalUrl}</code>
+            </div>
           </div>
         )
       ) : null}
-      <div className="lux-media-file-facts" aria-label="媒体文件摘要">
-        {source.container ? <span>{source.container.toUpperCase()}</span> : null}
-        {formatBytes(source.size) ? <span>{formatBytes(source.size)}</span> : null}
-        {formatBitrate(source.bitrate) ? <span>{formatBitrate(source.bitrate)}</span> : null}
-        {runtimeLabel(source.durationTicks) ? <span>{runtimeLabel(source.durationTicks)}</span> : null}
-      </div>
-      {streamGroups.length ? (
-        collapseTechnicalDetails ? (
-          <details className="lux-media-stream-disclosure">
-            <summary>轨道详情 · {streams.length} 条</summary>
-            {renderStreams()}
-          </details>
-        ) : renderStreams()
-      ) : null}
-    </>
-  );
 
-  function renderStreams() {
-    return (
-      <HorizontalScrollRail className="lux-media-stream-rail" ariaLabel="媒体轨道">
-        <div className="lux-media-stream-grid">
-          {streamGroups.flatMap(({ type, streams: groupStreams }) => groupStreams.map((stream) => (
-            <MediaStreamCard
-              key={`${type}-${stream.index}`}
-              stream={stream}
-              sourceBitrate={source.bitrate}
-            />
-          )))}
+      {/* LUX NATIVE HORIZONTAL SCROLL RAIL (精修版横向排列) */}
+      {streams.length ? (
+        <div className="relative group">
+          <HorizontalScrollRail className="lux-media-stream-rail overflow-x-auto pb-3 pt-1" ariaLabel="媒体轨道">
+            <div id="lux-stream-rail" className="lux-media-stream-grid flex flex-nowrap items-stretch gap-3 min-w-full">
+              {streams.map((stream, idx) => (
+                <MediaStreamCard
+                  key={`${stream.type ?? "stream"}-${stream.index}`}
+                  stream={stream}
+                  index={idx}
+                  sourceBitrate={source.bitrate}
+                />
+              ))}
+            </div>
+          </HorizontalScrollRail>
         </div>
-      </HorizontalScrollRail>
-    );
-  }
+      ) : null}
+    </div>
+  );
 }
 
 function MediaStreamCard({
   stream,
+  index,
   sourceBitrate,
 }: {
   stream: MediaStream;
+  index: number;
   sourceBitrate?: number | null;
 }) {
   const kind = stream.type?.toUpperCase() ?? "UNKNOWN";
+  const typeLabel = streamTypeLabel(kind);
   const title = stream.title || streamLabel(stream, kind);
-  const rows = streamDetailRows(stream, kind, sourceBitrate);
+  const rows = streamDetailRows(stream, kind, sourceBitrate, index);
   const language = stream.language ? languageLabel(stream.language) : undefined;
+  const codec = stream.codec ? codecLabel(stream.codec) : undefined;
+
+  const badges: Array<{ label: string; accent?: boolean }> = [];
+  if (codec) badges.push({ label: codec });
+  if (language) badges.push({ label: kind === "SUBTITLE" ? `${language}字幕` : language });
+  if (stream.isDefault) badges.push({ label: "默认", accent: true });
+  if (stream.isForced) badges.push({ label: "强制", accent: true });
+  if (stream.isExternal) badges.push({ label: "外挂" });
 
   return (
-    <article className="lux-media-stream-card" aria-label={`${streamTypeLabel(kind)}轨道 ${stream.index + 1}`}>
+    <article className="lux-media-stream-card" aria-label={`${typeLabel}轨道 ${index + 1}`}>
+      {/* Card Top: Heading & Badges */}
       <div className="lux-media-stream-heading">
-        <span className="lux-media-stream-type">{streamTypeLabel(kind)}</span>
-        <h3>{title}</h3>
+        <div className="lux-media-stream-heading-top flex items-center justify-between gap-2">
+          <span className="lux-media-stream-type text-xs font-semibold uppercase tracking-wider text-[var(--lux-silver-accent)]">
+            {typeLabel}
+          </span>
+          <span className="lux-media-stream-index text-[11px] font-mono text-[var(--lux-subtle)]">
+            #{index + 1}
+          </span>
+        </div>
+
+        <h3 className="text-sm font-bold text-white mt-1 truncate" title={title}>
+          {title}
+        </h3>
+
+        <div className="lux-media-stream-badges flex flex-wrap gap-1 mt-2.5">
+          {badges.map((b) => (
+            <span
+              key={b.label}
+              className={`lux-badge-pill text-[11px] py-0 px-1.5 ${b.accent ? "lux-badge-accent is-default" : ""}`}
+            >
+              {b.label}
+            </span>
+          ))}
+        </div>
       </div>
-      <div className="lux-media-stream-badges">
-        {stream.codec ? <span>{codecLabel(stream.codec)}</span> : null}
-        {language ? <span>{kind === "SUBTITLE" ? `${language}字幕` : language}</span> : null}
-        {stream.isDefault ? <span className="is-default">默认</span> : null}
-        {stream.isForced ? <span className="is-default">强制</span> : null}
-        {stream.isExternal ? <span>外挂</span> : null}
-      </div>
+
+      {/* Card Bottom: Balanced Key-Value Rows */}
       {rows.length ? (
-        <div className="lux-media-stream-details">
-          {rows.map(([label, value]) => <InfoRow key={label} label={label} value={value} />)}
+        <div className="lux-media-stream-details grid gap-1 pt-3 mt-3 border-t border-[var(--lux-line-soft)] text-xs">
+          {rows.map(([label, value]) => (
+            <div key={label} className="lux-media-nfo-row flex items-center justify-between gap-2 py-0.5">
+              <span className="text-[var(--lux-subtle)] shrink-0">{label}</span>
+              <strong className="font-mono font-medium text-[var(--lux-text)] truncate text-right">
+                {value}
+              </strong>
+            </div>
+          ))}
         </div>
       ) : null}
     </article>
@@ -178,6 +276,7 @@ function streamDetailRows(
   stream: MediaStream,
   kind: string,
   sourceBitrate?: number | null,
+  index?: number,
 ): Array<[string, string]> {
   const details = stream.details ?? {};
   const rows: Array<[string, string]> = [];
@@ -203,18 +302,27 @@ function streamDetailRows(
   if (kind === "AUDIO") {
     add("布局", channelLayout(details.ChannelLayout, details.Channels));
     add("声道", withUnit(details.Channels, "ch"));
-    add("码率", formatBitrate(details.BitRate));
     add("采样率", formatSampleRate(details.SampleRate));
     add("配置", textValue(details.Profile));
+    add("码率", formatBitrate(details.BitRate));
+    add("语言", stream.language ? languageLabel(stream.language) : undefined);
+    const isHighQuality = (numberValue(details.BitRate) ?? 0) >= 1_500_000 || (numberValue(details.SampleRate) ?? 0) >= 48_000;
+    if (isHighQuality) {
+      add("音质", "无损高清");
+    }
   }
   if (kind === "SUBTITLE") {
-    add("格式", stream.codec ? codecLabel(stream.codec) : undefined);
+    add("格式", stream.codec ? (codecLabel(stream.codec) === "PGSSUB" ? "图形位图 (PGS)" : codecLabel(stream.codec)) : undefined);
     add("语言", stream.language ? languageLabel(stream.language) : undefined);
-    add("来源", stream.isExternal ? "同目录外挂" : "内嵌字幕轨");
-    add("默认", stream.isDefault ? "是" : "否");
-    if (stream.isForced) {
-      add("强制字幕", "是");
+    if (stream.language) {
+      add("语言代码", stream.language);
     }
+    add("来源", stream.isExternal ? "同目录外挂" : "内嵌字幕轨");
+    if (index !== undefined) {
+      add("轨道序号", `#${index + 1}`);
+    }
+    add("默认", stream.isDefault ? "是" : "否");
+    add("强制字幕", stream.isForced ? "是" : "否");
   }
   return rows;
 }
