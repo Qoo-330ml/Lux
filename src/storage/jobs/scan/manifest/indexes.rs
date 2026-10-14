@@ -428,7 +428,11 @@ pub(super) fn is_file_change_only_sidecar_path(relative_path: &str) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"));
-    is_external_subtitle || is_media_info || is_danmaku_xml
+    let is_nfo = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"));
+    is_external_subtitle || is_media_info || is_danmaku_xml || is_nfo
 }
 
 fn record_manifest_file_change_applied<'a>(

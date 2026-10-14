@@ -2367,7 +2367,9 @@ pub(super) fn is_file_change_only_sidecar(path: &Path) -> bool {
         || path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("xml") || extension.eq_ignore_ascii_case("nfo")
+            })
 }
 
 pub(super) fn is_supported_incremental_sidecar_file(path: &Path) -> bool {

@@ -25,6 +25,28 @@ fn media_info_sidecar_source_stem(path: &Path) -> Option<&str> {
     Some(source_stem)
 }
 
+async fn changed_nfo_path_is_safe(root_path: &Path, relative_path: &Path) -> bool {
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let Ok(root_path) = tokio::fs::canonicalize(root_path).await else {
+        return false;
+    };
+    let Ok(nfo_path) = tokio::fs::canonicalize(root_path.join(relative_path)).await else {
+        return false;
+    };
+    if !nfo_path.starts_with(&root_path) {
+        return false;
+    }
+    tokio::fs::metadata(nfo_path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 1_048_576)
+}
+
 impl ScanJobService {
     pub async fn run_to_completion(
         &self,
@@ -712,8 +734,10 @@ impl ScanJobService {
                 .list_pending_scan_job_file_changes(job_id, after.as_ref(), limit)
                 .await?;
             if changes.is_empty() {
+                self.process_queued_danmaku_file_changes(job_id, batch_size, cancellation)
+                    .await?;
                 return self
-                    .process_queued_danmaku_file_changes(job_id, batch_size, cancellation)
+                    .process_queued_nfo_file_changes(job_id, batch_size, cancellation)
                     .await;
             }
             let mut restart_from_beginning = false;
@@ -1092,6 +1116,212 @@ impl ScanJobService {
                 };
                 if !applied {
                     restart_from_beginning = true;
+                }
+            }
+            if restart_from_beginning {
+                after = None;
+            } else {
+                after = changes
+                    .last()
+                    .map(|change| crate::storage::StoredScanJobPath {
+                        library_root_id: change.library_root_id.clone(),
+                        relative_path: change.relative_path.clone(),
+                        change_kind: change.change_kind.clone(),
+                        file_change_revision: change.file_change_revision,
+                    });
+            }
+        }
+    }
+
+    async fn process_queued_nfo_file_changes(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        cancellation: &AtomicBool,
+    ) -> Result<(), ScanJobError> {
+        self.database
+            .requeue_running_scan_job_file_changes(job_id)
+            .await?;
+        let limit = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
+        let mut after = None;
+        loop {
+            let changes = self
+                .database
+                .list_pending_scan_job_file_changes(job_id, after.as_ref(), limit)
+                .await?;
+            if changes.is_empty() {
+                return Ok(());
+            }
+            let mut restart_from_beginning = false;
+            for change in &changes {
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let relative_path = Path::new(&change.relative_path);
+                if !relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"))
+                {
+                    continue;
+                }
+                let Some(revision) = change.file_change_revision else {
+                    return Err(StorageError::Conflict(
+                        "scan file change is missing its revision".to_owned(),
+                    )
+                    .into());
+                };
+                let claimed = self
+                    .database
+                    .set_scan_job_file_change_state(
+                        job_id,
+                        &change.library_root_id,
+                        &change.relative_path,
+                        revision,
+                        "RUNNING",
+                        None,
+                    )
+                    .await?;
+                if !claimed {
+                    restart_from_beginning = true;
+                    continue;
+                }
+                if cancellation.load(Ordering::Acquire) {
+                    self.database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "PENDING",
+                            None,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let Some(entry) = self
+                    .database
+                    .find_filesystem_entry(&change.library_root_id, &change.relative_path)
+                    .await?
+                else {
+                    let completed = self
+                        .database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "DONE",
+                            None,
+                        )
+                        .await?;
+                    restart_from_beginning |= !completed;
+                    continue;
+                };
+                let sources = self
+                    .database
+                    .list_scan_local_metadata_sources(std::slice::from_ref(&entry.id))
+                    .await?;
+                if sources.is_empty() {
+                    let completed = self
+                        .database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "DONE",
+                            None,
+                        )
+                        .await?;
+                    restart_from_beginning |= !completed;
+                    continue;
+                }
+                let root_path = Path::new(&sources[0].root_path);
+                let nfo_path = root_path.join(relative_path);
+                if change.change_kind != "REMOVE"
+                    && !changed_nfo_path_is_safe(root_path, relative_path).await
+                {
+                    let marked = self
+                        .database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "FAILED",
+                            Some("INVALID_NFO"),
+                        )
+                        .await?;
+                    restart_from_beginning |= !marked;
+                    continue;
+                }
+                if cancellation.load(Ordering::Acquire) {
+                    self.database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "PENDING",
+                            None,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let mut enricher =
+                    crate::application::metadata::MetadataEnricher::new(self.database.clone());
+                if let Some(people) = self.people.clone() {
+                    enricher = enricher.with_people(people);
+                }
+                if let Some(local_nfo) = self.local_nfo.clone() {
+                    enricher = enricher.with_nfo_store(local_nfo);
+                }
+                let result = match enricher
+                    .enrich_scan_local_metadata_file_change_nfo(sources, &nfo_path)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let marked = self
+                            .database
+                            .set_scan_job_file_change_state(
+                                job_id,
+                                &change.library_root_id,
+                                &change.relative_path,
+                                revision,
+                                "FAILED",
+                                Some("NFO_PROCESSING_FAILED"),
+                            )
+                            .await?;
+                        restart_from_beginning |= !marked;
+                        continue;
+                    }
+                };
+                let (state, error) = if result.report.nfo_failed > 0 {
+                    ("FAILED", Some("NFO_ENRICHMENT_FAILED"))
+                } else {
+                    ("DONE", None)
+                };
+                let marked = self
+                    .database
+                    .set_scan_job_file_change_state(
+                        job_id,
+                        &change.library_root_id,
+                        &change.relative_path,
+                        revision,
+                        state,
+                        error,
+                    )
+                    .await?;
+                restart_from_beginning |= !marked;
+                if marked && result.report.nfo_loaded > 0 {
+                    if let Some(home) = &self.home {
+                        home.invalidate();
+                    }
+                    self.user_events.publish_home_coalesced().await;
                 }
             }
             if restart_from_beginning {

@@ -1593,7 +1593,7 @@ impl MetadataEnricher {
         let item_count = source_snapshot.len();
         let started = Instant::now();
         let result = self
-            .enrich_scan_local_metadata_batch_nfo_inner(source_snapshot, excluded_item_ids)
+            .enrich_scan_local_metadata_batch_nfo_inner(source_snapshot, excluded_item_ids, None)
             .await;
         let complete = result
             .as_ref()
@@ -1607,10 +1607,37 @@ impl MetadataEnricher {
         result
     }
 
+    pub(crate) async fn enrich_scan_local_metadata_file_change_nfo(
+        &self,
+        source_snapshot: Vec<StoredScanLocalMetadataSource>,
+        changed_nfo_path: &Path,
+    ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
+        let item_count = source_snapshot.len();
+        let started = Instant::now();
+        let result = self
+            .enrich_scan_local_metadata_batch_nfo_inner(
+                source_snapshot,
+                &[],
+                Some(changed_nfo_path),
+            )
+            .await;
+        let complete = result
+            .as_ref()
+            .is_ok_and(|batch| batch.report.failed_item_ids.is_empty());
+        self.resources.record_metadata_batch(
+            "local_nfo_file_change",
+            item_count,
+            started.elapsed(),
+            complete,
+        );
+        result
+    }
+
     async fn enrich_scan_local_metadata_batch_nfo_inner(
         &self,
         source_snapshot: Vec<StoredScanLocalMetadataSource>,
         excluded_item_ids: &[String],
+        changed_nfo_path: Option<&Path>,
     ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
         let excluded_item_ids = excluded_item_ids
             .iter()
@@ -1641,6 +1668,28 @@ impl MetadataEnricher {
             nfo_snapshot
                 .deferred_metadata_updates
                 .identity_conflict_gate = Some(Arc::clone(gate));
+        }
+        if let Some(changed_nfo_path) = changed_nfo_path {
+            let affected_item_ids = nfo_snapshot
+                .nfo_paths_by_item
+                .iter()
+                .filter(|(_, nfo_path)| nfo_path.as_path() == changed_nfo_path)
+                .map(|(item_id, _)| item_id.clone())
+                .collect::<HashSet<_>>();
+            nfo_snapshot
+                .nfo_paths_by_item
+                .retain(|item_id, _| affected_item_ids.contains(item_id));
+            sources.retain(|source| {
+                affected_item_ids.contains(&source.item_id)
+                    || source
+                        .series_id
+                        .as_ref()
+                        .is_some_and(|series_id| affected_item_ids.contains(series_id))
+                    || source
+                        .season_id
+                        .as_ref()
+                        .is_some_and(|season_id| affected_item_ids.contains(season_id))
+            });
         }
         let mut metadata_item_ids = nfo_snapshot
             .nfo_paths_by_item

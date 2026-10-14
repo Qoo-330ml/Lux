@@ -3872,6 +3872,86 @@ async fn incremental_scan_syncs_only_the_changed_danmaku_xml_result()
 }
 
 #[tokio::test]
+async fn manifest_scan_updates_only_the_changed_nfo_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("NFO Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("NFO.Movie.2024.mkv"), b"video").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let local_nfo = LocalNfoMetadataStore::new(database.clone());
+    let jobs = ScanJobService::new(database.clone()).with_nfo_store(local_nfo);
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("NFO Movie (2024)/NFO.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+    let nfo_path = "NFO Movie (2024)/movie.nfo";
+    tokio::fs::write(
+        root.join(nfo_path),
+        "<movie><title>来自新 NFO 的标题</title></movie>",
+    )
+    .await?;
+    let added = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+
+    let event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(nfo_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(event, ("ADD".to_owned(), "DONE".to_owned()));
+    let item_state: (String, String) =
+        sqlx::query_as("SELECT title, identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        item_state,
+        ("来自新 NFO 的标题".to_owned(), "LOCAL_CONFIRMED".to_owned())
+    );
+    let targets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+        .bind(&added.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(targets, 0);
+    let metadata_batches: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(metadata_batches, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn manifest_scan_queues_attachment_removal_only_after_root_confirmation()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
