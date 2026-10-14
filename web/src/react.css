@@ -237,7 +237,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-rail { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(235px, 100%), 1fr)); width: 100%; min-width: 0; align-items: start; }
 .lux-library-card { position: relative; display: flex; flex: 0 0 235px; flex-direction: column; align-items: stretch; min-width: 0; border: 0; border-radius: 0; background: transparent; transition: transform .2s var(--lux-ease); }
 .lux-library-card:hover { transform: translateY(-3px); }
-.lux-library-card-link { display: flex; flex: 1; flex-direction: column; min-width: 0; }
+.lux-library-card-cover-shell { position: relative; }
+.lux-library-card-cover-link, .lux-library-card-copy-link { display: block; min-width: 0; }
 .lux-library-card-cover { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: radial-gradient(circle at 50% 20%, rgba(107,107,118,.28), transparent 44%), linear-gradient(145deg, #27272c, #101013); box-shadow: 0 10px 25px rgba(0,0,0,.2); }
 .lux-library-card-cover::after { position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 1px rgba(255,255,255,.04); content: ""; pointer-events: none; }
 .lux-library-cover, .lux-library-cover-full { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .45s var(--lux-ease), filter .3s ease; }
@@ -245,9 +246,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-icon { display: grid; place-items: center; width: 100%; height: 100%; color: rgba(255,255,255,.78); font-size: 2rem; }
 .lux-library-card-copy { display: block; min-width: 0; padding: var(--lux-card-copy-padding); }
 .lux-library-card strong { display: block; overflow: hidden; color: rgba(255,255,255,.9); font-size: .86rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
-.lux-library-card-menu-trigger { position: absolute; z-index: 2; top: 8px; right: 8px; display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 1px solid rgba(255,255,255,.18); border-radius: 50%; color: #fff; background: rgba(15,15,19,.76); box-shadow: 0 5px 14px rgba(0,0,0,.25); opacity: 0; transform: translateY(3px); transition: opacity .2s ease, transform .2s var(--lux-ease), background .2s ease; backdrop-filter: blur(12px); }
-.lux-library-card:hover .lux-library-card-menu-trigger, .lux-library-card-menu-trigger:focus-visible { opacity: 1; transform: translateY(0); }
-.lux-library-card-menu-trigger:hover { background: rgba(255,255,255,.2); }
+.lux-library-card-menu-trigger { position: absolute; z-index: 2; right: 8px; bottom: 8px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; color: #fff; background: transparent; box-shadow: none; opacity: 0; pointer-events: none; transform: translateY(3px); transition: opacity .2s ease, transform .2s var(--lux-ease); }
+.lux-library-card-menu-trigger::before { position: absolute; inset: 0; width: 30px; height: 30px; margin: auto; box-sizing: border-box; border: 1px solid rgba(255,255,255,.18); border-radius: 50%; background: rgba(15,15,19,.76); box-shadow: 0 5px 14px rgba(0,0,0,.25); content: ""; pointer-events: none; backdrop-filter: blur(12px); transition: background .2s ease, border-color .2s ease; }
+.lux-library-card-cover-shell:hover .lux-library-card-menu-trigger, .lux-library-card-menu-trigger:focus-visible, .lux-library-card-menu-trigger[aria-expanded="true"] { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.lux-library-card-menu-trigger:hover::before, .lux-library-card-menu-trigger[aria-expanded="true"]::before { border-color: rgba(255,255,255,.56); background: rgba(255,255,255,.2); }
 .lux-library-card-action-feedback { margin: 8px 2px 0; color: var(--lux-subtle); font-size: .68rem; line-height: 1.4; }
 .lux-library-card-action-feedback.is-error { color: #f3aab8; }
 .lux-media-rail { align-items: flex-start; }
@@ -526,7 +528,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 @media (max-width: 700px) {
   .lux-person-detail-page { width: 92%; box-sizing: border-box; padding-top: 0; }
   .lux-library-rail { display: flex; width: max-content; min-width: 100%; }
-  .lux-library-card { flex: 0 0 min(170px, 52vw); }
+  .lux-library-card { flex: 0 0 min(180px, 56vw); }
+  .lux-home-content .lux-continue-card { flex-basis: min(190px, 58vw); }
+  .lux-home-content .lux-media-rail:not(.lux-continue-rail) .lux-media-card:not(.lux-media-card-landscape) { flex-basis: min(160px, 50vw); }
   .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
   .lux-person-detail-copy h1 { font-size: 2.2rem; }
@@ -2428,14 +2432,15 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-permission-toggle { min-height: var(--lux-button-height-touch); }
 }
 
-@media (hover: none), (pointer: coarse) {
-  .lux-media-art-shell > .lux-media-actions { opacity: 1; pointer-events: auto; transform: none; }
-  .lux-media-actions-trigger { width: var(--lux-button-height-touch); height: var(--lux-button-height-touch); }
-  .lux-media-action { min-height: var(--lux-button-height-touch); }
-  .lux-library-card-menu-trigger { width: var(--lux-button-height-touch); height: var(--lux-button-height-touch); opacity: 1; transform: none; }
+@media (hover: none) {
+  .lux-media-art-shell:not(.is-touch-hovered):not(:focus-within) > .lux-media-actions { opacity: 0; pointer-events: none; transform: translateY(3px); }
+  .lux-media-art-shell.is-touch-hovered > .lux-media-actions, .lux-media-art-shell:focus-within > .lux-media-actions { opacity: 1; pointer-events: auto; transform: none; }
+  .lux-library-card-cover-shell:not(.is-touch-hovered):not(:focus-within) .lux-library-card-menu-trigger:not(:focus-visible):not([aria-expanded="true"]) { opacity: 0; pointer-events: none; transform: translateY(3px); }
+  .lux-library-card-cover-shell.is-touch-hovered .lux-library-card-menu-trigger, .lux-library-card-menu-trigger:focus-visible, .lux-library-card-menu-trigger[aria-expanded="true"] { opacity: 1; pointer-events: auto; transform: none; }
 }
 
 @media (pointer: coarse) {
+  .lux-media-action { min-height: var(--lux-button-height-touch); }
   /* iOS zooms small text fields on focus; the floor must beat page-specific fonts. */
   :where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]):not([type="range"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]), textarea, select) { font-size: max(16px, var(--lux-input-font-size, 1em)) !important; }
 }

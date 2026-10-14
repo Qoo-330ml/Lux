@@ -245,7 +245,6 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
       <div className="lux-media-art">
         {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
-        <Rating value={item.rating} placement="card" />
         <EpisodeCount item={item} />
         <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
         {progress > 0 && progress < 100 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
@@ -393,23 +392,27 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
 
   return (
     <article ref={cardRef} className="lux-library-card" onContextMenu={handleContextMenu}>
-      <Link className="lux-library-card-link" to={`/libraries/${library.id}`} onMouseEnter={onPrefetch} onFocus={onPrefetch}>
-        <span className="lux-library-card-cover">
-          {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
-        </span>
+      <div className="lux-library-card-cover-shell">
+        <Link className="lux-library-card-cover-link" to={`/libraries/${library.id}`} onMouseEnter={onPrefetch} onFocus={onPrefetch}>
+          <span className="lux-library-card-cover">
+            {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
+          </span>
+        </Link>
+        <button
+          ref={menuTriggerRef}
+          className="lux-library-card-menu-trigger"
+          type="button"
+          aria-label={`打开 ${library.name} 操作菜单`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          onClick={handleTriggerClick}
+        >
+          <MoreHorizontal size={16} aria-hidden="true" />
+        </button>
+      </div>
+      <Link className="lux-library-card-copy-link" to={`/libraries/${library.id}`} onMouseEnter={onPrefetch} onFocus={onPrefetch}>
         <span className="lux-library-card-copy"><strong>{library.name}</strong></span>
       </Link>
-      <button
-        ref={menuTriggerRef}
-        className="lux-library-card-menu-trigger"
-        type="button"
-        aria-label={`打开 ${library.name} 操作菜单`}
-        aria-haspopup="menu"
-        aria-expanded={menuOpen}
-        onClick={handleTriggerClick}
-      >
-        <MoreHorizontal size={18} aria-hidden="true" />
-      </button>
       {actionNotice ? <p className="lux-library-card-action-feedback" role="status">{actionNotice}</p> : null}
       {actionError ? <p className="lux-library-card-action-feedback is-error" role="alert">{actionError}</p> : null}
       {pendingAction ? <span className="lux-visually-hidden" role="status">{pendingAction === "reidentify" ? "正在提交整库元数据匹配任务" : "正在提交扫描任务"}</span> : null}

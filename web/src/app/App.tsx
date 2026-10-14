@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { api, ApiError } from "../lib/api/client";
 import { queryKeys } from "../lib/api/query-keys";
 import type { LuxUser } from "../lib/api/types";
@@ -75,6 +75,34 @@ function SessionRoutes() {
 }
 
 function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {
+  useEffect(() => {
+    let activeCard: HTMLElement | null = null;
+    const cardAt = (x: number, y: number) => document.elementFromPoint(x, y)
+      ?.closest<HTMLElement>(".lux-media-art-shell, .lux-library-card-cover-shell") ?? null;
+    const setActiveCard = (nextCard: HTMLElement | null) => {
+      if (activeCard === nextCard) return;
+      activeCard?.classList.remove("is-touch-hovered");
+      activeCard = nextCard;
+      activeCard?.classList.add("is-touch-hovered");
+    };
+    const revealCardAtPointer = (event: PointerEvent) => {
+      if (event.pointerType !== "touch" || !event.isPrimary) return;
+      setActiveCard(cardAt(event.clientX, event.clientY));
+    };
+    const clearCardWhenTouchingElsewhere = (event: PointerEvent) => {
+      if (event.pointerType !== "touch" || !event.isPrimary) return;
+      if (cardAt(event.clientX, event.clientY) !== activeCard) setActiveCard(null);
+    };
+
+    document.addEventListener("pointermove", revealCardAtPointer, { passive: true });
+    document.addEventListener("pointerdown", clearCardWhenTouchingElsewhere, { passive: true });
+    return () => {
+      document.removeEventListener("pointermove", revealCardAtPointer);
+      document.removeEventListener("pointerdown", clearCardWhenTouchingElsewhere);
+      setActiveCard(null);
+    };
+  }, []);
+
   return (
     <Suspense fallback={<LoadingScreen label="正在打开页面" />}>
       <Routes>
