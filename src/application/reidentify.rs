@@ -50,6 +50,10 @@ const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 
+#[cfg(feature = "performance-benchmarks")]
+#[doc(hidden)]
+pub type MetadataBenchmarkItemTimings = Arc<Mutex<Vec<(String, u128)>>>;
+
 static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static METADATA_FILL_MISSING_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -100,6 +104,10 @@ pub struct MetadataReidentifyService {
     progress_events: MetadataProgressEventGate,
     worker_permits: Arc<Semaphore>,
     fill_missing_worker_permits: Arc<Semaphore>,
+    #[cfg(feature = "performance-benchmarks")]
+    fill_missing_benchmark_concurrency: Option<usize>,
+    #[cfg(feature = "performance-benchmarks")]
+    benchmark_item_timings: Option<MetadataBenchmarkItemTimings>,
     fill_missing_dispatchers: Option<MetadataFillMissingDispatchers>,
     running_jobs: MetadataJobOwners,
     library_job_creation: Arc<AsyncMutex<()>>,
@@ -736,6 +744,10 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            #[cfg(feature = "performance-benchmarks")]
+            fill_missing_benchmark_concurrency: None,
+            #[cfg(feature = "performance-benchmarks")]
+            benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
@@ -770,6 +782,10 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            #[cfg(feature = "performance-benchmarks")]
+            fill_missing_benchmark_concurrency: None,
+            #[cfg(feature = "performance-benchmarks")]
+            benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
@@ -798,6 +814,10 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            #[cfg(feature = "performance-benchmarks")]
+            fill_missing_benchmark_concurrency: None,
+            #[cfg(feature = "performance-benchmarks")]
+            benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
@@ -825,6 +845,44 @@ impl MetadataReidentifyService {
             .map(|resolver| resolver.with_resource_metrics(resources.clone()));
         self.resources = resources;
         self
+    }
+
+    #[cfg(feature = "performance-benchmarks")]
+    #[doc(hidden)]
+    pub fn with_fill_missing_concurrency_for_benchmark(
+        mut self,
+        concurrency: usize,
+    ) -> Result<Self, &'static str> {
+        if !matches!(concurrency, 4 | 8 | 12) {
+            return Err("benchmark concurrency must be one of 4, 8, or 12");
+        }
+        self.fill_missing_benchmark_concurrency = Some(concurrency);
+        self.fill_missing_worker_permits = Arc::new(Semaphore::new(concurrency));
+        Ok(self)
+    }
+
+    #[cfg(feature = "performance-benchmarks")]
+    #[doc(hidden)]
+    pub fn with_item_timing_samples_for_benchmark(
+        mut self,
+        samples: MetadataBenchmarkItemTimings,
+    ) -> Self {
+        self.benchmark_item_timings = Some(samples);
+        self
+    }
+
+    fn worker_concurrency_limit(
+        &self,
+        backend: DatabaseBackend,
+        mode: MetadataRefreshMode,
+    ) -> usize {
+        #[cfg(feature = "performance-benchmarks")]
+        if matches!(mode, MetadataRefreshMode::FillMissing)
+            && let Some(concurrency) = self.fill_missing_benchmark_concurrency
+        {
+            return concurrency;
+        }
+        metadata_worker_configured_concurrency(backend, mode)
     }
 
     pub fn with_webhooks(mut self, webhooks: WebhookService) -> Self {
@@ -1301,7 +1359,7 @@ impl MetadataReidentifyService {
         let mut claim_failed = false;
         loop {
             let configured_concurrency =
-                metadata_worker_configured_concurrency(self.database.backend(), mode);
+                self.worker_concurrency_limit(self.database.backend(), mode);
             let concurrency = metadata_worker_concurrency(
                 self.resources
                     .metadata_concurrency(configured_concurrency)
@@ -1587,8 +1645,15 @@ impl MetadataReidentifyService {
             Ok(None) => Err(MetadataReidentifyError::ItemNotFound(item_id.to_owned())),
             Err(error) => Err(MetadataReidentifyError::Storage(error)),
         };
+        let item_elapsed = item_started.elapsed();
         self.resources
-            .record_metadata_stage("item_total", item_started.elapsed());
+            .record_metadata_stage("item_total", item_elapsed);
+        #[cfg(feature = "performance-benchmarks")]
+        if let Some(samples) = &self.benchmark_item_timings
+            && let Ok(mut samples) = samples.lock()
+        {
+            samples.push((item_id.to_owned(), item_elapsed.as_nanos()));
+        }
         match result {
             Ok(candidate_count) => {
                 let _ = self

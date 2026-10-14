@@ -11190,14 +11190,16 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 同一 fixture/延迟/数据库参数可重复运行，测量结果包含有效性检查、版本/架构与原始数据。
-- [ ] 并发 sweep 每档独立设置，确认 worker 峰值不超过档位且背压可见；错误/取消样本不计为成功吞吐。
-- [ ] `scripts/run-metadata-performance.sh` 可选择运行该基准；文档将真实上游响应时延与 stub 吞吐分开说明。
-- [ ] 本任务只建立测量，不改变默认并发或宣称真实 TMDb 速率。
+- [x] 同一 fixture/延迟/数据库参数可重复运行，测量结果包含有效性检查、版本/架构与逐项原始数据；SQLite 连跑 3 次并记录完整结果范围，PostgreSQL 参数路径已实现。
+- [x] 并发 sweep 每档独立设置，记录峰值与 queue wait；SQLite 各档峰值精确达到 4/8/12 且不超限；成功吞吐过滤失败/取消项。
+- [x] `scripts/run-metadata-performance.sh` 支持 `concurrency`/`legacy` 选择；性能记录明确区分固定延迟 stub 与真实上游时延。
+- [x] 本任务仅增加测量和 feature-gated benchmark seam；生产默认并发仍为 4，没有宣称真实 TMDb 速率。
 
-预计文件：`tests/performance.rs`、`scripts/run-metadata-performance.sh`、`docs/PERFORMANCE.md`、本文档。
+预计文件：`tests/performance.rs`、`scripts/run-metadata-performance.sh`、`docs/PERFORMANCE.md`、本文档。为使 8/12 路档位走真实 FILL_MISSING worker 而不提前开放运行时配置，允许增加仅由 benchmark Cargo feature 暴露的并发注入 seam（`Cargo.toml`、`src/application/reidentify.rs`）；该 seam 不进入默认构建。
 
 验证：Toshiba 挂载检查后以共享 target 运行指定 ignored performance target；另运行 fmt 和 diff 检查。禁止将本机 ARM64 结果外推至 NAS/x86。
+
+实施结果（2026-10-14）：新增 `performance-benchmarks` feature 仅供 ignored benchmark 注入 4/8/12 worker 和收集真实 `item_total` 样本，默认构建不包含 seam。新基准每档使用 96 项、每次 stub provider 调用固定 100ms、SQLite 真实 storage 与真实 FILL_MISSING job worker；脚本保留 `legacy` LUX-200 入口，并允许通过 `LUX_PERF_BACKEND=postgres` 选择 PostgreSQL。SQLite 连续 3 轮各档均 96/96 成功，0 失败/取消，192 次 provider 调用；4/8/12 路 items/s 中位数为 16.45/29.57/35.75，成功项 p95 中位数为 255.6/323.5/378.1ms，完整范围见 `docs/PERFORMANCE.md`。默认值未改。测试 target、legacy target、默认 build、fmt、all-features Clippy 与 diff 检查通过。PostgreSQL benchmark 本机未运行：未发现 `postgres`、`psql`、`pg_isready` 或可用服务；其连接配置路径已实现但后端耗时仍待实测。本机为 ARM64，结果不外推 NAS/x86。
 
 #### LUX-532：可配置且有界的 FILL_MISSING 并发
 

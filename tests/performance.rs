@@ -59,6 +59,7 @@ use tracing_subscriber::{
 const FOREGROUND_REQUESTS: usize = 50;
 const INCREMENTAL_FILES: usize = 100;
 const METADATA_BENCHMARK_ITEMS: usize = 32;
+const METADATA_CONCURRENCY_BENCHMARK_ITEMS: usize = 96;
 const POOL_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy)]
@@ -181,6 +182,15 @@ fn scan_active_request_samples_are_unavailable_when_no_request_fits() {
 
     assert!(select_scan_active_requests(&requests, 100, 300).is_empty());
     assert_eq!(optional_percentile_ms(&[]), None);
+}
+
+#[test]
+fn metadata_benchmark_percentiles_use_nearest_rank_and_reject_empty_samples() {
+    let samples = [1_000_000, 2_000_000, 5_000_000, 9_000_000];
+
+    assert_eq!(metadata_benchmark_percentile_ms(&samples, 50), Some(2.0));
+    assert_eq!(metadata_benchmark_percentile_ms(&samples, 95), Some(9.0));
+    assert_eq!(metadata_benchmark_percentile_ms(&[], 95), None);
 }
 
 #[test]
@@ -3457,6 +3467,245 @@ print('{"format":{"format_name":"matroska"},"streams":[]}', end="")
     Ok(())
 }
 
+#[cfg(feature = "performance-benchmarks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "run with scripts/run-metadata-performance.sh for the LUX-531 concurrency sweep"]
+async fn lux_531_metadata_concurrency_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    let database_configuration = metadata_benchmark_database_configuration(&backend)?;
+    let provider_delay_ms = env::var("LUX_METADATA_BENCHMARK_PROVIDER_DELAY_MS")
+        .unwrap_or_else(|_| "100".to_owned())
+        .parse::<u64>()?;
+    if !(1..=5_000).contains(&provider_delay_ms) {
+        return Err("LUX_METADATA_BENCHMARK_PROVIDER_DELAY_MS must be between 1 and 5000".into());
+    }
+    let provider_delay = Duration::from_millis(provider_delay_ms);
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(&config, &database_configuration).await?;
+    let libraries = LibraryService::new(database.clone());
+    let selection = MetadataSelectionService::with_config_dir(
+        database.clone(),
+        ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+        config.config_dir.clone(),
+    );
+    let mut levels = Vec::new();
+
+    for concurrency in [4, 8, 12] {
+        let library_name = format!("LUX-531 metadata benchmark {concurrency}");
+        let library = libraries
+            .create_library(&library_name, LibraryKind::Movie, false)
+            .await?;
+        let media_root = temp_dir.path().join(format!("Movies-{concurrency}"));
+        for index in 0..METADATA_CONCURRENCY_BENCHMARK_ITEMS {
+            let movie_dir = media_root.join(format!("Benchmark Movie {index:03} (2024)"));
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(
+                movie_dir.join(format!("Benchmark.Movie.{index:03}.2024.mkv")),
+                b"LUX-531 FIXED-LATENCY METADATA FIXTURE\n",
+            )
+            .await?;
+        }
+        libraries
+            .add_root(
+                library.id,
+                media_root
+                    .to_str()
+                    .ok_or("non-utf8 metadata fixture path")?,
+            )
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+
+        let provider = MetadataBenchmarkScraper::with_fixed_latency(provider_delay);
+        let provider_metrics = provider.provider_metrics.clone();
+        let scraper = ScraperProvider::from_adapter(provider);
+        let resources = ResourceMetrics::new();
+        let item_timings = Arc::new(Mutex::new(Vec::<(String, u128)>::new()));
+        let metadata = MetadataReidentifyService::with_selection(
+            database.clone(),
+            scraper,
+            Some(selection.clone()),
+        )
+        .with_resource_metrics(resources.clone())
+        .with_fill_missing_concurrency_for_benchmark(concurrency)?
+        .with_item_timing_samples_for_benchmark(Arc::clone(&item_timings));
+        let job = metadata
+            .create_library_refresh_job(&library.id.to_string(), MetadataRefreshMode::FillMissing)
+            .await?;
+        let started = Instant::now();
+        metadata.run(&job.id).await;
+        let elapsed = started.elapsed();
+        let completed = metadata.get_job(&job.id).await?;
+        let snapshot = resources.snapshot().await;
+        let statuses = completed
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.item_id.clone(),
+                    (item.status.clone(), item.error.is_none()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let successful_item_count = completed
+            .items
+            .iter()
+            .filter(|item| item.status == "COMPLETED" && item.error.is_none())
+            .count();
+        let failed_item_count = completed
+            .items
+            .iter()
+            .filter(|item| item.status == "FAILED" || item.error.is_some())
+            .count();
+        let cancelled_item_count = completed
+            .items
+            .iter()
+            .filter(|item| item.status == "CANCELLED")
+            .count();
+        let item_elapsed_samples = item_timings
+            .lock()
+            .map_err(|_| "metadata benchmark item timing lock was poisoned")?
+            .iter()
+            .map(|(item_id, elapsed_ns)| {
+                let item_status = statuses
+                    .get(item_id)
+                    .map(|(status, no_error)| json!({ "value": status, "errorFree": no_error }));
+                json!({
+                    "itemId": item_id,
+                    "status": item_status,
+                    "elapsedNs": elapsed_ns,
+                })
+            })
+            .collect::<Vec<_>>();
+        let successful_item_elapsed_ns = item_timings
+            .lock()
+            .map_err(|_| "metadata benchmark item timing lock was poisoned")?
+            .iter()
+            .filter(|(item_id, _)| {
+                statuses
+                    .get(item_id)
+                    .is_some_and(|(status, no_error)| status == "COMPLETED" && *no_error)
+            })
+            .map(|(_, elapsed_ns)| *elapsed_ns)
+            .collect::<Vec<_>>();
+        let provider_call_samples_ns = provider_metrics
+            .call_durations_ns
+            .lock()
+            .map_err(|_| "metadata benchmark provider timing lock was poisoned")?
+            .clone();
+        let item_p50_ms = metadata_benchmark_percentile_ms(&successful_item_elapsed_ns, 50);
+        let item_p95_ms = metadata_benchmark_percentile_ms(&successful_item_elapsed_ns, 95);
+        let provider_call_p50_ms = metadata_benchmark_percentile_ms(&provider_call_samples_ns, 50);
+        let provider_call_p95_ms = metadata_benchmark_percentile_ms(&provider_call_samples_ns, 95);
+        let provider_calls_per_successful_item = (successful_item_count > 0)
+            .then(|| provider_call_samples_ns.len() as f64 / successful_item_count as f64);
+        let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+        let observed_peak = provider_metrics.peak_active_calls.load(Ordering::SeqCst);
+        let active_after_job = provider_metrics.active_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            completed.total_count,
+            METADATA_CONCURRENCY_BENCHMARK_ITEMS as i64
+        );
+        assert_eq!(completed.items.len(), METADATA_CONCURRENCY_BENCHMARK_ITEMS);
+        assert_eq!(completed.pending_count, 0);
+        assert!(observed_peak > 0 && observed_peak <= concurrency);
+        assert_eq!(active_after_job, 0);
+        assert_eq!(successful_item_elapsed_ns.len(), successful_item_count);
+        assert_eq!(
+            provider_call_samples_ns.len(),
+            provider_metrics.call_count.load(Ordering::SeqCst)
+        );
+
+        levels.push(json!({
+            "workerLimit": concurrency,
+            "observedPeakProviderCalls": observed_peak,
+            "providerConcurrencySaturated": observed_peak == concurrency,
+            "itemCount": METADATA_CONCURRENCY_BENCHMARK_ITEMS,
+            "fixedProviderCallLatencyMs": provider_delay_ms,
+            "providerCallCount": provider_call_samples_ns.len(),
+            "providerCallsPerSuccessfulItem": provider_calls_per_successful_item,
+            "successfulItemCount": successful_item_count,
+            "failedItemCount": failed_item_count,
+            "cancelledItemCount": cancelled_item_count,
+            "itemsPerSecond": successful_item_count as f64 / elapsed_seconds,
+            "jobElapsedMs": elapsed.as_secs_f64() * 1000.0,
+            "successfulItemP50Ms": item_p50_ms,
+            "successfulItemP95Ms": item_p95_ms,
+            "providerCallP50Ms": provider_call_p50_ms,
+            "providerCallP95Ms": provider_call_p95_ms,
+            "queueWaitP95Ms": snapshot.metadata.stage_p95_ms.get("queue_wait"),
+            "workerItemP95Ms": snapshot.metadata.stage_p95_ms.get("item_total"),
+            "rawItemElapsedSamples": item_elapsed_samples,
+            "rawProviderCallElapsedNs": provider_call_samples_ns,
+        }));
+    }
+
+    println!(
+        "LUX-531 METADATA RESULT {}",
+        serde_json::to_string(&json!({
+            "commit": luxd::COMMIT,
+            "packageVersion": env!("CARGO_PKG_VERSION"),
+            "rustcVersion": env::var("LUX_METADATA_BENCHMARK_RUSTC_VERSION").ok(),
+            "architecture": std::env::consts::ARCH,
+            "operatingSystem": std::env::consts::OS,
+            "databaseBackend": backend,
+            "fixture": {
+                "itemCountPerLevel": METADATA_CONCURRENCY_BENCHMARK_ITEMS,
+                "libraryKind": "MOVIE",
+                "providerCallLatencyMs": provider_delay_ms,
+                "provider": "in-process adapter stub; no TMDb/network requests",
+            },
+            "levels": levels,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(feature = "performance-benchmarks")]
+fn metadata_benchmark_database_configuration(
+    backend: &str,
+) -> Result<DatabaseConfiguration, Box<dyn std::error::Error>> {
+    match backend {
+        "sqlite" => Ok(DatabaseConfiguration::Sqlite),
+        "postgres" => {
+            let database = match env::var("POSTGRES_TEST_DATABASE") {
+                Ok(database)
+                    if !database.is_empty()
+                        && !matches!(database.as_str(), "postgres" | "template0" | "template1") =>
+                {
+                    database
+                }
+                _ => {
+                    return Err(
+                        "POSTGRES_TEST_DATABASE must name a disposable non-system database".into(),
+                    );
+                }
+            };
+            Ok(DatabaseConfiguration::Postgres(PostgresConnection {
+                host: env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: env::var("POSTGRES_TEST_PORT")
+                    .unwrap_or_else(|_| "55432".to_owned())
+                    .parse()?,
+                database,
+                username: env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+                password: env::var("POSTGRES_TEST_PASSWORD")
+                    .unwrap_or_else(|_| "lux-test-password".to_owned()),
+                ssl_mode: "disable".to_owned(),
+            }))
+        }
+        unsupported => Err(format!(
+            "unsupported LUX_PERF_BACKEND {unsupported:?}; expected sqlite or postgres"
+        )
+        .into()),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with scripts/run-metadata-performance.sh for the LUX-200 metadata gate"]
 async fn lux_200_metadata_pipeline_benchmark() -> Result<(), Box<dyn std::error::Error>> {
@@ -3605,14 +3854,60 @@ async fn lux_200_metadata_pipeline_benchmark() -> Result<(), Box<dyn std::error:
 #[derive(Clone)]
 struct MetadataBenchmarkScraper {
     image_base_url: String,
+    provider_delay: Duration,
     resources: Arc<Mutex<Option<ResourceMetrics>>>,
+    provider_metrics: MetadataBenchmarkProviderMetrics,
+}
+
+#[derive(Clone, Default)]
+struct MetadataBenchmarkProviderMetrics {
+    active_calls: Arc<AtomicUsize>,
+    peak_active_calls: Arc<AtomicUsize>,
+    call_count: Arc<AtomicUsize>,
+    call_durations_ns: Arc<Mutex<Vec<u128>>>,
+}
+
+struct MetadataBenchmarkCallGuard {
+    metrics: MetadataBenchmarkProviderMetrics,
+    started: Instant,
+}
+
+impl Drop for MetadataBenchmarkCallGuard {
+    fn drop(&mut self) {
+        self.metrics.active_calls.fetch_sub(1, Ordering::SeqCst);
+        if let Ok(mut samples) = self.metrics.call_durations_ns.lock() {
+            samples.push(self.started.elapsed().as_nanos());
+        }
+    }
+}
+
+impl MetadataBenchmarkProviderMetrics {
+    fn begin_call(&self) -> MetadataBenchmarkCallGuard {
+        let active = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_active_calls.fetch_max(active, Ordering::SeqCst);
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        MetadataBenchmarkCallGuard {
+            metrics: self.clone(),
+            started: Instant::now(),
+        }
+    }
 }
 
 impl MetadataBenchmarkScraper {
     fn new(image_base_url: String) -> Self {
+        Self::with_provider_delay(image_base_url, Duration::from_millis(2))
+    }
+
+    fn with_fixed_latency(provider_delay: Duration) -> Self {
+        Self::with_provider_delay(String::new(), provider_delay)
+    }
+
+    fn with_provider_delay(image_base_url: String, provider_delay: Duration) -> Self {
         Self {
             image_base_url,
+            provider_delay,
             resources: Arc::new(Mutex::new(None)),
+            provider_metrics: MetadataBenchmarkProviderMetrics::default(),
         }
     }
 
@@ -3656,7 +3951,7 @@ impl MetadataBenchmarkScraper {
     }
 
     fn images(&self, provider_id: &str) -> ScraperImagesResponse {
-        if Self::index(provider_id) % 8 == 0 {
+        if self.image_base_url.is_empty() || Self::index(provider_id) % 8 == 0 {
             return ScraperImagesResponse::default();
         }
         ScraperImagesResponse {
@@ -3681,8 +3976,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let index = request
                 .name
                 .rsplit(' ')
@@ -3710,8 +4006,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let provider_id = Self::provider_id(&request.provider_id);
             let metadata = Self::metadata(&provider_id);
             scraper.record("metadata.get", started);
@@ -3725,8 +4022,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let provider_id = Self::provider_id(&request.provider_id);
             let images = scraper.images(&provider_id);
             let result = ScraperMetadataBundle {
@@ -3749,8 +4047,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let provider_id = Self::provider_id(&request.provider_id);
             let result = scraper.images(&provider_id);
             scraper.record("metadata.images", started);
@@ -3764,8 +4063,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let _ = request;
             scraper.record("metadata.credits", started);
             Ok(ScraperCreditsResponse::default())
@@ -3778,8 +4078,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let provider_id = Self::provider_id(&request.provider_id);
             scraper.record("metadata.externalIds", started);
             Ok(ScraperExternalIdsResponse {
@@ -3794,8 +4095,9 @@ impl ScraperAdapter for MetadataBenchmarkScraper {
     ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
         let scraper = self.clone();
         Box::pin(async move {
+            let _provider_call = scraper.provider_metrics.begin_call();
             let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(scraper.provider_delay).await;
             let _ = request;
             scraper.record("metadata.trailers", started);
             Ok(ScraperTrailersResponse::default())
@@ -4045,6 +4347,16 @@ fn percentile(values: &[u128], percentile: usize) -> u128 {
     sorted.sort_unstable();
     let index = ((sorted.len() * percentile).saturating_add(99) / 100).saturating_sub(1);
     sorted[index.min(sorted.len().saturating_sub(1))]
+}
+
+fn metadata_benchmark_percentile_ms(values_ns: &[u128], percentile: usize) -> Option<f64> {
+    if values_ns.is_empty() || !(1..=100).contains(&percentile) {
+        return None;
+    }
+    let mut sorted = values_ns.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() * percentile).saturating_add(99) / 100).saturating_sub(1);
+    sorted.get(index).map(|sample| *sample as f64 / 1_000_000.0)
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
