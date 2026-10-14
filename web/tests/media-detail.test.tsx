@@ -1264,6 +1264,8 @@ describe("MediaDetailPage series hierarchy", () => {
               RealFrameRate: 30,
               BitDepth: 8,
               PixelFormat: "yuv420p",
+              AspectRatio: "960:377",
+              Level: 41,
             },
           },
           {
@@ -1318,9 +1320,12 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("更多信息");
     expect(details?.textContent).toContain("https://example.invalid/video.mkv");
     expect(details?.textContent).toContain("1920 × 1080");
+    expect(details?.textContent).toContain("2.55:1");
+    expect(details?.textContent).toContain("4.1");
     expect(details?.textContent).toContain("H264");
     expect(details?.textContent).toContain("stereo");
     expect(details?.textContent).toContain("中文字幕");
+    expect(details?.textContent).toContain("内嵌字幕轨");
     expect(details?.querySelector(".lux-media-nfo-media-heading")?.textContent).toContain("媒体文件");
     expect(details?.querySelector("details.lux-media-info-address")).toBeNull();
     expect(details?.querySelector(".lux-media-info-address")).not.toBeNull();

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>配置教程 — Lux</title>
+  <meta name="description" content="Lux 配置教程：Docker 部署、首次初始化、创建媒体库、刮削、连接 Emby 客户端、反向代理、PostgreSQL 与并发调优。">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="./"><img src="assets/logo-white.svg" alt="" width="26" height="26"><span>Lux</span></a>
+    <nav>
+      <a href="./">首页</a>
+      <a href="docs.html">配置教程</a>
+      <a class="gh" href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="docs">
+    <aside class="toc">
+      <a href="#deploy">1. 部署</a>
+      <a href="#setup">2. 首次初始化</a>
+      <a href="#library">3. 创建媒体库</a>
+      <a href="#scrape">4. 刮削与匹配</a>
+      <a href="#clients">5. 连接客户端</a>
+      <a href="#remote">6. 远程访问</a>
+      <a href="#postgres">7. PostgreSQL</a>
+      <a href="#tuning">8. 并发调优</a>
+      <a href="#upgrade">9. 升级</a>
+      <a href="#faq">10. 常见问题</a>
+    </aside>
+
+    <article class="article">
+      <h1>配置教程</h1>
+      <p>从零开始，十几分钟把 Lux 跑起来并连上你常用的客户端。以下内容与仓库 README、<code>docs/DEPLOYMENT.md</code> 保持一致。</p>
+
+      <h2 id="deploy">1. 部署</h2>
+      <p>需要 Docker Engine 与 Docker Compose v2。新建一个目录，保存为 <code>compose.yaml</code>：</p>
+      <div class="code"><button class="copy" type="button" data-copy="c1">复制</button>
+<pre id="c1"><code>services:
+  lux:
+    image: pdzhou/lux:latest
+    container_name: lux
+    environment:
+      LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-4}
+      LUX_PROBE_CONCURRENCY: ${LUX_PROBE_CONCURRENCY:-8}
+      LUX_FFMPEG_CONCURRENCY: ${LUX_FFMPEG_CONCURRENCY:-2}
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./config:/config:rw
+      - ./media:/media:rw
+    restart: unless-stopped</code></pre></div>
+      <div class="code"><button class="copy" type="button" data-copy="c2">复制</button>
+<pre id="c2"><code>docker compose up -d</code></pre></div>
+      <table>
+        <tr><th>宿主机</th><th>容器</th><th>用途</th></tr>
+        <tr><td><code>./config</code></td><td><code>/config</code></td><td>数据库、插件、配置和日志；<strong>必须持久化</strong></td></tr>
+        <tr><td><code>./media</code></td><td><code>/media</code></td><td>媒体库；需要读写权限以支持 NFO 和图片写回</td></tr>
+      </table>
+      <div class="callout">媒体在 NAS 的其他目录？把 <code>./media:/media</code> 改成实际路径，例如 <code>/volume1/video:/media</code>。后面添加媒体库时填写的是<strong>容器内路径</strong>（如 <code>/media/Movies</code>）。</div>
+
+      <h2 id="setup">2. 首次初始化</h2>
+      <ol class="steps">
+        <li><strong>打开 Web 首页</strong>浏览器访问 <code>http://NAS地址:8097/</code>，进入初始化引导。</li>
+        <li><strong>选择数据库</strong>默认 SQLite（数据在 <code>/config/lux.db</code>），个人使用无需额外服务。要用 PostgreSQL 见<a href="#postgres">第 7 节</a>。</li>
+        <li><strong>创建第一个管理员</strong>设置用户名和密码。</li>
+      </ol>
+      <div class="callout warn">数据库后端只能在创建第一个管理员<strong>之前</strong>选择，已初始化的实例不支持在线切换。首次初始化建议只在局域网完成，不要把未初始化的 setup 页面暴露到公网。</div>
+
+      <h2 id="library">3. 创建媒体库</h2>
+      <ol class="steps">
+        <li><strong>进入管理控制台 → 媒体库</strong>点击新建媒体库。</li>
+        <li><strong>选择类型</strong>电影、电视剧或混合。</li>
+        <li><strong>添加根路径</strong>填写容器内路径，如 <code>/media/Movies</code>。一个媒体库可以添加多个根路径。</li>
+        <li><strong>启动扫描</strong>扫描在后台任务中进行，可暂停、恢复、取消和重试；之后基于文件事件做增量更新。</li>
+      </ol>
+      <p>推荐目录结构（NFO 与图片放在媒体旁，Lux 优先读取本地数据）：</p>
+      <div class="code"><pre><code>/media/Movies/
+  盗梦空间 (2010)/
+    盗梦空间 (2010).mkv
+    movie.nfo
+    poster.jpg
+/media/TV/
+  某剧集 (2020)/
+    Season 01/
+      S01E01.mkv</code></pre></div>
+
+      <h2 id="scrape">4. 刮削与匹配</h2>
+      <ol class="steps">
+        <li><strong>安装并配置刮削插件</strong>在管理控制台的插件库中安装 TMDb 等元数据插件。</li>
+        <li><strong>处理待匹配条目</strong>低置信度的条目会进入候选匹配，手动确认即可；可锁定字段，避免被后续刮削覆盖。</li>
+        <li><strong>管理图片</strong>海报、背景图等可在管理端调整，并原子写回到媒体目录。</li>
+      </ol>
+      <div class="callout">刮削、NFO 解析和 <code>ffprobe</code> 都在后台任务里完成，不会占用你浏览和播放时的请求。</div>
+
+      <h2 id="clients">5. 连接客户端</h2>
+      <p>Lux 提供 Emby 兼容接口，在支持 Emby 的第三方客户端里按“Emby 服务器”添加即可：</p>
+      <ol class="steps">
+        <li><strong>在客户端选择添加 Emby 服务器</strong>VidHub、SenPlayer、Infuse、Harbor、Hills、Yamby 等。</li>
+        <li><strong>填写地址</strong><code>http://NAS地址:8097</code>；使用反向代理则填写 HTTPS 域名。</li>
+        <li><strong>填写 Lux 用户名和密码</strong>在“用户与权限”里可以为家人创建独立账号，并按媒体库设置访问权限。</li>
+      </ol>
+      <div class="callout warn">Lux 以<strong>直放</strong>为主，不做转码、HLS 或字幕格式转换；能否播放某种编码、渲染某种字幕取决于客户端。各客户端的实测记录见 <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/COMPATIBILITY.md" rel="noopener">兼容性文档</a>。</div>
+
+      <h2 id="remote">6. 远程访问</h2>
+      <h3>Nginx 反向代理</h3>
+      <div class="code"><button class="copy" type="button" data-copy="c3">复制</button>
+<pre id="c3"><code>server {
+    listen 443 ssl;
+    server_name lux.example.com;
+
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8097;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Range $http_range;
+        proxy_set_header If-Range $http_if_range;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}</code></pre></div>
+      <p>代理必须保留 <code>206</code>、<code>Content-Range</code>、<code>Content-Length</code>、<code>Accept-Ranges</code> 和 <code>ETag</code>，不要使用缓存整文件的代理模式。</p>
+      <h3>Tailscale</h3>
+      <p>用 Tailscale Serve 把 <code>http://127.0.0.1:8097</code> 映射到 tailnet 内部即可。除非额外配置了身份访问策略，否则不要使用公开的 Funnel。</p>
+      <div class="callout warn">不要把管理入口未经反向代理的安全措施直接暴露到公网。Docker 镜像目前以 root 运行，请保护好 <code>/config</code>。</div>
+
+      <h2 id="postgres">7. 使用 PostgreSQL（可选）</h2>
+      <p>在 Compose 中增加 <code>postgres</code> 服务：</p>
+      <div class="code"><button class="copy" type="button" data-copy="c4">复制</button>
+<pre id="c4"><code>  postgres:
+    image: postgres:16-alpine
+    container_name: lux-postgres
+    environment:
+      POSTGRES_DB: lux
+      POSTGRES_USER: lux
+      POSTGRES_PASSWORD: 请改成强密码
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped</code></pre></div>
+      <p>首次引导里选择 PostgreSQL，主机填 <code>postgres</code>，端口填 <code>5432</code>，保存后点击页面上的“重启 Lux”。也可以填写环境中已有的 PostgreSQL。</p>
+
+      <h2 id="tuning">8. 并发调优</h2>
+      <p>在 Compose 同目录的 <code>.env</code> 中设置，修改后执行 <code>docker compose up -d --force-recreate lux</code>（单纯重启不会更新环境变量）：</p>
+      <table>
+        <tr><th>变量</th><th>含义</th><th>范围 / 默认</th></tr>
+        <tr><td><code>LUX_SCAN_CONCURRENCY</code></td><td>文件扫描并发上限</td><td>1–1024 / 4</td></tr>
+        <tr><td><code>LUX_PROBE_CONCURRENCY</code></td><td>媒体技术信息探测（ffprobe）并发</td><td>1–512 / 8</td></tr>
+        <tr><td><code>LUX_FFMPEG_CONCURRENCY</code></td><td>缩略图生成（ffmpeg）并发</td><td>1–4 / 2</td></tr>
+        <tr><td><code>LUX_DB_MAX_CONNECTIONS</code></td><td>数据库连接池大小</td><td>1–100 / SQLite 8、PostgreSQL 20</td></tr>
+      </table>
+      <div class="callout">需要限制硬件占用时，请同时调低前三个变量。实际并发还会根据 CPU、内存和存储延迟自动降级；SQLite 入库保持单写者，增加连接数不会突破这一限制。</div>
+
+      <h2 id="upgrade">9. 升级</h2>
+      <div class="code"><button class="copy" type="button" data-copy="c5">复制</button>
+<pre id="c5"><code>docker compose pull
+docker compose up -d</code></pre></div>
+      <p>升级前建议备份 <code>./config</code> 目录。回滚边界和版本固定方式见 <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/DEPLOYMENT.md" rel="noopener">部署文档</a>。Lux 目前不内置备份恢复功能。</p>
+
+      <h2 id="faq">10. 常见问题</h2>
+      <h3>Web 端能直接播放吗？</h3>
+      <p>暂不支持 Web 播放（浏览器解码能力有限），请使用第三方 Emby 客户端播放。</p>
+      <h3>支持转码吗？</h3>
+      <p>不支持。Lux 首版只做直放。</p>
+      <h3>能和 Emby 同时用吗？</h3>
+      <p>它们是两个独立服务，使用不同端口即可。注意 Lux 会向媒体目录写回 NFO 和图片，若 Emby 指向同一目录，请先确认两者的写回设置不会互相覆盖。</p>
+      <h3>遇到问题怎么反馈？</h3>
+      <p>到 <a href="https://github.com/Qoo-330ml/Lux/issues" rel="noopener">GitHub Issues</a> 提交，并附上客户端版本、平台、脱敏后的请求路径、状态码和关键响应字段。请不要贴出密码、令牌或完整的 <code>.strm</code> 地址。</p>
+    </article>
+  </div>
+
+  <footer class="foot">
+    <span>© Lux</span>
+    <a href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+    <a href="./">返回首页</a>
+  </footer>
+  <script src="main.js" defer></script>
+</body>
+</html>

@@ -599,6 +599,21 @@ impl AppState {
         }
     }
 
+    /// Requeues scraping that the previous shutdown cancelled mid-way. The
+    /// jobs run one library at a time, so this returns immediately.
+    pub fn resume_interrupted_metadata_scraping(&self) {
+        if self.database_selection_required {
+            return;
+        }
+        if let Some(metadata) = self.metadata_reidentify.clone() {
+            tokio::spawn(async move {
+                if let Err(error) = metadata.resume_interrupted_fill_missing_jobs().await {
+                    tracing::error!(%error, "failed to requeue interrupted metadata scraping");
+                }
+            });
+        }
+    }
+
     pub fn require_database_selection(mut self) -> Self {
         self.database_selection_required = true;
         self

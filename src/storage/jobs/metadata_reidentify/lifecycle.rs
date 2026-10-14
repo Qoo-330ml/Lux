@@ -574,6 +574,26 @@ impl Database {
         })
     }
 
+    pub(crate) async fn metadata_reidentify_job_has_pending_items(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND status = 'PENDING'
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn metadata_reidentify_job_has_item_error(
         &self,
         job_id: &str,
@@ -590,6 +610,31 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    /// Libraries whose most recent FILL_MISSING job was cancelled by a
+    /// shutdown or restart, so their scraping stopped before finishing.
+    pub(crate) async fn list_libraries_with_interrupted_fill_missing_job(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT library_id FROM (
+                 SELECT library_id, status, error,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY library_id ORDER BY created_at DESC, id DESC
+                        ) AS recency
+                 FROM metadata_reidentify_jobs
+                 WHERE mode = 'FILL_MISSING' AND library_id IS NOT NULL
+             ) latest
+             WHERE recency = 1 AND status = 'CANCELLED' AND error = 'SERVER_SHUTDOWN'
+             ORDER BY library_id LIMIT 1000",
+        )
+        .fetch_all(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

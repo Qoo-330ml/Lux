@@ -48,7 +48,7 @@ export function MediaNfoPanel({
     { label: "最后播出", value: lastAirDate, icon: <CalendarDays size={14} /> },
     { label: "运行时长", value: details?.runtime != null ? `${details.runtime} 分钟` : undefined },
     { label: "季 / 集", value: formatSeasonEpisode(details?.seasonNumber, details?.episodeNumber) },
-    { label: "状态", value: status },
+    { label: "状态", value: formatStatus(status) },
   ].filter((row) => Boolean(row.value));
 
   return (
@@ -107,7 +107,11 @@ export function MediaNfoPanel({
             <div className="lux-media-nfo-secondary-item lux-media-nfo-provider-item">
               <span><Link2 size={14} />外部 ID</span>
               <strong className="lux-media-nfo-provider-ids">
-                {providerIds.map(([provider, id]) => <span key={`${provider}-${id}`}>{provider.toUpperCase()} {id}</span>)}
+                {providerIds.map(([provider, id]) => (
+                  <span key={`${provider}-${id}`} className="lux-media-nfo-provider-badge">
+                    {provider.toUpperCase()} {id}
+                  </span>
+                ))}
               </strong>
             </div>
           ) : null}
@@ -193,4 +197,16 @@ function formatSeasonEpisode(season?: number | null, episode?: number | null) {
 
 function isHttpUrl(value: string) {
   return value.startsWith("https://") || value.startsWith("http://");
+}
+
+function formatStatus(status?: string | null) {
+  if (!status) return undefined;
+  const s = status.trim().toLowerCase();
+  if (s === "released") return "已上映";
+  if (s === "ended") return "已完结";
+  if (s === "returning series") return "连载中";
+  if (s === "in production") return "制作中";
+  if (s === "planned") return "计划中";
+  if (s === "canceled" || s === "cancelled") return "已取消";
+  return status;
 }

@@ -161,8 +161,8 @@ function MediaStreamCard({
       <div className="lux-media-stream-badges">
         {stream.codec ? <span>{codecLabel(stream.codec)}</span> : null}
         {language ? <span>{kind === "SUBTITLE" ? `${language}字幕` : language}</span> : null}
-        {stream.isDefault ? <span>默认</span> : null}
-        {stream.isForced ? <span>强制</span> : null}
+        {stream.isDefault ? <span className="is-default">默认</span> : null}
+        {stream.isForced ? <span className="is-default">强制</span> : null}
         {stream.isExternal ? <span>外挂</span> : null}
       </div>
       {rows.length ? (
@@ -189,11 +189,11 @@ function streamDetailRows(
     const width = numberValue(details.Width);
     const height = numberValue(details.Height);
     add("分辨率", width && height ? `${width} × ${height}` : undefined);
-    add("宽高比", textValue(details.AspectRatio));
+    add("宽高比", formatAspectRatio(details.AspectRatio));
     add("帧率", formatFrameRate(details.RealFrameRate ?? details.AverageFrameRate));
     add("码率", formatBitrate(details.BitRate ?? sourceBitrate));
     add("配置", textValue(details.Profile));
-    add("等级", textValue(details.Level));
+    add("等级", formatCodecLevel(details.Level));
     add("色深", withUnit(details.BitDepth, "bit"));
     add("像素格式", textValue(details.PixelFormat));
     add("色域", textValue(details.ColorSpace ?? details.ColorRange));
@@ -206,6 +206,15 @@ function streamDetailRows(
     add("码率", formatBitrate(details.BitRate));
     add("采样率", formatSampleRate(details.SampleRate));
     add("配置", textValue(details.Profile));
+  }
+  if (kind === "SUBTITLE") {
+    add("格式", stream.codec ? codecLabel(stream.codec) : undefined);
+    add("语言", stream.language ? languageLabel(stream.language) : undefined);
+    add("来源", stream.isExternal ? "同目录外挂" : "内嵌字幕轨");
+    add("默认", stream.isDefault ? "是" : "否");
+    if (stream.isForced) {
+      add("强制字幕", "是");
+    }
   }
   return rows;
 }
@@ -254,6 +263,29 @@ function withUnit(value: unknown, unit: string) {
 function formatFrameRate(value: unknown) {
   const number = ratioValue(value) ?? numberValue(value);
   return number === undefined ? undefined : `${number} fps`;
+}
+
+function formatAspectRatio(value: unknown) {
+  const text = textValue(value);
+  if (!text) return undefined;
+  const match = text.trim().match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+  if (!match) return text;
+  const w = Number(match[1]);
+  const h = Number(match[2]);
+  if (!w || !h || !Number.isFinite(w) || !Number.isFinite(h)) return text;
+  if (text === "16:9" || text === "4:3") return text;
+  const ratio = (w / h).toFixed(2).replace(/\.00$/, "");
+  return `${ratio}:1`;
+}
+
+function formatCodecLevel(value: unknown) {
+  const text = textValue(value);
+  if (!text) return undefined;
+  const num = Number(text);
+  if (Number.isFinite(num) && num >= 10 && num <= 70 && !text.includes(".")) {
+    return (num / 10).toFixed(1).replace(/\.0$/, "");
+  }
+  return text;
 }
 
 function ratioValue(value: unknown) {
