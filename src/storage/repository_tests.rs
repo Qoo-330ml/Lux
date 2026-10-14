@@ -17888,6 +17888,562 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
     Ok(())
 }
 
+#[tokio::test]
+async fn library_pipeline_activity_page_is_bounded_and_aggregates_scan_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::StoredPipelineStageKind;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let alpha = libraries
+        .create_library("Alpha", LibraryKind::Movie, false)
+        .await?;
+    let beta = libraries
+        .create_library("Beta", LibraryKind::Movie, false)
+        .await?;
+    let disabled = libraries
+        .create_library("Disabled", LibraryKind::Movie, false)
+        .await?;
+    let removed = libraries
+        .create_library("Removed", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(disabled.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .create_scan_job(
+            "pipeline-removed-library",
+            &removed.id.to_string(),
+            "RECONCILE_LIBRARY",
+            "g0",
+            1,
+            false,
+        )
+        .await?;
+    libraries.delete_library(removed.id).await?;
+
+    let alpha_id = alpha.id.to_string();
+    database
+        .create_scan_job(
+            "pipeline-alpha-running",
+            &alpha_id,
+            "RECONCILE_LIBRARY",
+            "g1",
+            4,
+            false,
+        )
+        .await?;
+    database
+        .create_scan_job(
+            "pipeline-alpha-completed",
+            &alpha_id,
+            "INCREMENTAL_SCAN",
+            "g2",
+            7,
+            false,
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE scan_jobs
+         SET status = 'RUNNING', scan_phase = 'INDEXING', processed_count = 2,
+             updated_at = 100
+         WHERE id = 'pipeline-alpha-running'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE scan_jobs
+         SET status = 'COMPLETED', scan_phase = 'IDLE', processed_count = 7,
+             updated_at = 200
+         WHERE id = 'pipeline-alpha-completed'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    let first_page = database.list_library_pipeline_activity(1, 1).await?;
+    assert_eq!(first_page.total_libraries, 2);
+    assert_eq!(first_page.libraries.len(), 1);
+    assert_eq!(first_page.libraries[0].name, "Alpha");
+    let index = first_page.libraries[0]
+        .stages
+        .iter()
+        .find(|stage| stage.kind == StoredPipelineStageKind::Index)
+        .ok_or("missing index stage")?;
+    assert!(index.planned);
+    assert_eq!(index.counts.running, 1);
+    assert_eq!(index.counts.completed, 1);
+    assert_eq!(index.recent_activity_at, Some(200));
+    assert!(database.query_count() <= 2, "page query must stay bounded");
+
+    let second_page = database.list_library_pipeline_activity(2, 1).await?;
+    assert_eq!(second_page.total_libraries, 2);
+    assert_eq!(second_page.libraries[0].name, "Beta");
+    assert_eq!(second_page.libraries[0].id, beta.id.to_string());
+    assert!(
+        second_page.libraries[0]
+            .stages
+            .iter()
+            .all(|stage| !stage.planned)
+    );
+    assert!(
+        database
+            .list_library_pipeline_activity(3, 1)
+            .await?
+            .libraries
+            .is_empty()
+    );
+    assert!(
+        database
+            .list_library_pipeline_activity(1, 51)
+            .await
+            .is_err()
+    );
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_pipeline_activity_counts_persisted_background_stages()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::StoredPipelineStageKind;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Pipeline", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("media-root");
+    std::fs::create_dir(&root_path)?;
+    let root = libraries
+        .add_root(
+            library.id,
+            root_path.to_str().ok_or("media root is not UTF-8")?,
+        )
+        .await?
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+
+    for (job_id, job_type, status, phase, current_item, updated_at) in [
+        (
+            "pipeline-postprocessing",
+            "RECONCILE_LIBRARY",
+            "COMPLETED",
+            "POSTPROCESSING",
+            Some("视频缩略图"),
+            900_i64,
+        ),
+        (
+            "pipeline-cancelled",
+            "INCREMENTAL_SCAN",
+            "CANCELLED",
+            "IDLE",
+            None,
+            800_i64,
+        ),
+        (
+            "pipeline-probing",
+            "INCREMENTAL_SCAN",
+            "COMPLETED",
+            "POSTPROCESSING",
+            Some("媒体探测"),
+            850_i64,
+        ),
+    ] {
+        database
+            .create_scan_job(job_id, &library_id, job_type, job_id, 1, false)
+            .await?;
+        sqlx::query(
+            "UPDATE scan_jobs SET status = ?, scan_phase = ?, current_item = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(phase)
+        .bind(current_item)
+        .bind(updated_at)
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (sequence, status, source_count) in [
+        (0_i64, "PENDING", 3_i64),
+        (1, "RUNNING", 2),
+        (2, "COMPLETED", 4),
+        (3, "FAILED", 1),
+        (4, "CANCELLED", 2),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json,
+                 source_count, status, updated_at
+             ) VALUES (?, 'pipeline-postprocessing', ?, ?, '[\"source\"]', ?, ?, ?)",
+        )
+        .bind(format!("pipeline-batch-{sequence}"))
+        .bind(&root_id)
+        .bind(sequence)
+        .bind(source_count)
+        .bind(status)
+        .bind(100 + sequence)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, status, updated_at)
+         VALUES (?, 'FAILED', 300)",
+    )
+    .bind(&root_id)
+    .execute(database.pool())
+    .await?;
+
+    for (target_id, metadata_state, thumbnail_state) in [
+        ("legacy-pending", "PENDING", "PENDING"),
+        ("legacy-done", "DONE", "DONE"),
+        ("legacy-failed", "FAILED", "FAILED"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind,
+                 metadata_state, thumbnail_state, updated_at
+             ) VALUES ('pipeline-cancelled', 'ITEM', ?, ?, 'NEW', ?, ?, 400)",
+        )
+        .bind(target_id)
+        .bind(target_id)
+        .bind(metadata_state)
+        .bind(thumbnail_state)
+        .execute(database.pool())
+        .await?;
+    }
+    for (job_id, target_id, probe_state) in [
+        ("pipeline-probing", "probe-pending", "PENDING"),
+        ("pipeline-probing", "probe-done", "DONE"),
+        ("pipeline-probing", "probe-failed", "FAILED"),
+        ("pipeline-cancelled", "probe-cancelled", "PENDING"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, source_id, change_kind,
+                 probe_state, updated_at
+             ) VALUES (?, 'SOURCE', ?, 'pipeline-secret-title', ?, 'NEW', ?, 450)",
+        )
+        .bind(job_id)
+        .bind(target_id)
+        .bind(target_id)
+        .bind(probe_state)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             thumbnail_state, updated_at
+         ) VALUES ('pipeline-postprocessing', 'ITEM', 'thumb-pending', 'thumb-pending', 'NEW', 'PENDING', 500),
+                  ('pipeline-postprocessing', 'ITEM', 'thumb-done', 'thumb-done', 'NEW', 'DONE', 500),
+                  ('pipeline-postprocessing', 'ITEM', 'thumb-failed', 'thumb-failed', 'NEW', 'FAILED', 500)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('pipeline-secret-title', ?, 'MOVIE', 'DO_NOT_LEAK_MEDIA_TITLE', 'pipeline-title', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    for (job_id, status, updated_at) in [
+        ("probe-queued", "PENDING", 506_i64),
+        ("probe-failed-job", "FAILED", 507),
+        ("probe-cancelled-job", "CANCELLED", 508),
+    ] {
+        sqlx::query(
+            "INSERT INTO strm_probe_jobs (id, operation_id, library_id, status, concurrency, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?)",
+        )
+        .bind(job_id)
+        .bind("pipeline-operation")
+        .bind(&library_id)
+        .bind(status)
+        .bind(updated_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (job_id, status, item_status) in [
+        ("auto-queued", "QUEUED", "PENDING"),
+        ("auto-running", "RUNNING", "RUNNING"),
+        ("auto-completed", "COMPLETED", "COMPLETED"),
+        ("auto-failed", "FAILED", "FAILED"),
+        ("auto-cancelled", "CANCELLED", "PENDING"),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (
+                 id, status, total_count, mode, library_id, dispatch_source
+             ) VALUES (?, ?, 1, 'FILL_MISSING', ?, 'AUTOMATIC')",
+        )
+        .bind(job_id)
+        .bind(status)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+             VALUES (?, 'pipeline-secret-title', ?)",
+        )
+        .bind(job_id)
+        .bind(item_status)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs (
+             id, status, total_count, mode, library_id, dispatch_source
+         ) VALUES ('explicit-fill', 'COMPLETED', 1, 'FILL_MISSING', ?, 'EXPLICIT')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+         VALUES ('explicit-fill', 'pipeline-secret-title', 'COMPLETED')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let page = database.list_library_pipeline_activity(1, 50).await?;
+    let stages = &page.libraries[0].stages;
+    assert_eq!(
+        stages.iter().map(|stage| stage.kind).collect::<Vec<_>>(),
+        vec![
+            StoredPipelineStageKind::Index,
+            StoredPipelineStageKind::LocalMetadata,
+            StoredPipelineStageKind::Probe,
+            StoredPipelineStageKind::Thumbnail,
+            StoredPipelineStageKind::AutomaticMetadata,
+        ]
+    );
+    let local_metadata = stages
+        .iter()
+        .find(|stage| stage.kind == StoredPipelineStageKind::LocalMetadata)
+        .ok_or("missing local metadata stage")?;
+    assert_eq!(local_metadata.counts.queued, 3);
+    assert_eq!(local_metadata.counts.running, 2);
+    assert_eq!(local_metadata.counts.completed, 5);
+    assert_eq!(local_metadata.counts.failed, 3);
+    assert_eq!(local_metadata.counts.cancelled, 3);
+
+    let probe = stages
+        .iter()
+        .find(|stage| stage.kind == StoredPipelineStageKind::Probe)
+        .ok_or("missing probe stage")?;
+    assert_eq!(probe.counts.queued, 2);
+    assert_eq!(probe.counts.running, 1);
+    assert_eq!(probe.counts.completed, 1);
+    assert_eq!(probe.counts.failed, 2);
+    assert_eq!(probe.counts.cancelled, 2);
+
+    let thumbnail = stages
+        .iter()
+        .find(|stage| stage.kind == StoredPipelineStageKind::Thumbnail)
+        .ok_or("missing thumbnail stage")?;
+    assert_eq!(thumbnail.counts.queued, 1);
+    assert_eq!(thumbnail.counts.running, 1);
+    assert_eq!(thumbnail.counts.completed, 2);
+    assert_eq!(thumbnail.counts.failed, 2);
+    assert_eq!(thumbnail.counts.cancelled, 1);
+
+    let automatic_metadata = stages
+        .iter()
+        .find(|stage| stage.kind == StoredPipelineStageKind::AutomaticMetadata)
+        .ok_or("missing automatic metadata stage")?;
+    assert_eq!(automatic_metadata.counts.queued, 1);
+    assert_eq!(automatic_metadata.counts.running, 1);
+    assert_eq!(automatic_metadata.counts.completed, 1);
+    assert_eq!(automatic_metadata.counts.failed, 1);
+    assert_eq!(automatic_metadata.counts.cancelled, 1);
+    assert!(!format!("{page:?}").contains("DO_NOT_LEAK_MEDIA_TITLE"));
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_library_pipeline_activity_uses_the_shared_aggregate_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD").unwrap_or_default(),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let check_result = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("PostgreSQL Pipeline", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let root_path = temp_dir.path().join("postgres-media-root");
+        std::fs::create_dir(&root_path)?;
+        let root = LibraryService::new(database.clone())
+            .add_root(
+                library.id,
+                root_path.to_str().ok_or("media root is not UTF-8")?,
+            )
+            .await?
+            .root;
+        let root_id = root.id.to_string();
+        database
+            .create_scan_job(
+                "pg-pipeline-scan",
+                &library_id,
+                "RECONCILE_LIBRARY",
+                "pg-pipeline-generation",
+                1,
+                false,
+            )
+            .await?;
+        database
+            .query(
+                "UPDATE scan_jobs
+                 SET status = 'COMPLETED', scan_phase = 'POSTPROCESSING',
+                     current_item = '媒体探测', updated_at = 900
+                 WHERE id = 'pg-pipeline-scan'",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_local_metadata_batches (
+                     id, job_id, library_root_id, batch_sequence, source_refs_json,
+                     source_count, status, updated_at
+                 ) VALUES ('pg-pipeline-batch', 'pg-pipeline-scan', ?, 0, '[\"source\"]', 3, 'COMPLETED', 800)",
+            )
+            .bind(&root_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, source_id, change_kind,
+                     probe_state, updated_at
+                 ) VALUES ('pg-pipeline-scan', 'SOURCE', 'pg-probe-failed', 'pg-item',
+                          'pg-probe-failed', 'NEW', 'FAILED', 850)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind,
+                     thumbnail_state, updated_at
+                 ) VALUES ('pg-pipeline-scan', 'ITEM', 'pg-thumbnail-done', 'pg-item',
+                          'NEW', 'DONE', 810)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO metadata_reidentify_jobs (
+                     id, status, total_count, mode, library_id, dispatch_source
+                 ) VALUES ('pg-auto-fill-missing', 'QUEUED', 1, 'FILL_MISSING', ?, 'AUTOMATIC')",
+            )
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        let page = database.list_library_pipeline_activity(1, 50).await?;
+        assert_eq!(page.total_libraries, 1);
+        assert_eq!(page.libraries.len(), 1);
+        assert_eq!(page.libraries[0].stages.len(), 5);
+        let stages = &page.libraries[0].stages;
+        let index = stages
+            .iter()
+            .find(|stage| stage.kind == StoredPipelineStageKind::Index)
+            .ok_or("missing index stage")?;
+        assert_eq!(index.counts.completed, 1);
+        let local_metadata = stages
+            .iter()
+            .find(|stage| stage.kind == StoredPipelineStageKind::LocalMetadata)
+            .ok_or("missing local metadata stage")?;
+        assert_eq!(local_metadata.counts.completed, 3);
+        let probe = stages
+            .iter()
+            .find(|stage| stage.kind == StoredPipelineStageKind::Probe)
+            .ok_or("missing probe stage")?;
+        assert_eq!(probe.counts.running, 1);
+        assert_eq!(probe.counts.failed, 1);
+        assert_eq!(probe.recent_activity_at, Some(900));
+        let thumbnail = stages
+            .iter()
+            .find(|stage| stage.kind == StoredPipelineStageKind::Thumbnail)
+            .ok_or("missing thumbnail stage")?;
+        assert_eq!(thumbnail.counts.completed, 1);
+        let automatic_metadata = stages
+            .iter()
+            .find(|stage| stage.kind == StoredPipelineStageKind::AutomaticMetadata)
+            .ok_or("missing automatic metadata stage")?;
+        assert_eq!(automatic_metadata.counts.queued, 1);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    database.close().await;
+    let drop_result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    check_result?;
+    drop_result?;
+    Ok(())
+}
+
 async fn assert_removed_media_item_purge(
     database: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -11218,24 +11218,40 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 实施结果（2026-10-14）：`LUX_METADATA_CONCURRENCY` 采用缺省 4、支持 1–12、超过范围 clamp 到边界，非整数回退缺省；对非法/越界值发 warning，但不记录原始 env 内容。configured limit 在进程内 OnceLock 一次读取，并保存在每个 MetadataReidentifyService 实例；同一个 OnceLock 同时创建全局 FILL_MISSING semaphore，配置不会动态重读。资源 pressure 路径、每库 dispatcher 和取消不变。定向 reidentify 单测 42/42，通过；`LUX_METADATA_CONCURRENCY=1` 与 env unset 两种环境下，跨两个库的进程级 FILL_MISSING worker 集成各通过 1/1。默认 SQLite build、fmt、all-features Clippy 与 diff 检查通过。默认值依据 SQLite 4 路基线保持 4；PostgreSQL 没有可用服务，未测也未提高默认值。部署配置见 `docs/COMPATIBILITY.md`，性能依据见 `docs/PERFORMANCE.md`。
 
-#### LUX-533：提供只读库级入库流水线状态
+#### LUX-533：存储层聚合库级入库阶段
 
-范围：聚合启用媒体库当前扫描、Manifest/local metadata、probe、thumbnail、自动 FILL_MISSING 的待处理/运行/完成/失败/取消计数和最近活动时间，供管理员活动视图分页读取。只读聚合现有持久化状态，不新建通用 pipeline 表，不改各 worker 的运行路径或单项状态。未启用阶段/没有待办的阶段显示为未计划/空闲，不制造假进度。
+范围：只读聚合启用媒体库的扫描索引、Manifest/local metadata、probe、thumbnail、自动 FILL_MISSING 持久化状态，返回按库分页的内部快照和最近活动时间。只读现有表，不新建通用 pipeline 表，不改 worker 执行路径、单项状态或扫描完成语义。SQL 先限制到最多 50 个启用库，再在数据库内分组计数；不把 item 行载入应用层，不读取路径、媒体标题、来源凭据或上游错误文本。阶段运行状态只能依据已持久化的 job/target 状态与 scan job 当前阶段推导，缺少对应记录时返回无计划/空闲，不合成进度。各 stage 计数只在本 stage 内解释，底层分别按 scan job、local metadata batch/backfill/legacy target、probe target/STRM probe job、thumbnail target、自动 metadata job 计数，不跨 stage 求和，也不据此估算 ETA。扫描驱动的 NFO/probe/thumbnail 若没有逐项 RUNNING 状态，用 scan job 当前阶段计一个运行中的驱动任务；未完成的 target 仍留在 queued。
 
 验收：
 
-- [ ] API 每页最多 50 个库；聚合 SQL/存储读取有界，不读取 item 全表到应用内、不触发 provider 或 filesystem work。
-- [ ] 计数能区分 queued/running/completed/failed/cancelled，扫描索引完成与后台阶段明确分开；在线补缺不延长扫描进度。
-- [ ] 覆盖无任务、扫描后处理、仅本地任务、自动刮削、混合阶段、失败/取消、库移除与 SQLite/PostgreSQL。
-- [ ] 管理员响应不暴露来源凭据、标题、路径或上游错误文本；不改变 Emby/ScanCompleted/Webhook DTO。
+- [x] storage 返回每库各阶段的 queued/running/completed/failed/cancelled 计数、是否有计划和最近活动时间；索引阶段与后台阶段独立，在线 FILL_MISSING 不计入扫描索引。
+- [x] 页大小拒绝或限制到 50；聚合只访问所选启用库，有界 SQL 完成计数，不读取 item 全表到应用层，也不触发 provider/filesystem。
+- [x] SQLite fixture 覆盖无任务、Manifest 后处理、local metadata batches/backfill、自动刮削、混合阶段、失败/取消与库移除；PostgreSQL 合同测试使用代表性五阶段 fixture 执行共享聚合 SQL。
+- [x] 类型只包含库标识/显示名、阶段状态计数和时间；不含媒体标题、路径、凭据、错误文本或 scan activity 的 current item。
 
-预计文件：`src/storage/jobs/`、`src/storage/mod.rs`、`src/application/`、`src/api/admin/`、`tests/`、本文档。若超过 5 个文件，开始前再拆分为存储聚合与 API 接线两项。
+预计文件（5 个）：`src/storage/repository.rs`、新建 `src/storage/pipeline_activity.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、本文档。
 
-验证：目标 API/storage integration targets、PostgreSQL 合同、fmt、build 与 all-features Clippy；Toshiba 挂载检查并使用共享 target。
+验证：storage repository 定向回归与 PostgreSQL 合同；`cargo build --locked`、fmt、all-features Clippy 和 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
 
-#### LUX-534：管理员活动视图展示库级入库阶段
+实施结果（2026-10-14）：存储层以单条分页聚合查询返回五个阶段的状态计数和最近活动时间，只把启用库当前页（最多 50 个）的聚合结果带回应用；状态计数保留阶段本身的持久化单位，不合并成整体百分比。SQLite 定向回归 2/2 通过，覆盖分页、禁用/移除库、扫描后处理、metadata batch/backfill、probe/STRM、thumbnail、自动/显式 FILL_MISSING 与失败/取消；测试确认不回传媒体标题。build、all-target/all-features Clippy、fmt 与 diff 检查通过。增加了运行 PostgreSQL 共享查询的忽略测试并编译通过；尝试启动一次性 PostgreSQL 16 容器，但当前网络访问 Docker Hub 失败（registry 请求返回 EOF），因此该数据库运行证据仍待有 PostgreSQL 服务的环境补齐。
 
-范围：在现有管理员活动弹层中以媒体库为组展示 LUX-532 聚合结果，清楚区分索引和后台 NFO、probe、thumbnail、刮削进度；支持无进度阶段、长任务与失败项。复用现有活动入口，不改变桌面/移动 shell 的触发方式。
+#### LUX-534：提供只读库级入库阶段 API
+
+范围：增加管理员读取接口 `GET /api/v1/admin/library-pipeline-activity?page=1&pageSize=20`，将 LUX-533 storage 快照序列化为 `libraries` 与分页元数据。每页最多 50 个启用库；`pageSize` 缺省 20，页码从 1 开始。每库返回 `libraryId`、`libraryName`、各 stage 的 `planned`、五类状态计数及 `recentActivityAt`。只增加 Lux 管理 API，不改已有 task activity、Emby、ScanCompleted、Webhook DTO 或任务执行路径。
+
+验收：
+
+- [ ] admin 鉴权、分页边界、空页和错误映射符合现有 API 约定，响应只包含 storage 阶段契约允许的字段。
+- [ ] 集成测试覆盖两个库并行、各阶段混合状态、取消/失败、禁用或移除库、无任务和超过 50 库分页；不会序列化媒体标题、路径、凭据或错误内容。
+- [ ] compatibility 文档记录 endpoint、分页和字段语义；PostgreSQL 行为由 LUX-533 storage contract 验证，不做第二次全表读取。
+
+预计文件（5 个）：`src/application/admin_task_activity.rs`、`src/api/admin/admin_scheduled_tasks.rs`、`tests/libraries_api.rs`、`docs/COMPATIBILITY.md`、本文档。
+
+验证：`tests/libraries_api.rs` 定向目标、build/fmt/all-features Clippy 与 diff 检查；Toshiba 挂载检查并使用共享 target。
+
+#### LUX-535：管理员活动视图展示库级入库阶段
+
+范围：在现有管理员活动弹层中以媒体库为组展示 LUX-534 API 结果，清楚区分索引和后台 NFO、probe、thumbnail、刮削进度；支持无计划阶段、长任务与失败项。复用现有活动入口，不改变桌面/移动 shell 的触发方式。
 
 验收：
 
@@ -11243,7 +11259,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 - [ ] 无任务、纯后台处理、部分失败、完成、分页/刷新与 API 错误均有 Web 回归。
 - [ ] 视图不把阶段总计伪装成精确 ETA；ARIA 状态与进度值准确，长库名和窄视口不造成横向溢出。
 
-预计文件：`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、本文档。
+预计文件（5 个）：`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、本文档。
 
 验证：定向 Web 测试、完整 Web 测试与 production build。阶段 27 全部任务完成后，运行该阶段门、更新性能/兼容记录并停在项目所有者确认点；阶段 23 原有 5% A/B 性能门仍按其规格单独开放。
 
