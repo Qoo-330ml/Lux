@@ -293,6 +293,12 @@ fn nfo_movie_collection_reference(
     )
 }
 
+fn nfo_collection_reference_key(reference: Option<&GlobalMovieCollectionReference>) -> String {
+    reference
+        .map(GlobalMovieCollectionReference::identity_key)
+        .unwrap_or_default()
+}
+
 fn unqualified_nfo_set_id_from_details(
     details: &crate::application::nfo::LocalNfoDetails,
 ) -> Option<String> {
@@ -978,6 +984,7 @@ struct DeferredLocalNfoMetadataUpdate {
     locked_fields_json: String,
     collection_reference: Option<Option<GlobalMovieCollectionReference>>,
     unqualified_nfo_set_id: Option<String>,
+    nfo_collection_reference_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1026,6 +1033,7 @@ impl DeferredLocalNfoMetadataUpdate {
         update: MediaMetadataUpdate<'_>,
         collection_reference: Option<Option<GlobalMovieCollectionReference>>,
         unqualified_nfo_set_id: Option<String>,
+        nfo_collection_reference_key: Option<String>,
     ) -> Self {
         Self {
             item_id: update.item_id.to_owned(),
@@ -1042,6 +1050,7 @@ impl DeferredLocalNfoMetadataUpdate {
             locked_fields_json: update.locked_fields_json.to_owned(),
             collection_reference,
             unqualified_nfo_set_id,
+            nfo_collection_reference_key,
         }
     }
 
@@ -1069,6 +1078,7 @@ impl DeferredLocalNfoMetadataUpdates {
         update: MediaMetadataUpdate<'_>,
         collection_reference: Option<Option<GlobalMovieCollectionReference>>,
         unqualified_nfo_set_id: Option<String>,
+        nfo_collection_reference_key: Option<String>,
     ) {
         self.state
             .lock()
@@ -1078,6 +1088,7 @@ impl DeferredLocalNfoMetadataUpdates {
                 update,
                 collection_reference,
                 unqualified_nfo_set_id,
+                nfo_collection_reference_key,
             ));
         #[cfg(test)]
         if let Some(gate) = self.identity_conflict_gate.as_ref() {
@@ -1895,6 +1906,10 @@ impl MetadataEnricher {
                             item_id: &update.item_id,
                             reference: reference.as_ref(),
                             unqualified_nfo_set_id: update.unqualified_nfo_set_id.as_deref(),
+                            nfo_collection_reference_key: update
+                                .nfo_collection_reference_key
+                                .as_deref()
+                                .unwrap_or_default(),
                         }
                     })
                 })
@@ -1931,6 +1946,10 @@ impl MetadataEnricher {
                                 update.as_update(),
                                 reference.as_ref(),
                                 update.unqualified_nfo_set_id.as_deref(),
+                                update
+                                    .nfo_collection_reference_key
+                                    .as_deref()
+                                    .unwrap_or_default(),
                             )
                             .await
                     } else {
@@ -2851,10 +2870,20 @@ impl MetadataEnricher {
             && cached_nfo
                 .as_ref()
                 .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_none());
-        let movie_collection_reference_needs_nfo_reindex = metadata
+        let movie_collection_reference_needs_nfo_reindex = if let Some(metadata) = metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.item_type == "MOVIE")
-            && self.local_nfo.is_none();
+            .filter(|metadata| metadata.item_type == "MOVIE")
+        {
+            match metadata.nfo_collection_reference_key.as_deref() {
+                None => true,
+                Some("") => false,
+                Some(expected_key) => {
+                    metadata.collection_reference_identity_key.as_deref() != Some(expected_key)
+                }
+            }
+        } else {
+            false
+        };
         let actor_relation_missing = if let Some(people) = &self.people {
             match people.nfo_relation_snapshot_is_current(item_id).await {
                 Ok(exists) => !exists,
@@ -2873,8 +2902,8 @@ impl MetadataEnricher {
         if already_checked
             && !rich_cache_missing
             && !semantic_cache_missing
-            && !actor_relation_missing
             && !movie_collection_reference_needs_nfo_reindex
+            && !actor_relation_missing
         {
             if let (Some(metadata), Some((details, _, _, _))) =
                 (metadata.as_ref(), cached_nfo.as_ref())
@@ -2921,13 +2950,23 @@ impl MetadataEnricher {
                 .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_some())
             && !local_nfo_defaults_missing(metadata, details)
         {
+            let collection_reference_key = (metadata.item_type == "MOVIE").then(|| {
+                let reference = cached_nfo.as_ref().and_then(|(details, _, _, _)| {
+                    nfo_movie_collection_reference(metadata, details, None)
+                });
+                nfo_collection_reference_key(reference.as_ref())
+            });
             if let Some((details, _, _, _)) = cached_nfo.as_ref() {
                 self.refresh_cached_movie_collection_reference(item_id, metadata, details)
                     .await?;
             }
             if let Some(fingerprint) = fingerprint.as_deref() {
                 self.database
-                    .mark_media_item_metadata_checked(item_id, fingerprint)
+                    .mark_media_item_metadata_checked(
+                        item_id,
+                        fingerprint,
+                        collection_reference_key.as_deref(),
+                    )
                     .await?;
             }
             report.nfo_skipped = 1;
@@ -2948,8 +2987,16 @@ impl MetadataEnricher {
                         .map_err(MetadataError::NfoCache)?;
                 }
                 if let Some(fingerprint) = fingerprint.as_deref() {
+                    let indexed_reference_key = metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.item_type == "MOVIE")
+                        .then_some("");
                     self.database
-                        .mark_media_item_metadata_checked(item_id, fingerprint)
+                        .mark_media_item_metadata_checked(
+                            item_id,
+                            fingerprint,
+                            indexed_reference_key,
+                        )
                         .await?;
                 }
                 report.nfo_failed = 1;
@@ -2995,15 +3042,16 @@ impl MetadataEnricher {
             && let Some(metadata) = metadata.as_ref()
             && !local_nfo_defaults_missing(metadata, &projection.details)
         {
+            let collection_reference = nfo_movie_collection_reference(
+                metadata,
+                &projection.details,
+                projection.metadata.production_year.map(i64::from),
+            );
+            let reference_key = nfo_collection_reference_key(collection_reference.as_ref());
             self.database
                 .update_movie_collection_reference(
                     item_id,
-                    nfo_movie_collection_reference(
-                        metadata,
-                        &projection.details,
-                        projection.metadata.production_year.map(i64::from),
-                    )
-                    .as_ref(),
+                    collection_reference.as_ref(),
                     unqualified_nfo_set_id_from_details(&projection.details).as_deref(),
                 )
                 .await?;
@@ -3026,7 +3074,11 @@ impl MetadataEnricher {
             }
             if let Some(fingerprint) = fingerprint.as_deref() {
                 self.database
-                    .mark_media_item_metadata_checked(item_id, fingerprint)
+                    .mark_media_item_metadata_checked(
+                        item_id,
+                        fingerprint,
+                        (metadata.item_type == "MOVIE").then_some(reference_key.as_str()),
+                    )
                     .await?;
             }
             report.nfo_skipped = 1;
@@ -3256,8 +3308,15 @@ impl MetadataEnricher {
                 let unqualified_nfo_set_id = (current.item_type == "MOVIE")
                     .then(|| unqualified_nfo_set_id.clone())
                     .flatten();
+                let collection_reference_key = (current.item_type == "MOVIE")
+                    .then(|| nfo_collection_reference_key(collection_reference.as_ref()));
                 deferred_metadata_updates
-                    .push(update, collection_reference_update, unqualified_nfo_set_id)
+                    .push(
+                        update,
+                        collection_reference_update,
+                        unqualified_nfo_set_id,
+                        collection_reference_key,
+                    )
                     .await;
                 drop(identity_update_guard.take());
             } else if current.item_type == "MOVIE" {
@@ -3266,6 +3325,7 @@ impl MetadataEnricher {
                         update,
                         collection_reference.as_ref(),
                         unqualified_nfo_set_id.as_deref(),
+                        &nfo_collection_reference_key(collection_reference.as_ref()),
                     )
                     .await?;
                 drop(identity_update_guard.take());
@@ -5256,8 +5316,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO media_items (
                 id, library_id, item_type, title, sort_title, identification_status,
-                provider_ids_json, metadata_fingerprint
-             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', '{}', ?)",
+                provider_ids_json, metadata_fingerprint, nfo_collection_reference_key
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', '{}', ?, '')",
         )
         .bind(item_id)
         .bind(library.id.to_string())
@@ -5342,6 +5402,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
             )
             .await;
         enricher
@@ -5412,8 +5473,9 @@ mod tests {
         sqlx::query(
             "INSERT INTO media_items (
                 id, library_id, item_type, title, sort_title, identification_status,
-                provider_ids_json, premiere_date, metadata_fingerprint
-             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?)",
+                provider_ids_json, premiere_date, metadata_fingerprint,
+                nfo_collection_reference_key
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?, '')",
         )
         .bind(item_id)
         .bind(library.id.to_string())

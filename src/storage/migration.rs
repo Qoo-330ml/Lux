@@ -182,7 +182,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 poster_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (poster_fallback_required IN (0, 1)),
                 merged_into_item_id TEXT REFERENCES media_items(id) ON DELETE SET NULL,
                 nfo_metadata_json TEXT,
-                nfo_metadata_fingerprint BLOB
+                nfo_metadata_fingerprint BLOB,
+                nfo_collection_reference_key TEXT
             )",
             "INSERT INTO media_items_new (
                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
@@ -193,7 +194,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 merged_into_item_id,
-                nfo_metadata_json, nfo_metadata_fingerprint
+                nfo_metadata_json, nfo_metadata_fingerprint,
+                nfo_collection_reference_key
              )
              SELECT
                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
@@ -204,7 +206,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 merged_into_item_id,
-                nfo_metadata_json, nfo_metadata_fingerprint
+                nfo_metadata_json, nfo_metadata_fingerprint,
+                nfo_collection_reference_key
              FROM media_items",
             "DROP TABLE media_items",
             "ALTER TABLE media_items_new RENAME TO media_items",

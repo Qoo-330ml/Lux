@@ -335,6 +335,15 @@ pub(crate) struct GlobalMovieCollectionReference {
 }
 
 impl GlobalMovieCollectionReference {
+    pub(crate) fn identity_key(&self) -> String {
+        global_movie_collection_reference_identity_key(
+            &self.movie_provider,
+            &self.movie_provider_id,
+            &self.collection_provider,
+            &self.collection_provider_id,
+        )
+    }
+
     pub(crate) fn matches_existing_nfo_identity(
         &self,
         set_id: &str,
@@ -435,6 +444,16 @@ pub(crate) struct GlobalMovieCollectionReferenceUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) reference: Option<&'a GlobalMovieCollectionReference>,
     pub(crate) unqualified_nfo_set_id: Option<&'a str>,
+    pub(crate) nfo_collection_reference_key: &'a str,
+}
+
+pub(crate) fn global_movie_collection_reference_identity_key(
+    movie_provider: &str,
+    movie_provider_id: &str,
+    collection_provider: &str,
+    collection_provider_id: &str,
+) -> String {
+    format!("{movie_provider}:{movie_provider_id}:{collection_provider}:{collection_provider_id}")
 }
 
 fn reliable_provider_namespace(value: &str) -> Option<String> {

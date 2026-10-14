@@ -6654,7 +6654,7 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.update_media_item_metadata_in_transaction(&mut transaction, &update)
+        self.update_media_item_metadata_in_transaction(&mut transaction, &update, None)
             .await?;
         transaction
             .commit()
@@ -6670,11 +6670,16 @@ impl Database {
         update: MediaMetadataUpdate<'_>,
         reference: Option<&GlobalMovieCollectionReference>,
         unqualified_nfo_set_id: Option<&str>,
+        nfo_collection_reference_key: &str,
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.update_media_item_metadata_in_transaction(&mut transaction, &update)
-            .await?;
+        self.update_media_item_metadata_in_transaction(
+            &mut transaction,
+            &update,
+            Some(nfo_collection_reference_key),
+        )
+        .await?;
         self.replace_global_movie_collection_reference_in_transaction(
             &mut transaction,
             update.item_id,
@@ -6746,8 +6751,16 @@ impl Database {
             let _write_guard = self.acquire_metadata_write_lock().await;
             let mut transaction = self.begin_metadata_write_transaction().await?;
             for update in update_chunk {
-                self.update_media_item_metadata_in_transaction(&mut transaction, update)
-                    .await?;
+                let nfo_collection_reference_key = reference_updates
+                    .iter()
+                    .find(|reference_update| reference_update.item_id == update.item_id)
+                    .map(|reference_update| reference_update.nfo_collection_reference_key);
+                self.update_media_item_metadata_in_transaction(
+                    &mut transaction,
+                    update,
+                    nfo_collection_reference_key,
+                )
+                .await?;
             }
             for reference_update in reference_updates.iter().filter(|reference_update| {
                 update_chunk
@@ -6861,11 +6874,11 @@ impl Database {
         .bind(reference.sort_order)
         .execute(&mut **transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        Ok(())
     }
 
     async fn repair_local_nfo_defaults_in_transaction(
@@ -6948,6 +6961,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         update: &MediaMetadataUpdate<'_>,
+        nfo_collection_reference_key: Option<&str>,
     ) -> Result<(), StorageError> {
         // The rating comparison binds the presence flag and a plain f64 (like the SET clause)
         // instead of an `Option<f64>`: PostgreSQL rejects the optional float in the repeated
@@ -6966,6 +6980,7 @@ impl Database {
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = COALESCE(?, provider_ids_json),
                  metadata_fingerprint = ?,
+                 nfo_collection_reference_key = COALESCE(?, nfo_collection_reference_key),
                  metadata_provenance_json = ?,
                  locked_fields_json = ?,
                  updated_at = unixepoch()
@@ -6981,6 +6996,7 @@ impl Database {
                    OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
                    OR metadata_fingerprint IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND nfo_collection_reference_key IS DISTINCT FROM ?)
                    OR metadata_provenance_json IS DISTINCT FROM ?
                    OR locked_fields_json IS DISTINCT FROM ?
                )",
@@ -6997,6 +7013,7 @@ impl Database {
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
         .bind(update.metadata_fingerprint)
+        .bind(nfo_collection_reference_key)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
         .bind(update.item_id)
@@ -7014,6 +7031,8 @@ impl Database {
         .bind(update.provider_ids_json)
         .bind(update.provider_ids_json)
         .bind(update.metadata_fingerprint)
+        .bind(nfo_collection_reference_key)
+        .bind(nfo_collection_reference_key)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
         .execute(&mut **transaction)
@@ -7153,15 +7172,19 @@ impl Database {
         &self,
         item_id: &str,
         metadata_fingerprint: &[u8],
+        nfo_collection_reference_key: Option<&str>,
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
-             SET metadata_fingerprint = ?, updated_at = unixepoch()
+             SET metadata_fingerprint = ?,
+                 nfo_collection_reference_key = COALESCE(?, nfo_collection_reference_key),
+                 updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(metadata_fingerprint)
+        .bind(nfo_collection_reference_key)
         .bind(item_id)
         .execute(&mut *transaction)
         .await
