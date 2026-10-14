@@ -432,7 +432,25 @@ pub(super) fn is_file_change_only_sidecar_path(relative_path: &str) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"));
-    is_external_subtitle || is_media_info || is_danmaku_xml || is_nfo
+    let is_image = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp"
+            )
+        });
+    let is_unconsumed_edl = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("edl"));
+    is_external_subtitle
+        || is_media_info
+        || is_danmaku_xml
+        || is_nfo
+        || is_image
+        || is_unconsumed_edl
 }
 
 fn record_manifest_file_change_applied<'a>(

@@ -10,6 +10,8 @@ struct ScanPostprocessingOptions {
     thumbnails: Option<ThumbnailService>,
 }
 
+const MAX_CHANGED_LOCAL_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+
 fn media_info_sidecar_source_stem(path: &Path) -> Option<&str> {
     let extension = path.extension()?.to_str()?;
     if !extension.eq_ignore_ascii_case("json") {
@@ -25,26 +27,30 @@ fn media_info_sidecar_source_stem(path: &Path) -> Option<&str> {
     Some(source_stem)
 }
 
-async fn changed_nfo_path_is_safe(root_path: &Path, relative_path: &Path) -> bool {
+async fn safe_changed_sidecar_path(
+    root_path: &Path,
+    relative_path: &Path,
+    max_bytes: u64,
+) -> Option<PathBuf> {
     if relative_path.is_absolute()
         || relative_path
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        return false;
+        return None;
     }
-    let Ok(root_path) = tokio::fs::canonicalize(root_path).await else {
-        return false;
-    };
-    let Ok(nfo_path) = tokio::fs::canonicalize(root_path.join(relative_path)).await else {
-        return false;
-    };
-    if !nfo_path.starts_with(&root_path) {
-        return false;
-    }
-    tokio::fs::metadata(nfo_path)
+    let root_path = tokio::fs::canonicalize(root_path).await.ok()?;
+    let nfo_path = tokio::fs::canonicalize(root_path.join(relative_path))
         .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 1_048_576)
+        .ok()?;
+    if !nfo_path.starts_with(&root_path) {
+        return None;
+    }
+    tokio::fs::metadata(&nfo_path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file() && metadata.len() <= max_bytes)
+        .map(|_| nfo_path)
 }
 
 impl ScanJobService {
@@ -737,7 +743,7 @@ impl ScanJobService {
                 self.process_queued_danmaku_file_changes(job_id, batch_size, cancellation)
                     .await?;
                 return self
-                    .process_queued_nfo_file_changes(job_id, batch_size, cancellation)
+                    .process_queued_metadata_sidecar_changes(job_id, batch_size, cancellation)
                     .await;
             }
             let mut restart_from_beginning = false;
@@ -1133,7 +1139,7 @@ impl ScanJobService {
         }
     }
 
-    async fn process_queued_nfo_file_changes(
+    async fn process_queued_metadata_sidecar_changes(
         &self,
         job_id: &str,
         batch_size: usize,
@@ -1158,11 +1164,24 @@ impl ScanJobService {
                     return Ok(());
                 }
                 let relative_path = Path::new(&change.relative_path);
-                if !relative_path
+                let is_nfo = relative_path
                     .extension()
                     .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"))
-                {
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"));
+                let is_image = relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "jpg" | "jpeg" | "png" | "webp"
+                        )
+                    });
+                let is_unconsumed_edl = relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("edl"));
+                if !is_nfo && !is_image && !is_unconsumed_edl {
                     continue;
                 }
                 let Some(revision) = change.file_change_revision else {
@@ -1200,6 +1219,22 @@ impl ScanJobService {
                     return Ok(());
                 }
 
+                if is_unconsumed_edl {
+                    let completed = self
+                        .database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "DONE",
+                            None,
+                        )
+                        .await?;
+                    restart_from_beginning |= !completed;
+                    continue;
+                }
+
                 let Some(entry) = self
                     .database
                     .find_filesystem_entry(&change.library_root_id, &change.relative_path)
@@ -1221,7 +1256,9 @@ impl ScanJobService {
                 };
                 let sources = self
                     .database
-                    .list_scan_local_metadata_sources(std::slice::from_ref(&entry.id))
+                    .list_scan_local_metadata_sources_for_file_change(std::slice::from_ref(
+                        &entry.id,
+                    ))
                     .await?;
                 if sources.is_empty() {
                     let completed = self
@@ -1239,24 +1276,38 @@ impl ScanJobService {
                     continue;
                 }
                 let root_path = Path::new(&sources[0].root_path);
-                let nfo_path = root_path.join(relative_path);
-                if change.change_kind != "REMOVE"
-                    && !changed_nfo_path_is_safe(root_path, relative_path).await
-                {
-                    let marked = self
-                        .database
-                        .set_scan_job_file_change_state(
-                            job_id,
-                            &change.library_root_id,
-                            &change.relative_path,
-                            revision,
-                            "FAILED",
-                            Some("INVALID_NFO"),
-                        )
-                        .await?;
-                    restart_from_beginning |= !marked;
-                    continue;
-                }
+                let sidecar_path = if change.change_kind == "REMOVE" {
+                    root_path.join(relative_path)
+                } else {
+                    let max_bytes = if is_nfo {
+                        1_048_576
+                    } else {
+                        MAX_CHANGED_LOCAL_IMAGE_BYTES
+                    };
+                    let Some(path) =
+                        safe_changed_sidecar_path(root_path, relative_path, max_bytes).await
+                    else {
+                        let error = if is_nfo {
+                            "INVALID_NFO"
+                        } else {
+                            "INVALID_IMAGE"
+                        };
+                        let marked = self
+                            .database
+                            .set_scan_job_file_change_state(
+                                job_id,
+                                &change.library_root_id,
+                                &change.relative_path,
+                                revision,
+                                "FAILED",
+                                Some(error),
+                            )
+                            .await?;
+                        restart_from_beginning |= !marked;
+                        continue;
+                    };
+                    path
+                };
                 if cancellation.load(Ordering::Acquire) {
                     self.database
                         .set_scan_job_file_change_state(
@@ -1279,31 +1330,29 @@ impl ScanJobService {
                 if let Some(local_nfo) = self.local_nfo.clone() {
                     enricher = enricher.with_nfo_store(local_nfo);
                 }
-                let result = match enricher
-                    .enrich_scan_local_metadata_file_change_nfo(sources, &nfo_path)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let marked = self
-                            .database
-                            .set_scan_job_file_change_state(
-                                job_id,
-                                &change.library_root_id,
-                                &change.relative_path,
-                                revision,
-                                "FAILED",
-                                Some("NFO_PROCESSING_FAILED"),
-                            )
-                            .await?;
-                        restart_from_beginning |= !marked;
-                        continue;
+                let (state, error, changed_result) = if is_nfo {
+                    match enricher
+                        .enrich_scan_local_metadata_file_change_nfo(sources, &sidecar_path)
+                        .await
+                    {
+                        Ok(result) if result.report.nfo_failed > 0 => {
+                            ("FAILED", Some("NFO_ENRICHMENT_FAILED"), false)
+                        }
+                        Ok(result) => ("DONE", None, result.report.nfo_loaded > 0),
+                        Err(_) => ("FAILED", Some("NFO_PROCESSING_FAILED"), false),
                     }
-                };
-                let (state, error) = if result.report.nfo_failed > 0 {
-                    ("FAILED", Some("NFO_ENRICHMENT_FAILED"))
                 } else {
-                    ("DONE", None)
+                    match enricher
+                        .index_scan_local_metadata_file_change_image(
+                            &sources,
+                            &sidecar_path,
+                            change.change_kind == "REMOVE",
+                        )
+                        .await
+                    {
+                        Ok(changed_count) => ("DONE", None, changed_count > 0),
+                        Err(_) => ("FAILED", Some("IMAGE_PROCESSING_FAILED"), false),
+                    }
                 };
                 let marked = self
                     .database
@@ -1317,7 +1366,7 @@ impl ScanJobService {
                     )
                     .await?;
                 restart_from_beginning |= !marked;
-                if marked && result.report.nfo_loaded > 0 {
+                if marked && changed_result {
                     if let Some(home) = &self.home {
                         home.invalidate();
                     }

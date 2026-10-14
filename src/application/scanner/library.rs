@@ -2368,7 +2368,12 @@ pub(super) fn is_file_change_only_sidecar(path: &Path) -> bool {
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("xml") || extension.eq_ignore_ascii_case("nfo")
+                extension.eq_ignore_ascii_case("xml")
+                    || extension.eq_ignore_ascii_case("nfo")
+                    || matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "jpg" | "jpeg" | "png" | "webp" | "edl"
+                    )
             })
 }
 
