@@ -11429,6 +11429,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 验收：
 
 - [x] SQLite 空库和升级迁移检查通过：`cargo test --locked --test storage` 为 56 passed。
+- [x] PostgreSQL 16 临时实例迁移回归通过：`cargo test --locked --target aarch64-apple-darwin --test postgres_database -- --include-ignored` 为 16 passed；空库启动断言 v173 合集表、系统合集库无根路径及 NFO 引用列。
 - [x] Rust 完整完成检查通过：ARM64 `cargo test --locked --target aarch64-apple-darwin --all-targets` 在 4 个 test threads 下完成，库测试 872 passed、22 ignored，所有可运行 integration targets 通过。
 - [x] Web 冻结依赖安装、完整测试（Node 139/139、Vitest 600/600）和生产构建通过。
 - [x] Playwright 浏览器流程通过：打开合集库、进入“飞驰人生”、选择 4K 来源并触发来源偏好写入；该流程使用 mock API，服务端合同由 Rust 集成测试验证。
@@ -11437,7 +11438,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 预计文件：兼容记录、本文档和阶段验收涉及的回归文件。
 
-实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。本机没有 PostgreSQL 实例，PostgreSQL 运行时用例仍按设计忽略。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub、SenPlayer、Infuse 客户端实测仍未完成，阶段门停在项目所有者确认点。
+实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。全量门禁中的 PostgreSQL 专用用例按设计忽略；随后在临时 PostgreSQL 16 实例单独运行 `postgres_database` 目标，16 项通过。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub、SenPlayer、Infuse 客户端实测仍未完成，阶段门停在项目所有者确认点。
 
 2026-10-15 续查：VidHub 2.1.8、SenPlayer 6.0.6、Infuse 8.5.1 均已安装并启动，但 CUA 绑定原生窗口均返回 `-10005 cgWindowNotFound`，无法执行合集浏览、来源切换和进度回写。隔离浏览器访问本机服务停留在登录页；未改动现有本地用户或媒体数据。客户端验收继续保持未完成。
 
