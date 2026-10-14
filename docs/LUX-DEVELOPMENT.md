@@ -11125,13 +11125,15 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] ADR-046、任务规格与阶段 23 阻塞记录明确同一调度策略如何同时满足 LUX-303 和 LUX-424。
-- [ ] 决策明确禁止无界内存队列、每 job task fan-out、自动工作并入显式 job，以及改变扫描完成语义。
-- [ ] 运行时代码尚未修改；阶段 23 性能门维持开放，后续实施任务明确包含超过 32 个 job 的慢 provider 回归。
+- [x] ADR-046、任务规格与阶段 23 阻塞记录明确同一调度策略如何同时满足 LUX-303 和 LUX-424。
+- [x] 决策明确禁止无界内存队列、每 job task fan-out、自动工作并入显式 job，以及改变扫描完成语义。
+- [x] 本决策增量只修改文档；阶段 23 性能门维持开放，后续 LUX-530 实现包含超过 32 个 job 的阻塞 provider 排空回归。
 
 预计文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/046-progressive-scan-and-missing-metadata.md`、`docs/PERFORMANCE.md`、`docs/STAGE-23-GATE-REVIEW-2026-10-09.md`。
 
 验证：核对 LUX-303/LUX-424 原合同、现有失败快照与旧 job 升级边界；运行 `git diff --check`。本任务仅记录决策，不声称运行时修复或阶段门通过。
+
+实施结果（2026-10-14）：ADR-046 明确自动补缺以持久化 QUEUED job 为工作队列，合并唤醒和有界分页领取满足 LUX-303 的本地 worker 不等待要求；容量 32 的显式 dispatcher 背压与完成等待仍满足 LUX-424，自动和显式来源不混合。LUX-528–530 随后完成来源字段、持久队列 drain 与超过 32 个自动 job 的回归；保留原 10k 失败快照，阶段 23 双后端 5% 性能门仍开放。
 
 #### LUX-528：持久化补缺 job 来源字段
 

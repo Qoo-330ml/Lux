@@ -1209,7 +1209,13 @@ SQL/pool/lock 观测也没有分离出单一根因。rescan 并发请求窗口�
 
 1k 两组明确验证每 job 最多 100 项、所有 item `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL，scan/local 均在 provider 放行前完成。10k SQLite 快照为 scan `COMPLETED/IDLE`，local 15 批完成、31 批待处理、4 批运行；online 39 QUEUED+1 RUNNING。`local_metadata_completeness` 在持久化后等待 `enqueue_fill_missing_job_id`，该方法最终等待容量 32 channel 的 `sender.reserve().await`；provider 阻塞导致队列满，背压传回本地 worker。失败的 online 时延保持 unavailable，poster 矩阵中的 `onlineFillMissingJobCount=0` 仅表示该 fixture 禁止在线调度。
 
-该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。2026-10-14 项目所有者授权按自动/显式来源分流解决冲突：自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用合并唤醒和分页领取；保留管理员/计划入口的显式提交背压和完成等待合同，禁止按 job 无界 spawn。此处记录的是决策，LUX-528/LUX-529 尚未实现；阶段 23 性能门仍开放，失败样本仍保持 unavailable，不计作在线刮削耗时。
+该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。2026-10-14 项目所有者授权按自动/显式来源分流解决冲突：自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用合并唤醒和分页领取；保留管理员/计划入口的显式提交背压和完成等待合同，禁止按 job 无界 spawn。上段是决策时点快照；原失败样本保持 unavailable，不计作在线刮削耗时。
+
+#### LUX-528–530 自动补缺队列实现状态
+
+2026-10-14 完成追加式来源字段、自动/显式 job 分流和持久化自动队列 drain。每库 dispatcher 通过容量为 1 的合并唤醒通道触发，按创建时间分页领取、每页最多 100 条并串行运行自动 QUEUED job；显式入口仍使用容量 32 的背压队列，自动 completion waiter 有界为每库 32。扫描的 `ScanCompleted`/`JOB_COMPLETED` 时序未改变。
+
+回归在 provider gate 阻塞期间验证本地 completeness worker 与 scan 可继续完成，并在放行后有序排空 108 个自动 job 及 drain 期间新增的 job；另覆盖显式队列背压、取消、panic、shutdown、重启恢复和来源隔离。`application::reidentify::tests::` 39/39、扫描 dispatch 1/1、SQLite 来源/分页合同 1/1、串行 `tests/reidentify.rs` 21/21 通过。该 fixture 验证持久队列和调度合同，不测上游吞吐或真实刮削时延；PostgreSQL live runtime 仍待可用服务。原 10k 失败快照保留，阶段 23 A/B 性能门未通过。
 
 #### 质量门与证据
 
