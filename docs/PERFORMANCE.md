@@ -166,6 +166,22 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 | 2026-09-30 | `edb28dbb`（`uname -m=arm64`） | `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/run-metadata-performance.sh`（release，连续 3 次） | 32/32 条目均成功；耗时 599–662ms，中位数 608ms；吞吐 48.3–53.4 条/秒；每次 32 次 search/bundle，图片 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms` 范围 `{bundle:3–4,image_download:0,image_download_queue:0,image_write:26–33,image_write_queue:0,item_total:92–129,nfo_write:30–37,queue_claim:5–8,queue_wait:5–8,search:3}`；`imageBytes=1876` | 仅本机 ARM64/SQLite、32 条固定夹具和 adapter stub；没有匹配改动前的同机 A/B，不据此声称吞吐提升；不代表 NAS/x86_64 或独立 PostgreSQL 的 CPU/延迟 |
 | 2026-09-30 | `a420389f`（`uname -m=arm64`） | `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/run-metadata-performance.sh`（release，连续 3 次） | 32/32 条目均成功；耗时 568–633ms，中位数 584ms；吞吐 50.5–56.3 条/秒，中位数 54.8；每次 32 次 search/bundle，图片 28 条可用、4 条明确不可用、1 次临时重试、scraper 重试为 0；`stageP95Ms` 范围 `{bundle:3–4,image_download:0,image_download_queue:0,image_write:24–28,image_write_queue:0,item_total:86–213,nfo_write:27–36,queue_claim:5–7,queue_wait:5–7,search:3–4}`；`imageBytes=1876` | 仅本机 ARM64/SQLite、32 条固定夹具和 adapter stub；本基准不运行持久化 provider cache 或 `ScraperPluginClient`，不测真实插件、PostgreSQL、NAS/x86_64 或容器 CPU；没有严格同机 A/B，不据此声称 CPU 降幅或吞吐提升 |
 
+### LUX-531 固定延迟 FILL_MISSING 并发矩阵
+
+`./scripts/run-metadata-performance.sh concurrency` 使用真实 `MetadataReidentifyService::run` job worker、SQLite 或 `LUX_PERF_BACKEND=postgres` 选择的 storage 路径，以及进程内 adapter stub。每档使用 96 个相同电影 fixture；默认每次 provider 调用固定等待 100ms（可用 `LUX_METADATA_BENCHMARK_PROVIDER_DELAY_MS` 调整，范围 1–5000ms），仅发起本地 stub 调用，不访问 TMDb。JSON 结果包含构建版本、Rust 版本、架构、数据库 backend、固定配置、逐 item 耗时、逐 provider 调用耗时、并发峰值、阶段 p95 和错误/取消计数。成功吞吐只计算 `COMPLETED` 且无 item error 的项目。
+
+2026-10-14 本机连续运行 3 次；`uname -m=arm64`，Rust target architecture `aarch64`，Lux `0.5.25`，`rustc 1.97.1`，SQLite，基准输出中的 HEAD 为 `42e36ce3`（运行时包含未提交的 LUX-531 工作树改动）。每轮各档均为 96/96 成功、0 失败、0 取消、192 次 provider 调用，观测峰值分别精确达到 4/8/12，且没有超过档位。
+
+| worker 档位 | items/s 中位数（范围） | job 总耗时中位数（范围） | 成功项 p50 中位数（范围） | 成功项 p95 中位数（范围） | queue wait p95 中位数（范围） |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 16.45（16.43–16.63） | 5,835ms（5,773–5,843） | 233.1ms（230.9–235.1） | 255.6ms（254.6–263.2） | 3ms（3–5） |
+| 8 | 29.57（27.40–31.14） | 3,247ms（3,083–3,503） | 248.3ms（236.3–268.2） | 323.5ms（305.7–334.7） | 12ms（6–16） |
+| 12 | 35.75（34.25–36.86） | 2,685ms（2,604–2,803） | 301.4ms（269.9–324.0） | 378.1ms（375.6–400.6） | 17ms（16–23） |
+
+stub 单次调用实测 p50 约 101.4–102.0ms、p95 约 102.6–103.5ms，和固定 100ms 等待相符。SQLite 下 12 路相较 8 路吞吐中位数约高 21%，但成功项 p95 约高 17%，queue wait p95 也更高；这些数据呈现本机写锁/存储争用下的收益与尾延迟代价，不能外推到 PostgreSQL 或 NAS。基准不测 TMDb 响应时间、限流策略、插件 cache、远程图片下载或真实网络吞吐；不得把 stub 吞吐解读为上游请求速率。PostgreSQL 选择路径已实现，但本机未安装 `postgres`/`psql`/`pg_isready` 且没有可用服务，本次未运行 PostgreSQL 档位。默认线上并发仍为 4，本任务没有调整它。
+
+LUX-532 默认继续使用 4，`LUX_METADATA_CONCURRENCY` 可在 1–12 之间配置，硬上限为 12。4 是已有 SQLite 基线；PostgreSQL 缺少测量证据，所以本次不提高默认，也不把 8/12 档的 SQLite 吞吐当成跨后端建议值。设置解析在进程内只进行一次，semaphore 与 worker limit 使用同一值；无效输入回退到 4 并告警，整数越界夹到边界并告警。
+
 本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
 
 ## 本地 NFO page 运行指标
@@ -1080,6 +1096,54 @@ LUX-304/1k 的 image-pending 窗口开始采样时已没有 pending batch，因�
 
 这些单轮观测值用于确认字段、SQL/pool 样本及严格 drain 条件；不能证明性能收益。ARM64 全量 Rust 门禁已通过：library 807 passed、13 ignored，所有 integration targets 通过，build、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。要求本机 PostgreSQL 实例的专项测试仍为 ignored。LUX-304 10k PostgreSQL 队列完成后目录 p95 的 59→63 ms（+6.8%）仍需按相同配置复测；SQLite/PostgreSQL 多轮 A/B 和阶段 23 性能门仍未完成。本节结果不能外推 FNOS 或 NAS/x86_64。
 
+### 阶段 23 / LUX-270：1k 双后端 A/B 初步观测
+
+2026-10-09 在本机 ARM64（`uname -m=arm64`）对 1,000 文件 / 100 目录 fixture 交错运行三轮。Manifest 基线代码 revision 为 `6424ab122a556e2214f9948580b8c7bf42407aa3`（LUX-295 前），候选代码为 `e6a7ef8a14122a7affda50a78042e7c6c4e89b2f`；候选不包含后续 #10/#16/#17 集成。fixture 在运行时由固定测试 harness 生成，没有独立 Git fixture commit；manifest 为 `lux-catalog-fixture-v1`，声明内容 SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`，1k tree SHA-256 `4e79fb577948fa257d8ceba8b1eb42782f2767a0f94603cfc60e5a40064ff325`。基线和候选的 `tests/performance.rs` 字节相同（SHA-256 `97d5cf4196c93aa8feb733057e2670d0db18517ceda2aab3fe296ee1d9639b5d`）；基线工作树仅以该相同文件覆盖测试观测 harness，生产代码仍来自基线 commit。
+
+每轮在单个进程中串行运行 baseline 后 candidate，不并行跑样本。r1 使用 `cargo test --locked --release --test performance lux_270_manifest_job_scan_benchmark -- --ignored --nocapture --test-threads=1`；r2/r3 使用同一 benchmark 的已编译 release test binary，参数为 `lux_270_manifest_job_scan_benchmark --ignored --nocapture --test-threads=1`。环境分别设置 `LUX_PERF_MEDIA_ROOT`、`LUX_PERF_FILE_COUNT=1000`、`LUX_PERF_BACKEND=sqlite|postgres`；PostgreSQL 使用临时 16.15 容器和每轮独立数据库。脚本为 `/tmp/lux-stage23-ab-20261009-codex/run-formal.sh`、`run-direct.sh`；完整结构化样本保存在 `/tmp/lux-stage23-ab-20261009-codex/results-formal.jsonl`、`results-direct.jsonl`，逐轮控制台日志也保留在同目录。direct test binary SHA-256：baseline `5151a72fed9404503367fd92ba33834425a4c7e293c6428e8b78edd6d79d5d7b`，candidate `63dbf2a013009341653df624df21160e80b88d0f4d6db1c221f3e0ae4a5d5834`。
+
+下表保留每轮原始核心结果，时间单位 ms；热页 p50/p95 来自扫描重跑前 50 个并发目录页请求。`foregroundP95` 是重跑期间 50 个并发管理 API 请求的 p95，`catalogP95` 是随后 50 个并发目录请求的 p95。RSS 是整次测试进程峰值 MiB，不对应单个阶段。
+
+| 后端 | 轮次 | revision | 索引 | `unchangedRescanMs`* | 热页 p50 / p95 | 前台 p95 | 目录 p95 | DML | RSS MiB |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| SQLite | 1 | baseline | 64 | 1,146 | 323 / 529 | 544 | 566 | 37 | 174 |
+| SQLite | 1 | candidate | 69 | 1,611 | 453 / 772 | 791 | 771 | 34 | 198 |
+| SQLite | 2 | baseline | 67 | 1,118 | 315 / 516 | 547 | 541 | 37 | 136 |
+| SQLite | 2 | candidate | 54 | 1,432 | 458 / 758 | 731 | 656 | 34 | 437 |
+| SQLite | 3 | baseline | 48 | 1,247 | 407 / 595 | 588 | 628 | 37 | 152 |
+| SQLite | 3 | candidate | 52 | 1,723 | 555 / 874 | 827 | 854 | 34 | 208 |
+| PostgreSQL | 1 | baseline | 160 | 1,098 | 350 / 543 | 542 | 518 | 37 | 158 |
+| PostgreSQL | 1 | candidate | 166 | 1,561 | 374 / 680 | 792 | 722 | 34 | 400 |
+| PostgreSQL | 2 | baseline | 146 | 1,142 | 294 / 474 | 557 | 541 | 37 | 396 |
+| PostgreSQL | 2 | candidate | 149 | 1,575 | 506 / 770 | 750 | 765 | 34 | 378 |
+| PostgreSQL | 3 | baseline | 143 | 1,343 | 461 / 644 | 694 | 603 | 37 | 185 |
+| PostgreSQL | 3 | candidate | 144 | 1,796 | 584 / 854 | 874 | 874 | 34 | 279 |
+
+三轮中位数：SQLite 首扫索引 64→54 ms（−15.6%），无变化重跑复合窗口 1,146→1,611 ms（+40.6%），管理前台 p95 547→791 ms（+44.6%），目录 p95 566→771 ms（+36.2%）；PostgreSQL 分别为 146→149 ms（+2.1%）、1,142→1,575 ms（+37.9%）、557→792 ms（+42.2%）、541→765 ms（+41.4%）。热页 p95 也在 rescan 前独立复现回退：SQLite 529→772 ms（+45.9%），PostgreSQL 543→770 ms（+41.8%）；单个首次目录请求中位数仅从 16→19 ms / 38→42 ms。尽管 DML 从 37 降至 34，这组中间候选样本在两个后端都显示前台 p95 超过 5% 回退门槛；最终阶段状态待集成候选复测。
+
+`unchangedRescanMs` **不是纯扫描 wall**：计时从第一批 rescan 开始，到后台批次完成且串行的两组 50 请求测量都完成后停止。`foregroundP95` 与 `catalogP95` 是明确的并发前台负载结果；不能把复合 `unchangedRescanMs` 的差值都归于扫描 worker。阶段计时显示 rescan 中 SQLite `transaction_total` 中位数为 5.92→6.11 ms、`presence_ledger` 为 3.89→3.70 ms；PostgreSQL 分别为 46.69→55.81 ms、23.45→36.49 ms，不能解释复合 wall 的数百毫秒变化。
+
+SQL/pool/lock 观测也没有分离出单一根因。rescan 并发请求窗口内，PostgreSQL 最大 lock waiter 为 0，各轮 pool 均未采到饱和；SQLite `BEGIN IMMEDIATE` acquisition p95 为 baseline 28–83 μs、candidate 20–75 μs，错误为 0。独立 warm catalog 的 50 请求 SQL 累计执行时间中位数：SQLite 23.54→25.74 ms，`SELECT DISTINCT T.ITEM_ID` 的 statement p95 为 383→461 μs；PostgreSQL 总累计 383.5→657.6 ms，该 query p95 为 9.30→13.17 ms。SQLx elapsed 不包括 pool-acquire wait，采样窗口也可能混入同进程其他 SQL。热页请求在两后端都回退，而 SQLite 已计量 SQL 延迟、pool saturation 和锁等待基本不变；因此目前只能假设并发 catalog 请求的 DB 外等待/处理开销增长，PostgreSQL 查询变慢可能另有贡献。缺少 per-request pool-acquire、storage await、item mapping/JSON 编码、响应字节和进程 CPU 观测，不能确认具体函数或后台 worker 是根因。
+
+以下保留每轮热页 SQL 汇总和压力采样摘要。SQL 累积时间是 50 个请求窗口内所有 statement elapsed 的总和；statement p95 对应规范化 `SELECT DISTINCT T.ITEM_ID` 摘要。pool 写为最大 in-use/size（饱和样本/总采样数）；SQLite 锁列为 admission canary acquisition p95/错误数，PostgreSQL 列为采样最大 waiter 数。
+
+| 后端 | 轮次 | revision | 热页 SQL 累计 ms / 主 query p95 μs | 热页 pool | 重跑管理 / 目录 pool | 锁观测 |
+|---|---:|---|---:|---|---|---|
+| SQLite | 1 | baseline | 26.06 / 383 | 2/7 (0/78) | 1/7 (0/68) / 2/7 (0/83) | 83 μs / 0 errors |
+| SQLite | 1 | candidate | 35.63 / 475 | 3/7 (0/93) | 1/7 (0/76) / 1/7 (0/91) | 75 μs / 0 errors |
+| SQLite | 2 | baseline | 23.54 / 292 | 3/6 (0/77) | 1/7 (0/70) / 4/7 (0/79) | 73 μs / 0 errors |
+| SQLite | 2 | candidate | 17.18 / 392 | 1/4 (0/94) | 1/5 (0/73) / 8/8 (1/73) | 68 μs / 0 errors |
+| SQLite | 3 | baseline | 17.84 / 433 | 3/4 (0/85) | 1/5 (0/76) / 3/5 (0/90) | 28 μs / 0 errors |
+| SQLite | 3 | candidate | 25.74 / 461 | 2/6 (0/102) | 1/6 (0/84) / 1/6 (0/107) | 20 μs / 0 errors |
+| PostgreSQL | 1 | baseline | 273.88 / 4,282 | 6/9 (0/86) | 3/9 (0/85) / 6/9 (0/80) | 0 waiters |
+| PostgreSQL | 1 | candidate | 810.01 / 15,135 | 18/18 (0/85) | 3/18 (0/115) / 6/18 (0/97) | 0 waiters |
+| PostgreSQL | 2 | baseline | 922.62 / 13,866 | 20/20 (4/61) | 5/20 (0/83) / 7/20 (0/81) | 0 waiters |
+| PostgreSQL | 2 | candidate | 437.10 / 7,391 | 7/9 (0/108) | 11/13 (0/97) / 6/13 (0/107) | 0 waiters |
+| PostgreSQL | 3 | baseline | 383.48 / 9,298 | 7/9 (0/92) | 4/9 (0/100) / 13/14 (0/89) | 0 waiters |
+| PostgreSQL | 3 | candidate | 657.64 / 13,167 | 10/13 (0/118) | 2/13 (0/124) / 6/13 (0/127) | 0 waiters |
+
+本组 1k 结果作为回退证据保留，不代替最终集成候选的阶段结论。LUX-270 的 10k 矩阵、LUX-304 poster-worker 的 1k/10k 矩阵，以及集成 #10/#16/#17 后的受影响路径复测仍未完成。最终复测不得删减这些指标或放宽 5% 门槛；本机 ARM64/临时 PostgreSQL 数据不外推 FNOS/NAS 或 x86_64。
+
 ### LUX-306 批量本地图片写入 A/B：1k/10k SQLite/PostgreSQL
 
 2026-09-29 在 Mac16,10 / 16 GiB / ARM64（`uname -m=arm64`），以 LUX-305 提交 `245d2f83` 为基线、LUX-306 worker 提交 `1bedd2e1` 为候选，对同一 1k/10k poster-worker fixture 在 SQLite 与 Docker PostgreSQL 16.15 上各交错运行三轮。每个 movie 有一张有效 1×1 PNG；每轮扫描期间及队列完成后各测 50 个并发 `GET /api/v1/libraries/{id}/items` 请求的 p95。表中为三轮中位数，单位 ms；首 poster 与 scan job 时间由 20 ms 轮询观察。候选每页最多准备并原子写入 16 个 movie，首个 movie 仍走单项快速路径。
@@ -1145,7 +1209,13 @@ LUX-304/1k 的 image-pending 窗口开始采样时已没有 pending batch，因�
 
 1k 两组明确验证每 job 最多 100 项、所有 item `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL，scan/local 均在 provider 放行前完成。10k SQLite 快照为 scan `COMPLETED/IDLE`，local 15 批完成、31 批待处理、4 批运行；online 39 QUEUED+1 RUNNING。`local_metadata_completeness` 在持久化后等待 `enqueue_fill_missing_job_id`，该方法最终等待容量 32 channel 的 `sender.reserve().await`；provider 阻塞导致队列满，背压传回本地 worker。失败的 online 时延保持 unavailable，poster 矩阵中的 `onlineFillMissingJobCount=0` 仅表示该 fixture 禁止在线调度。
 
-该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。已报告此规格冲突，按 AGENTS.md 在修订公共调度/存储边界前等待项目所有者选择。建议自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用有界通知/分页异步领取；保留管理员请求背压和完成等待合同，禁止按 job 无界 spawn。该建议尚未实施。
+该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。2026-10-14 项目所有者授权按自动/显式来源分流解决冲突：自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用合并唤醒和分页领取；保留管理员/计划入口的显式提交背压和完成等待合同，禁止按 job 无界 spawn。上段是决策时点快照；原失败样本保持 unavailable，不计作在线刮削耗时。
+
+#### LUX-528–530 自动补缺队列实现状态
+
+2026-10-14 完成追加式来源字段、自动/显式 job 分流和持久化自动队列 drain。每库 dispatcher 通过容量为 1 的合并唤醒通道触发，按创建时间分页领取、每页最多 100 条并串行运行自动 QUEUED job；显式入口仍使用容量 32 的背压队列，自动 completion waiter 有界为每库 32。扫描的 `ScanCompleted`/`JOB_COMPLETED` 时序未改变。
+
+回归在 provider gate 阻塞期间验证本地 completeness worker 与 scan 可继续完成，并在放行后有序排空 108 个自动 job 及 drain 期间新增的 job；另覆盖显式队列背压、取消、panic、shutdown、重启恢复和来源隔离。`application::reidentify::tests::` 39/39、扫描 dispatch 1/1、SQLite 来源/分页合同 1/1、串行 `tests/reidentify.rs` 21/21 通过。该 fixture 验证持久队列和调度合同，不测上游吞吐或真实刮削时延；PostgreSQL live runtime 仍待可用服务。原 10k 失败快照保留，阶段 23 A/B 性能门未通过。
 
 #### 质量门与证据
 

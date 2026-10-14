@@ -91,6 +91,8 @@ export function applyAccountTheme(theme: LuxTheme): void {
     document.documentElement.dataset.luxTheme = theme;
     const favicon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
     if (favicon) favicon.href = theme === "light" ? "/favicon.svg" : "/favicon-white.svg";
+    const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    if (themeColor) themeColor.content = theme === "light" ? "#f4f3f1" : "#050506";
   }
 }
 

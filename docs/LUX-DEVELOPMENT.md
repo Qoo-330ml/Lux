@@ -704,6 +704,9 @@ pnpm --dir web exec playwright test
 cargo run --bin luxd
 pnpm --dir web dev
 
+本地开发时由 Vite（`http://127.0.0.1:5173`）提供 React Web 页面；Rust 服务只从 `web/dist` 或显式配置的
+`LUX_WEB_DIR` 提供静态文件。需要从 Rust 服务同源访问 Web 页面时，先运行 `pnpm --dir web build`。
+
 # Docker
 docker compose build
 docker compose up
@@ -1271,6 +1274,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 - 搜索候选短期缓存，详情较长时间缓存。
 - 响应 schema 验证后进入领域层。
 - 自动匹配和手动重新匹配共用候选模型；候选的 provider ID、provider 名称和实际 scraper 来源必须一致。补充候选不得静默改变已确认的媒体身份。
+- 管理员手动搜索候选时，按媒体库配置顺序查询 `PRIMARY`、`BACKUP` 和 `BOTH`，并按来源分组展示成功候选；单个来源失败不丢弃其他来源的成功结果。`SUPPLEMENT` 不参与身份候选。
 - 电影和剧集候选同时携带 0-10 的来源评分；确认候选后保存评分及其刮削器来源，Lux Web 目录和详情海报在右上角显示“来源 + 评分”。
 
 ### 13.4 NFO 和图片写回
@@ -2191,6 +2195,7 @@ services:
 | LUX-301 | src/application/scanner.rs、src/api/legacy.rs、docs/LUX-DEVELOPMENT.md；扫描后持久化本地完整性状态 |
 | LUX-302 | src/storage/metadata.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失记录与补全任务原子提交 |
 | LUX-303 | src/application/metadata.rs、src/application/scanner.rs、src/application/reidentify.rs、src/api/legacy.rs、docs/LUX-DEVELOPMENT.md；渐进扫描接入 FILL_MISSING |
+| LUX-475 | src/storage/jobs.rs、src/application/metadata.rs、src/application/scanner.rs、docs/LUX-DEVELOPMENT.md；渐进扫描将分集所属的季度与剧集容器纳入 FILL_MISSING |
 | LUX-304 | tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；渐进扫描及海报处理性能测量 |
 | LUX-305 | src/storage/catalog.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；本地图片批量写入合同 |
 | LUX-306 | src/application/metadata.rs、tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；海报 worker 批量写入及复测 |
@@ -5686,6 +5691,12 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 调用旧的 `resume_*_jobs` 自动恢复入口。优雅关闭时，在关闭数据库连接前再次执行同一清理，覆盖关闭窗口内的
 活动作业。计划任务在后续调度周期可以创建新的作业实例，但不恢复被取消的旧实例。
 
+例外（元数据补全，2026-10-14 修订）：被取消的作业实例仍不恢复，但每次启动后，对「最近一个 `FILL_MISSING`
+作业被 `SERVER_SHUTDOWN` 取消且已选择刮削器」的媒体库，各新建一个库级 `FILL_MISSING` 作业并按库依次
+执行，使中断的在线刮削自动补完；已完整的条目不发起刮削请求。同时，元数据作业不得在仍有 `PENDING`
+条目时记为完成（以 `FAILED` / `QUEUE_INCOMPLETE` 结束），无法派发的作业记为 `FAILED` / `DISPATCH_FAILED`
+而不是长期停留在 `QUEUED`。
+
 验收：
 
 - [ ] 八类持久化作业全部在同一个数据库事务中标记为 `CANCELLED`，错误码为 `SERVER_SHUTDOWN`，任务历史保留。
@@ -8707,6 +8718,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：预检失败与明确不可用状态现在分开处理。已配置 scraper 的 item 级或整批预检错误会进入现有补全 worker，错误由 worker 记录为 `SCRAPER_UNAVAILABLE` 并使用 LUX-402 退避；明确无 scraper 仍不入队。`cargo test --locked --all-targets --no-fail-fast` 中 library tests 为 750 passed、12 ignored，`scanning_jobs` 81/81、`scanned_metadata` 16/16、`storage` 49/49 通过；全目标的 `emby_counts` 与 `strm` 失败已在干净 `origin/test=8412cc2a` 基线复现，`libraries_api` 全目标并行运行时失败后独立复跑 13/13 通过。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。该分支未部署到 FNOS，也没有生产 CPU 降幅证据。
 
+补充结果（2026-10-09，阶段 23 无候选分类）：自动搜索所有标题/年份变体都成功返回空结果时，旧逻辑把它转换成 `SCRAPER_UNAVAILABLE`，导致合法的“没有匹配”进入 provider 退避；分集在找不到系列父候选时也会这样误分类。现在空搜索结果作为无候选返回，仍保留真实请求错误的 `SCRAPER_UNAVAILABLE` 分类。新增电影与分集 FILL_MISSING 集成回归，确认 job 不进入 `DEFERRED`、item 记录 `LOW_CONFIDENCE` 且 `candidate_count=0`、没有候选行，并且 title/provider IDs 不变。`cargo test --locked --test reidentify -- --test-threads=1` 在本机 ARM64/SQLite fixture 上 19/19 通过，包含既有 provider unavailable deferred 回归；没有运行 PostgreSQL 专项或性能基准，也未部署 FNOS。
+
 短计划与文件：预计修改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先在 scanner 单测中固定“预检错误继续排队、明确无 scraper 不排队”的决策，再把预检错误送入已有 provider-unavailable job 流程，最后运行窄测试与相关完整检查。
 
 #### LUX-408：合并扫描本地 metadata outbox 批量写入
@@ -10180,6 +10193,1116 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 修改文件：`web/src/react.css`、`web/tests/light-theme-contrast.test.ts` 和本文档。只调整 Web 外观与回归覆盖，不修改服务端或数据库。
 
 结果（2026-10-10）：旧样式下新增七组回归全部失败，修复后主题定向测试 18/18、Web 全量 Node 134/134、Vitest 576/576 通过，TypeScript 检查和 Vite 生产构建通过。Playwright 以本地样式夹具在 390px 与 320px 检查计算样式；320px 页面宽度未溢出，手机操作默认文字为深灰、悬停文字为深色，已看状态为深绿，焦点轮廓为深色；播放器键盘焦点仍为白色 3px。语义错误、成功、警告、活动色对浅色背景的自动对比度断言均达到 4.5:1。`cargo fmt --all -- --check`、Toshiba 共享 target 上的全目标全 feature Clippy 和 `git diff --check` 通过；本任务仅修改 Web，没有 Rust 行为变化，未运行 Rust 测试。这里只验证本地 Web 样式，不代表部署状态或真实 iOS Safari 渲染。
+
+#### LUX-473：压缩移动端仪表盘媒体数量卡片并同步浏览器主题色
+
+范围：Lux 管理仪表盘在手机宽度下让电影数量和剧集数量卡片并排显示，其余概览卡片继续占满一行。应用账户主题时同步更新 `meta[name="theme-color"]`，使 Safari 页面顶部浏览器区域匹配当前 Lux 深浅主题；保留现有桌面布局、卡片内容、主题背景和深色默认值。
+
+验收：
+
+- [x] 640px 及以下，电影数量与剧集数量卡片左右并排，服务器概况、用户、CPU、内存和存储卡片继续单列全宽；较宽视口布局不变。
+- [x] 浅色主题将浏览器 `theme-color` 更新为浅色页面背景 `#f4f3f1`，深色主题更新为 `#050506`；主题切换后无需刷新即可更新。
+- [x] 两项行为均有回归测试；Web 全量测试和生产构建通过。
+
+预计文件：`docs/LUX-DEVELOPMENT.md`、`web/src/react.css`、`web/src/features/account/account-settings.ts`、`web/tests/admin-dashboard-layout.test.mjs`、`web/tests/account-settings.test.tsx`。
+
+明确不做：其他仪表盘重排、浏览器 UI 自动读取 CSS 颜色、浅色主题之外的主题改动或真实 iOS 设备渲染声明。
+
+结果（2026-10-10）：新布局和主题色回归在旧实现下均失败，修改后定向测试通过；Web 全量 Node 测试 135/135、Vitest 579/579 和生产构建通过。Playwright 的 CSS 预览在 390px 与 320px 检查到电影/剧集卡同排、用户卡全宽，页面滚动宽度分别等于视口宽度。主题色切换由账户主题单测验证。浏览器预览使用 Chromium，不代表真实 iOS Safari 渲染或部署状态。
+
+#### LUX-474：加宽手机管理页主体内容
+
+范围：在手机宽度下让管理页主体使用完整可用宽度，并将内容区左右留白缩至至少 12px，同时避开设备安全区。保留平板、桌面和普通媒体浏览页面的现有布局。
+
+验收：
+
+- [x] 560px 及以下，管理页外层占满视口，主体左右留白至少 12px，并避开更大的设备安全区。
+- [x] 320px 与 390px 手机视口下，管理页主体变宽且页面没有横向溢出；561px 及以上布局不变。
+- [x] 新布局有回归测试；Web 全量测试和生产构建通过。
+
+预计文件：`docs/LUX-DEVELOPMENT.md`、`web/src/react.css`、`web/tests/admin-dashboard-layout.test.mjs`。
+
+结果（2026-10-10）：手机断点将管理页扩至视口宽度，左右安全区感知内边距最少 12px；平板以上和普通媒体浏览页规则不变。定向布局测试、Web Node 测试 136/136、Vitest 579/579、生产构建、Rust fmt/build/Clippy 均通过。Playwright Chromium 样式预览在 390px 下主体可用宽度 366px，320px 下 296px；滚动宽度分别与视口相等。561px 下保留 92% 外层宽度与 20px 边距；1280px 桌面布局也保持原有比例。Rust 全目标测试的首次运行有 835 个单测通过、20 个忽略，随后在 `tests/scanned_metadata.rs::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 遇到一次本地元数据批次失败；单独复跑该用例以及整个 `scanned_metadata` 目标（23/23）均通过。该前端改动未修改 Rust 源码，全目标套件未重新运行；浏览器检查使用本地 CSS 预览，不代表真实 iOS Safari 渲染或部署状态。
+
+#### LUX-475：渐进扫描补全剧集与季度容器元数据
+
+范围：workflow 3 本地 metadata completeness 和实时增量扫描在当前分集媒体源通过有效性检查、其本地图片/NFO 处理完成后，将该分集及其同库、未删除的父 SEASON 与 SERIES 一并纳入本地完整性计划。按现有扫描策略只派发确实缺失且可请求的能力；同一页多个分集共享的季/剧集去重。source identity 检查失败或层级关系无效时不得借旧分集身份调度容器。保持本地 NFO/图片优先级、字段锁定、INCREMENTAL_SCAN 策略快照、活动任务去重和独立异步 FILL_MISSING worker。
+
+验收：
+
+- [x] 开启自动补缺的增量扫描为分集及其季、剧集容器保存完整性状态，并将三个条目合并进有界 FILL_MISSING 工作。
+- [x] 关闭自动补缺时仍保存这三个条目的本地缺失状态，但不创建在线任务。
+- [x] source identity 检查失败、文件已缺失、条目已删除或容器跨库/类型不符时，不扩展到其父项。
+- [x] 同页多个分集共享的季和剧集只参与一次计划/派发；现有去重、策略快照和分集任务行为不变。
+- [x] 不新增 schema、公共 API 或扫描路径中的 provider 请求；provider 仍只由现有后台 worker 调用。
+
+验证：定向 cargo test --locked --lib 覆盖 source 身份/父级扩展和增量扫描派发；cargo build --locked、cargo test --locked --all-targets、cargo fmt --all -- --check、cargo clippy --locked --all-targets --all-features -- -D warnings。Cargo 命令使用 Toshiba 原项目共享 target。
+
+预计文件：src/storage/jobs.rs、src/application/metadata.rs、src/application/scanner.rs、docs/LUX-DEVELOPMENT.md。
+
+结果（2026-10-11）：增量扫描的本地 metadata worker 在分集本地检查成功后，将所属季/剧集加入 completeness 计划，并在派发前去重；本地 outbox/backfill 路径则在首选 source 身份校验通过后扩展层级。失败的本地 NFO/图片项不会触发容器补缺。SQLite 回归覆盖首选 source 变化、文件缺失、条目删除和层级扩展；增量扫描回归用同季两集验证只产生一个季项、一个剧集项及两个分集项，并验证策略关闭时仍保存三类缺失状态。
+
+验证：存储与增量扫描定向单测通过；scanning_jobs 81/81、scanned_metadata 23/23、scanned_series_metadata 3/3；cargo build --locked、cargo test --locked --all-targets（库测试 835 passed、20 ignored，所有集成目标通过）、cargo fmt --all -- --check、cargo clippy --locked --all-targets --all-features -- -D warnings 通过。Cargo 使用 Toshiba 原项目共享 target。本机 arm64；未部署 FNOS、未触发生产刮削。
+
+#### LUX-476：补充元数据刮削逐条诊断日志
+
+范围：为元数据刷新/补全任务增加结构化运行日志，帮助按 job ID 和 item ID 定位每条失败的阶段与原因。记录刮削器选择、插件不可用/超时/退出/无效响应、候选匹配未确认、元数据写回、图片下载/校验/路径写回及可用的图片上游 HTTP 状态码。主、备用或补充来源的单次尝试失败时，即使后续回退成功，也单独保留尝试记录；主来源返回低置信度候选、需要人工复核时记录 `NEEDS_REVIEW`，但保留原完成状态。没有选中刮削器而被跳过的条目单独记录 `NO_SCRAPER_SELECTED` 原因。保留现有任务状态、持久化错误码和 API DTO；LOW_CONFIDENCE 仍是完成状态下带错误码的条目，任务详情必须列出所有带错误码的条目。
+
+运行日志事件名固定为 `metadata_reidentify_item_issue`、`metadata_reidentify_item_skipped` 和 `metadata_reidentify_scraper_attempt_issue`；逐尝试事件额外包含 `scraper_id`、`scraper_role` 和 `attempt_outcome`。字段使用 `job_id`、`item_id`、`mode`、`item_status`、`error_code`、`failure_stage`、`failure_reason`、`upstream_status` 和 `item_result_recorded` 等稳定值。禁止写入标题、路径、完整外部错误文本、图片 URL、查询参数或凭据。管理员可从“任务与日志”导出运行日志后按事件名、job ID 或 item ID 搜索。
+
+验收：
+
+- [x] 每条已记录的失败/低匹配结果产生带 job/item ID、模式、阶段和稳定原因码的 JSON 运行日志；图片上游 HTTP 状态存在时可查询。
+- [x] 主、备用或补充刮削器尝试的失败即使后续来源成功也会记录，并标明来源 ID、角色和尝试结果；低置信度待复核结果记录为 `NEEDS_REVIEW`。
+- [x] 未选刮削器导致补全项跳过时产生 `metadata_reidentify_item_skipped` 日志，但不改变该任务的既有状态语义。
+- [x] 原始 provider 错误、URL、标题、路径和凭据不会写入诊断日志；图片状态码只在已知时记录。
+- [x] 元数据任务详情在返回的条目页中包含所有 `error != null` 的条目，包括状态为 `COMPLETED` 的 `LOW_CONFIDENCE`；没有问题的条目保持隐藏。
+- [x] 不新增 migration、公共 API 字段或日志查询端点；已有任务错误码和状态合同保持不变。
+
+验证：Toshiba 原项目共享 target 下，刮削 service 单测、`reidentify` 集成测试、`cargo build --locked`、library-only Clippy、格式检查、管理任务页定向测试、Web 类型检查和生产构建通过。全量 Rust 测试与 all-targets Clippy 被未修改的 `tests/performance.rs` 中未定义变量/函数挡住；Web 全量测试有 5 个 `HomePage` 轮播测试失败，单独运行该文件可复现，其余 Node 测试和 576 个 Vitest 通过。本次改动没有部署到生产，也没有对报告用户的媒体库执行刮削。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`、本文档。
+
+### 阶段 24：扫描应用服务模块化与流程简化
+
+本阶段只整理 `application::scanner` 内部实现，不改变 HTTP/Emby 合同、数据库 schema/SQL 事务、扫描状态与错误码、批次大小、并发上限、工作流版本或运行时副作用顺序。`scanner` 根模块保留稳定的公开路径与薄 facade；子模块按文件处理、任务生命周期、Manifest、reconciliation、增量扫描、本地 metadata worker 和后处理划分。文件系统 descriptor/stat/STRM 安全访问继续由现有 `scanner/manifest.rs` 承担。
+
+各任务最多预计修改 5 个文件，逐项独立验证和提交。实现中按增量移动代码，不引入通用 pipeline/dispatcher 抽象，不合并事务、不新增数据库状态读取；只有现有回归不能表达关键行为时才补充行为测试。扫描服务公开类型和 `crate::application::scanner::*` 调用路径由 facade re-export 保持。
+
+#### LUX-477：拆分 LibraryScanner 文件处理实现
+
+范围：把 `LibraryScanner` 的扫描/文件准备实现与文件名解析、混合库分类职责移入有界子模块。公开的 `LibraryScanner`、解析器和指纹 API 继续从 `application::scanner` 导出；内部跨模块方法使用最小可见性。纯移动，不改变扫描、归并、路径校验、探测或写入行为。
+
+验收：
+
+- [x] `scanner.rs` 不再承载完整的 `LibraryScanner` 实现和文件名/混合库分类实现。
+- [x] `LibraryScanner`、`ParsedMovieFilename`、`ParsedEpisodeFilename`、`parse_movie_filename`、`parse_episode_filename` 和 `compute_file_fingerprint` 保持现有公开路径与签名。
+- [x] 电影、剧集、混合库、文件移动、版本归并和 STRM 路径行为由既有测试覆盖且通过。
+
+验证：`cargo test --locked --test scanner --test series_scanner --test mixed_scanner`、`cargo test --locked --lib scanner::tests`、fmt 检查和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/names.rs`、本文档。
+
+结果（2026-10-12）：`LibraryScanner` 扫描实现、文件准备、文件名解析与混合库分类移入 `scanner/library.rs`、`scanner/library/prepare.rs` 和 `scanner/names.rs`；文件遍历和受限 STRM 读取留在 library 模块。根模块通过 re-export 保持现有公开路径。scanner 根从约 15,151 行减至 11,701 行，拆出的文件处理模块分别约 2,070、900 和 511 行。scanner library tests 41 passed、1 ignored；`scanner`、`series_scanner`、`mixed_scanner` 集成目标 30 项通过；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。该任务只移动实现并调整子树内可见性，不声称运行时性能变化。
+
+#### LUX-478：隔离扫描任务 facade 与单元测试
+
+范围：将 `ScanJobService` 共享状态、生命周期 guard 和稳定公开任务类型归入 `scanner/jobs`，把 scanner 内联单测移至 `scanner/tests.rs`。根模块只 re-export 公开合同并组合子模块，不复制锁、Notify、取消标记或状态注册表。
+
+验收：
+
+- [x] `ScanJobService`、`ScanJob`、`ScanJobError`、`ScanBatchReport`、`IncrementalScanChange` 与 `LocalMetadataRefreshAccepted` 的现有导出路径不变。
+- [x] 活动任务 guard、删除 fencing、取消标志和 worker 通知仍共享同一组 `Arc` 状态。
+- [x] 所有既有 scanner 单测仍在 `application::scanner::tests` 名称空间下运行。
+
+验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test shutdown_jobs --test scanning_jobs`、fmt 检查和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/tests.rs`、本文档。
+
+结果（2026-10-12）：`ScanJobService` 状态、运行/删除 guard、worker handle 与公开任务 DTO/error 移至 `scanner/jobs/mod.rs`，scanner 单测移至 `scanner/tests.rs`，根模块 re-export 保持类型路径及 `scanner::tests` 测试路径。取消与删除协调仍共享原 `Arc` 注册表、通知和标志。scanner library tests 41 passed、1 ignored；`scanning_jobs` 81/81、`shutdown_jobs` 1/1 通过；fmt 与 `git diff --check` 通过。剩余 runner 和各扫描阶段仍在 `scanner.rs`，后续任务继续拆分。
+
+#### LUX-479：拆分 Manifest 扫描阶段
+
+范围：分别移动 Manifest 目录发现与文件系统观察、差异计算/批次应用实现。保留 workflow 2/3、lite discovery、持久化 frontier、根身份确认、批次事务、取消与重试路径；文件描述符和受限 STRM 读取仍由既有 `scanner/manifest.rs` 实现。
+
+验收：
+
+- [x] runner 只根据已持久化阶段选择 discovery、diff、apply 或 indexed completion，不内嵌目录处理算法。
+- [x] 根被替换/卸载、目录观察改变、并发增量索引、批次提交失败、取消/恢复与 workflow 2 兼容语义保持。
+- [x] 所有 Manifest 定向回归及 scanner 单测通过。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test scanned_metadata`、scanner library tests、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/manifest_discovery.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+结果（2026-10-12）：Manifest 目录发现、受观察保护的批次提交与 lite discovery 移入 `jobs/manifest_discovery.rs`；差异计算、批次应用、postprocessing target materialization 和 indexed completion 移入 `jobs/manifest_index.rs`。runner 仍按持久化 Manifest 状态选择阶段，workflow 兼容判断、批次大小和调用顺序保持原样；底层 descriptor/stat/STRM 安全访问仍在 `scanner/manifest.rs`。定向集成测试 `scanned_metadata` 23 项、`scanner` 18 项、`scanning_jobs` 81 项通过；scanner library tests 41 项通过、1 项按要求忽略；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 8,756 行减至 6,353 行，两个 Manifest 阶段模块分别 1,436 行和 973 行。仅验证本地行为，无运行时性能结论。
+
+#### LUX-480：拆分 reconciliation 与增量扫描
+
+范围：将旧持久化 reconciliation 与实时/定向增量扫描编排分别移入所属任务子模块。保持发现快照、根不可用保护、删除确认、同路径更新、增量路径队列和并发协调行为。
+
+验收：
+
+- [x] reconciliation 和 incremental 算法从 runner 中分离，阶段状态由现有数据库记录驱动。
+- [x] 根离线、扫描期间根替换、文件身份变化、reconciliation 重试和实时扫描抢占回归保持。
+- [x] 不新增 whole-library request path 或无界后台工作。
+
+验证：`cargo test --locked --test scanning_jobs --test watch --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/incremental.rs`、本文档。
+
+结果（2026-10-12）：持久化 reconciliation 的目录发现、文件批次、指纹与缺失确认移入 `jobs/reconciliation.rs`；实时/定向增量批次及媒体/sidecar 处理移入 `jobs/incremental.rs`。root runner 保留既有任务读取与阶段路由，未增加整库请求路径、后台队列或工作单元。定向集成目标 `mixed_scanner` 1 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 6,353 行减至 4,355 行，两个新模块分别 1,470 行和 534 行；扫描和并发语义由原有回归覆盖，不据此推断性能变化。
+
+#### LUX-481：抽离本地元数据 outbox worker
+
+范围：把本地 metadata batch/backfill 辅助状态、outbox worker、每任务 worker、完成 waiter 与 completeness 协调放入独立模块。保持 source identity 快照、策略快照、批次顺序、重试和 Notify/fallback 语义。
+
+验收：
+
+- [x] 扫描编排只调用 worker 的明确入口，不持有 worker 循环和队列细节。
+- [x] NFO/图片失败可重试、取消终结、源变化拒绝旧结果、父级 metadata 补缺和 worker 关闭行为保持；series 不可读海报用例通过。
+- [x] 不将在线 provider 请求移入扫描请求路径；FILL_MISSING 仍由现有后台 worker 处理。
+
+验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs`、`cargo test --locked --lib scanner::tests`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+结果（2026-10-12）：local metadata 的 batch/backfill/completeness helpers、单任务 worker、outbox worker、等待器、取消收尾及 refresh 实现移入 `jobs/local_metadata.rs`；outbox worker 从 incremental 模块抽出，scanner facade 保留稳定服务 API 与 worker 调用入口。`scanned_metadata` 23 项、`scanning_jobs` 81 项、scanner 单测 41 项通过（1 项按要求忽略）。海报失败用例原先用无序 `LIMIT 1` 读取批次；同一任务可同时包含已完成批次和图片失败批次，因此测试有时读到正常行。现改为按图片错误选取失败批次并用同一 batch ID 验证重试，重复运行通过；无需修改扫描逻辑。`cargo build --locked`、fmt 和 `git diff --check` 通过。根模块从 4,355 行减至 3,195 行，`jobs/local_metadata.rs` 为 1,415 行；未把在线 provider 请求移入扫描路径，也未增加后台队列。
+
+#### LUX-482：拆分任务生命周期与扫描后处理
+
+范围：将创建/取消/重试/运行 fencing 与扫描完成后的 probe、metadata、thumbnail、cover、事件发布拆入独立职责模块。索引完成与后处理仍保持两个阶段；后处理继续释放共享扫描锁并使用现有有界 worker。
+
+验收：
+
+- [x] lifecycle 负责任务状态转换与锁；postprocessing 负责已有后处理调用，不互相复制状态。
+- [x] 增量与全量扫描的完成、取消、失败重试、锁释放、Home 刷新、Webhook/用户事件顺序保持。
+- [x] 相关定向测试通过，文件职责与模块可见性记录清楚。
+
+验证：`cargo test --locked --test scanning_jobs --test shutdown_jobs --test scanned_metadata --test watch`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/jobs/mod.rs`、`src/application/scanner/jobs/lifecycle.rs`、`src/application/scanner/jobs/postprocessing.rs`、本文档。
+
+结果（2026-10-12）：任务创建、取消/重试、run fencing、状态查询与失败收尾移入 `jobs/lifecycle.rs`；后处理执行体、扫描锁协调、probe、metadata、thumbnail、cover 与 webhook 发布移入 `jobs/postprocessing.rs`。`run_to_completion*` 公开入口仍与每任务 worker/run guard 协调放在 `jobs/local_metadata.rs`，并调用 postprocessing 执行体；`ScanJobService` 公开方法路径与签名保持不变。索引完成和后处理仍由既有 `scan_phase` 分离，后处理仍在现有有界 worker 中释放共享扫描锁。定向集成目标 `scanned_metadata` 23 项、`scanning_jobs` 81 项、`shutdown_jobs` 1 项、`watch` 5 项全部通过；`cargo build --locked`、fmt 与 `git diff --check` 通过。根模块从 3,195 行降至 826 行；lifecycle 与 postprocessing 模块分别 1,323 行和 1,078 行。未改状态、事件或副作用顺序，也未据此作性能结论。
+
+#### LUX-483：收口 scanner facade 与 reconciliation helper
+
+范围：把 scanner 根模块残留、同时供 `LibraryScanner` 与 reconciliation 使用的 batch/task helper 归入 `scanner/library.rs`，跨模块调用使用 scanner 内部最小可见性；根模块只保留 facade、稳定共享类型、错误/API 与 re-export。`lifecycle.rs` 已承载扫描批次 runner，本任务不再新增重复 runner 模块。只移动实现，不改行为。
+
+验收：
+
+- [x] `scanner.rs` 不超过 600 行，电影/剧集文件解析和 fingerprint 等公开路径保持不变。
+- [x] library/reconciliation 共用的 task/result helper 位于 `library` 模块，未改变扫描批次、事务或错误传播。
+- [x] scanner 单测、scanning_jobs 定向回归、fmt 和 build 通过。
+
+验证：`cargo test --locked --lib scanner::tests`、`cargo test --locked --test scanning_jobs --test scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner.rs`、`src/application/scanner/library.rs`、`src/application/scanner/jobs/reconciliation.rs`、本文档。
+
+结果（2026-10-12）：电影/剧集并发扫描与 reconciliation 共用的 task/result 类型和 JoinSet 收集 helper 从根模块移入 `scanner/library.rs`，reconciliation 通过 scanner 子树内受限可见性调用。根模块为 557 行，保留 facade、稳定共享 DTO/error、文件 fingerprint API 与 re-export；不新增与 `jobs/lifecycle.rs` 重叠的 runner。scanner 单测 41 项通过（1 项按要求忽略），`scanner` 18 项、`scanning_jobs` 81 项通过；build、fmt 和 `git diff --check` 通过。纯移动，无行为或性能结论。
+
+#### LUX-484：简化 reconciliation 与 Manifest 编排
+
+范围：整理 `run_reconciliation_file_batch`、`run_movie_reconciliation_file_batch`、Manifest diff/apply，将已有准备、根与文件身份校验、事务提交和事件发布步骤提取成有名操作。只重排现有控制流，不改变事务、取消检查、错误传播和副作用顺序。
+
+验收：
+
+- [x] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [x] 根离线/替换、同路径更新、并发增量索引、提交失败、删除确认与 workflow 2 兼容语义保持。
+- [x] 相关定向测试通过。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test series_scanner --test mixed_scanner`、fmt 和 build。
+
+预计文件：`src/application/scanner/jobs/reconciliation.rs`、`src/application/scanner/jobs/manifest_index.rs`、本文档。
+
+结果（2026-10-12）：reconciliation 文件批次拆为 entry 分类、regular 扫描、并发文件准备和逐根提交；movie 路径另拆为 quick/sidecar、同目录分组扫描、准备和提交。Manifest diff/apply 拆为持久化 delta、根身份校验、准备、删除确认与事务提交步骤。相关方法均不超过 150 行，未改每根事务、root fencing、取消检查、增量冲突处理、删除确认或事件顺序。定向集成目标 `mixed_scanner` 1 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项全部通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-485：简化扫描完成编排并关闭阶段 24
+
+范围：整理增量批次与全量/增量完成、取消收尾和后处理编排，将已有步骤提取成明确的准备、校验、提交和发布操作。保持索引完成与后处理两个阶段；不改变事务、锁释放、取消、错误传播、worker 上限及事件顺序。
+
+验收：
+
+- [x] 相关单个编排函数目标不超过 150 行；超出时在结果记录单一职责与保留理由。
+- [x] 增量/全量成功、取消、失败重试、共享扫描锁释放、Home 刷新与 webhook/用户事件顺序保持。
+- [x] 全量 Rust 完成门通过：build、all-targets tests、fmt、all-targets/all-features Clippy；扫描定向目标通过。
+- [x] 模块边界记录更新；进入下一阶段前仍须项目所有者确认。
+
+验证：Toshiba 挂载检查后设置共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行扫描定向目标与 `cargo test --locked --all-targets`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，记录 `uname -m`。不得以本机 ARM 结果推断 NAS/x86 性能。
+
+预计文件：`src/application/scanner/jobs/incremental.rs`、`src/application/scanner/jobs/postprocessing.rs`、`src/application/scanner/jobs/local_metadata.rs`、本文档。
+
+结果（2026-10-12）：incremental batch 与空队列完成拆为路径处理、终结状态更新；`run_to_completion*` 公共入口和 run guard 移到 postprocessing，主循环拆为扫描批次循环、Manifest target 准备、增量收尾和全量 probe/metadata/cover/thumbnail/completion 阶段。局部 worker 与 outbox loop 拆为单页/单批处理和等待入口；NFO 并发上限、批次优先级、通知与 fallback 顺序保持。相关 orchestration 方法均不超过 150 行。扫描定向集成 `mixed_scanner` 1 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanner` 18 项、`scanning_jobs` 81 项、`series_scanner` 11 项、`shutdown_jobs` 1 项、`watch` 5 项通过（合计 143 项）；scanner 单测 41 项通过、1 项按要求忽略。海报失败用例的多批次选择误差已修正，重复 5 次及全目标测试通过。全目标完成门的原阻塞来自 `6d5b758c` 合并时未完整整合的性能请求探针：`tests/performance.rs` 引用了缺失变量、函数和批次初始化。现恢复到合并前可编译的基准 harness；原有基准测试仍保留并保持显式忽略，未运行性能矩阵，也不据此声称性能结果。`cargo test --locked --all-targets`、`cargo build --locked`、fmt、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 全部通过。机器为 `arm64`，不得外推 NAS/x86 性能。阶段24的代码与全量 Rust 完成门已通过；下一阶段仍须项目所有者确认。
+
+依赖：无。明确不做：Storage/API 重构、schema/SQL 修改、新后台 worker、新扫描状态、新性能承诺或部署。
+
+### 阶段 25：共享存储层 jobs 职责拆分与事务编排重构
+
+本阶段以阶段 24 完成版本 `b08bdcf4` 为基线，整理 `src/storage/jobs.rs` 的共享存储职责。继续使用 `Database` 的现有方法作为内部调用面，保持方法签名、存储导出路径、SQL、批次大小、状态转换、错误和提交语义。先将根目录、字幕、文件系统条目、媒体源与关机处理迁入所属 storage 模块，再按 scan/Manifest、reconciliation、增量扫描、本地 metadata、metadata reidentify、STRM probe 分拆 jobs。最后整理 Manifest discovery/apply、diff 和 FILL_MISSING 大函数。每个 LUX 任务最多预计修改 5 个文件，逐个完成、验证并独立提交。
+
+阶段验收：`jobs.rs` 只保留模块声明和需要稳定的导出，目标不超过 200 行；事务编排函数目标不超过 150 行，纯 SQL 阶段超出时须在结果中说明。跨步骤的子函数沿用调用方的 `&mut Transaction<'_, Any>`；不得在步骤内另开事务或改变锁顺序、SQL/绑定顺序、计数、批次边界及取消 fencing。保留 `storage::repository::jobs::tests` 测试名称空间。对文件和函数的移动须检查 repository 内调用点、application/storage 调用点与实际路由引用；`Database` 现有方法名和路由合同不变。
+
+#### LUX-486：拆分媒体库根目录存储操作
+
+范围：将 library root 的增删查、扫描游标和可用性操作从 `jobs.rs` 移入 `storage/library_roots.rs`。保留 `Database` 方法签名、SQL、删除清理范围及路径调用点。
+
+验收：
+
+- [x] 根目录存储实现不再位于 `jobs.rs`。
+- [x] 既有 `Database` 调用点和路由调用无需改名，根目录删除与扫描游标行为保持。
+- [x] library deletion、storage 和 jobs 单测通过；fmt/build 与 `git diff --check` 通过。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后使用共享 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::repository::jobs::tests`、`cargo test --locked --test storage --test library_deletion`、`cargo fmt --all -- --check`、`cargo build --locked` 及 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/library_roots.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：library root 的 13 个 `Database` 方法移入 `storage/library_roots.rs`，原方法名、签名和 repository 内调用路径保持。核对了 API、application、storage 和 tests 的所有同名调用。基线与迁移后 jobs 单测均为 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项与 `library_deletion` 1 项均通过；fmt 和 `git diff --check` 通过。
+
+#### LUX-487：拆分字幕存储操作
+
+范围：将外部字幕定位、字幕流查询与字幕记录更新从 `jobs.rs` 移入 `storage/subtitles.rs`。保留现有 Emby/Lux DTO 映射和 SQL 语义，不改变播放或字幕路由合同。
+
+验收：
+
+- [x] 字幕存储方法不再位于 `jobs.rs`，`Database` 方法签名保持。
+- [x] Emby 与 Lux 字幕查询/更新调用点保持原方法名和响应映射。
+- [x] 字幕集成测试、fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test subtitles`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/subtitles.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：字幕定位、轨道分页与外部字幕更新移入 `storage/subtitles.rs`，`Database` 方法名和返回映射保持。核对了 Emby/Lux media handlers、管理员 handler 与 storage tests 的原调用点；`subtitles` 1 项回归通过，fmt 和 `git diff --check` 通过。
+
+#### LUX-488：拆分文件系统条目存储操作
+
+范围：将 filesystem entry 查询、移动、批量 observed/restore 与 missing 状态更新移入 `storage/filesystem.rs`。文件系统状态变化仍使用现有的事务入口；reconciliation 对事务内恢复 helper 的调用保持同一事务。
+
+验收：
+
+- [x] 文件系统条目操作不再位于 `jobs.rs`，事务内 helper 可见性限于 storage 子树。
+- [x] 路径、inode、seen/missing 状态和 reconciliation 批次确认语义保持。
+- [x] storage、媒体库/媒体删除与 jobs 单测通过；fmt/build、`git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test storage --test media_deletion --test library_deletion`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/filesystem.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：15 个 filesystem entry 查询/移动/观察/缺失状态方法移入 `storage/filesystem.rs`。reconciliation 调用的批量 restore 和 missing-path helper 仅开放到 repository 子树；媒体移除刷新仍复用 jobs 中的原事务 helper。核对了 API、application、storage 与 tests 调用点。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`storage` 52 项、`media_deletion` 1 项、`library_deletion` 1 项通过；fmt 和 `git diff --check` 通过。
+
+#### LUX-489：拆分媒体源存储操作
+
+范围：将媒体源查询、重分配、探测状态、原子删除及关联媒体条目移除/恢复移入 `storage/media_sources.rs`。删除、恢复及 removal refresh 继续接收并使用原事务；媒体源删除批量上限与其回归保持在所属模块。
+
+验收：
+
+- [x] 媒体源写入/删除和关联媒体状态维护不再位于 `jobs.rs`。
+- [x] `Database` 方法名、批量边界、默认来源约束、级联 item 清理和回滚语义保持。
+- [x] 媒体源原子删除单测、媒体删除与 storage 集成测试、fmt/build 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test media_deletion --test storage`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/media_sources.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：媒体源查询、STRM/variant 更新、item 重分配、探测状态、恢复、删除与关联媒体移除操作移入 `storage/media_sources.rs`；删除批次上限随模块迁移，单测仍从 jobs 测试入口使用该合同。原子事务和批次常量保持。核对了应用层删除、扫描、catalog 与 `storage/media.rs` 的方法调用。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`media_deletion` 1 项及 `storage` 52 项通过；fmt 与 `git diff --check` 通过。
+
+#### LUX-490：隔离 storage jobs 单元测试
+
+范围：将 `jobs.rs` 末尾的内联单测迁入 `storage/jobs/tests.rs`，由根模块使用路径属性声明。测试名称空间和测试体保持，允许继续访问其父模块中的私有测试辅助函数。
+
+验收：
+
+- [x] 所有 jobs 内联单测位于独立测试文件中，路径仍为 `storage::repository::jobs::tests`。
+- [x] 测试导入所用的媒体源删除批次上限继续指向 owning module。
+- [x] 单测数量、忽略项和结果与迁移前一致；fmt、build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --lib storage::repository::jobs::tests`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/tests.rs`、本文档。
+
+结果（2026-10-12）：1,200 余行 jobs 单测从 `jobs.rs` 移入 `jobs/tests.rs`，以 `#[path]` 保持原测试名称空间及私有测试 helper 访问。迁移前后均为 14 passed、1 项 PostgreSQL 用例 ignored；fmt 和 `git diff --check` 通过。
+
+#### LUX-491：拆分 STRM probe 与关机取消存储逻辑
+
+范围：将 STRM probe job 的创建、领取、查询、进度、取消与终结操作移入 `jobs/strm_probe.rs`；将覆盖多类后台 job 的统一关机取消移入 `jobs/shutdown.rs`。关机取消事务与提交后 legacy scan event 顺序保持。
+
+验收：
+
+- [x] STRM probe persistence 与关机取消不再位于 `jobs.rs`。
+- [x] `Database` 方法签名、取消 fencing、关机错误码、单事务更新及提交后事件写入顺序保持。
+- [x] STRM、shutdown 与 jobs 单测通过，fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --test strm_probe --test strm_probe_api --test shutdown_jobs` 与 jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/strm_probe.rs`、`src/storage/jobs/shutdown.rs`、本文档。
+
+结果（2026-10-12）：11 个 STRM job 方法移入 `jobs/strm_probe.rs`；原子关机取消方法和错误码移入 `jobs/shutdown.rs`。核对了 main shutdown、管理员列表与 application probe 的调用路径。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`shutdown_jobs` 1 项、`strm_probe` 2 项、`strm_probe_api` 1 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-492：拆分本地 metadata backfill 存储
+
+范围：将 backfill page DTO、页大小限制与 root 注册、领取、完成、失败和中断恢复方法迁入 `jobs/local_metadata/backfill.rs`。`StoredScanLocalMetadataBackfillPage` 继续通过 repository 的现有 crate 内导出供 application 使用；本地 metadata item 排除序列化 helper 留在 local metadata 根模块供批次与 backfill 共用。
+
+验收：
+
+- [x] backfill 数据类型、限制与方法不再由 `jobs.rs` 实现。
+- [x] repository 现有 DTO 导出路径、游标 fencing、页大小与重试/恢复状态保持。
+- [x] backfill root 幂等和有界可恢复分页回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::tests::scan_local_metadata_backfill_roots_register_in_one_query`、`cargo test --locked --lib storage::repository::tests::progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/backfill.rs`、本文档。
+
+结果（2026-10-12）：backfill DTO、page size、排除项校验 helper 和 8 个 root/分页/完成/失败/恢复方法移入 `jobs/local_metadata/backfill.rs`；本地 metadata 根复用排除项序列化，repository 继续通过 `jobs::StoredScanLocalMetadataBackfillPage` 导出原 DTO。backfill root 幂等与有界分页/重试/中断恢复各 1 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-493：拆分本地 metadata 批次与 outbox 存储
+
+范围：将 local metadata batch 的创建、领取、完成、失败、取消、重试、分页和 Manifest outbox 写入移入 `jobs/local_metadata/batches.rs`。outbox transaction helper 仅对 repository 子树可见，Manifest discovery 继续传入并复用其原 transaction。
+
+验收：
+
+- [x] 本地 metadata batch/outbox 方法及批次限制常量不再位于 `jobs.rs`。
+- [x] application、Manifest 和原 jobs 单测继续使用相同 `Database` 方法与事务入口。
+- [x] outbox 有界批量和查询次数回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --lib storage::repository::jobs::tests::manifest_local_metadata_outbox_inserts_three_batches_with_one_query`、jobs 其余单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/batches.rs`、本文档。
+
+结果（2026-10-12）：15 个 local metadata batch/outbox 方法移入 `jobs/local_metadata/batches.rs`；写入批次限制归入 owning module，source 上限和错误长度限制留在 local metadata 根供其调用者共享。Manifest outbox transaction helper 限定 repository 子树可见，Manifest 调用仍复用原事务。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanned_metadata` 23 项、`scanned_series_metadata` 3 项、`scanning_jobs` 81 项全部通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-494：拆分本地 metadata 来源读取
+
+范围：将扫描 metadata source 列表、当前来源 identity 检查及 SQL LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`。分页、来源身份批次大小和查询过滤保持。
+
+验收：
+
+- [x] source 查询与 identity 校验不再位于 `jobs.rs`。
+- [x] scanner 与 metadata application 的 `Database` 调用签名及来源筛选结果保持。
+- [x] 来源身份单测、metadata path 与扫描 metadata 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::local_metadata_completeness_reuses_current_source_identities_and_expands_episode_hierarchy`、`cargo test --locked --test metadata_paths --test scanned_metadata --test scanned_series_metadata`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/local_metadata.rs`、`src/storage/jobs/local_metadata/sources.rs`、本文档。
+
+结果（2026-10-12）：两项 local metadata source/identity 方法、来源身份批次上限与 LIKE 转义 helper 移入 `jobs/local_metadata/sources.rs`；原 `Database` 签名保持。因 LIKE 转义还用于 jobs 内另一个既有目录查询，由 local metadata 根按 repository 子树 re-export 同一 helper。核对了 scanner、metadata application 和 jobs tests 调用点。身份单测 1 项、`metadata_paths` 8 项、`scanned_metadata` 23 项、`scanned_series_metadata` 3 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-495：拆分 metadata reidentify 生命周期和 item 队列
+
+范围：新增 `jobs/metadata_reidentify`，将 job 创建/查询/取消/重试/活动状态移入 `lifecycle.rs`，将目标查询、领取、item 完成与失败恢复移入 `items.rs`。现有 application、API 与 storage `Database` 调用保持。
+
+验收：
+
+- [x] metadata reidentify job 状态与 item 领取/结算实现不再位于 `jobs.rs`。
+- [x] job 和 item 状态、取消竞态、retry/active 查询及 API 返回映射保持。
+- [x] reidentify、metadata cancel 与 metadata API 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；迁移前后运行 `cargo test --locked --test reidentify --test metadata_cancel --test metadata_api`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/metadata_reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/jobs/metadata_reidentify/items.rs`、本文档。
+
+结果（2026-10-12）：15 个 reidentify job 创建/查询/状态方法移入 `lifecycle.rs`，8 个 item 查询、领取、完成及失败恢复方法移入 `items.rs`；优先级 SQL 片段放在新子树根，供 FILL_MISSING 后续复用。原 `Database` 签名保持。`metadata_api` 9 项、`metadata_cancel` 3 项、`reidentify` 20 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-496：拆分 FILL_MISSING 去重与请求合并
+
+范围：将 FILL_MISSING job/item 去重、快照比较、队列合并与重试登记移入 `jobs/metadata_reidentify/fill_missing.rs`。把 `lock_media_items_for_update` 作为共享事务工具移入 repository。传入的 transaction、item 排序/锁定顺序、job 容量和请求快照规则保持。
+
+验收：
+
+- [x] FILL_MISSING 创建/合并实现及私有辅助状态类型不再位于 `jobs.rs`。
+- [x] metadata 写入继续共享同一 sorted item lock helper，方法签名与 transaction 调用保持。
+- [x] 去重、队列容量、请求快照、重试退避与 metadata 原子性回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 FILL_MISSING repository 单测、`cargo test --locked --test reidentify --test metadata_cancel`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/metadata_reidentify.rs`、`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/repository.rs`、本文档。
+
+结果（2026-10-12）：FILL_MISSING 请求快照、排队 job 合并、容量复用、item 插入与去重辅助状态移入 `metadata_reidentify/fill_missing.rs`。`lock_media_items_for_update` 移入 repository 事务工具，保留 ID 排序、去重、分批和 PostgreSQL `FOR UPDATE` 顺序；metadata application 与 fill_missing 继续使用同一方法。队列合并 2 项、请求快照退避 1 项、metadata 原子性 1 项、`reidentify` 20 项、`metadata_cancel` 3 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-497：拆分 scan job 生命周期
+
+范围：将 scan job 创建、查找/列表、活动状态、领取/进度、取消、终结和 postprocessing 状态迁入 `jobs/scan/lifecycle.rs`。现有 application/API/repository 调用使用同一 `Database` 方法。
+
+验收：
+
+- [x] scan job lifecycle 实现不再位于 `jobs.rs`。
+- [x] 状态筛选、取消 fencing、完成/后处理重试及管理端列表行为保持。
+- [x] scanning/shutdown 集成测试、fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs --test shutdown_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/lifecycle.rs`、本文档。
+
+结果（2026-10-12）：scan job 创建、自动匹配设置、查询/list/active、claim/progress、取消、完成、postprocessing 状态与重试等生命周期方法移入 `scan/lifecycle.rs`。外部 `Database` 方法签名及管理端/application 调用不变。`scanning_jobs` 81 项与 `shutdown_jobs` 1 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-498：拆分增量扫描路径队列
+
+范围：将 incremental path 的单条/批量入队、计数刷新、待处理分页、已处理标记、item ID 读取及队列清理移入 `jobs/scan/incremental.rs`。保留路径去重、处理顺序与每批限制。
+
+验收：
+
+- [x] 增量路径队列与状态存储不再位于 `jobs.rs`。
+- [x] `Database` 方法、队列容量/批次上限、删除及重试行为保持。
+- [x] scanning/watch 与 incremental storage 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs --test watch`、增量 storage 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/incremental.rs`、本文档。
+
+结果（2026-10-12）：7 个 incremental path 入队、分页、处理、ID 查询与清理方法及 100 路径批次上限移入 `scan/incremental.rs`。application/watch/storage 调用仍使用原 `Database` 方法。增量队列 storage 单测 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-499：拆分 scan postprocessing target 存储
+
+范围：将 scan target 和 sidecar target 登记、metadata/thumbnail 阶段分页、完成/失败/重试状态移入 `jobs/scan/targets.rs`。为 Manifest apply 与 reconciliation 共用的事务 helper 保持 repository 子树可见；侧车目录裁剪与 SQL 构造随目标模块迁移并保持现有查询边界。
+
+验收：
+
+- [x] scan job target 持久化和 worker page 查询不再位于 `jobs.rs`。
+- [x] metadata/thumbnail 状态、removed target 优先级、sidecar 路径范围和事务调用保持。
+- [x] query-count、sidecar 与扫描后处理回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs --test scanned_metadata`、相关 repository target/query-count 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/targets.rs`、本文档。
+
+结果（2026-10-12）：21 个 scan target 写入、分页、metadata/thumbnail 状态及查询方法和 sidecar helper 移入 `scan/targets.rs`；Application/API 的 `Database` 调用保持。target/outbox、reconciliation 与 Manifest apply 共用的事务 helper 暂限 repository 子树可见，后续调用方迁移后再收窄。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；target 单查询与 sidecar 多目录查询各 1 项通过；`scanned_metadata` 串行 23 项、`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。两目标合并运行时 FIFO 海报用例超过 60 秒；单独运行 1 项和 `scanned_metadata -- --test-threads=1` 全部 23 项均通过。
+
+#### LUX-500：拆分 reconciliation 存储
+
+范围：将 reconciliation snapshot 读取、目录发现、文件批次事务、缺失确认、root page 完成与存在状态查询移入 `jobs/scan/reconciliation.rs`。共用 target/filesystem/media-source helper 沿用原 transaction；不改变根可用性 fencing 和重试 checkpoint。
+
+验收：
+
+- [x] reconciliation 存储方法不再位于 `jobs.rs`。
+- [x] root 丢失保护、批次回滚、文件确认/缺失计数、checkpoint 与 target 登记仍在原事务中。
+- [x] reconciliation 原子性单测和扫描集成回归通过；fmt/build 与 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::repository_tests::reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_entries`、`cargo test --locked --test scanning_jobs --test mixed_scanner --test watch`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/reconciliation.rs`、本文档。
+
+结果（2026-10-12）：15 个 reconciliation snapshot/discovery/批次提交/root page 方法移入 `scan/reconciliation.rs`。reconciliation 的 filesystem restore、media removal refresh 与 target 登记继续调用其原 transaction helper；外部 `Database` 方法名保持。reconciliation 原子性单测 1 项、`mixed_scanner` 1 项、`scanning_jobs` 81 项、`watch` 5 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-501：拆分 Manifest 创建与状态存储
+
+范围：建立 `jobs/scan/manifest` 子树，将 Manifest 创建、读取、root 状态、diff-ready/apply/indexed 转换、结束与 retry fencing 移入 `manifest/state.rs`。原方法名、manifest workflow/state 值与 CAS 条件保持。
+
+验收：
+
+- [x] Manifest 创建/状态实现不再位于 `jobs.rs`。
+- [x] workflow 2/3、root 状态、cancel fencing、retry 与 status transition 条件保持。
+- [x] Manifest 创建原子性、恢复/重试扫描回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::scan_manifest_creation_is_atomic_and_idempotent`、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/state.rs`、本文档。
+
+结果（2026-10-12）：15 个 Manifest 创建、查询、root 状态、transition、finish 与 retry 方法，以及状态校验 helper 移入 `scan/manifest/state.rs`。原 Database 签名与 workflow 2/3、cancel/root fencing 保持。Manifest 原子创建单测 1 项和 `scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-502：拆分 Manifest 后处理目标分页
+
+范围：将 Manifest postprocessing target page materialization、空页完成和事务内 target insert 移入 `scan/manifest/targets.rs`。保留 item target precedence、root identity checkpoint、cursor 和 target 写入的同事务边界。Manifest discovery 目录与 diff candidate 查询在其所属子模块迁移。
+
+验收：
+
+- [x] Manifest postprocessing target 物化与游标实现不再位于 `jobs.rs`。
+- [x] 新旧 target 优先级、page limit、cursor CAS 和 root replacement fencing 保持。
+- [x] target 回滚/续页与扫描集成回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、`cargo test --locked --lib storage::repository::jobs::tests`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/targets.rs`、本文档。
+
+结果（2026-10-12）：Manifest postprocessing target page、empty page 完成、事务内 target insert 及 page range DTO 移入 `scan/manifest/targets.rs`。cursor、root fencing、target precedence 和 transaction ownership 保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-503：拆分 Manifest discovery 与正向索引
+
+范围：将 discovery chunk 校验、frontier/observations、presence ledger、计数提交和正向媒体索引分别归入 `manifest/discovery.rs`、`manifest/indexes.rs`。两步继续共享本次 database transaction；本任务只移动步骤，不拆其内部大函数。
+
+验收：
+
+- [x] Manifest discovery 与正向索引实现不再位于 `jobs.rs`。
+- [x] observations、filesystem/media indexes、local metadata outbox、presence ledger、manifest/job counters 仍在原事务按原顺序提交。
+- [x] discovery 取消/去重、正向索引、outbox rollback 和 scanning integration 回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/indexes.rs`、本文档。
+
+结果（2026-10-12）：Manifest discovery commit/chunk 与正向媒体索引步骤移入 `manifest/discovery.rs`、`manifest/indexes.rs`；共享发现结果类型与 file identity helper 放在 Manifest 根。discovery、index、sidecar targets 与 local metadata outbox 继续复用同一 transaction，顺序及 progress/checkpoint 更新保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-504：拆分 Manifest 差异计算和读取
+
+范围：将 Manifest 目录/文件系统基线、removal candidates、差异状态计算与 delta 写入移入 `manifest/diff.rs`。差异顺序、root completeness 条件和 retryable state 保持。
+
+验收：
+
+- [x] Manifest diff/query 方法与差异批次常量不再位于 `jobs.rs`。
+- [x] unchanged、ADD/CHANGE/REAPPEARED/REMOVE 分类、movie identity 检查和 root completeness 条件保持。
+- [x] Manifest diff、root 离线/替换和扫描回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/diff.rs`、本文档。
+
+结果（2026-10-12）：10 个 Manifest directory/root baseline/removal candidate/diff/insert delta 方法与 diff batch limit 移入 `scan/manifest/diff.rs`。unchanged 与 ADD/CHANGE/REAPPEARED/REMOVE 判定、root completeness、movie variant identity 和原查询顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-505：拆分 Manifest delta apply
+
+范围：将 pending delta 分页/删除计数与 delta batch apply 移入 `scan/manifest/apply.rs`，apply page limit 随方法归属迁移。job/manifest/root 检查、filesystem/media mutation、target 更新和进度仍在一个原 transaction 中。
+
+验收：
+
+- [x] Manifest apply 实现及分页上限不再位于 `jobs.rs`。
+- [x] active job/cancel fencing、delta CAS、索引和 removal 原子提交、进度计数与返回结果保持。
+- [x] delta rollback、并发增量冲突与批次上限回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs`、jobs 单测、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest.rs`、`src/storage/jobs/scan/manifest/apply.rs`、本文档。
+
+结果（2026-10-12）：Manifest pending delta 读取、applied removal 计数和单批 delta apply 移入 `scan/manifest/apply.rs`；apply page limit 随模块迁移。active job/cancel fencing、delta CAS、filesystem/media mutations、target writes 与 progress checkpoint 仍在原 transaction。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-506：抽离 Manifest discovery 输入校验
+
+范围：把多 chunk 输入合并、跨 job/root 检查、路径/entry 校验、positive/unchanged/seen 路径唯一性和 baseline 校验移入 `manifest/discovery/input.rs`。结果带回已验证的借用数据和查找集合供原事务编排使用。
+
+验收：
+
+- [x] discovery coordinator 只接收已完成结构校验的输入，非法与空输入在打开事务前返回。
+- [x] 错误类型/原因及检查顺序保持，输入顺序、去重规则和 collection 内容保持。
+- [x] 既有 Manifest 输入/取消回归通过；fmt/build 和 `git diff --check` 通过。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 jobs 单测、`cargo test --locked --test scanning_jobs`、fmt、build 和 `git diff --check`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/input.rs`、本文档。
+
+结果（2026-10-12）：chunk 合并、path/entry 验证、positive/unchanged/seen 身份唯一性及 baseline 检查移入 `ManifestDiscoveryInput::collect`。invalid/empty 输入仍在开启 transaction 前返回，原错误原因和检查顺序保持。jobs 单测 14 passed、1 项 PostgreSQL 用例 ignored；`scanning_jobs` 81 项通过；build、fmt 与 `git diff --check` 通过。
+
+#### LUX-507：提取 Manifest discovery 状态与 frontier 步骤
+
+范围：把同一事务中的 Manifest/job state snapshot 与目录 frontier upsert 提取为具名 storage 步骤。主方法继续持有并传递原 `Transaction`，保留 stage diagnostics 的触发位置。
+
+验收：
+
+- [x] 单次状态读取仍返回同一 workflow/root/job/cancel snapshot。
+- [x] 目录 frontier 的 chunk size、冲突处理、lite mode 跳过及插入计数语义保持。
+- [x] frontier 取消/重试和 bounded directory batch 回归通过；fmt/build 与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/state.rs`、`src/storage/jobs/scan/manifest/discovery/frontier.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::manifest_discovery_chunk_does_not_complete_directory_after_cancel_request`、`cargo test --locked --test scanning_jobs manifest_frontier_batches_handle_long_and_small_directories`、`cargo build --locked`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：Manifest/job 状态读取改为单个 `ManifestDiscoveryStateSnapshot`，目录 frontier upsert 与完成更新分别迁入独立步骤；两者均复用 coordinator 持有的 transaction，SQL、bind 顺序、批次上限、冲突策略、lite mode 计数和诊断阶段位置保持。取消回归 1 passed，bounded directory batch 回归 1 passed；`cargo build --locked`、fmt 和 `git diff --check` 通过。`commit_scan_manifest_discovery_chunks` 及其应用层调用点未改名。
+
+#### LUX-508：提取 Manifest root checkpoint 与 observation 写入
+
+范围：将 root checkpoint 的目录/文件计数及 observation/local metadata sequence 预留，以及 observation 的分批写入迁入私有 discovery 子模块。继续由 coordinator 持有同一 transaction，并保留诊断计时边界。
+
+验收：
+
+- [x] workflow v2/v3 的 observation sequence 连续且与 root 高水位一致；legacy observation 的逐路径 sequence 语义保持。
+- [x] local metadata batch sequence 预留与大目录 bounded batch 行为保持。
+- [x] SQL/bind 顺序、批次上限、错误检查顺序和 diagnostics 计时边界保持；相关回归与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/checkpoint.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs full_scan_manifest_persists_discovery_and_reobservations_without_directory_work_queue`、`cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：root checkpoint 序号预留与 observation 批量写入移入 `discovery/checkpoint.rs`，原事务仍由 coordinator 创建、提交；SQL 和 bind 顺序、legacy/v2/v3 序号算法、批次大小和计时边界保持。目录计数转换仍在 frontier completion 前执行。observation 高水位回归 1 passed，大目录/local metadata sequence 回归 1 passed；fmt 与 `git diff --check` 通过。
+
+#### LUX-509：提取 Manifest presence ledger 与 counters checkpoint
+
+范围：将 format-3 generation presence CAS、seen-path ledger upsert 和 manifest/job counters checkpoint 拆为私有步骤。保持 filesystem row 的 ID/path/fingerprint CAS、Postgres/SQLite 更新路径、job cancel fencing 与同事务提交。
+
+验收：
+
+- [x] unchanged filesystem entry 仍按 generation 更新；不匹配的 ID/path/fingerprint 不计为 seen。
+- [x] positive-index paths 与 seen generation paths 仍从 presence ledger 排除，其余路径按原批次 upsert。
+- [x] manifest/job counters、取消 fencing、诊断计数与事务失败回滚语义保持；相关回归与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/jobs/scan/manifest/discovery/counters.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、`cargo test --locked --lib storage::repository::jobs::tests::manifest_discovery_chunk_does_not_complete_directory_after_cancel_request`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：presence CAS/ledger 与 counters/cancel fence 分别迁入独立子模块；SQL、bind 顺序、backend 分支、failure rollback 和 stage diagnostics 统计保持。大目录两次扫描的 generation presence 回归 1 passed，取消回归 1 passed；fmt 与 `git diff --check` 通过。
+
+#### LUX-510：收敛 Manifest discovery coordinator
+
+范围：把 `commit_scan_manifest_discovery_chunks` 整理为短事务编排函数，已提取的阶段通过私有子步骤串接。保留同一 transaction 的创建/提交边界与现有 `Database` 调用面。
+
+验收：
+
+- [x] 事务协调函数不超过 150 行；transaction 仍只在 coordinator 开启和提交。
+- [x] repository、application、API/main route 引用的 storage 方法名与签名不变。
+- [x] 端到端 bounded scan、阶段 diagnostics 和 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery.rs`、`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/indexing.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt、`git diff --check`，并搜索所有 `commit_scan_manifest_discovery_chunk(s)` repository/application 调用点。
+
+结果（2026-10-12）：`commit_manifest_discovery_transaction` 为 149 行，transaction 仍由 `commit_scan_manifest_discovery_chunks` 单点创建和提交；路径查询、index/outbox 与 observation 子步骤独立。bounded full scan 回归 1 passed；格式和 diff 检查通过。搜索确认 application/scanner 与 storage tests 仍引用相同 `commit_scan_manifest_discovery_chunk(s)` 方法。
+
+#### LUX-511：提取 Manifest apply guard 与 ADD preparation
+
+范围：将 delta apply 的 active job/manifest/root 状态读取、ADD observation 验证、filesystem entry claim 与首次 movie/episode materialization 移入私有 preparation 步骤。保持校验顺序和共享 apply transaction。
+
+验收：
+
+- [x] active job、manifest state、root state 查询及冲突文案/次序保持。
+- [x] ADD 只 claim 有完整 observation 且 root complete 的路径；未 claim 的媒体不 materialize。
+- [x] requested bounded transaction batch 与 incremental ADD race 回归通过；storage 方法签名不变。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/prepare.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_add_conflicts_with_incremental_entry_claimed_after_diff`、`cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：apply preparation 提取事务内 active-state 检查、root 查询、四类路径映射、ADD observation 校验、filesystem claim 及首次 media insert；Delta 循环仍消费原 claim set。ADD race 1 passed，450 项 bounded apply 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 对外方法名/签名保持。
+
+#### LUX-512：提取 Manifest delta apply CAS 阶段
+
+范围：将单条 ADD/CHANGE/REAPPEARED/REMOVE dispatch 与 filesystem CAS 操作从事务入口移入 `apply/deltas.rs`，返回 delta 状态和后续副作用所需路径集合。继续由原方法持有 transaction。
+
+验收：
+
+- [x] ADD claim、change/reappear baseline/fingerprint CAS、remove CAS 与冲突/unstable 分类保持。
+- [x] delta 更新的输入顺序、计数和 batch 上限不变；helper 不另开/提交 transaction。
+- [x] newer incremental write、bounded apply 和取消后恢复回归通过；storage 调用面不变。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/deltas.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry`、`cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、`cargo test --locked --test scanning_jobs cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta dispatch/CAS 阶段移入事务内 helper，状态结果与 paths/update payload 显式返回给 coordinator；同一 batch transaction 继续负责后续 delta state、targets 与 job progress。incremental CAS、450 项 bounded apply、cancel/resume 三项均 1 passed；fmt 与 diff 检查通过，`commit_scan_manifest_delta_batch` 名称/签名不变。
+
+#### LUX-513：提取 Manifest apply finalization
+
+范围：将 delta state/error CASE 更新、metadata target/removal side effects、manifest/job progress checkpoint 移入 finalizer。transaction 仍由 `commit_scan_manifest_delta_batch` 创建并提交。
+
+验收：
+
+- [x] delta state/error CASE bind 顺序、affected-row guard、attempt count 与 batch 边界不变。
+- [x] NEW/CHANGED/sidecar/removal targets、removed media refresh 与 applied/processed counters 保持。
+- [x] cancel/resume 与 bounded apply 回归通过；只有入口持有 transaction 的 commit 权。
+
+预计文件：`src/storage/jobs/scan/manifest/apply.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_apply_uses_requested_bounded_transaction_batch`、`cargo test --locked --test scanning_jobs cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta persistence、target/removal side effects 与 progress checkpoint 移入 finalizer；CASE placeholders 和绑定顺序未改，取消检查仍在 job progress UPDATE，transaction commit 仍仅在入口。bounded apply 与 cancel/resume 均 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-514：拆分 Manifest diff completion 查询
+
+范围：把 `finish_scan_manifest_diff` 中按 lite/v2/v3/legacy 分支统计 remaining changes，以及 legacy unchanged count 的查询提取到 `diff/finish.rs`。主方法保留 state transition、job progress/cancel fence 和 transaction commit。
+
+验收：
+
+- [x] 四种 workflow/version 路径及 SQL bind 顺序、remaining-change 条件不变。
+- [x] 未完成变化时仍不推进 `APPLYING`；成功 completion 仍要求 `RUNNING AND cancel_requested = 0`。
+- [x] legacy observation 与 v3/LITE 大目录回归通过；completion coordinator 不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs manifest_uses_latest_directory_observation_when_diffing_file_paths`、`cargo test --locked --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：remaining-change 与 unchanged 统计查询移入 `diff/finish.rs`，`finish_scan_manifest_diff` 协调函数缩至 104 行；UPDATE 顺序、transaction guard、cancel fence 和 commit 位置保持。observation regression 与 v3/LITE 大目录两次扫描均 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-515：拆分 FILL_MISSING request reconciliation
+
+范围：将 active/deferred request snapshot 查询、输入快照分类和 queued/deferred/job 更新分为状态读取、纯计划与持久化步骤。保留调用方 transaction 和现有存储方法签名。
+
+验收：
+
+- [x] Postgres row lock、100 项 query/update chunk、request fingerprint/capabilities 匹配语义不变。
+- [x] 自动 retry/deferred suppression、obsolete snapshot consumption、queued completed-item reopen 与 processed count 下调保持。
+- [x] 剩余请求仍经现有 100-item job coalescing/256-item insert 路径；retry 与 running request 回归通过。
+
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/fill_missing/requests.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::repository_tests::automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_scoped`、`cargo test --locked --lib storage::repository::repository_tests::changed_local_fill_request_during_running_item_is_not_lost`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：request state load、request matching plan 和批量持久化分别成为私有步骤，`enqueue_or_update_fill_missing_requests_in_transaction` 收敛为短编排入口；锁子句、SQL/bind 顺序和 transaction ownership 保持。retry snapshot 与 running request 两项均 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-516：清理 jobs 根模块残留
+
+范围：将 `restore_media_item` 移入媒体源 storage owner，将 legacy scan 重试错误码常量移入 shutdown owner。`jobs.rs` 只保留 jobs 模块 wiring、共享 imports/exports 与原测试入口。
+
+验收：
+
+- [x] `jobs.rs` 不再包含 `Database` 实现或业务常量，长度低于 200 行。
+- [x] `restore_media_item`、legacy scan error code 和全部调用签名/引用保持。
+- [x] shutdown 回归、crate build、fmt 与 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/media_sources.rs`、`src/storage/jobs/shutdown.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test shutdown_jobs`、`cargo build --locked`、fmt、`git diff --check`，并搜索 `restore_media_item` 与 legacy error code 的所有引用。
+
+结果（2026-10-12）：`jobs.rs` 缩至模块 wiring 与必要共享 imports/exports；restore 方法迁入 `media_sources.rs`，legacy scan error code 迁入 `shutdown.rs`。调用方法名保持。shutdown、build、fmt 与 diff 检查通过。
+
+#### LUX-517：收窄事务内存储 helper 可见范围
+
+范围：把 local metadata outbox、LIKE escaping 和 scan target/removal transaction helper 限制在实际调用的 `jobs` 或 `jobs::scan` 子树。保持可供同层 repository tests 使用的 jobs 范围。
+
+验收：
+
+- [x] 不再有 jobs helper 使用整个 `storage::repository` 的事务内可见权限。
+- [x] discovery/reconciliation/apply 与 jobs repository tests 的调用仍可解析。
+- [x] build、jobs 单测、fmt 和 `git diff --check` 通过。
+
+预计文件：`src/storage/jobs/local_metadata/sources.rs`、`src/storage/jobs/local_metadata/batches.rs`、`src/storage/jobs/scan/targets.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo build --locked`、`cargo test --locked --lib storage::repository::jobs::tests`、fmt 和 `git diff --check`，并搜索 repository 范围 helper 与所有调用点。
+
+结果（2026-10-12）：LIKE escaping 和 Manifest outbox helper 缩至 `jobs`；scan target、sidecar、removal transaction helpers 缩至 `jobs::scan`。jobs repository tests 与 scanner/reconciliation/manifest 调用点仍在可见树内；build、jobs 单测、fmt 与 diff 检查通过。
+
+#### LUX-518：缩短 reconciliation batch 事务协调函数
+
+范围：将 pending path 过滤、movie/episode 索引、NEW/CHANGED/sidecar target 写入和 seen filesystem entry 恢复迁入事务内 batch helper。外层 coordinator 继续持有唯一 transaction。
+
+验收：
+
+- [x] reconciliation `Database` 公共方法名/签名不变；事务仍由 batch coordinator 开始并提交。
+- [x] 文件索引、target 和 restore 更新保持原顺序，均复用调用方 transaction。
+- [x] mixed reconciliation、失败回滚重试回归通过；事务协调函数不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/reconciliation.rs`、`src/storage/jobs/scan/reconciliation/batch.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs mixed_reconciliation_batches_known_media_and_keeps_unresolved`、`cargo test --locked --test scanning_jobs reconciliation_batch_rolls_back_index_and_retries_all_pending_files`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：媒体索引/targets/restore 阶段移入 `reconciliation/batch.rs`；`commit_reconciliation_batch_in_transaction` 缩至 110 行，仍是唯一 transaction owner。mixed batch 与失败回滚重试回归各 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-519：拆分 Manifest 创建与 retry 生命周期事务
+
+范围：将 full-scan Manifest root 初始化、legacy retry target 迁移和 DISCOVERING retry root reset 提取为事务内步骤。创建/重试 coordinator 继续独占 transaction begin/commit。
+
+验收：
+
+- [x] `create_full_scan_manifest_job` 与 `prepare_scan_manifest_retry` 方法名/签名及 validation/error 顺序保持。
+- [x] root registration、legacy target copy、lite/persisted retry SQL 与 transaction 顺序保持。
+- [x] 创建幂等与 DISCOVERING frontier resume 回归通过；事务协调函数不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/state.rs`、`src/storage/jobs/scan/manifest/state/transactions.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanning_jobs full_scan_manifest_indexes_safe_positive_batches_during_discovery`、`cargo test --locked --test scanning_jobs shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：Manifest full-scan root registration/legacy target copy 与 DISCOVERING retry reset 移入 state transaction 子模块；外层方法保留 transaction owner。full scan/LITE 与 persisted frontier resume 回归各 1 passed；fmt 与 diff 检查通过。
+
+#### LUX-520：拆分 Manifest delta 幂等批次写入
+
+范围：将一组 delta 的 baseline conflict 检查、bounded row insert 和 kind 计数提取为 transaction 内 helper。外层 `insert_scan_manifest_deltas` 保留 payload 校验、每个 transaction batch 的 READY_TO_DIFF 锁、counter 更新和提交。
+
+验收：
+
+- [x] root/path 唯一性、delta payload 校验、retry baseline equality 与错误语义不变。
+- [x] inner insert chunk、outer transaction batch 和 ADD/CHANGE/REMOVE/REAPPEARED 计数/绑定顺序不变。
+- [x] 同输入幂等重试、冲突 baseline rollback 和 malformed payload 回归通过；外层 coordinator 不超过 150 行。
+
+预计文件：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/insert.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --lib storage::repository::jobs::tests::scan_manifest_creation_is_atomic_and_idempotent`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：delta row verification/insert 与分类计数迁入单批 helper；外层方法缩至 101 行并继续逐 outer batch 独立 commit。幂等 retry、baseline conflict、malformed ADD 回归通过；fmt 与 diff 检查通过。
+
+#### LUX-521：Stage25 最终集成与调用合同审计
+
+范围：运行项目完整检查门，并对 jobs 根长度、事务 coordinator 长度、storage `Database` 方法签名和 application/API/main 调用面做最终审计；把 Manifest discovery transaction coordinator 的内部 lifetime 声明收敛到不超过 150 行。
+
+验收：
+
+- [x] `jobs.rs` 小于 200 行；Stage25 事务 coordinators 不超过 150 行，或在结果中说明 SQL 阶段例外。
+- [x] 基线中的 storage 方法名/签名无丢失或变化；`src/api`、`src/application`、`src/main.rs` 没有因本阶段产生的路由/调用改动。
+- [x] `./scripts/check-all.sh` 全部通过，`git diff --check` 通过，本任务未修改原工作区。
+
+预计文件：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`web/tests/home-page.test.tsx`、本文档。
+
+验证：先确认 Toshiba 挂载，然后以 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `./scripts/check-all.sh`；补充方法签名/调用点 diff、`uname -m` 和 git 状态检查。
+
+结果（2026-10-12）：`jobs.rs` 28 行；`commit_manifest_discovery_transaction` 完整声明块 150 行（函数体 146 行）。此前收敛的 reconciliation、Manifest diff、delta insert、create/retry coordinator 也均不超过 150 行。基线 `b08bdcf4` 的 186 个 storage `Database` 方法在当前模块均存在且签名一致；`src/api`、`src/application`、`src/main.rs` 相对基线无改动；本机 `arm64`。首次最终门禁中的 Rust build、840 个单元测试（20 个按配置忽略）、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 检查、两个 Python 检查和冻结锁文件安装通过；Web gate 在 Vitest `home-page.test.tsx` 的 5 个异步 carousel 断言失败（75/76 文件、576/581 tests）。该文件单独运行 17/17 通过，Web 与基线无差异，且此前一次完整 Web suite 通过 581/581、Web build 通过；首次门禁时第三项验收暂未勾选，后续修复和复验见补记。`git diff --check` 通过。
+
+补记（2026-10-12）：统一将 `home-page.test.tsx` 的异步 UI 等待窗口设为 3 秒，并将轮播点击测试从固定 450ms 睡眠改为等待目标 dot 的 `aria-current` 状态，避免并行测试负载下默认 1 秒等待不足。定向 HomePage 测试 17/17 通过；随后 `./scripts/check-all.sh` 全部通过，包括 840 个 Rust 单元测试、全部 Rust integration、fmt、all-targets/all-features Clippy、shell 与 Python 检查、冻结锁文件安装、Web Node 136/136、Vitest 581/581 和 Web production build。本任务未修改原工作区文件；该工作区的 `test` HEAD 在本轮执行期间从 `bc9fd6ee` 前进到 `dcda7345`，现存未提交和未跟踪文件仍保留。
+
+#### LUX-522：确保阻塞 metadata 测试总能释放 FIFO
+
+范围：修正 scanned-metadata integration tests 的阻塞 NFO/poster FIFO 清理边界。先保存 NFO 解锁前的观测结果，再无论查询成功或失败都释放 FIFO；poster fixture 通过 guard 在提前返回时写入并移除 FIFO，避免 Tokio runtime shutdown 等待阻塞 reader。
+
+验收：
+
+- [x] snapshot 查询失败时也执行 FIFO release，Tokio runtime shutdown 不再遗留阻塞 reader。
+- [x] scan 已在 NFO 解锁前结束时不重复 poll JoinHandle；未结束时仍在释放后等待 scan。
+- [x] poster 阻塞与取消用例在正常和提前退出路径都释放 FIFO，失败断言不会卡住测试进程。
+- [x] 独立阻塞 NFO 回归通过，原有 poster-before-NFO 与 scan-before-NFO 断言保留。
+
+预计文件：`tests/scanned_metadata.rs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR`；运行 `cargo test --locked --test scanned_metadata manifest_scan_indexes_poster_while_local_nfo_is_blocked`、fmt 和 `git diff --check`。
+
+结果（2026-10-12）：snapshot queries 改为先收集结果，随后总是释放 FIFO，再传播查询错误；通过 timeout 结果避免对已完成 JoinHandle 二次 poll。poster 阻塞/取消测试共用释放 guard，在 `Drop` 中打开读写 FIFO、写入 fixture 并移除路径。独立 NFO 用例通过；完整 `scanned_metadata` 23 passed、`scanning_jobs` 81 passed，fmt 与 diff 检查通过。
+
+#### LUX-523：移动端首页媒体库单行滚动
+
+范围：首页“我的媒体库”在桌面端继续使用现有自适应网格；移动端改为单行横向滚动，并复用“继续观看”的左右滚动按钮。
+
+验收：
+
+- [x] 桌面端网格布局和卡片尺寸保持不变。
+- [x] 移动端媒体库卡片保持在同一行，可通过左右按钮分段滚动，也保留触控横向滚动。
+- [x] 仅一个媒体库或滚动到边界时，不显示不可用方向的按钮。
+
+预计文件：`web/src/react.css`、`web/tests/home-media-layout.test.mjs`、本文档。
+
+验证：运行定向布局测试、完整 Web 测试和 Web 构建；执行 `git diff --check`。
+
+结果（2026-10-13）：移动端媒体库沿用 `HorizontalScrollRail` 的左右按钮并保持 235px 卡片单行滚动；桌面自适应网格不变。定向布局测试 6/6、Web Node 测试 137/137、Vitest 583/583、Web 构建和 `git diff --check` 通过。
+
+#### LUX-524：缩小移动端首页媒体库封面
+
+范围：移动端首页“我的媒体库”沿用单行横向滚动，把媒体库卡片宽度缩小到最多 170px；桌面卡片尺寸和网格保持不变。
+
+验收：
+
+- [x] 移动端媒体库卡片宽度最多 170px，窄屏时随视口继续缩小。
+- [x] 桌面媒体库卡片继续使用 235px 宽度和现有自适应网格。
+- [x] 移动端继续使用现有左右滚动按钮与触控横向滚动。
+
+预计文件：`web/src/react.css`、`web/tests/home-media-layout.test.mjs`、本文档。
+
+验证：运行定向布局测试、完整 Web 测试和 Web 构建；执行 `git diff --check`。
+
+结果（2026-10-13）：移动端卡片设置为 `min(170px, 52vw)`，窄屏更窄、桌面仍为 235px。定向布局测试 6/6，完整 Web 测试和构建通过。
+
+#### LUX-525：移除旧 Web 源码目录 fallback
+
+范围：Rust 静态服务默认只提供 `web/dist`，并继续支持显式 `LUX_WEB_DIR`；不再因构建产物缺失而把 `web/src` 当作旧版站点提供。将仍被历史测试导入的旧 JavaScript 实现隔离到 `web/tests/fixtures/legacy-web/`，更新测试引用；清理旧 HTML、CSS 与空入口文件。
+
+验收：
+
+- [x] 默认静态根目录固定为 `web/dist`；未设置 `LUX_WEB_DIR` 时不再读取或服务 `web/src`。
+- [x] 旧 JavaScript 仅从测试 fixture 被显式导入，React 生产入口不依赖它。
+- [x] 旧 HTML、CSS 和空 `index.mjs` 不再留在应用源码目录；浏览器标题检查只覆盖当前入口。
+
+预计文件：`src/api/legacy.rs`、`web/src/app.mjs`、`web/src/request-options.mjs`、`web/src/admin-navigation.mjs`、`web/src/index.html`、`web/src/styles.css`、`web/src/index.mjs`、`web/tests/home-legacy.test.mjs`、`web/tests/setup-page.test.tsx`、`web/tests/request-options.test.mjs`、`web/tests/admin-navigation.test.mjs`、`web/tests/browser-title.test.mjs`、本文档。
+
+验证：Toshiba 挂载检查后使用共享 `CARGO_TARGET_DIR` 运行 `cargo build --locked`；运行 Web 单测和构建；执行 `git diff --check`。
+
+进度（2026-10-13）：静态根目录与 fixture 清理已完成。`cargo build --locked`、`cargo fmt --all -- --check`、all-targets/all-features Clippy、TypeScript 检查、Vite production build 和 `git diff --check` 通过。Web 自动化测试未运行；`pnpm build` 在尝试清理依赖目录时因无交互终端中止，随后直接运行现有 `tsc` 与 Vite 可执行文件完成构建检查。Web 测试门仍待执行。
+
+### 阶段 26：管理员 API 领域化与 application 编排
+
+#### LUX-526：拆分管理员接口并下沉业务编排
+
+范围：以现有管理员 API 为合同基线，按用户、媒体库、媒体条目、元数据、人物、插件、Emby
+迁移、扫描/后台任务、计划任务、设置、Webhook、日志/事件、健康、仪表盘和数据库诊断拆分
+handler、DTO、映射及路由。`admin.rs` 保留显式领域路由组合和稳定 re-export，其他 Lux、用户、
+媒体与 Emby 调用方继续从稳定 facade 引用共享 API helper。
+
+管理员 handler 中的多服务业务编排、跨表/跨任务查询聚合、缓存失效、插件同步及后台 worker 启动
+迁入所属 `application` 用例；单次调用现有 application service 的 handler 可保留为协议适配。
+application 不接收 Axum 类型或 `AppState`，不直接生成 HTTP 响应。保留 SSE 协议循环在 API 层。
+
+保持全部现有 HTTP 路径、方法、请求/响应 JSON、状态码、错误码、鉴权/CSRF 条件、请求大小限制、
+查询上限、顺序和副作用。尤其保持计划任务旧接口、FILL_MISSING dispatcher、媒体库写入后的缓存及
+插件同步、审计位置、健康探测缓存 TTL/并发行为、Emby 迁移 actor 要求与事件流格式。
+不修改 schema、数据库关系、共享部署边界或依赖。
+
+验收：
+
+- [x] 管理员路由由领域子模块持有，并经 `admin.rs` 的显式稳定 re-export 组合；110 个基线路径及其方法（包括 Axum GET 隐含的 HEAD）均保留。
+- [x] `admin_handlers.rs` 删除；API handler 不再直接编排多服务用例、数据库查询聚合或启动领域 worker。SSE writer/heartbeat 留在 API 协议适配。
+- [x] application 用例使用领域输入/结果与显式依赖，不接收 HTTP 类型或 `AppState`；所有原调用方的 helper/DTO 兼容路径仍可编译。
+- [x] 序列化、鉴权、错误响应、部分成功、审计、事件发布、任务调度、缓存失效与资源限制保持原行为。
+- [x] 领域回归、全部 Rust 集成测试、完整项目检查通过；API 和 ADR 模块边界文档已更新。
+
+计划文件：`src/api/admin.rs`、`src/api/admin_handlers.rs` 及按上述领域新建的 `src/api/admin/` 子模块；
+`src/api/legacy.rs`、`users.rs`、`media.rs`、`playback.rs`、`emby_handlers.rs`、`emby_catalog.rs`、
+`routes.rs` 中实际受 facade 引用影响的 helper；新增或扩展领域 `src/application/` 用例与导出；
+路由合同和既有管理员领域 integration tests；本文档与 `docs/decisions/030-domain-module-boundaries.md`。
+
+验证：每个增量先补/更新相关回归，再运行显式 Rust 集成 target 或 library test、`cargo build --locked`、
+fmt 与 `git diff --check`，独立提交。完成时运行 `./scripts/check-all.sh`，以及 all-targets Rust、
+Clippy、Web 测试和构建质量门；Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。记录本机架构，
+不从 ARM 检查推断 NAS/x86 性能。
+
+实施结果（2026-10-13）：删除 9,956 行管理员 handler 单体，按用户、媒体库、媒体条目、元数据、人物、
+插件、Emby 迁移、后台任务、计划任务、设置、Webhook、日志/事件、健康、仪表盘和数据库诊断拆成领域
+子模块；`admin.rs` 显式组合子路由并重导出兼容 helper/DTO。跨服务编排、查询聚合、缓存失效、插件同步
+和领域 worker 启动迁入 `application::admin_*`。与 `origin/test` 基线对照，110 个路径、128 个显式方法
+绑定及包含隐式 HEAD 的 179 个路径/方法组合均一致。
+
+验证结果：相关定向测试 30/30 通过；`./scripts/check-all.sh` 全部通过，其中 Rust 111 个测试目标共
+1,536 passed、0 failed、42 ignored（library 840 passed、20 ignored），fmt、all-features Clippy、shell
+语法、Python 3/3 与 2/2、冻结 lockfile 安装、Node 137/137、Vitest 583/583 及 Web production build
+均通过。本机架构为 `arm64`，未据此推断 NAS/x86 性能。此前两次全量重跑分别遇到未修改区域的 NFO actor
+credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 all-targets 与 check-all 完整运行均通过。
+
+### 阶段 27：自动刮削排队、吞吐基准与库级进度
+
+本阶段先修正 workflow 3 自动补缺持久化后仍等待容量 32 dispatcher channel 的合同冲突，再测量并调整在线刮削并发，最后为管理员提供只读的库级入库进度。自动来源与管理员/计划任务显式来源必须在持久化状态中区分；自动 worker 不等待内存队列容量，显式入口保留已有背压、完成 receiver、取消与每库串行语义。不得使用无界队列或按 job 无界 spawn。
+
+每个任务一次只处理一个 LUX 编号，先写失败回归，再做最小实现并定向验证。该阶段不改扫描索引、Manifest 删除/完成语义或 `ScanCompleted`/`JOB_COMPLETED`/Webhook/Emby 合同，不批量提交刮削写库，不放宽阶段 23 的 5% 性能门。所有本机性能记录标明 ARM64 和 SQLite/PostgreSQL 配置，不外推 FNOS/NAS/x86。
+
+#### LUX-527：修订自动 FILL_MISSING dispatcher 合同
+
+范围：记录自动本地补缺与管理员/计划任务显式提交的分离合同。持久化 `QUEUED` 自动 job 是自动调度来源；每库 dispatcher 通过有界唤醒与分页领取自动工作。自动本地 worker 不等待队列容量或 provider 完成；显式入口仍保留当前容量背压与完成等待。旧 job 升级后不推断来源。扫描任务状态、索引完成事件和 webhook 时序保持不变。
+
+验收：
+
+- [x] ADR-046、任务规格与阶段 23 阻塞记录明确同一调度策略如何同时满足 LUX-303 和 LUX-424。
+- [x] 决策明确禁止无界内存队列、每 job task fan-out、自动工作并入显式 job，以及改变扫描完成语义。
+- [x] 本决策增量只修改文档；阶段 23 性能门维持开放，后续 LUX-530 实现包含超过 32 个 job 的阻塞 provider 排空回归。
+
+预计文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/046-progressive-scan-and-missing-metadata.md`、`docs/PERFORMANCE.md`、`docs/STAGE-23-GATE-REVIEW-2026-10-09.md`。
+
+验证：核对 LUX-303/LUX-424 原合同、现有失败快照与旧 job 升级边界；运行 `git diff --check`。本任务仅记录决策，不声称运行时修复或阶段门通过。
+
+实施结果（2026-10-14）：ADR-046 明确自动补缺以持久化 QUEUED job 为工作队列，合并唤醒和有界分页领取满足 LUX-303 的本地 worker 不等待要求；容量 32 的显式 dispatcher 背压与完成等待仍满足 LUX-424，自动和显式来源不混合。LUX-528–530 随后完成来源字段、持久队列 drain 与超过 32 个自动 job 的回归；保留原 10k 失败快照，阶段 23 双后端 5% 性能门仍开放。
+
+#### LUX-528：持久化补缺 job 来源字段
+
+范围：追加 SQLite/PostgreSQL migration，为 FILL_MISSING job 保存内部调度来源。新旧/显式 job 默认显式来源，自动来源仅由后续任务设置；升级不得推断已有 job 的历史来源，公开 DTO/API 不增加来源字段。
+
+验收：
+
+- [x] SQLite migration 可从空库运行且能从当前 schema 升级；PostgreSQL migration 与其语义一致，已发布 migration checksum 不变。
+- [x] 既有 job 获得显式来源默认值，来源字段有必要索引且不出现在 API DTO。
+- [x] SQLite 空库与旧数据升级回归通过；PostgreSQL bootstrap/旧 schema regression 验证默认值和 partial index，并在本机服务可用时运行 ignored target（本机无服务，执行情况见结果）。
+
+预计文件：`migrations/0169_metadata_reidentify_dispatch_source.sql`、`migrations-postgres/0169_metadata_reidentify_dispatch_source.sql`、`tests/storage.rs`、`tests/postgres_database.rs`、本文档。
+
+验证：`tests/storage.rs` SQLite migration targets；本机 PostgreSQL 可用时运行 `tests/postgres_database.rs` bootstrap migration target；`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+实施结果（2026-10-14）：追加 SQLite/PostgreSQL 0169 migration，`dispatch_source` 默认 `EXPLICIT` 并限制为 `EXPLICIT/AUTOMATIC`；部分索引只收录未取消的自动 FILL_MISSING QUEUED job。SQLite 旧 schema 记录保留原状态并读到显式默认值，空库能建立字段和索引；已发布 migration 未改。`cargo test --locked --test storage` 53/53 通过，格式检查与 diff 检查通过。PostgreSQL bootstrap 回归已补默认值和索引断言，但本机没有 Docker daemon 或 PostgreSQL server，`--include-ignored` 运行因 `PoolTimedOut` 未能验证数据库执行；该服务端运行限制在阶段 27 最终记录中保留。
+
+#### LUX-529：自动与显式补缺事务分流
+
+范围：本地 completeness 事务创建的 job 设置自动来源，只合并到同库、同来源自动 job；显式创建与管理员重试设置显式来源。保留活跃 item 去重、单 job 100 项边界、状态/计数和事务原子性。
+
+验收：
+
+- [x] 自动完整性事务不会扩展显式 job；显式 job 不会被自动合并逻辑重分类。
+- [x] 显式 create/retry 保持显式来源；自动 job 去重/合并、item 状态、总数与回滚语义正确。
+- [x] 覆盖两个来源的 SQLite 存储合同和 PostgreSQL 事务合同；来源字段不出现在 API DTO。
+
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/fill_missing/requests.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、`tests/admin_health.rs`、`tests/danmaku.rs`、`tests/scanning_jobs.rs`、`tests/scanner.rs`、`tests/ready_version.rs`、本文档。上述 health、danmaku、scan 与 version 测试同步 0169 migration 后的 schema version。
+
+验证：存储 repository library tests、PostgreSQL FILL_MISSING transaction contract、fmt 与 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
+
+实施结果（2026-10-14）：自动补缺只更新/合并自动来源 job；显式 queued/running/deferred item 会阻止自动计划改写请求快照或消耗 provider retry，管理员 retry 将 job 转为显式来源。SQLite 来源隔离和扫描 dispatch 回归通过；PostgreSQL 合同回归已加入但执行因本机 `PoolTimedOut` 未能连接。`cargo build --locked`、all-features Clippy、fmt 与 diff 检查通过。`cargo test --all-targets` 被现有 HLS generation 用例的 `Superseded` unwrap 阻断；跳过该用例后，catalog 集成用例复现 HTTP 502，另一个 catalog 集成用例超过 60 秒未结束。0169 schema 版本相关集成断言已统一更新为 169。
+
+#### LUX-530：自动补缺使用有界唤醒与持久队列 drain
+
+范围：每库 dispatcher 保留单 runner 与显式 job 的有界 channel；自动来源通过合并唤醒通知触发持久队列 drain。dispatcher 只分页拉取并领取自动来源 `QUEUED` job，按创建顺序串行运行；自动提交即使存在 32 个以上待处理 job 也立即返回，不丢唤醒、不重复执行。显式提交仍等待既有 channel 容量并获得 completion receiver。
+
+验收：
+
+- [x] provider 被 gate 阻塞且自动队列超过 32 个 job 时，本地完整性 worker 与 scan 可完成；放行 provider 后自动 job 全部按每库单 runner 排空。
+- [x] 显式提交在 channel 满时仍呈现原背压/completion receiver 语义；自动工作不提前领取显式 job。
+- [x] 覆盖唤醒合并/竞态、自动 job 合并、取消、dispatcher shutdown、worker panic 恢复及重启后的 QUEUED job drain；不产生无界内存或 task fan-out。
+- [x] SQLite 与 PostgreSQL 均有存储领取合同测试；保留 `ScanCompleted`/`JOB_COMPLETED` 与扫描进度时序。
+
+预计文件：`src/application/reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：先运行自动 dispatch/慢 provider regression 和 `tests/reidentify.rs`、扫描 metadata targets；阶段实现完成时运行 Rust 全目标与 all-features Clippy。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+实施结果（2026-10-14）：自动来源改走每库容量为 1 的合并 mpsc 唤醒通道，显式来源继续使用容量 32 的背压队列；dispatcher 每次最多读取 100 条持久 QUEUED 自动 job，按 created_at/id 顺序串行处理，满页或失败后继续 drain/retry。自动 completion waiter 上限为每库 32。回归覆盖 provider gate 下 108 条及并发新增 job 的有序排空、显式队列已满时自动提交立即返回、显式与自动唤醒同时就绪、未 settled job 的 completion 保留、取消、panic、shutdown、重启恢复，以及本地 metadata worker 不阻塞 scan。
+
+定向验证：`application::reidentify::tests::` 39/39，扫描 dispatch 回归 1/1，SQLite 来源/分页合同 1/1，串行 `tests/reidentify.rs` 21/21；`cargo build --locked`、fmt 与 all-features Clippy 通过。最终 `cargo test --locked --all-targets` 的单元部分 850 passed、21 ignored；integration 执行到 `libraries_api` 时有一项在默认并行下返回 `DATABASE_UNAVAILABLE`，该项单独通过且 `libraries_api -- --test-threads=1` 13/13。PostgreSQL 合同测试已编译但未执行：本机 Docker daemon 不可用、没有 PostgreSQL 监听端口或 `pg_isready`。`web_static` 依赖 Web 构建产物，在生成本地 `web/dist` 后通过；生成产物未纳入变更。
+
+#### LUX-531：增加固定延迟的刮削并发基准
+
+范围：为现有 metadata pipeline benchmark 增加可控的 stub provider 延迟和并发矩阵，至少测 4/8/12 个 worker、固定 item 数与固定每次 provider 调用延迟，记录 items/s、p50/p95 单项耗时、job 总耗时与配置。benchmark 使用真实 job worker 和当前 SQLite/PostgreSQL storage 路径；网络请求保持 stub，不访问 TMDb。
+
+验收：
+
+- [x] 同一 fixture/延迟/数据库参数可重复运行，测量结果包含有效性检查、版本/架构与逐项原始数据；SQLite 连跑 3 次并记录完整结果范围，PostgreSQL 参数路径已实现。
+- [x] 并发 sweep 每档独立设置，记录峰值与 queue wait；SQLite 各档峰值精确达到 4/8/12 且不超限；成功吞吐过滤失败/取消项。
+- [x] `scripts/run-metadata-performance.sh` 支持 `concurrency`/`legacy` 选择；性能记录明确区分固定延迟 stub 与真实上游时延。
+- [x] 本任务仅增加测量和 feature-gated benchmark seam；生产默认并发仍为 4，没有宣称真实 TMDb 速率。
+
+预计文件：`tests/performance.rs`、`scripts/run-metadata-performance.sh`、`docs/PERFORMANCE.md`、本文档。为使 8/12 路档位走真实 FILL_MISSING worker 而不提前开放运行时配置，允许增加仅由 benchmark Cargo feature 暴露的并发注入 seam（`Cargo.toml`、`src/application/reidentify.rs`）；该 seam 不进入默认构建。
+
+验证：Toshiba 挂载检查后以共享 target 运行指定 ignored performance target；另运行 fmt 和 diff 检查。禁止将本机 ARM64 结果外推至 NAS/x86。
+
+实施结果（2026-10-14）：新增 `performance-benchmarks` feature 仅供 ignored benchmark 注入 4/8/12 worker 和收集真实 `item_total` 样本，默认构建不包含 seam。新基准每档使用 96 项、每次 stub provider 调用固定 100ms、SQLite 真实 storage 与真实 FILL_MISSING job worker；脚本保留 `legacy` LUX-200 入口，并允许通过 `LUX_PERF_BACKEND=postgres` 选择 PostgreSQL。SQLite 连续 3 轮各档均 96/96 成功，0 失败/取消，192 次 provider 调用；4/8/12 路 items/s 中位数为 16.45/29.57/35.75，成功项 p95 中位数为 255.6/323.5/378.1ms，完整范围见 `docs/PERFORMANCE.md`。默认值未改。测试 target、legacy target、默认 build、fmt、all-features Clippy 与 diff 检查通过。PostgreSQL benchmark 本机未运行：未发现 `postgres`、`psql`、`pg_isready` 或可用服务；其连接配置路径已实现但后端耗时仍待实测。本机为 ARM64，结果不外推 NAS/x86。
+
+#### LUX-532：可配置且有界的 FILL_MISSING 并发
+
+范围：依据 LUX-531 的固定延迟矩阵为在线 FILL_MISSING 增加 `LUX_METADATA_CONCURRENCY` 启动期配置与绝对上限；默认值和上限写入性能/部署说明。保留全局 semaphore、每库串行 dispatcher、resource metrics 降档、取消响应和 DB 后端资源差异。无效/超范围值采用安全 clamp 并发出不含 secret 的配置告警。决策：LUX-531 只完成 SQLite 矩阵，PostgreSQL 尚无可用服务；因此默认仍为 4，不基于单一后端把默认提高到 8/12，绝对上限为 12，等待双后端实测后再决定是否提高默认。
+
+验收：
+
+- [x] env 未设置、有效边界、0、负数/非整数、超过上限均有解析回归；configured limit 在进程内由 OnceLock 初始化一次，并保存在 service 实例，避免 semaphore 与 worker limit 不一致。
+- [x] 默认 4、绝对上限 12；PostgreSQL 未实测时保持默认。resource metrics 继续接收 configured limit，现有压力测试覆盖降档规则，worker loop 每轮重新读取并可恢复。
+- [x] 两个并行 library job 共用 global semaphore；集成测试在 unset 默认 4 与 env=1 下通过；其它 metadata 模式仍遵循原后端建议值和进程级限制。
+- [x] 更新性能/兼容文档并注明 PostgreSQL 基准待测；没有宣称未经上游验证的 TMDb 请求速率。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`、本文档。
+
+验证：Rust parser/worker 测试、`tests/reidentify.rs` 与相关 metadata 集成 target、build/fmt/all-features Clippy；Toshiba 挂载检查与共享 target 必须满足。
+
+实施结果（2026-10-14）：`LUX_METADATA_CONCURRENCY` 采用缺省 4、支持 1–12、超过范围 clamp 到边界，非整数回退缺省；对非法/越界值发 warning，但不记录原始 env 内容。configured limit 在进程内 OnceLock 一次读取，并保存在每个 MetadataReidentifyService 实例；同一个 OnceLock 同时创建全局 FILL_MISSING semaphore，配置不会动态重读。资源 pressure 路径、每库 dispatcher 和取消不变。定向 reidentify 单测 42/42，通过；`LUX_METADATA_CONCURRENCY=1` 与 env unset 两种环境下，跨两个库的进程级 FILL_MISSING worker 集成各通过 1/1。默认 SQLite build、fmt、all-features Clippy 与 diff 检查通过。默认值依据 SQLite 4 路基线保持 4；PostgreSQL 没有可用服务，未测也未提高默认值。部署配置见 `docs/COMPATIBILITY.md`，性能依据见 `docs/PERFORMANCE.md`。
+
+#### LUX-533：存储层聚合库级入库阶段
+
+范围：只读聚合启用媒体库的扫描索引、Manifest/local metadata、probe、thumbnail、自动 FILL_MISSING 持久化状态，返回按库分页的内部快照和最近活动时间。只读现有表，不新建通用 pipeline 表，不改 worker 执行路径、单项状态或扫描完成语义。SQL 先限制到最多 50 个启用库，再在数据库内分组计数；不把 item 行载入应用层，不读取路径、媒体标题、来源凭据或上游错误文本。阶段运行状态只能依据已持久化的 job/target 状态与 scan job 当前阶段推导，缺少对应记录时返回无计划/空闲，不合成进度。各 stage 计数只在本 stage 内解释，底层分别按 scan job、local metadata batch/backfill/legacy target、probe target/STRM probe job、thumbnail target、自动 metadata job 计数，不跨 stage 求和，也不据此估算 ETA。扫描驱动的 NFO/probe/thumbnail 若没有逐项 RUNNING 状态，用 scan job 当前阶段计一个运行中的驱动任务；未完成的 target 仍留在 queued。
+
+验收：
+
+- [x] storage 返回每库各阶段的 queued/running/completed/failed/cancelled 计数、是否有计划和最近活动时间；索引阶段与后台阶段独立，在线 FILL_MISSING 不计入扫描索引。
+- [x] 页大小拒绝或限制到 50；聚合只访问所选启用库，有界 SQL 完成计数，不读取 item 全表到应用层，也不触发 provider/filesystem。
+- [x] SQLite fixture 覆盖无任务、Manifest 后处理、local metadata batches/backfill、自动刮削、混合阶段、失败/取消与库移除；PostgreSQL 合同测试使用代表性五阶段 fixture 执行共享聚合 SQL。
+- [x] 类型只包含库标识/显示名、阶段状态计数和时间；不含媒体标题、路径、凭据、错误文本或 scan activity 的 current item。
+
+预计文件（5 个）：`src/storage/repository.rs`、新建 `src/storage/pipeline_activity.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：storage repository 定向回归与 PostgreSQL 合同；`cargo build --locked`、fmt、all-features Clippy 和 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
+
+实施结果（2026-10-14）：存储层以单条分页聚合查询返回五个阶段的状态计数和最近活动时间，只把启用库当前页（最多 50 个）的聚合结果带回应用；状态计数保留阶段本身的持久化单位，不合并成整体百分比。SQLite 定向回归 2/2 通过，覆盖分页、禁用/移除库、扫描后处理、metadata batch/backfill、probe/STRM、thumbnail、自动/显式 FILL_MISSING 与失败/取消；测试确认不回传媒体标题。build、all-target/all-features Clippy、fmt 与 diff 检查通过。增加了运行 PostgreSQL 共享查询的忽略测试并编译通过；尝试启动一次性 PostgreSQL 16 容器，但当前网络访问 Docker Hub 失败（registry 请求返回 EOF），因此该数据库运行证据仍待有 PostgreSQL 服务的环境补齐。
+
+#### LUX-534：提供只读库级入库阶段 API
+
+范围：增加管理员读取接口 `GET /api/v1/admin/library-pipeline-activity?page=1&pageSize=20`，将 LUX-533 storage 快照序列化为 `libraries` 与分页元数据。每页最多 50 个启用库；`pageSize` 缺省 20，页码从 1 开始。每库返回 `libraryId`、`libraryName`、各 stage 的 `planned`、五类状态计数及 `recentActivityAt`。只增加 Lux 管理 API，不改已有 task activity、Emby、ScanCompleted、Webhook DTO 或任务执行路径。
+
+验收：
+
+- [x] admin 鉴权、分页边界、空页和错误映射符合现有 API 约定，响应只包含 storage 阶段契约允许的字段。
+- [x] 集成测试覆盖两个库并行、各阶段混合状态、取消/失败、禁用或移除库、无任务和超过 50 库分页；不会序列化媒体标题、路径、凭据或错误内容。
+- [x] compatibility 文档记录 endpoint、分页和字段语义；复用 LUX-533 的共享 PostgreSQL storage query contract，不做第二次全表读取。
+
+预计文件（5 个）：`src/application/admin_task_activity.rs`、`src/api/admin/admin_scheduled_tasks.rs`、`tests/libraries_api.rs`、`docs/COMPATIBILITY.md`、本文档。
+
+验证：`tests/libraries_api.rs` 定向目标、build/fmt/all-features Clippy 与 diff 检查；Toshiba 挂载检查并使用共享 target。
+
+实施结果（2026-10-14）：新增只读管理员 endpoint，默认页大小 20、最大 50、页码从 1 开始；沿用管理员鉴权，分页非法返回 400，数据库/服务不可用返回 503。应用层把 storage snapshot 映射到固定五阶段 API shape，不增加第二次读取。`tests/libraries_api.rs` 14/14 通过，包含未授权、51 库分页、空页、无计划阶段、混合 queued/running/completed/failed/cancelled、禁用/移除库排除和敏感字段不回传；build、all-features Clippy、fmt 与 diff 检查通过。API 字段和 Unix epoch 秒时间语义已记入 `docs/COMPATIBILITY.md`。PostgreSQL live contract 仍受 LUX-533 中记录的 Docker Hub 网络限制影响。
+
+#### LUX-535：管理员活动视图展示库级入库阶段
+
+范围：在现有管理员活动弹层中以媒体库为组展示 LUX-534 API 结果，清楚区分索引和后台 NFO、probe、thumbnail、刮削进度；支持无计划阶段、长任务与失败项。复用现有活动入口，不改变桌面/移动 shell 的触发方式。
+
+验收：
+
+- [x] 多库并行时各库独立显示阶段与计数；扫描索引完成后仍显示未结束的后台阶段。
+- [x] 无任务、纯后台处理、部分失败、完成、分页/刷新与 API 错误均有 Web 回归。
+- [x] 视图不把阶段总计伪装成精确 ETA；ARIA 状态与进度值准确，长库名和窄视口不造成横向溢出。
+
+预计文件（5 个）：`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、本文档。
+
+验证：定向 Web 测试、完整 Web 测试与 production build。阶段 27 全部任务完成后，运行该阶段门、更新性能/兼容记录并停在项目所有者确认点；阶段 23 原有 5% A/B 性能门仍按其规格单独开放。
+
+实施结果（2026-10-14）：管理员活动弹层按库显示五个阶段的计划状态、队列/运行/完成/失败/取消计数和最近活动时间；索引结束后仍保留后续后台阶段。弹层打开时每 5 秒刷新，支持手动刷新、每页 5 个媒体库、阶段展开、无计划/无任务状态和不暴露原始错误的重试。没有合成百分比或 ETA。`tests/scan-activity.test.tsx` 覆盖并行媒体库、纯后台处理、无计划、部分失败、全阶段完成、分页/刷新和 API 错误。浏览器用 mock API 在 375×812 验证长库名和阶段展开；视口和文档宽度均为 375px，弹层内容纵向滚动。
+
+验证结果：目标测试 10/10、production build、定向浏览器检查和 `git diff --check` 通过。完整 `pnpm test` 的 Node 检查 137/137 通过；默认并行 Vitest 全量运行中，`tests/home-page.test.tsx` 的 5 个轮播用例失败，其余 583/588 通过。单 worker Vitest 全量运行中，另有 `tests/library-page.test.ts` 的 1 个排序恢复断言失败，其余 587/588 通过；这两个失败文件分别单独运行均为 17/17 通过，显示全量运行结果不稳定。阶段 23 的 A/B 性能门仍开放；LUX-533 PostgreSQL live query 受 Docker Hub EOF 阻塞，尚未取得 PostgreSQL runtime 证据。
+
+阶段 27 阶段门（2026-10-14）：在 Toshiba 挂载、`arm64` 环境下，通过 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `scripts/check-all.sh`。Cargo build、fmt、all-target/all-feature Clippy、shell 语法、两组 Python 工具测试均通过；`cargo test --locked --all-targets` 在 lib target 停止，854 通过、1 失败、22 ignored。失败 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation` 在隔离重跑时仍因 `Superseded` 失败，位于本阶段未修改的 HLS 播放代码。Web frozen-lockfile install 和 production build 通过；完整 Web 测试波动详见 LUX-535 结果。PostgreSQL live query 未验证，阶段 23 的 5% A/B 门仍开放。本阶段按门停在项目所有者确认点，不将失败检查记为通过。
+
+#### LUX-536：在媒体详情展示剧照
+
+范围：电影详情与剧级电视剧详情读取现有条目图片中的 `FANART`、`THUMB`、`WALLPAPER`，作为“剧照”横向图片栏，放在“演职人员”之后、“更多信息”之前。季、集及其他条目类型不展示剧照；海报、LOGO 等其他图片类型不进入剧照栏。无符合类型的图片时隐藏该栏。
+
+验收：
+
+- [x] 电影与剧级电视剧详情展示该条目全部 FANART、THUMB、WALLPAPER 图片，按图片类型和索引稳定排序。
+- [x] 季、集、普通视频及其他条目不展示剧照；其他图片类型不会混入；无匹配图片时不渲染空栏。
+- [x] 桌面和移动布局中，“剧照”都位于演职人员之后、更多信息之前；图片有可访问的替代文本，并使用延迟加载。
+- [x] 详情页回归覆盖支持的条目类型、过滤规则、空数据和分区顺序；Web 测试与生产构建通过。
+
+预计文件（5 个）：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/detail/MediaStills.tsx`、`web/src/react.css`、`web/tests/media-detail.test.tsx`、本文档。
+
+验证：Toshiba 挂载后使用共享 `CARGO_TARGET_DIR` 运行 `cargo build --locked`、fmt 与 all-targets/all-features Clippy；Web 运行冻结锁文件安装、`web/tests/media-detail.test.tsx` 定向测试、完整 Web 测试和 production build；执行 `git diff --check`。本任务未修改 Rust 源码或 Rust API 合同，没有相关 Rust 行为测试。
+
+实施结果（2026-10-14）：详情页复用现有 item-images 查询，不增加后端接口。电影和剧级电视剧通过“剧照”横向栏展示全部 FANART、THUMB、WALLPAPER 图，先按类型再按 imageIndex 排序；海报、LOGO 等类型被排除。季、集、VIDEO 和其他条目不渲染剧照栏；无符合类型的图片时隐藏空栏。桌面与移动布局均将剧照排在演职人员和更多信息之间，图片带描述性 alt 并延迟加载。
+
+验证结果：冻结锁文件安装通过；`media-detail.test.tsx` 32/32、`detail-layout.test.mjs` 29/29、完整 Web Node 137/137 与 Vitest 593/593、production build 通过。Toshiba 已挂载，本机 `arm64`；共享 target 下 `cargo build --locked`、`cargo fmt --all -- --check`、all-targets/all-features Clippy 通过。`git diff --check` 通过。未运行 Rust 行为测试，因为本任务不改 Rust 代码或合同。
+
+详情页视觉补充验收（2026-10-14）：
+
+- [x] “更多信息”面板在深色和浅色主题使用半透明表面及背景模糊，可透出页面图片。
+- [x] 浅色模式下评分和合集标题正确挂接深色文字样式，底层浅色渐变与信息面板透明度进一步降低，能看见背景图内容。
+- [x] 浅色模式下媒体文件摘要框和视频、音频、字幕轨道卡片采用与“更多信息”一致的透明度和背景模糊。
+- [x] 媒体摘要、折叠标题和展开后的地址共用一个外框；“媒体源地址与技术详情”作为无框按钮显示。
+- [x] 展开时直接展示媒体源地址，并将复制按钮放在地址行最右侧；移除“媒体播放地址 (已安全收纳)”标签，折叠仍由原按钮控制。
+
+补充实现与回归文件（5 个）：`web/src/features/detail/MediaInfoPanel.tsx`、`web/src/react.css`、`web/tests/media-detail.test.tsx`、`web/tests/detail-layout.test.mjs`、`web/tests/light-theme-contrast.test.ts`。本文档作为独立文档增量更新。
+
+补充验证：冻结锁文件安装通过；媒体详情组件测试 32/32、详情布局检查 31/31、浅色主题测试 19/19；完整 Web 测试 Node 139/139、Vitest 593/593、production build 和 `git diff --check` 通过。浏览器本地预览确认剧照、半透明“更多信息”面板及媒体地址展开/收起和复制按钮位置。
 
 ## 28. 参考资料
 

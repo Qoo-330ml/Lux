@@ -9,6 +9,7 @@ import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
+import type { ItemImage, MediaItem } from "../src/lib/api/types";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -41,6 +42,120 @@ describe("MediaDetailPage series hierarchy", () => {
     if (root) act(() => root?.unmount());
     container?.remove();
     vi.restoreAllMocks();
+  });
+
+  async function renderDetail(item: MediaItem, images: ItemImage[] = []) {
+    if (root) act(() => root?.unmount());
+    container?.remove();
+    vi.spyOn(api, "item").mockResolvedValue(item);
+    vi.mocked(api.itemImages).mockResolvedValue({ images });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 100 });
+
+    const rendered = document.createElement("div");
+    container = rendered;
+    document.body.append(rendered);
+    root = createRoot(rendered);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[`/items/${item.id}`]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    return rendered;
+  }
+
+  function mediaImage(itemId: string, id: string, imageType: string, imageIndex = 0): ItemImage {
+    return {
+      id,
+      itemId,
+      imageType,
+      imageIndex,
+      url: `/api/v1/items/${itemId}/images/${id}`,
+    };
+  }
+
+  function detailItem(id: string, itemType: string): MediaItem {
+    return {
+      id,
+      title: "剧照测试条目",
+      itemType,
+      actors: [{ id: "person-1", name: "演员甲" }],
+      mediaSources: [{ id: "source-1", isDefault: true, container: "mkv" }],
+    };
+  }
+
+  it("shows all still image types for movies in a stable order between cast and more information", async () => {
+    const itemId = "movie-stills";
+    const rendered = await renderDetail(detailItem(itemId, "MOVIE"), [
+      mediaImage(itemId, "wallpaper-0", "WALLPAPER"),
+      mediaImage(itemId, "poster-0", "POSTER"),
+      mediaImage(itemId, "fanart-1", "fanart", 1),
+      mediaImage(itemId, "thumb-0", "THUMB"),
+      mediaImage(itemId, "fanart-0", "FANART", 0),
+      mediaImage(itemId, "logo-0", "LOGO"),
+    ]);
+
+    const gallery = rendered.querySelector(".lux-detail-stills");
+    const images = [...(gallery?.querySelectorAll<HTMLImageElement>("img") ?? [])];
+    expect(images.map((image) => image.getAttribute("src"))).toEqual([
+      `/api/v1/items/${itemId}/images/fanart-0`,
+      `/api/v1/items/${itemId}/images/fanart-1`,
+      `/api/v1/items/${itemId}/images/thumb-0`,
+      `/api/v1/items/${itemId}/images/wallpaper-0`,
+    ]);
+    expect(images.every((image, index) => image.alt === `剧照测试条目 剧照 ${index + 1}`)).toBe(true);
+    expect(images.every((image) => image.getAttribute("loading") === "lazy")).toBe(true);
+
+    const cast = rendered.querySelector(".lux-media-cast");
+    const moreInfo = rendered.querySelector(".lux-media-nfo");
+    expect(gallery?.querySelector("h2")?.textContent).toBe("剧照");
+    expect(cast && gallery && (cast.compareDocumentPosition(gallery) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+    expect(gallery && moreInfo && (gallery.compareDocumentPosition(moreInfo) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+  });
+
+  it("shows stills on series details", async () => {
+    const itemId = "series-stills";
+    const rendered = await renderDetail(detailItem(itemId, "SERIES"), [
+      mediaImage(itemId, "series-fanart", "FANART"),
+    ]);
+
+    expect(rendered.querySelector(".lux-detail-stills img")?.getAttribute("src"))
+      .toBe(`/api/v1/items/${itemId}/images/series-fanart`);
+  });
+
+  it("does not show stills on seasons, episodes, videos, or other item types", async () => {
+    for (const itemType of ["SEASON", "EPISODE", "VIDEO", "BOX_SET"]) {
+      const itemId = `excluded-${itemType.toLowerCase()}`;
+      const rendered = await renderDetail(detailItem(itemId, itemType), [
+        mediaImage(itemId, "fanart-0", "FANART"),
+      ]);
+
+      expect(rendered.querySelector(".lux-detail-stills"), itemType).toBeNull();
+    }
+  });
+
+  it("hides the stills section when there are no supported images", async () => {
+    const itemId = "movie-no-stills";
+    const noImages = await renderDetail(detailItem(itemId, "MOVIE"));
+    expect(noImages.querySelector(".lux-detail-stills")).toBeNull();
+
+    const posterOnly = await renderDetail(detailItem(itemId, "MOVIE"), [
+      mediaImage(itemId, "poster-0", "POSTER"),
+      mediaImage(itemId, "logo-0", "LOGO"),
+    ]);
+    expect(posterOnly.querySelector(".lux-detail-stills")).toBeNull();
   });
 
   it("presents HomeVideos entries as regular videos with playback, NFO, and manual metadata editing", async () => {
@@ -248,7 +363,84 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(2);
     expect(container.querySelector(".lux-season-episode-copy")?.getAttribute("href")).toBe("/items/episode-1");
     expect(container.querySelector(".lux-season-episode-play")?.getAttribute("href")).toBe("/watch/episode-1");
-    expect(children).toHaveBeenCalledWith("series-1", { itemType: "EPISODE", seasonId: "season-1" });
+    expect(children).toHaveBeenCalledWith("series-1", { page: 1, itemType: "EPISODE", seasonId: "season-1" });
+  });
+
+  it("loads later episode pages and reports the complete episode count", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "series-1",
+      title: "长篇单季剧集",
+      itemType: "SERIES",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    const firstPageEpisodes: MediaItem[] = Array.from({ length: 100 }, (_, index) => ({
+      id: `episode-${index + 1}`,
+      title: `第${index + 1}集`,
+      itemType: "EPISODE",
+      indexNumber: index + 1,
+    }));
+    const children = vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => {
+      if (options?.itemType === "SEASON") {
+        return {
+          items: [{ id: "season-1", title: "第一季", itemType: "SEASON", parentIndexNumber: 1 }],
+          total: 1,
+          page: 1,
+          pageSize: 100,
+        };
+      }
+      const page = options?.page ?? 1;
+      return {
+        items: page === 1
+          ? firstPageEpisodes
+          : [{ id: "episode-101", title: "第一百零一集", itemType: "EPISODE", indexNumber: 101 }],
+        total: 101,
+        page,
+        pageSize: 100,
+      };
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/series-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-season-episodes .lux-section-heading")?.textContent).toContain("101 集");
+    expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(100);
+    const loadMore = container.querySelector<HTMLButtonElement>("[data-action='load-more-episodes']");
+    expect(loadMore).not.toBeNull();
+
+    await act(async () => loadMore?.click());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(101);
+    expect(container.querySelector(".lux-season-episode-list")?.textContent).toContain("第一百零一集");
+    expect(container.querySelector("[data-action='load-more-episodes']")).toBeNull();
+    expect(children).toHaveBeenCalledWith("series-1", {
+      itemType: "EPISODE",
+      seasonId: "season-1",
+      page: 2,
+    });
   });
 
   it("uses the series poster for season cards without their own poster", async () => {
@@ -404,7 +596,7 @@ describe("MediaDetailPage series hierarchy", () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(container.querySelector('[data-route="watch"]')).not.toBeNull();
+    await vi.waitFor(() => expect(container.querySelector('[data-route="watch"]')).not.toBeNull());
   });
 
   it("starts the first unplayed playable episode from a season detail", async () => {
@@ -621,12 +813,14 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("评分8.1 / 10");
     expect(container.querySelector(".lux-media-nfo-rating")?.textContent).toContain("8.1 / 10");
     expect(container.querySelector(".lux-media-nfo-rating")?.textContent).toContain("123 票");
+    expect(container.querySelector(".lux-media-nfo-rating-val > strong")).not.toBeNull();
     expect(container.querySelector(".lux-media-nfo-overview .lux-media-nfo-summary")?.textContent)
       .not.toContain("评分");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("国家/地区中国");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("制片公司示例影业");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("分级PG-13");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("合集镖人");
+    expect(container.querySelector(".lux-collection-name")?.textContent).toBe("镖人");
     const identity = container.querySelector(".lux-media-nfo-identity")?.textContent;
     expect(identity).toContain("原始片名本地电影原名");
     expect(identity).toContain("年份2026");
@@ -1187,6 +1381,8 @@ describe("MediaDetailPage series hierarchy", () => {
               RealFrameRate: 30,
               BitDepth: 8,
               PixelFormat: "yuv420p",
+              AspectRatio: "960:377",
+              Level: 41,
             },
           },
           {
@@ -1241,12 +1437,31 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("更多信息");
     expect(details?.textContent).toContain("https://example.invalid/video.mkv");
     expect(details?.textContent).toContain("1920 × 1080");
+    expect(details?.textContent).toContain("2.55:1");
+    expect(details?.textContent).toContain("4.1");
     expect(details?.textContent).toContain("H264");
     expect(details?.textContent).toContain("stereo");
     expect(details?.textContent).toContain("中文字幕");
+    expect(details?.textContent).toContain("内嵌字幕轨");
     expect(details?.querySelector(".lux-media-nfo-media-heading")?.textContent).toContain("媒体文件");
     expect(details?.querySelector("details.lux-media-info-address")).toBeNull();
-    expect(details?.querySelector(".lux-media-info-address")).not.toBeNull();
+    const drawer = details?.querySelector<HTMLElement>("#media-url-drawer");
+    const drawerToggle = details?.querySelector<HTMLButtonElement>('[aria-controls="media-url-drawer"]');
+    const mediaFileCard = details?.querySelector(".lux-media-file-facts");
+    expect(drawer).not.toBeNull();
+    expect(drawer?.parentElement).toBe(mediaFileCard);
+    expect(drawerToggle?.classList.contains("lux-badge-pill")).toBe(false);
+    expect(drawer?.hidden).toBe(true);
+    expect(drawerToggle?.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => drawerToggle?.click());
+    expect(drawer?.hidden).toBe(false);
+    expect(drawerToggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(drawer?.textContent).not.toContain("媒体播放地址");
+    expect(drawer?.querySelector("#media-url-display")?.textContent).toBe("https://example.invalid/video.mkv");
+    expect(drawer?.querySelector("#media-url-display")?.nextElementSibling?.textContent).toContain("复制地址");
+    await act(async () => drawerToggle?.click());
+    expect(drawer?.hidden).toBe(true);
+    expect(drawerToggle?.getAttribute("aria-expanded")).toBe("false");
     expect(details?.querySelector(".lux-media-stream-disclosure")).toBeNull();
     expect(details?.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(container.querySelector(".lux-detail-source")?.textContent).toContain("mkv");

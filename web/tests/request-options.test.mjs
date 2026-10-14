@@ -5,7 +5,7 @@ import {
   readCsrfToken,
   rememberCsrfToken,
   requestOptions,
-} from "../src/request-options.mjs";
+} from "./fixtures/legacy-web/request-options.mjs";
 
 test("request options preserve CSRF and JSON headers together", () => {
   const options = requestOptions({

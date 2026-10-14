@@ -4,16 +4,24 @@ import test from "node:test";
 
 const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
 const mediaSource = readFileSync(new URL("../src/features/home/media.tsx", import.meta.url), "utf8");
+const homeSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
 
-test("home media actions are hidden until the poster is hovered and sit in its upper-right corner", () => {
+test("home media actions are hidden until the poster is hovered and sit in its lower-right corner", () => {
   const actionsRule = stylesheet.match(/\.lux-media-art-shell\s*>\s*\.lux-media-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+  const triggerRule = stylesheet.match(/\.lux-media-art-shell\s*>\s*\.lux-media-actions\s+\.lux-media-actions-trigger\s*\{([^}]*)\}/)?.[1] ?? "";
+  const triggerSurfaceRule = stylesheet.match(/\.lux-media-art-shell\s*>\s*\.lux-media-actions\s+\.lux-media-actions-trigger::before\s*\{([^}]*)\}/)?.[1] ?? "";
   const visibleRule = stylesheet.match(/\.lux-media-art-shell:hover\s*>\s*\.lux-media-actions,\s*\.lux-media-art-shell:focus-within\s*>\s*\.lux-media-actions\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(mediaSource, /className="lux-media-art-shell"/);
   assert.match(mediaSource, /<Rating value=\{item\.rating\} placement="card" \/>/);
   assert.doesNotMatch(mediaSource, /compactRating/);
-  assert.match(actionsRule, /top:\s*9px/);
-  assert.match(actionsRule, /bottom:\s*auto/);
+  assert.match(actionsRule, /top:\s*auto/);
+  assert.match(actionsRule, /right:\s*9px/);
+  assert.match(actionsRule, /bottom:\s*9px/);
+  assert.match(triggerRule, /width:\s*44px/);
+  assert.match(triggerRule, /height:\s*44px/);
+  assert.match(triggerSurfaceRule, /width:\s*32px/);
+  assert.match(triggerSurfaceRule, /height:\s*32px/);
   assert.match(actionsRule, /opacity:\s*0/);
   assert.match(actionsRule, /pointer-events:\s*none/);
   assert.match(visibleRule, /opacity:\s*1/);
@@ -52,6 +60,20 @@ test("homepage library cards use a compact adaptive grid", () => {
   const continueCardRule = stylesheet.match(/\.lux-continue-card\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.match(continueCardRule, /flex:\s*0 0 280px/);
   assert.match(mediaSource, /className="lux-continue-card"/);
+});
+
+test("homepage library cards stay compact in one horizontal row with shared scroll buttons on mobile", () => {
+  const mobileRules = stylesheet.match(/@media \(max-width: 700px\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const mobileLibraryRule = mobileRules.match(/\.lux-library-rail\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileLibraryCardRule = mobileRules.match(/\.lux-library-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const libraryCardRule = stylesheet.match(/\.lux-library-card\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(homeSource, /<HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">/);
+  assert.match(mobileLibraryRule, /display:\s*flex/);
+  assert.match(mobileLibraryRule, /width:\s*max-content/);
+  assert.match(mobileLibraryRule, /min-width:\s*100%/);
+  assert.match(mobileLibraryCardRule, /flex:\s*0 0 min\(170px,\s*52vw\)/);
+  assert.match(libraryCardRule, /flex:\s*0 0 235px/);
 });
 
 test("continue-watching titles shrink before the remaining-time label", () => {

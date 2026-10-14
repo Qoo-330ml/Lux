@@ -6,7 +6,7 @@ import {
   adminSectionForRoute,
   isAdminRoute,
   renderAdminNavigation,
-} from "../src/admin-navigation.mjs";
+} from "./fixtures/legacy-web/admin-navigation.mjs";
 
 test("management navigation exposes the documented sections without a separate metadata inbox", () => {
   assert.deepEqual(

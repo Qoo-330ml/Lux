@@ -798,6 +798,41 @@ export type AdminTaskActivity = {
   createdAt?: string | number;
 };
 
+export type AdminLibraryPipelineStageName =
+  | "INDEX"
+  | "LOCAL_METADATA"
+  | "PROBE"
+  | "THUMBNAIL"
+  | "AUTOMATIC_METADATA";
+
+export type AdminLibraryPipelineStatusCounts = {
+  queued: number;
+  running: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+};
+
+export type AdminLibraryPipelineStage = {
+  stage: AdminLibraryPipelineStageName;
+  planned: boolean;
+  statusCounts: AdminLibraryPipelineStatusCounts;
+  recentActivityAt: number | null;
+};
+
+export type AdminLibraryPipelineLibrary = {
+  libraryId: string;
+  libraryName: string;
+  stages: AdminLibraryPipelineStage[];
+};
+
+export type AdminLibraryPipelineActivityPage = {
+  page: number;
+  pageSize: number;
+  totalLibraries: number;
+  libraries: AdminLibraryPipelineLibrary[];
+};
+
 export type AdminScheduledTask = {
   id?: string;
   ownerType: "GLOBAL" | "LIBRARY" | string;

@@ -514,6 +514,22 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("requests a later page of children when specified", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 101, page: 2, pageSize: 100 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().children("series-1", {
+      itemType: "EPISODE",
+      seasonId: "season-1",
+      page: 2,
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/items/series-1/children?page=2&pageSize=100&itemType=EPISODE&seasonId=season-1",
+    );
+  });
+
   it("reports a Web playback state with the shared progress endpoint", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(null, { status: 204 }),

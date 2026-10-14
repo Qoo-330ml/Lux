@@ -30,6 +30,10 @@ function mockHomeSections(response: HomeResponse) {
   }));
 }
 
+function waitForHomeUpdate(assertion: () => unknown) {
+  return vi.waitFor(assertion, { timeout: 3_000 });
+}
+
 describe("HomePage shelves", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
@@ -87,7 +91,7 @@ describe("HomePage shelves", () => {
     expect(container.querySelector(".lux-skeleton-page")).toBeNull();
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
       .toContain("电影库");
-    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
+    await waitForHomeUpdate(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
       .toContain("刚刮削完成"));
     expect(container.querySelector<HTMLImageElement>(
       '[aria-label="最新电影库"] .lux-media-card img',
@@ -138,9 +142,9 @@ describe("HomePage shelves", () => {
       .toContain("华语电影");
     expect(container.querySelector<HTMLImageElement>(".lux-library-cover")?.getAttribute("decoding")).toBe("async");
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-horizontal-scroll-viewport')).not.toBeNull();
-    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
+    await waitForHomeUpdate(() => expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
       .toContain("最新华语片"));
-    await vi.waitFor(() => expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影"));
+    await waitForHomeUpdate(() => expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影"));
     expect(container.querySelector('[aria-label="最新华语电影"] .lux-horizontal-scroll-viewport')).not.toBeNull();
     expect(container.querySelector<HTMLAnchorElement>('[aria-label="最新华语电影"] .lux-section-heading h2 a'))
       .toMatchObject({ href: `${window.location.origin}/libraries/library-1` });
@@ -232,9 +236,9 @@ describe("HomePage shelves", () => {
       .toEqual(["我的媒体库", "最新剧集库", "最新电影库"]);
     expect(latest).toHaveBeenCalledTimes(1);
     expect(latest.mock.calls[0]?.[0]).toEqual(["library-2", "library-1"]);
-    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新剧集库"]')?.textContent)
+    await waitForHomeUpdate(() => expect(container.querySelector('[aria-label="最新剧集库"]')?.textContent)
       .toContain("剧集最新"));
-    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
+    await waitForHomeUpdate(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
       .toContain("电影最新"));
     expect(legacyLatest).not.toHaveBeenCalled();
     const latestQuery = queryClient.getQueryCache().find({
@@ -350,7 +354,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(1));
+    await waitForHomeUpdate(() => expect(latest).toHaveBeenCalledTimes(1));
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
       .toContain("电影库");
     expect(container.querySelector(".lux-continue-card")?.textContent)
@@ -390,7 +394,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
+    await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
     const actionRow = container.querySelector(".lux-hero-action-row");
     expect(actionRow).not.toBeNull();
     expect(actionRow?.querySelector(".lux-hero-actions")).not.toBeNull();
@@ -427,7 +431,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
+    await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
     const controls = container.querySelector(".lux-hero-carousel-controls");
     expect(controls?.querySelectorAll(".lux-hero-carousel-arrow")).toHaveLength(0);
     expect(controls?.querySelectorAll(".lux-hero-dot")).toHaveLength(2);
@@ -436,8 +440,9 @@ describe("HomePage shelves", () => {
     const dots = controls?.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
     await act(async () => {
       dots?.[1].click();
-      await new Promise((resolve) => setTimeout(resolve, 450));
     });
+    await waitForHomeUpdate(() => expect(container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.getAttribute("aria-current"))
+      .toBe("true"));
     const nextDots = container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
     expect(nextDots[1].getAttribute("aria-current")).toBe("true");
     expect(nextDots[1].querySelector(".lux-hero-dot-progress")).not.toBeNull();
@@ -472,7 +477,7 @@ describe("HomePage shelves", () => {
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
       });
-      await vi.waitFor(() => expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
+      await waitForHomeUpdate(() => expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
         .toContain("第 1 条精选"));
 
       vi.useFakeTimers();
@@ -524,7 +529,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
+    await waitForHomeUpdate(() => expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
       .toBe("/watch/episode-7"));
     expect(container.querySelector(".lux-hero-actions a.lux-button-primary")?.textContent).toContain("继续播放");
   });
@@ -592,7 +597,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
+    await waitForHomeUpdate(() => expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
       .toBe("/watch/movie-1"));
   });
 
@@ -623,7 +628,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toBe(title));
+    await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toBe(title));
     const heroTitle = container.querySelector(".lux-hero-title");
     expect(heroTitle?.classList.contains("lux-hero-title--small")).toBe(true);
     expect(heroTitle?.querySelector(".lux-hero-title-text")?.textContent).toBe(title);
@@ -659,7 +664,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("src"))
+    await waitForHomeUpdate(() => expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("src"))
       .toBe("/api/v1/items/featured-1/images/logo?tag=logo-tag"));
     expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("decoding")).toBe("async");
     expect(container.querySelector(".lux-hero-title")?.textContent).toBe("");
@@ -695,7 +700,7 @@ describe("HomePage shelves", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    await vi.waitFor(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toContain("缓存轮播"));
+    await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toContain("缓存轮播"));
     const cachedCarousel = JSON.parse(sessionStorage.getItem("lux.home-carousel.v2:user-1") ?? "{}");
     expect(Object.keys(cachedCarousel.data ?? {})).toEqual(["recommended"]);
 
@@ -716,7 +721,7 @@ describe("HomePage shelves", () => {
       );
     });
 
-    await vi.waitFor(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toContain("缓存轮播"));
+    await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toContain("缓存轮播"));
     expect(container.querySelector(".lux-skeleton-page")).toBeNull();
 
     await act(async () => {

@@ -255,15 +255,20 @@ fn remote_file_name(url: &Url) -> Option<String> {
 }
 
 pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> bool {
-    if selected_name.eq_ignore_ascii_case(candidate_name) {
-        return true;
-    }
     let Some(selected_stem) = selected_name.rsplit_once('.').map(|(stem, _)| stem) else {
         return false;
     };
     let Some((candidate_stem, extension)) = candidate_name.rsplit_once('.') else {
         return false;
     };
+    if extension.eq_ignore_ascii_case("xml") {
+        return candidate_stem.eq_ignore_ascii_case(selected_stem);
+    }
+    if extension.eq_ignore_ascii_case("json")
+        && candidate_stem.eq_ignore_ascii_case(&format!("{selected_stem}-mediainfo"))
+    {
+        return true;
+    }
     if !is_sidecar_extension(extension) {
         return false;
     }
@@ -368,9 +373,27 @@ mod tests {
             "二毛 (2019) - 2160p - H.265 - AAC - test.mkv",
             "二毛 (2019) - 2160p - H.265 - AAC - test.zh.ass",
         ));
+        assert!(is_matching_sidecar(
+            "Example.Movie.2024.mkv",
+            "Example.Movie.2024.xml",
+        ));
+        assert!(is_matching_sidecar(
+            "Example.Movie.2024.strm",
+            "Example.Movie.2024-mediainfo.json",
+        ));
+        assert!(!is_matching_sidecar(
+            "Example.Movie.2024.mkv",
+            "Example.Movie.2024.Extended.xml",
+        ));
         assert!(!is_matching_sidecar(
             "二毛 (2019) - 2160p - H.265 - AAC - test.mkv",
             "二毛 (2019) - 1080p - H.264 - AAC.mkv",
         ));
+    }
+
+    #[test]
+    fn media_files_are_never_classified_as_sidecars() {
+        assert!(!is_matching_sidecar("Movie.mkv", "movie.MKV"));
+        assert!(!is_matching_sidecar("Movie.strm", "movie.STRM"));
     }
 }

@@ -14,6 +14,22 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-532 在线 FILL_MISSING 并发配置
+
+服务启动时读取 `LUX_METADATA_CONCURRENCY`，仅控制在线 `FILL_MISSING`。默认值为 4，硬上限为 12；可用范围是 1–12。未设置或空字符串使用默认值，0 和负数夹到 1，超过 12 夹到 12，非整数回退到默认值。无效或越界配置会记录有效 worker 数和硬上限，不记录原始环境变量值。该值在进程内只解析一次，并同时决定全局 semaphore 容量与 worker 请求上限；重启服务后才会采用新值。
+
+所有媒体库和 FILL_MISSING job 共用此进程级上限；同库 dispatcher 仍按原规则串行。ResourceMetrics 可在 configured limit 内动态降档，并在压力缓解后重新升档。其它 metadata 模式仍沿用 SQLite/PostgreSQL 各自的既有 worker 建议值与 16 路进程级 semaphore。
+
+LUX-531 目前只完成 SQLite 固定延迟矩阵，PostgreSQL 路径尚未实测，因此默认保留 4；12 是支持的硬上限，不代表已批准把默认调高，也不代表 TMDb 允许的请求速率。后续调整默认值前需完成 PostgreSQL 对照测量。
+
+## LUX-534 管理员库级入库阶段 API
+
+Lux 管理 API 新增 `GET /api/v1/admin/library-pipeline-activity`，沿用现有管理员鉴权。查询参数 `page` 默认 `1`，`pageSize` 默认 `20`；页码从 1 开始，页大小仅接受 1–50。无效页码、页大小或 offset 溢出返回 `400`；合法的空页返回 `200`、空 `libraries` 和真实 `totalLibraries`。数据库不可用时返回 `503`。
+
+成功响应顶层包含 `page`、`pageSize`、`totalLibraries` 和 `libraries`。每个库包含 `libraryId`、`libraryName` 与按固定顺序排列的五个 `stages`：`INDEX`、`LOCAL_METADATA`、`PROBE`、`THUMBNAIL`、`AUTOMATIC_METADATA`。每个阶段包含 `planned`、`statusCounts`（`queued`、`running`、`completed`、`failed`、`cancelled`）和 `recentActivityAt`。时间为 Unix epoch 秒；无持久化活动时返回 `null`。阶段计数使用各自底层作业/批次/target 的持久化单位，不能跨阶段求和或换算为整体百分比/ETA。
+
+聚合只返回当前页启用媒体库的阶段摘要；响应不包含媒体标题、文件路径、凭据、上游错误文本或 scan activity 的 `currentItem`。本接口独立于已有 `/api/v1/admin/task-activity`，不改变 Emby、ScanCompleted 或 Webhook DTO。
+
 ## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
 
 Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有
@@ -187,7 +203,9 @@ TMDb 插件的 `originalLanguageEnabled` 默认关闭。启用后，电影/剧�
 Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 Emby token/API key 可删除媒体源；
 `MediaSourceId` 用于选择版本，省略时沿用 Lux 管理删除服务的整条目语义，成功返回 `204`。普通用户
 返回 `403`，未知条目或媒体源返回 `404`。媒体详情 DTO 的 `CanDelete` 与该服务器管理权限保持一致，
-不会再固定返回 `false`。这只是协议回归证据，尚未据此宣称任一目标客户端的真实删除 UI 已实测。
+不会再固定返回 `false`。删除会清理同目录同 basename 的 NFO、字幕和弹幕 XML，以及 `.strm` 的
+`-mediainfo.json` 旁车；即使媒体文件已被外部删除，仍会在根路径校验通过后清理这些旁车。这只是协议回归证据，
+尚未据此宣称任一目标客户端的真实删除 UI 已实测。
 
 ## Emby 增量同步状态兼容合同
 
@@ -211,7 +229,9 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 
 媒体条目 DTO 的 `DateCreated` 来自 `media_items.added_at`，`DateLastSaved` 和 `DateModified` 来自
 `media_items.updated_at`；带 `Fields` 时仍遵循字段选择。数据库迁移 `0126_emby_item_timestamps` 为旧库补充
-`updated_at` 和索引，元数据/NFO 写入、扫描恢复/移除、层级修复及合集/版本关系更新会同步刷新该值。
+`updated_at` 和索引。SQLite 的 `ALTER TABLE ... ADD COLUMN` 不允许动态默认表达式，因此迁移使用常量哨兵值、
+回填既有媒体行，并通过插入触发器为省略时间戳的新行设置当前 Unix 时间；元数据/NFO 写入、扫描恢复/移除、
+层级修复及合集/版本关系更新会同步刷新该值。
 
 自动化证据：`tests/emby_incremental_refresh.rs`、`tests/emby_auth.rs`、`tests/sessions.rs`、
 `tests/catalog.rs`，以及存储层 `recommended_catalog_rows_use_rating_median_for_missing_ratings` 回归。

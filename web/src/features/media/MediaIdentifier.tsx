@@ -1,4 +1,4 @@
-import { Check, LoaderCircle, Search, X } from "lucide-react";
+import { Check, Image as ImageIcon, LoaderCircle, Search, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import "./MediaIdentifier.css";
 import { api } from "../../lib/api/client";
@@ -76,6 +76,14 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
     }
   }
 
+  const candidatesByProvider = new Map<string, AdminMetadataCandidate[]>();
+  for (const candidate of candidates) {
+    const provider = candidate.provider || "元数据刮削器";
+    const providerCandidates = candidatesByProvider.get(provider) ?? [];
+    providerCandidates.push(candidate);
+    candidatesByProvider.set(provider, providerCandidates);
+  }
+
   return (
     <div className="lux-media-editor-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="lux-media-editor lux-identifier-editor" role="dialog" aria-modal="true" aria-labelledby="lux-identifier-title">
@@ -97,7 +105,14 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
           {loading || searching ? <div className="lux-image-result-state"><LoaderCircle className="lux-spin" size={21} /> 正在读取候选…</div> : null}
           {!loading && !searching && !candidates.length ? <div className="lux-image-result-state">没有候选结果，请调整名称或年份后重新搜索。</div> : null}
           <div className="lux-identifier-list">
-            {candidates.map((candidate) => <CandidateCard key={candidate.id} candidate={candidate} selecting={selecting} onSelect={select} />)}
+            {Array.from(candidatesByProvider, ([provider, providerCandidates]) => (
+              <section className="lux-identifier-source-group" key={provider}>
+                <div className="lux-identifier-source-heading"><span>来源：{provider}</span><small>{providerCandidates.length} 个</small></div>
+                <div className="lux-identifier-source-candidates">
+                  {providerCandidates.map((candidate) => <CandidateCard key={candidate.id} candidate={candidate} selecting={selecting} onSelect={select} />)}
+                </div>
+              </section>
+            ))}
           </div>
         </div>
       </section>
@@ -114,24 +129,44 @@ function CandidateCard({
   selecting?: string;
   onSelect: (candidate: AdminMetadataCandidate, mode: "fillMissing" | "refreshUnlocked") => void;
 }) {
+  const [failedPosterUrl, setFailedPosterUrl] = useState<string>();
   const title = valueAsString(candidate.candidate.title) || valueAsString(candidate.candidate.originalTitle) || candidate.providerId;
   const originalTitle = valueAsString(candidate.candidate.originalTitle);
   const overview = valueAsString(candidate.candidate.overview);
   const productionYear = valueAsString(candidate.candidate.productionYear) || valueAsString(candidate.candidate.releaseDate).slice(0, 4);
+  const posterUrl = safeCandidatePosterUrl(candidate.candidate.posterUrl ?? candidate.candidate.poster_url ?? candidate.candidate.poster);
   return (
     <article className="lux-identifier-card">
-      <div className="lux-identifier-card-heading">
-        <div><strong>{title}</strong><small>{originalTitle ? `${originalTitle} · ` : ""}{productionYear || "年份未知"} · {candidate.provider} ID {candidate.providerId}</small></div>
-        <span className="lux-status-pill">{Math.round(candidate.score)} 分</span>
+      <div className="lux-identifier-poster" role="img" aria-label={`${title} 海报`}>
+        {posterUrl && failedPosterUrl !== posterUrl ? <img src={posterUrl} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setFailedPosterUrl(posterUrl)} /> : <ImageIcon size={24} aria-hidden="true" />}
       </div>
-      {overview ? <p>{overview}</p> : null}
-      {candidate.fieldDiffs.length ? <div className="lux-identifier-diffs">{candidate.fieldDiffs.map((diff) => <div key={diff.field}><span>{diff.field}</span><small>{displayValue(diff.current)} → {displayValue(diff.candidate)}</small></div>)}</div> : <small className="lux-identifier-no-diff">没有字段差异</small>}
-      <div className="lux-identifier-actions">
-        <button className="lux-button lux-button-compact lux-button-primary" data-action="identify-fill" type="button" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "fillMissing")}><Check size={15} /> {selecting === `${candidate.id}:fillMissing` ? "应用中…" : "仅补缺"}</button>
-        <button className="lux-button lux-button-compact lux-button-secondary" data-action="identify-refresh" type="button" title="会替换当前媒体所有未锁定的元数据及图片" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "refreshUnlocked")}><Search size={15} /> {selecting === `${candidate.id}:refreshUnlocked` ? "应用中…" : "全量替换"}</button>
+      <div className="lux-identifier-content">
+        <div className="lux-identifier-card-heading">
+          <div><strong title={title}>{title}</strong><small title={`${originalTitle ? `${originalTitle} · ` : ""}${productionYear || "年份未知"} · ${candidate.provider} ID ${candidate.providerId}`}>{originalTitle ? `${originalTitle} · ` : ""}{productionYear || "年份未知"} · {candidate.provider} ID {candidate.providerId}</small></div>
+          <span className="lux-status-pill">{Math.round(candidate.score)} 分</span>
+        </div>
+        <div className="lux-identifier-card-details">
+          {overview ? <p>{overview}</p> : null}
+          {candidate.fieldDiffs.length ? <div className="lux-identifier-diffs">{candidate.fieldDiffs.map((diff) => <div key={diff.field}><span>{diff.field}</span><small>{displayValue(diff.current)} → {displayValue(diff.candidate)}</small></div>)}</div> : <small className="lux-identifier-no-diff">没有字段差异</small>}
+        </div>
+        <div className="lux-identifier-actions">
+          <button className="lux-button lux-button-compact lux-button-primary" data-action="identify-fill" type="button" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "fillMissing")}><Check size={15} /> {selecting === `${candidate.id}:fillMissing` ? "应用中…" : "仅补缺"}</button>
+          <button className="lux-button lux-button-compact lux-button-secondary" data-action="identify-refresh" type="button" title="会替换当前媒体所有未锁定的元数据及图片" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "refreshUnlocked")}><Search size={15} /> {selecting === `${candidate.id}:refreshUnlocked` ? "应用中…" : "全量替换"}</button>
+        </div>
       </div>
     </article>
   );
+}
+
+function safeCandidatePosterUrl(value: unknown) {
+  const posterUrl = valueAsString(value).trim();
+  if (!posterUrl) return "";
+  try {
+    const parsed = new URL(posterUrl);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? posterUrl : "";
+  } catch {
+    return "";
+  }
 }
 
 function valueAsString(value: unknown) {

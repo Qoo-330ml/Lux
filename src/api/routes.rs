@@ -1,6 +1,8 @@
 use super::*;
 
 const CATALOG_WORKER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PERFORMANCE_PROBE_HEADER: &str = "x-lux-performance-probe";
+const PERFORMANCE_PROBE_VALUE: &str = "v1";
 // Keep the existing per-pool concurrency for Home while isolating it from
 // unrelated catalog traffic that could otherwise hold every shared worker.
 const MAX_CONCURRENT_HOME_REQUESTS: usize = MAX_CONCURRENT_CATALOG_REQUESTS;
@@ -41,11 +43,16 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                     } else {
                         None
                     };
+                    let mut worker_wait_us = 0_u64;
                     let worker_permit = if request_slot.is_some() {
-                        let wait_started = Instant::now();
                         let workers =
                             select_catalog_worker_pool(&path, catalog_workers, home_workers);
-                        match acquire_catalog_worker(workers, CATALOG_WORKER_WAIT_TIMEOUT).await {
+                        let (acquire_result, wait_duration) =
+                            acquire_catalog_worker_with_wait(workers, CATALOG_WORKER_WAIT_TIMEOUT)
+                                .await;
+                        worker_wait_us =
+                            u64::try_from(wait_duration.as_micros()).unwrap_or(u64::MAX);
+                        match acquire_result {
                             Ok(permit) => Some(permit),
                             Err(CatalogWorkerWaitError::TimedOut) => {
                                 tracing::warn!(
@@ -54,7 +61,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                                         .and_then(|value| value.to_str().ok())
                                         .unwrap_or("unknown"),
                                     route_class = catalog_route_class(&path),
-                                    wait_ms = u64::try_from(wait_started.elapsed().as_millis())
+                                    wait_ms = u64::try_from(wait_duration.as_millis())
                                         .unwrap_or(u64::MAX),
                                     "catalog worker queue wait timed out"
                                 );
@@ -67,7 +74,18 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                     } else {
                         None
                     };
-                    let response = next.run(request).await;
+                    let handler_started = Instant::now();
+                    let mut response = next.run(request).await;
+                    if request_slot.is_some() {
+                        add_performance_probe_headers(
+                            &mut response,
+                            &request_headers,
+                            &path,
+                            worker_wait_us,
+                            u64::try_from(handler_started.elapsed().as_micros())
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
                     drop(worker_permit);
                     drop(request_slot);
                     response
@@ -136,6 +154,50 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         )
 }
 
+fn add_performance_probe_headers(
+    response: &mut Response,
+    request_headers: &HeaderMap,
+    path: &str,
+    worker_wait_us: u64,
+    handler_us: u64,
+) {
+    if request_headers
+        .get(PERFORMANCE_PROBE_HEADER)
+        .is_none_or(|value| value != PERFORMANCE_PROBE_VALUE)
+        || !path.starts_with('/')
+        || path.contains('?')
+        || path.contains('#')
+    {
+        return;
+    }
+    let Some(request_id) = request_headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+    else {
+        return;
+    };
+    let Ok(request_id) = HeaderValue::from_str(request_id) else {
+        return;
+    };
+    let Ok(path) = HeaderValue::from_str(path) else {
+        return;
+    };
+
+    let headers = response.headers_mut();
+    headers.insert("x-lux-perf-request-id", request_id);
+    headers.insert("x-lux-perf-path", path);
+    headers.insert(
+        "x-lux-perf-worker-wait-us",
+        HeaderValue::from(worker_wait_us),
+    );
+    headers.insert("x-lux-perf-handler-us", HeaderValue::from(handler_us));
+}
+
 fn select_catalog_worker_pool(
     path: &str,
     catalog_workers: Arc<tokio::sync::Semaphore>,
@@ -167,6 +229,18 @@ async fn acquire_catalog_worker(
         Ok(Err(_)) => Err(CatalogWorkerWaitError::Closed),
         Err(_) => Err(CatalogWorkerWaitError::TimedOut),
     }
+}
+
+async fn acquire_catalog_worker_with_wait(
+    workers: Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+) -> (
+    Result<tokio::sync::OwnedSemaphorePermit, CatalogWorkerWaitError>,
+    Duration,
+) {
+    let started = Instant::now();
+    let result = acquire_catalog_worker(workers, wait).await;
+    (result, started.elapsed())
 }
 
 fn catalog_busy_response(path: &str, headers: &HeaderMap) -> Response {
@@ -218,6 +292,74 @@ mod tests {
         assert_eq!(catalog_route_class("/api/v1/home/carousel"), "home");
     }
 
+    #[test]
+    fn performance_probe_headers_require_opt_in_request_id_and_path() {
+        let mut response = StatusCode::OK.into_response();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("x-request-id", HeaderValue::from_static("probe-17"));
+        assert!(response.headers().get("x-lux-perf-request-id").is_none());
+
+        add_performance_probe_headers(
+            &mut response,
+            &request_headers,
+            "/api/v1/libraries/1/items",
+            19,
+            241,
+        );
+        assert!(response.headers().get("x-lux-perf-request-id").is_none());
+
+        request_headers.insert(
+            PERFORMANCE_PROBE_HEADER,
+            HeaderValue::from_static(PERFORMANCE_PROBE_VALUE),
+        );
+        add_performance_probe_headers(
+            &mut response,
+            &request_headers,
+            "/api/v1/libraries/1/items",
+            19,
+            241,
+        );
+
+        assert_eq!(response.headers()["x-lux-perf-request-id"], "probe-17");
+        assert_eq!(
+            response.headers()["x-lux-perf-path"],
+            "/api/v1/libraries/1/items"
+        );
+        assert_eq!(response.headers()["x-lux-perf-worker-wait-us"], "19");
+        assert_eq!(response.headers()["x-lux-perf-handler-us"], "241");
+
+        let mut query_path_response = StatusCode::OK.into_response();
+        add_performance_probe_headers(
+            &mut query_path_response,
+            &request_headers,
+            "/api/v1/libraries/1/items?sort=Name",
+            19,
+            241,
+        );
+        assert!(
+            query_path_response
+                .headers()
+                .get("x-lux-perf-request-id")
+                .is_none()
+        );
+
+        let mut missing_request_id_response = StatusCode::OK.into_response();
+        request_headers.remove("x-request-id");
+        add_performance_probe_headers(
+            &mut missing_request_id_response,
+            &request_headers,
+            "/api/v1/libraries/1/items",
+            19,
+            241,
+        );
+        assert!(
+            missing_request_id_response
+                .headers()
+                .get("x-lux-perf-request-id")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn catalog_worker_queue_wait_has_a_deadline() {
         let workers = Arc::new(tokio::sync::Semaphore::new(1));
@@ -236,6 +378,22 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_worker_timeout_records_elapsed_wait_duration() {
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = workers
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("worker permit");
+
+        let (result, elapsed) =
+            acquire_catalog_worker_with_wait(workers, Duration::from_millis(5)).await;
+
+        assert!(matches!(result, Err(CatalogWorkerWaitError::TimedOut)));
+        assert!(elapsed >= Duration::from_millis(5));
     }
 
     #[tokio::test]

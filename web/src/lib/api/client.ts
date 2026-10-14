@@ -16,6 +16,7 @@ import type {
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
   AdminLibraryCoverJob,
+  AdminLibraryPipelineActivityPage,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
@@ -603,8 +604,8 @@ export class LuxApiClient {
     );
   }
 
-  children(itemId: string, options: { itemType?: string; seasonId?: string; pageSize?: number } = {}) {
-    const params = new URLSearchParams({ page: "1", pageSize: String(options.pageSize ?? 100) });
+  children(itemId: string, options: { itemType?: string; seasonId?: string; page?: number; pageSize?: number } = {}) {
+    const params = new URLSearchParams({ page: String(options.page ?? 1), pageSize: String(options.pageSize ?? 100) });
     if (options.itemType) params.set("itemType", options.itemType);
     if (options.seasonId) params.set("seasonId", options.seasonId);
     return this.request<PageResponse<MediaItem>>(
@@ -1116,6 +1117,13 @@ export class LuxApiClient {
   adminTaskActivity() {
     return this.request<{ activities?: AdminTaskActivity[] }>(
       "/api/v1/admin/task-activity",
+    );
+  }
+
+  adminLibraryPipelineActivity(page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminLibraryPipelineActivityPage>(
+      `/api/v1/admin/library-pipeline-activity?${params}`,
     );
   }
 

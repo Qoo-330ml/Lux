@@ -11,7 +11,7 @@ import { api } from "../src/lib/api/client";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-const legacyApp = readFileSync("src/app.mjs", "utf8");
+const legacyApp = readFileSync("tests/fixtures/legacy-web/app.mjs", "utf8");
 
 describe("SetupPage database restart", () => {
   let container: HTMLDivElement;

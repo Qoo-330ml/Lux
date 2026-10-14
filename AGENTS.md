@@ -87,3 +87,23 @@ this development machine, record ARM validation using `uname -m`; the expected n
 At the end of each documented phase, run that phase's checks, update compatibility or performance
 records as required, and stop for project-owner confirmation before entering the next phase. Never
 silently expand a task because a later feature appears convenient.
+
+<!-- CANVAS_DEV_PLATFORM_START -->
+## Canvas Dev 平台感知
+
+本项目可能由 Canvas Dev 平台管理。Canvas Dev 会管理工作区、会话、终端、文件、节点和多 Agent 协作。
+
+如果环境变量 `CANVAS_DEV=1` 存在，说明当前 agent 是由 Canvas Dev 启动的。常见环境变量：
+
+- `CANVAS_AGENT`: 当前 agent 类型
+- `CANVAS_SESSION_NAME`: 当前平台会话名
+- `CANVAS_WORKSPACE_ID`: 当前工作区 ID
+- `CANVAS_SPACE_ID`: 当前空间 ID
+- `CANVAS_PLATFORM_CONTEXT`: 当前会话的平台上下文文件路径
+
+默认不要读取其他 agent 的对话上下文，除非用户明确要求。需要了解当前平台动态信息时，优先读取 `CANVAS_PLATFORM_CONTEXT`。
+
+可视化工具：用 python3 "$CANVAS_TASK_CLI" tool list / describe <id> / run <id> --wait 调用；创建工具和生图用 visual-tools Skill（位于 "$CANVAS_TASK_CLI" 所在目录的 ../backend/claude_plugin/skills/visual-tools/SKILL.md；Claude 入口 /tspace:visual-tools）。
+
+- Canvas workspace: `Lux` (`4c6fda595909`)
+<!-- CANVAS_DEV_PLATFORM_END -->

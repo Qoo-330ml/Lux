@@ -125,6 +125,8 @@ const ERROR_LABELS: Record<string, string> = {
   METADATA_STORAGE_FAILED: "元数据数据库写入失败",
   METADATA_WRITE_UNAVAILABLE: "元数据写回服务不可用",
   ITEM_ISSUES: "部分条目处理失败",
+  DISPATCH_FAILED: "任务未能加入执行队列，可重试",
+  QUEUE_INCOMPLETE: "任务未处理完即中断，可重试",
   DEFERRED_PROVIDER_UNAVAILABLE: "刮削器暂不可用，已延后重试",
   WORKER_FAILED: "任务工作线程异常退出",
   STORAGE_ERROR: "数据库处理失败",
@@ -886,7 +888,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
     queryFn: () => api.adminMetadataReidentifyJob(job.id),
     enabled: detailsOpen && job.kind === "metadata",
   });
-  const failedItems = details.data?.job.items?.filter((item) => item.status === "FAILED") ?? [];
+  const issueItems = details.data?.job.items?.filter((item) => Boolean(item.error)) ?? [];
   const jobLabel = formatJobType(job.jobType);
   const duration = formatJobDuration(job);
   return <article className="lux-admin-job-row">
@@ -899,7 +901,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
       {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">
         {details.isPending ? <p role="status">正在读取失败详情…</p> : null}
         {details.error ? <p role="alert">详情读取失败，请稍后重试。</p> : null}
-        {details.data ? <><strong>问题条目 {failedItems.length} 个</strong>{failedItems.length ? <ul>{failedItems.map((item) => <li key={item.itemId}><code>{item.itemId}</code><span>{formatJobError(item.error) || "未记录具体原因"}</span></li>)}</ul> : <p>任务未记录逐条问题信息。</p>}</> : null}
+        {details.data ? <><strong>问题条目 {issueItems.length} 个</strong>{issueItems.length ? <ul>{issueItems.map((item) => <li key={item.itemId}><code>{item.itemId}</code><span>{metadataItemIssueText(item.error, item.candidateCount)}</span></li>)}</ul> : <p>没有记录逐条问题。</p>}</> : null}
       </div> : null}
       <time className="lux-admin-job-finished-at">完成时间：{active || job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
       {duration ? <span className="lux-admin-job-duration">{duration}</span> : null}
@@ -907,7 +909,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
       {pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}
     </div>
     <div className="lux-admin-job-actions">
-      {error && job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
+      {job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
       {cancellable && job.kind !== "cover" ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
       {retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}
     </div>
@@ -977,6 +979,15 @@ function formatJobError(
   if (!error) return "";
   const knownLabel = Object.prototype.hasOwnProperty.call(ERROR_LABELS, error) ? ERROR_LABELS[error] : undefined;
   return knownLabel || (isErrorCode(error) ? `任务处理失败（${error}）` : unrecognizedErrorLabel);
+}
+
+function metadataItemIssueText(error: string | null | undefined, candidateCount: number) {
+  if (error === "LOW_CONFIDENCE") {
+    return candidateCount > 0
+      ? `找到 ${candidateCount} 个候选，但匹配置信度不足`
+      : "未获得可自动确认的候选";
+  }
+  return formatJobError(error) || "未记录具体原因";
 }
 
 function formatJobDuration(job: OperationsJob) {

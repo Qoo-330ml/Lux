@@ -1,8 +1,9 @@
 mod common;
 
 use std::{
+    io::{self, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -20,12 +21,13 @@ use luxd::{
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
+        plugins::PluginService,
         reidentify::{
             MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
             MetadataReidentifyService,
         },
         scanner::LibraryScanner,
-        scraper::ScraperProvider,
+        scraper::{ScraperProvider, ScraperResolver},
         setup::SetupService,
         webhooks::WebhookService,
     },
@@ -40,6 +42,34 @@ use tokio::{net::TcpListener, sync::Semaphore};
 use uuid::Uuid;
 
 static FILL_MISSING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone)]
+struct CapturedLogWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriterFactory {
+    type Writer = CapturedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogWriter(Arc::clone(&self.0))
+    }
+}
+
+impl Write for CapturedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut output = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("captured log buffer is unavailable"))?;
+        output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 async fn tmdb_search_stub() -> Json<Value> {
     Json(json!({
@@ -77,6 +107,16 @@ async fn complete_movie_tmdb_stub(AxumState(tracker): AxumState<RequestTracker>)
             "original_language": "en",
             "vote_average": 8.0
         }]
+    }))
+}
+
+async fn empty_tmdb_stub(AxumState(tracker): AxumState<RequestTracker>) -> Json<Value> {
+    tracker.requests.fetch_add(1, Ordering::SeqCst);
+    Json(json!({
+        "page": 1,
+        "total_pages": 1,
+        "total_results": 0,
+        "results": []
     }))
 }
 
@@ -209,6 +249,35 @@ fn unreachable_tmdb_provider() -> Result<ScraperProvider, Box<dyn std::error::Er
         ..TestScraperConfig::default()
     })?;
     Ok(ScraperProvider::from_adapter(tmdb))
+}
+
+async fn empty_search_tmdb_provider() -> Result<
+    (ScraperProvider, RequestTracker, tokio::task::JoinHandle<()>),
+    Box<dyn std::error::Error>,
+> {
+    let tracker = RequestTracker {
+        requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(empty_tmdb_stub))
+        .with_state(tracker.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move {
+        let _ = axum::serve(tmdb_listener, tmdb_app).await;
+    });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+        ..TestScraperConfig::default()
+    })?;
+    Ok((ScraperProvider::from_adapter(tmdb), tracker, tmdb_server))
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -1053,6 +1122,171 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
 }
 
 #[tokio::test]
+async fn fill_missing_empty_provider_search_is_low_confidence_not_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let before: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+
+    let (tmdb, tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let selection =
+        MetadataSelectionService::new(database.clone(), ImageWriteService::new(database.clone())?);
+    let metadata =
+        MetadataReidentifyService::with_selection(database.clone(), tmdb, Some(selection));
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert!(tracker.requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.items.len(), 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
+    assert_eq!(completed.items[0].candidate_count, 0);
+    assert_eq!(completed.items[0].error.as_deref(), Some("LOW_CONFIDENCE"));
+
+    let candidates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let after: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(candidates, 0);
+    assert_eq!(after, before);
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_fill_missing_work_is_requeued_once_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let (_temp_dir, database, library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    sqlx::query("UPDATE libraries SET scraper_id = 'tmdb' WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let (tmdb, _tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), tmdb);
+    let interrupted = metadata.create_fill_missing_job(vec![item_id]).await?;
+    // Simulate the previous process exiting mid-scrape: startup cancels it.
+    assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 1);
+
+    assert_eq!(metadata.resume_interrupted_fill_missing_jobs().await?, 1);
+    assert_eq!(metadata.resume_interrupted_fill_missing_jobs().await?, 0);
+
+    let jobs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, status FROM metadata_reidentify_jobs
+         WHERE mode = 'FILL_MISSING' ORDER BY created_at, id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0], (interrupted.id.clone(), "CANCELLED".to_owned()));
+    assert_ne!(jobs[1].0, interrupted.id);
+
+    metadata.shutdown().await;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_episode_without_series_candidates_is_not_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season = root.join("No Match Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&season).await?;
+    tokio::fs::write(season.join("No.Match.Show.S01E01.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'EPISODE' AND removed_at IS NULL LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let before: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+
+    let (tmdb, tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let selection =
+        MetadataSelectionService::new(database.clone(), ImageWriteService::new(database.clone())?);
+    let metadata =
+        MetadataReidentifyService::with_selection(database.clone(), tmdb, Some(selection));
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert!(tracker.requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.items.len(), 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
+    assert_eq!(completed.items[0].candidate_count, 0);
+    assert_eq!(completed.items[0].error.as_deref(), Some("LOW_CONFIDENCE"));
+
+    let candidates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let after: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(candidates, 0);
+    assert_eq!(after, before);
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_metadata_job_processes_items_concurrently()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -1139,6 +1373,11 @@ async fn library_metadata_job_processes_items_concurrently()
 async fn fill_missing_jobs_share_a_process_global_worker_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let configured_worker_limit = std::env::var("LUX_METADATA_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<i128>().ok())
+        .map(|value| value.clamp(1, 12) as i64)
+        .unwrap_or(4);
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8098".parse()?,
@@ -1227,8 +1466,8 @@ async fn fill_missing_jobs_share_a_process_global_worker_limit()
 
     assert!(maximum_running_items > 0);
     assert!(
-        maximum_running_items <= 4,
-        "automatic FILL_MISSING jobs must claim at most four running items process-wide; observed {maximum_running_items}"
+        maximum_running_items <= configured_worker_limit,
+        "FILL_MISSING jobs must stay within configured process-wide limit {configured_worker_limit}; observed {maximum_running_items}"
     );
     tmdb_server.abort();
     Ok(())
@@ -1992,5 +2231,60 @@ async fn scraper_unavailable_metadata_job_is_deferred() -> Result<(), Box<dyn st
         finished.error.as_deref(),
         Some("DEFERRED_PROVIDER_UNAVAILABLE")
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fill_missing_without_selected_scraper_records_a_structured_skip_log()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let captured_logs = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedLogWriterFactory(Arc::clone(&captured_logs)))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+    let (temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let selection =
+        MetadataSelectionService::new(database.clone(), ImageWriteService::new(database.clone())?);
+    let resolver = ScraperResolver::new(
+        database.clone(),
+        PluginService::new(database.clone(), temp_dir.path().join("config")),
+    );
+    let metadata = MetadataReidentifyService::with_resolver_and_selection(
+        database.clone(),
+        unreachable_tmdb_provider()?,
+        resolver,
+        Some(selection),
+    );
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let finished = metadata.get_job(&job.id).await?;
+    assert_eq!(finished.status, "COMPLETED");
+    assert_eq!(finished.items.len(), 1);
+    assert_eq!(finished.items[0].status, "COMPLETED");
+    assert_eq!(finished.items[0].error, None);
+    let logs = String::from_utf8(
+        captured_logs
+            .lock()
+            .map_err(|_| "log buffer poisoned")?
+            .clone(),
+    )?;
+    assert!(logs.contains("metadata_reidentify_item_skipped"));
+    assert!(logs.contains("NO_SCRAPER_SELECTED"));
+    assert!(logs.contains(&job.id));
+    assert!(logs.contains(&item_id));
     Ok(())
 }

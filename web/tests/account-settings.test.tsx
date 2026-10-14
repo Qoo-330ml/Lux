@@ -114,6 +114,22 @@ describe("account settings", () => {
     expect(favicon.href).toBe("http://localhost:3000/favicon-white.svg");
   });
 
+  it("updates the browser theme color to match the selected theme", () => {
+    const themeColor = document.createElement("meta");
+    themeColor.name = "theme-color";
+    document.head.append(themeColor);
+
+    try {
+      applyAccountTheme("light");
+      expect(themeColor.content).toBe("#f4f3f1");
+
+      applyAccountTheme("dark");
+      expect(themeColor.content).toBe("#050506");
+    } finally {
+      themeColor.remove();
+    }
+  });
+
   it("persists the selected accent color for the current account", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 

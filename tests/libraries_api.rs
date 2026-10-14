@@ -344,6 +344,251 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
 }
 
 #[tokio::test]
+async fn admin_library_pipeline_activity_is_authorized_bounded_and_sanitized()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let endpoint = format!("{base_url}/api/v1/admin/library-pipeline-activity");
+
+    let unauthorized = client.get(&endpoint).send().await?;
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, _) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("A Pipeline", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Library 02", LibraryKind::Movie, false)
+        .await?;
+    for index in 3..=51 {
+        libraries
+            .create_library(&format!("Library {index:02}"), LibraryKind::Movie, false)
+            .await?;
+    }
+    let disabled = libraries
+        .create_library("Z Disabled", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(disabled.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let removed = libraries
+        .create_library("Y Removed", LibraryKind::Movie, false)
+        .await?;
+    libraries.delete_library(removed.id).await?;
+
+    let completed_scan = ScanJobService::new(database.clone())
+        .create_movie_scan_job(first_library.id)
+        .await?;
+    sqlx::query(
+        "UPDATE scan_jobs
+         SET status = 'COMPLETED', scan_phase = 'POSTPROCESSING', current_item = '媒体探测',
+             processed_count = 1, total_count = 1, updated_at = 900,
+             error = 'DO_NOT_LEAK_PIPELINE_ERROR'
+         WHERE id = ?",
+    )
+    .bind(&completed_scan.id)
+    .execute(database.pool())
+    .await?;
+    let cancelled_scan = ScanJobService::new(database.clone())
+        .create_movie_scan_job(first_library.id)
+        .await?;
+    sqlx::query(
+        "UPDATE scan_jobs
+         SET status = 'CANCELLED', scan_phase = 'IDLE', updated_at = 1000
+         WHERE id = ?",
+    )
+    .bind(&cancelled_scan.id)
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, source_id, change_kind,
+             probe_state, updated_at
+         ) VALUES (?, 'SOURCE', 'pipeline-probe-failed', 'pipeline-secret-item',
+                  'pipeline-probe-failed', 'NEW', 'FAILED', 910),
+                  (?, 'SOURCE', 'pipeline-probe-cancelled', 'pipeline-secret-item',
+                   'pipeline-probe-cancelled', 'NEW', 'PENDING', 1000)",
+    )
+    .bind(&completed_scan.id)
+    .bind(&cancelled_scan.id)
+    .execute(database.pool())
+    .await?;
+
+    let root_path = temp_dir.path().join("DO_NOT_LEAK_PIPELINE_ROOT");
+    std::fs::create_dir(&root_path)?;
+    let root = libraries
+        .add_root(
+            first_library.id,
+            root_path.to_str().ok_or("media root is not UTF-8")?,
+        )
+        .await?
+        .root;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, status, updated_at)
+         VALUES (?, 'FAILED', 930)",
+    )
+    .bind(root.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind, thumbnail_state, updated_at
+         ) VALUES (?, 'ITEM', 'pipeline-thumbnail-done', 'pipeline-secret-item', 'NEW', 'DONE', 920)",
+    )
+    .bind(&completed_scan.id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('pipeline-secret-item', ?, 'MOVIE', 'DO_NOT_LEAK_PIPELINE_TITLE',
+                  'pipeline-secret-title', 'LOCAL_CONFIRMED')",
+    )
+    .bind(first_library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    for (job_id, status, source) in [
+        ("pipeline-auto-queued", "QUEUED", "AUTOMATIC"),
+        ("pipeline-auto-failed", "FAILED", "AUTOMATIC"),
+        ("pipeline-auto-cancelled", "CANCELLED", "AUTOMATIC"),
+        ("pipeline-explicit", "COMPLETED", "EXPLICIT"),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (
+                 id, status, total_count, mode, library_id, dispatch_source
+             ) VALUES (?, ?, 1, 'FILL_MISSING', ?, ?)",
+        )
+        .bind(job_id)
+        .bind(status)
+        .bind(first_library.id.to_string())
+        .bind(source)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs (
+             id, status, total_count, mode, library_id, dispatch_source
+         ) VALUES ('pipeline-second-library-running', 'RUNNING', 1, 'FILL_MISSING', ?, 'AUTOMATIC')",
+    )
+    .bind(second_library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let first_page = client
+        .get(&endpoint)
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(first_page.status(), reqwest::StatusCode::OK);
+    let first_page: Value = first_page.json().await?;
+    assert_eq!(first_page["page"], 1);
+    assert_eq!(first_page["pageSize"], 20);
+    assert_eq!(first_page["totalLibraries"], 51);
+    assert_eq!(first_page["libraries"].as_array().map(Vec::len), Some(20));
+    let first = &first_page["libraries"][0];
+    assert_eq!(first["libraryId"], first_library.id.to_string());
+    assert_eq!(first["libraryName"], "A Pipeline");
+    let stages = first["stages"].as_array().ok_or("missing stages")?;
+    assert_eq!(stages.len(), 5);
+    assert_eq!(stages[0]["stage"], "INDEX");
+    assert_eq!(stages[0]["planned"], true);
+    assert_eq!(stages[0]["statusCounts"]["completed"], 1);
+    assert_eq!(stages[0]["statusCounts"]["cancelled"], 1);
+    assert_eq!(stages[0]["recentActivityAt"], 1000);
+    assert_eq!(stages[1]["stage"], "LOCAL_METADATA");
+    assert_eq!(stages[1]["statusCounts"]["failed"], 1);
+    assert_eq!(stages[1]["recentActivityAt"], 930);
+    assert_eq!(stages[2]["stage"], "PROBE");
+    assert_eq!(stages[2]["statusCounts"]["running"], 1);
+    assert_eq!(stages[2]["statusCounts"]["failed"], 1);
+    assert_eq!(stages[2]["statusCounts"]["cancelled"], 1);
+    assert_eq!(stages[2]["recentActivityAt"], 1000);
+    assert_eq!(stages[3]["stage"], "THUMBNAIL");
+    assert_eq!(stages[3]["statusCounts"]["completed"], 1);
+    assert_eq!(stages[3]["recentActivityAt"], 920);
+    assert_eq!(stages[4]["stage"], "AUTOMATIC_METADATA");
+    assert_eq!(stages[4]["statusCounts"]["queued"], 1);
+    assert_eq!(stages[4]["statusCounts"]["failed"], 1);
+    assert_eq!(stages[4]["statusCounts"]["cancelled"], 1);
+    assert_eq!(
+        first_page["libraries"][1]["libraryId"],
+        second_library.id.to_string()
+    );
+    assert_eq!(
+        first_page["libraries"][1]["stages"][4]["statusCounts"]["running"],
+        1
+    );
+    let serialized = first_page.to_string();
+    for private_value in [
+        "DO_NOT_LEAK_PIPELINE_TITLE",
+        "DO_NOT_LEAK_PIPELINE_ROOT",
+        "DO_NOT_LEAK_PIPELINE_ERROR",
+        "媒体探测",
+    ] {
+        assert!(!serialized.contains(private_value));
+    }
+
+    let second_page = client
+        .get(format!("{endpoint}?page=2&pageSize=50"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(second_page.status(), reqwest::StatusCode::OK);
+    let second_page: Value = second_page.json().await?;
+    assert_eq!(second_page["page"], 2);
+    assert_eq!(second_page["pageSize"], 50);
+    assert_eq!(second_page["totalLibraries"], 51);
+    assert_eq!(second_page["libraries"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second_page["libraries"][0]["stages"][0]["planned"], false);
+    assert_eq!(
+        second_page["libraries"][0]["stages"][0]["recentActivityAt"],
+        Value::Null
+    );
+    let empty_page = client
+        .get(format!("{endpoint}?page=3&pageSize=50"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(empty_page.status(), reqwest::StatusCode::OK);
+    assert_eq!(empty_page.json::<Value>().await?["libraries"], json!([]));
+
+    for query in [
+        "page=0",
+        "pageSize=51",
+        "page=9223372036854775807&pageSize=50",
+    ] {
+        let invalid = client
+            .get(format!("{endpoint}?{query}"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_delete_disabled_library_with_active_scan_and_probe_jobs()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -716,6 +961,23 @@ async fn admin_can_run_registered_auto_library_cover_task_manually()
         .await?;
     assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
     let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let unregistered_missing_library = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/00000000-0000-0000-0000-000000000000/cover/auto"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(
+        unregistered_missing_library.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        unregistered_missing_library.json::<Value>().await?["error"]["message"],
+        "自动媒体库封面任务尚未注册"
+    );
 
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))

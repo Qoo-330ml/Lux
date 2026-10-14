@@ -11,6 +11,53 @@ use luxd::{
     storage::Database,
 };
 
+#[cfg(unix)]
+struct FifoReadReleaseGuard {
+    path: std::path::PathBuf,
+    contents: Vec<u8>,
+    released: bool,
+}
+
+#[cfg(unix)]
+impl FifoReadReleaseGuard {
+    fn new(path: &std::path::Path, contents: Vec<u8>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            contents,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if self.released {
+            return Ok(());
+        }
+        // Satisfy a reader blocked in FIFO open before removing the fixture path.
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.path)?;
+        let write_result = std::io::Write::write_all(&mut writer, &self.contents);
+        let remove_result = match std::fs::remove_file(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
+        drop(writer);
+        self.released = true;
+        write_result.and(remove_result)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FifoReadReleaseGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 async fn wait_for_local_metadata_batches(
     database: &Database,
     job_id: &str,
@@ -770,63 +817,93 @@ async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
     let scan_jobs = jobs.clone();
     let mut scan = tokio::spawn(async move { scan_jobs.run_to_completion(&job_id, 1, None).await });
 
-    let poster_visible_before_nfo = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let poster_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM item_images
-                 WHERE item_images.local_path LIKE '%01 Fast NFO (2024)/poster.jpg'
-                   AND item_images.image_type = 'POSTER'",
-            )
-            .fetch_one(database.pool())
-            .await?;
-            let local_batch_running: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM scan_local_metadata_batches
-                 WHERE job_id = ? AND status = 'RUNNING'",
-            )
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-            if poster_count > 0 && local_batch_running > 0 {
-                return Ok::<_, sqlx::Error>(true);
+    let observations = async {
+        let poster_visible_before_nfo = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let poster_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM item_images
+                     WHERE item_images.local_path LIKE '%01 Fast NFO (2024)/poster.jpg'
+                       AND item_images.image_type = 'POSTER'",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                let local_batch_running: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM scan_local_metadata_batches
+                     WHERE job_id = ? AND status = 'RUNNING'",
+                )
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+                if poster_count > 0 && local_batch_running > 0 {
+                    return Ok::<_, sqlx::Error>(true);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or(Ok(false))?;
+        })
+        .await
+        .unwrap_or(Ok(false))?;
 
-    let queue_state: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM scan_local_metadata_batches
-         WHERE job_id = ? GROUP BY status ORDER BY status",
-    )
-    .bind(&job.id)
-    .fetch_all(database.pool())
-    .await?;
-    let scan_state: (String, String) =
-        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-    let image_paths: Vec<(String, String)> = sqlx::query_as(
-        "SELECT item_images.image_type, item_images.local_path FROM item_images
-         JOIN media_items ON media_items.id = item_images.item_id
-         ORDER BY media_items.sort_title LIMIT 10",
-    )
-    .fetch_all(database.pool())
-    .await?;
-    let early_claim_states: Vec<String> =
-        sqlx::query_scalar("SELECT state FROM test_local_metadata_claim_states")
-            .fetch_all(database.pool())
-            .await?;
-    let scan_finished_before_nfo_unblocked =
-        tokio::time::timeout(Duration::from_secs(30), &mut scan)
-            .await
-            .is_ok();
+        let queue_state: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM scan_local_metadata_batches
+             WHERE job_id = ? GROUP BY status ORDER BY status",
+        )
+        .bind(&job.id)
+        .fetch_all(database.pool())
+        .await?;
+        let scan_state: (String, String) =
+            sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        let image_paths: Vec<(String, String)> = sqlx::query_as(
+            "SELECT item_images.image_type, item_images.local_path FROM item_images
+             JOIN media_items ON media_items.id = item_images.item_id
+             ORDER BY media_items.sort_title LIMIT 10",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        let early_claim_states: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM test_local_metadata_claim_states")
+                .fetch_all(database.pool())
+                .await?;
+        let scan_finished_before_nfo_unblocked =
+            tokio::time::timeout(Duration::from_secs(30), &mut scan)
+                .await
+                .is_ok();
 
-    // Release the NFO read whether the assertion passes or fails, so the worker can exit.
-    tokio::fs::write(&nfo_path, b"<movie><title>Slow NFO</title></movie>").await?;
-    if !scan_finished_before_nfo_unblocked {
-        scan.await??;
+        Ok::<_, Box<dyn std::error::Error>>((
+            poster_visible_before_nfo,
+            queue_state,
+            scan_state,
+            image_paths,
+            early_claim_states,
+            scan_finished_before_nfo_unblocked,
+        ))
+    }
+    .await;
+    // Release the FIFO before propagating any snapshot-query error so a blocking
+    // NFO reader cannot hold Tokio runtime shutdown open.
+    let nfo_release = tokio::fs::write(&nfo_path, b"<movie><title>Slow NFO</title></movie>").await;
+    let scan_finished_before_nfo_unblocked = observations
+        .as_ref()
+        .map(|snapshot| snapshot.5)
+        .unwrap_or(false);
+    let scan_result = if scan_finished_before_nfo_unblocked {
+        None
+    } else {
+        Some(scan.await)
+    };
+    let (
+        poster_visible_before_nfo,
+        queue_state,
+        scan_state,
+        image_paths,
+        early_claim_states,
+        scan_finished_before_nfo_unblocked,
+    ) = observations?;
+    nfo_release?;
+    if let Some(scan_result) = scan_result {
+        scan_result??;
     }
     wait_for_local_metadata_batches(&database, &job.id).await?;
 
@@ -853,7 +930,6 @@ async fn blocked_first_local_poster_does_not_block_manifest_scan()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         ffi::CString,
-        io::Write,
         os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
         time::Duration,
     };
@@ -884,6 +960,8 @@ async fn blocked_first_local_poster_does_not_block_manifest_scan()
     ))
     .write_to(&mut poster_png, image::ImageFormat::Png)?;
     tokio::fs::write(second_movie_dir.join("poster.png"), poster_png.get_ref()).await?;
+    let mut poster_release =
+        FifoReadReleaseGuard::new(&blocked_poster, poster_png.get_ref().clone());
 
     let database = Database::connect(&config).await?;
     let libraries = LibraryService::new(database.clone());
@@ -946,13 +1024,9 @@ async fn blocked_first_local_poster_does_not_block_manifest_scan()
         .ok();
     let scan_finished_while_poster_blocked = completed_scan.is_some();
 
-    // Always release the FIFO so a failed assertion cannot leave the worker stuck.
-    if let Some(writer) = fifo_writer.as_mut() {
-        writer.write_all(poster_png.get_ref())?;
-        drop(fifo_writer.take());
-    } else {
-        tokio::fs::remove_file(&blocked_poster).await?;
-    }
+    drop(fifo_writer.take());
+    // Release the FIFO even if an earlier assertion or query returns an error.
+    poster_release.release()?;
     if let Some(result) = completed_scan {
         result??;
     } else {
@@ -991,12 +1065,7 @@ async fn blocked_first_local_poster_does_not_block_manifest_scan()
 #[tokio::test]
 async fn cancelling_scan_during_running_local_image_claim_cancels_before_completeness()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::{
-        ffi::CString,
-        io::Write,
-        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-        time::Duration,
-    };
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Duration};
 
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1020,6 +1089,7 @@ async fn cancelling_scan_during_running_local_image_claim_cancels_before_complet
         image::Rgba([76, 54, 32, 255]),
     ))
     .write_to(&mut poster_png, image::ImageFormat::Png)?;
+    let mut poster_release = FifoReadReleaseGuard::new(&poster_path, poster_png.get_ref().clone());
 
     let database = Database::connect(&config).await?;
     let libraries = LibraryService::new(database.clone());
@@ -1070,28 +1140,6 @@ async fn cancelling_scan_during_running_local_image_claim_cancels_before_complet
     })
     .await
     .unwrap_or(Ok(false))?;
-    let mut fifo_writer = if claimed {
-        Some(
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match std::fs::OpenOptions::new()
-                        .write(true)
-                        .custom_flags(libc::O_NONBLOCK)
-                        .open(&poster_path)
-                    {
-                        Ok(writer) => return Ok::<_, std::io::Error>(writer),
-                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            })
-            .await??,
-        )
-    } else {
-        None
-    };
     if claimed {
         jobs.cancel(&job.id).await?;
     }
@@ -1101,13 +1149,8 @@ async fn cancelling_scan_during_running_local_image_claim_cancels_before_complet
         false
     };
 
-    // Release the blocked image read even if cancellation did not reach the terminal state.
-    if let Some(writer) = fifo_writer.as_mut() {
-        writer.write_all(poster_png.get_ref())?;
-        drop(fifo_writer.take());
-    } else {
-        tokio::fs::remove_file(&poster_path).await?;
-    }
+    // Release the blocked image read even if an assertion or query above returns early.
+    poster_release.release()?;
     let batch: (String, Option<i64>) = sqlx::query_as(
         "SELECT status, images_completed_at FROM scan_local_metadata_batches
          WHERE job_id = ? LIMIT 1",

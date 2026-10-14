@@ -230,6 +230,8 @@ fn error_label(value: &str) -> String {
     let label = match value {
         "ITEM_FAILED" => "媒体项目处理失败",
         "ITEM_ISSUES" => "部分媒体存在问题",
+        "DISPATCH_FAILED" => "任务未能加入执行队列，可重试",
+        "QUEUE_INCOMPLETE" => "任务未处理完即中断，可重试",
         "DEFERRED_PROVIDER_UNAVAILABLE" => "元数据服务暂不可用",
         "LIBRARY_NOT_FOUND" => "媒体库不存在",
         "JOB_NOT_FOUND" => "任务不存在",
