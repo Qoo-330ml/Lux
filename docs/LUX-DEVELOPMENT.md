@@ -11139,13 +11139,15 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] SQLite migration 可从空库运行且能从当前 schema 升级；PostgreSQL migration 与其语义一致，已发布 migration checksum 不变。
-- [ ] 既有 job 获得显式来源默认值，来源字段有必要索引且不出现在 API DTO。
-- [ ] SQLite 与 PostgreSQL migration/旧数据默认值回归通过。
+- [x] SQLite migration 可从空库运行且能从当前 schema 升级；PostgreSQL migration 与其语义一致，已发布 migration checksum 不变。
+- [x] 既有 job 获得显式来源默认值，来源字段有必要索引且不出现在 API DTO。
+- [x] SQLite 空库与旧数据升级回归通过；PostgreSQL bootstrap/旧 schema regression 验证默认值和 partial index，并在本机服务可用时运行 ignored target（本机无服务，执行情况见结果）。
 
-预计文件：`migrations/0169_metadata_reidentify_dispatch_source.sql`、`migrations-postgres/0169_metadata_reidentify_dispatch_source.sql`、`tests/storage.rs`、本文档。
+预计文件：`migrations/0169_metadata_reidentify_dispatch_source.sql`、`migrations-postgres/0169_metadata_reidentify_dispatch_source.sql`、`tests/storage.rs`、`tests/postgres_database.rs`、本文档。
 
-验证：SQLite migration target 与 PostgreSQL migration target；`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+验证：`tests/storage.rs` SQLite migration targets；本机 PostgreSQL 可用时运行 `tests/postgres_database.rs` bootstrap migration target；`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+实施结果（2026-10-14）：追加 SQLite/PostgreSQL 0169 migration，`dispatch_source` 默认 `EXPLICIT` 并限制为 `EXPLICIT/AUTOMATIC`；部分索引只收录未取消的自动 FILL_MISSING QUEUED job。SQLite 旧 schema 记录保留原状态并读到显式默认值，空库能建立字段和索引；已发布 migration 未改。`cargo test --locked --test storage` 53/53 通过，格式检查与 diff 检查通过。PostgreSQL bootstrap 回归已补默认值和索引断言，但本机没有 Docker daemon 或 PostgreSQL server，`--include-ignored` 运行因 `PoolTimedOut` 未能验证数据库执行；该服务端运行限制在阶段 27 最终记录中保留。
 
 #### LUX-529：自动与显式补缺事务分流
 
