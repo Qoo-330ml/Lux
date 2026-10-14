@@ -23,6 +23,15 @@ struct GlobalCollectionSyncMember {
     collection_title: String,
 }
 
+struct GlobalGeneratedMediaItem<'a> {
+    item_type: &'a str,
+    identity_key: &'a str,
+    title: &'a str,
+    sort_title: &'a str,
+    overview: Option<&'a str>,
+    has_available_source: bool,
+}
+
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
                  SELECT 1
@@ -6348,12 +6357,14 @@ impl Database {
             let work_item_id = self
                 .ensure_global_generated_media_item(
                     &mut transaction,
-                    "MOVIE",
-                    &identity_key,
-                    title,
-                    sort_title,
-                    overview.as_deref(),
-                    true,
+                    GlobalGeneratedMediaItem {
+                        item_type: "MOVIE",
+                        identity_key: &identity_key,
+                        title,
+                        sort_title,
+                        overview: overview.as_deref(),
+                        has_available_source: true,
+                    },
                 )
                 .await?;
             self.query(
@@ -6448,19 +6459,22 @@ impl Database {
             });
         if let Some(collection_title) = collection_title {
             let is_visible = members.len() >= 2;
+            let identity_key = global_generated_identity_key(
+                "collection",
+                collection_provider,
+                collection_provider_id,
+            );
             let collection_item_id = self
                 .ensure_global_generated_media_item(
                     &mut transaction,
-                    "BOX_SET",
-                    &global_generated_identity_key(
-                        "collection",
-                        collection_provider,
-                        collection_provider_id,
-                    ),
-                    &collection_title,
-                    &collection_title.to_lowercase(),
-                    None,
-                    is_visible,
+                    GlobalGeneratedMediaItem {
+                        item_type: "BOX_SET",
+                        identity_key: &identity_key,
+                        title: &collection_title,
+                        sort_title: &collection_title.to_lowercase(),
+                        overview: None,
+                        has_available_source: is_visible,
+                    },
                 )
                 .await?;
             self.query(
@@ -6573,16 +6587,11 @@ impl Database {
     async fn ensure_global_generated_media_item(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        item_type: &str,
-        identity_key: &str,
-        title: &str,
-        sort_title: &str,
-        overview: Option<&str>,
-        has_available_source: bool,
+        item: GlobalGeneratedMediaItem<'_>,
     ) -> Result<String, StorageError> {
         let existing_id = self
             .query_scalar::<String>("SELECT id FROM media_items WHERE identity_key = ?")
-            .bind(identity_key)
+            .bind(item.identity_key)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -6602,11 +6611,11 @@ impl Database {
                  WHERE id = ?",
             )
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
-            .bind(item_type)
-            .bind(title)
-            .bind(sort_title)
-            .bind(overview)
-            .bind(database_flag(has_available_source))
+            .bind(item.item_type)
+            .bind(item.title)
+            .bind(item.sort_title)
+            .bind(item.overview)
+            .bind(database_flag(item.has_available_source))
             .bind(&id)
             .execute(&mut **transaction)
             .await
@@ -6623,12 +6632,12 @@ impl Database {
             )
             .bind(&id)
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
-            .bind(item_type)
-            .bind(title)
-            .bind(sort_title)
-            .bind(overview)
-            .bind(identity_key)
-            .bind(database_flag(has_available_source))
+            .bind(item.item_type)
+            .bind(item.title)
+            .bind(item.sort_title)
+            .bind(item.overview)
+            .bind(item.identity_key)
+            .bind(database_flag(item.has_available_source))
             .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -8681,7 +8690,7 @@ mod tests {
             )
             .await?;
         assert_eq!(alpha_total, 1);
-        assert_eq!(
+        assert!(
             database
                 .set_global_collection_source_preference(
                     &viewer.id.to_string(),
@@ -8691,11 +8700,10 @@ mod tests {
                     "visible-alpha-one",
                     None,
                 )
-                .await?,
-            true
+                .await?
         );
-        assert_eq!(
-            database
+        assert!(
+            !database
                 .set_global_collection_source_preference(
                     &viewer.id.to_string(),
                     false,
@@ -8704,8 +8712,7 @@ mod tests {
                     "hidden-alpha-one",
                     None,
                 )
-                .await?,
-            false
+                .await?
         );
         let sources = database
             .list_global_collection_sources_for_works(
