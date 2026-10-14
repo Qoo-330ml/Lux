@@ -4525,6 +4525,166 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        self.save_media_probe_in_transaction(&mut transaction, &update)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn save_media_probe_for_scan_file_change(
+        &self,
+        job_id: &str,
+        change: &StoredScanJobPath,
+        updates: &[MediaProbeUpdate<'_>],
+        clear_source_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        let Some(revision) = change.file_change_revision else {
+            return Err(StorageError::Conflict(
+                "scan file change is missing its revision".to_owned(),
+            ));
+        };
+        if !matches!(change.change_kind.as_str(), "ADD" | "CHANGE" | "REMOVE")
+            || (change.change_kind == "REMOVE" && !updates.is_empty())
+            || (change.change_kind != "REMOVE" && !clear_source_ids.is_empty())
+        {
+            return Err(StorageError::Conflict(
+                "invalid media info file update".to_owned(),
+            ));
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let current = self
+            .query_scalar::<i64>(
+                "SELECT 1 FROM scan_job_file_changes
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ? AND processing_state = 'RUNNING'
+                 LIMIT 1",
+            )
+            .bind(job_id)
+            .bind(&change.library_root_id)
+            .bind(&change.relative_path)
+            .bind(revision)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !current {
+            return Ok(false);
+        }
+
+        for update in updates {
+            self.save_media_probe_in_transaction(&mut transaction, update)
+                .await?;
+            self.query(
+                "UPDATE scan_job_targets
+                 SET probe_state = 'DONE', error = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND target_type = 'SOURCE' AND target_id = ?",
+            )
+            .bind(job_id)
+            .bind(update.source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        for source_id in clear_source_ids {
+            self.query(
+                "UPDATE media_sources
+                 SET container = NULL, size = NULL, duration_ticks = NULL, bitrate = NULL,
+                     probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 WHERE id = ? AND source_kind = 'STRM_URL'",
+            )
+            .bind(source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE scan_job_targets
+                 SET probe_state = 'SKIPPED', error = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND target_type = 'SOURCE' AND target_id = ?",
+            )
+            .bind(job_id)
+            .bind(source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query("DELETE FROM media_streams WHERE media_source_id = ?")
+                .bind(source_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query("DELETE FROM media_info_chapters WHERE media_source_id = ?")
+                .bind(source_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let completed = self
+            .query(
+                "UPDATE scan_job_file_changes
+                 SET processing_state = 'DONE', error = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ? AND processing_state = 'RUNNING'",
+            )
+            .bind(job_id)
+            .bind(&change.library_root_id)
+            .bind(&change.relative_path)
+            .bind(revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1;
+        if !completed {
+            return Ok(false);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    async fn save_media_probe_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        update: &MediaProbeUpdate<'_>,
+    ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_sources
              SET container = CASE
@@ -4542,7 +4702,7 @@ impl Database {
         .bind(update.duration_ticks)
         .bind(update.bitrate)
         .bind(update.source_id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
@@ -4550,7 +4710,7 @@ impl Database {
         })?;
         self.query("DELETE FROM media_streams WHERE media_source_id = ?")
             .bind(update.source_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -4584,7 +4744,7 @@ impl Database {
                     .bind(database_flag(stream.is_forced));
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -4593,7 +4753,7 @@ impl Database {
         }
         self.query("DELETE FROM media_info_chapters WHERE media_source_id = ?")
             .bind(update.source_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -4610,20 +4770,14 @@ impl Database {
             .bind(chapter.start_position_ticks)
             .bind(&chapter.name)
             .bind(chapter.chapter_index)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(())
     }
 
     pub(crate) async fn list_series_metadata_sources_page(

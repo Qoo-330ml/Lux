@@ -1374,8 +1374,32 @@ fn is_strm_path(path: &Path) -> bool {
 async fn read_media_info_sidecar(path: &Path) -> Option<MediaProbeResult> {
     let stem = path.file_stem()?.to_str()?;
     let sidecar = path.with_file_name(format!("{stem}-mediainfo.json"));
-    let bytes = fs::read(sidecar).await.ok()?;
-    parse_media_info_json(&bytes).ok()
+    read_media_info_sidecar_file(&sidecar).await.ok()
+}
+
+pub(crate) async fn read_media_info_sidecar_file(
+    path: &Path,
+) -> Result<MediaProbeResult, ProbeError> {
+    let file = fs::File::open(path).await.map_err(ProbeError::Io)?;
+    let bytes = read_limited(file, MAX_OUTPUT_BYTES).await?;
+    parse_media_info_json(&bytes)
+}
+
+pub(crate) async fn read_media_info_sidecar_from_root(
+    root_path: &str,
+    relative_path: &str,
+) -> Result<MediaProbeResult, ProbeError> {
+    let path = safe_media_path(root_path, relative_path).map_err(|_| {
+        ProbeError::InvalidOutput("media info path is outside its library root".to_owned())
+    })?;
+    let root = fs::canonicalize(root_path).await.map_err(ProbeError::Io)?;
+    let path = fs::canonicalize(path).await.map_err(ProbeError::Io)?;
+    if !path.starts_with(root) {
+        return Err(ProbeError::InvalidOutput(
+            "media info path is outside its library root".to_owned(),
+        ));
+    }
+    read_media_info_sidecar_file(&path).await
 }
 
 async fn read_existing_media_info_sidecar(target: &Path) -> Result<Option<Value>, ProbeError> {

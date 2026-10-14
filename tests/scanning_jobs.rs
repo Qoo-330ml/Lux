@@ -6901,9 +6901,10 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
         b"poster fixture",
     )
     .await?;
-    libraries
+    let root_record = libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
-        .await?;
+        .await?
+        .root;
 
     let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
     fs::write(
@@ -6920,7 +6921,8 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
     );
-    jobs.run_to_completion(&job.id, 100, Some(probe)).await?;
+    jobs.run_to_completion(&job.id, 100, Some(probe.clone()))
+        .await?;
 
     let source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
         "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
@@ -6973,6 +6975,152 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
             "Remote Movie (2022)/Remote.Movie.2022-poster.jpg".to_owned(),
             "Remote Movie (2022)/Remote.Movie.2022.strm".to_owned(),
         ]
+    );
+
+    tokio::fs::write(
+        movie_dir.join("Remote.Movie.2022-mediainfo.json"),
+        br#"[{"MediaSourceInfo":{"Container":"mkv","RunTimeTicks":600000000,"Bitrate":256000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"hevc"},{"Index":1,"Type":"Audio","Codec":"aac"}]}}]"#,
+    )
+    .await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&changed.id, 100, Some(probe.clone()))
+        .await?;
+    let changed_source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        changed_source,
+        (
+            "mkv".to_owned(),
+            Some(600000000),
+            Some(256000),
+            "READY".to_owned()
+        )
+    );
+    let changed_streams: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT mts.stream_index, mts.stream_type, mts.codec
+         FROM media_streams mts
+         JOIN media_sources ms ON ms.id = mts.media_source_id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'
+         ORDER BY mts.stream_index",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        changed_streams,
+        vec![
+            (0, "VIDEO".to_owned(), "hevc".to_owned()),
+            (1, "AUDIO".to_owned(), "aac".to_owned()),
+        ]
+    );
+    let sidecar_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&changed.id)
+    .bind("Remote Movie (2022)/Remote.Movie.2022-mediainfo.json")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(sidecar_state, "DONE");
+
+    let sidecar_path = movie_dir.join("Remote.Movie.2022-mediainfo.json");
+    tokio::fs::write(&sidecar_path, b"{not valid JSON").await?;
+    let invalid = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&invalid.id, 100, Some(probe.clone()))
+        .await?;
+    let invalid_source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(invalid_source, changed_source);
+    let invalid_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT processing_state, error FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&invalid.id)
+    .bind("Remote Movie (2022)/Remote.Movie.2022-mediainfo.json")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        invalid_state,
+        ("FAILED".to_owned(), Some("INVALID_MEDIA_INFO".to_owned()))
+    );
+
+    tokio::fs::remove_file(&sidecar_path).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, Some(probe.clone()))
+        .await?;
+    let removed_source: (Option<String>, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_source, (None, None, None, "PENDING".to_owned()));
+    let removed_stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         JOIN media_sources ON media_sources.id = media_streams.media_source_id
+         JOIN filesystem_entries fe ON fe.id = media_sources.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_stream_count, 0);
+    let removed_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&removed.id)
+    .bind("Remote Movie (2022)/Remote.Movie.2022-mediainfo.json")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_state, "DONE");
+
+    tokio::fs::write(
+        &sidecar_path,
+        br#"[{"MediaSourceInfo":{"Container":"webm","RunTimeTicks":900000000,"Bitrate":512000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"vp9"}]}}]"#,
+    )
+    .await?;
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Remote Movie (2022)/Remote.Movie.2022-mediainfo.json".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&incremental.id, 100, Some(probe.clone()))
+        .await?;
+    let incremental_source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        incremental_source,
+        (
+            "webm".to_owned(),
+            Some(900000000),
+            Some(512000),
+            "READY".to_owned()
+        )
     );
     Ok(())
 }

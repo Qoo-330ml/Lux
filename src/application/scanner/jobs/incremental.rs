@@ -75,6 +75,8 @@ impl ScanJobService {
     ) -> Result<ScanBatchReport, ScanJobError> {
         self.process_queued_external_subtitle_changes(&job.id, batch_size, cancellation)
             .await?;
+        self.process_queued_media_info_changes(&job.id, batch_size, cancellation)
+            .await?;
         if self
             .cancellation_requested(&job.id, job.cancel_requested, cancellation)
             .await?
