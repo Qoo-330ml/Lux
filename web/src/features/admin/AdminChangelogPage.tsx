@@ -15,6 +15,24 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.0",
+    date: "2026-10-14",
+    sections: [
+      { kind: "added", items: [
+        "管理员可查看媒体库扫描与元数据补全的活动状态和进度。",
+        "新增 Lux 项目介绍网站与使用指南，并配置 GitHub Pages 部署工作流。",
+      ] },
+      { kind: "changed", items: [
+        "自动补全队列区分扫描触发的自动任务与管理员显式识别任务，可配置自动补全并发度并持续处理排队项目。",
+        "调整媒体详情页的媒体轨道和元数据布局；首页主视觉加载期间隐藏空白文案。",
+      ] },
+      { kind: "fixed", items: [
+        "修复元数据任务未处理完全部项目时误报成功、无法派发时长期排队，以及服务重启后中断任务未恢复的问题。",
+        "修复 SQLite 0126 时间戳迁移无法兼容已发布数据库升级的问题。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.25",
     date: "2026-10-13",
     sections: [
