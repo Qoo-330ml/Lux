@@ -18,8 +18,9 @@ use crate::{
         daily_recommendation_items, recommendation_library_scope_key,
     },
     storage::{
-        CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, ResumeItemsQuery,
-        StorageError, StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter,
+        CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database,
+        GLOBAL_COLLECTION_LIBRARY_ID, ResumeItemsQuery, StorageError, StoredCatalogDetail,
+        StoredCatalogRow, StoredMediaChapter,
     },
 };
 
@@ -417,6 +418,220 @@ impl CatalogService {
         self.library_page_cache.invalidate();
     }
 
+    pub async fn list_global_collection_cards(
+        &self,
+        principal: AccessPrincipal,
+        offset: i64,
+        limit: i64,
+    ) -> Result<GlobalCollectionPage, CatalogError> {
+        let (stored_cards, total) = self
+            .database
+            .list_global_collection_cards_page(
+                &principal.user_id_string(),
+                principal.is_admin,
+                offset,
+                limit,
+            )
+            .await?;
+        let item_ids = stored_cards
+            .iter()
+            .map(|card| card.item_id.clone())
+            .collect::<Vec<_>>();
+        let mut items_by_id =
+            assemble_items(self.database.list_catalog_rows_by_ids(&item_ids).await?)
+                .into_iter()
+                .map(|item| (item.id.clone(), item))
+                .collect::<HashMap<_, _>>();
+        let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
+        let mut cards = Vec::with_capacity(stored_cards.len());
+        for stored in stored_cards {
+            let Some(mut item) = items_by_id.remove(&stored.item_id) else {
+                continue;
+            };
+            if let Some(detail) = details.get(&stored.item_id) {
+                apply_catalog_detail(&mut item, detail);
+            }
+            if item.poster_image_tag.is_none() {
+                item.poster_image_tag = stored.poster_image_tag;
+            }
+            cards.push(GlobalCollectionCard {
+                item,
+                member_count: stored.member_count,
+                poster_item_id: stored.poster_item_id,
+            });
+        }
+        Ok(GlobalCollectionPage {
+            cards,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn find_global_collection_card(
+        &self,
+        principal: AccessPrincipal,
+        collection_item_id: &str,
+    ) -> Result<Option<GlobalCollectionCard>, CatalogError> {
+        let Some(mut item) = self.find_item(principal, collection_item_id).await? else {
+            return Ok(None);
+        };
+        if item.library_id != GLOBAL_COLLECTION_LIBRARY_ID || item.item_type != "BOX_SET" {
+            return Ok(None);
+        }
+        let (member_ids, member_count) = self
+            .database
+            .list_global_collection_member_ids_page(
+                collection_item_id,
+                &principal.user_id_string(),
+                principal.is_admin,
+                0,
+                1,
+            )
+            .await?;
+        if member_count == 0 {
+            return Ok(None);
+        }
+        let mut poster_item_id = None;
+        if item.poster_image_tag.is_none() && !member_ids.is_empty() {
+            let work_sources = self
+                .global_collection_sources_for_works(principal, &member_ids)
+                .await?;
+            if let Some(source) = work_sources.first().and_then(|work| {
+                work.copies
+                    .iter()
+                    .find(|copy| copy.poster_image_tag.is_some())
+            }) {
+                item.poster_image_tag = source.poster_image_tag.clone();
+                poster_item_id = Some(source.item_id.clone());
+            }
+        } else if item.poster_image_tag.is_some() {
+            poster_item_id = Some(item.id.clone());
+        }
+        Ok(Some(GlobalCollectionCard {
+            item,
+            member_count,
+            poster_item_id,
+        }))
+    }
+
+    pub async fn list_global_collection_members(
+        &self,
+        principal: AccessPrincipal,
+        collection_item_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<GlobalCollectionMembersPage, CatalogError> {
+        let (member_ids, total) = self
+            .database
+            .list_global_collection_member_ids_page(
+                collection_item_id,
+                &principal.user_id_string(),
+                principal.is_admin,
+                offset,
+                limit,
+            )
+            .await?;
+        if total == 0 {
+            return Err(CatalogError::AccessDenied);
+        }
+        let mut page = self
+            .catalog_page_from_ids(member_ids.clone(), total, offset, limit)
+            .await?;
+        let mut sources_by_work = self
+            .global_collection_sources_for_works(principal, &member_ids)
+            .await?
+            .into_iter()
+            .map(|work| (work.work_item_id.clone(), work))
+            .collect::<HashMap<_, _>>();
+        let mut members = Vec::with_capacity(page.items.len());
+        for item in page.items.drain(..) {
+            let source_group = sources_by_work.remove(&item.id);
+            members.push(GlobalCollectionMember {
+                item,
+                sources: source_group
+                    .as_ref()
+                    .map(|group| group.copies.clone())
+                    .unwrap_or_default(),
+                preferred_source_item_id: source_group
+                    .and_then(|group| group.preferred_source_item_id),
+            });
+        }
+        Ok(GlobalCollectionMembersPage {
+            members,
+            total: page.total,
+            offset,
+            limit,
+        })
+    }
+
+    async fn global_collection_sources_for_works(
+        &self,
+        principal: AccessPrincipal,
+        work_item_ids: &[String],
+    ) -> Result<Vec<GlobalCollectionWorkSources>, CatalogError> {
+        let stored_sources = self
+            .database
+            .list_global_collection_sources_for_works(
+                work_item_ids,
+                &principal.user_id_string(),
+                principal.is_admin,
+            )
+            .await?;
+        let mut groups = Vec::<GlobalCollectionWorkSources>::new();
+        let mut group_indices = HashMap::<String, usize>::new();
+        let mut copy_indices = HashMap::<(String, String), usize>::new();
+        for source in stored_sources {
+            let work_index = match group_indices.get(&source.work_item_id).copied() {
+                Some(index) => index,
+                None => {
+                    let index = groups.len();
+                    group_indices.insert(source.work_item_id.clone(), index);
+                    groups.push(GlobalCollectionWorkSources {
+                        work_item_id: source.work_item_id.clone(),
+                        copies: Vec::new(),
+                        preferred_source_item_id: None,
+                    });
+                    index
+                }
+            };
+            let group = &mut groups[work_index];
+            if group.preferred_source_item_id.is_none() && source.last_played_at.is_some() {
+                group.preferred_source_item_id = Some(source.source_item_id.clone());
+            }
+            let copy_key = (source.work_item_id.clone(), source.source_item_id.clone());
+            let copy_index = match copy_indices.get(&copy_key).copied() {
+                Some(index) => index,
+                None => {
+                    let index = group.copies.len();
+                    copy_indices.insert(copy_key, index);
+                    group.copies.push(GlobalCollectionSourceCopy {
+                        item_id: source.source_item_id.clone(),
+                        library_id: source.library_id.clone(),
+                        library_name: source.library_name.clone(),
+                        title: source.title.clone(),
+                        poster_image_tag: source.poster_image_tag.clone(),
+                        versions: Vec::new(),
+                    });
+                    index
+                }
+            };
+            if let Some(id) = source.media_source_id {
+                let version = GlobalCollectionSourceVersion {
+                    id,
+                    edition_name: source.edition_name,
+                    quality_label: source.quality_label,
+                    container: source.container,
+                };
+                let versions = &mut group.copies[copy_index].versions;
+                if !versions.iter().any(|existing| existing.id == version.id) {
+                    versions.push(version);
+                }
+            }
+        }
+        Ok(groups)
+    }
+
     pub async fn count_item_types(
         &self,
         principal: AccessPrincipal,
@@ -791,6 +1006,30 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        if self
+            .database
+            .find_item_library_id(collection_item_id)
+            .await?
+            .as_deref()
+            == Some(GLOBAL_COLLECTION_LIBRARY_ID)
+        {
+            let (member_ids, total) = self
+                .database
+                .list_global_collection_member_ids_page(
+                    collection_item_id,
+                    &principal.user_id_string(),
+                    principal.is_admin,
+                    offset,
+                    limit,
+                )
+                .await?;
+            if total == 0 {
+                return Err(CatalogError::AccessDenied);
+            }
+            return self
+                .catalog_page_from_ids(member_ids, total, offset, limit)
+                .await;
+        }
         if !self
             .access
             .can_view_item(principal, collection_item_id)
@@ -812,6 +1051,17 @@ impl CatalogService {
                 limit,
             )
             .await?;
+        self.catalog_page_from_ids(member_ids, total, offset, limit)
+            .await
+    }
+
+    async fn catalog_page_from_ids(
+        &self,
+        member_ids: Vec<String>,
+        total: i64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
         let rows = self.database.list_catalog_rows_by_ids(&member_ids).await?;
         let mut items_by_id = assemble_items(rows)
             .into_iter()
@@ -1231,13 +1481,45 @@ impl CatalogService {
         principal: AccessPrincipal,
         item_id: &str,
     ) -> Result<Option<CatalogItem>, CatalogError> {
-        if !self.access.can_view_item(principal, item_id).await? {
+        let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
             return Ok(None);
-        }
+        };
         let rows = self.database.find_catalog_rows(item_id).await?;
         let Some(mut item) = assemble_items(rows).into_iter().next() else {
             return Ok(None);
         };
+        if library_id == GLOBAL_COLLECTION_LIBRARY_ID {
+            let visible = match item.item_type.as_str() {
+                "BOX_SET" => {
+                    let (_, total) = self
+                        .database
+                        .list_global_collection_member_ids_page(
+                            item_id,
+                            &principal.user_id_string(),
+                            principal.is_admin,
+                            0,
+                            1,
+                        )
+                        .await?;
+                    total > 0
+                }
+                "MOVIE" => {
+                    let sources = self
+                        .global_collection_sources_for_works(
+                            principal,
+                            std::slice::from_ref(&item.id),
+                        )
+                        .await?;
+                    sources.iter().any(|work| !work.copies.is_empty())
+                }
+                _ => false,
+            };
+            if !visible {
+                return Ok(None);
+            }
+        } else if !self.access.can_view_item(principal, item_id).await? {
+            return Ok(None);
+        }
         if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
             apply_catalog_detail(&mut item, &detail);
         }
@@ -1621,6 +1903,61 @@ pub struct CatalogPage {
     pub total: i64,
     pub offset: i64,
     pub limit: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionCard {
+    pub item: CatalogItem,
+    pub member_count: i64,
+    pub poster_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionPage {
+    pub cards: Vec<GlobalCollectionCard>,
+    pub total: i64,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionMember {
+    pub item: CatalogItem,
+    pub sources: Vec<GlobalCollectionSourceCopy>,
+    pub preferred_source_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionMembersPage {
+    pub members: Vec<GlobalCollectionMember>,
+    pub total: i64,
+    pub offset: i64,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionSourceCopy {
+    pub item_id: String,
+    pub library_id: String,
+    pub library_name: String,
+    pub title: String,
+    pub poster_image_tag: Option<String>,
+    pub versions: Vec<GlobalCollectionSourceVersion>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionSourceVersion {
+    pub id: String,
+    pub edition_name: Option<String>,
+    pub quality_label: Option<String>,
+    pub container: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GlobalCollectionWorkSources {
+    work_item_id: String,
+    copies: Vec<GlobalCollectionSourceCopy>,
+    preferred_source_item_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2327,5 +2664,164 @@ mod tests {
             .await
             .expect("a failed search flight must wake waiters");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn global_collection_catalog_uses_visible_source_libraries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, GLOBAL_COLLECTION_LIBRARY_ID},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let visible_library = libraries
+            .create_library("Visible Movies", LibraryKind::Movie, false)
+            .await?;
+        let hidden_library = libraries
+            .create_library("Hidden Movies", LibraryKind::Movie, false)
+            .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("catalog-viewer", "Catalog Viewer", "test password", false)
+            .await?;
+        database
+            .set_user_library_access(&user.id.to_string(), &visible_library.id.to_string(), true)
+            .await?;
+
+        for (item_id, library_id, movie_id) in [
+            (
+                "catalog-visible-movie",
+                visible_library.id.to_string(),
+                "movie-visible",
+            ),
+            (
+                "catalog-hidden-movie",
+                hidden_library.id.to_string(),
+                "movie-hidden",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, production_year,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 2020, 'ONLINE_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO collection_item_references (
+                     item_id, movie_provider, movie_provider_id, collection_provider,
+                     collection_provider_id, collection_title, sort_order
+                 ) VALUES (?, 'tmdb', ?, 'tmdb', 'catalog-series', 'Catalog Series', 2020)",
+            )
+            .bind(item_id)
+            .bind(movie_id)
+            .execute(database.pool())
+            .await?;
+        }
+        for job in database.list_pending_global_collection_syncs(10).await? {
+            database
+                .sync_global_collection(
+                    &job.collection_provider,
+                    &job.collection_provider_id,
+                    job.generation,
+                )
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+             VALUES ('catalog-visible-poster', 'catalog-visible-movie', 'POSTER', 0, '/visible.jpg'),
+                    ('catalog-hidden-poster', 'catalog-hidden-movie', 'POSTER', 0, '/hidden.jpg')",
+        )
+        .execute(database.pool())
+        .await?;
+        let collection_item_id: String = sqlx::query_scalar(
+            "SELECT item_id FROM collections WHERE library_id = ? AND provider_id = 'catalog-series'",
+        )
+        .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+        .fetch_one(database.pool())
+        .await?;
+        let hidden_work_item_id: String = sqlx::query_scalar(
+            "SELECT work_item_id FROM collection_work_items WHERE movie_provider_id = 'movie-hidden'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+
+        let access = crate::application::access::MediaAccessService::new(database.clone());
+        let catalog = super::CatalogService::new(database.clone(), access.clone());
+        let principal = AccessPrincipal::new(user.id, false);
+        let physical_library_ids = access.accessible_library_ids(principal).await?;
+        assert_eq!(physical_library_ids, vec![visible_library.id.to_string()]);
+        assert!(
+            !access
+                .can_view_library(principal, GLOBAL_COLLECTION_LIBRARY_ID)
+                .await?
+        );
+
+        let page = catalog
+            .list_global_collection_cards(principal, 0, 10)
+            .await?;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.cards.len(), 1);
+        assert_eq!(page.cards[0].item.id, collection_item_id);
+        assert_eq!(page.cards[0].member_count, 1);
+        assert_eq!(
+            page.cards[0].poster_item_id.as_deref(),
+            Some("catalog-visible-movie")
+        );
+        assert_eq!(
+            page.cards[0].item.poster_image_tag.as_deref(),
+            Some("catalog-visible-poster")
+        );
+
+        assert!(
+            catalog
+                .find_item(principal, &collection_item_id)
+                .await?
+                .is_some()
+        );
+        assert!(
+            catalog
+                .find_item(principal, &hidden_work_item_id)
+                .await?
+                .is_none()
+        );
+        let members = catalog
+            .list_collection_items(principal, &collection_item_id, 0, 10)
+            .await?;
+        assert_eq!(members.total, 1);
+        assert_eq!(members.items.len(), 1);
+        assert_eq!(members.items[0].library_id, GLOBAL_COLLECTION_LIBRARY_ID);
+        let detailed_card = catalog
+            .find_global_collection_card(principal, &collection_item_id)
+            .await?
+            .ok_or("expected a visible global collection")?;
+        assert_eq!(
+            detailed_card.poster_item_id.as_deref(),
+            Some("catalog-visible-movie")
+        );
+        let detailed_members = catalog
+            .list_global_collection_members(principal, &collection_item_id, 0, 10)
+            .await?;
+        assert_eq!(detailed_members.total, 1);
+        assert_eq!(detailed_members.members[0].sources.len(), 1);
+        assert_eq!(
+            detailed_members.members[0].sources[0].item_id,
+            "catalog-visible-movie"
+        );
+        Ok(())
     }
 }

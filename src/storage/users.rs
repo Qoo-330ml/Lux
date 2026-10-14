@@ -980,6 +980,7 @@ impl Database {
             "SELECT l.id
              FROM libraries l
              WHERE l.is_enabled = 1
+               AND l.system_kind IS NULL
                AND (
                    NOT EXISTS (
                        SELECT 1 FROM user_library_access
@@ -1056,6 +1057,20 @@ impl Database {
                 version: row.get("version"),
             })
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_enabled_media_library_ids(&self) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id FROM libraries
+             WHERE is_enabled = 1 AND system_kind IS NULL
+             ORDER BY name, id",
+        )
+        .fetch_all(&self.pool)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

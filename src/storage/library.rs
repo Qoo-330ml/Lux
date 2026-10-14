@@ -574,7 +574,9 @@ impl Database {
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
-             FROM libraries ORDER BY name, id",
+             FROM libraries
+             WHERE system_kind IS NULL
+             ORDER BY name, id",
                 )
                 .fetch_all(&self.pool)
                 .await
