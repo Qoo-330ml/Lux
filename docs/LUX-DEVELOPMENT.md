@@ -11437,7 +11437,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 预计文件：兼容记录、本文档和阶段验收涉及的回归文件。
 
-实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。本机没有 PostgreSQL 实例，PostgreSQL 运行时用例仍按设计忽略。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub 当前没有可操作窗口，SenPlayer 和 Infuse 在本机不可用；合集客户端实测仍未完成，阶段门停在项目所有者确认点。
+实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。本机没有 PostgreSQL 实例，PostgreSQL 运行时用例仍按设计忽略。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub、SenPlayer、Infuse 客户端实测仍未完成，阶段门停在项目所有者确认点。
+
+2026-10-15 续查：VidHub 2.1.8、SenPlayer 6.0.6、Infuse 8.5.1 均已安装并启动，但 CUA 绑定原生窗口均返回 `-10005 cgWindowNotFound`，无法执行合集浏览、来源切换和进度回写。隔离浏览器访问本机服务停留在登录页；未改动现有本地用户或媒体数据。客户端验收继续保持未完成。
 
 ## 29. 参考资料
 
