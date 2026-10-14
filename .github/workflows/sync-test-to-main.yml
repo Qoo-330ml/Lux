@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Match main content to test
+    name: Merge test into main
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -27,7 +27,7 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Match main tree to test and push
+      - name: Merge and push test to main
         id: sync
         shell: bash
         run: |
@@ -35,16 +35,15 @@ jobs:
 
           git fetch origin main test
           git reset --hard origin/main
-          if [[ "$(git rev-parse 'origin/main^{tree}')" == "$(git rev-parse 'origin/test^{tree}')" ]]; then
+          if git merge-base --is-ancestor origin/test origin/main; then
             echo "updated=false" >> "$GITHUB_OUTPUT"
-            echo "main content already matches test."
+            echo "test is already included in main."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git read-tree --reset -u origin/test
-          git commit -m "Sync main content to test"
+          git merge --no-ff --no-edit origin/test
           git push origin HEAD:main
           echo "updated=true" >> "$GITHUB_OUTPUT"
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
