@@ -5890,7 +5890,8 @@ impl Database {
                     source_item.library_id, source_library.name AS library_name,
                     source_item.title, media_source.id AS media_source_id,
                     media_source.edition_name, media_source.quality_label, media_source.container,
-                    user_state.last_played_at,
+                    source_preference.source_item_id AS preferred_source_item_id,
+                    source_preference.media_source_id AS preferred_media_source_id,
                     (SELECT id FROM item_images
                      WHERE item_id = source_item.id AND image_type = 'POSTER'
                      ORDER BY image_index, id LIMIT 1) AS poster_image_tag
@@ -5908,8 +5909,14 @@ impl Database {
                         AND source_file.is_missing = 0
                   )
               )
-             LEFT JOIN user_item_state user_state
-               ON user_state.item_id = source_item.id AND user_state.user_id = ?
+             LEFT JOIN user_collection_source_preferences source_preference
+               ON source_preference.user_id = ?
+              AND source_preference.work_item_id = source_work.work_item_id
+              AND source_preference.source_item_id = source_item.id
+              AND (
+                  source_preference.media_source_id IS NULL
+                  OR source_preference.media_source_id = media_source.id
+              )
              WHERE source_work.work_item_id IN ({work_placeholders})
                AND source_item.item_type = 'MOVIE'
                AND source_item.removed_at IS NULL
@@ -5924,8 +5931,6 @@ impl Database {
                      AND visible_library.can_view = 1
                ))
              ORDER BY source_work.work_item_id,
-                      CASE WHEN user_state.last_played_at IS NULL THEN 1 ELSE 0 END,
-                      user_state.last_played_at DESC,
                       source_library.name, source_item.id,
                       media_source.is_default DESC, media_source.id"
         );
@@ -5956,10 +5961,94 @@ impl Database {
                 edition_name: row.get("edition_name"),
                 quality_label: row.get("quality_label"),
                 container: row.get("container"),
-                last_played_at: row.get("last_played_at"),
+                preferred_source_item_id: row.get("preferred_source_item_id"),
+                preferred_media_source_id: row.get("preferred_media_source_id"),
                 poster_image_tag: row.get("poster_image_tag"),
             })
             .collect())
+    }
+
+    pub(crate) async fn set_global_collection_source_preference(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        collection_item_id: &str,
+        work_item_id: &str,
+        source_item_id: &str,
+        media_source_id: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "INSERT INTO user_collection_source_preferences (
+                     user_id, work_item_id, source_item_id, media_source_id, updated_at
+                 )
+                 SELECT ?, ?, ?, ?, unixepoch()
+                 WHERE EXISTS (
+                     SELECT 1
+                     FROM collections collection
+                     JOIN collection_items member ON member.collection_id = collection.id
+                     JOIN collection_work_sources source_work
+                       ON source_work.work_item_id = member.item_id
+                     JOIN media_items source_item ON source_item.id = source_work.source_item_id
+                     JOIN libraries source_library
+                       ON source_library.id = source_item.library_id AND source_library.is_enabled = 1
+                     WHERE collection.item_id = ?
+                       AND collection.library_id = ?
+                       AND member.item_id = ?
+                       AND source_work.source_item_id = ?
+                       AND source_item.item_type = 'MOVIE'
+                       AND source_item.removed_at IS NULL
+                       AND source_item.has_available_source = 1
+                       AND (? = 1 OR NOT EXISTS (
+                           SELECT 1 FROM user_library_access any_visible_library
+                           WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
+                       ) OR EXISTS (
+                           SELECT 1 FROM user_library_access visible_library
+                           WHERE visible_library.user_id = ?
+                             AND visible_library.library_id = source_item.library_id
+                             AND visible_library.can_view = 1
+                       ))
+                       AND (
+                           ? IS NULL OR EXISTS (
+                               SELECT 1 FROM media_sources selected_source
+                               WHERE selected_source.id = ?
+                                 AND selected_source.item_id = source_item.id
+                                 AND (
+                                     selected_source.filesystem_entry_id IS NULL
+                                     OR EXISTS (
+                                         SELECT 1 FROM filesystem_entries selected_file
+                                         WHERE selected_file.id = selected_source.filesystem_entry_id
+                                           AND selected_file.is_missing = 0
+                                     )
+                                 )
+                           )
+                       )
+                 )
+                 ON CONFLICT (user_id, work_item_id) DO UPDATE SET
+                     source_item_id = excluded.source_item_id,
+                     media_source_id = excluded.media_source_id,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(user_id)
+            .bind(work_item_id)
+            .bind(source_item_id)
+            .bind(media_source_id)
+            .bind(collection_item_id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(work_item_id)
+            .bind(source_item_id)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(media_source_id)
+            .bind(media_source_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Rebuild one global collection and its logical movie works in one transaction.
@@ -8527,6 +8616,32 @@ mod tests {
             )
             .await?;
         assert_eq!(alpha_total, 1);
+        assert_eq!(
+            database
+                .set_global_collection_source_preference(
+                    &viewer.id.to_string(),
+                    false,
+                    &first_page[0].item_id,
+                    &alpha_member_ids[0],
+                    "visible-alpha-one",
+                    None,
+                )
+                .await?,
+            true
+        );
+        assert_eq!(
+            database
+                .set_global_collection_source_preference(
+                    &viewer.id.to_string(),
+                    false,
+                    &first_page[0].item_id,
+                    &alpha_member_ids[0],
+                    "hidden-alpha-one",
+                    None,
+                )
+                .await?,
+            false
+        );
         let sources = database
             .list_global_collection_sources_for_works(
                 &alpha_member_ids,
@@ -8537,7 +8652,11 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source_item_id, "visible-alpha-one");
         assert_eq!(sources[0].library_id, visible_library.id.to_string());
-        assert_eq!(sources[0].last_played_at, Some(10));
+        assert_eq!(
+            sources[0].preferred_source_item_id.as_deref(),
+            Some("visible-alpha-one")
+        );
+        assert_eq!(sources[0].preferred_media_source_id, None);
         assert_eq!(
             sources[0].poster_image_tag.as_deref(),
             Some("visible-alpha-poster")

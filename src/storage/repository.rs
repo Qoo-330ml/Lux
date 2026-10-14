@@ -2045,7 +2045,8 @@ pub(crate) struct StoredGlobalCollectionSource {
     pub(crate) edition_name: Option<String>,
     pub(crate) quality_label: Option<String>,
     pub(crate) container: Option<String>,
-    pub(crate) last_played_at: Option<i64>,
+    pub(crate) preferred_source_item_id: Option<String>,
+    pub(crate) preferred_media_source_id: Option<String>,
     pub(crate) poster_image_tag: Option<String>,
 }
 
