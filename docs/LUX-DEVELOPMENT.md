@@ -11334,17 +11334,17 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证：storage library 定向测试与 PostgreSQL 合同测试；Toshiba 挂载后使用共享 target 运行 build、fmt、all-features Clippy 与 diff 检查。Cargo 命令设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。
 
-#### LUX-539：增量扫描按文件登记旁车变化
+#### LUX-539：增量扫描发现外挂字幕和媒体信息文件
 
-范围：将扫描器已支持的外挂字幕、NFO、图片、XML/EDL 和媒体信息 JSON 文件类型纳入增量文件发现。仅文件内容/存在状态确实变化时，登记精确路径与变化种类；未知扩展名和未变化文件不排队。现有 NFO/图片消费者保持各自输入边界，不重跑视频技术探测。
+范围：将外挂字幕与 `*-mediainfo.json` 纳入增量文件发现，按具体路径登记 ADD、CHANGE、REMOVE。仅文件状态或 fingerprint 确实变化时排队；未知 JSON、未变化文件不排队。这是 LUX-538 文件队列的增量发现切片。现有 NFO/图片/XML/EDL 处理暂沿原消费者路径，后续 LUX-541 会将有定义的消费者迁到按文件处理并移除目录级重复调度。
 
 验收：
 
-- [ ] watcher 和定向增量扫描能登记上述已支持文件的新增、修改、删除；目录批次也走相同分类。
-- [ ] 只追加文件事件，不把媒体源、媒体项元数据或无关缩略图标为待处理；相同 fingerprint 不产生新工作。
+- [ ] watcher、定向增量扫描和目录批次都能登记字幕支持格式及 `*-mediainfo.json` 的新增、修改、删除；普通 JSON 不进入队列。
+- [ ] 新附件只追加文件事件，不改媒体源 probe、媒体项 identification/metadata 或 thumbnail 状态；相同 fingerprint 不产生新工作。
 - [ ] 新文件首次出现在旧媒体库时会进入队列，带有路径及 root 身份，处理路径仍受库根约束。
 
-预计文件（4 个）：`src/application/scanner/library.rs`、`src/application/scanner/jobs/incremental.rs`、`tests/scanning_jobs.rs`、本文档。
+预计代码文件（5 个）：`src/application/scanner/library.rs`、`src/application/scanner/jobs/incremental.rs`、`src/storage/filesystem.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
 验证：`tests/scanning_jobs.rs` 定向目标、build、fmt、all-features Clippy 与 diff 检查。
 

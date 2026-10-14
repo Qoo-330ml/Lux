@@ -185,14 +185,25 @@ impl ScanJobService {
             fs::metadata(&media_path).await.ok()
         };
         if metadata.is_none() {
-            if is_supported_sidecar_file(&media_path) {
-                let sidecar_paths = [path.relative_path.clone()];
-                let targets_changed = self
-                    .database
-                    .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
-                    .await?;
-                if targets_changed {
-                    self.notify_local_metadata_worker(&job.id);
+            if super::super::library::is_supported_incremental_sidecar_file(&media_path) {
+                if super::super::library::is_file_change_only_sidecar(&media_path) {
+                    self.database
+                        .record_scan_job_file_change(
+                            &job.id,
+                            &root.id,
+                            &path.relative_path,
+                            "REMOVE",
+                        )
+                        .await?;
+                } else {
+                    let sidecar_paths = [path.relative_path.clone()];
+                    let targets_changed = self
+                        .database
+                        .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
+                        .await?;
+                    if targets_changed {
+                        self.notify_local_metadata_worker(&job.id);
+                    }
                 }
             }
             self.database
@@ -205,13 +216,13 @@ impl ScanJobService {
         };
         if metadata.is_dir() {
             let mut created_items = 0_usize;
-            let mut walker = FileBatchWalker::new(&media_path);
+            let mut walker = FileBatchWalker::new_with_sidecars(&media_path);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 for file in files {
                     if cancellation.load(Ordering::Acquire) {
                         return Ok(created_items);
                     }
-                    if is_supported_sidecar_file(&file) {
+                    if super::super::library::is_supported_incremental_sidecar_file(&file) {
                         self.process_incremental_sidecar_file(job, root, root_path, &file)
                             .await?;
                     } else {
@@ -243,7 +254,7 @@ impl ScanJobService {
                 &mut classification_cache,
             )
             .await
-        } else if is_supported_sidecar_file(&media_path) {
+        } else if super::super::library::is_supported_incremental_sidecar_file(&media_path) {
             self.process_incremental_sidecar_file(job, root, root_path, &media_path)
                 .await?;
             Ok(0)
@@ -347,12 +358,22 @@ impl ScanJobService {
             .scan_sidecar_file(root, root_path, path, &existing_entries, &job.generation)
             .await?;
         if changed {
-            let targets_changed = self
-                .database
-                .record_scan_job_sidecar_targets(&job.id, &root.id, &relative_paths)
-                .await?;
-            if targets_changed {
-                self.notify_local_metadata_worker(&job.id);
+            if super::super::library::is_file_change_only_sidecar(path) {
+                let change_kind = existing_entries
+                    .get(&relative_path)
+                    .filter(|entry| !entry.is_missing)
+                    .map_or("ADD", |_| "CHANGE");
+                self.database
+                    .record_scan_job_file_change(&job.id, &root.id, &relative_path, change_kind)
+                    .await?;
+            } else {
+                let targets_changed = self
+                    .database
+                    .record_scan_job_sidecar_targets(&job.id, &root.id, &relative_paths)
+                    .await?;
+                if targets_changed {
+                    self.notify_local_metadata_worker(&job.id);
+                }
             }
         }
         Ok(())

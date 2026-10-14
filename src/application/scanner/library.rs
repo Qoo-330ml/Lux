@@ -281,6 +281,7 @@ pub(in crate::application::scanner) async fn collect_episode_preparation_task(
 pub(super) struct FileBatchWalker {
     directories: Vec<PathBuf>,
     current: Option<(PathBuf, fs::ReadDir)>,
+    include_sidecars: bool,
 }
 
 impl FileBatchWalker {
@@ -288,6 +289,15 @@ impl FileBatchWalker {
         Self {
             directories: vec![root.to_owned()],
             current: None,
+            include_sidecars: false,
+        }
+    }
+
+    pub(super) fn new_with_sidecars(root: &Path) -> Self {
+        Self {
+            directories: vec![root.to_owned()],
+            current: None,
+            include_sidecars: true,
         }
     }
 
@@ -324,7 +334,11 @@ impl FileBatchWalker {
                         path: path.clone(),
                         source,
                     })?;
-                    if file_type.is_file() && is_supported_movie_file(&path) {
+                    if file_type.is_file()
+                        && (is_supported_movie_file(&path)
+                            || (self.include_sidecars
+                                && is_supported_incremental_sidecar_file(&path)))
+                    {
                         files.push(path);
                     } else if file_type.is_dir() {
                         self.directories.push(path);
@@ -2247,7 +2261,9 @@ impl LibraryScanner {
         let (_, inode) = file_identity(&metadata);
         let inode = inode.and_then(|value| i64::try_from(value).ok());
         if let Some(existing_entry) = existing_entries.get(&relative_path) {
-            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
+            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice())
+                && !existing_entry.is_missing
+            {
                 return Ok((existing_entry.id.clone(), false));
             }
             self.database
@@ -2343,4 +2359,29 @@ fn strm_target_kind_name(target: &StrmTarget) -> &'static str {
         StrmTargetKind::Path => "PATH",
         StrmTargetKind::Smb | StrmTargetKind::Ftp | StrmTargetKind::Unsupported => "OPAQUE",
     }
+}
+
+pub(super) fn is_file_change_only_sidecar(path: &Path) -> bool {
+    is_external_subtitle_file(path) || is_media_info_sidecar_file(path)
+}
+
+pub(super) fn is_supported_incremental_sidecar_file(path: &Path) -> bool {
+    is_supported_sidecar_file(path) || is_file_change_only_sidecar(path)
+}
+
+fn is_external_subtitle_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup"
+            )
+        })
+}
+
+fn is_media_info_sidecar_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.to_ascii_lowercase().ends_with("-mediainfo.json"))
 }
