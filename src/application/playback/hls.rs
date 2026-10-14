@@ -2225,7 +2225,7 @@ directory=$(dirname "$manifest")
 mkdir -p "$directory"
 printf '%s\n' "$start_number" >> "$directory/starts.log"
 if [ "$start_number" -eq 100 ]; then
-  sleep 2
+  sleep 1
 fi
 printf '#EXTM3U\n#EXT-X-MAP:URI="%s"\n#EXTINF:4,\nsegment_%06d.m4s\n' "$init" "$start_number" > "$manifest"
 printf 'init-%s' "$start_number" > "$directory/$init"
