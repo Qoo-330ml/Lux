@@ -1636,6 +1636,7 @@ pub(crate) struct ReconciliationBatchCommit<'a> {
     pub(crate) new_paths: &'a [String],
     pub(crate) changed_paths: &'a [String],
     pub(crate) sidecar_paths: &'a [String],
+    pub(crate) file_change_events: &'a [(String, String)],
 }
 
 #[derive(Debug, Eq, PartialEq)]

@@ -11387,9 +11387,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 - [ ] 取消、重试和恢复不丢失已提交事件；不可用 root 或无法确认的缺失不登记 REMOVE。
 - [ ] 使用与增量扫描和 Manifest 相同的分类、change kind 语义，且不重新探测未变化视频。
 
-预计代码文件（4 个）：`src/application/scanner/jobs/reconciliation.rs`、`src/storage/repository.rs`、`src/storage/jobs/scan/reconciliation.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
+预计代码文件（5 个）：`src/application/scanner/jobs/reconciliation.rs`、`src/storage/repository.rs`、`src/storage/jobs/scan/reconciliation.rs`、`src/storage/repository_tests.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
-验证：持久 reconciliation 定向扫描作业回归、build、fmt、all-features Clippy 与 diff 检查。
+验证：持久 reconciliation 定向扫描作业回归、storage repository 批次合同测试、build、fmt、all-features Clippy 与 diff 检查。
 
 #### LUX-543：按文件变化同步依赖数据
 

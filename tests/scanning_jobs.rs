@@ -3646,6 +3646,251 @@ async fn manifest_scan_queues_attachment_removal_only_after_root_confirmation()
 }
 
 #[tokio::test]
+async fn reconciliation_queues_attachment_changes_without_directory_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Reconcile Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Reconcile.Movie.2024.mkv"), b"video").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let (source_id, item_id): (String, String) = sqlx::query_as(
+        "SELECT ms.id, ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Reconcile Movie (2024)/Reconcile.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_sources
+         SET probe_status = 'READY', container = 'mkv', duration_ticks = 300000000,
+             bitrate = 128000
+         WHERE id = ?",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, codec)
+         VALUES ('reconciliation-existing-video-stream', ?, 0, 'VIDEO', 'h264')",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
+    let subtitle_path = "Reconcile Movie (2024)/Reconcile.Movie.2024.en.srt";
+    let media_info_path = "Reconcile Movie (2024)/Reconcile.Movie.2024-mediainfo.json";
+    let unrelated_path = "Reconcile Movie (2024)/notes.json";
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .await?;
+    tokio::fs::write(root.join(media_info_path), br#"{"streams":[]}"#).await?;
+    tokio::fs::write(root.join(unrelated_path), br#"{"unrelated":true}"#).await?;
+
+    let added = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&added.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &added.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+    let added_events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT library_root_id, relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&added.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        added_events,
+        vec![
+            (
+                root_record.id.to_string(),
+                media_info_path.to_owned(),
+                "ADD".to_owned(),
+            ),
+            (
+                root_record.id.to_string(),
+                subtitle_path.to_owned(),
+                "ADD".to_owned(),
+            ),
+        ]
+    );
+    let unrelated_entry_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind(unrelated_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unrelated_entry_count, 0);
+    let added_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(added_targets, 0);
+
+    let unchanged = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&unchanged.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &unchanged.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&unchanged.id, 100, None).await?;
+    let unchanged_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unchanged.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unchanged_events, 0);
+
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nChanged subtitle\n",
+    )
+    .await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&changed.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &changed.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&changed.id, 100, None).await?;
+    let changed_kind: String = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND library_root_id = ? AND relative_path = ?",
+    )
+    .bind(&changed.id)
+    .bind(root_record.id.to_string())
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_kind, "CHANGE");
+
+    let moved_root = temp_dir.path().join("Movies-unmounted");
+    tokio::fs::rename(&root, &moved_root).await?;
+    let unavailable = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&unavailable.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &unavailable.id, &root_record.id.to_string())
+        .await?;
+    jobs.run_to_completion(&unavailable.id, 100, None).await?;
+    let unavailable_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unavailable.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unavailable_events, 0);
+
+    tokio::fs::rename(&moved_root, &root).await?;
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    tokio::fs::remove_file(root.join(media_info_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&removed.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &removed.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&removed.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        removed_events,
+        vec![
+            (media_info_path.to_owned(), "REMOVE".to_owned()),
+            (subtitle_path.to_owned(), "REMOVE".to_owned()),
+        ]
+    );
+    let removal_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&removed.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(removal_targets, 0);
+
+    let source_state: (String, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT probe_status, container, duration_ticks, bitrate FROM media_sources WHERE id = ?",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        source_state,
+        (
+            "READY".to_owned(),
+            Some("mkv".to_owned()),
+            Some(300000000),
+            Some(128000)
+        )
+    );
+    let video_stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND stream_type = 'VIDEO' AND is_external = 0",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(video_stream_count, 1);
+    let item_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(item_state, "LOCAL_CONFIRMED");
+    Ok(())
+}
+
+async fn queue_legacy_reconciliation_root(
+    database: &Database,
+    job_id: &str,
+    root_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type
+         ) VALUES (?, ?, '', 'DIRECTORY')",
+    )
+    .bind(job_id)
+    .bind(root_id)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_commits_positive_manifest_indexes_during_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

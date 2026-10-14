@@ -15767,7 +15767,8 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
 
     let first_path = "Atomic.Movie.2024.mkv";
     let second_path = "Already.Done.Movie.2023.mkv";
-    for path in [first_path, second_path] {
+    let attachment_path = "Atomic.Movie.2024.en.srt";
+    for path in [first_path, second_path, attachment_path] {
         sqlx::query(
             "INSERT INTO reconciliation_scan_entries (
                  job_id, library_root_id, relative_path, entry_type, status
@@ -15813,6 +15814,10 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
     let entries = vec![
         StoredReconciliationScanEntry {
             library_root_id: root_id.clone(),
+            relative_path: attachment_path.to_owned(),
+        },
+        StoredReconciliationScanEntry {
+            library_root_id: root_id.clone(),
             relative_path: first_path.to_owned(),
         },
         StoredReconciliationScanEntry {
@@ -15822,6 +15827,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
     ];
     let new_paths = vec![first_path.to_owned()];
     let missing_paths = vec![second_path.to_owned()];
+    let file_change_events = vec![(attachment_path.to_owned(), "ADD".to_owned())];
 
     sqlx::query(
         "CREATE TRIGGER fail_reconciliation_targets
@@ -15845,22 +15851,25 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
         new_paths: &new_paths,
         changed_paths: &[],
         sidecar_paths: &[],
+        file_change_events: &file_change_events,
     };
     assert!(database.commit_reconciliation_batch(&batch).await.is_err());
 
-    let rollback_state: (i64, i64, i64, i64) = sqlx::query_as(
+    let rollback_state: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
              (SELECT COUNT(*) FROM filesystem_entries),
              (SELECT COUNT(*) FROM media_sources),
              (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?),
              (SELECT processed_count FROM scan_jobs WHERE id = ?)",
     )
+    .bind(job_id)
     .bind(job_id)
     .bind(job_id)
     .fetch_one(database.pool())
     .await
     .expect("rollback state");
-    assert_eq!(rollback_state, (0, 0, 0, 0));
+    assert_eq!(rollback_state, (0, 0, 0, 0, 0));
     let pending_after_failure: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_scan_entries
          WHERE job_id = ? AND entry_type = 'FILE' AND status = 'PENDING'",
@@ -15869,7 +15878,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
     .fetch_one(database.pool())
     .await
     .expect("pending after failure");
-    assert_eq!(pending_after_failure, 2);
+    assert_eq!(pending_after_failure, 3);
 
     sqlx::query("DROP TRIGGER fail_reconciliation_targets")
         .execute(database.pool())
@@ -15880,9 +15889,23 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
         .commit_reconciliation_batch(&batch)
         .await
         .expect("retry batch");
-    assert_eq!(committed.confirmed_entries, 2);
+    assert_eq!(committed.confirmed_entries, 3);
     assert!(committed.metadata_targets_changed);
-    assert_eq!(database.query_count(), 11);
+    assert_eq!(database.query_count(), 12);
+
+    let persisted_file_change: (String, String) = sqlx::query_as(
+        "SELECT relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND library_root_id = ?",
+    )
+    .bind(job_id)
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("committed file change");
+    assert_eq!(
+        persisted_file_change,
+        (attachment_path.to_owned(), "ADD".to_owned())
+    );
 
     let second_commit = database
         .commit_reconciliation_batch(&batch)
@@ -15904,7 +15927,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
     .expect("entry states");
     assert_eq!(
         entry_states,
-        vec![("DONE".to_owned(), 1), ("PENDING".to_owned(), 1)]
+        vec![("DONE".to_owned(), 2), ("PENDING".to_owned(), 1)]
     );
 
     let final_state: (i64, i64, i64, i64, i64, Option<String>) = sqlx::query_as(
@@ -15923,7 +15946,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
     .fetch_one(database.pool())
     .await
     .expect("final state");
-    assert_eq!(final_state, (1, 1, 2, 2, 2, Some(second_path.to_owned())));
+    assert_eq!(final_state, (1, 1, 2, 3, 3, Some(second_path.to_owned())));
     assert!(final_state.4 >= final_state.3);
 }
 
@@ -15948,6 +15971,7 @@ async fn empty_reconciliation_batch_is_a_noop() {
         new_paths: &[],
         changed_paths: &[],
         sidecar_paths: &[],
+        file_change_events: &[],
     };
 
     database.reset_query_count();

@@ -337,6 +337,7 @@ impl Database {
             && batch.new_paths.is_empty()
             && batch.changed_paths.is_empty()
             && batch.sidecar_paths.is_empty()
+            && batch.file_change_events.is_empty()
         {
             return Ok(ReconciliationBatchCommitResult {
                 confirmed_entries: 0,
@@ -380,6 +381,19 @@ impl Database {
         let pending_paths = self
             .list_pending_reconciliation_paths_in_transaction(&mut transaction, batch)
             .await?;
+        let file_change_events = batch
+            .file_change_events
+            .iter()
+            .filter(|(relative_path, _)| pending_paths.contains(relative_path))
+            .map(|(relative_path, change_kind)| (relative_path.as_str(), change_kind.as_str()))
+            .collect::<Vec<_>>();
+        self.record_reconciliation_file_changes_in_transaction(
+            &mut transaction,
+            batch.job_id,
+            batch.library_root_id,
+            &file_change_events,
+        )
+        .await?;
         let (created_items, metadata_targets_changed) = self
             .apply_reconciliation_batch_media_and_targets(&mut transaction, batch, &pending_paths)
             .await?;
@@ -594,16 +608,81 @@ impl Database {
         Ok(pending)
     }
 
+    async fn record_reconciliation_file_changes_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        library_root_id: &str,
+        changes: &[(&str, &str)],
+    ) -> Result<(), StorageError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        for (relative_path, change_kind) in changes {
+            let path = Path::new(relative_path);
+            if relative_path.trim().is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(StorageError::Conflict(
+                    "invalid scan file change path".to_owned(),
+                ));
+            }
+            if !matches!(*change_kind, "ADD" | "CHANGE" | "REMOVE") {
+                return Err(StorageError::Conflict(
+                    "invalid scan file change kind".to_owned(),
+                ));
+            }
+        }
+
+        for chunk in changes.chunks((SCAN_DML_CHUNK_SIZE / 4).max(1)) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO scan_job_file_changes (
+                     job_id, library_root_id, relative_path, change_kind
+                 ) VALUES {values}
+                 ON CONFLICT(job_id, library_root_id, relative_path) DO UPDATE SET
+                     change_kind = excluded.change_kind,
+                     processing_state = 'PENDING', error = NULL,
+                     revision = scan_job_file_changes.revision + 1,
+                     updated_at = unixepoch()
+                 WHERE scan_job_file_changes.change_kind <> excluded.change_kind
+                    OR scan_job_file_changes.processing_state <> 'PENDING'
+                    OR scan_job_file_changes.error IS NOT NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (relative_path, change_kind) in chunk {
+                statement = statement
+                    .bind(job_id)
+                    .bind(library_root_id)
+                    .bind(relative_path)
+                    .bind(change_kind);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn finalize_reconciliation_root_page(
         &self,
         job_id: &str,
         library_root_id: &str,
         generation: &str,
         missing_paths: &[String],
-        removed_media_paths: &[String],
-        removed_sidecar_paths: &[String],
+        removed_paths: (&[String], &[String], &[String]),
     ) -> Result<u64, StorageError> {
-        if missing_paths.is_empty() {
+        let (removed_media_paths, removed_sidecar_paths, removed_file_change_paths) = removed_paths;
+        if missing_paths.is_empty() && removed_file_change_paths.is_empty() {
             return Ok(0);
         }
         let mut transaction = self.begin_scan_write_transaction().await?;
@@ -647,6 +726,25 @@ impl Database {
                 missing_paths,
             )
             .await?;
+        let confirmed_removed_file_change_paths = self
+            .list_confirmed_missing_file_change_paths_in_transaction(
+                &mut transaction,
+                library_root_id,
+                generation,
+                removed_file_change_paths,
+            )
+            .await?;
+        let removed_file_changes = confirmed_removed_file_change_paths
+            .iter()
+            .map(|path| (path.as_str(), "REMOVE"))
+            .collect::<Vec<_>>();
+        self.record_reconciliation_file_changes_in_transaction(
+            &mut transaction,
+            job_id,
+            library_root_id,
+            &removed_file_changes,
+        )
+        .await?;
         transaction
             .commit()
             .await
@@ -655,6 +753,54 @@ impl Database {
                 source,
             })?;
         Ok(missing_entries)
+    }
+
+    async fn list_confirmed_missing_file_change_paths_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_root_id: &str,
+        generation: &str,
+        candidates: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut confirmed = Vec::new();
+        for paths in candidates.chunks(SCAN_DML_CHUNK_SIZE) {
+            if paths.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT relative_path
+                 FROM filesystem_entries
+                 WHERE library_root_id = ? AND is_missing = 1
+                   AND last_seen_generation <> ?
+                   AND relative_path IN ({placeholders})"
+            );
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(library_root_id)
+                .bind(generation);
+            for path in paths {
+                statement = statement.bind(path);
+            }
+            let rows = statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                confirmed.push(row.try_get("relative_path").map_err(|source| {
+                    StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    }
+                })?);
+            }
+        }
+        Ok(confirmed)
     }
 
     pub(crate) async fn has_reconciliation_scan_entries(
