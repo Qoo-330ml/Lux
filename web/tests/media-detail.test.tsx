@@ -1328,7 +1328,17 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("内嵌字幕轨");
     expect(details?.querySelector(".lux-media-nfo-media-heading")?.textContent).toContain("媒体文件");
     expect(details?.querySelector("details.lux-media-info-address")).toBeNull();
-    expect(details?.querySelector(".lux-media-info-address")).not.toBeNull();
+    const drawer = details?.querySelector<HTMLElement>("#media-url-drawer");
+    const drawerToggle = details?.querySelector<HTMLButtonElement>('[aria-controls="media-url-drawer"]');
+    expect(drawer).not.toBeNull();
+    expect(drawer?.hidden).toBe(true);
+    expect(drawerToggle?.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => drawerToggle?.click());
+    expect(drawer?.hidden).toBe(false);
+    expect(drawerToggle?.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => drawerToggle?.click());
+    expect(drawer?.hidden).toBe(true);
+    expect(drawerToggle?.getAttribute("aria-expanded")).toBe("false");
     expect(details?.querySelector(".lux-media-stream-disclosure")).toBeNull();
     expect(details?.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(container.querySelector(".lux-detail-source")?.textContent).toContain("mkv");

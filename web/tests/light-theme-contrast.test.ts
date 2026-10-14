@@ -199,4 +199,16 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-season-tab.is-active")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-episode-link")).toContain("background: rgba(255,255,255");
   });
+
+  it("keeps detail metadata and technical source readable in light mode", () => {
+    expect(lightThemeRule(".lux-media-nfo-media-heading h3")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-media-nfo-rating-val strong")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-media-nfo-grid .lux-media-nfo-row")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule(".lux-badge-accent")).toContain("color: var(--lux-muted)");
+    expect(lightThemeRule(".lux-media-nfo-collection-card")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule(".lux-media-nfo-provider-badge strong")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule("#media-url-display")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule(".lux-media-file-facts #fact-container")).toContain("color: var(--lux-muted)");
+    expect(lightThemeRule(".lux-media-stream-badges span.is-default")).toContain("color: var(--lux-muted)");
+  });
 });

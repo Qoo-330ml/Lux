@@ -140,6 +140,8 @@ export function MediaInfoContent({
           <button
             type="button"
             onClick={() => setShowAddress((prev) => !prev)}
+            aria-expanded={showAddress}
+            aria-controls="media-url-drawer"
             className="lux-badge-pill hover:text-white cursor-pointer ml-auto sm:ml-0"
           >
             <span>媒体源地址与技术详情</span>
@@ -160,7 +162,8 @@ export function MediaInfoContent({
         ) : (
           <div
             id="media-url-drawer"
-            className={`lux-surface-panel p-4 space-y-2.5 bg-black/40 lux-media-info-address ${showAddress ? "" : "hidden"}`}
+            hidden={!showAddress}
+            className="lux-surface-panel p-4 space-y-2.5 bg-black/40 lux-media-info-address"
           >
             <div className="flex items-center justify-between text-xs">
               <span className="text-[var(--lux-subtle)]">媒体播放地址 (已安全收纳)</span>
