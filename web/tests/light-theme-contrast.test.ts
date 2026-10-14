@@ -194,7 +194,10 @@ describe("light theme contrast", () => {
     expect(lightThemeRule('.lux-select-option[aria-selected="true"]')).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-info-row")).toContain("background: rgba(255,255,255");
     expect(lightThemeRule(".lux-media-info-row > strong")).toContain("color: var(--lux-text)");
-    expect(lightThemeRule(".lux-media-stream-card")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-media-file-facts")).toContain("background: rgba(255,255,255,.22)");
+    expect(lightThemeRule(".lux-media-file-facts")).toContain("backdrop-filter: blur(12px)");
+    expect(lightThemeRule(".lux-media-stream-card")).toContain("background: rgba(255,255,255,.22)");
+    expect(lightThemeRule(".lux-media-stream-card")).toContain("backdrop-filter: blur(12px)");
     expect(lightThemeRule(".lux-media-stream-heading h3")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-season-tab.is-active")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-episode-link")).toContain("background: rgba(255,255,255");
@@ -206,6 +209,7 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-media-nfo-grid .lux-media-nfo-row")).toContain("background: rgba(28,28,34");
     expect(lightThemeRule(".lux-badge-accent")).toContain("color: var(--lux-muted)");
     expect(lightThemeRule(".lux-media-nfo-collection-card")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule(".lux-media-nfo-collection-card .lux-collection-name")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-nfo-provider-badge strong")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-address-value")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-file-facts #fact-container")).toContain("color: var(--lux-muted)");

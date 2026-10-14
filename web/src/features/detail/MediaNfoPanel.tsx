@@ -133,7 +133,7 @@ export function MediaNfoPanel({
               {hasRating ? (
                 <div className="lux-media-nfo-rating col-span-2 sm:col-span-1 md:col-span-2 p-3.5 rounded-lg bg-black/30 border border-[var(--lux-line-soft)] flex flex-col justify-center" aria-label="评分与投票数">
                   <span className="text-xs text-[var(--lux-subtle)]">综合评分</span>
-                  <div className="flex items-baseline gap-1.5 mt-0.5">
+                  <div className="lux-media-nfo-rating-val flex items-baseline gap-1.5 mt-0.5">
                     <strong className="text-3xl font-bold tracking-tight text-white">
                       {details?.rating}
                       <small className="text-xs text-[var(--lux-subtle)] font-normal"> / 10</small>
@@ -253,7 +253,7 @@ export function MediaNfoPanel({
                 <span className="text-base text-[var(--lux-silver-accent)]">🗂️</span>
                 <div>
                   <span className="text-xs text-[var(--lux-subtle)] block">所属系列合集</span>
-                  <span className="text-sm font-semibold text-white">{details.setName || collection}</span>
+                  <span className="lux-collection-name text-sm font-semibold text-white">{details.setName || collection}</span>
                 </div>
               </div>
               <div className="text-xs text-[var(--lux-muted)] hover:text-white flex items-center gap-1">

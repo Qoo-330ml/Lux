@@ -813,12 +813,14 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("评分8.1 / 10");
     expect(container.querySelector(".lux-media-nfo-rating")?.textContent).toContain("8.1 / 10");
     expect(container.querySelector(".lux-media-nfo-rating")?.textContent).toContain("123 票");
+    expect(container.querySelector(".lux-media-nfo-rating-val > strong")).not.toBeNull();
     expect(container.querySelector(".lux-media-nfo-overview .lux-media-nfo-summary")?.textContent)
       .not.toContain("评分");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("国家/地区中国");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("制片公司示例影业");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("分级PG-13");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("合集镖人");
+    expect(container.querySelector(".lux-collection-name")?.textContent).toBe("镖人");
     const identity = container.querySelector(".lux-media-nfo-identity")?.textContent;
     expect(identity).toContain("原始片名本地电影原名");
     expect(identity).toContain("年份2026");

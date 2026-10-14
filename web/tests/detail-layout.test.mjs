@@ -183,10 +183,13 @@ test("media metadata surface shows the page image through in both themes", () =>
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const darkPanelRule = stylesheet.match(/\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const lightPanelRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const lightOverlayRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-detail-overlay\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(darkPanelRule, /background:\s*rgba\(22,\s*22,\s*25,\s*\.5\)/);
   assert.match(darkPanelRule, /backdrop-filter:\s*blur\(12px\)/);
-  assert.match(lightPanelRule, /background:\s*rgba\(255,\s*255,\s*255,\s*\.5\)/);
+  assert.match(lightPanelRule, /background:\s*rgba\(255,\s*255,\s*255,\s*\.22\)/);
+  assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.4\)/);
+  assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.28\)/);
 });
 
 test("media file address and summary share one surface with an unboxed toggle", () => {
