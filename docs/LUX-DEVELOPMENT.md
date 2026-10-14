@@ -11335,7 +11335,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 - [ ] SQLite 升级保留已有库、合集、用户权限和成员关系；PostgreSQL schema 与 SQLite 对齐。
 - [ ] 相同稳定 ID 可表示多个库中的副本；现有手动合集结构及约束保持有效。
 
-预计文件（3 个）：`migrations/0170_global_movie_collections.sql`、`migrations-postgres/0170_global_movie_collections.sql`、`tests/storage.rs`。
+预计文件（5 个）：`migrations/0170_global_movie_collections.sql`、`migrations-postgres/0170_global_movie_collections.sql`、`src/storage/repository.rs`、`src/storage/migration.rs`、`tests/storage.rs`。
 
 验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage` 与 `git diff --check`。
 

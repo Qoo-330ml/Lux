@@ -2023,6 +2023,8 @@ pub(crate) struct StoredCollectionRefresh {
     pub(crate) member_count: usize,
 }
 
+pub(crate) const GLOBAL_COLLECTION_LIBRARY_ID: &str = "00000000-0000-7000-8000-000000000538";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEmbyCollection {
     pub(crate) collection_item_id: String,

@@ -111,7 +111,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 media_strategy_json TEXT,
                 realtime_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 0 CHECK (realtime_metadata_auto_match_enabled IN (0, 1)),
                 scan_missing_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 1 CHECK (scan_missing_metadata_auto_match_enabled IN (0, 1)),
-                chapter_source_id TEXT
+                chapter_source_id TEXT,
+                system_kind TEXT CHECK (system_kind IS NULL OR system_kind = 'COLLECTIONS')
             )",
             "INSERT INTO libraries_new (
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
@@ -119,7 +120,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
                 realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
-                chapter_source_id
+                chapter_source_id, system_kind
              )
              SELECT
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
@@ -127,10 +128,13 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
                 realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
-                chapter_source_id
+                chapter_source_id, system_kind
              FROM libraries",
             "DROP TABLE libraries",
             "ALTER TABLE libraries_new RENAME TO libraries",
+            "CREATE UNIQUE INDEX idx_libraries_system_kind
+             ON libraries(system_kind)
+             WHERE system_kind IS NOT NULL",
             "DROP TRIGGER IF EXISTS media_items_search_ai",
             "DROP TRIGGER IF EXISTS media_items_search_au",
             "DROP TRIGGER IF EXISTS media_items_search_ad",
