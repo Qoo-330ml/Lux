@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::{GlobalMovieCollectionReference, GlobalMovieCollectionReferenceUpdate};
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
@@ -5597,10 +5598,70 @@ impl Database {
             })
     }
 
+    pub(crate) async fn update_media_item_metadata_with_collection_reference(
+        &self,
+        update: MediaMetadataUpdate<'_>,
+        reference: Option<&GlobalMovieCollectionReference>,
+        unqualified_nfo_set_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.update_media_item_metadata_in_transaction(&mut transaction, &update)
+            .await?;
+        self.replace_global_movie_collection_reference_in_transaction(
+            &mut transaction,
+            update.item_id,
+            reference,
+            unqualified_nfo_set_id,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn update_movie_collection_reference(
+        &self,
+        item_id: &str,
+        reference: Option<&GlobalMovieCollectionReference>,
+        unqualified_nfo_set_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.replace_global_movie_collection_reference_in_transaction(
+            &mut transaction,
+            item_id,
+            reference,
+            unqualified_nfo_set_id,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn commit_local_nfo_state_batch(
         &self,
         updates: &[MediaMetadataUpdate<'_>],
         defaults_repairs: &[LocalNfoDefaultsRepair<'_>],
+    ) -> Result<(), StorageError> {
+        self.commit_local_nfo_state_batch_with_collection_references(updates, defaults_repairs, &[])
+            .await
+    }
+
+    pub(crate) async fn commit_local_nfo_state_batch_with_collection_references(
+        &self,
+        updates: &[MediaMetadataUpdate<'_>],
+        defaults_repairs: &[LocalNfoDefaultsRepair<'_>],
+        reference_updates: &[GlobalMovieCollectionReferenceUpdate<'_>],
     ) -> Result<(), StorageError> {
         let defaults_repairs = defaults_repairs
             .iter()
@@ -5621,6 +5682,19 @@ impl Database {
                 self.update_media_item_metadata_in_transaction(&mut transaction, update)
                     .await?;
             }
+            for reference_update in reference_updates.iter().filter(|reference_update| {
+                update_chunk
+                    .iter()
+                    .any(|update| update.item_id == reference_update.item_id)
+            }) {
+                self.replace_global_movie_collection_reference_in_transaction(
+                    &mut transaction,
+                    reference_update.item_id,
+                    reference_update.reference,
+                    reference_update.unqualified_nfo_set_id,
+                )
+                .await?;
+            }
             for repair in repair_chunk {
                 self.repair_local_nfo_defaults_in_transaction(&mut transaction, repair)
                     .await?;
@@ -5636,6 +5710,95 @@ impl Database {
             repair_offset = repair_end;
         }
         Ok(())
+    }
+
+    pub(crate) async fn replace_global_movie_collection_reference_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_id: &str,
+        reference: Option<&GlobalMovieCollectionReference>,
+        unqualified_nfo_set_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if reference.is_none()
+            && let Some(set_id) = unqualified_nfo_set_id
+            && let Some((
+                collection_provider_id,
+                movie_provider,
+                movie_provider_id,
+                collection_provider,
+                collection_title,
+                sort_order,
+                provider_ids_json,
+            )) = self
+                .query_as::<(
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    Option<i64>,
+                    Option<String>,
+                )>(
+                    "SELECT reference.collection_provider_id, reference.movie_provider,
+                            reference.movie_provider_id, reference.collection_provider,
+                            reference.collection_title, reference.sort_order,
+                            item.provider_ids_json
+                     FROM collection_item_references reference
+                     JOIN media_items item ON item.id = reference.item_id
+                     WHERE reference.item_id = ?
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+        {
+            let existing = GlobalMovieCollectionReference {
+                movie_provider,
+                movie_provider_id,
+                collection_provider,
+                collection_provider_id,
+                collection_title,
+                sort_order,
+            };
+            if existing.matches_existing_nfo_identity(set_id, provider_ids_json.as_deref()) {
+                return Ok(());
+            }
+        }
+        self.query("DELETE FROM collection_item_references WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(reference) = reference else {
+            return Ok(());
+        };
+        self.query(
+            "INSERT INTO collection_item_references (
+                 item_id, movie_provider, movie_provider_id, collection_provider,
+                 collection_provider_id, collection_title, sort_order
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(&reference.movie_provider)
+        .bind(&reference.movie_provider_id)
+        .bind(&reference.collection_provider)
+        .bind(&reference.collection_provider_id)
+        .bind(&reference.collection_title)
+        .bind(reference.sort_order)
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     async fn repair_local_nfo_defaults_in_transaction(

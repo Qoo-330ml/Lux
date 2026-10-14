@@ -11345,11 +11345,13 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] TMDb 与 NFO 的同一命名空间/系列 ID 产生相同引用；不同命名空间不会仅凭数值相同或标题相同合并。
-- [ ] 缺失、非法、待确认和重新识别的元数据不会留下旧系列关系。
-- [ ] 重复确认和刷新幂等，不改变现有影片元数据优先级或 NFO 内容。
+- [x] TMDb 与 NFO 的同一命名空间/系列 ID 产生相同引用；不同命名空间不会仅凭数值相同或标题相同合并。
+- [x] 缺失、非法、待确认和重新识别的元数据不会留下旧系列关系。
+- [x] 重复确认和刷新幂等，不改变现有影片元数据优先级或 NFO 内容。
 
-预计文件（不超过 5 个）：候选元数据应用、NFO 索引、storage 写入、metadata 回归测试及本文档。
+预计代码文件（5 个）：`src/application/candidates.rs`、`src/application/metadata.rs`、`src/storage/mod.rs`、`src/storage/catalog.rs`、`src/storage/metadata.rs`；存储和 NFO 回归测试放在对应模块内。本文档作为独立文档增量更新。
+
+验证：所有 Cargo 命令均设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::tests`、`cargo test --locked --lib application::candidates::tests`、`cargo test --locked --lib application::metadata::tests -- --test-threads=1`、`cargo test --locked --test metadata_selection`、`cargo fmt --all -- --check` 与 `git diff --check`。
 
 #### LUX-540：自动生成并维护全站系列与作品
 

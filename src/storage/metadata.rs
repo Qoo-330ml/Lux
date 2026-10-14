@@ -1,7 +1,8 @@
 use super::*;
 use crate::storage::{
-    ItemMetadataCompletenessCommit, MetadataAutoMatchPolicy, MetadataFillMissingRequest,
-    NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult,
+    GlobalMovieCollectionReference, ItemMetadataCompletenessCommit, MetadataAutoMatchPolicy,
+    MetadataFillMissingRequest, NewItemMetadataCompletenessCheck,
+    NewItemMetadataCompletenessResult,
 };
 use std::collections::BTreeSet;
 
@@ -1829,9 +1830,19 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)] // Storage regression tests retain the compatibility wrapper.
     pub(crate) async fn select_metadata_candidate(
         &self,
         update: SelectedMetadataUpdate<'_>,
+    ) -> Result<bool, StorageError> {
+        self.select_metadata_candidate_with_collection_reference(update, None)
+            .await
+    }
+
+    pub(crate) async fn select_metadata_candidate_with_collection_reference(
+        &self,
+        update: SelectedMetadataUpdate<'_>,
+        collection_reference: Option<&GlobalMovieCollectionReference>,
     ) -> Result<bool, StorageError> {
         let sort_title = update.title.to_lowercase();
         let _write_guard = self.acquire_metadata_write_lock().await;
@@ -1909,6 +1920,13 @@ impl Database {
                 })?;
             return Ok(false);
         }
+        self.replace_global_movie_collection_reference_in_transaction(
+            &mut transaction,
+            update.item_id,
+            collection_reference,
+            None,
+        )
+        .await?;
         self.query(
             "UPDATE metadata_candidates
              SET status = 'REJECTED', updated_at = unixepoch()

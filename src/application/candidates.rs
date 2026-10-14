@@ -843,6 +843,8 @@ impl MetadataCandidateService {
                         status: None,
                         set_name: None,
                         set_id: None,
+                        collection_name: None,
+                        collection_provider_id: None,
                         poster_url: result.image_url,
                         backdrop_url: result.backdrop_image_url,
                         production_year: result.production_year,
@@ -1142,6 +1144,12 @@ impl MetadataCandidateService {
                     status: details.as_ref().and_then(|value| value.status.clone()),
                     set_name: details.as_ref().and_then(|value| value.set_name.clone()),
                     set_id: details.as_ref().and_then(|value| value.set_id.clone()),
+                    collection_name: details
+                        .as_ref()
+                        .and_then(|value| value.collection.as_ref()?.name.clone()),
+                    collection_provider_id: details
+                        .as_ref()
+                        .and_then(|value| value.collection.as_ref()?.provider_id.clone()),
                     poster_url: details.as_ref().and_then(|value| value.poster_url.clone()),
                     backdrop_url: details
                         .as_ref()
@@ -1497,6 +1505,14 @@ impl MetadataCandidateService {
                     website: metadata.website,
                     set_name: metadata.set_name,
                     set_id: metadata.set_id,
+                    collection_name: metadata
+                        .collection
+                        .as_ref()
+                        .and_then(|collection| collection.name.clone()),
+                    collection_provider_id: metadata
+                        .collection
+                        .as_ref()
+                        .and_then(|collection| collection.provider_id.clone()),
                     poster_url: metadata.poster_url,
                     backdrop_url: metadata.backdrop_url,
                     runtime: metadata.runtime,
@@ -1627,6 +1643,8 @@ impl MetadataCandidateService {
                     "status": candidate.status,
                     "setName": candidate.set_name,
                     "setId": candidate.set_id,
+                    "collectionName": candidate.collection_name,
+                    "collectionProviderId": candidate.collection_provider_id,
                     "posterUrl": candidate.poster_url,
                     "backdropUrl": candidate.backdrop_url,
                     "productionYear": candidate.production_year,
@@ -1730,6 +1748,8 @@ struct CandidateMetadata {
     status: Option<String>,
     set_name: Option<String>,
     set_id: Option<String>,
+    collection_name: Option<String>,
+    collection_provider_id: Option<String>,
     poster_url: Option<String>,
     backdrop_url: Option<String>,
     production_year: Option<i32>,
@@ -2894,6 +2914,44 @@ impl MetadataSelectionService {
             ));
         }
         let mut payload = candidate_payload(&candidate)?;
+        let collection_reference = (current.item_type == "MOVIE" && !options.keep_pending)
+            .then(|| {
+                let current_provider_ids = current_provider_ids(&current);
+                let (movie_provider, movie_provider_id) = if options.preserve_identity {
+                    Some((
+                        candidate.provider.as_str(),
+                        provider_id_for_key(&current_provider_ids, &candidate.provider)?,
+                    ))
+                } else if options.supplemental {
+                    Some((
+                        candidate.provider.as_str(),
+                        provider_id_for_key(&current_provider_ids, &candidate.provider)
+                            .unwrap_or(candidate.provider.as_str()),
+                    ))
+                } else {
+                    Some((candidate.provider.as_str(), candidate.provider_id.as_str()))
+                }?;
+                crate::storage::GlobalMovieCollectionReference::from_scraper(
+                    movie_provider,
+                    movie_provider_id,
+                    payload
+                        .movie_nfo
+                        .set_id
+                        .as_deref()
+                        .or(payload.collection_provider_id.as_deref()),
+                    payload
+                        .movie_nfo
+                        .set_name
+                        .as_deref()
+                        .or(payload.collection_name.as_deref()),
+                    payload
+                        .metadata
+                        .production_year
+                        .map(i64::from)
+                        .or(current.production_year),
+                )
+            })
+            .flatten();
         let candidate_provider = candidate.provider.trim().to_ascii_lowercase();
         for actor in &mut payload.actors {
             if actor.provider.is_none() && !actor.id.trim().is_empty() {
@@ -3004,31 +3062,34 @@ impl MetadataSelectionService {
             .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))?;
         let selected = self
             .database
-            .select_metadata_candidate(SelectedMetadataUpdate {
-                item_id,
-                candidate_id,
-                title: state.metadata.title.as_deref().unwrap_or(&current.title),
-                original_title: state.metadata.original_title.as_deref(),
-                overview: state.metadata.overview.as_deref(),
-                production_year: state.metadata.production_year.map(i64::from),
-                premiere_date: payload.premiere_date.as_deref(),
-                last_air_date: payload.end_date.as_deref(),
-                status: payload.status.as_deref(),
-                original_language: payload.original_language.as_deref(),
-                rating: payload.rating,
-                rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
-                provider_ids_json: &provider_ids_json,
-                metadata_scraper_id: (!options.supplemental
-                    && !options.preserve_identity
-                    && !options.keep_pending)
-                    .then_some(options.scraper_id)
-                    .flatten(),
-                metadata_fingerprint: &nfo_report.fingerprint,
-                provenance_json: &state.provenance_json(),
-                locked_fields_json: &state.locked_fields_json(),
-                poster_fallback_required: !has_primary_artwork,
-                keep_pending: options.keep_pending,
-            })
+            .select_metadata_candidate_with_collection_reference(
+                SelectedMetadataUpdate {
+                    item_id,
+                    candidate_id,
+                    title: state.metadata.title.as_deref().unwrap_or(&current.title),
+                    original_title: state.metadata.original_title.as_deref(),
+                    overview: state.metadata.overview.as_deref(),
+                    production_year: state.metadata.production_year.map(i64::from),
+                    premiere_date: payload.premiere_date.as_deref(),
+                    last_air_date: payload.end_date.as_deref(),
+                    status: payload.status.as_deref(),
+                    original_language: payload.original_language.as_deref(),
+                    rating: payload.rating,
+                    rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
+                    provider_ids_json: &provider_ids_json,
+                    metadata_scraper_id: (!options.supplemental
+                        && !options.preserve_identity
+                        && !options.keep_pending)
+                        .then_some(options.scraper_id)
+                        .flatten(),
+                    metadata_fingerprint: &nfo_report.fingerprint,
+                    provenance_json: &state.provenance_json(),
+                    locked_fields_json: &state.locked_fields_json(),
+                    poster_fallback_required: !has_primary_artwork,
+                    keep_pending: options.keep_pending,
+                },
+                collection_reference.as_ref(),
+            )
             .await?;
         if !selected {
             return Err(MetadataSelectionError::CandidateNotPending(
@@ -3685,6 +3746,8 @@ impl From<PeopleError> for MetadataSelectionError {
 struct CandidatePayload {
     metadata: NfoMetadata,
     movie_nfo: MovieNfoMetadata,
+    collection_name: Option<String>,
+    collection_provider_id: Option<String>,
     premiere_date: Option<String>,
     end_date: Option<String>,
     status: Option<String>,
@@ -3824,6 +3887,9 @@ fn candidate_payload(
     let status = candidate_text(&value, &["status", "Status"]);
     let set_name = candidate_text(&value, &["setName", "set_name", "SetName"]);
     let set_id = candidate_text(&value, &["setId", "set_id", "SetId"]);
+    let collection_name = candidate_text(&value, &["collectionName", "collection_name"]);
+    let collection_provider_id =
+        candidate_text(&value, &["collectionProviderId", "collection_provider_id"]);
     let original_language = candidate_text(&value, &["originalLanguage", "original_language"]);
     let rating = candidate_rating(&value)?;
     let votes = candidate_integer(&value, &["votes", "Votes", "voteCount", "vote_count"])?;
@@ -3924,6 +3990,8 @@ fn candidate_payload(
     Ok(CandidatePayload {
         metadata,
         movie_nfo,
+        collection_name,
+        collection_provider_id,
         premiere_date,
         end_date,
         status,
@@ -4306,8 +4374,8 @@ mod tests {
         ACTOR_METADATA_FETCH_CONCURRENCY, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
         FillMissingRequestPlan, ImageSelectionPolicy, MAX_ACTOR_DETAIL_FETCHES,
         MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
-        SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors, capability_needs_request,
-        completeness_capabilities, credits_need_actor_relation_check,
+        SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors, candidate_payload,
+        capability_needs_request, completeness_capabilities, credits_need_actor_relation_check,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_actors,
         generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
@@ -4332,6 +4400,52 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::time::{Duration, sleep};
+
+    #[test]
+    fn confirmed_scraper_candidate_keeps_collection_provider_namespace() {
+        let candidate = super::StoredMetadataCandidate {
+            id: "candidate".to_owned(),
+            item_id: "movie".to_owned(),
+            provider: "TMDB".to_owned(),
+            provider_id: "movie-599".to_owned(),
+            candidate_json: json!({
+                "title": "飞驰人生",
+                "productionYear": 2019,
+                "collectionName": "飞驰人生",
+                "collectionProviderId": "1281825",
+                "providerIds": {"Tmdb": "movie-599"}
+            })
+            .to_string(),
+            score: 1.0,
+            status: "PENDING".to_owned(),
+            expires_at: None,
+            item_title: "飞驰人生".to_owned(),
+        };
+        let payload = candidate_payload(&candidate).expect("candidate payload");
+        assert!(payload.movie_nfo.set_name.is_none());
+        assert!(payload.movie_nfo.set_id.is_none());
+        let reference = crate::storage::GlobalMovieCollectionReference::from_scraper(
+            &candidate.provider,
+            &candidate.provider_id,
+            payload
+                .collection_provider_id
+                .as_deref()
+                .or(payload.movie_nfo.set_id.as_deref()),
+            payload
+                .collection_name
+                .as_deref()
+                .or(payload.movie_nfo.set_name.as_deref()),
+            payload.metadata.production_year.map(i64::from),
+        )
+        .expect("confirmed candidate collection reference");
+
+        assert_eq!(reference.movie_provider, "tmdb");
+        assert_eq!(reference.movie_provider_id, "movie-599");
+        assert_eq!(reference.collection_provider, "tmdb");
+        assert_eq!(reference.collection_provider_id, "1281825");
+        assert_eq!(reference.collection_title, "飞驰人生");
+        assert_eq!(reference.sort_order, Some(2019));
+    }
 
     #[tokio::test]
     async fn local_completeness_page_shares_movie_projection_and_relation_caches()
