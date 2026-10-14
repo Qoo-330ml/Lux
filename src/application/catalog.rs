@@ -554,7 +554,10 @@ impl CatalogService {
                     .map(|group| group.copies.clone())
                     .unwrap_or_default(),
                 preferred_source_item_id: source_group
-                    .and_then(|group| group.preferred_source_item_id),
+                    .as_ref()
+                    .and_then(|group| group.preferred_source_item_id.clone()),
+                preferred_media_source_id: source_group
+                    .and_then(|group| group.preferred_media_source_id),
             });
         }
         Ok(GlobalCollectionMembersPage {
@@ -563,6 +566,32 @@ impl CatalogService {
             offset,
             limit,
         })
+    }
+
+    pub async fn set_global_collection_source_preference(
+        &self,
+        principal: AccessPrincipal,
+        collection_item_id: &str,
+        work_item_id: &str,
+        source_item_id: &str,
+        media_source_id: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        let saved = self
+            .database
+            .set_global_collection_source_preference(
+                &principal.user_id_string(),
+                principal.is_admin,
+                collection_item_id,
+                work_item_id,
+                source_item_id,
+                media_source_id,
+            )
+            .await?;
+        if saved {
+            Ok(())
+        } else {
+            Err(CatalogError::AccessDenied)
+        }
     }
 
     async fn global_collection_sources_for_works(
@@ -591,13 +620,15 @@ impl CatalogService {
                         work_item_id: source.work_item_id.clone(),
                         copies: Vec::new(),
                         preferred_source_item_id: None,
+                        preferred_media_source_id: None,
                     });
                     index
                 }
             };
             let group = &mut groups[work_index];
-            if group.preferred_source_item_id.is_none() && source.last_played_at.is_some() {
-                group.preferred_source_item_id = Some(source.source_item_id.clone());
+            if let Some(preferred_source_item_id) = source.preferred_source_item_id.clone() {
+                group.preferred_source_item_id = Some(preferred_source_item_id);
+                group.preferred_media_source_id = source.preferred_media_source_id.clone();
             }
             let copy_key = (source.work_item_id.clone(), source.source_item_id.clone());
             let copy_index = match copy_indices.get(&copy_key).copied() {
@@ -1925,6 +1956,7 @@ pub struct GlobalCollectionMember {
     pub item: CatalogItem,
     pub sources: Vec<GlobalCollectionSourceCopy>,
     pub preferred_source_item_id: Option<String>,
+    pub preferred_media_source_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1958,6 +1990,7 @@ struct GlobalCollectionWorkSources {
     work_item_id: String,
     copies: Vec<GlobalCollectionSourceCopy>,
     preferred_source_item_id: Option<String>,
+    preferred_media_source_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -458,6 +458,318 @@ async fn emby_manual_collections_and_library_cover_follow_qmby_contract()
     Ok(())
 }
 
+#[tokio::test]
+async fn global_collections_are_visible_only_through_accessible_source_libraries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8099".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let isolated = UserStore::new(database.clone())?
+        .create_user("isolated", "Isolated", "isolated password", false)
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let visible_library = libraries
+        .create_library("Visible Movies", LibraryKind::Movie, false)
+        .await?;
+    let hidden_library = libraries
+        .create_library("Hidden Movies", LibraryKind::Movie, false)
+        .await?;
+    let empty_library = libraries
+        .create_library("Empty Movies", LibraryKind::Movie, false)
+        .await?;
+
+    for (item_id, library_id, movie_id, year) in [
+        (
+            "viewer-visible-movie",
+            visible_library.id.to_string(),
+            "viewer-movie-one",
+            2020,
+        ),
+        (
+            "viewer-hidden-copy",
+            hidden_library.id.to_string(),
+            "viewer-movie-one",
+            2020,
+        ),
+        (
+            "viewer-hidden-movie",
+            hidden_library.id.to_string(),
+            "viewer-movie-two",
+            2021,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, production_year,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'ONLINE_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library_id)
+        .bind(item_id)
+        .bind(item_id.to_lowercase())
+        .bind(year)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO collection_item_references (
+                 item_id, movie_provider, movie_provider_id, collection_provider,
+                 collection_provider_id, collection_title, sort_order
+             ) VALUES (?, 'tmdb', ?, 'tmdb', 'viewer-series', 'Viewer Series', ?)",
+        )
+        .bind(item_id)
+        .bind(movie_id)
+        .bind(year)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, container, is_default)
+         VALUES ('viewer-visible-version', 'viewer-visible-movie', 'LOCAL_FILE', 'mkv', 1),
+                ('viewer-hidden-version', 'viewer-hidden-copy', 'LOCAL_FILE', 'mkv', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('viewer-visible-poster', 'viewer-visible-movie', 'POSTER', 0, '/visible.jpg'),
+                ('viewer-hidden-poster', 'viewer-hidden-movie', 'POSTER', 0, '/hidden.jpg')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let state = AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    );
+    let app = app_with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    for (user_id, library_id) in [
+        (viewer.id, visible_library.id),
+        (isolated.id, empty_library.id),
+    ] {
+        let grant = client
+            .patch(format!(
+                "{base_url}/api/v1/admin/users/{user_id}/libraries/{library_id}"
+            ))
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&json!({ "canView": true }))
+            .send()
+            .await?;
+        assert_eq!(grant.status(), reqwest::StatusCode::OK);
+    }
+
+    let admin_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(admin_libraries.status(), reqwest::StatusCode::OK);
+    let admin_libraries: Value = admin_libraries.json().await?;
+    let collection_library = admin_libraries["libraries"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "合集"))
+        .ok_or("admin did not see the visible collections library")?;
+    let collection_library_id = collection_library["id"]
+        .as_str()
+        .ok_or("missing global collection library id")?
+        .to_owned();
+    assert!(
+        admin_libraries["libraries"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["name"] == "Hidden Movies"))
+    );
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookie = cookie_pair(viewer_login.headers());
+    let viewer_csrf = cookie_value(viewer_login.headers(), "lux_csrf");
+    let viewer_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(viewer_libraries.status(), reqwest::StatusCode::OK);
+    let viewer_libraries: Value = viewer_libraries.json().await?;
+    let viewer_library_names = viewer_libraries["libraries"]
+        .as_array()
+        .ok_or("missing library list")?
+        .iter()
+        .filter_map(|library| library["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(viewer_library_names.contains(&"Visible Movies"));
+    assert!(viewer_library_names.contains(&"合集"));
+    assert!(!viewer_library_names.contains(&"Hidden Movies"));
+
+    let global_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{collection_library_id}/items?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(global_page.status(), reqwest::StatusCode::OK);
+    let global_page: Value = global_page.json().await?;
+    assert_eq!(global_page["total"], 1);
+    assert_eq!(global_page["items"][0]["title"], "Viewer Series");
+    assert_eq!(global_page["items"][0]["memberCount"], 1);
+    assert_eq!(
+        global_page["items"][0]["posterItemId"],
+        "viewer-visible-movie"
+    );
+
+    let collection_item_id = global_page["items"][0]["id"]
+        .as_str()
+        .ok_or("missing collection item id")?;
+    let collection_detail = client
+        .get(format!(
+            "{base_url}/api/v1/collections/{collection_item_id}?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(collection_detail.status(), reqwest::StatusCode::OK);
+    let collection_detail: Value = collection_detail.json().await?;
+    assert_eq!(collection_detail["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        collection_detail["items"][0]["sources"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        collection_detail["items"][0]["sources"][0]["itemId"],
+        "viewer-visible-movie"
+    );
+    assert_eq!(
+        collection_detail["items"][0]["sources"][0]["versions"][0]["id"],
+        "viewer-visible-version"
+    );
+    let work_item_id = collection_detail["items"][0]["id"]
+        .as_str()
+        .ok_or("missing logical work item id")?;
+
+    let select_source = client
+        .put(format!(
+            "{base_url}/api/v1/collections/{collection_item_id}/items/{work_item_id}/source"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({
+            "sourceItemId": "viewer-visible-movie",
+            "mediaSourceId": "viewer-visible-version"
+        }))
+        .send()
+        .await?;
+    assert_eq!(select_source.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let hidden_source = client
+        .put(format!(
+            "{base_url}/api/v1/collections/{collection_item_id}/items/{work_item_id}/source"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({ "sourceItemId": "viewer-hidden-copy" }))
+        .send()
+        .await?;
+    assert_eq!(hidden_source.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let mismatched_version = client
+        .put(format!(
+            "{base_url}/api/v1/collections/{collection_item_id}/items/{work_item_id}/source"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({
+            "sourceItemId": "viewer-visible-movie",
+            "mediaSourceId": "viewer-hidden-version"
+        }))
+        .send()
+        .await?;
+    assert_eq!(mismatched_version.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let selected_collection_detail = client
+        .get(format!(
+            "{base_url}/api/v1/collections/{collection_item_id}?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(selected_collection_detail.status(), reqwest::StatusCode::OK);
+    let selected_collection_detail: Value = selected_collection_detail.json().await?;
+    assert_eq!(
+        selected_collection_detail["items"][0]["preferredSourceItemId"],
+        "viewer-visible-movie"
+    );
+    assert_eq!(
+        selected_collection_detail["items"][0]["preferredMediaSourceId"],
+        "viewer-visible-version"
+    );
+
+    let movie_library_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=10",
+            visible_library.id
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(movie_library_page.status(), reqwest::StatusCode::OK);
+    let movie_library_page: Value = movie_library_page.json().await?;
+    assert_eq!(movie_library_page["total"], 1);
+    assert_eq!(movie_library_page["items"][0]["id"], "viewer-visible-movie");
+
+    let isolated_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "isolated", "password": "isolated password" }))
+        .send()
+        .await?;
+    let isolated_cookie = cookie_pair(isolated_login.headers());
+    let isolated_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &isolated_cookie)
+        .send()
+        .await?;
+    assert_eq!(isolated_libraries.status(), reqwest::StatusCode::OK);
+    let isolated_libraries: Value = isolated_libraries.json().await?;
+    assert!(
+        !isolated_libraries["libraries"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["name"] == "合集"))
+    );
+
+    server.abort();
+    assert_ne!(admin.id, viewer.id);
+    Ok(())
+}
+
 fn cookie_pair(headers: &reqwest::header::HeaderMap) -> String {
     format!(
         "lux_session={}; lux_csrf={}",
