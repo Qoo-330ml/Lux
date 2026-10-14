@@ -3679,6 +3679,167 @@ async fn manifest_scan_queues_attachment_changes_without_reprobing_unchanged_vid
 }
 
 #[tokio::test]
+async fn incremental_scan_syncs_only_the_changed_danmaku_xml_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Danmaku Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Danmaku.Movie.2024.mkv"), b"video").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let (source_id, item_id): (String, String) = sqlx::query_as(
+        "SELECT ms.id, ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Danmaku Movie (2024)/Danmaku.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, codec)
+         VALUES ('danmaku-unchanged-video', ?, 0, 'VIDEO', 'h264')",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
+    let xml_path = "Danmaku Movie (2024)/Danmaku.Movie.2024.xml";
+    let valid_xml = br#"<i><d p="1,1,25,16777215,0,0,0,0">hello</d></i>"#;
+    tokio::fs::write(root.join(xml_path), valid_xml).await?;
+    let added = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: xml_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+    let added_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(added_event, ("ADD".to_owned(), "DONE".to_owned()));
+    let added_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(added_targets, 0);
+    let indexed_track: (String, Option<Vec<u8>>, String) = sqlx::query_as(
+        "SELECT relative_path, fingerprint, status FROM danmaku_tracks
+         WHERE media_source_id = ?",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_track.0, xml_path);
+    assert!(indexed_track.1.is_some());
+    assert_eq!(indexed_track.2, "READY");
+
+    tokio::fs::write(root.join(xml_path), b"<html>invalid</html>").await?;
+    let invalid = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: xml_path.to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&invalid.id, 100, None).await?;
+    let invalid_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT processing_state, error FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&invalid.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        invalid_state,
+        ("FAILED".to_owned(), Some("INVALID_DANMAKU_XML".to_owned()))
+    );
+    let preserved_fingerprint: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_fingerprint, indexed_track.1);
+
+    tokio::fs::remove_file(root.join(xml_path)).await?;
+    let removed = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: xml_path.to_owned(),
+                kind: ChangeKind::Remove,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_state: (String, String) = sqlx::query_as(
+        "SELECT processing_state, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&removed.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_state, ("DONE".to_owned(), "REMOVE".to_owned()));
+    let removed_track_state: String =
+        sqlx::query_scalar("SELECT status FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(removed_track_state, "MISSING");
+    let source_streams: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id, stream_index FROM media_streams WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        source_streams,
+        vec![("danmaku-unchanged-video".to_owned(), 0)]
+    );
+    let metadata_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(metadata_state, "LOCAL_CONFIRMED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn manifest_scan_queues_attachment_removal_only_after_root_confirmation()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

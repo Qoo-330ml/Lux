@@ -2362,7 +2362,12 @@ fn strm_target_kind_name(target: &StrmTarget) -> &'static str {
 }
 
 pub(super) fn is_file_change_only_sidecar(path: &Path) -> bool {
-    is_external_subtitle_file(path) || is_media_info_sidecar_file(path)
+    is_external_subtitle_file(path)
+        || is_media_info_sidecar_file(path)
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
 }
 
 pub(super) fn is_supported_incremental_sidecar_file(path: &Path) -> bool {

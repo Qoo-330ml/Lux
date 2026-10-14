@@ -712,7 +712,9 @@ impl ScanJobService {
                 .list_pending_scan_job_file_changes(job_id, after.as_ref(), limit)
                 .await?;
             if changes.is_empty() {
-                return Ok(());
+                return self
+                    .process_queued_danmaku_file_changes(job_id, batch_size, cancellation)
+                    .await;
             }
             let mut restart_from_beginning = false;
             for change in &changes {
@@ -900,6 +902,192 @@ impl ScanJobService {
                     }
                     self.database
                         .save_media_probe_for_scan_file_change(job_id, change, &updates, &[])
+                        .await?
+                };
+                if !applied {
+                    restart_from_beginning = true;
+                }
+            }
+            if restart_from_beginning {
+                after = None;
+            } else {
+                after = changes
+                    .last()
+                    .map(|change| crate::storage::StoredScanJobPath {
+                        library_root_id: change.library_root_id.clone(),
+                        relative_path: change.relative_path.clone(),
+                        change_kind: change.change_kind.clone(),
+                        file_change_revision: change.file_change_revision,
+                    });
+            }
+        }
+    }
+
+    async fn process_queued_danmaku_file_changes(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        cancellation: &AtomicBool,
+    ) -> Result<(), ScanJobError> {
+        self.database
+            .requeue_running_scan_job_file_changes(job_id)
+            .await?;
+        let limit = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
+        let mut after = None;
+        loop {
+            let changes = self
+                .database
+                .list_pending_scan_job_file_changes(job_id, after.as_ref(), limit)
+                .await?;
+            if changes.is_empty() {
+                return Ok(());
+            }
+            let mut restart_from_beginning = false;
+            for change in &changes {
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let sidecar_relative_path = Path::new(&change.relative_path);
+                if !sidecar_relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+                {
+                    continue;
+                }
+                let Some(revision) = change.file_change_revision else {
+                    return Err(StorageError::Conflict(
+                        "scan file change is missing its revision".to_owned(),
+                    )
+                    .into());
+                };
+                let claimed = self
+                    .database
+                    .set_scan_job_file_change_state(
+                        job_id,
+                        &change.library_root_id,
+                        &change.relative_path,
+                        revision,
+                        "RUNNING",
+                        None,
+                    )
+                    .await?;
+                if !claimed {
+                    restart_from_beginning = true;
+                    continue;
+                }
+                if cancellation.load(Ordering::Acquire) {
+                    self.database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "PENDING",
+                            None,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let relative_directory = sidecar_relative_path
+                    .parent()
+                    .map(|directory| directory.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let sources = self
+                    .database
+                    .list_media_sources_for_external_subtitle(
+                        &change.library_root_id,
+                        &relative_directory,
+                    )
+                    .await?;
+                let matching_sources = sources
+                    .into_iter()
+                    .filter(|source| {
+                        crate::application::danmaku::danmaku_sidecar_path(Path::new(
+                            &source.relative_path,
+                        ))
+                        .is_ok_and(|path| path == sidecar_relative_path)
+                    })
+                    .collect::<Vec<_>>();
+
+                let applied = if change.change_kind == "REMOVE" {
+                    let missing_source_ids = matching_sources
+                        .iter()
+                        .map(|source| source.source_id.clone())
+                        .collect::<Vec<_>>();
+                    self.database
+                        .apply_scan_danmaku_file_change(job_id, change, &[], &missing_source_ids)
+                        .await?
+                } else if matching_sources.is_empty() {
+                    self.database
+                        .apply_scan_danmaku_file_change(job_id, change, &[], &[])
+                        .await?
+                } else {
+                    let root_path = Path::new(&matching_sources[0].root_path);
+                    let bytes = match crate::application::danmaku::read_danmaku_sidecar_from_root(
+                        root_path,
+                        sidecar_relative_path,
+                    )
+                    .await
+                    {
+                        Ok(bytes)
+                            if crate::application::danmaku::validate_danmaku_xml(&bytes)
+                                .is_ok() =>
+                        {
+                            bytes
+                        }
+                        _ => {
+                            let marked = self
+                                .database
+                                .set_scan_job_file_change_state(
+                                    job_id,
+                                    &change.library_root_id,
+                                    &change.relative_path,
+                                    revision,
+                                    "FAILED",
+                                    Some("INVALID_DANMAKU_XML"),
+                                )
+                                .await?;
+                            restart_from_beginning |= !marked;
+                            continue;
+                        }
+                    };
+                    if cancellation.load(Ordering::Acquire) {
+                        self.database
+                            .set_scan_job_file_change_state(
+                                job_id,
+                                &change.library_root_id,
+                                &change.relative_path,
+                                revision,
+                                "PENDING",
+                                None,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    let fingerprint = crate::application::danmaku::fingerprint(&bytes);
+                    let ids = matching_sources
+                        .iter()
+                        .map(|_| uuid::Uuid::now_v7().to_string())
+                        .collect::<Vec<_>>();
+                    let tracks = matching_sources
+                        .iter()
+                        .zip(&ids)
+                        .map(|(source, id)| crate::storage::NewDanmakuTrack {
+                            id,
+                            media_source_id: &source.source_id,
+                            relative_path: &change.relative_path,
+                            provider: None,
+                            provider_anime_id: None,
+                            provider_episode_id: None,
+                            fingerprint: Some(&fingerprint),
+                            status: "READY",
+                            error_code: None,
+                        })
+                        .collect::<Vec<_>>();
+                    self.database
+                        .apply_scan_danmaku_file_change(job_id, change, &tracks, &[])
                         .await?
                 };
                 if !applied {

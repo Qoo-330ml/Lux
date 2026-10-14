@@ -3125,6 +3125,139 @@ impl Database {
         })
     }
 
+    pub(crate) async fn apply_scan_danmaku_file_change(
+        &self,
+        job_id: &str,
+        change: &StoredScanJobPath,
+        tracks: &[NewDanmakuTrack<'_>],
+        missing_source_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        let Some(revision) = change.file_change_revision else {
+            return Err(StorageError::Conflict(
+                "scan file change is missing its revision".to_owned(),
+            ));
+        };
+        if !matches!(change.change_kind.as_str(), "ADD" | "CHANGE" | "REMOVE")
+            || tracks
+                .iter()
+                .any(|track| track.relative_path != change.relative_path || track.status != "READY")
+            || (change.change_kind == "REMOVE" && !tracks.is_empty())
+            || (change.change_kind != "REMOVE" && !missing_source_ids.is_empty())
+        {
+            return Err(StorageError::Conflict(
+                "invalid danmaku file update".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let current = self
+            .query_scalar::<i64>(
+                "SELECT 1 FROM scan_job_file_changes
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ? AND processing_state = 'RUNNING'
+                 LIMIT 1",
+            )
+            .bind(job_id)
+            .bind(&change.library_root_id)
+            .bind(&change.relative_path)
+            .bind(revision)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if !current {
+            return Ok(false);
+        }
+
+        if change.change_kind == "REMOVE" {
+            for source_id in missing_source_ids {
+                self.query(
+                    "UPDATE danmaku_tracks
+                     SET status = 'MISSING', fingerprint = NULL, error_code = NULL,
+                         last_checked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE media_source_id = ? AND relative_path = ?",
+                )
+                .bind(source_id)
+                .bind(&change.relative_path)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        } else {
+            for track in tracks {
+                self.query(
+                    "INSERT INTO danmaku_tracks (
+                        id, media_source_id, relative_path, format, provider,
+                        provider_anime_id, provider_episode_id, fingerprint,
+                        status, error_code, last_checked_at
+                     ) VALUES (?, ?, ?, 'XML', ?, ?, ?, ?, ?, ?, unixepoch())
+                     ON CONFLICT(media_source_id) DO UPDATE SET
+                        relative_path = excluded.relative_path,
+                        provider = excluded.provider,
+                        provider_anime_id = excluded.provider_anime_id,
+                        provider_episode_id = excluded.provider_episode_id,
+                        fingerprint = excluded.fingerprint,
+                        status = excluded.status,
+                        error_code = excluded.error_code,
+                        last_checked_at = unixepoch(),
+                        updated_at = unixepoch()",
+                )
+                .bind(track.id)
+                .bind(track.media_source_id)
+                .bind(track.relative_path)
+                .bind(track.provider)
+                .bind(track.provider_anime_id)
+                .bind(track.provider_episode_id)
+                .bind(track.fingerprint)
+                .bind(track.status)
+                .bind(track.error_code)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
+        let completed = self
+            .query(
+                "UPDATE scan_job_file_changes
+                 SET processing_state = 'DONE', error = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND library_root_id = ? AND relative_path = ?
+                   AND revision = ? AND processing_state = 'RUNNING'",
+            )
+            .bind(job_id)
+            .bind(&change.library_root_id)
+            .bind(&change.relative_path)
+            .bind(revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1;
+        if !completed {
+            return Ok(false);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn create_danmaku_match_job(
         &self,
         job: NewDanmakuMatchJob<'_>,
