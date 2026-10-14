@@ -11279,14 +11279,18 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 电影与剧级电视剧详情展示该条目全部 FANART、THUMB、WALLPAPER 图片，按图片类型和索引稳定排序。
-- [ ] 季、集、普通视频及其他条目不展示剧照；其他图片类型不会混入；无匹配图片时不渲染空栏。
-- [ ] 桌面和移动布局中，“剧照”都位于演职人员之后、更多信息之前；图片有可访问的替代文本，并使用延迟加载。
-- [ ] 详情页回归覆盖支持的条目类型、过滤规则、空数据和分区顺序；Web 测试与生产构建通过。
+- [x] 电影与剧级电视剧详情展示该条目全部 FANART、THUMB、WALLPAPER 图片，按图片类型和索引稳定排序。
+- [x] 季、集、普通视频及其他条目不展示剧照；其他图片类型不会混入；无匹配图片时不渲染空栏。
+- [x] 桌面和移动布局中，“剧照”都位于演职人员之后、更多信息之前；图片有可访问的替代文本，并使用延迟加载。
+- [x] 详情页回归覆盖支持的条目类型、过滤规则、空数据和分区顺序；Web 测试与生产构建通过。
 
 预计文件（5 个）：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/detail/MediaStills.tsx`、`web/src/react.css`、`web/tests/media-detail.test.tsx`、本文档。
 
-验证：运行 `web/tests/media-detail.test.tsx` 定向测试、完整 Web 测试及 production build；执行 `git diff --check`。
+验证：Toshiba 挂载后使用共享 `CARGO_TARGET_DIR` 运行 `cargo build --locked`、fmt 与 all-targets/all-features Clippy；Web 运行冻结锁文件安装、`web/tests/media-detail.test.tsx` 定向测试、完整 Web 测试和 production build；执行 `git diff --check`。本任务未修改 Rust 源码或 Rust API 合同，没有相关 Rust 行为测试。
+
+实施结果（2026-10-14）：详情页复用现有 item-images 查询，不增加后端接口。电影和剧级电视剧通过“剧照”横向栏展示全部 FANART、THUMB、WALLPAPER 图，先按类型再按 imageIndex 排序；海报、LOGO 等类型被排除。季、集、VIDEO 和其他条目不渲染剧照栏；无符合类型的图片时隐藏空栏。桌面与移动布局均将剧照排在演职人员和更多信息之间，图片带描述性 alt 并延迟加载。
+
+验证结果：冻结锁文件安装通过；`media-detail.test.tsx` 32/32、`detail-layout.test.mjs` 29/29、完整 Web Node 137/137 与 Vitest 593/593、production build 通过。Toshiba 已挂载，本机 `arm64`；共享 target 下 `cargo build --locked`、`cargo fmt --all -- --check`、all-targets/all-features Clippy 通过。`git diff --check` 通过。未运行 Rust 行为测试，因为本任务不改 Rust 代码或合同。
 
 ## 28. 参考资料
 
