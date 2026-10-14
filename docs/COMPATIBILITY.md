@@ -875,3 +875,46 @@ Rust 回归由 `tests/metadata_selection.rs`、`tests/nfo_writer.rs` 覆盖；�
 成功的本地电影探测会把实际探测到的视频、音频和字幕轨写入主媒体 source 对应的 NFO，并按媒体库策略同步配置卷镜像。重复探测会替换旧 streamdetails，同时保留 NFO 其他字段。宽高、codec、帧率、aspect、语言、声道、采样率、默认/强制标志和时长都来自 Lux 探测结果；`.strm` 仅使用旁车数据供播放信息读取，不据此生成本地 NFO 技术信息。
 
 回归由 `tests/probe.rs` 与 `tests/nfo_writer.rs` 覆盖，包含真实媒体 source 的 NFO 回写、重探测去重、镜像同步和 `.strm` 不写回；尚未部署到实际媒体库与 Emby 对照验证。
+
+## LUX-537：Emby 鉴权来源优先级（2026-10-14）
+
+依据官方 [Emby 4.10.1.0 ARM64 发布包](https://github.com/MediaBrowser/Emby.Releases/releases/tag/4.10.1.0) 的临时原生实例实测：在 `/System/Info` 和 `/Users/{user_id}/Items/{root_item_id}` 对比有效/无效用户 token、静态 key、不同 URL 顺序与普通用户权限；`/emby` 前缀详情结果一致。安装包 SHA256 为 `12974f6833d01953733274b52d4396200cf8ff7852135eb8ed91b27fe0b68281`。凭据含义参考官方 [API Key 认证](https://dev.emby.media/doc/restapi/API-Key-Authentication.html) 与 [用户认证](https://dev.emby.media/doc/restapi/User-Authentication.html)；下面的优先级与重复参数结果来自运行时实测，不能仅从官方文档或 2018 年历史源码推断，也不声称覆盖其他 Emby 版本。
+
+标准来源按以下顺序选择首个非空凭据：
+
+| 优先级 | 来源 |
+| --- | --- |
+| 1 | HTTP header `X-Emby-Token` |
+| 2 | query `X-Emby-Token` |
+| 3 | `X-Emby-Authorization` 的 `Token`，其次 `Authorization` 的 `Token` |
+| 4 | HTTP header `X-MediaBrowser-Token` |
+| 5 | query `api_key` |
+
+authorization 两个 header 的比较只实测了都含非空 `Token` 的情况。Lux 在前一个 header 没有非空 `Token` 时继续读取后一个；该细节不声称已完成 Emby 对照。
+
+不同 query 名称各自代表来源，不再作为同一 Serde 字段参与反序列化。选中后仍由既有服务验证身份和权限；标准 token 无效返回 401，不尝试低优先级凭据。不同来源不要求值相同，不合并权限。普通用户 query token 与代理补入的管理员 key 并存时，仍使用普通用户权限。
+
+| 请求组合 | 标准 token 鉴权结果 |
+| --- | --- |
+| query `X-Emby-Token=U&api_key=U` | 接受 U，不再返回重复字段 400 |
+| query `X-Emby-Token=U&api_key=K`，任意顺序 | 使用 U 的身份 |
+| query `X-Emby-Token=无效&api_key=K` | 401 |
+| query `X-Emby-Token=&api_key=K` | 使用 K |
+| query 同名 `api_key` 两次，即使值相同 | 401 |
+| 更高优先级有效 header / query `X-Emby-Token` 与重复 query `api_key` | 使用高优先级来源 |
+
+U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不敏感；同一来源的重复出现不会取首值或末值。非鉴权参数保留原编码、顺序与原有重复参数语义，例如媒体入口重复 `MediaSourceId` 仍取首值。根路径和 `/emby` 下的受保护路由统一处理，涵盖 GET/HEAD/POST、详情、列表、Counts、搜索、图片、PlaybackInfo、登出与媒体入口。公开发现、Ping、公开用户和密码登录沿用原规则，不因为未使用的 query token 重复而拒绝请求。原生 `/api/v1` 的鉴权规则不变。
+
+实测 Emby 不把 query `apiKey` 或 query `X-MediaBrowser-Token` 当作标准来源。为保留现有 Lux 客户端合同，Lux 将它们作为所有标准来源为空时的扩展回退；历史 `X-Lux-Api-Key`、`X-Emby-Authentication` 和 Authorization 的 Bearer/原始 token 也仅作扩展回退。选中的 query token 按原始凭据处理，不把其中的 `Bearer ` 或 `Token=` 当作 header 语法。
+
+请求内选中的凭据只在 Emby 路由内部传递，外部同名内部 header 会被清除；该内部 header 不会转发给插件，也不会作为 header 输出到响应或日志。既有用户、媒体库 ACL 与 HMAC 播放票据验证保持不变；签名播放票据继续使用原有独立授权路径。PlaybackInfo 使用实际选中的用户 token 生成 `.strm` 签名播放 URL，低优先级 Lux key header 不再抑制它；管理员共享 key 仍禁止写入播放 URL。
+
+本机验证（Toshiba 已挂载，macOS `arm64`，所有 Cargo 命令使用 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`）：
+
+- 修复前回归明确复现不同 query 名称但相同 token 返回 400；统一提取后通过。播放 URL 补充回归也先复现用户 token 丢失，再修复；公开发现/密码登录边界回归先复现 401，再修复。
+- 11 个相关 integration target 共 27/27 通过，新增凭据解析单元测试 3/3 通过。收尾再次运行 `emby_auth`、`strm`、`playback`、`web_playback`、`subtitles`、`strm_resolver_playback`、`shutdown`，共 17/17 通过。
+- `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 通过。
+- 第一轮 `cargo test --locked --all-targets` 在 `shutdown` 停止：1451 通过、1 失败、44 ignored。单独复现启动错误为 `AddrInUse`，本机已有 Lux 占用默认 UDP 7359；只对测试临时设置 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0` 后，shutdown 通过，原服务未停止或重启，代码默认端口不变。
+- 在该临时发现端口下重跑全量，库测试 858 通过、1 失败、22 ignored；失败是项目此前已记录的 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation`，在 `src/application/playback/hls.rs:2290` 遇到 `Superseded`。该用例第一轮全量通过、第二轮失败、随后单独运行通过，HLS 文件本任务未修改。全量完成门保留失败，不能由定向通过或单跑通过替代。
+
+本次没有推送或部署，不代表 NanShare/Caddy/Hills 的已部署链路已通过实机验证；也不外推 NAS/x86 或其他 Emby 版本的结果。

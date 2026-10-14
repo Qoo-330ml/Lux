@@ -11310,14 +11310,21 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 不同 query 来源同时存在时按优先级选择，与顺序及值是否相同无关；不再因 Serde alias 冲突返回 400。
-- [ ] 高优先级无效返回 401；普通用户 token 与管理员 API key 同时存在时不得提升权限。
-- [ ] 被选中的同名 query 出现多次时返回 401；更高优先级有效来源覆盖低优先级重复 query。
-- [ ] 根路径与 `/emby`、详情/列表/图片/PlaybackInfo/媒体入口使用相同提取规则；非鉴权参数保留原编码、顺序与既有重复参数语义。
-- [ ] Lux query `apiKey`/`X-MediaBrowser-Token` 与历史扩展 header 继续作为低优先级回退，原生 API 不变。
-- [ ] 自动化回归、Rust 完成检查与兼容文档记录完成；不声称 NanShare/Hills 部署后的实机链路已验证。
+- [x] 不同 query 来源同时存在时按优先级选择，与顺序及值是否相同无关；不再因 Serde alias 冲突返回 400。
+- [x] 高优先级无效返回 401；普通用户 token 与管理员 API key 同时存在时不得提升权限。
+- [x] 被选中的同名 query 出现多次时返回 401；更高优先级有效来源覆盖低优先级重复 query。
+- [x] 根路径与 `/emby`、详情/列表/图片/PlaybackInfo/媒体入口使用相同提取规则；非鉴权参数保留原编码、顺序与既有重复参数语义。
+- [x] Lux query `apiKey`/`X-MediaBrowser-Token` 与历史扩展 header 继续作为低优先级回退，原生 API 不变。
+- [x] 自动化回归与兼容文档记录完成；不声称 NanShare/Hills 部署后的实机链路已验证。
+- [ ] Rust 全量完成门通过；本次两轮全量失败与隔离重跑结果如实保留。
 
-预计代码增量文件：`src/api/emby.rs`、`src/api/emby_credentials.rs`、`tests/emby_auth.rs`、`tests/strm.rs`。规格与兼容记录作为独立文档增量。
+代码分三个增量：统一鉴权入口（`src/api/emby.rs`、`src/api/emby_credentials.rs`、`src/api/emby_handlers.rs`、`tests/emby_auth.rs`、`tests/strm.rs`）；播放 URL 选中凭据（`src/api/playback.rs`、`tests/strm.rs`）；公开发现/密码登录边界（`src/api/emby.rs`、`tests/emby_auth.rs`）。规格与兼容记录作为独立文档增量。
+
+公开发现、Ping、公开用户与密码登录不消费标准 token，保留未使用 query token 的原行为。authorization 同时存在但前者不含 Token 的边界没有实测 Emby；Lux 保留查找后者非空 Token 的回退，明确不声称该边界已完成对照。签名播放票据保留独立授权路径。
+
+实施结果（2026-10-14）：统一入口在受保护 Emby 路由内部按实测优先级选出凭据，原 query 不再把鉴权别名交给 DTO；保留非鉴权参数原编码和重复 MediaSourceId 的首值语义。内部凭据 header 防外部伪造，登出使用同一提取结果。公开发现/Ping/用户与密码登录保留原行为。PlaybackInfo 按选中的用户 token 生成代理播放 URL，低优先级 Lux key header 不再抑制它，共享管理员 key 仍不进入 URL。代码增量为 `c79e21ef`、`d53e8088`、`95e0d014`。
+
+验证：先写失败回归，11 个相关 target 27/27、新解析单元测试 3/3 通过；收尾 7 个 target 17/17 通过。build、fmt、all-target/all-feature Clippy 和 diff 检查通过。本机 ARM64，Cargo target 保留 Toshiba。首轮 all-targets 1451 通过、1 失败、44 ignored，在 shutdown 因已有服务占用 UDP 7359 而启动失败；测试临时使用 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0` 后 shutdown 通过，不改默认端口、不停止现有服务。第二轮全量在 lib 停止，858 通过、1 失败、22 ignored：此前已记录的 HLS generation 用例遇到 `Superseded`；该用例第一轮通过、第二轮失败、随后单跑通过。HLS 文件未修改，全量门仍未通过。详细边界见 `docs/COMPATIBILITY.md` 的 LUX-537。未推送、未部署，实际 NanShare/Hills 链路尚未复测。
 
 ## 28. 参考资料
 
