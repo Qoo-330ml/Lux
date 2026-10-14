@@ -57,6 +57,33 @@ fn migration_versions_are_unique_per_backend() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+#[test]
+fn scan_job_file_changes_migration_matches_both_backends() -> Result<(), Box<dyn std::error::Error>>
+{
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sqlite = fs::read_to_string(repository.join("migrations/0170_scan_job_file_changes.sql"))?;
+    let postgres =
+        fs::read_to_string(repository.join("migrations-postgres/0170_scan_job_file_changes.sql"))?;
+
+    for migration in [&sqlite, &postgres] {
+        assert!(migration.contains("CREATE TABLE scan_job_file_changes"));
+        assert!(migration.contains("PRIMARY KEY (job_id, library_root_id, relative_path)"));
+        assert!(migration.contains("idx_scan_job_file_changes_pending"));
+        for state in [
+            "ADD", "CHANGE", "REMOVE", "PENDING", "RUNNING", "DONE", "FAILED", "SKIPPED",
+        ] {
+            assert!(
+                migration.contains(state),
+                "missing {state} in migration: {migration}"
+            );
+        }
+    }
+    assert!(sqlite.contains("unixepoch()"));
+    assert!(postgres.contains("EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)"));
+    assert!(!postgres.contains("unixepoch()"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn sqlite_media_item_timestamps_upgrade_handles_legacy_and_new_rows()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1289,7 +1316,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 169);
+    assert_eq!(schema_version, 170);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -1650,7 +1677,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 169);
+    assert_eq!(schema_version, 170);
     database.close().await;
     Ok(())
 }
