@@ -6,6 +6,7 @@ const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = 4_096;
 const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
+use crate::storage::GLOBAL_COLLECTION_LIBRARY_ID;
 
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
@@ -873,10 +874,11 @@ pub(super) async fn emby_visible_library_items(
         )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let child_counts = state
+    let catalog = state
         .catalog
         .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let child_counts = catalog
         .count_library_root_items(&accessible_library_ids)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -894,7 +896,59 @@ pub(super) async fn emby_visible_library_items(
             child_count,
         ));
     }
+    let collections = catalog
+        .list_global_collection_cards(principal, 0, 1)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if collections.total > 0 {
+        items.push(emby_global_collection_library_json(
+            &state.server_id,
+            collections.total,
+        ));
+    }
     Ok(items)
+}
+
+fn emby_global_collection_library_json(server_id: &str, child_count: i64) -> Value {
+    let id = emby_public_id(GLOBAL_COLLECTION_LIBRARY_ID);
+    json!({
+        "Name": "合集",
+        "SortName": "合集",
+        "Id": id,
+        "ServerId": server_id,
+        "Type": "CollectionFolder",
+        "IsFolder": true,
+        "MediaType": "Video",
+        "CollectionType": "boxsets",
+        "ChildCount": child_count,
+        "RecursiveItemCount": child_count,
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": false,
+        },
+    })
+}
+
+async fn emby_global_collection_library_detail(
+    state: &AppState,
+    principal: AccessPrincipal,
+) -> Response {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog.list_global_collection_cards(principal, 0, 1).await {
+        Ok(page) if page.total > 0 => Json(emby_global_collection_library_json(
+            &state.server_id,
+            page.total,
+        ))
+        .into_response(),
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 pub(super) async fn emby_library_root_count(
@@ -1929,6 +1983,21 @@ pub(super) async fn emby_list_items(
             Err(status) => status.into_response(),
         };
     }
+    if query
+        .parent_id
+        .as_deref()
+        .is_some_and(|parent_id| emby_internal_id(parent_id) == GLOBAL_COLLECTION_LIBRARY_ID)
+    {
+        return emby_global_collection_root_items_response(
+            state,
+            principal,
+            &principal.user_id_string(),
+            can_download,
+            can_delete,
+            query,
+        )
+        .await;
+    }
     if let Some(response) =
         emby_single_id_lookup_response(state, principal, can_download, can_delete, query).await
     {
@@ -1956,6 +2025,62 @@ pub(super) async fn emby_list_items(
         }
         Err(status) => status.into_response(),
     }
+}
+
+async fn emby_global_collection_root_items_response(
+    state: &AppState,
+    principal: AccessPrincipal,
+    user_id: &str,
+    can_download: bool,
+    can_delete: bool,
+    query: &EmbyItemsQuery,
+) -> Response {
+    let (offset, limit) = match emby_catalog_items_page_params(query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = match catalog
+        .list_global_collection_cards(principal, offset, limit)
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let catalog_page = CatalogPage {
+        items: page.cards.iter().map(|card| card.item.clone()).collect(),
+        total: page.total,
+        offset,
+        limit,
+    };
+    let mut items = match emby_catalog_items_for_user(
+        state,
+        user_id,
+        &catalog_page,
+        query.fields.as_deref(),
+        can_download,
+        can_delete,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(status) => return status.into_response(),
+    };
+    for (item, card) in items.iter_mut().zip(&page.cards) {
+        if let Value::Object(object) = item {
+            object.insert("ChildCount".to_owned(), json!(card.member_count));
+            object.insert("RecursiveItemCount".to_owned(), json!(card.member_count));
+            object.insert("IsFolder".to_owned(), Value::Bool(true));
+        }
+    }
+    Json(json!({
+        "Items": items,
+        "TotalRecordCount": page.total,
+        "StartIndex": offset,
+    }))
+    .into_response()
 }
 
 pub(super) fn emby_single_id_lookup(query: &EmbyItemsQuery) -> Option<&str> {
@@ -2146,7 +2271,10 @@ pub(super) async fn emby_query_requests_series_children(
     let parent_id = emby_internal_id(parent_id);
     matches!(
         catalog.find_item(principal, &parent_id).await,
-        Ok(Some(item)) if matches!(item.item_type.as_str(), "SERIES" | "SEASON")
+        Ok(Some(item))
+            if matches!(item.item_type.as_str(), "SERIES" | "SEASON")
+                || (item.item_type == "BOX_SET"
+                    && item.library_id == GLOBAL_COLLECTION_LIBRARY_ID)
     )
 }
 
@@ -2571,8 +2699,11 @@ pub(super) async fn emby_item_response(
     if item_id == principal.user_id_string() {
         return emby_user_root_response(state, principal).await;
     }
-    let response_fields = emby_item_detail_response_fields(fields);
     let internal_item_id = emby_internal_id(item_id);
+    if internal_item_id == GLOBAL_COLLECTION_LIBRARY_ID {
+        return emby_global_collection_library_detail(state, principal).await;
+    }
+    let response_fields = emby_item_detail_response_fields(fields);
     if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>()
         && let Some(libraries) = state.libraries.as_ref()
     {
@@ -2633,6 +2764,19 @@ pub(super) async fn emby_item_response(
             Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, false),
         };
     match catalog_item {
+        Some(item)
+            if item.item_type == "BOX_SET" && item.library_id == GLOBAL_COLLECTION_LIBRARY_ID =>
+        {
+            emby_global_collection_item_detail(
+                state,
+                principal,
+                &item.id,
+                fields,
+                can_download,
+                can_delete,
+            )
+            .await
+        }
         Some(item) if resolved_from_media_source_id => {
             let unplayed_item_count = match emby_unplayed_episode_count(
                 catalog,
@@ -2798,6 +2942,58 @@ pub(super) async fn emby_item_response(
             }
         }
     }
+}
+
+async fn emby_global_collection_item_detail(
+    state: &AppState,
+    principal: AccessPrincipal,
+    collection_item_id: &str,
+    fields: Option<&str>,
+    can_download: bool,
+    can_delete: bool,
+) -> Response {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let card = match catalog
+        .find_global_collection_card(principal, collection_item_id)
+        .await
+    {
+        Ok(Some(card)) => card,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let page = CatalogPage {
+        items: vec![card.item],
+        total: 1,
+        offset: 0,
+        limit: 1,
+    };
+    let mut items = match emby_catalog_items_for_user(
+        state,
+        &principal.user_id_string(),
+        &page,
+        fields,
+        can_download,
+        can_delete,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(status) => return status.into_response(),
+    };
+    let Some(item) = items.first_mut() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Value::Object(object) = item {
+        object.insert("ChildCount".to_owned(), json!(card.member_count));
+        object.insert("RecursiveItemCount".to_owned(), json!(card.member_count));
+        object.insert("IsFolder".to_owned(), Value::Bool(true));
+    }
+    Json(item).into_response()
 }
 
 pub(super) async fn emby_person_image(

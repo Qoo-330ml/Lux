@@ -772,6 +772,71 @@ impl Database {
             })
     }
 
+    pub(crate) async fn count_visible_global_collections(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        is_favorite: Option<bool>,
+    ) -> Result<i64, StorageError> {
+        let favorite_filter = is_favorite.map_or(String::new(), |_| {
+            " AND COALESCE(
+                (SELECT state_filter.is_favorite
+                 FROM user_item_state state_filter
+                 WHERE state_filter.user_id = ? AND state_filter.item_id = collection_item.id),
+                0
+            ) = ?"
+                .to_owned()
+        });
+        let query = format!(
+            "SELECT COUNT(DISTINCT collection.id)
+             FROM collections collection
+             JOIN media_items collection_item ON collection_item.id = collection.item_id
+             JOIN collection_items member ON member.collection_id = collection.id
+             JOIN collection_work_items work ON work.work_item_id = member.item_id
+             JOIN media_items work_item ON work_item.id = member.item_id
+             WHERE collection.library_id = ?
+               AND collection_item.item_type = 'BOX_SET'
+               AND collection_item.removed_at IS NULL
+               AND collection_item.has_available_source = 1
+               AND EXISTS (
+                   SELECT 1 FROM collection_work_sources cws
+                   JOIN media_items source_item ON source_item.id = cws.source_item_id
+                   JOIN libraries source_library
+                     ON source_library.id = source_item.library_id AND source_library.is_enabled = 1
+                   WHERE cws.work_item_id = member.item_id
+                     AND source_item.item_type = 'MOVIE'
+                     AND source_item.removed_at IS NULL
+                     AND source_item.has_available_source = 1
+                     AND (? = 1 OR NOT EXISTS (
+                         SELECT 1 FROM user_library_access any_visible_library
+                         WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
+                     ) OR EXISTS (
+                         SELECT 1 FROM user_library_access visible_library
+                         WHERE visible_library.user_id = ?
+                           AND visible_library.library_id = source_item.library_id
+                           AND visible_library.can_view = 1
+                     ))
+               )
+               {favorite_filter}"
+        );
+        let mut statement = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(query))
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(database_flag(is_admin))
+            .bind(user_id)
+            .bind(user_id);
+        if let Some(is_favorite) = is_favorite {
+            statement = statement.bind(user_id).bind(database_flag(is_favorite));
+        }
+        statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
         self.query(
             "SELECT

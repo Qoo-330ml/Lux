@@ -674,12 +674,20 @@ impl CatalogService {
             .database
             .count_catalog_item_types(&library_ids, user_id, is_favorite)
             .await?;
+        let global_collection_count = self
+            .database
+            .count_visible_global_collections(
+                &principal.user_id_string(),
+                principal.is_admin,
+                is_favorite,
+            )
+            .await?;
         Ok(CatalogItemCounts {
             movie_count: counts.movie_count,
             series_count: counts.series_count,
             episode_count: counts.episode_count,
-            box_set_count: counts.box_set_count,
-            item_count: counts.item_count,
+            box_set_count: counts.box_set_count + global_collection_count,
+            item_count: counts.item_count + global_collection_count,
         })
     }
 
