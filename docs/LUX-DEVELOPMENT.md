@@ -11426,11 +11426,16 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] SQLite 空库与升级迁移、Rust 完整完成检查、Web 完整测试/构建和 relevant Playwright 用户流程通过。
-- [ ] VidHub、SenPlayer、Infuse 逐个记录合集浏览、来源选择与进度回写实测结果；未实测的客户端不记为通过。
-- [ ] 更新 `docs/COMPATIBILITY.md` 并记录本机架构、验证限制与剩余风险；阶段门结束后停在项目所有者确认点。
+- [x] SQLite 空库和升级迁移检查通过：`cargo test --locked --test storage` 为 55 passed。
+- [ ] Rust 完整完成检查通过。库测试为 872 passed、22 ignored；全量测试在 `tests/libraries_api.rs::admin_can_create_list_and_add_library_root_with_csrf` 收到 `DATABASE_UNAVAILABLE`/503 后失败。单独重跑该用例通过；`tests/metadata.rs::metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking` 另一次全量运行和单独运行均失败（第二次扫描的 `nfo_loaded` 为 1，期望 0）。
+- [x] Web 冻结依赖安装、完整测试（Node 139/139、Vitest 600/600）和生产构建通过。
+- [x] Playwright 浏览器流程通过：打开合集库、进入“飞驰人生”、选择 4K 来源并触发来源偏好写入；该流程使用 mock API，服务端合同由 Rust 集成测试验证。
+- [ ] VidHub、SenPlayer、Infuse 的合集浏览、来源选择与进度回写实测尚未完成，未实测客户端不记为通过。
+- [x] `docs/COMPATIBILITY.md` 已记录本机 arm64、检查结果、客户端状态和剩余风险；本阶段停在项目所有者确认点。
 
 预计文件：兼容记录、本文档和阶段验收涉及的回归文件。
+
+实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过；PostgreSQL 测试未运行，因为本机没有 PostgreSQL 实例。全量测试的失败、单测复跑结果、Web 检查和 mock API 的浏览器流程已按证据写入 `docs/COMPATIBILITY.md`。VidHub 当前没有可操作窗口，SenPlayer 和 Infuse 在本机不可用。阶段门未完成，等待项目所有者确认后续处理。
 
 ## 29. 参考资料
 

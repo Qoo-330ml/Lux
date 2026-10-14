@@ -157,6 +157,22 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 
 `tests/emby_global_collection_playback.rs` 验证了两份跨库原件的 DTO 和真实直放字节、外置字幕路由、显式 source 选择、单副本 source 缺省回调、歧义回调拒绝、不同设备并发会话、暂停/停止、source/device/会话错配拒绝及撤权后旧流和回调拒绝。Rust 自动化结果只证明服务端合同。该记录未进行 VidHub、SenPlayer 或 Infuse 的合集真实 UI/source 切换测试，不能据此声明这些客户端能浏览合集、选择版本或回写对应原电影进度；这些实机结果留待 LUX-545 阶段门逐项记录。
 
+## LUX-545 合集阶段门（2026-10-15）
+
+本机为 macOS `arm64`（`uname -m`）；所有 Cargo 构建和测试均将 `CARGO_TARGET_DIR` 指向项目共享目录 `/Volumes/Toshiba/mywork/Lux/target`。SQLite 存储目标从空库和已有 schema 迁移的检查通过（`cargo test --locked --test storage`：55 passed）；合集单元覆盖通过（`cargo test --locked --lib global_collection`：6 passed）。最终代码的 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。PostgreSQL 相关测试因本机没有可用 PostgreSQL 实例而按设计忽略，不能视为 PostgreSQL 运行时验证。
+
+Rust 全量门禁尚未通过。最终代码的 `cargo test --locked --all-targets --quiet` 中，库测试为 872 passed、22 ignored、0 failed；随后 `tests/libraries_api.rs` 有 13 passed、1 failed，`admin_can_create_list_and_add_library_root_with_csrf` 在库更新时收到 `DATABASE_UNAVAILABLE`/503。单独运行该测试通过，说明此轮全量失败未能在隔离运行中复现。另一次完整运行中，`tests/metadata.rs::metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking` 因第二次扫描的 `nfo_loaded` 实际为 1、期望为 0 而失败；单独运行也失败。两处测试及对应元数据行为不属于合集改动；当前阶段不把全量 Rust 检查标记为通过。
+
+Web 检查通过：冻结依赖安装、Web 测试（Node 139/139，Vitest 600/600，77 个文件）和生产构建均通过。Playwright 浏览器流程打开 `/libraries` 的“合集”，进入“飞驰人生”，选择 4K 来源，随后链接包含 `collectionId`/`sourceId`，并发出来源偏好写入请求；浏览器控制台 0 errors、0 warnings。该流程的 API 路由使用 mock，因此只作为真实浏览器 UI 流程证据；服务端接口由 Rust 集成测试覆盖。
+
+| 客户端 | 合集浏览 | 来源选择 | 进度回写 | 结果 |
+|---|---|---|---|---|
+| VidHub | 未实测 | 未实测 | 未实测 | 当前机器未能打开可操作的 VidHub 窗口 |
+| SenPlayer | 未实测 | 未实测 | 未实测 | 当前机器未发现可用应用 |
+| Infuse | 未实测 | 未实测 | 未实测 | 当前机器未发现可用应用 |
+
+阶段风险：Rust 全量集成目标仍有未解决失败，第三方客户端的合集 UI、跨库来源选择和原电影进度回写也缺少实机证据。LUX-545 阶段门未完成，停在项目所有者确认点。
+
 2026-09-20 播放状态兼容：Emby `GET /Sessions` 和 Lux 管理仪表盘现在根据活动 HLS 会话报告
 `DirectStream` 或 `Transcode`，不再把服务端转码固定报告为 `DirectPlay`；可用时同时返回/展示 HLS 容器、视频/音频输出 codec
 及目标码率。该状态信息来自 Lux 的实际播放会话和 FFmpeg 输出档位，不代表 Harbor 等第三方客户端已完成部署环境实测。
