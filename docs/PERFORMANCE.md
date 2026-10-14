@@ -1193,7 +1193,7 @@ SQL/pool/lock 观测也没有分离出单一根因。rescan 并发请求窗口�
 
 1k 两组明确验证每 job 最多 100 项、所有 item `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL，scan/local 均在 provider 放行前完成。10k SQLite 快照为 scan `COMPLETED/IDLE`，local 15 批完成、31 批待处理、4 批运行；online 39 QUEUED+1 RUNNING。`local_metadata_completeness` 在持久化后等待 `enqueue_fill_missing_job_id`，该方法最终等待容量 32 channel 的 `sender.reserve().await`；provider 阻塞导致队列满，背压传回本地 worker。失败的 online 时延保持 unavailable，poster 矩阵中的 `onlineFillMissingJobCount=0` 仅表示该 fixture 禁止在线调度。
 
-该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。已报告此规格冲突，按 AGENTS.md 在修订公共调度/存储边界前等待项目所有者选择。建议自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用有界通知/分页异步领取；保留管理员请求背压和完成等待合同，禁止按 job 无界 spawn。该建议尚未实施。
+该现象与 LUX-424“队列满时对提交方施加背压”一致，却不满足阶段 23/LUX-303“新 job 不阻塞本地 worker”。2026-10-14 项目所有者授权按自动/显式来源分流解决冲突：自动补缺以已持久化 QUEUED job 为队列、每库 dispatcher 用合并唤醒和分页领取；保留管理员/计划入口的显式提交背压和完成等待合同，禁止按 job 无界 spawn。此处记录的是决策，LUX-528/LUX-529 尚未实现；阶段 23 性能门仍开放，失败样本仍保持 unavailable，不计作在线刮削耗时。
 
 #### 质量门与证据
 

@@ -11113,6 +11113,128 @@ Clippy、Web 测试和构建质量门；Cargo 命令使用 `/Volumes/Toshiba/myw
 均通过。本机架构为 `arm64`，未据此推断 NAS/x86 性能。此前两次全量重跑分别遇到未修改区域的 NFO actor
 credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 all-targets 与 check-all 完整运行均通过。
 
+### 阶段 27：自动刮削排队、吞吐基准与库级进度
+
+本阶段先修正 workflow 3 自动补缺持久化后仍等待容量 32 dispatcher channel 的合同冲突，再测量并调整在线刮削并发，最后为管理员提供只读的库级入库进度。自动来源与管理员/计划任务显式来源必须在持久化状态中区分；自动 worker 不等待内存队列容量，显式入口保留已有背压、完成 receiver、取消与每库串行语义。不得使用无界队列或按 job 无界 spawn。
+
+每个任务一次只处理一个 LUX 编号，先写失败回归，再做最小实现并定向验证。该阶段不改扫描索引、Manifest 删除/完成语义或 `ScanCompleted`/`JOB_COMPLETED`/Webhook/Emby 合同，不批量提交刮削写库，不放宽阶段 23 的 5% 性能门。所有本机性能记录标明 ARM64 和 SQLite/PostgreSQL 配置，不外推 FNOS/NAS/x86。
+
+#### LUX-527：修订自动 FILL_MISSING dispatcher 合同
+
+范围：记录自动本地补缺与管理员/计划任务显式提交的分离合同。持久化 `QUEUED` 自动 job 是自动调度来源；每库 dispatcher 通过有界唤醒与分页领取自动工作。自动本地 worker 不等待队列容量或 provider 完成；显式入口仍保留当前容量背压与完成等待。旧 job 升级后不推断来源。扫描任务状态、索引完成事件和 webhook 时序保持不变。
+
+验收：
+
+- [ ] ADR-046、任务规格与阶段 23 阻塞记录明确同一调度策略如何同时满足 LUX-303 和 LUX-424。
+- [ ] 决策明确禁止无界内存队列、每 job task fan-out、自动工作并入显式 job，以及改变扫描完成语义。
+- [ ] 运行时代码尚未修改；阶段 23 性能门维持开放，后续实施任务明确包含超过 32 个 job 的慢 provider 回归。
+
+预计文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/046-progressive-scan-and-missing-metadata.md`、`docs/PERFORMANCE.md`、`docs/STAGE-23-GATE-REVIEW-2026-10-09.md`。
+
+验证：核对 LUX-303/LUX-424 原合同、现有失败快照与旧 job 升级边界；运行 `git diff --check`。本任务仅记录决策，不声称运行时修复或阶段门通过。
+
+#### LUX-528：持久化补缺 job 来源字段
+
+范围：追加 SQLite/PostgreSQL migration，为 FILL_MISSING job 保存内部调度来源。新旧/显式 job 默认显式来源，自动来源仅由后续任务设置；升级不得推断已有 job 的历史来源，公开 DTO/API 不增加来源字段。
+
+验收：
+
+- [ ] SQLite migration 可从空库运行且能从当前 schema 升级；PostgreSQL migration 与其语义一致，已发布 migration checksum 不变。
+- [ ] 既有 job 获得显式来源默认值，来源字段有必要索引且不出现在 API DTO。
+- [ ] SQLite 与 PostgreSQL migration/旧数据默认值回归通过。
+
+预计文件：`migrations/0169_metadata_reidentify_dispatch_source.sql`、`migrations-postgres/0169_metadata_reidentify_dispatch_source.sql`、`tests/storage.rs`、本文档。
+
+验证：SQLite migration target 与 PostgreSQL migration target；`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+#### LUX-529：自动与显式补缺事务分流
+
+范围：本地 completeness 事务创建的 job 设置自动来源，只合并到同库、同来源自动 job；显式创建与管理员重试设置显式来源。保留活跃 item 去重、单 job 100 项边界、状态/计数和事务原子性。
+
+验收：
+
+- [ ] 自动完整性事务不会扩展显式 job；显式 job 不会被自动合并逻辑重分类。
+- [ ] 显式 create/retry 保持显式来源；自动 job 去重/合并、item 状态、总数与回滚语义正确。
+- [ ] 覆盖两个来源的 SQLite 存储合同和 PostgreSQL 事务合同；来源字段不出现在 API DTO。
+
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：存储 repository library tests、PostgreSQL FILL_MISSING transaction contract、fmt 与 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
+
+#### LUX-530：自动补缺使用有界唤醒与持久队列 drain
+
+范围：每库 dispatcher 保留单 runner 与显式 job 的有界 channel；自动来源通过合并唤醒通知触发持久队列 drain。dispatcher 只分页拉取并领取自动来源 `QUEUED` job，按创建顺序串行运行；自动提交即使存在 32 个以上待处理 job 也立即返回，不丢唤醒、不重复执行。显式提交仍等待既有 channel 容量并获得 completion receiver。
+
+验收：
+
+- [ ] provider 被 gate 阻塞且自动队列超过 32 个 job 时，本地完整性 worker 与 scan 可完成；放行 provider 后自动 job 全部按每库单 runner 排空。
+- [ ] 显式提交在 channel 满时仍呈现原背压/completion receiver 语义；自动工作不提前领取显式 job。
+- [ ] 覆盖唤醒合并/竞态、自动 job 合并、取消、dispatcher shutdown、worker panic 恢复及重启后的 QUEUED job drain；不产生无界内存或 task fan-out。
+- [ ] SQLite 与 PostgreSQL 均覆盖存储领取；保留 `ScanCompleted`/`JOB_COMPLETED` 与扫描进度时序。
+
+预计文件：`src/application/reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：先运行自动 dispatch/慢 provider regression 和 `tests/reidentify.rs`、扫描 metadata targets；阶段实现完成时运行 Rust 全目标与 all-features Clippy。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+#### LUX-531：增加固定延迟的刮削并发基准
+
+范围：为现有 metadata pipeline benchmark 增加可控的 stub provider 延迟和并发矩阵，至少测 4/8/12 个 worker、固定 item 数与固定每次 provider 调用延迟，记录 items/s、p50/p95 单项耗时、job 总耗时与配置。benchmark 使用真实 job worker 和当前 SQLite/PostgreSQL storage 路径；网络请求保持 stub，不访问 TMDb。
+
+验收：
+
+- [ ] 同一 fixture/延迟/数据库参数可重复运行，测量结果包含有效性检查、版本/架构与原始数据。
+- [ ] 并发 sweep 每档独立设置，确认 worker 峰值不超过档位且背压可见；错误/取消样本不计为成功吞吐。
+- [ ] `scripts/run-metadata-performance.sh` 可选择运行该基准；文档将真实上游响应时延与 stub 吞吐分开说明。
+- [ ] 本任务只建立测量，不改变默认并发或宣称真实 TMDb 速率。
+
+预计文件：`tests/performance.rs`、`scripts/run-metadata-performance.sh`、`docs/PERFORMANCE.md`、本文档。
+
+验证：Toshiba 挂载检查后以共享 target 运行指定 ignored performance target；另运行 fmt 和 diff 检查。禁止将本机 ARM64 结果外推至 NAS/x86。
+
+#### LUX-532：可配置且有界的 FILL_MISSING 并发
+
+范围：依据 LUX-530 的固定延迟矩阵确定默认 worker 数，为在线 FILL_MISSING 增加 `LUX_METADATA_CONCURRENCY` 启动期配置与绝对上限；默认值和上限写入性能/部署说明。保留全局 semaphore、每库串行 dispatcher、resource metrics 降档、取消响应和 DB 后端资源差异。无效/超范围值采用安全 clamp 并发出不含 secret 的配置告警。
+
+验收：
+
+- [ ] env 未设置、有效边界、0、负数/非整数、超过上限均有解析回归；服务启动后配置固定，避免运行中改 env 造成 semaphore 与 worker limit 不一致。
+- [ ] SQLite/PostgreSQL 批准的默认值由 benchmark 支撑；资源背压可把实际并发降到 1 且恢复后可重新升档。
+- [ ] 连续多个 library/job 的合计 FILL_MISSING worker 不超过全局上限；其它 metadata 模式不超过现有全局限制。
+- [ ] 更新部署/兼容文档；不宣称未经上游验证的 TMDb 请求速率。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`、本文档。
+
+验证：Rust parser/worker 测试、`tests/reidentify.rs` 与相关 metadata 集成 target、build/fmt/all-features Clippy；Toshiba 挂载检查与共享 target 必须满足。
+
+#### LUX-533：提供只读库级入库流水线状态
+
+范围：聚合启用媒体库当前扫描、Manifest/local metadata、probe、thumbnail、自动 FILL_MISSING 的待处理/运行/完成/失败/取消计数和最近活动时间，供管理员活动视图分页读取。只读聚合现有持久化状态，不新建通用 pipeline 表，不改各 worker 的运行路径或单项状态。未启用阶段/没有待办的阶段显示为未计划/空闲，不制造假进度。
+
+验收：
+
+- [ ] API 每页最多 50 个库；聚合 SQL/存储读取有界，不读取 item 全表到应用内、不触发 provider 或 filesystem work。
+- [ ] 计数能区分 queued/running/completed/failed/cancelled，扫描索引完成与后台阶段明确分开；在线补缺不延长扫描进度。
+- [ ] 覆盖无任务、扫描后处理、仅本地任务、自动刮削、混合阶段、失败/取消、库移除与 SQLite/PostgreSQL。
+- [ ] 管理员响应不暴露来源凭据、标题、路径或上游错误文本；不改变 Emby/ScanCompleted/Webhook DTO。
+
+预计文件：`src/storage/jobs/`、`src/storage/mod.rs`、`src/application/`、`src/api/admin/`、`tests/`、本文档。若超过 5 个文件，开始前再拆分为存储聚合与 API 接线两项。
+
+验证：目标 API/storage integration targets、PostgreSQL 合同、fmt、build 与 all-features Clippy；Toshiba 挂载检查并使用共享 target。
+
+#### LUX-534：管理员活动视图展示库级入库阶段
+
+范围：在现有管理员活动弹层中以媒体库为组展示 LUX-532 聚合结果，清楚区分索引和后台 NFO、probe、thumbnail、刮削进度；支持无进度阶段、长任务与失败项。复用现有活动入口，不改变桌面/移动 shell 的触发方式。
+
+验收：
+
+- [ ] 多库并行时各库独立显示阶段与计数；扫描索引完成后仍显示未结束的后台阶段。
+- [ ] 无任务、纯后台处理、部分失败、完成、分页/刷新与 API 错误均有 Web 回归。
+- [ ] 视图不把阶段总计伪装成精确 ETA；ARIA 状态与进度值准确，长库名和窄视口不造成横向溢出。
+
+预计文件：`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、本文档。
+
+验证：定向 Web 测试、完整 Web 测试与 production build。阶段 27 全部任务完成后，运行该阶段门、更新性能/兼容记录并停在项目所有者确认点；阶段 23 原有 5% A/B 性能门仍按其规格单独开放。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

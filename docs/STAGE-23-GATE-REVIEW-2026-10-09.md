@@ -29,11 +29,11 @@ Web 复核保留一次默认并行全量的 5 个首页轮播失败；新增 DOM
 
 来源链：本地 completeness 已原子持久化缺失结果与 job，随后同步调用 `enqueue_fill_missing_job_id`；dispatcher 的 `sender.reserve().await` 等待容量 32 队列，provider 不释放就不消费后续队列，背压传回本地 worker。1k 仅 10 个 job，未达到这一容量边界。
 
-正式规格 LUX-424 明确要求满队列对扫描提交方背压；阶段 23/LUX-303 又要求独立在线任务不阻塞本地 worker。这两项在 10k fixture 上不能同时成立。按 **AGENTS.md / Source of truth**，在改变公共调度/存储边界前已报告并请求项目所有者选择。建议修订自动入口：QUEUED 数据库记录作为真实队列、每库 dispatcher 通过有界通知和分页异步领取，管理员/计划入口的背压与完成等待继续保留；不使用无界内存或逐 job spawn。该修订与实现尚未发生。
+正式规格 LUX-424 明确要求满队列对扫描提交方背压；阶段 23/LUX-303 又要求独立在线任务不阻塞本地 worker。这两项在 10k fixture 上不能同时成立。2026-10-14 项目所有者授权修订自动入口：QUEUED 数据库记录作为自动工作的真实队列、每库 dispatcher 通过合并唤醒和分页异步领取；管理员/计划入口的显式背压与完成等待继续保留；不使用无界内存或逐 job spawn。该决定登记为阶段 27/LUX-527；来源标记与运行时实现尚未完成。原 10k 失败快照不变，阶段 23 性能门仍未通过。
 
 ## 最短剩余清单
 
-1. 项目所有者选择上述冲突的合同；若采用建议，先补 >32-job、阻塞 provider 下 local drain 的失败回归，再最小修复；保留 dedupe、每库串行、shutdown、取消和完成通知语义。
+1. 完成阶段 27/LUX-528/529 来源持久化和 dispatcher 实现，并用 >32-job、阻塞 provider 复跑 local drain；保留 dedupe、每库串行、shutdown、取消和完成通知语义。
 2. 在可用的采样窗口，以最终 revision、相同 scan/pool 配置完成 1k/10k × 两后端 × LUX-270/LUX-304 三轮配对，记录默认配置差异另作对照；拒绝受外部 Cargo 干扰的整个配对。补齐 10k online 矩阵。
 3. 对有效复测中仍超过 5% 的稳定回退做 phase/pool-acquire/HTTP/SQL 定位、调整和完整复测；不删跨终点慢请求，不把 null 当零。
 4. 最终源码重跑相关 Rust/Web 全门，更新精确 SHA、结果和兼容性记录；按全局完成标准补需要的真实用户流程验证。
