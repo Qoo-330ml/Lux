@@ -1,6 +1,10 @@
 use super::*;
 use axum::extract::DefaultBodyLimit;
 
+#[path = "emby_credentials.rs"]
+mod credentials;
+pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-credential";
+
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/System/Info/Public", get(emby_public_system_info))
@@ -202,4 +206,5 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(emby_mark_favorite).delete(emby_unmark_favorite),
         )
         .route("/Sessions/Logout", post(emby_logout))
+        .route_layer(middleware::from_fn(credentials::normalize_credentials))
 }

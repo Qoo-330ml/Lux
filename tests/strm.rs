@@ -569,10 +569,30 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .await?;
     assert_eq!(
         duplicate_source_query_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    // A higher-priority header makes the repeated query credential irrelevant;
+    // duplicate media source parameters still retain their existing first value.
+    let header_authenticated_duplicate_stream = no_redirect_client
+        .get(format!(
+            "http://{address}/emby/videos/{remote_item_id}/stream.mkv"
+        ))
+        .query(&[
+            ("MediaSourceId", remote_source_id.as_str()),
+            ("MediaSourceId", "00000000-0000-0000-0000-000000000000"),
+            ("api_key", token.as_str()),
+            ("api_key", "invalid-second-token"),
+        ])
+        .header("X-Emby-Token", token.as_str())
+        .header(reqwest::header::USER_AGENT, player_user_agent)
+        .send()
+        .await?;
+    assert_eq!(
+        header_authenticated_duplicate_stream.status(),
         reqwest::StatusCode::FOUND
     );
     assert_eq!(
-        duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
+        header_authenticated_duplicate_stream.headers()[reqwest::header::LOCATION],
         expected_remote_location.as_str()
     );
 
