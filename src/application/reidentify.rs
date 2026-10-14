@@ -222,6 +222,16 @@ async fn reserve_fill_missing_queue_capacity<'a>(
     }
 }
 
+/// Whether a dispatch failure leaves a persisted QUEUED job that nothing will
+/// ever run. `ShuttingDown` is excluded: the process is exiting and the
+/// shutdown/startup cleanup already settles every unfinished job.
+fn dispatch_error_strands_queued_job(error: &MetadataDispatchError) -> bool {
+    !matches!(
+        error,
+        MetadataDispatchError::InvalidJob | MetadataDispatchError::ShuttingDown
+    )
+}
+
 fn dispatch_panic_outcome(cancel_requested: bool) -> (&'static str, Option<&'static str>) {
     if cancel_requested {
         ("CANCELLED", None)
@@ -685,6 +695,44 @@ impl MetadataReidentifyService {
     }
 
     async fn enqueue_fill_missing_job_verified(
+        &self,
+        job_id: &str,
+        expected_library_id: Option<&str>,
+    ) -> Result<Option<oneshot::Receiver<()>>, MetadataDispatchError> {
+        let result = self
+            .enqueue_fill_missing_job_inner(job_id, expected_library_id)
+            .await;
+        if let Err(error) = &result
+            && dispatch_error_strands_queued_job(error)
+        {
+            self.fail_undispatched_job(job_id).await;
+        }
+        result
+    }
+
+    /// A persisted QUEUED job that never reached a dispatcher would otherwise
+    /// stay QUEUED forever; fail it so the admin task page can retry it.
+    async fn fail_undispatched_job(&self, job_id: &str) {
+        match self.database.find_metadata_reidentify_job(job_id).await {
+            Ok(Some(job)) if job.status == "QUEUED" => {}
+            _ => return,
+        }
+        match self
+            .database
+            .finish_metadata_reidentify_job(job_id, "FAILED", Some("DISPATCH_FAILED"))
+            .await
+        {
+            Ok(()) => {
+                tracing::warn!(job_id, "metadata job could not be dispatched and was failed");
+                self.publish_job_finished(job_id);
+            }
+            Err(error) => {
+                tracing::error!(job_id, %error, "undispatched metadata job could not be failed");
+            }
+        }
+    }
+
+    async fn enqueue_fill_missing_job_inner(
         &self,
         job_id: &str,
         expected_library_id: Option<&str>,
@@ -3876,6 +3924,22 @@ mod tests {
             super::metadata_job_outcome(input(false, false)),
             ("COMPLETED", None)
         );
+    }
+
+    #[test]
+    fn dispatch_failures_fail_queued_jobs_except_during_shutdown() {
+        use super::MetadataDispatchError as Error;
+        assert!(super::dispatch_error_strands_queued_job(&Error::QueueClosed));
+        assert!(super::dispatch_error_strands_queued_job(
+            &Error::StateUnavailable
+        ));
+        assert!(super::dispatch_error_strands_queued_job(&Error::Storage(
+            "busy".to_owned()
+        )));
+        assert!(!super::dispatch_error_strands_queued_job(
+            &Error::ShuttingDown
+        ));
+        assert!(!super::dispatch_error_strands_queued_job(&Error::InvalidJob));
     }
 
     #[test]

@@ -125,6 +125,7 @@ const ERROR_LABELS: Record<string, string> = {
   METADATA_STORAGE_FAILED: "元数据数据库写入失败",
   METADATA_WRITE_UNAVAILABLE: "元数据写回服务不可用",
   ITEM_ISSUES: "部分条目处理失败",
+  DISPATCH_FAILED: "任务未能加入执行队列，可重试",
   QUEUE_INCOMPLETE: "任务未处理完即中断，可重试",
   DEFERRED_PROVIDER_UNAVAILABLE: "刮削器暂不可用，已延后重试",
   WORKER_FAILED: "任务工作线程异常退出",
