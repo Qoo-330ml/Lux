@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
+    env, fmt,
     future::Future,
     sync::{
         Arc, Mutex, OnceLock,
@@ -38,7 +38,9 @@ use crate::{
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
-const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 4;
+const METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT: usize = 4;
+const METADATA_FILL_MISSING_MAX_WORKER_LIMIT: usize = 12;
+const METADATA_FILL_MISSING_CONCURRENCY_ENV: &str = "LUX_METADATA_CONCURRENCY";
 const METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY: usize = 32;
 const METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT: usize = 32;
 const METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -56,6 +58,84 @@ pub type MetadataBenchmarkItemTimings = Arc<Mutex<Vec<(String, u128)>>>;
 
 static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static METADATA_FILL_MISSING_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static METADATA_FILL_MISSING_CONFIGURED_WORKER_LIMIT: OnceLock<usize> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataConcurrencySettingSource {
+    Unset,
+    Explicit,
+    Clamped,
+    Invalid,
+}
+
+fn parse_metadata_fill_missing_concurrency(
+    configured: Option<&str>,
+) -> (usize, MetadataConcurrencySettingSource) {
+    let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (
+            METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT,
+            MetadataConcurrencySettingSource::Unset,
+        );
+    };
+    match value.parse::<i128>() {
+        Ok(parsed) => {
+            let limit = parsed.clamp(1, METADATA_FILL_MISSING_MAX_WORKER_LIMIT as i128);
+            let source = if parsed == limit {
+                MetadataConcurrencySettingSource::Explicit
+            } else {
+                MetadataConcurrencySettingSource::Clamped
+            };
+            (limit as usize, source)
+        }
+        Err(_)
+            if value.strip_prefix('-').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            (1, MetadataConcurrencySettingSource::Clamped)
+        }
+        Err(_)
+            if {
+                let digits = value.strip_prefix('+').unwrap_or(value);
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            } =>
+        {
+            (
+                METADATA_FILL_MISSING_MAX_WORKER_LIMIT,
+                MetadataConcurrencySettingSource::Clamped,
+            )
+        }
+        Err(_) => (
+            METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT,
+            MetadataConcurrencySettingSource::Invalid,
+        ),
+    }
+}
+
+fn metadata_fill_missing_configured_worker_limit() -> usize {
+    *METADATA_FILL_MISSING_CONFIGURED_WORKER_LIMIT.get_or_init(|| {
+        let configured = env::var(METADATA_FILL_MISSING_CONCURRENCY_ENV).ok();
+        metadata_fill_missing_worker_limit_from_setting(configured.as_deref())
+    })
+}
+
+fn metadata_fill_missing_worker_limit_from_setting(configured: Option<&str>) -> usize {
+    let (limit, source) = parse_metadata_fill_missing_concurrency(configured);
+    match source {
+        MetadataConcurrencySettingSource::Clamped => tracing::warn!(
+            worker_limit = limit,
+            hard_limit = METADATA_FILL_MISSING_MAX_WORKER_LIMIT,
+            "LUX_METADATA_CONCURRENCY was outside the supported range and has been clamped"
+        ),
+        MetadataConcurrencySettingSource::Invalid => tracing::warn!(
+            worker_limit = limit,
+            hard_limit = METADATA_FILL_MISSING_MAX_WORKER_LIMIT,
+            "LUX_METADATA_CONCURRENCY was invalid and the default worker limit will be used"
+        ),
+        MetadataConcurrencySettingSource::Unset | MetadataConcurrencySettingSource::Explicit => {}
+    }
+    limit
+}
 
 fn metadata_global_permits() -> Arc<Semaphore> {
     METADATA_GLOBAL_PERMITS
@@ -65,7 +145,11 @@ fn metadata_global_permits() -> Arc<Semaphore> {
 
 fn metadata_fill_missing_global_permits() -> Arc<Semaphore> {
     METADATA_FILL_MISSING_GLOBAL_PERMITS
-        .get_or_init(|| Arc::new(Semaphore::new(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT)))
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                metadata_fill_missing_configured_worker_limit(),
+            ))
+        })
         .clone()
 }
 
@@ -104,8 +188,7 @@ pub struct MetadataReidentifyService {
     progress_events: MetadataProgressEventGate,
     worker_permits: Arc<Semaphore>,
     fill_missing_worker_permits: Arc<Semaphore>,
-    #[cfg(feature = "performance-benchmarks")]
-    fill_missing_benchmark_concurrency: Option<usize>,
+    fill_missing_worker_limit: usize,
     #[cfg(feature = "performance-benchmarks")]
     benchmark_item_timings: Option<MetadataBenchmarkItemTimings>,
     fill_missing_dispatchers: Option<MetadataFillMissingDispatchers>,
@@ -744,8 +827,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
-            #[cfg(feature = "performance-benchmarks")]
-            fill_missing_benchmark_concurrency: None,
+            fill_missing_worker_limit: metadata_fill_missing_configured_worker_limit(),
             #[cfg(feature = "performance-benchmarks")]
             benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
@@ -782,8 +864,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
-            #[cfg(feature = "performance-benchmarks")]
-            fill_missing_benchmark_concurrency: None,
+            fill_missing_worker_limit: metadata_fill_missing_configured_worker_limit(),
             #[cfg(feature = "performance-benchmarks")]
             benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
@@ -814,8 +895,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
-            #[cfg(feature = "performance-benchmarks")]
-            fill_missing_benchmark_concurrency: None,
+            fill_missing_worker_limit: metadata_fill_missing_configured_worker_limit(),
             #[cfg(feature = "performance-benchmarks")]
             benchmark_item_timings: None,
             fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
@@ -856,7 +936,7 @@ impl MetadataReidentifyService {
         if !matches!(concurrency, 4 | 8 | 12) {
             return Err("benchmark concurrency must be one of 4, 8, or 12");
         }
-        self.fill_missing_benchmark_concurrency = Some(concurrency);
+        self.fill_missing_worker_limit = concurrency;
         self.fill_missing_worker_permits = Arc::new(Semaphore::new(concurrency));
         Ok(self)
     }
@@ -876,13 +956,7 @@ impl MetadataReidentifyService {
         backend: DatabaseBackend,
         mode: MetadataRefreshMode,
     ) -> usize {
-        #[cfg(feature = "performance-benchmarks")]
-        if matches!(mode, MetadataRefreshMode::FillMissing)
-            && let Some(concurrency) = self.fill_missing_benchmark_concurrency
-        {
-            return concurrency;
-        }
-        metadata_worker_configured_concurrency(backend, mode)
+        metadata_worker_configured_concurrency(backend, mode, self.fill_missing_worker_limit)
     }
 
     pub fn with_webhooks(mut self, webhooks: WebhookService) -> Self {
@@ -2855,9 +2929,10 @@ fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
 fn metadata_worker_configured_concurrency(
     backend: DatabaseBackend,
     mode: MetadataRefreshMode,
+    fill_missing_limit: usize,
 ) -> usize {
     if matches!(mode, MetadataRefreshMode::FillMissing) {
-        METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT
+        fill_missing_limit
     } else {
         metadata_worker_default_concurrency(backend)
     }
@@ -2929,16 +3004,19 @@ mod tests {
 
     use super::{
         AUTO_MATCH_MIN_SCORE, METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE,
-        METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY, METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT,
-        METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage, MetadataCandidateView,
+        METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT, METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY,
+        METADATA_FILL_MISSING_MAX_WORKER_LIMIT, METADATA_GLOBAL_WORKER_LIMIT,
+        MetadataCandidatePage, MetadataCandidateView, MetadataConcurrencySettingSource,
         MetadataFillMissingDispatcher, MetadataFillMissingDispatchers,
         MetadataFillMissingPendingJobs, MetadataJobOwners, MetadataRefreshMode,
         MetadataRequestPlan, acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
         candidate_count_for_page, deduplicate_item_ids_preserving_first_occurrence,
-        dispatch_panic_outcome, metadata_fill_missing_global_permits, metadata_global_permits,
-        metadata_reidentify_issue_diagnostic, metadata_request_plan_is_complete,
-        metadata_worker_concurrency, metadata_worker_configured_concurrency,
-        metadata_worker_default_concurrency, reserve_fill_missing_queue_capacity,
+        dispatch_panic_outcome, metadata_fill_missing_configured_worker_limit,
+        metadata_fill_missing_global_permits, metadata_fill_missing_worker_limit_from_setting,
+        metadata_global_permits, metadata_reidentify_issue_diagnostic,
+        metadata_request_plan_is_complete, metadata_worker_concurrency,
+        metadata_worker_configured_concurrency, metadata_worker_default_concurrency,
+        parse_metadata_fill_missing_concurrency, reserve_fill_missing_queue_capacity,
         run_fill_missing_dispatcher_loop, signal_automatic_fill_missing_queue,
     };
     use crate::{
@@ -4064,6 +4142,83 @@ mod tests {
     }
 
     #[test]
+    fn fill_missing_concurrency_defaults_and_accepts_supported_boundaries() {
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(None),
+            (4, MetadataConcurrencySettingSource::Unset)
+        );
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some(" 1 ")),
+            (1, MetadataConcurrencySettingSource::Explicit)
+        );
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some("12")),
+            (12, MetadataConcurrencySettingSource::Explicit)
+        );
+    }
+
+    #[test]
+    fn fill_missing_concurrency_clamps_invalid_and_out_of_range_values() {
+        for value in [Some("0"), Some("-2")] {
+            assert_eq!(
+                parse_metadata_fill_missing_concurrency(value),
+                (1, MetadataConcurrencySettingSource::Clamped)
+            );
+        }
+        for value in [
+            Some("13"),
+            Some("18446744073709551615"),
+            Some("999999999999999999999999999999999999999999999999999"),
+        ] {
+            assert_eq!(
+                parse_metadata_fill_missing_concurrency(value),
+                (12, MetadataConcurrencySettingSource::Clamped)
+            );
+        }
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some(
+                "-999999999999999999999999999999999999999999999999999"
+            )),
+            (1, MetadataConcurrencySettingSource::Clamped)
+        );
+        assert_eq!(
+            parse_metadata_fill_missing_concurrency(Some("not-a-number")),
+            (4, MetadataConcurrencySettingSource::Invalid)
+        );
+    }
+
+    #[test]
+    fn fill_missing_concurrency_warnings_do_not_log_raw_values() {
+        let captured_logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CapturedTraceWriterFactory(Arc::clone(&captured_logs)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+
+        assert_eq!(
+            metadata_fill_missing_worker_limit_from_setting(Some("NOT_A_SECRET_SENTINEL")),
+            4
+        );
+        assert_eq!(
+            metadata_fill_missing_worker_limit_from_setting(Some("13")),
+            12
+        );
+
+        let logs = String::from_utf8_lossy(
+            &captured_logs
+                .lock()
+                .expect("captured log lock should be available"),
+        )
+        .to_string();
+        assert!(logs.contains("LUX_METADATA_CONCURRENCY was invalid"));
+        assert!(logs.contains("was outside the supported range and has been clamped"));
+        assert!(!logs.contains("NOT_A_SECRET_SENTINEL"));
+    }
+
+    #[test]
     fn metadata_worker_defaults_are_four_for_both_backends() {
         assert_eq!(
             metadata_worker_default_concurrency(DatabaseBackend::Sqlite),
@@ -4076,21 +4231,28 @@ mod tests {
     }
 
     #[test]
-    fn metadata_worker_mode_defaults_are_four_for_both_backends() {
+    fn metadata_worker_mode_limits_preserve_other_backend_defaults() {
+        let fill_missing_limit = metadata_fill_missing_configured_worker_limit();
         for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
             for mode in [
                 MetadataRefreshMode::Reidentify,
                 MetadataRefreshMode::FillMissing,
                 MetadataRefreshMode::FullRefresh,
             ] {
+                let expected = if matches!(mode, MetadataRefreshMode::FillMissing) {
+                    fill_missing_limit
+                } else {
+                    metadata_worker_default_concurrency(backend)
+                };
                 assert_eq!(
-                    metadata_worker_configured_concurrency(backend, mode),
-                    4,
+                    metadata_worker_configured_concurrency(backend, mode, fill_missing_limit),
+                    expected,
                     "unexpected default for {backend:?} in {mode:?} mode"
                 );
             }
         }
-        assert_eq!(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT, 4);
+        assert_eq!(METADATA_FILL_MISSING_DEFAULT_WORKER_LIMIT, 4);
+        assert_eq!(METADATA_FILL_MISSING_MAX_WORKER_LIMIT, 12);
     }
 
     #[test]
@@ -4105,9 +4267,10 @@ mod tests {
     fn fill_missing_worker_permits_are_process_global_and_hard_capped() {
         let first = metadata_fill_missing_global_permits();
         let second = metadata_fill_missing_global_permits();
+        let configured_limit = metadata_fill_missing_configured_worker_limit();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT, 4);
-        assert!(first.available_permits() <= METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT);
+        assert!(first.available_permits() <= configured_limit);
+        assert!(first.available_permits() <= METADATA_FILL_MISSING_MAX_WORKER_LIMIT);
     }
 
     #[tokio::test]

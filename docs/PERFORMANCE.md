@@ -180,6 +180,8 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 
 stub 单次调用实测 p50 约 101.4–102.0ms、p95 约 102.6–103.5ms，和固定 100ms 等待相符。SQLite 下 12 路相较 8 路吞吐中位数约高 21%，但成功项 p95 约高 17%，queue wait p95 也更高；这些数据呈现本机写锁/存储争用下的收益与尾延迟代价，不能外推到 PostgreSQL 或 NAS。基准不测 TMDb 响应时间、限流策略、插件 cache、远程图片下载或真实网络吞吐；不得把 stub 吞吐解读为上游请求速率。PostgreSQL 选择路径已实现，但本机未安装 `postgres`/`psql`/`pg_isready` 且没有可用服务，本次未运行 PostgreSQL 档位。默认线上并发仍为 4，本任务没有调整它。
 
+LUX-532 默认继续使用 4，`LUX_METADATA_CONCURRENCY` 可在 1–12 之间配置，硬上限为 12。4 是已有 SQLite 基线；PostgreSQL 缺少测量证据，所以本次不提高默认，也不把 8/12 档的 SQLite 吞吐当成跨后端建议值。设置解析在进程内只进行一次，semaphore 与 worker limit 使用同一值；无效输入回退到 4 并告警，整数越界夹到边界并告警。
+
 本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
 
 ## 本地 NFO page 运行指标

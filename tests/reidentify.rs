@@ -1373,6 +1373,11 @@ async fn library_metadata_job_processes_items_concurrently()
 async fn fill_missing_jobs_share_a_process_global_worker_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let configured_worker_limit = std::env::var("LUX_METADATA_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<i128>().ok())
+        .map(|value| value.clamp(1, 12) as i64)
+        .unwrap_or(4);
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8098".parse()?,
@@ -1461,8 +1466,8 @@ async fn fill_missing_jobs_share_a_process_global_worker_limit()
 
     assert!(maximum_running_items > 0);
     assert!(
-        maximum_running_items <= 4,
-        "automatic FILL_MISSING jobs must claim at most four running items process-wide; observed {maximum_running_items}"
+        maximum_running_items <= configured_worker_limit,
+        "FILL_MISSING jobs must stay within configured process-wide limit {configured_worker_limit}; observed {maximum_running_items}"
     );
     tmdb_server.abort();
     Ok(())

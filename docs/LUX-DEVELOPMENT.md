@@ -11203,18 +11203,20 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 #### LUX-532：可配置且有界的 FILL_MISSING 并发
 
-范围：依据 LUX-530 的固定延迟矩阵确定默认 worker 数，为在线 FILL_MISSING 增加 `LUX_METADATA_CONCURRENCY` 启动期配置与绝对上限；默认值和上限写入性能/部署说明。保留全局 semaphore、每库串行 dispatcher、resource metrics 降档、取消响应和 DB 后端资源差异。无效/超范围值采用安全 clamp 并发出不含 secret 的配置告警。
+范围：依据 LUX-531 的固定延迟矩阵为在线 FILL_MISSING 增加 `LUX_METADATA_CONCURRENCY` 启动期配置与绝对上限；默认值和上限写入性能/部署说明。保留全局 semaphore、每库串行 dispatcher、resource metrics 降档、取消响应和 DB 后端资源差异。无效/超范围值采用安全 clamp 并发出不含 secret 的配置告警。决策：LUX-531 只完成 SQLite 矩阵，PostgreSQL 尚无可用服务；因此默认仍为 4，不基于单一后端把默认提高到 8/12，绝对上限为 12，等待双后端实测后再决定是否提高默认。
 
 验收：
 
-- [ ] env 未设置、有效边界、0、负数/非整数、超过上限均有解析回归；服务启动后配置固定，避免运行中改 env 造成 semaphore 与 worker limit 不一致。
-- [ ] SQLite/PostgreSQL 批准的默认值由 benchmark 支撑；资源背压可把实际并发降到 1 且恢复后可重新升档。
-- [ ] 连续多个 library/job 的合计 FILL_MISSING worker 不超过全局上限；其它 metadata 模式不超过现有全局限制。
-- [ ] 更新部署/兼容文档；不宣称未经上游验证的 TMDb 请求速率。
+- [x] env 未设置、有效边界、0、负数/非整数、超过上限均有解析回归；configured limit 在进程内由 OnceLock 初始化一次，并保存在 service 实例，避免 semaphore 与 worker limit 不一致。
+- [x] 默认 4、绝对上限 12；PostgreSQL 未实测时保持默认。resource metrics 继续接收 configured limit，现有压力测试覆盖降档规则，worker loop 每轮重新读取并可恢复。
+- [x] 两个并行 library job 共用 global semaphore；集成测试在 unset 默认 4 与 env=1 下通过；其它 metadata 模式仍遵循原后端建议值和进程级限制。
+- [x] 更新性能/兼容文档并注明 PostgreSQL 基准待测；没有宣称未经上游验证的 TMDb 请求速率。
 
 预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`、本文档。
 
 验证：Rust parser/worker 测试、`tests/reidentify.rs` 与相关 metadata 集成 target、build/fmt/all-features Clippy；Toshiba 挂载检查与共享 target 必须满足。
+
+实施结果（2026-10-14）：`LUX_METADATA_CONCURRENCY` 采用缺省 4、支持 1–12、超过范围 clamp 到边界，非整数回退缺省；对非法/越界值发 warning，但不记录原始 env 内容。configured limit 在进程内 OnceLock 一次读取，并保存在每个 MetadataReidentifyService 实例；同一个 OnceLock 同时创建全局 FILL_MISSING semaphore，配置不会动态重读。资源 pressure 路径、每库 dispatcher 和取消不变。定向 reidentify 单测 42/42，通过；`LUX_METADATA_CONCURRENCY=1` 与 env unset 两种环境下，跨两个库的进程级 FILL_MISSING worker 集成各通过 1/1。默认 SQLite build、fmt、all-features Clippy 与 diff 检查通过。默认值依据 SQLite 4 路基线保持 4；PostgreSQL 没有可用服务，未测也未提高默认值。部署配置见 `docs/COMPATIBILITY.md`，性能依据见 `docs/PERFORMANCE.md`。
 
 #### LUX-533：提供只读库级入库流水线状态
 

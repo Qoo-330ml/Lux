@@ -14,6 +14,14 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-532 在线 FILL_MISSING 并发配置
+
+服务启动时读取 `LUX_METADATA_CONCURRENCY`，仅控制在线 `FILL_MISSING`。默认值为 4，硬上限为 12；可用范围是 1–12。未设置或空字符串使用默认值，0 和负数夹到 1，超过 12 夹到 12，非整数回退到默认值。无效或越界配置会记录有效 worker 数和硬上限，不记录原始环境变量值。该值在进程内只解析一次，并同时决定全局 semaphore 容量与 worker 请求上限；重启服务后才会采用新值。
+
+所有媒体库和 FILL_MISSING job 共用此进程级上限；同库 dispatcher 仍按原规则串行。ResourceMetrics 可在 configured limit 内动态降档，并在压力缓解后重新升档。其它 metadata 模式仍沿用 SQLite/PostgreSQL 各自的既有 worker 建议值与 16 路进程级 semaphore。
+
+LUX-531 目前只完成 SQLite 固定延迟矩阵，PostgreSQL 路径尚未实测，因此默认保留 4；12 是支持的硬上限，不代表已批准把默认调高，也不代表 TMDb 允许的请求速率。后续调整默认值前需完成 PostgreSQL 对照测量。
+
 ## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
 
 Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有
