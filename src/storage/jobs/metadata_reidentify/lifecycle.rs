@@ -481,7 +481,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE metadata_reidentify_jobs
-             SET status = 'QUEUED',
+             SET status = 'QUEUED', dispatch_source = 'EXPLICIT',
                  processed_count = (
                      SELECT COUNT(*) FROM metadata_reidentify_job_items
                      WHERE job_id = ? AND status = 'COMPLETED'

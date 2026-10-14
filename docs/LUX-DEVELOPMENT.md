@@ -11155,13 +11155,15 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 自动完整性事务不会扩展显式 job；显式 job 不会被自动合并逻辑重分类。
-- [ ] 显式 create/retry 保持显式来源；自动 job 去重/合并、item 状态、总数与回滚语义正确。
-- [ ] 覆盖两个来源的 SQLite 存储合同和 PostgreSQL 事务合同；来源字段不出现在 API DTO。
+- [x] 自动完整性事务不会扩展显式 job；显式 job 不会被自动合并逻辑重分类。
+- [x] 显式 create/retry 保持显式来源；自动 job 去重/合并、item 状态、总数与回滚语义正确。
+- [x] 覆盖两个来源的 SQLite 存储合同和 PostgreSQL 事务合同；来源字段不出现在 API DTO。
 
-预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、本文档。
+预计文件：`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/fill_missing/requests.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、`tests/admin_health.rs`、`tests/danmaku.rs`、`tests/scanning_jobs.rs`、`tests/scanner.rs`、`tests/ready_version.rs`、本文档。上述 health、danmaku、scan 与 version 测试同步 0169 migration 后的 schema version。
 
 验证：存储 repository library tests、PostgreSQL FILL_MISSING transaction contract、fmt 与 diff 检查。Cargo 前确认 Toshiba 挂载并使用共享 target。
+
+实施结果（2026-10-14）：自动补缺只更新/合并自动来源 job；显式 queued/running/deferred item 会阻止自动计划改写请求快照或消耗 provider retry，管理员 retry 将 job 转为显式来源。SQLite 来源隔离和扫描 dispatch 回归通过；PostgreSQL 合同回归已加入但执行因本机 `PoolTimedOut` 未能连接。`cargo build --locked`、all-features Clippy、fmt 与 diff 检查通过。`cargo test --all-targets` 被现有 HLS generation 用例的 `Superseded` unwrap 阻断；跳过该用例后，catalog 集成用例复现 HTTP 502，另一个 catalog 集成用例超过 60 秒未结束。0169 schema 版本相关集成断言已统一更新为 169。
 
 #### LUX-530：自动补缺使用有界唤醒与持久队列 drain
 
