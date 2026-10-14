@@ -65,7 +65,8 @@ impl Database {
     ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
         self.query(
             "INSERT INTO person_index_rebuild_jobs (library_id, schema_version)
-             SELECT id, ? FROM libraries WHERE is_enabled = 1
+             SELECT id, ? FROM libraries
+             WHERE is_enabled = 1 AND system_kind IS NULL
              ON CONFLICT(library_id) DO UPDATE SET
                 schema_version = excluded.schema_version,
                 status = CASE

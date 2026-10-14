@@ -24,6 +24,7 @@ const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({
 const SearchPage = lazy(() => import("../features/search/SearchPage").then(({ SearchPage }) => ({ default: SearchPage })));
 const FavoritesPage = lazy(() => import("../features/favorites/FavoritesPage").then(({ FavoritesPage }) => ({ default: FavoritesPage })));
 const MediaDetailPage = lazy(() => import("../features/detail/MediaDetailPage").then(({ MediaDetailPage }) => ({ default: MediaDetailPage })));
+const CollectionDetailPage = lazy(() => import("../features/detail/CollectionDetailPage").then(({ CollectionDetailPage }) => ({ default: CollectionDetailPage })));
 const PersonDetailPage = lazy(() => import("../features/detail/PersonDetailPage").then(({ PersonDetailPage }) => ({ default: PersonDetailPage })));
 const PlayerPage = lazy(() => import("../features/player/PlayerPage").then(({ PlayerPage }) => ({ default: PlayerPage })));
 const AccountPage = lazy(() => import("../features/account/AccountPage").then(({ AccountPage }) => ({ default: AccountPage })));
@@ -113,6 +114,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
           <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
           <Route path="favorites" element={<FavoritesPage />} />
           <Route path="items/:itemId" element={<MediaDetailPage />} />
+          <Route path="collections/:collectionId" element={<CollectionDetailPage />} />
           <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
           <Route path="search" element={<SearchPage />} />
           <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />

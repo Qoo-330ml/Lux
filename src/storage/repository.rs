@@ -2030,6 +2030,33 @@ pub(crate) struct StoredCollectionRefresh {
     pub(crate) member_count: usize,
 }
 
+pub(crate) const GLOBAL_COLLECTION_LIBRARY_ID: &str = "00000000-0000-7000-8000-000000000538";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredGlobalCollection {
+    pub(crate) item_id: String,
+    pub(crate) title: String,
+    pub(crate) member_count: i64,
+    pub(crate) poster_item_id: Option<String>,
+    pub(crate) poster_image_tag: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredGlobalCollectionSource {
+    pub(crate) work_item_id: String,
+    pub(crate) source_item_id: String,
+    pub(crate) library_id: String,
+    pub(crate) library_name: String,
+    pub(crate) title: String,
+    pub(crate) media_source_id: Option<String>,
+    pub(crate) edition_name: Option<String>,
+    pub(crate) quality_label: Option<String>,
+    pub(crate) container: Option<String>,
+    pub(crate) preferred_source_item_id: Option<String>,
+    pub(crate) preferred_media_source_id: Option<String>,
+    pub(crate) poster_image_tag: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEmbyCollection {
     pub(crate) collection_item_id: String,
@@ -2069,6 +2096,8 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) locked_fields_json: Option<String>,
     pub(crate) nfo_metadata_json: Option<String>,
     pub(crate) metadata_fingerprint: Option<Vec<u8>>,
+    pub(crate) nfo_collection_reference_key: Option<String>,
+    pub(crate) collection_reference_identity_key: Option<String>,
     pub(crate) series_item_id: Option<String>,
     pub(crate) series_title: Option<String>,
     pub(crate) series_production_year: Option<i64>,

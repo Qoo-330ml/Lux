@@ -155,6 +155,34 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
 部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。
 
+## LUX-544 Emby 跨库合集版本播放（2026-10-15）
+
+合集逻辑电影的 `PlaybackInfo` 以标准 `MediaSources[]` 返回当前用户可访问的原电影副本和版本。每个媒体源的 `ItemId`、直放/转码 URL、媒体流与字幕均指向该 source 所属的原电影；默认 source 使用用户已保存的副本/版本偏好，其后按默认版本和媒体库顺序排列。显式撤销媒体库权限后，合集 `PlaybackInfo` 不再提供该 source；已签名的原 source 播放 URL 也会在媒体入口重新执行 ACL/source 授权。
+
+使用合集逻辑 `ItemId` 的播放回调按登录用户可见的原副本和 `MediaSourceId` 解析后，只更新原电影的播放会话和进度。缺少 source 时仅在原副本/已有会话能唯一定位时接受；多个可见副本无法唯一定位时返回 `400`。已有合集播放会话还绑定原电影、source 和设备，错配回调或撤权后的旧回调返回 `404`。
+
+`tests/emby_global_collection_playback.rs` 验证了两份跨库原件的 DTO 和真实直放字节、外置字幕路由、显式 source 选择、单副本 source 缺省回调、歧义回调拒绝、不同设备并发会话、暂停/停止、source/device/会话错配拒绝及撤权后旧流和回调拒绝。Rust 自动化结果只证明服务端合同。该记录未进行 VidHub、SenPlayer 或 Infuse 的合集真实 UI/source 切换测试，不能据此声明这些客户端能浏览合集、选择版本或回写对应原电影进度；这些实机结果留待 LUX-545 阶段门逐项记录。
+
+## LUX-545 合集阶段门（2026-10-15）
+
+本机为 macOS `arm64`（`uname -m`）；所有 Cargo 构建和测试均将 `CARGO_TARGET_DIR` 指向项目共享目录 `/Volumes/Toshiba/mywork/Lux/target`。SQLite 存储目标从空库和已有 schema 迁移的检查通过（`cargo test --locked --test storage`：56 passed）；合集逻辑、NFO 修复及 Emby 播放测试包含在全量 Rust 门禁中。最终代码的 `cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。
+
+PostgreSQL 16 运行时补测：使用临时 PostgreSQL 16 实例运行 `cargo test --locked --target aarch64-apple-darwin --test postgres_database -- --include-ignored`，16 passed、0 failed。空库启动测试实际应用全部迁移到 v173，并断言六张合集表、无根路径系统合集库和 `media_items.nfo_collection_reference_key` 列存在。该结果验证 PostgreSQL 16 的迁移和 schema，不代表生产数据库实例或其他 PostgreSQL 版本。
+
+Rust 全量门禁通过：设置 `RUST_TEST_THREADS=4` 后运行 `cargo test --locked --target aarch64-apple-darwin --all-targets`，库测试为 872 passed、22 ignored、0 failed，所有可运行的 integration targets 均通过。为让 shutdown 子进程不与本机常驻 Lux 的 UDP 7359 发现端口冲突，该测试使用临时发现端口；插件查询计数测试使用不启动周期 worker 的测试构造器，避免无关查询污染计数。该全量运行按设计忽略 PostgreSQL 专用用例；上述 PostgreSQL 16 补测单独提供了数据库运行时证据。
+
+Web 检查通过：冻结依赖安装、Web 测试（Node 139/139，Vitest 600/600，77 个文件）和生产构建均通过。Playwright 浏览器流程打开 `/libraries` 的“合集”，进入“飞驰人生”，选择 4K 来源，随后链接包含 `collectionId`/`sourceId`，并发出来源偏好写入请求；浏览器控制台 0 errors、0 warnings。该流程的 API 路由使用 mock，因此只作为真实浏览器 UI 流程证据；服务端接口由 Rust 集成测试覆盖。
+
+| 客户端 | 合集浏览 | 来源选择 | 进度回写 | 结果 |
+|---|---|---|---|---|
+| VidHub | 未实测 | 未实测 | 未实测 | VidHub 2.1.8 已安装并启动；CUA 绑定原生窗口返回 `cgWindowNotFound` |
+| SenPlayer | 未实测 | 未实测 | 未实测 | SenPlayer 6.0.6 已安装并启动；CUA 绑定原生窗口返回 `cgWindowNotFound` |
+| Infuse | 未实测 | 未实测 | 未实测 | Infuse 8.5.1 已安装并启动；CUA 绑定原生窗口返回 `cgWindowNotFound` |
+
+阶段风险：VidHub、SenPlayer、Infuse 的合集 UI、跨库来源选择和原电影进度回写仍缺少实机证据。PostgreSQL 迁移已在临时 PostgreSQL 16 实例验证，但没有生产实例或其他 PostgreSQL 版本的证据。LUX-545 阶段门未完成，停在项目所有者确认点。
+
+2026-10-15 续查：三款客户端均可在本机启动，系统窗口枚举也能找到各自窗口，但 CUA 对三个应用的原生窗口绑定均返回 `-10005 cgWindowNotFound`，因此无法可靠完成客户端交互。隔离浏览器访问本机 `127.0.0.1:8097` 只显示登录页，`127.0.0.1:5173` 当前没有监听；未使用已有个人浏览器登录态，也未对现有本地数据库写入测试用户或媒体。客户端兼容性验收仍未完成。
+
 2026-09-20 播放状态兼容：Emby `GET /Sessions` 和 Lux 管理仪表盘现在根据活动 HLS 会话报告
 `DirectStream` 或 `Transcode`，不再把服务端转码固定报告为 `DirectPlay`；可用时同时返回/展示 HLS 容器、视频/音频输出 codec
 及目标码率。该状态信息来自 Lux 的实际播放会话和 FFmpeg 输出档位，不代表 Harbor 等第三方客户端已完成部署环境实测。

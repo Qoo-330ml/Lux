@@ -6,6 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LibraryCard } from "../src/features/home/media";
 import { api } from "../src/lib/api/client";
+import { GLOBAL_COLLECTION_LIBRARY_ID } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -68,6 +69,36 @@ describe("LibraryCard", () => {
     });
 
     expect(onPrefetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the virtual collection entry without physical-library operations", async () => {
+    const onPrefetch = vi.fn();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LibraryCard
+            library={{ id: GLOBAL_COLLECTION_LIBRARY_ID, name: "合集", kind: "MIXED" }}
+            onPrefetch={onPrefetch}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const link = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    expect(link?.getAttribute("href")).toBe(`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`);
+    expect(container.querySelector(".lux-library-card-menu-trigger")).toBeNull();
+    const contextMenuEvent = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    await act(async () => {
+      container.querySelector<HTMLElement>(".lux-library-card")?.dispatchEvent(contextMenuEvent);
+      link?.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    });
+    expect(contextMenuEvent.defaultPrevented).toBe(false);
+    expect(document.body.querySelector("[role=menu]")).toBeNull();
+    expect(onPrefetch).not.toHaveBeenCalled();
   });
 
   it("opens a custom context menu for whole-library operations", async () => {

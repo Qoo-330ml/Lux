@@ -574,7 +574,9 @@ impl Database {
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
-             FROM libraries ORDER BY name, id",
+             FROM libraries
+             WHERE system_kind IS NULL
+             ORDER BY name, id",
                 )
                 .fetch_all(&self.pool)
                 .await
@@ -631,7 +633,7 @@ impl Database {
                 "SELECT l.id, l.name, r.canonical_path
                  FROM libraries l
                  LEFT JOIN library_roots r ON r.library_id = l.id
-                 WHERE l.is_enabled = 1
+                 WHERE l.is_enabled = 1 AND l.system_kind IS NULL
                  ORDER BY l.name, l.id, r.canonical_path, r.id",
             )
             .fetch_all(&self.pool)

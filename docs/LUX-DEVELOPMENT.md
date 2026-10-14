@@ -11352,7 +11352,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 - [x] 操作文件变化队列不改动媒体源 probe 状态、媒体项 metadata 状态、既有 `scan_job_targets` 或其缩略图状态。
 - [x] SQLite 回归覆盖 ADD/CHANGE/REMOVE、合并、分页、运行中更新、旧 revision 完成保护、中断重排和任务删除级联；PostgreSQL repository 合同覆盖写入及领取/完成语义。
 
-预计文件（5 个）：`migrations/0170_scan_job_file_changes.sql`、`src/storage/jobs/scan/targets.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、本文档。
+预计文件（5 个）：`migrations/0174_scan_job_file_changes.sql`、`src/storage/jobs/scan/targets.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、本文档。
 
 验证：storage library 定向测试与 PostgreSQL 合同测试；Toshiba 挂载后使用共享 target 运行 build、fmt、all-features Clippy 与 diff 检查。Cargo 命令设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。
 
@@ -11432,7 +11432,130 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证结果：`tests/scanning_jobs.rs` 87/87、`tests/storage.rs` 54/54、`tests/ready_version.rs` 2/2、migration 双后端合同测试 1/1、build、fmt 与 all-target/all-feature Clippy 通过。最终全量 `cargo test --locked --all-targets` 的 lib target 为 855 passed、2 failed、23 ignored：未修改的 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 与 HLS `emby_init_and_segment_share_the_requested_generation` 失败；NFO 用例随后隔离重跑 1/1 通过，HLS 用例隔离运行有通过和 `Superseded` 失败两种结果。因 lib target 失败，这次 all-target 命令未运行后续 integration targets；相关扫描、storage 和 ready/version integration targets 已分别通过。PostgreSQL runtime 未验证；本机 ARM64/SQLite 验证不代表 PostgreSQL runtime 结果。
 
-## 28. 参考资料
+## 28. 自动电影合集阶段
+
+目标：提供系统自动维护的“合集”虚拟媒体库。一个系列跨多个普通媒体库归并为一个合集；同一影片的不同库副本在合集内只展示一次，普通电影库仍逐条展示。仅根据已确认的来源 ID 自动归组，不以相似标题猜测关系。用户可见部数、作品、图片和来源都受其现有媒体库权限限制。Web 与 Emby 客户端均提供合集浏览、跨库版本选择和原条目播放进度。
+
+工作条目是合集内的逻辑展示身份；各原电影、媒体源、收藏、已看和播放记录仍属于各自媒体库条目。默认版本优先使用用户上次选择的可访问副本，再按用户媒体库顺序选择。只有至少两部不同的有效电影构成同一系列时才显示合集；详情只列出用户可访问的已入库电影。自动合集只由系统维护，已有手动合集合同保留。
+
+#### LUX-538：建立跨库合集存储结构
+
+范围：为系统管理的无根路径合集库、跨库系列引用、影片逻辑身份及原电影副本映射建立 SQLite/PostgreSQL 迁移。合集库稳定存在于存储层，但只在有用户可见合集时出现在客户端。原电影、文件和媒体源继续归属普通媒体库；不迁移或复制媒体文件。旧的按库合集表及其手动成员关系保持可用。
+
+验收：
+
+- [x] 从空库应用全部迁移后，系统合集库和跨库关系表可用，系统库没有文件根路径。
+- [x] SQLite 升级保留已有库、合集、用户权限和成员关系；PostgreSQL schema 与 SQLite 对齐。
+- [x] 相同稳定 ID 可表示多个库中的副本；现有手动合集结构及约束保持有效。
+
+预计文件（5 个）：`migrations/0170_global_movie_collections.sql`、`migrations-postgres/0170_global_movie_collections.sql`、`src/storage/repository.rs`、`src/storage/migration.rs`、`tests/storage.rs`。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage` 与 `git diff --check`。
+
+#### LUX-539：持久化电影的可靠系列身份
+
+范围：从已确认的刮削器结果和带可识别命名空间的 NFO `setid` 记录电影 ID、合集 ID、来源命名空间、系列名称及顺序提示。身份确认、元数据刷新或 NFO 索引更新后原子更新该关系；没有可靠 ID 时不建立关系。
+
+验收：
+
+- [x] TMDb 与 NFO 的同一命名空间/系列 ID 产生相同引用；不同命名空间不会仅凭数值相同或标题相同合并。
+- [x] 缺失、非法、待确认和重新识别的元数据不会留下旧系列关系。
+- [x] 重复确认和刷新幂等，不改变现有影片元数据优先级或 NFO 内容。
+
+预计代码文件（5 个）：`src/application/candidates.rs`、`src/application/metadata.rs`、`src/storage/mod.rs`、`src/storage/catalog.rs`、`src/storage/metadata.rs`；存储和 NFO 回归测试放在对应模块内。本文档作为独立文档增量更新。
+
+验证：所有 Cargo 命令均设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::tests`、`cargo test --locked --lib application::candidates::tests`、`cargo test --locked --lib application::metadata::tests -- --test-threads=1`、`cargo test --locked --test metadata_selection`、`cargo fmt --all -- --check` 与 `git diff --check`。
+
+补充实施结果（2026-10-15）：迁移 `0173_nfo_collection_reference_key` 为已有电影记录添加 NFO `setid` 索引状态，后台元数据 worker 会对未记录或与当前合集引用不符的旧 NFO 幂等补建/修复关系；状态与现有元数据更新合并写入，并在 SQLite catalog 表重建时保留。回归覆盖从 v172 升级、旧元数据指纹保留、NFO 重复处理幂等和缺失引用修复。
+
+#### LUX-540：自动生成并维护全站系列与作品
+
+范围：依据 LUX-539 的已确认关系，在后台幂等建立合集和逻辑作品，将各媒体库的相同影片副本挂到同一作品下。同步由元数据入库/变化及条目移除触发，不在用户请求中调用刮削器或扫描媒体库。系列不足两部有效不同影片时对客户端隐藏；恢复后重用稳定 ID。
+
+验收：
+
+- [x] 两个媒体库中的同系列电影自动产生一个合集；重复、并发和重启后的同步不重复建合集/作品。
+- [x] 副本只计作一部作品；新增副本、移除文件、禁用/删除库及改正系列 ID 后关系和阈值正确。
+- [x] 单条失败不会损坏上一份完整关系；后台可重试。
+
+实施拆为两个独立提交，每个提交最多改 5 个文件：
+
+1. SQLite/PostgreSQL 迁移、storage 后台同步事务与回归测试；加入可重试 outbox，关系变更、可用性变化、媒体库禁用/删除均在同一事务入队。
+2. 合集后台 worker、启动/关闭接线与 worker 回归测试；启动时恢复积压任务，失败后保留队列并周期重试，不扫描媒体库也不调用刮削器。
+
+客户端可见成员的海报回退由 LUX-541 在权限过滤后的读取路径实现，不能由全局后台写入共享海报路径。
+
+#### LUX-541：提供权限安全的合集库与 Web 数据接口
+
+范围：在 Lux 库列表中按需公开系统合集库；复用有界分页提供系列卡片和详情。权限按各用户当前可访问的原媒体库成员计算，详情包括去重作品、可选副本和用户最近选择的可访问来源，并提供经 CSRF 校验的来源/版本偏好写入接口。
+
+验收：
+
+- [x] 管理员和普通用户均不需要创建合集库；无可见合集时隐藏入口。
+- [x] 用户仅能看到至少一个自己可访问成员所属的系列；合集海报缺失时只从当前用户可见成员回退，计数、元数据、图片和副本来源不泄露其它库内容。
+- [x] 结果稳定分页、顺序确定；原电影库仍逐条返回普通电影，不出现系统逻辑作品。
+
+预计文件（不超过 5 个）：库/媒体 API、access/catalog 服务、合集测试及本文档。
+
+#### LUX-542：接入 Lux Web 合集浏览与来源选择
+
+范围：显示“合集”库入口、系列卡片及详情作品列表；同一作品有多个可访问副本时展示来源库和版本选择，链接回原媒体详情并播放。
+
+验收：
+
+- [x] 系列按默认上映顺序展示；合集海报缺失时安全回退；窄屏和空列表状态可用。
+- [x] 来源选择只显示用户可访问副本，选择后进入原条目并保留其既有收藏、已看和播放进度。
+- [x] 详情中可从电影回到所属合集；普通电影库布局和内容不变。
+
+预计文件（不超过 5 个）：Web API client/types、库列表/合集页/详情组件、Web 测试及本文档。
+
+#### LUX-543：接入 Emby 合集库与系列浏览
+
+范围：Emby 用户库列表提供 `CollectionType=boxsets` 的系统入口；合集显示为 `BoxSet`，成员显示为唯一逻辑 `Movie`。不同媒体库的同片副本不重复显示为多个系列成员。
+
+验收：
+
+- [x] `/Users/{id}/Views`、合集根列表、系列 children 与计数均使用同一权限过滤和稳定 ID。
+- [x] 普通 Emby 电影库和既有手动合集合同不变；管理员不能通过系统合集 ID 修改自动关系。
+- [x] 分页、排序和列表 DTO 有集成回归。
+
+预计文件（不超过 5 个）：Emby catalog/handler、合集访问服务、Emby 合集测试及本文档。
+
+#### LUX-544：支持 Emby 跨库版本播放与进度
+
+范围：合集逻辑电影的 `PlaybackInfo` 展示所有有权访问的原副本为媒体版本。实际选中的原媒体 source 负责播放地址、字幕及会话；回调经用户/设备/会话和 source 校验后只更新该原电影的播放状态。媒体源缺省回调无法唯一匹配时拒绝更新。
+
+验收：
+
+- [x] 任一客户端选择的来源只能访问其所属启用库中的真实 source；撤权后播放及旧会话回调均被拒绝。
+- [x] `ItemId`、`MediaSourceId` 缺省/转换组合、暂停、进度、停止、跨设备并发均不会把状态写给另一副本。
+- [x] Emby DTO 保持标准媒体版本字段；兼容记录明确标注 VidHub、SenPlayer、Infuse 的合集浏览/版本选择/进度回写尚未实测，不将服务端测试冒充客户端通过。
+
+文件（5 个）：`src/application/catalog.rs`、`src/api/playback.rs`、`tests/emby_global_collection_playback.rs`、`docs/COMPATIBILITY.md` 及本文档。复用了现有 playback source 授权查询，没有 schema 或 storage 授权代码变更。
+
+实施结果（2026-10-15）：Catalog 将 ACL 过滤后的原电影与可用媒体 source 装配给 Emby `PlaybackInfo`，优先遵循已保存的副本/版本偏好，再按默认版本和库顺序排列。响应 DTO、直放/转码地址、字幕流和播放时长均使用 source 所属的原电影 ID；source 授权仍由原媒体入口重新校验。以合集逻辑 ItemId 上报时，回调先按当前 ACL 与 MediaSourceId 唯一解析原电影；无 source 的回调只在原件或已有会话可唯一定位时接受。已有合集会话绑定原件、source 和设备，撤权或会话错配会在写进度、改状态或停止转码前拒绝。
+
+验证：`cargo test --locked --test emby_global_collection_playback --test playback --test subtitles --test emby_multi_part_playback`、`cargo fmt --all -- --check`、`git diff --check` 通过；Cargo 使用项目共享 target 目录。自动化覆盖两份跨库原件的 DTO/直放字节/字幕、source 选择、唯一和歧义回调、暂停/进度/停止、独立设备会话、source/device/session 错配拒绝及撤权后旧 URL/回调拒绝。真实 VidHub、SenPlayer、Infuse 客户端尚未做合集流程实测，阶段门由 LUX-545 如实记录。
+
+#### LUX-545：完成合集阶段门与客户端兼容记录
+
+验收：
+
+- [x] SQLite 空库和升级迁移检查通过：`cargo test --locked --test storage` 为 56 passed。
+- [x] PostgreSQL 16 临时实例迁移回归通过：`cargo test --locked --target aarch64-apple-darwin --test postgres_database -- --include-ignored` 为 16 passed；空库启动断言 v173 合集表、系统合集库无根路径及 NFO 引用列。
+- [x] Rust 完整完成检查通过：ARM64 `cargo test --locked --target aarch64-apple-darwin --all-targets` 在 4 个 test threads 下完成，库测试 872 passed、22 ignored，所有可运行 integration targets 通过。
+- [x] Web 冻结依赖安装、完整测试（Node 139/139、Vitest 600/600）和生产构建通过。
+- [x] Playwright 浏览器流程通过：打开合集库、进入“飞驰人生”、选择 4K 来源并触发来源偏好写入；该流程使用 mock API，服务端合同由 Rust 集成测试验证。
+- [ ] VidHub、SenPlayer、Infuse 的合集浏览、来源选择与进度回写实测尚未完成，未实测客户端不记为通过。
+- [x] `docs/COMPATIBILITY.md` 已记录本机 arm64、检查结果、客户端状态和剩余风险；本阶段停在项目所有者确认点。
+
+预计文件：兼容记录、本文档和阶段验收涉及的回归文件。
+
+实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。全量门禁中的 PostgreSQL 专用用例按设计忽略；随后在临时 PostgreSQL 16 实例单独运行 `postgres_database` 目标，16 项通过。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub、SenPlayer、Infuse 客户端实测仍未完成，阶段门停在项目所有者确认点。
+
+2026-10-15 续查：VidHub 2.1.8、SenPlayer 6.0.6、Infuse 8.5.1 均已安装并启动，但 CUA 绑定原生窗口均返回 `-10005 cgWindowNotFound`，无法执行合集浏览、来源切换和进度回写。隔离浏览器访问本机服务停留在登录页；未改动现有本地用户或媒体数据。客户端验收继续保持未完成。
+
+## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
 

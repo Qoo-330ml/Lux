@@ -439,6 +439,41 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("requests paged collection details", async () => {
+    const responseBody = {
+      collection: { id: "collection-1", title: "飞驰人生", itemType: "BOX_SET" },
+      items: [],
+      page: 2,
+      pageSize: 12,
+      total: 30,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(responseBody), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().collection("collection/1", 2, 12)).resolves.toEqual(responseBody);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/collections/collection%2F1?page=2&pageSize=12");
+  });
+
+  it("saves the selected accessible collection copy and version with CSRF", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await new LuxApiClient().setCollectionSourcePreference("collection-1", "work-1", {
+      sourceItemId: "movie-1",
+      mediaSourceId: "version-1",
+    });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/collections/collection-1/items/work-1/source");
+    expect(options?.method).toBe("PUT");
+    expect(JSON.parse(String(options?.body))).toEqual({ sourceItemId: "movie-1", mediaSourceId: "version-1" });
+    expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
   it("sends the selected HomeVideos parent folder to the server", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

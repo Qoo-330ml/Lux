@@ -587,6 +587,19 @@ pub(super) async fn lux_list_libraries(
                     "coverImageUrl": library_cover_url(&view.library),
                 }));
             }
+            let Some(catalog) = state.catalog.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            match catalog.list_global_collection_cards(principal, 0, 1).await {
+                Ok(collections) if collections.total > 0 => visible.push(json!({
+                    "id": crate::storage::GLOBAL_COLLECTION_LIBRARY_ID,
+                    "name": "合集",
+                    "kind": "MIXED",
+                    "coverImageUrl": null,
+                })),
+                Ok(_) => {}
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
             Json(json!({
                 "libraries": visible,
                 "showMetadataPending": show_metadata_pending,
@@ -799,6 +812,59 @@ pub(super) async fn lux_list_library_items(
             .into_response();
         }
     };
+    if library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID {
+        let item_type_matches = query.item_type.as_deref().is_none_or(|item_types| {
+            item_types
+                .split(',')
+                .any(|item_type| item_type.trim().eq_ignore_ascii_case("BOX_SET"))
+        });
+        if query.parent_id.is_some() || !item_type_matches {
+            return Json(json!({
+                "items": [],
+                "total": 0,
+                "page": offset / limit + 1,
+                "pageSize": limit,
+            }))
+            .into_response();
+        }
+        return match catalog
+            .list_global_collection_cards(principal, offset, limit)
+            .await
+        {
+            Ok(page) => {
+                let items = page
+                    .cards
+                    .iter()
+                    .map(|card| card.item.clone())
+                    .collect::<Vec<_>>();
+                let mut values =
+                    match lux_catalog_items_json_for_user(database, &user.id.to_string(), &items)
+                        .await
+                    {
+                        Ok(values) => values,
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    };
+                for (value, card) in values.iter_mut().zip(&page.cards) {
+                    add_global_collection_card_fields(
+                        value,
+                        card.member_count,
+                        card.poster_item_id.as_deref(),
+                    );
+                }
+                Json(json!({
+                    "items": values,
+                    "total": page.total,
+                    "page": offset / limit + 1,
+                    "pageSize": limit,
+                }))
+                .into_response()
+            }
+            Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        };
+    }
     let mut filter = catalog_filter_from_values(
         query.item_type.as_deref(),
         query.year.map(|year| year.to_string()).as_deref(),
@@ -1270,6 +1336,91 @@ pub(super) async fn lux_get_collection(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
+    match catalog
+        .find_global_collection_card(principal, &collection_id)
+        .await
+    {
+        Ok(Some(card)) => {
+            let collection_state = match database
+                .find_user_item_state(&user.id.to_string(), &card.item.id)
+                .await
+            {
+                Ok(state) => state,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let page = match catalog
+                .list_global_collection_members(principal, &collection_id, offset, limit)
+                .await
+            {
+                Ok(page) => page,
+                Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                Err(CatalogError::Storage(_)) => {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            };
+            let member_items = page
+                .members
+                .iter()
+                .map(|member| member.item.clone())
+                .collect::<Vec<_>>();
+            let values = match lux_catalog_items_json_for_user(
+                database,
+                &user.id.to_string(),
+                &member_items,
+            )
+            .await
+            {
+                Ok(values) => values,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let items = values
+                .into_iter()
+                .zip(&page.members)
+                .map(|(mut value, member)| {
+                    if let Value::Object(object) = &mut value {
+                        object.insert(
+                            "sources".to_owned(),
+                            Value::Array(
+                                member
+                                    .sources
+                                    .iter()
+                                    .map(lux_global_collection_source_copy_json)
+                                    .collect(),
+                            ),
+                        );
+                        object.insert(
+                            "preferredSourceItemId".to_owned(),
+                            json!(member.preferred_source_item_id),
+                        );
+                        object.insert(
+                            "preferredMediaSourceId".to_owned(),
+                            json!(member.preferred_media_source_id),
+                        );
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            let mut collection_value =
+                lux_catalog_item_json_with_user_state(&card.item, collection_state.as_ref());
+            add_global_collection_card_fields(
+                &mut collection_value,
+                card.member_count,
+                card.poster_item_id.as_deref(),
+            );
+            return Json(json!({
+                "collection": collection_value,
+                "items": items,
+                "total": page.total,
+                "page": page.offset / page.limit + 1,
+                "pageSize": page.limit,
+            }))
+            .into_response();
+        }
+        Ok(None) => {}
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     let Some(collection) = (match catalog.find_item(principal, &collection_id).await {
         Ok(collection) => collection,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1307,6 +1458,48 @@ pub(super) async fn lux_get_collection(
             }))
             .into_response()
         }
+        Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LuxGlobalCollectionSourceRequest {
+    source_item_id: String,
+    #[serde(default)]
+    media_source_id: Option<String>,
+}
+
+pub(super) async fn lux_set_collection_source(
+    headers: HeaderMap,
+    Path((collection_id, work_item_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<LuxGlobalCollectionSourceRequest>,
+) -> Response {
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .set_global_collection_source_preference(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &collection_id,
+            &work_item_id,
+            &request.source_item_id,
+            request.media_source_id.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(CatalogError::AccessDenied | CatalogError::LibraryNotFound) => {
             StatusCode::NOT_FOUND.into_response()
         }
@@ -3382,6 +3575,35 @@ pub(super) fn lux_catalog_item_json(item: &CatalogItem) -> Value {
             "logo": item.logo_image_tag,
         },
         "mediaSources": item.media_sources.iter().map(lux_catalog_source_json).collect::<Vec<_>>(),
+    })
+}
+
+fn add_global_collection_card_fields(
+    value: &mut Value,
+    member_count: i64,
+    poster_item_id: Option<&str>,
+) {
+    if let Value::Object(object) = value {
+        object.insert("memberCount".to_owned(), json!(member_count));
+        object.insert("posterItemId".to_owned(), json!(poster_item_id));
+    }
+}
+
+fn lux_global_collection_source_copy_json(
+    source: &crate::application::catalog::GlobalCollectionSourceCopy,
+) -> Value {
+    json!({
+        "itemId": source.item_id,
+        "libraryId": source.library_id,
+        "libraryName": source.library_name,
+        "title": source.title,
+        "posterImageTag": source.poster_image_tag,
+        "versions": source.versions.iter().map(|version| json!({
+            "id": version.id,
+            "editionName": version.edition_name,
+            "qualityLabel": version.quality_label,
+            "container": version.container,
+        })).collect::<Vec<_>>(),
     })
 }
 

@@ -20,6 +20,7 @@ export const queryKeys = {
     metadataStatus = "all",
     pageSize = 24,
   ) => ["library", libraryId, page, pageSize, itemTypes ?? "root", sortBy, sortOrder, metadataStatus] as const,
+  collection: (collectionId: string) => ["collection", collectionId] as const,
   item: (itemId: string) => ["item", itemId] as const,
   person: (personId: string) => ["person", personId] as const,
   personItems: (personId: string) => ["person", personId, "items"] as const,

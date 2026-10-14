@@ -8460,6 +8460,50 @@ async fn migration_library_identity_listing_reads_only_enabled_libraries_once() 
 }
 
 #[tokio::test]
+async fn system_collection_library_is_excluded_from_regular_library_workflows() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("regular library");
+    let library_id = library.id.to_string();
+
+    assert_eq!(
+        database
+            .list_enabled_library_ids()
+            .await
+            .expect("enabled media libraries"),
+        vec![library_id.clone()]
+    );
+    let identities = database
+        .list_enabled_library_identities()
+        .await
+        .expect("migration media-library identities");
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].id, library_id);
+
+    let rebuild_jobs = database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("person rebuild jobs");
+    assert_eq!(rebuild_jobs.len(), 1);
+    assert_eq!(rebuild_jobs[0].library_id, library.id.to_string());
+
+    let activity = database
+        .list_library_pipeline_activity(1, 50)
+        .await
+        .expect("regular library activity");
+    assert_eq!(activity.total_libraries, 1);
+    assert_eq!(activity.libraries.len(), 1);
+    assert_eq!(activity.libraries[0].id, library.id.to_string());
+}
+
+#[tokio::test]
 async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

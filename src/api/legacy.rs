@@ -59,7 +59,7 @@ use crate::{
             CatalogSource, normalize_search_like_query, normalize_search_query,
         },
         chapter_detector::{ChapterDetectionError, ChapterDetectionService},
-        collections::{CollectionError, CollectionService},
+        collections::{CollectionError, CollectionService, GlobalCollectionSyncWorker},
         database_diagnostics::DatabaseDiagnosticsService,
         directory_browser::{DirectoryBrowserError, list_directories},
         emby_migration_service::{
@@ -190,6 +190,7 @@ pub struct AppState {
     scraper_resolver: Option<ScraperResolver>,
     scraper: Option<ScraperProvider>,
     collections: Option<CollectionService>,
+    global_collection_sync_worker: Option<GlobalCollectionSyncWorker>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
@@ -207,6 +208,9 @@ impl AppState {
     pub async fn shutdown_background_workers(&self) {
         if let Some(metadata_reidentify) = &self.metadata_reidentify {
             metadata_reidentify.shutdown().await;
+        }
+        if let Some(worker) = &self.global_collection_sync_worker {
+            worker.shutdown().await;
         }
     }
 
@@ -374,6 +378,8 @@ impl AppState {
         )
         .with_library_covers(library_covers.clone())
         .with_danmaku(danmaku.clone());
+        let global_collection_sync_worker =
+            Some(GlobalCollectionSyncWorker::start(database.clone()));
         Self {
             admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
@@ -435,6 +441,7 @@ impl AppState {
             scraper_resolver: Some(scraper_resolver),
             scraper: Some(scraper),
             collections,
+            global_collection_sync_worker,
             people: Some(people),
             local_nfo: Some(local_nfo),
             user_avatars,
