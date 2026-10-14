@@ -149,6 +149,14 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
 部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。
 
+## LUX-544 Emby 跨库合集版本播放（2026-10-15）
+
+合集逻辑电影的 `PlaybackInfo` 以标准 `MediaSources[]` 返回当前用户可访问的原电影副本和版本。每个媒体源的 `ItemId`、直放/转码 URL、媒体流与字幕均指向该 source 所属的原电影；默认 source 使用用户已保存的副本/版本偏好，其后按默认版本和媒体库顺序排列。显式撤销媒体库权限后，合集 `PlaybackInfo` 不再提供该 source；已签名的原 source 播放 URL 也会在媒体入口重新执行 ACL/source 授权。
+
+使用合集逻辑 `ItemId` 的播放回调按登录用户可见的原副本和 `MediaSourceId` 解析后，只更新原电影的播放会话和进度。缺少 source 时仅在原副本/已有会话能唯一定位时接受；多个可见副本无法唯一定位时返回 `400`。已有合集播放会话还绑定原电影、source 和设备，错配回调或撤权后的旧回调返回 `404`。
+
+`tests/emby_global_collection_playback.rs` 验证了两份跨库原件的 DTO 和真实直放字节、外置字幕路由、显式 source 选择、单副本 source 缺省回调、歧义回调拒绝、不同设备并发会话、暂停/停止、source/device/会话错配拒绝及撤权后旧流和回调拒绝。Rust 自动化结果只证明服务端合同。该记录未进行 VidHub、SenPlayer 或 Infuse 的合集真实 UI/source 切换测试，不能据此声明这些客户端能浏览合集、选择版本或回写对应原电影进度；这些实机结果留待 LUX-545 阶段门逐项记录。
+
 2026-09-20 播放状态兼容：Emby `GET /Sessions` 和 Lux 管理仪表盘现在根据活动 HLS 会话报告
 `DirectStream` 或 `Transcode`，不再把服务端转码固定报告为 `DirectPlay`；可用时同时返回/展示 HLS 容器、视频/音频输出 codec
 及目标码率。该状态信息来自 Lux 的实际播放会话和 FFmpeg 输出档位，不代表 Harbor 等第三方客户端已完成部署环境实测。

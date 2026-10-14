@@ -42,47 +42,89 @@ pub(super) async fn emby_playback_info(
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let sources = item.media_sources.iter().collect::<Vec<_>>();
-    let query_media_source_requested = query.media_source_id.is_some();
-    // The catalog already grouped the parts of each version and ordered the versions; only
-    // move the default version (with all of its parts) to the front and keep the rest.
-    let default_version = sources
+    let (playback_items, preferred_source_item_id, preferred_media_source_id) = if item.library_id
+        == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID
+        && item.item_type == "MOVIE"
+    {
+        let playback_sources = match catalog
+            .global_collection_playback_sources(principal, &item.id)
+            .await
+        {
+            Ok(Some(sources)) => sources,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(CatalogError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        };
+        (
+            playback_sources.copies,
+            playback_sources.preferred_source_item_id,
+            playback_sources.preferred_media_source_id,
+        )
+    } else {
+        (vec![item.clone()], None, None)
+    };
+    let mut sources = playback_items
         .iter()
-        .map(|source| {
-            crate::application::catalog::belongs_to_default_version(&item.media_sources, source)
+        .flat_map(|source_item| {
+            source_item
+                .media_sources
+                .iter()
+                .map(move |source| (source_item, source))
         })
         .collect::<Vec<_>>();
-    let mut ranked = sources.into_iter().zip(default_version).collect::<Vec<_>>();
-    ranked.sort_by_key(|(_, in_default_version)| !*in_default_version);
-    let mut sources = ranked
-        .into_iter()
-        .map(|(source, _)| source)
-        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let query_media_source_requested = query.media_source_id.is_some();
+    // Keep each version attached to its original item so the DTO, media URL,
+    // subtitle routes and HLS session all authorize against the real owner.
+    sources.sort_by_key(|(source_item, source)| {
+        let preferred_copy =
+            usize::from(preferred_source_item_id.as_deref() != Some(source_item.id.as_str()));
+        let preferred_source =
+            usize::from(preferred_media_source_id.as_deref() != Some(source.id.as_str()));
+        let default_version =
+            usize::from(!crate::application::catalog::belongs_to_default_version(
+                &source_item.media_sources,
+                source,
+            ));
+        (preferred_copy, preferred_source, default_version)
+    });
     if let Some(source_id) = query.media_source_id {
-        let Some(index) = sources.iter().position(|source| source.id == source_id) else {
+        let Some(index) = sources
+            .iter()
+            .position(|(_, source)| source.id == source_id)
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
         let source = sources.remove(index);
         sources.insert(0, source);
     }
     if let Some(source_id) = request.media_source_id.as_deref() {
-        let Some(index) = sources.iter().position(|source| source.id == source_id) else {
+        let Some(index) = sources
+            .iter()
+            .position(|(_, source)| source.id == source_id)
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
         let source = sources.remove(index);
         sources.insert(0, source);
     }
-    let runtime_ticks = sources
-        .first()
-        .and_then(|source| super::emby_catalog::emby_source_runtime_ticks(&item, source));
+    let runtime_ticks = sources.first().and_then(|(source_item, source)| {
+        super::emby_catalog::emby_source_runtime_ticks(source_item, source)
+    });
     let transcode_requested = method == Method::POST
-        && sources.first().is_some_and(|source| {
+        && sources.first().is_some_and(|(_, source)| {
             request.requests_server_transcoding_for_source(force_transcode, source)
         });
-    if let Some(source) = sources.first() {
+    if let Some((source_item, source)) = sources.first() {
         tracing::info!(
             event = "emby_playback_negotiation",
-            item_id_prefix = %playback_identifier_prefix(&item.id),
+            item_id_prefix = %playback_identifier_prefix(&source_item.id),
             source_id_prefix = %playback_identifier_prefix(&source.id),
             source_kind = %source.source_kind,
             query_media_source_requested,
@@ -111,7 +153,7 @@ pub(super) async fn emby_playback_info(
     }
     let strm_resolver_available = if sources
         .iter()
-        .any(|source| emby_source_needs_strm_resolver(source))
+        .any(|(_, source)| emby_source_needs_strm_resolver(source))
     {
         match state.plugins.as_ref() {
             Some(plugins) => match plugins.has_available_strm_resolver().await {
@@ -125,10 +167,13 @@ pub(super) async fn emby_playback_info(
     };
     let transcode_user_id = user.id.to_string();
     let transcode_start_time_ticks = if transcode_requested {
+        let Some((source_item, _)) = sources.first() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
         match emby_transcoding_start_time_ticks(
             &state,
             &transcode_user_id,
-            &item.id,
+            &source_item.id,
             request.start_time_ticks,
             runtime_ticks,
         )
@@ -141,7 +186,7 @@ pub(super) async fn emby_playback_info(
         None
     };
     let transcode_container = if transcode_requested {
-        let Some(source) = sources.first() else {
+        let Some((_, source)) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
         };
         match request.selected_hls_container(source) {
@@ -152,13 +197,13 @@ pub(super) async fn emby_playback_info(
         None
     };
     let transcode_session = if transcode_requested {
-        let Some(source) = sources.first() else {
+        let Some((source_item, source)) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
         };
         match create_emby_transcoding_session(
             &state,
             &user,
-            &item.id,
+            &source_item.id,
             source,
             EmbyTranscodingSessionOptions {
                 request: &request,
@@ -188,9 +233,9 @@ pub(super) async fn emby_playback_info(
         "RunTimeTicks": runtime_ticks,
         "MediaSources": sources
             .into_iter()
-            .map(|source| {
+            .map(|(source_item, source)| {
                 let mut value = emby_media_source_json_with_resolver(
-                    &item.id,
+                    &source_item.id,
                     source,
                     true,
                     strm_resolver_available,
@@ -212,7 +257,7 @@ pub(super) async fn emby_playback_info(
                 if let Value::Object(object) = &mut value {
                     object.insert(
                         "RunTimeTicks".to_owned(),
-                        super::emby_catalog::emby_source_runtime_ticks(&item, source)
+                        super::emby_catalog::emby_source_runtime_ticks(source_item, source)
                             .map(Value::from)
                             .unwrap_or(Value::Null),
                     );
@@ -242,7 +287,7 @@ pub(super) async fn emby_playback_info(
                         state.web_playback.as_ref().and_then(|service| {
                             emby_transcoding_url(
                                 service,
-                                &item.id,
+                                &source_item.id,
                                 source,
                                 session,
                                 EmbyTranscodingUrlOptions {
@@ -264,7 +309,7 @@ pub(super) async fn emby_playback_info(
                         && let Some(service) = state.web_playback.as_ref()
                         && let Some(url) = emby_signed_direct_stream_url(
                             service,
-                            &item.id,
+                            &source_item.id,
                             source,
                             &user,
                             &play_session_id,
@@ -316,7 +361,7 @@ pub(super) async fn emby_playback_info(
                 {
                     tracing::info!(
                         event = "emby_transcoding_offer",
-                        item_id_prefix = %playback_identifier_prefix(&item.id),
+                        item_id_prefix = %playback_identifier_prefix(&source_item.id),
                         source_id_prefix = %playback_identifier_prefix(&source.id),
                         session_id_prefix = %playback_identifier_prefix(&session.id),
                         transcoding_url_present = value
@@ -1208,7 +1253,117 @@ pub(super) async fn handle_emby_playback_event(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let item_id_prefix = playback_identifier_prefix(&request.item_id);
-    let internal_item_id = emby_internal_id(&request.item_id);
+    let Some(database) = state.database.as_ref() else {
+        tracing::error!(
+            event = "emby_playback_callback_rejected",
+            stage = "database",
+            status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            playback_state = state_name,
+            item_id_prefix = %item_id_prefix,
+            "playback database is unavailable"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let mut internal_item_id = emby_internal_id(&request.item_id);
+    let requested_media_source_id = request
+        .media_source_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mut media_source_id = requested_media_source_id.clone();
+    let requested_play_session_id = request
+        .play_session_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let requested_previous_session =
+        if let Some(play_session_id) = requested_play_session_id.as_deref() {
+            match database
+                .find_playback_session(&user.id.to_string(), play_session_id)
+                .await
+            {
+                Ok(session) => session,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        } else {
+            None
+        };
+    let is_global_collection_work = match database.find_item_library_id(&internal_item_id).await {
+        Ok(Some(library_id)) if library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID => {
+            let Some(catalog) = state.catalog.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let logical_item = match catalog.find_item(principal, &internal_item_id).await {
+                Ok(Some(item)) if item.item_type == "MOVIE" => item,
+                Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(CatalogError::Storage(_)) => {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+            };
+            let playback_sources = match catalog
+                .global_collection_playback_sources(principal, &logical_item.id)
+                .await
+            {
+                Ok(Some(sources)) => sources,
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(CatalogError::Storage(_)) => {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+            };
+            let matching_copy = if let Some(source_id) = requested_media_source_id.as_deref() {
+                let mut matches = playback_sources.copies.iter().filter(|copy| {
+                    copy.media_sources
+                        .iter()
+                        .any(|source| source.id == source_id)
+                });
+                let Some(copy) = matches.next() else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                if matches.next().is_some() {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                copy
+            } else if let Some(previous_session) = requested_previous_session.as_ref() {
+                let Some(copy) = playback_sources
+                    .copies
+                    .iter()
+                    .find(|copy| copy.id == previous_session.item_id)
+                else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                if previous_session
+                    .media_source_id
+                    .as_ref()
+                    .is_some_and(|source_id| {
+                        !copy
+                            .media_sources
+                            .iter()
+                            .any(|source| source.id == *source_id)
+                    })
+                {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                media_source_id = previous_session.media_source_id.clone();
+                copy
+            } else if playback_sources.copies.len() == 1 {
+                &playback_sources.copies[0]
+            } else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            internal_item_id = matching_copy.id.clone();
+            true
+        }
+        Ok(_) => false,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let Some(access) = state.access.as_ref() else {
         tracing::error!(
             event = "emby_playback_callback_rejected",
@@ -1220,13 +1375,7 @@ pub(super) async fn handle_emby_playback_event(
         );
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access
-        .can_view_item(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &internal_item_id,
-        )
-        .await
-    {
+    match access.can_view_item(principal, &internal_item_id).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::warn!(
@@ -1250,52 +1399,6 @@ pub(super) async fn handle_emby_playback_event(
                 "failed to check playback item access"
             );
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    }
-    let Some(database) = state.database.as_ref() else {
-        tracing::error!(
-            event = "emby_playback_callback_rejected",
-            stage = "database",
-            status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            playback_state = state_name,
-            item_id_prefix = %item_id_prefix,
-            "playback database is unavailable"
-        );
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let media_source_id = request
-        .media_source_id
-        .as_deref()
-        .filter(|value| !value.is_empty());
-    if let Some(media_source_id) = media_source_id {
-        match database
-            .media_source_belongs_to_item(media_source_id, &internal_item_id)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(
-                    event = "emby_playback_callback_rejected",
-                    stage = "media_source",
-                    status_code = StatusCode::NOT_FOUND.as_u16(),
-                    playback_state = state_name,
-                    item_id_prefix = %item_id_prefix,
-                    "playback media source does not belong to item"
-                );
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            Err(error) => {
-                tracing::error!(
-                    event = "emby_playback_callback_rejected",
-                    stage = "media_source",
-                    status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    playback_state = state_name,
-                    item_id_prefix = %item_id_prefix,
-                    error = %error,
-                    "failed to check playback media source"
-                );
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
         }
     }
     let mut header_device = emby_device_info_from_headers(&headers);
@@ -1334,7 +1437,6 @@ pub(super) async fn handle_emby_playback_event(
         .device_type
         .as_deref()
         .or_else(|| (!header_device.device.is_empty()).then_some(header_device.device.as_str()));
-    let requested_play_session_id = request.play_session_id.filter(|value| !value.is_empty());
     let mut play_session_id = requested_play_session_id
         .clone()
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
@@ -1347,7 +1449,7 @@ pub(super) async fn handle_emby_playback_event(
             .find_active_playback_session_for_stop(
                 &user.id.to_string(),
                 &internal_item_id,
-                media_source_id,
+                media_source_id.as_deref(),
                 stop_device_id,
             )
             .await
@@ -1355,6 +1457,77 @@ pub(super) async fn handle_emby_playback_event(
             Ok(Some(session)) => play_session_id = session.play_session_id,
             Ok(None) => {}
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    let previous_session = if requested_previous_session
+        .as_ref()
+        .is_some_and(|session| session.play_session_id == play_session_id)
+    {
+        requested_previous_session
+    } else {
+        match database
+            .find_playback_session(&user.id.to_string(), &play_session_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    };
+    if is_global_collection_work && let Some(session) = previous_session.as_ref() {
+        let source_mismatch = media_source_id
+            .as_deref()
+            .zip(session.media_source_id.as_deref())
+            .is_some_and(|(requested, stored)| requested != stored);
+        let device_mismatch = !device_id.trim().is_empty()
+            && !device_id.eq_ignore_ascii_case("unknown")
+            && !session.device_id.trim().is_empty()
+            && !session.device_id.eq_ignore_ascii_case("unknown")
+            && session.device_id != device_id;
+        if session.item_id != internal_item_id || source_mismatch || device_mismatch {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if media_source_id.is_none() {
+            media_source_id = session.media_source_id.clone();
+        }
+    }
+    if is_global_collection_work {
+        match access
+            .authorized_playback_source(principal, &internal_item_id, media_source_id.as_deref())
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else if let Some(media_source_id) = media_source_id.as_deref() {
+        match database
+            .media_source_belongs_to_item(media_source_id, &internal_item_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    event = "emby_playback_callback_rejected",
+                    stage = "media_source",
+                    status_code = StatusCode::NOT_FOUND.as_u16(),
+                    playback_state = state_name,
+                    item_id_prefix = %item_id_prefix,
+                    "playback media source does not belong to item"
+                );
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Err(error) => {
+                tracing::error!(
+                    event = "emby_playback_callback_rejected",
+                    stage = "media_source",
+                    status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    playback_state = state_name,
+                    item_id_prefix = %item_id_prefix,
+                    error = %error,
+                    "failed to check playback media source"
+                );
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
         }
     }
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
@@ -1379,13 +1552,6 @@ pub(super) async fn handle_emby_playback_event(
         Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let previous_session = match database
-        .find_playback_session(&user_id, &play_session_id)
-        .await
-    {
-        Ok(session) => session,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     // A client playing a growing HLS playlist may report the currently
     // available playlist length here. Prefer Lux's known source/item runtime
     // so that callbacks cannot replace the canonical duration with that
@@ -1393,9 +1559,9 @@ pub(super) async fn handle_emby_playback_event(
     // usable runtime at all.
     let duration_ticks = emby_playback_event_duration_ticks(
         &state,
-        AccessPrincipal::new(user.id, user.is_admin),
+        principal,
         &internal_item_id,
-        media_source_id,
+        media_source_id.as_deref(),
     )
     .await
     .or_else(|| request.duration_ticks.filter(|duration| *duration > 0))
@@ -1427,7 +1593,7 @@ pub(super) async fn handle_emby_playback_event(
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
             item_id: &internal_item_id,
-            media_source_id,
+            media_source_id: media_source_id.as_deref(),
             play_session_id: &play_session_id,
             device_id: &device_id,
             client,
@@ -1490,7 +1656,7 @@ pub(super) async fn handle_emby_playback_event(
                     event_type,
                     occurred_at,
                     &internal_item_id,
-                    media_source_id,
+                    media_source_id.as_deref(),
                     &play_session_id,
                     state_name,
                     request.position_ticks,

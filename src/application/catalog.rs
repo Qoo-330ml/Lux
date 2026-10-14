@@ -568,6 +568,51 @@ impl CatalogService {
         })
     }
 
+    pub async fn global_collection_playback_sources(
+        &self,
+        principal: AccessPrincipal,
+        work_item_id: &str,
+    ) -> Result<Option<GlobalCollectionPlaybackSources>, CatalogError> {
+        let work_sources = self
+            .global_collection_sources_for_works(principal, &[work_item_id.to_owned()])
+            .await?;
+        let Some(work_sources) = work_sources.into_iter().next() else {
+            return Ok(None);
+        };
+        let mut copies = Vec::with_capacity(work_sources.copies.len());
+        for source_copy in work_sources.copies {
+            let Some(mut item) = self.find_item(principal, &source_copy.item_id).await? else {
+                continue;
+            };
+            let available_source_ids = source_copy
+                .versions
+                .iter()
+                .map(|version| version.id.as_str())
+                .collect::<HashSet<_>>();
+            item.media_sources
+                .retain(|source| available_source_ids.contains(source.id.as_str()));
+            if !item.media_sources.is_empty() {
+                copies.push(item);
+            }
+        }
+        let preferred_source_item_id = work_sources
+            .preferred_source_item_id
+            .filter(|preferred_id| copies.iter().any(|item| item.id == *preferred_id));
+        let preferred_media_source_id =
+            work_sources.preferred_media_source_id.filter(|source_id| {
+                copies.iter().any(|item| {
+                    item.media_sources
+                        .iter()
+                        .any(|source| source.id == *source_id)
+                })
+            });
+        Ok(Some(GlobalCollectionPlaybackSources {
+            copies,
+            preferred_source_item_id,
+            preferred_media_source_id,
+        }))
+    }
+
     pub async fn set_global_collection_source_preference(
         &self,
         principal: AccessPrincipal,
@@ -1973,6 +2018,13 @@ pub struct GlobalCollectionMembersPage {
     pub total: i64,
     pub offset: i64,
     pub limit: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalCollectionPlaybackSources {
+    pub copies: Vec<CatalogItem>,
+    pub preferred_source_item_id: Option<String>,
+    pub preferred_media_source_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

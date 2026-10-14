@@ -11412,11 +11412,15 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 任一客户端选择的来源只能访问其所属启用库中的真实 source；撤权后播放及旧会话回调均被拒绝。
-- [ ] `ItemId`、`MediaSourceId` 缺省/转换组合、暂停、进度、停止、跨设备并发均不会把状态写给另一副本。
-- [ ] Emby DTO 保持标准媒体版本字段；对不支持来源选择的客户端如实记录兼容限制，不伪造通过。
+- [x] 任一客户端选择的来源只能访问其所属启用库中的真实 source；撤权后播放及旧会话回调均被拒绝。
+- [x] `ItemId`、`MediaSourceId` 缺省/转换组合、暂停、进度、停止、跨设备并发均不会把状态写给另一副本。
+- [x] Emby DTO 保持标准媒体版本字段；兼容记录明确标注 VidHub、SenPlayer、Infuse 的合集浏览/版本选择/进度回写尚未实测，不将服务端测试冒充客户端通过。
 
-预计文件（不超过 5 个）：catalog source 装配、Emby playback/session、storage 授权、播放集成测试及本文档。
+文件（5 个）：`src/application/catalog.rs`、`src/api/playback.rs`、`tests/emby_global_collection_playback.rs`、`docs/COMPATIBILITY.md` 及本文档。复用了现有 playback source 授权查询，没有 schema 或 storage 授权代码变更。
+
+实施结果（2026-10-15）：Catalog 将 ACL 过滤后的原电影与可用媒体 source 装配给 Emby `PlaybackInfo`，优先遵循已保存的副本/版本偏好，再按默认版本和库顺序排列。响应 DTO、直放/转码地址、字幕流和播放时长均使用 source 所属的原电影 ID；source 授权仍由原媒体入口重新校验。以合集逻辑 ItemId 上报时，回调先按当前 ACL 与 MediaSourceId 唯一解析原电影；无 source 的回调只在原件或已有会话可唯一定位时接受。已有合集会话绑定原件、source 和设备，撤权或会话错配会在写进度、改状态或停止转码前拒绝。
+
+验证：`cargo test --locked --test emby_global_collection_playback --test playback --test subtitles --test emby_multi_part_playback`、`cargo fmt --all -- --check`、`git diff --check` 通过；Cargo 使用项目共享 target 目录。自动化覆盖两份跨库原件的 DTO/直放字节/字幕、source 选择、唯一和歧义回调、暂停/进度/停止、独立设备会话、source/device/session 错配拒绝及撤权后旧 URL/回调拒绝。真实 VidHub、SenPlayer、Infuse 客户端尚未做合集流程实测，阶段门由 LUX-545 如实记录。
 
 #### LUX-545：完成合集阶段门与客户端兼容记录
 
