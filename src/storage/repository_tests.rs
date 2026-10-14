@@ -2010,6 +2010,292 @@ fn database_pool_max_connections_rejects_invalid_overrides() {
 }
 
 #[tokio::test]
+async fn scan_job_file_change_queue_is_path_scoped_coalesced_and_retryable() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"video")
+        .await
+        .expect("movie file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let second_root_path = temp_dir.path().join("Other Movies");
+    tokio::fs::create_dir_all(&second_root_path)
+        .await
+        .expect("second root directory");
+    let second_root = libraries
+        .add_root(
+            library.id,
+            second_root_path.to_str().expect("second media root"),
+        )
+        .await
+        .expect("second library root")
+        .root;
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root")
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("initial index");
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs
+        .create_movie_scan_job(library.id)
+        .await
+        .expect("scan job");
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             probe_state, metadata_state, thumbnail_state
+         )
+         SELECT ?, 'ITEM', mi.id, mi.id, 'CHANGED', 'DONE', 'DONE', 'DONE'
+         FROM media_items mi WHERE mi.library_id = ?",
+    )
+    .bind(&job.id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("completed item target");
+    sqlx::query("UPDATE media_sources SET probe_status = 'READY'")
+        .execute(database.pool())
+        .await
+        .expect("ready media source");
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED'")
+        .execute(database.pool())
+        .await
+        .expect("confirmed media metadata");
+
+    let root_id = root.id.to_string();
+    let second_root_id = second_root.id.to_string();
+    assert!(
+        database
+            .record_scan_job_file_change(&job.id, &root_id, "Example Movie (2020)/Zulu.srt", "ADD",)
+            .await
+            .expect("record subtitle change")
+    );
+    assert!(database
+        .record_scan_job_file_change(
+            &job.id,
+            &root_id,
+            "Example Movie (2020)/Alpha.nfo",
+            "ADD",
+        )
+        .await
+        .expect("record NFO change"));
+    assert!(
+        database
+            .record_scan_job_file_change(
+                &job.id,
+                &second_root_id,
+                "Example Movie (2020)/Alpha.nfo",
+                "ADD",
+            )
+            .await
+            .expect("record same relative path in another root")
+    );
+    assert!(!database
+        .record_scan_job_file_change(
+            &job.id,
+            &root_id,
+            "Example Movie (2020)/Alpha.nfo",
+            "ADD",
+        )
+        .await
+        .expect("deduplicate pending NFO change"));
+
+    let page = database
+        .list_pending_scan_job_file_changes(&job.id, None, 1)
+        .await
+        .expect("first pending page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].relative_path, "Example Movie (2020)/Alpha.nfo");
+    let next_page = database
+        .list_pending_scan_job_file_changes(&job.id, Some(&page[0]), 10)
+        .await
+        .expect("next pending page");
+    assert_eq!(next_page.len(), 2);
+    let all_rows = [&page[0], &next_page[0], &next_page[1]];
+    assert!(all_rows.windows(2).all(|pair| {
+        pair[0].relative_path < pair[1].relative_path
+            || (pair[0].relative_path == pair[1].relative_path
+                && pair[0].library_root_id < pair[1].library_root_id)
+    }));
+    let alpha_change = all_rows
+        .iter()
+        .find(|change| {
+            change.library_root_id == root_id && change.relative_path.ends_with("Alpha.nfo")
+        })
+        .expect("first root NFO event");
+    let alpha_revision = alpha_change
+        .file_change_revision
+        .expect("file queue revision");
+
+    assert!(
+        database
+            .set_scan_job_file_change_state(
+                &job.id,
+                &root_id,
+                "Example Movie (2020)/Alpha.nfo",
+                alpha_revision,
+                "RUNNING",
+                None,
+            )
+            .await
+            .expect("claim file event")
+    );
+    assert!(database
+        .record_scan_job_file_change(
+            &job.id,
+            &root_id,
+            "Example Movie (2020)/Alpha.nfo",
+            "ADD",
+        )
+        .await
+        .expect("new observation during processing"));
+    assert!(
+        !database
+            .set_scan_job_file_change_state(
+                &job.id,
+                &root_id,
+                "Example Movie (2020)/Alpha.nfo",
+                alpha_revision,
+                "DONE",
+                None,
+            )
+            .await
+            .expect("stale completion must not win")
+    );
+    let current_alpha_revision = database
+        .list_pending_scan_job_file_changes(&job.id, None, 10)
+        .await
+        .expect("current pending event")
+        .into_iter()
+        .find(|change| {
+            change.library_root_id == root_id && change.relative_path.ends_with("Alpha.nfo")
+        })
+        .and_then(|change| change.file_change_revision)
+        .expect("requeued file event revision");
+    database
+        .set_scan_job_file_change_state(
+            &job.id,
+            &root_id,
+            "Example Movie (2020)/Alpha.nfo",
+            current_alpha_revision,
+            "FAILED",
+            Some("test failure"),
+        )
+        .await
+        .expect("mark file event failed");
+    assert!(
+        database
+            .record_scan_job_file_change(
+                &job.id,
+                &root_id,
+                "Example Movie (2020)/Alpha.nfo",
+                "REMOVE",
+            )
+            .await
+            .expect("new observation requeues failed event")
+    );
+    let requeued = database
+        .list_pending_scan_job_file_changes(&job.id, None, 10)
+        .await
+        .expect("requeued events");
+    assert_eq!(
+        requeued
+            .iter()
+            .find(|change| {
+                change.library_root_id == root_id && change.relative_path.ends_with("Alpha.nfo")
+            })
+            .expect("requeued NFO event")
+            .change_kind,
+        "REMOVE"
+    );
+    let zulu_revision = requeued
+        .iter()
+        .find(|change| change.relative_path.ends_with("Zulu.srt"))
+        .and_then(|change| change.file_change_revision)
+        .expect("pending subtitle revision");
+    assert!(
+        database
+            .set_scan_job_file_change_state(
+                &job.id,
+                &root_id,
+                "Example Movie (2020)/Zulu.srt",
+                zulu_revision,
+                "RUNNING",
+                None,
+            )
+            .await
+            .expect("claim subtitle event")
+    );
+    database
+        .requeue_running_scan_job_file_changes(&job.id)
+        .await
+        .expect("recover interrupted file event");
+    assert!(
+        database
+            .list_pending_scan_job_file_changes(&job.id, None, 10)
+            .await
+            .expect("recovered events")
+            .iter()
+            .any(|change| change.relative_path.ends_with("Zulu.srt"))
+    );
+
+    let target_states: (String, String, String) = sqlx::query_as(
+        "SELECT probe_state, metadata_state, thumbnail_state
+         FROM scan_job_targets WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("item target states");
+    assert_eq!(
+        target_states,
+        ("DONE".to_owned(), "DONE".to_owned(), "DONE".to_owned())
+    );
+    let probe_status: String = sqlx::query_scalar("SELECT probe_status FROM media_sources LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("probe status");
+    assert_eq!(probe_status, "READY");
+    let identification_status: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("metadata status");
+    assert_eq!(identification_status, "LOCAL_CONFIRMED");
+
+    sqlx::query("DELETE FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .expect("delete scan job");
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("cascaded file queue rows");
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
 async fn changed_sidecar_target_requeues_completed_local_metadata() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -6666,6 +6952,50 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .create_movie_scan_job(library.id)
         .await?;
     let scan_job_id = scan_job.id;
+    assert!(
+        database
+            .record_scan_job_file_change(
+                &scan_job_id,
+                &root_id,
+                "Postgres Movie (2025)/Postgres.Movie.2025.srt",
+                "ADD",
+            )
+            .await?
+    );
+    let file_changes = database
+        .list_pending_scan_job_file_changes(&scan_job_id, None, 10)
+        .await?;
+    assert_eq!(file_changes.len(), 1);
+    assert_eq!(file_changes[0].change_kind, "ADD");
+    assert!(
+        database
+            .set_scan_job_file_change_state(
+                &scan_job_id,
+                &root_id,
+                &file_changes[0].relative_path,
+                file_changes[0]
+                    .file_change_revision
+                    .expect("file queue revision"),
+                "DONE",
+                None,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .record_scan_job_file_change(
+                &scan_job_id,
+                &root_id,
+                "Postgres Movie (2025)/Postgres.Movie.2025.srt",
+                "CHANGE",
+            )
+            .await?
+    );
+    let requeued_file_changes = database
+        .list_pending_scan_job_file_changes(&scan_job_id, None, 10)
+        .await?;
+    assert_eq!(requeued_file_changes.len(), 1);
+    assert_eq!(requeued_file_changes[0].change_kind, "CHANGE");
     let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = $1")
         .bind(&scan_job_id)
         .fetch_one(database.pool())

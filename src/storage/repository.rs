@@ -1579,6 +1579,9 @@ pub(crate) struct StoredScanJobPath {
     pub(crate) library_root_id: String,
     pub(crate) relative_path: String,
     pub(crate) change_kind: String,
+    // The file-change worker consumes this only in LUX-539; normal scan paths have no revision.
+    #[allow(dead_code)]
+    pub(crate) file_change_revision: Option<i64>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -1725,6 +1728,7 @@ fn stored_scan_job_path(row: sqlx::any::AnyRow) -> StoredScanJobPath {
         library_root_id: row.get("library_root_id"),
         relative_path: row.get("relative_path"),
         change_kind: row.get("change_kind"),
+        file_change_revision: None,
     }
 }
 

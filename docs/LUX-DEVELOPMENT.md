@@ -11319,6 +11319,64 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 预计代码增量文件：`src/api/emby.rs`、`src/api/emby_credentials.rs`、`tests/emby_auth.rs`、`tests/strm.rs`。规格与兼容记录作为独立文档增量。
 
+#### LUX-538：为入库后的旁车变化建立独立文件队列
+
+范围：增加扫描任务级、以 root 和相对文件路径为键的旁车变化队列，记录 ADD、CHANGE、REMOVE 与处理结果。该队列只表达某个文件待同步，不复用 `media_sources.probe_status`、条目 metadata 状态或缩略图状态。相同任务和路径的新观察合并为最新变化并重新排队；队列项按路径稳定分页，可持久恢复。
+
+验收：
+
+- [ ] SQLite 空库 migration 建立文件变化队列表、状态约束、外键和分页索引；PostgreSQL 使用相同 migration 合同。
+- [ ] storage 可登记、稳定分页、领取、完成/失败/跳过和重排文件变化项；同一路径仅保留一项，运行期间出现新观察会递增 revision 并重新排队，旧 revision 不能完成新事件。
+- [ ] 操作文件变化队列不改动媒体源 probe 状态、媒体项 metadata 状态、既有 `scan_job_targets` 或其缩略图状态。
+- [ ] SQLite 回归覆盖 ADD/CHANGE/REMOVE、合并、分页、运行中更新、旧 revision 完成保护、中断重排和任务删除级联；PostgreSQL repository 合同覆盖写入及领取/完成语义。
+
+预计文件（5 个）：`migrations/0170_scan_job_file_changes.sql`、`src/storage/jobs/scan/targets.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验证：storage library 定向测试与 PostgreSQL 合同测试；Toshiba 挂载后使用共享 target 运行 build、fmt、all-features Clippy 与 diff 检查。Cargo 命令设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。
+
+#### LUX-539：增量扫描按文件登记旁车变化
+
+范围：将扫描器已支持的外挂字幕、NFO、图片、XML/EDL 和媒体信息 JSON 文件类型纳入增量文件发现。仅文件内容/存在状态确实变化时，登记精确路径与变化种类；未知扩展名和未变化文件不排队。现有 NFO/图片消费者保持各自输入边界，不重跑视频技术探测。
+
+验收：
+
+- [ ] watcher 和定向增量扫描能登记上述已支持文件的新增、修改、删除；目录批次也走相同分类。
+- [ ] 只追加文件事件，不把媒体源、媒体项元数据或无关缩略图标为待处理；相同 fingerprint 不产生新工作。
+- [ ] 新文件首次出现在旧媒体库时会进入队列，带有路径及 root 身份，处理路径仍受库根约束。
+
+预计文件（4 个）：`src/application/scanner/library.rs`、`src/application/scanner/jobs/incremental.rs`、`tests/scanning_jobs.rs`、本文档。
+
+验证：`tests/scanning_jobs.rs` 定向目标、build、fmt、all-features Clippy 与 diff 检查。
+
+#### LUX-540：全量扫描和 reconciliation 登记旁车变化
+
+范围：让 Manifest 全量扫描及持久 reconciliation 对齐增量扫描的文件分类和旁车变化队列。新建修复后第一次全量扫描时，即使旧数据库没有这些附件的 filesystem entry，也能发现并入队；删除确认仍遵守 root 可用性和二次缺失确认。
+
+验收：
+
+- [ ] Manifest 对新增、变化、删除的旁车按精确路径入队；未变化路径不入队，移除候选仍通过现有 fencing/缺失确认。
+- [ ] 持久 reconciliation 与增量、Manifest 使用同一文件分类和 change kind 语义；取消/恢复不会丢失已提交事件。
+- [ ] 对已有媒体库加字幕或其他旁车后只需全量扫描即可补发现，不重建媒体库，也不重探测未变化视频。
+
+预计代码文件（5 个）：`src/application/scanner/jobs/manifest_discovery.rs`、`src/application/scanner/jobs/manifest_index.rs`、`src/application/scanner/jobs/reconciliation.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。实施前若调用边界要求调整，将先更新此列表。
+
+验证：Manifest/reconciliation 定向扫描作业回归、build、fmt、all-features Clippy 与 diff 检查。
+
+#### LUX-541：按文件变化同步依赖数据
+
+范围：消费旁车文件队列并按类型更新依赖数据。外挂字幕只增删/更新对应外部轨道；媒体信息 JSON 只更新实际依赖它的 STRM/来源信息；NFO、图片、danmaku XML 只更新各自结果。视频本身未变时保留内嵌轨道和技术信息。失败保留上次有效结果，处理成功后完成精确文件队列项。
+
+验收：
+
+- [ ] 新增/修改/删除字幕轨道的回归证明不会调用 ffprobe、不重写内嵌轨道、不改媒体源探测或 metadata 状态；其它外部轨道 ID 与 stream index 稳定。
+- [ ] 媒体信息 JSON、NFO、图片、XML/danmaku 变化只触发有定义的消费者；未变化输入不重新解析/索引。没有消费者的文件类型不得制造 metadata/thumbnail 任务。
+- [ ] 同目录多媒体、文件改名、相同路径内容变化、重复扫描、无效文件、文件删除和扫描取消/恢复都有覆盖；旧库可由全量扫描修复。
+- [ ] worker 使用有界批处理和输入版本检查，旧任务不能覆盖更新文件结果；数据库变化兼容 SQLite 与 PostgreSQL。
+
+预计文件：实施前按 LUX-538 至 LUX-540 的最终 worker/存储边界拆成不超过 5 个文件的可提交增量。
+
+验证：字幕、扫描、媒体信息、NFO/图片与 danmaku 对应的最窄集成目标；完整 Rust 完成检查、兼容性记录和 diff 检查。不得以定向测试替代规格要求的完成门。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
