@@ -11325,10 +11325,10 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] SQLite 空库 migration 建立文件变化队列表、状态约束、外键和分页索引；PostgreSQL 使用相同 migration 合同。
-- [ ] storage 可登记、稳定分页、领取、完成/失败/跳过和重排文件变化项；同一路径仅保留一项，运行期间出现新观察会递增 revision 并重新排队，旧 revision 不能完成新事件。
-- [ ] 操作文件变化队列不改动媒体源 probe 状态、媒体项 metadata 状态、既有 `scan_job_targets` 或其缩略图状态。
-- [ ] SQLite 回归覆盖 ADD/CHANGE/REMOVE、合并、分页、运行中更新、旧 revision 完成保护、中断重排和任务删除级联；PostgreSQL repository 合同覆盖写入及领取/完成语义。
+- [x] SQLite 空库 migration 建立文件变化队列表、状态约束、外键和分页索引；PostgreSQL 使用相同 migration 合同。
+- [x] storage 可登记、稳定分页、领取、完成/失败/跳过和重排文件变化项；同一路径仅保留一项，运行期间出现新观察会递增 revision 并重新排队，旧 revision 不能完成新事件。
+- [x] 操作文件变化队列不改动媒体源 probe 状态、媒体项 metadata 状态、既有 `scan_job_targets` 或其缩略图状态。
+- [x] SQLite 回归覆盖 ADD/CHANGE/REMOVE、合并、分页、运行中更新、旧 revision 完成保护、中断重排和任务删除级联；PostgreSQL repository 合同覆盖写入及领取/完成语义。
 
 预计文件（5 个）：`migrations/0170_scan_job_file_changes.sql`、`src/storage/jobs/scan/targets.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、本文档。
 
@@ -11340,9 +11340,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] watcher、定向增量扫描和目录批次都能登记字幕支持格式及 `*-mediainfo.json` 的新增、修改、删除；普通 JSON 不进入队列。
-- [ ] 新附件只追加文件事件，不改媒体源 probe、媒体项 identification/metadata 或 thumbnail 状态；相同 fingerprint 不产生新工作。
-- [ ] 新文件首次出现在旧媒体库时会进入队列，带有路径及 root 身份，处理路径仍受库根约束。
+- [x] watcher、定向增量扫描和目录批次都能登记字幕支持格式及 `*-mediainfo.json` 的新增、修改、删除；普通 JSON 不进入队列。
+- [x] 新附件只追加文件事件，不改媒体源 probe、媒体项 identification/metadata 或 thumbnail 状态；相同 fingerprint 不产生新工作。
+- [x] 新文件首次出现在旧媒体库时会进入队列，带有路径及 root 身份，处理路径仍受库根约束。
 
 预计代码文件（5 个）：`src/application/scanner/library.rs`、`src/application/scanner/jobs/incremental.rs`、`src/storage/filesystem.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
@@ -11354,10 +11354,10 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] Manifest 对新增和变化的字幕、媒体信息文件按精确路径及 root 入队，change kind 与增量扫描一致；未变化路径不入队。
-- [ ] 文件状态与队列事件在同一 Manifest 正向索引或 delta 事务提交；root 不可用、观测冲突或取消时不产生越过 fencing 的事件。
-- [ ] 字幕和媒体信息事件不生成目录级 metadata/thumbnail target，也不改变未变化视频的探测、轨道或条目 metadata 状态。
-- [ ] 对已有媒体库加字幕或媒体信息文件后只需全量扫描即可补发现，不重建媒体库，也不重探测未变化视频。
+- [x] Manifest 对新增和变化的字幕、媒体信息文件按精确路径及 root 入队，change kind 与增量扫描一致；未变化路径不入队。
+- [x] 文件状态与队列事件在同一 Manifest 正向索引或 delta 事务提交；root 不可用、观测冲突或取消时不产生越过 fencing 的事件。
+- [x] 字幕和媒体信息事件不生成目录级 metadata/thumbnail target，也不改变未变化视频的探测、轨道或条目 metadata 状态。
+- [x] 对已有媒体库加字幕或媒体信息文件后只需全量扫描即可补发现，不重建媒体库，也不重探测未变化视频。
 
 预计代码文件（5 个）：`src/application/scanner/manifest.rs`、`src/application/scanner/jobs/manifest_discovery.rs`、`src/storage/jobs/scan/manifest/indexes.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
@@ -11369,9 +11369,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] Manifest 只在 root 可用且缺失 fencing 确认成功后按精确路径及 root 登记 REMOVE；未确认缺失、不可用 root 不登记事件。
-- [ ] Manifest delta 状态与 REMOVE 队列事件在同一事务提交，取消、重试和恢复不会丢失已提交事件。
-- [ ] 被删除附件不会触发同目录其他媒体的 metadata/thumbnail target，也不改未变化视频状态。
+- [x] Manifest 只在 root 可用且缺失 fencing 确认成功后按精确路径及 root 登记 REMOVE；未确认缺失、不可用 root 不登记事件。
+- [x] Manifest delta 状态与 REMOVE 队列事件在同一事务提交，取消、重试和恢复不会丢失已提交事件。
+- [x] 被删除附件不会触发同目录其他媒体的 metadata/thumbnail target，也不改未变化视频状态。
 
 预计代码文件（3 个）：`src/application/scanner/jobs/manifest_index.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
@@ -11383,9 +11383,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] reconciliation 对新增、变化及确认删除的字幕和媒体信息文件按精确路径及 root 入队；未变化路径不入队。
-- [ ] 取消、重试和恢复不丢失已提交事件；不可用 root 或无法确认的缺失不登记 REMOVE。
-- [ ] 使用与增量扫描和 Manifest 相同的分类、change kind 语义，且不重新探测未变化视频。
+- [x] reconciliation 对新增、变化及确认删除的字幕和媒体信息文件按精确路径及 root 入队；未变化路径不入队。
+- [x] 取消、重试和恢复不丢失已提交事件；不可用 root 或无法确认的缺失不登记 REMOVE。
+- [x] 使用与增量扫描和 Manifest 相同的分类、change kind 语义，且不重新探测未变化视频。
 
 预计代码文件（5 个）：`src/application/scanner/jobs/reconciliation.rs`、`src/storage/repository.rs`、`src/storage/jobs/scan/reconciliation.rs`、`src/storage/repository_tests.rs`、`tests/scanning_jobs.rs`。本文档单独记录范围。
 
@@ -11397,14 +11397,18 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 新增/修改/删除字幕轨道的回归证明不会调用 ffprobe、不重写内嵌轨道、不改媒体源探测或 metadata 状态；其它外部轨道 ID 与 stream index 稳定。
-- [ ] 媒体信息 JSON、NFO、图片、XML/danmaku 变化只触发有定义的消费者；未变化输入不重新解析/索引。没有消费者的文件类型不得制造 metadata/thumbnail 任务。
-- [ ] 同目录多媒体、文件改名、相同路径内容变化、重复扫描、无效文件、文件删除和扫描取消/恢复都有覆盖；旧库可由全量扫描修复。
+- [x] 新增/修改/删除字幕轨道的回归证明不会调用 ffprobe、不重写内嵌轨道、不改媒体源探测或 metadata 状态；其它外部轨道 ID 与 stream index 稳定。
+- [x] 媒体信息 JSON、NFO、图片、XML/danmaku 变化只触发有定义的消费者；未变化输入不重新解析/索引。没有消费者的文件类型不得制造 metadata/thumbnail 任务。
+- [x] 同目录多媒体、文件改名、相同路径内容变化、重复扫描、无效文件、文件删除和扫描取消/恢复都有覆盖；旧库可由全量扫描修复。
 - [ ] worker 使用有界批处理和输入版本检查，旧任务不能覆盖更新文件结果；数据库变化兼容 SQLite 与 PostgreSQL。
 
 预计文件：实施前按 LUX-538 至 LUX-542 的最终 worker/存储边界拆成不超过 5 个文件的可提交增量。
 
 验证：字幕、扫描、媒体信息、NFO/图片与 danmaku 对应的最窄集成目标；完整 Rust 完成检查、兼容性记录和 diff 检查。不得以定向测试替代规格要求的完成门。
+
+实施结果（2026-10-15）：新增独立的 scan-job 文件变化队列，增量扫描、Manifest 和持久 reconciliation 对精确路径登记 ADD/CHANGE/REMOVE；处理器按文件类型同步外挂字幕、STRM 媒体信息、NFO、图片和 danmaku XML，EDL 等无消费者文件以 no-op 完成。队列不改媒体项 metadata、媒体源 probe 或 thumbnail 状态；视频 fingerprint 未变时保留内嵌轨道和技术信息。PostgreSQL 0170 migration 与 revision/恢复合同测试已补齐；LUX-538 至 LUX-542 的队列和发现验收已覆盖。PostgreSQL 服务不可用，因此 LUX-543 最后一项留待运行时合同验证。
+
+验证结果：`tests/scanning_jobs.rs` 87/87、`tests/storage.rs` 54/54、`tests/ready_version.rs` 2/2、migration 双后端合同测试 1/1、build、fmt 与 all-target/all-feature Clippy 通过。最终全量 `cargo test --locked --all-targets` 的 lib target 为 855 passed、2 failed、23 ignored：未修改的 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 与 HLS `emby_init_and_segment_share_the_requested_generation` 失败；NFO 用例随后隔离重跑 1/1 通过，HLS 用例隔离运行有通过和 `Superseded` 失败两种结果。因 lib target 失败，这次 all-target 命令未运行后续 integration targets；相关扫描、storage 和 ready/version integration targets 已分别通过。PostgreSQL runtime 未验证；本机 ARM64/SQLite 验证不代表 PostgreSQL runtime 结果。
 
 ## 28. 参考资料
 
