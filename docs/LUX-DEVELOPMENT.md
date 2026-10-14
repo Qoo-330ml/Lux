@@ -11331,9 +11331,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] 从空库应用全部迁移后，系统合集库和跨库关系表可用，系统库没有文件根路径。
-- [ ] SQLite 升级保留已有库、合集、用户权限和成员关系；PostgreSQL schema 与 SQLite 对齐。
-- [ ] 相同稳定 ID 可表示多个库中的副本；现有手动合集结构及约束保持有效。
+- [x] 从空库应用全部迁移后，系统合集库和跨库关系表可用，系统库没有文件根路径。
+- [x] SQLite 升级保留已有库、合集、用户权限和成员关系；PostgreSQL schema 与 SQLite 对齐。
+- [x] 相同稳定 ID 可表示多个库中的副本；现有手动合集结构及约束保持有效。
 
 预计文件（5 个）：`migrations/0170_global_movie_collections.sql`、`migrations-postgres/0170_global_movie_collections.sql`、`src/storage/repository.rs`、`src/storage/migration.rs`、`tests/storage.rs`。
 
@@ -11352,6 +11352,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 预计代码文件（5 个）：`src/application/candidates.rs`、`src/application/metadata.rs`、`src/storage/mod.rs`、`src/storage/catalog.rs`、`src/storage/metadata.rs`；存储和 NFO 回归测试放在对应模块内。本文档作为独立文档增量更新。
 
 验证：所有 Cargo 命令均设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`；运行 `cargo test --locked --lib storage::tests`、`cargo test --locked --lib application::candidates::tests`、`cargo test --locked --lib application::metadata::tests -- --test-threads=1`、`cargo test --locked --test metadata_selection`、`cargo fmt --all -- --check` 与 `git diff --check`。
+
+补充实施结果（2026-10-15）：迁移 `0173_nfo_collection_reference_key` 为已有电影记录添加 NFO `setid` 索引状态，后台元数据 worker 会对未记录或与当前合集引用不符的旧 NFO 幂等补建/修复关系；状态与现有元数据更新合并写入，并在 SQLite catalog 表重建时保留。回归覆盖从 v172 升级、旧元数据指纹保留、NFO 重复处理幂等和缺失引用修复。
 
 #### LUX-540：自动生成并维护全站系列与作品
 
@@ -11426,8 +11428,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [x] SQLite 空库和升级迁移检查通过：`cargo test --locked --test storage` 为 55 passed。
-- [ ] Rust 完整完成检查通过。库测试为 872 passed、22 ignored；全量测试在 `tests/libraries_api.rs::admin_can_create_list_and_add_library_root_with_csrf` 收到 `DATABASE_UNAVAILABLE`/503 后失败。单独重跑该用例通过；`tests/metadata.rs::metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking` 另一次全量运行和单独运行均失败（第二次扫描的 `nfo_loaded` 为 1，期望 0）。
+- [x] SQLite 空库和升级迁移检查通过：`cargo test --locked --test storage` 为 56 passed。
+- [x] Rust 完整完成检查通过：ARM64 `cargo test --locked --target aarch64-apple-darwin --all-targets` 在 4 个 test threads 下完成，库测试 872 passed、22 ignored，所有可运行 integration targets 通过。
 - [x] Web 冻结依赖安装、完整测试（Node 139/139、Vitest 600/600）和生产构建通过。
 - [x] Playwright 浏览器流程通过：打开合集库、进入“飞驰人生”、选择 4K 来源并触发来源偏好写入；该流程使用 mock API，服务端合同由 Rust 集成测试验证。
 - [ ] VidHub、SenPlayer、Infuse 的合集浏览、来源选择与进度回写实测尚未完成，未实测客户端不记为通过。
@@ -11435,7 +11437,7 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 预计文件：兼容记录、本文档和阶段验收涉及的回归文件。
 
-实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过；PostgreSQL 测试未运行，因为本机没有 PostgreSQL 实例。全量测试的失败、单测复跑结果、Web 检查和 mock API 的浏览器流程已按证据写入 `docs/COMPATIBILITY.md`。VidHub 当前没有可操作窗口，SenPlayer 和 Infuse 在本机不可用。阶段门未完成，等待项目所有者确认后续处理。
+实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。本机没有 PostgreSQL 实例，PostgreSQL 运行时用例仍按设计忽略。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub 当前没有可操作窗口，SenPlayer 和 Infuse 在本机不可用；合集客户端实测仍未完成，阶段门停在项目所有者确认点。
 
 ## 29. 参考资料
 
