@@ -633,7 +633,7 @@ impl Database {
                 "SELECT l.id, l.name, r.canonical_path
                  FROM libraries l
                  LEFT JOIN library_roots r ON r.library_id = l.id
-                 WHERE l.is_enabled = 1
+                 WHERE l.is_enabled = 1 AND l.system_kind IS NULL
                  ORDER BY l.name, l.id, r.canonical_path, r.id",
             )
             .fetch_all(&self.pool)

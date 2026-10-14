@@ -1024,13 +1024,17 @@ impl Database {
     }
 
     pub(crate) async fn list_enabled_library_ids(&self) -> Result<Vec<String>, StorageError> {
-        self.query_scalar("SELECT id FROM libraries WHERE is_enabled = 1 ORDER BY name, id")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query_scalar(
+            "SELECT id FROM libraries
+             WHERE is_enabled = 1 AND system_kind IS NULL
+             ORDER BY name, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn find_user_item_state(
