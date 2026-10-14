@@ -47,7 +47,9 @@ impl ScanJobService {
         )
         .await?;
         if paths.is_empty() {
-            return self.finish_empty_incremental_scan_batch(&job).await;
+            return self
+                .finish_empty_incremental_scan_batch(&job, batch_size, cancellation)
+                .await;
         }
         let library = self
             .database
@@ -68,7 +70,17 @@ impl ScanJobService {
     async fn finish_empty_incremental_scan_batch(
         &self,
         job: &StoredScanJob,
+        batch_size: usize,
+        cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
+        self.process_queued_external_subtitle_changes(&job.id, batch_size, cancellation)
+            .await?;
+        if self
+            .cancellation_requested(&job.id, job.cancel_requested, cancellation)
+            .await?
+        {
+            return self.cancel_running_job(&job.id).await;
+        }
         if self.database.finish_scan_job_if_idle(&job.id).await? {
             self.database
                 .update_library_last_scan(&job.library_id)

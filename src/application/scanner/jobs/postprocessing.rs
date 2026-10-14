@@ -528,6 +528,158 @@ impl ScanJobService {
         .await
     }
 
+    pub(super) async fn process_queued_external_subtitle_changes(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        cancellation: &AtomicBool,
+    ) -> Result<(), ScanJobError> {
+        self.database
+            .requeue_running_scan_job_file_changes(job_id)
+            .await?;
+        let limit = i64::try_from(batch_size.max(1)).unwrap_or(i64::MAX);
+        let mut after = None;
+        loop {
+            let changes = self
+                .database
+                .list_pending_scan_job_file_changes(job_id, after.as_ref(), limit)
+                .await?;
+            if changes.is_empty() {
+                return Ok(());
+            }
+            let mut restart_from_beginning = false;
+            for change in &changes {
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let sidecar_relative_path = Path::new(&change.relative_path);
+                if !crate::application::probe::is_external_subtitle_path(sidecar_relative_path) {
+                    continue;
+                }
+                let Some(revision) = change.file_change_revision else {
+                    return Err(StorageError::Conflict(
+                        "scan file change is missing its revision".to_owned(),
+                    )
+                    .into());
+                };
+                let claimed = self
+                    .database
+                    .set_scan_job_file_change_state(
+                        job_id,
+                        &change.library_root_id,
+                        &change.relative_path,
+                        revision,
+                        "RUNNING",
+                        None,
+                    )
+                    .await?;
+                if !claimed {
+                    restart_from_beginning = true;
+                    continue;
+                }
+                if cancellation.load(Ordering::Acquire) {
+                    self.database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "PENDING",
+                            None,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let relative_directory = sidecar_relative_path
+                    .parent()
+                    .map(|directory| directory.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let sources = self
+                    .database
+                    .list_media_sources_for_external_subtitle(
+                        &change.library_root_id,
+                        &relative_directory,
+                    )
+                    .await?;
+                let mut tracks = Vec::new();
+                for source in sources {
+                    let media_path = Path::new(&source.root_path).join(&source.relative_path);
+                    let sidecar_path = Path::new(&source.root_path).join(&change.relative_path);
+                    if media_path.parent() != sidecar_path.parent() {
+                        continue;
+                    }
+                    let Some(subtitle) = crate::application::probe::external_subtitle_for_media(
+                        &media_path,
+                        &sidecar_path,
+                        &source.root_path,
+                    ) else {
+                        continue;
+                    };
+                    let source_kind = if source
+                        .relative_path
+                        .rsplit_once('.')
+                        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("strm"))
+                    {
+                        "STRM_URL"
+                    } else {
+                        "LOCAL_FILE"
+                    };
+                    tracks.push(crate::storage::StoredSubtitleStream {
+                        media_source_id: source.source_id,
+                        item_id: source.item_id,
+                        source_kind: source_kind.to_owned(),
+                        probe_status: source.probe_status,
+                        root_path: source.root_path,
+                        relative_path: source.relative_path,
+                        stream_index: -1,
+                        stream_type: "SUBTITLE".to_owned(),
+                        codec: subtitle.codec,
+                        language: subtitle.language,
+                        title: subtitle.title,
+                        details_json: None,
+                        external_path: Some(subtitle.relative_path),
+                        is_external: true,
+                        is_default: subtitle.is_default,
+                        is_forced: subtitle.is_forced,
+                    });
+                }
+                if cancellation.load(Ordering::Acquire) {
+                    self.database
+                        .set_scan_job_file_change_state(
+                            job_id,
+                            &change.library_root_id,
+                            &change.relative_path,
+                            revision,
+                            "PENDING",
+                            None,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                if !self
+                    .database
+                    .apply_scan_external_subtitle_file_change(job_id, change, &tracks)
+                    .await?
+                {
+                    restart_from_beginning = true;
+                }
+            }
+            if restart_from_beginning {
+                after = None;
+            } else {
+                after = changes
+                    .last()
+                    .map(|change| crate::storage::StoredScanJobPath {
+                        library_root_id: change.library_root_id.clone(),
+                        relative_path: change.relative_path.clone(),
+                        change_kind: change.change_kind.clone(),
+                        file_change_revision: change.file_change_revision,
+                    });
+            }
+        }
+    }
+
     async fn skip_full_scan_metadata_targets(&self, job_id: &str) -> Result<(), ScanJobError> {
         for target_type in ["SOURCE", "ITEM"] {
             self.database
@@ -551,6 +703,19 @@ impl ScanJobService {
                 .await?;
         }
         self.run_probe_after_scan(job_id, probe).await?;
+        if self
+            .finish_cancellation_if_requested(job_id, local_metadata_worker)
+            .await?
+        {
+            return Ok(true);
+        }
+        let cancellation = self.cancellation_flag(job_id);
+        self.process_queued_external_subtitle_changes(
+            job_id,
+            BACKGROUND_SCAN_BATCH_SIZE,
+            &cancellation,
+        )
+        .await?;
         if self
             .finish_cancellation_if_requested(job_id, local_metadata_worker)
             .await?

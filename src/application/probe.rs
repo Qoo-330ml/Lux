@@ -1702,13 +1702,13 @@ pub(crate) fn safe_media_path(
 }
 
 #[derive(Clone, Debug)]
-struct ExternalSubtitle {
-    relative_path: String,
-    codec: Option<String>,
-    language: Option<String>,
-    title: Option<String>,
-    is_default: bool,
-    is_forced: bool,
+pub(crate) struct ExternalSubtitle {
+    pub(crate) relative_path: String,
+    pub(crate) codec: Option<String>,
+    pub(crate) language: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) is_default: bool,
+    pub(crate) is_forced: bool,
 }
 
 async fn enumerate_external_subtitle_paths(directory: &Path) -> Vec<PathBuf> {
@@ -1749,45 +1749,67 @@ async fn discover_external_subtitles(
     let Some(directory) = media_path.parent() else {
         return Vec::new();
     };
-    let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
-        return Vec::new();
-    };
     let paths = cache.paths_for(directory).await;
     paths
         .into_iter()
-        .filter_map(|path| {
-            let stem = path.file_stem()?.to_str()?;
-            if stem != media_stem && !stem.starts_with(&format!("{media_stem}.")) {
-                return None;
-            }
-            let suffix = stem.strip_prefix(media_stem).unwrap_or_default();
-            let tokens = suffix
-                .trim_start_matches('.')
-                .split(['.', '_', '-'])
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            let language = tokens.iter().find_map(|token| subtitle_language(token));
-            let is_forced = tokens
-                .iter()
-                .any(|token| token.eq_ignore_ascii_case("forced"));
-            let is_default = tokens
-                .iter()
-                .any(|token| token.eq_ignore_ascii_case("default"));
-            let codec = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|value| value.to_ascii_lowercase());
-            let relative_path = path.strip_prefix(root_path).ok()?.to_str()?.to_owned();
-            Some(ExternalSubtitle {
-                relative_path,
-                codec,
-                language,
-                title: (!tokens.is_empty()).then(|| tokens.join(" ")),
-                is_default,
-                is_forced,
-            })
-        })
+        .filter_map(|path| external_subtitle_for_media(media_path, &path, root_path))
         .collect()
+}
+
+pub(crate) fn is_external_subtitle_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup"
+            )
+        })
+}
+
+pub(crate) fn external_subtitle_for_media(
+    media_path: &Path,
+    subtitle_path: &Path,
+    root_path: &str,
+) -> Option<ExternalSubtitle> {
+    if !is_external_subtitle_path(subtitle_path) {
+        return None;
+    }
+    let media_stem = media_path.file_stem()?.to_str()?;
+    let subtitle_stem = subtitle_path.file_stem()?.to_str()?;
+    if subtitle_stem != media_stem && !subtitle_stem.starts_with(&format!("{media_stem}.")) {
+        return None;
+    }
+    let suffix = subtitle_stem.strip_prefix(media_stem).unwrap_or_default();
+    let tokens = suffix
+        .trim_start_matches('.')
+        .split(['.', '_', '-'])
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let language = tokens.iter().find_map(|token| subtitle_language(token));
+    let is_forced = tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("forced"));
+    let is_default = tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("default"));
+    let codec = subtitle_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let relative_path = subtitle_path
+        .strip_prefix(root_path)
+        .ok()?
+        .to_str()?
+        .to_owned();
+    Some(ExternalSubtitle {
+        relative_path,
+        codec,
+        language,
+        title: (!tokens.is_empty()).then(|| tokens.join(" ")),
+        is_default,
+        is_forced,
+    })
 }
 
 fn subtitle_language(value: &str) -> Option<String> {

@@ -3265,6 +3265,26 @@ async fn incremental_attachment_additions_only_record_changed_file_events()
     .await?;
     assert_eq!(embedded_stream_count, 1);
     jobs.run_to_completion(&incremental.id, 100, None).await?;
+    let indexed_subtitle: (String, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT id, stream_index, codec, language FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_subtitle.1, 1);
+    assert_eq!(indexed_subtitle.2, "srt");
+    assert_eq!(indexed_subtitle.3.as_deref(), Some("eng"));
+    let subtitle_event_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&incremental.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(subtitle_event_state, "DONE");
 
     let vtt_path = "Indexed Movie (2024)/Indexed.Movie.2024.fr.vtt";
     tokio::fs::write(
@@ -3301,6 +3321,15 @@ async fn incremental_attachment_additions_only_record_changed_file_events()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(directory_target_count, 0);
+    let directory_subtitle_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(vtt_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(directory_subtitle_count, 1);
 
     let unchanged = jobs
         .enqueue_incremental_changes(
@@ -3345,6 +3374,18 @@ async fn incremental_attachment_additions_only_record_changed_file_events()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(modified_kind, "CHANGE");
+    let modified_subtitle: (String, i64) = sqlx::query_as(
+        "SELECT id, stream_index FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        modified_subtitle,
+        (indexed_subtitle.0.clone(), indexed_subtitle.1)
+    );
 
     tokio::fs::remove_file(root.join(subtitle_path)).await?;
     let removed = jobs
@@ -3367,6 +3408,15 @@ async fn incremental_attachment_additions_only_record_changed_file_events()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(removed_change, ("REMOVE".to_owned(), 1));
+    let removed_track_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_track_count, 0);
 
     tokio::fs::write(
         root.join(subtitle_path),
@@ -3450,6 +3500,16 @@ async fn manifest_scan_queues_attachment_changes_without_reprobing_unchanged_vid
     .bind(&source_id)
     .execute(database.pool())
     .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+             id, media_source_id, stream_index, stream_type, codec,
+             external_path, is_external
+         ) VALUES ('manifest-existing-external-track', ?, 7, 'SUBTITLE', 'ass', ?, 1)",
+    )
+    .bind(&source_id)
+    .bind("Manifest Movie (2024)/Manifest.Movie.2024.existing.ass")
+    .execute(database.pool())
+    .await?;
 
     let subtitle_path = "Manifest Movie (2024)/Manifest.Movie.2024.en.srt";
     let media_info_path = "Manifest Movie (2024)/Manifest.Movie.2024-mediainfo.json";
@@ -3501,6 +3561,42 @@ async fn manifest_scan_queues_attachment_changes_without_reprobing_unchanged_vid
             .fetch_one(database.pool())
             .await?;
     assert_eq!(added_targets, 0);
+    let subtitle_track: (String, i64, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT id, stream_index, codec, language, title FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        subtitle_track.1, 8,
+        "a new subtitle gets the next stream index without probing the video"
+    );
+    assert_eq!(subtitle_track.2, "srt");
+    assert_eq!(subtitle_track.3.as_deref(), Some("eng"));
+    let subtitle_stream_id = subtitle_track.0.clone();
+    let existing_external_track: (String, i64) = sqlx::query_as(
+        "SELECT id, stream_index FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind("Manifest Movie (2024)/Manifest.Movie.2024.existing.ass")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        existing_external_track,
+        ("manifest-existing-external-track".to_owned(), 7)
+    );
+    let subtitle_change_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(subtitle_change_state, "DONE");
 
     let unchanged = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&unchanged.id, 100, None).await?;
@@ -3527,6 +3623,28 @@ async fn manifest_scan_queues_attachment_changes_without_reprobing_unchanged_vid
     .fetch_one(database.pool())
     .await?;
     assert_eq!(changed_kind, "CHANGE");
+    let changed_subtitle_track: (String, i64) = sqlx::query_as(
+        "SELECT id, stream_index FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_subtitle_track, (subtitle_stream_id, 8));
+
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_external_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_external_count, 0);
 
     let source_state: (String, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
         "SELECT probe_status, container, duration_ticks, bitrate FROM media_sources WHERE id = ?",
