@@ -11241,13 +11241,15 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] admin 鉴权、分页边界、空页和错误映射符合现有 API 约定，响应只包含 storage 阶段契约允许的字段。
-- [ ] 集成测试覆盖两个库并行、各阶段混合状态、取消/失败、禁用或移除库、无任务和超过 50 库分页；不会序列化媒体标题、路径、凭据或错误内容。
-- [ ] compatibility 文档记录 endpoint、分页和字段语义；PostgreSQL 行为由 LUX-533 storage contract 验证，不做第二次全表读取。
+- [x] admin 鉴权、分页边界、空页和错误映射符合现有 API 约定，响应只包含 storage 阶段契约允许的字段。
+- [x] 集成测试覆盖两个库并行、各阶段混合状态、取消/失败、禁用或移除库、无任务和超过 50 库分页；不会序列化媒体标题、路径、凭据或错误内容。
+- [x] compatibility 文档记录 endpoint、分页和字段语义；复用 LUX-533 的共享 PostgreSQL storage query contract，不做第二次全表读取。
 
 预计文件（5 个）：`src/application/admin_task_activity.rs`、`src/api/admin/admin_scheduled_tasks.rs`、`tests/libraries_api.rs`、`docs/COMPATIBILITY.md`、本文档。
 
 验证：`tests/libraries_api.rs` 定向目标、build/fmt/all-features Clippy 与 diff 检查；Toshiba 挂载检查并使用共享 target。
+
+实施结果（2026-10-14）：新增只读管理员 endpoint，默认页大小 20、最大 50、页码从 1 开始；沿用管理员鉴权，分页非法返回 400，数据库/服务不可用返回 503。应用层把 storage snapshot 映射到固定五阶段 API shape，不增加第二次读取。`tests/libraries_api.rs` 14/14 通过，包含未授权、51 库分页、空页、无计划阶段、混合 queued/running/completed/failed/cancelled、禁用/移除库排除和敏感字段不回传；build、all-features Clippy、fmt 与 diff 检查通过。API 字段和 Unix epoch 秒时间语义已记入 `docs/COMPATIBILITY.md`。PostgreSQL live contract 仍受 LUX-533 中记录的 Docker Hub 网络限制影响。
 
 #### LUX-535：管理员活动视图展示库级入库阶段
 

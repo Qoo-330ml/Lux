@@ -22,6 +22,14 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 LUX-531 目前只完成 SQLite 固定延迟矩阵，PostgreSQL 路径尚未实测，因此默认保留 4；12 是支持的硬上限，不代表已批准把默认调高，也不代表 TMDb 允许的请求速率。后续调整默认值前需完成 PostgreSQL 对照测量。
 
+## LUX-534 管理员库级入库阶段 API
+
+Lux 管理 API 新增 `GET /api/v1/admin/library-pipeline-activity`，沿用现有管理员鉴权。查询参数 `page` 默认 `1`，`pageSize` 默认 `20`；页码从 1 开始，页大小仅接受 1–50。无效页码、页大小或 offset 溢出返回 `400`；合法的空页返回 `200`、空 `libraries` 和真实 `totalLibraries`。数据库不可用时返回 `503`。
+
+成功响应顶层包含 `page`、`pageSize`、`totalLibraries` 和 `libraries`。每个库包含 `libraryId`、`libraryName` 与按固定顺序排列的五个 `stages`：`INDEX`、`LOCAL_METADATA`、`PROBE`、`THUMBNAIL`、`AUTOMATIC_METADATA`。每个阶段包含 `planned`、`statusCounts`（`queued`、`running`、`completed`、`failed`、`cancelled`）和 `recentActivityAt`。时间为 Unix epoch 秒；无持久化活动时返回 `null`。阶段计数使用各自底层作业/批次/target 的持久化单位，不能跨阶段求和或换算为整体百分比/ETA。
+
+聚合只返回当前页启用媒体库的阶段摘要；响应不包含媒体标题、文件路径、凭据、上游错误文本或 scan activity 的 `currentItem`。本接口独立于已有 `/api/v1/admin/task-activity`，不改变 Emby、ScanCompleted 或 Webhook DTO。
+
 ## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
 
 Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有
