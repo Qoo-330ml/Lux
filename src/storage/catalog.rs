@@ -7,6 +7,22 @@ const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingGlobalCollectionSync {
+    pub(crate) collection_provider: String,
+    pub(crate) collection_provider_id: String,
+    pub(crate) generation: i64,
+}
+
+struct GlobalCollectionSyncMember {
+    movie_provider: String,
+    movie_provider_id: String,
+    title: String,
+    production_year: Option<i64>,
+    sort_order: Option<i64>,
+    collection_title: String,
+}
+
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
                  SELECT 1
@@ -5581,6 +5597,562 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_pending_global_collection_syncs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingGlobalCollectionSync>, StorageError> {
+        let limit = limit.clamp(1, 1_000) as i64;
+        self.query_as::<(String, String, i64)>(
+            "SELECT collection_provider, collection_provider_id, generation
+             FROM collection_sync_outbox
+             ORDER BY updated_at, collection_provider, collection_provider_id
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(collection_provider, collection_provider_id, generation)| {
+                        PendingGlobalCollectionSync {
+                            collection_provider,
+                            collection_provider_id,
+                            generation,
+                        }
+                    },
+                )
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    /// Rebuild one global collection and its logical movie works in one transaction.
+    /// The outbox generation lock prevents a concurrent reference change from being lost.
+    pub(crate) async fn sync_global_collection(
+        &self,
+        collection_provider: &str,
+        collection_provider_id: &str,
+        expected_generation: i64,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let generation_query = format!(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = ? AND collection_provider_id = ?{lock_clause}"
+        );
+        let generation = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(generation_query))
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if generation != Some(expected_generation) {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+
+        let old_work_keys = self
+            .query_as::<(String, String)>(
+                "SELECT movie_provider, movie_provider_id
+                 FROM global_collection_work_references
+                 WHERE collection_provider = ? AND collection_provider_id = ?",
+            )
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let reference_rows = self
+            .query_as::<(
+                String,
+                String,
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                String,
+            )>(
+                "SELECT reference.movie_provider, reference.movie_provider_id,
+                        item.id, item.title, item.production_year, reference.sort_order,
+                        reference.collection_title
+                 FROM collection_item_references reference
+                 JOIN media_items item ON item.id = reference.item_id
+                 JOIN libraries library ON library.id = item.library_id
+                 WHERE reference.collection_provider = ?
+                   AND reference.collection_provider_id = ?
+                   AND item.item_type = 'MOVIE'
+                   AND item.removed_at IS NULL
+                   AND item.has_available_source = 1
+                   AND library.is_enabled = 1
+                 ORDER BY reference.movie_provider, reference.movie_provider_id, item.id",
+            )
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut members = BTreeMap::new();
+        for (
+            movie_provider,
+            movie_provider_id,
+            _source_item_id,
+            title,
+            production_year,
+            sort_order,
+            collection_title,
+        ) in reference_rows
+        {
+            members
+                .entry((movie_provider.clone(), movie_provider_id.clone()))
+                .or_insert(GlobalCollectionSyncMember {
+                    movie_provider,
+                    movie_provider_id,
+                    title,
+                    production_year,
+                    sort_order,
+                    collection_title,
+                });
+        }
+
+        self.query(
+            "DELETE FROM global_collection_work_references
+             WHERE collection_provider = ? AND collection_provider_id = ?",
+        )
+        .bind(collection_provider)
+        .bind(collection_provider_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        for member in members.values() {
+            self.query(
+                "INSERT INTO global_collection_work_references (
+                     collection_provider, collection_provider_id,
+                     movie_provider, movie_provider_id, sort_order
+                 ) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .bind(&member.movie_provider)
+            .bind(&member.movie_provider_id)
+            .bind(
+                member
+                    .sort_order
+                    .unwrap_or(member.production_year.unwrap_or(0)),
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        let mut affected_work_keys = old_work_keys;
+        affected_work_keys.extend(members.keys().cloned());
+        affected_work_keys.sort();
+        affected_work_keys.dedup();
+        let mut existing_work_ids = BTreeMap::new();
+        for (movie_provider, movie_provider_id) in &affected_work_keys {
+            let identity_key =
+                global_generated_identity_key("work", movie_provider, movie_provider_id);
+            let work_item_id = self
+                .query_scalar::<String>(
+                    "SELECT id FROM media_items WHERE identity_key = ? AND item_type = 'MOVIE'",
+                )
+                .bind(&identity_key)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if let Some(work_item_id) = work_item_id {
+                self.query("DELETE FROM collection_work_sources WHERE work_item_id = ?")
+                    .bind(&work_item_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                existing_work_ids.insert(
+                    (movie_provider.clone(), movie_provider_id.clone()),
+                    work_item_id,
+                );
+            }
+        }
+
+        let mut work_item_ids = BTreeMap::new();
+        for (movie_provider, movie_provider_id) in &affected_work_keys {
+            let source_rows = self
+                .query_as::<(String, i64, String, String, Option<String>)>(
+                    "SELECT item.id, MIN(COALESCE(reference.sort_order, item.production_year, 0)),
+                            item.title, item.sort_title, item.overview
+                     FROM collection_item_references reference
+                     JOIN media_items item ON item.id = reference.item_id
+                     JOIN libraries library ON library.id = item.library_id
+                     WHERE reference.movie_provider = ?
+                       AND reference.movie_provider_id = ?
+                       AND item.item_type = 'MOVIE'
+                       AND item.removed_at IS NULL
+                       AND item.has_available_source = 1
+                       AND library.is_enabled = 1
+                     GROUP BY item.id, item.title, item.sort_title, item.overview,
+                              item.production_year
+                     ORDER BY item.id",
+                )
+                .bind(movie_provider)
+                .bind(movie_provider_id)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let key = (movie_provider.clone(), movie_provider_id.clone());
+            let Some((_, _, title, sort_title, overview)) = source_rows.first() else {
+                if let Some(work_item_id) = existing_work_ids.get(&key) {
+                    self.query(
+                        "UPDATE media_items
+                         SET has_available_source = 0,
+                             removed_at = COALESCE(removed_at, unixepoch()),
+                             updated_at = unixepoch()
+                         WHERE id = ?",
+                    )
+                    .bind(work_item_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                }
+                continue;
+            };
+            let identity_key =
+                global_generated_identity_key("work", movie_provider, movie_provider_id);
+            let work_item_id = self
+                .ensure_global_generated_media_item(
+                    &mut transaction,
+                    "MOVIE",
+                    &identity_key,
+                    title,
+                    sort_title,
+                    overview.as_deref(),
+                    true,
+                )
+                .await?;
+            self.query(
+                "INSERT INTO collection_work_items (
+                     work_item_id, movie_provider, movie_provider_id
+                 ) VALUES (?, ?, ?)
+                 ON CONFLICT (work_item_id) DO UPDATE SET
+                     movie_provider = excluded.movie_provider,
+                     movie_provider_id = excluded.movie_provider_id",
+            )
+            .bind(&work_item_id)
+            .bind(movie_provider)
+            .bind(movie_provider_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            for (source_item_id, sort_order, ..) in &source_rows {
+                self.query(
+                    "INSERT INTO collection_work_sources (
+                         work_item_id, source_item_id, sort_order
+                     ) VALUES (?, ?, ?)
+                     ON CONFLICT (source_item_id) DO UPDATE SET
+                         work_item_id = excluded.work_item_id,
+                         sort_order = excluded.sort_order",
+                )
+                .bind(&work_item_id)
+                .bind(source_item_id)
+                .bind(sort_order)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            self.query(
+                "UPDATE media_items
+                 SET has_available_source = 1, removed_at = NULL, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(&work_item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            work_item_ids.insert(key, work_item_id);
+        }
+
+        let stored_collection_title = self
+            .query_scalar::<String>(
+                "SELECT collection_title FROM collection_item_references
+                 WHERE collection_provider = ? AND collection_provider_id = ?
+                 ORDER BY item_id LIMIT 1",
+            )
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let existing_collection = self
+            .query_as::<(String, String, String)>(
+                "SELECT id, item_id, title FROM collections
+                 WHERE library_id = ? AND provider = ? AND provider_id = ?",
+            )
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let active_collection_title = members
+            .values()
+            .next()
+            .map(|member| member.collection_title.clone());
+        let collection_title = active_collection_title
+            .or(stored_collection_title)
+            .or_else(|| {
+                existing_collection
+                    .as_ref()
+                    .map(|(_, _, title)| title.clone())
+            });
+        if let Some(collection_title) = collection_title {
+            let is_visible = members.len() >= 2;
+            let collection_item_id = self
+                .ensure_global_generated_media_item(
+                    &mut transaction,
+                    "BOX_SET",
+                    &global_generated_identity_key(
+                        "collection",
+                        collection_provider,
+                        collection_provider_id,
+                    ),
+                    &collection_title,
+                    &collection_title.to_lowercase(),
+                    None,
+                    is_visible,
+                )
+                .await?;
+            self.query(
+                "INSERT INTO collections (
+                     id, item_id, library_id, provider, provider_id, title
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (library_id, provider, provider_id) DO UPDATE SET
+                     item_id = excluded.item_id,
+                     title = excluded.title,
+                     updated_at = unixepoch()",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&collection_item_id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(collection_provider)
+            .bind(collection_provider_id)
+            .bind(&collection_title)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            let collection_id = self
+                .query_scalar::<String>(
+                    "SELECT id FROM collections
+                     WHERE library_id = ? AND provider = ? AND provider_id = ?",
+                )
+                .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+                .bind(collection_provider)
+                .bind(collection_provider_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query("DELETE FROM collection_items WHERE collection_id = ?")
+                .bind(&collection_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if is_visible {
+                let mut ordered_members = members.values().collect::<Vec<_>>();
+                ordered_members.sort_by(|left, right| {
+                    left.sort_order
+                        .unwrap_or(left.production_year.unwrap_or(0))
+                        .cmp(
+                            &right
+                                .sort_order
+                                .unwrap_or(right.production_year.unwrap_or(0)),
+                        )
+                        .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+                        .then_with(|| left.movie_provider.cmp(&right.movie_provider))
+                        .then_with(|| left.movie_provider_id.cmp(&right.movie_provider_id))
+                });
+                for member in ordered_members {
+                    if let Some(work_item_id) = work_item_ids.get(&(
+                        member.movie_provider.clone(),
+                        member.movie_provider_id.clone(),
+                    )) {
+                        self.query(
+                            "INSERT INTO collection_items (collection_id, item_id, sort_order)
+                             VALUES (?, ?, ?)",
+                        )
+                        .bind(&collection_id)
+                        .bind(work_item_id)
+                        .bind(
+                            member
+                                .sort_order
+                                .unwrap_or(member.production_year.unwrap_or(0)),
+                        )
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        self.query(
+            "DELETE FROM collection_sync_outbox
+             WHERE collection_provider = ? AND collection_provider_id = ? AND generation = ?",
+        )
+        .bind(collection_provider)
+        .bind(collection_provider_id)
+        .bind(expected_generation)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    async fn ensure_global_generated_media_item(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_type: &str,
+        identity_key: &str,
+        title: &str,
+        sort_title: &str,
+        overview: Option<&str>,
+        has_available_source: bool,
+    ) -> Result<String, StorageError> {
+        let existing_id = self
+            .query_scalar::<String>("SELECT id FROM media_items WHERE identity_key = ?")
+            .bind(identity_key)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let (id, already_exists) = match existing_id {
+            Some(id) => (id, true),
+            None => (Uuid::now_v7().to_string(), false),
+        };
+        if already_exists {
+            self.query(
+                "UPDATE media_items
+                 SET library_id = ?, item_type = ?, title = ?, sort_title = ?, overview = ?,
+                     production_year = NULL, identification_status = 'LOCAL_CONFIRMED',
+                     has_available_source = ?, removed_at = NULL, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(item_type)
+            .bind(title)
+            .bind(sort_title)
+            .bind(overview)
+            .bind(database_flag(has_available_source))
+            .bind(&id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        } else {
+            self.query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, overview,
+                     identification_status, identity_key, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+            )
+            .bind(&id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(item_type)
+            .bind(title)
+            .bind(sort_title)
+            .bind(overview)
+            .bind(identity_key)
+            .bind(database_flag(has_available_source))
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(id)
+    }
+
     pub(crate) async fn update_media_item_metadata(
         &self,
         update: MediaMetadataUpdate<'_>,
@@ -7244,6 +7816,14 @@ impl Database {
     }
 }
 
+fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {
+    format!(
+        "lux-global-{kind}:{}:{provider}:{}:{provider_id}",
+        provider.len(),
+        provider_id.len()
+    )
+}
+
 /// Restricts a query over `filesystem_entries fe` to the entries touched by the paths of one
 /// incremental scan job (one `?` placeholder: the job id).
 ///
@@ -7294,8 +7874,8 @@ fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        RECOMMENDATION_STATS_CLEANUP_QUERY, postgres_recent_catalog_rows_by_library_query,
-        sqlite_recent_catalog_rows_by_library_query,
+        Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
+        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
     };
 
     #[test]
@@ -7336,5 +7916,434 @@ mod tests {
         assert!(!query.contains("ROW_NUMBER()"));
         assert_eq!(query.matches("LIMIT ?").count(), 6);
         assert_eq!(query.matches("UNION ALL").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn global_collection_sync_queue_tracks_reference_replacements_and_removals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES ('collection-sync-movie', ?, 'MOVIE', 'Movie', 'movie', 'ONLINE_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO collection_item_references (
+                 item_id, movie_provider, movie_provider_id, collection_provider,
+                 collection_provider_id, collection_title, sort_order
+             ) VALUES ('collection-sync-movie', 'tmdb', 'movie-1', 'tmdb', 'series-1', 'Series', 2020)",
+        )
+        .execute(database.pool())
+        .await?;
+        let first_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = 'series-1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(first_generation, 1);
+
+        sqlx::query(
+            "UPDATE collection_item_references
+             SET collection_provider = 'imdb', collection_provider_id = 'series-1'
+             WHERE item_id = 'collection-sync-movie'",
+        )
+        .execute(database.pool())
+        .await?;
+        let queued_keys: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT collection_provider, collection_provider_id, generation
+             FROM collection_sync_outbox ORDER BY collection_provider",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            queued_keys,
+            vec![
+                ("imdb".to_owned(), "series-1".to_owned(), 1),
+                ("tmdb".to_owned(), "series-1".to_owned(), 2),
+            ]
+        );
+        assert!(
+            !database
+                .sync_global_collection("tmdb", "series-1", first_generation)
+                .await?
+        );
+        let latest_tmdb_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = 'series-1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(latest_tmdb_generation, 2);
+
+        sqlx::query(
+            "DELETE FROM collection_item_references WHERE item_id = 'collection-sync-movie'",
+        )
+        .execute(database.pool())
+        .await?;
+        let removed_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'imdb' AND collection_provider_id = 'series-1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(removed_generation, 2);
+        sqlx::query(
+            "INSERT INTO collection_item_references (
+                 item_id, movie_provider, movie_provider_id, collection_provider,
+                 collection_provider_id, collection_title
+             ) VALUES ('collection-sync-movie', 'tmdb', 'movie-1', 'imdb', 'series-1', 'Series')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query("DELETE FROM libraries WHERE id = ?")
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let deleted_library_generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'imdb' AND collection_provider_id = 'series-1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert!(deleted_library_generation >= 4);
+        let system_library_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM libraries WHERE id = ? AND system_kind = 'COLLECTIONS'",
+        )
+        .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(system_library_exists, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_collection_sync_deduplicates_copies_and_retains_stable_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8098".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let first_library = libraries
+            .create_library("Movies A", LibraryKind::Movie, false)
+            .await?;
+        let second_library = libraries
+            .create_library("Movies B", LibraryKind::Movie, false)
+            .await?;
+        let movies = [
+            ("copy-a", first_library.id.to_string(), "movie-1", "Movie 1"),
+            (
+                "movie-b",
+                first_library.id.to_string(),
+                "movie-2",
+                "Movie 2",
+            ),
+            (
+                "copy-a-2",
+                second_library.id.to_string(),
+                "movie-1",
+                "Movie 1 alt",
+            ),
+            (
+                "movie-c",
+                second_library.id.to_string(),
+                "movie-3",
+                "Movie 3",
+            ),
+        ];
+        for (item_id, library_id, movie_id, title) in &movies {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, production_year,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 2020, 'ONLINE_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library_id)
+            .bind(title)
+            .bind(title.to_ascii_lowercase())
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO collection_item_references (
+                     item_id, movie_provider, movie_provider_id, collection_provider,
+                     collection_provider_id, collection_title, sort_order
+                 ) VALUES (?, 'tmdb', ?, 'tmdb', 'series-1', 'Series One', ?)",
+            )
+            .bind(item_id)
+            .bind(movie_id)
+            .bind(match *movie_id {
+                "movie-1" => 1_i64,
+                "movie-2" => 2_i64,
+                _ => 3_i64,
+            })
+            .execute(database.pool())
+            .await?;
+        }
+
+        let mut pending = database.list_pending_global_collection_syncs(10).await?;
+        assert_eq!(pending.len(), 1);
+        let job = pending.pop().ok_or("expected one collection sync job")?;
+        assert!(
+            database
+                .sync_global_collection(
+                    &job.collection_provider,
+                    &job.collection_provider_id,
+                    job.generation,
+                )
+                .await?
+        );
+        let collection_id: String = sqlx::query_scalar(
+            "SELECT id FROM collections
+             WHERE library_id = ? AND provider = 'tmdb' AND provider_id = 'series-1'",
+        )
+        .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+        .fetch_one(database.pool())
+        .await?;
+        let original_collection_item_id: String =
+            sqlx::query_scalar("SELECT item_id FROM collections WHERE id = ?")
+                .bind(&collection_id)
+                .fetch_one(database.pool())
+                .await?;
+        let original_work_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT work_item_id FROM collection_work_items ORDER BY movie_provider_id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        let initial_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM collection_items WHERE collection_id = ?),
+                 (SELECT COUNT(*) FROM collection_work_items),
+                 (SELECT COUNT(*) FROM collection_work_sources)",
+        )
+        .bind(&collection_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(initial_counts, (3, 3, 4));
+
+        sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+            .bind(second_library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        pending = database.list_pending_global_collection_syncs(10).await?;
+        assert_eq!(pending.len(), 1);
+        let job = pending.pop().ok_or("expected disable sync job")?;
+        assert!(
+            database
+                .sync_global_collection(
+                    &job.collection_provider,
+                    &job.collection_provider_id,
+                    job.generation,
+                )
+                .await?
+        );
+        let disabled_library_counts: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM collection_items WHERE collection_id = ?),
+                 (SELECT COUNT(*) FROM collection_work_sources)",
+        )
+        .bind(&collection_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(disabled_library_counts, (2, 2));
+
+        sqlx::query("UPDATE media_items SET removed_at = unixepoch() WHERE id = 'movie-b'")
+            .execute(database.pool())
+            .await?;
+        pending = database.list_pending_global_collection_syncs(10).await?;
+        assert_eq!(pending.len(), 1);
+        let job = pending.pop().ok_or("expected removal sync job")?;
+        assert!(
+            database
+                .sync_global_collection(
+                    &job.collection_provider,
+                    &job.collection_provider_id,
+                    job.generation,
+                )
+                .await?
+        );
+        let hidden_member_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM collection_items WHERE collection_id = ?")
+                .bind(&collection_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(hidden_member_count, 0);
+
+        sqlx::query("UPDATE libraries SET is_enabled = 1 WHERE id = ?")
+            .bind(second_library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        pending = database.list_pending_global_collection_syncs(10).await?;
+        let job = pending.pop().ok_or("expected enable sync job")?;
+        assert!(
+            database
+                .sync_global_collection(
+                    &job.collection_provider,
+                    &job.collection_provider_id,
+                    job.generation,
+                )
+                .await?
+        );
+        let restored: (String, String, i64) = sqlx::query_as(
+            "SELECT collection.id, collection.item_id,
+                    (SELECT COUNT(*) FROM collection_items WHERE collection_id = collection.id)
+             FROM collections collection WHERE collection.id = ?",
+        )
+        .bind(&collection_id)
+        .fetch_one(database.pool())
+        .await?;
+        let restored_work_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT work_item_id FROM collection_work_items ORDER BY movie_provider_id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(restored.0, collection_id);
+        assert_eq!(restored.1, original_collection_item_id);
+        assert_eq!(restored.2, 2);
+        assert_eq!(restored_work_ids, original_work_ids);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_collection_sync_failure_keeps_previous_mapping_and_pending_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8099".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        for (item_id, movie_id) in [("movie-a", "a"), ("movie-b", "b")] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'ONLINE_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(format!("Movie {movie_id}"))
+            .bind(format!("movie {movie_id}"))
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO collection_item_references (
+                     item_id, movie_provider, movie_provider_id, collection_provider,
+                     collection_provider_id, collection_title
+                 ) VALUES (?, 'tmdb', ?, 'tmdb', 'series-1', 'Series One')",
+            )
+            .bind(item_id)
+            .bind(movie_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let initial_job = database
+            .list_pending_global_collection_syncs(10)
+            .await?
+            .pop()
+            .ok_or("expected initial sync job")?;
+        assert!(
+            database
+                .sync_global_collection(
+                    &initial_job.collection_provider,
+                    &initial_job.collection_provider_id,
+                    initial_job.generation,
+                )
+                .await?
+        );
+        let collection_id: String = sqlx::query_scalar(
+            "SELECT id FROM collections WHERE provider = 'tmdb' AND provider_id = 'series-1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE collection_item_references SET sort_order = 8 WHERE item_id = 'movie-a'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER fail_global_collection_member_insert
+             BEFORE INSERT ON collection_items
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected collection sync failure');
+             END",
+        )
+        .execute(database.pool())
+        .await?;
+        let failed_job = database
+            .list_pending_global_collection_syncs(10)
+            .await?
+            .pop()
+            .ok_or("expected retryable sync job")?;
+        let result = database
+            .sync_global_collection(
+                &failed_job.collection_provider,
+                &failed_job.collection_provider_id,
+                failed_job.generation,
+            )
+            .await;
+        assert!(result.is_err());
+        let preserved_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM collection_items WHERE collection_id = ?),
+                 (SELECT COUNT(*) FROM collection_work_items),
+                 (SELECT COUNT(*) FROM collection_sync_outbox)",
+        )
+        .bind(&collection_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(preserved_counts, (2, 2, 1));
+
+        sqlx::query("DROP TRIGGER fail_global_collection_member_insert")
+            .execute(database.pool())
+            .await?;
+        let retry_job = database
+            .list_pending_global_collection_syncs(10)
+            .await?
+            .pop()
+            .ok_or("expected sync job to remain pending")?;
+        assert!(
+            database
+                .sync_global_collection(
+                    &retry_job.collection_provider,
+                    &retry_job.collection_provider_id,
+                    retry_job.generation,
+                )
+                .await?
+        );
+        let retry_result: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM collection_items WHERE collection_id = ?),
+                 (SELECT COUNT(*) FROM collection_sync_outbox)",
+        )
+        .bind(&collection_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(retry_result, (2, 0));
+        Ok(())
     }
 }

@@ -381,6 +381,69 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                      WHERE filesystem_entry_id = NEW.id
                  );
              END",
+            "CREATE TRIGGER collection_media_item_sync_au
+             AFTER UPDATE OF removed_at, has_available_source, library_id, item_type ON media_items
+             WHEN OLD.removed_at IS NOT NEW.removed_at
+               OR OLD.has_available_source IS NOT NEW.has_available_source
+               OR OLD.library_id IS NOT NEW.library_id
+               OR OLD.item_type IS NOT NEW.item_type
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM collection_item_references reference
+                 WHERE reference.item_id = NEW.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
+            "CREATE TRIGGER collection_media_item_sync_bd
+             BEFORE DELETE ON media_items
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM collection_item_references reference
+                 WHERE reference.item_id = OLD.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
+            "CREATE TRIGGER collection_library_sync_au
+             AFTER UPDATE OF is_enabled ON libraries
+             WHEN OLD.is_enabled IS NOT NEW.is_enabled
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM media_items item
+                 JOIN collection_item_references reference ON reference.item_id = item.id
+                 WHERE item.library_id = NEW.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
+            "CREATE TRIGGER collection_library_sync_bd
+             BEFORE DELETE ON libraries
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM media_items item
+                 JOIN collection_item_references reference ON reference.item_id = item.id
+                 WHERE item.library_id = OLD.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
         ];
         for statement in statements {
             sqlx::query(statement)
