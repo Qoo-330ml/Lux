@@ -11171,14 +11171,18 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验收：
 
-- [ ] provider 被 gate 阻塞且自动队列超过 32 个 job 时，本地完整性 worker 与 scan 可完成；放行 provider 后自动 job 全部按每库单 runner 排空。
-- [ ] 显式提交在 channel 满时仍呈现原背压/completion receiver 语义；自动工作不提前领取显式 job。
-- [ ] 覆盖唤醒合并/竞态、自动 job 合并、取消、dispatcher shutdown、worker panic 恢复及重启后的 QUEUED job drain；不产生无界内存或 task fan-out。
-- [ ] SQLite 与 PostgreSQL 均覆盖存储领取；保留 `ScanCompleted`/`JOB_COMPLETED` 与扫描进度时序。
+- [x] provider 被 gate 阻塞且自动队列超过 32 个 job 时，本地完整性 worker 与 scan 可完成；放行 provider 后自动 job 全部按每库单 runner 排空。
+- [x] 显式提交在 channel 满时仍呈现原背压/completion receiver 语义；自动工作不提前领取显式 job。
+- [x] 覆盖唤醒合并/竞态、自动 job 合并、取消、dispatcher shutdown、worker panic 恢复及重启后的 QUEUED job drain；不产生无界内存或 task fan-out。
+- [x] SQLite 与 PostgreSQL 均有存储领取合同测试；保留 `ScanCompleted`/`JOB_COMPLETED` 与扫描进度时序。
 
 预计文件：`src/application/reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/repository_tests.rs`、本文档。
 
 验证：先运行自动 dispatch/慢 provider regression 和 `tests/reidentify.rs`、扫描 metadata targets；阶段实现完成时运行 Rust 全目标与 all-features Clippy。Cargo 前确认 Toshiba 挂载并使用共享 `CARGO_TARGET_DIR`。
+
+实施结果（2026-10-14）：自动来源改走每库容量为 1 的合并 mpsc 唤醒通道，显式来源继续使用容量 32 的背压队列；dispatcher 每次最多读取 100 条持久 QUEUED 自动 job，按 created_at/id 顺序串行处理，满页或失败后继续 drain/retry。自动 completion waiter 上限为每库 32。回归覆盖 provider gate 下 108 条及并发新增 job 的有序排空、显式队列已满时自动提交立即返回、显式与自动唤醒同时就绪、未 settled job 的 completion 保留、取消、panic、shutdown、重启恢复，以及本地 metadata worker 不阻塞 scan。
+
+定向验证：`application::reidentify::tests::` 39/39，扫描 dispatch 回归 1/1，SQLite 来源/分页合同 1/1，串行 `tests/reidentify.rs` 21/21；`cargo build --locked`、fmt 与 all-features Clippy 通过。最终 `cargo test --locked --all-targets` 的单元部分 850 passed、21 ignored；integration 执行到 `libraries_api` 时有一项在默认并行下返回 `DATABASE_UNAVAILABLE`，该项单独通过且 `libraries_api -- --test-threads=1` 13/13。PostgreSQL 合同测试已编译但未执行：本机 Docker daemon 不可用、没有 PostgreSQL 监听端口或 `pg_isready`。`web_static` 依赖 Web 构建产物，在生成本地 `web/dist` 后通过；生成产物未纳入变更。
 
 #### LUX-531：增加固定延迟的刮削并发基准
 

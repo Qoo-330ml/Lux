@@ -1,5 +1,7 @@
 use super::*;
 
+const AUTOMATIC_FILL_MISSING_DISPATCH_PAGE_MAX: i64 = 100;
+
 impl Database {
     pub(crate) async fn create_metadata_reidentify_job(
         &self,
@@ -365,6 +367,96 @@ impl Database {
                 source,
             })?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn metadata_reidentify_job_dispatch_source(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar("SELECT dispatch_source FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_queued_automatic_fill_missing_job_ids(
+        &self,
+        library_id: &str,
+        after_created_at: Option<i64>,
+        after_job_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let limit = limit.clamp(1, AUTOMATIC_FILL_MISSING_DISPATCH_PAGE_MAX);
+        let rows = if let (Some(created_at), Some(job_id)) = (after_created_at, after_job_id) {
+            self.query_as::<(String, i64)>(
+                "SELECT id, created_at FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'
+                   AND dispatch_source = 'AUTOMATIC' AND status = 'QUEUED'
+                   AND (created_at > ? OR (created_at = ? AND id > ?))
+                 ORDER BY created_at, id LIMIT ?",
+            )
+            .bind(library_id)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(job_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query_as::<(String, i64)>(
+                "SELECT id, created_at FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'
+                   AND dispatch_source = 'AUTOMATIC' AND status = 'QUEUED'
+                 ORDER BY created_at, id LIMIT ?",
+            )
+            .bind(library_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_queued_automatic_fill_missing_library_ids(
+        &self,
+        after_library_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let limit = limit.clamp(1, AUTOMATIC_FILL_MISSING_DISPATCH_PAGE_MAX);
+        let rows = if let Some(after_library_id) = after_library_id {
+            self.query_scalar(
+                "SELECT DISTINCT library_id FROM metadata_reidentify_jobs
+                 WHERE library_id IS NOT NULL AND library_id > ?
+                   AND mode = 'FILL_MISSING' AND dispatch_source = 'AUTOMATIC'
+                   AND status = 'QUEUED'
+                 ORDER BY library_id LIMIT ?",
+            )
+            .bind(after_library_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query_scalar(
+                "SELECT DISTINCT library_id FROM metadata_reidentify_jobs
+                 WHERE library_id IS NOT NULL AND mode = 'FILL_MISSING'
+                   AND dispatch_source = 'AUTOMATIC' AND status = 'QUEUED'
+                 ORDER BY library_id LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn finish_metadata_reidentify_job(

@@ -15860,6 +15860,62 @@ async fn automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate
     let automatic_job_id = automatic_dispatch.scheduled_job_ids[0].clone();
     assert_ne!(automatic_job_id, explicit_job_id);
 
+    assert_eq!(
+        database
+            .metadata_reidentify_job_dispatch_source(&automatic_job_id)
+            .await?,
+        Some("AUTOMATIC".to_owned())
+    );
+    let automatic_created_at: i64 = database
+        .query_scalar("SELECT created_at FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(&automatic_job_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs (
+             id, status, total_count, mode, library_id, job_scope, dispatch_source, created_at
+         ) VALUES ('automatic-dispatch-page-2', 'QUEUED', 0, 'FILL_MISSING', ?, 'LIBRARY', 'AUTOMATIC', ?)",
+    )
+    .bind(&library_id)
+    .bind(automatic_created_at + 1)
+    .execute(database.pool())
+    .await?;
+    let first_automatic_page = database
+        .list_queued_automatic_fill_missing_job_ids(&library_id, None, None, 1)
+        .await?;
+    assert_eq!(first_automatic_page.len(), 1);
+    assert_eq!(first_automatic_page[0].0, automatic_job_id);
+    let second_automatic_page = database
+        .list_queued_automatic_fill_missing_job_ids(
+            &library_id,
+            Some(first_automatic_page[0].1),
+            Some(&first_automatic_page[0].0),
+            1,
+        )
+        .await?;
+    assert_eq!(
+        second_automatic_page,
+        vec![(
+            "automatic-dispatch-page-2".to_owned(),
+            automatic_created_at + 1
+        )]
+    );
+    assert_eq!(
+        database
+            .list_queued_automatic_fill_missing_library_ids(None, 1)
+            .await?,
+        vec![library_id.clone()]
+    );
+    assert!(
+        database
+            .list_queued_automatic_fill_missing_library_ids(Some(&library_id), 1)
+            .await?
+            .is_empty()
+    );
+    sqlx::query("DELETE FROM metadata_reidentify_jobs WHERE id = 'automatic-dispatch-page-2'")
+        .execute(database.pool())
+        .await?;
+
     let second_fingerprint = b"automatic-dispatch-source-second";
     assert!(
         database
@@ -16125,6 +16181,25 @@ async fn postgres_automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources
         assert_eq!(dispatch_rows.len(), 2);
         assert!(dispatch_rows.contains(&(explicit_job_id, "EXPLICIT".to_owned())));
         assert!(dispatch_rows.contains(&(automatic_job_id.clone(), "AUTOMATIC".to_owned())));
+        assert_eq!(
+            database
+                .list_queued_automatic_fill_missing_job_ids(&library_id, None, None, 10)
+                .await?,
+            vec![(
+                automatic_job_id.clone(),
+                database
+                    .query_scalar("SELECT created_at FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(automatic_job_id)
+                    .fetch_one(database.pool())
+                    .await?
+            )]
+        );
+        assert_eq!(
+            database
+                .list_queued_automatic_fill_missing_library_ids(None, 10)
+                .await?,
+            vec![library_id.clone()]
+        );
 
         database
             .finish_metadata_reidentify_job(automatic_job_id, "FAILED", Some("TEST_FAILURE"))
