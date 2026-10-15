@@ -45,6 +45,7 @@ describe("LoginPage session state", () => {
       );
     });
 
+    expect(container.querySelector(".lux-auth-card-animated")).not.toBeNull();
     expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
     expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
 

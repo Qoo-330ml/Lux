@@ -11797,6 +11797,36 @@ Rust 完成门禁（macOS `arm64`，Toshiba 已挂载，Cargo 输出使用 `/Vol
 
 Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 613 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 65 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
 
+#### LUX-552：优化横向滚动栏与前端动画
+
+范围：落实前端重构方案第七项和第八项。横向滚动栏在滚动时不再逐事件同步读取元素几何信息；移动端导航、首页 Hero 轮播和登录卡片使用 CSS 动画，消除应用主入口对 `framer-motion` 的依赖。保留滚动按钮、导航开关、轮播切换、视觉布局和现有文案；动画遵从减少动态效果设置。
+
+验收：
+
+- [x] `HorizontalScrollRail` 通过 `IntersectionObserver` 更新首尾边界状态，滚动事件路径不调用 `getBoundingClientRect()`；内容或尺寸变化后箭头状态仍正确。
+- [x] 不支持 `IntersectionObserver` 的环境有节流回退；滚动按钮仍按视口比例平滑滚动，到达边界后正确隐藏对应按钮。
+- [x] 移动导航和 Hero 背景/文案在状态变化时平滑过渡；关闭导航后不可点击、聚焦或被辅助技术访问。
+- [x] 登录、首页和移动导航动画使用 CSS，所有 `framer-motion` 调用点移除后依赖可删除；减少动态效果模式禁用新增动画。
+- [x] 自动化回归覆盖滚动边界、导航开关、轮播切换和动画减少策略；真实浏览器流程通过。
+- [ ] Web 全量检查通过。执行记录见下方；当前失败均在本任务未修改的测试中。
+- [x] 记录 ARM64 环境优化前后主入口 JS/gzip 体积；不得将构建体积差异表述为真实设备帧率或 RUM 数据。
+
+预计分五个增量，每次不超过五个文件：
+
+1. 本文档、`web/src/components/layout/HorizontalScrollRail.tsx`、`web/tests/horizontal-scroll-rail.test.tsx`。
+2. 本文档、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、`web/tests/lux-shell.test.tsx`。
+3. 本文档、`web/src/features/home/HomePage.tsx`、`web/src/react.css`、`web/tests/home-page.test.tsx`、`web/tests/home-hero-layout.test.mjs`。
+4. 本文档、`web/src/features/auth/LoginPage.tsx`、`web/src/react.css`、`web/tests/login-page.test.tsx`。
+5. 本文档、`web/package.json`、`web/pnpm-lock.yaml`、`web/vite.config.ts`。
+
+实施结果（2026-10-16）：`HorizontalScrollRail` 用首尾卡片的 `IntersectionObserver` 可见边界更新滚动箭头，滚动路径不再同步读取 DOM 几何；内容替换时重新绑定端点，缺少 IntersectionObserver 时使用 requestAnimationFrame 合并的尺寸指标回退。移动导航、Hero 背景和文案、登录卡片改用 CSS 动画，并保留减少动态效果支持；删除 `framer-motion` 依赖及 Vite 分块规则。
+
+验证：新增与相关回归通过：`horizontal-scroll-rail.test.tsx` 7/7、`lux-shell.test.tsx` 18/18、`home-hero-layout.test.mjs` 9/9、`login-page.test.tsx` 13/13。`home-page.test.tsx` 为 16/17，唯一失败是已有的媒体库分页预取夹具测试；它在本任务改动前的基线运行中也失败。冻结锁文件安装、生产构建和 `git diff --check` 通过。真实 Playwright 浏览器使用本地 API mock 复核了移动端 Hero、导航开关与继续观看滚动；导航关闭时带 `aria-hidden` 和 `inert`，浏览器控制台错误为 0。未访问生产数据或部署环境。
+
+Web 全量检查未全绿：`pnpm test` 的静态层为 141 passed、2 failed，失败在未修改的 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；脚本因静态层失败而未继续，另行运行完整 Vitest 后为 74 个文件、601 passed、4 failed，失败分布在未修改的 HomePage、home-media 与 library-card 测试。相关失败与本任务修改文件无关，保持为未通过验收项，不为此扩大任务范围。
+
+ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 kB / 33.47 kB gzip，另有静态依赖的 motion chunk 128.88 kB / 42.37 kB gzip；优化后入口 JS 为 124.49 kB / 33.70 kB gzip，motion chunk 已移除。按入口和该静态 motion chunk 合计，构建 JS 体积约减少 128.48 kB / 42.14 kB gzip；该数据只表示构建产物体积，不代表运行帧率或 RUM 表现。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

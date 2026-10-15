@@ -297,6 +297,36 @@ describe("LuxShell user control", () => {
     expect(container.querySelector('.lux-mobile-nav a[href="/favorites"]')?.textContent).toBe("收藏");
   });
 
+  it("keeps the closed mobile navigation inaccessible and closes it after navigation", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      renderWithProviders(root,
+        <MemoryRouter initialEntries={["/"]}>
+          <LuxShell user={{ id: "user-1", usernameNormalized: "test" }} />
+        </MemoryRouter>,
+      );
+    });
+
+    const nav = container.querySelector<HTMLElement>(".lux-mobile-nav");
+    expect(nav).not.toBeNull();
+    expect(nav?.getAttribute("data-state")).toBe("closed");
+    expect(nav?.getAttribute("aria-hidden")).toBe("true");
+    expect(nav?.hasAttribute("inert")).toBe(true);
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="打开导航"]')?.click());
+    expect(nav?.getAttribute("data-state")).toBe("open");
+    expect(nav?.getAttribute("aria-hidden")).toBe("false");
+    expect(nav?.hasAttribute("inert")).toBe(false);
+
+    act(() => nav?.querySelector<HTMLAnchorElement>('a[href="/favorites"]')?.click());
+    expect(nav?.getAttribute("data-state")).toBe("closed");
+    expect(nav?.getAttribute("aria-hidden")).toBe("true");
+    expect(nav?.hasAttribute("inert")).toBe(true);
+  });
+
   it("hides the back button on the home page", () => {
     container = document.createElement("div");
     document.body.append(container);

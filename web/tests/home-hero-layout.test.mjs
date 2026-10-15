@@ -55,3 +55,21 @@ test("hero text titles provide two smaller readable size levels", () => {
   assert.match(stylesheet, /\.lux-hero-title--compact\s*\{[^}]*font-size:/);
   assert.match(stylesheet, /\.lux-hero-title--small\s*\{[^}]*font-size:/);
 });
+
+test("hero slide copy and backdrops use CSS animations with reduced-motion support", () => {
+  const backdropRule = stylesheet.match(/\.lux-hero-backdrop-animated\s*\{([^}]*)\}/)?.[1] ?? "";
+  const copyRule = stylesheet.match(/\.lux-hero-copy-animated\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(backdropRule, /animation:\s*lux-hero-backdrop-in\s*\.55s\s*ease-out\s*both/);
+  assert.match(copyRule, /animation:\s*lux-hero-copy-in\s*\.38s\s*ease\s*both/);
+  assert.match(stylesheet, /@keyframes lux-hero-backdrop-in\s*\{\s*from\s*\{[^}]*opacity:\s*0[^}]*transform:\s*scale\(1\.04\)[^}]*\}\s*to\s*\{[^}]*opacity:\s*1[^}]*transform:\s*scale\(1\.015\)/);
+  assert.match(stylesheet, /@keyframes lux-hero-copy-in\s*\{\s*from\s*\{[^}]*opacity:\s*0[^}]*translateY\(18px\)[^}]*\}\s*to\s*\{[^}]*opacity:\s*1[^}]*translateY\(0\)/);
+  assert.match(stylesheet, /@media \(prefers-reduced-motion: reduce\) \{\s*\*, \*::before, \*::after \{[^}]*animation-duration:\s*\.01ms !important;[^}]*transition-duration:\s*\.01ms !important;/);
+});
+
+test("login panel entrance uses the same reduced-motion-safe CSS path", () => {
+  const authCardRule = stylesheet.match(/\.lux-auth-card-animated\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(authCardRule, /animation:\s*lux-auth-card-in\s*\.35s\s*ease\s*both/);
+  assert.match(stylesheet, /@keyframes lux-auth-card-in\s*\{\s*from\s*\{[^}]*opacity:\s*0[^}]*translateY\(16px\)[^}]*\}\s*to\s*\{[^}]*opacity:\s*1[^}]*translateY\(0\)/);
+});

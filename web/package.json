@@ -17,7 +17,6 @@
     "clsx": "^2.1.1",
     "ebml": "2.2.4",
     "events": "3.3.0",
-    "framer-motion": "^12.23.0",
     "hls.js": "1.7.1",
     "lucide-react": "^0.468.0",
     "mp4box": "2.4.1",

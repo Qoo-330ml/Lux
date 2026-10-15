@@ -1,5 +1,4 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AnimatePresence, motion } from "framer-motion";
 import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
 import { memo, useEffect, useMemo, useState } from "react";
@@ -224,13 +223,19 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
 
   return (
     <section className="lux-hero" aria-label="精选媒体轮播" aria-roledescription="carousel" aria-busy={isLoading}>
-      <AnimatePresence initial={false}>
-        {image ? <motion.img key={`backdrop-${item?.id}`} className="lux-hero-backdrop" src={image} alt="" decoding="async" fetchPriority="high" initial={{ opacity: 0, scale: 1.04 }} animate={{ opacity: 1, scale: 1.015 }} exit={{ opacity: 0 }} transition={{ duration: 0.55, ease: "easeOut" }} /> : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
-      </AnimatePresence>
+      {image ? (
+        <img
+          key={`backdrop-${item?.id}`}
+          className="lux-hero-backdrop lux-hero-backdrop-animated"
+          src={image}
+          alt=""
+          decoding="async"
+          fetchPriority="high"
+        />
+      ) : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
       <div className="lux-hero-overlay" />
-      <AnimatePresence initial={false} mode="wait">
-        {item || showEmptyState ? (
-          <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
+      {item || showEmptyState ? (
+          <div key={item?.id ?? "empty"} className="lux-hero-copy lux-hero-copy-animated" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"}>
             <h1 className={titleClassName}>
               {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} decoding="async" /> : <span className="lux-hero-title-text">{title}</span>}
             </h1>
@@ -247,9 +252,8 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
               </div>
               {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
             </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+          </div>
+      ) : null}
     </section>
   );
 });

@@ -79,7 +79,6 @@ export default defineConfig({
           if (id.includes("hls.js")) return "hls";
           if (id.includes("@tanstack/react-virtual") || id.includes("@tanstack/virtual-core")) return "react-virtual";
           if (id.includes("@tanstack/react-query")) return "react-query";
-          if (id.includes("framer-motion")) return "motion";
           if (id.includes("lucide-react")) return "icons";
           if (id.includes("react-router")) return "router";
           if (id.includes("react-dom")) return "react-dom";
