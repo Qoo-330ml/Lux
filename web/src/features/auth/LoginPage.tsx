@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { motion } from "framer-motion";
 import { FormEvent, type CSSProperties, useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -192,12 +191,7 @@ export function LoginPage() {
 
       {/* 右侧登录交互面板 */}
       <section className="lux-auth-panel">
-        <motion.div
-          className="lux-auth-card"
-          initial={{ opacity: 0, y: 16 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.35 }}
-        >
+        <div className="lux-auth-card lux-auth-card-animated">
           <div className="lux-auth-header">
             <span className="lux-auth-eyebrow">欢迎探索 · WELCOME BACK</span>
             <h1 className="lux-auth-title">登录媒体中心</h1>
@@ -277,7 +271,7 @@ export function LoginPage() {
               {login.error.message}
             </p>
           ) : null}
-        </motion.div>
+        </div>
       </section>
     </main>
   );
