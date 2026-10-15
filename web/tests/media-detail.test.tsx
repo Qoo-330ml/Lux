@@ -253,8 +253,13 @@ describe("MediaDetailPage series hierarchy", () => {
       itemType: "SERIES",
       rating: 7.6,
       ratingSource: "TMDb",
+      productionYear: 2020,
+      actors: [{ id: "actor-1", name: "演员甲" }],
       mediaSources: [],
     }, { addedAt: Number.NaN }));
+    vi.mocked(api.itemImages).mockResolvedValue({
+      images: [mediaImage("series-1", "series-fanart", "FANART")],
+    });
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
@@ -301,6 +306,13 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-card .lux-rating")).not.toBeNull();
     expect(container.querySelector(".lux-season-card .lux-rating svg")).toBeNull();
     expect(container.querySelector(".lux-season-card .lux-media-episode-count")?.textContent).toBe("8 集");
+    const castSection = container.querySelector(".lux-detail-cast");
+    const seasonSection = container.querySelector(".lux-detail-series-seasons");
+    const stillsSection = container.querySelector(".lux-detail-stills");
+    const nfoSection = container.querySelector(".lux-detail-nfo");
+    expect(castSection && seasonSection && (castSection.compareDocumentPosition(seasonSection) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+    expect(seasonSection && stillsSection && (seasonSection.compareDocumentPosition(stillsSection) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+    expect(stillsSection && nfoSection && (stillsSection.compareDocumentPosition(nfoSection) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.item("series-1") })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.mediaSurface);
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.itemImages("series-1") })?.options.refetchInterval)
@@ -735,9 +747,8 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-original-title")?.textContent).toBe("Rick and Morty");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("首播 2013-12-02");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("7 季");
-    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("91 集");
-    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("TMDb 60625");
-    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("评分 8.7");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).not.toContain("TMDb");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("8.7 评分");
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
     expect(container.querySelector(".lux-media-file-summary")?.textContent).toContain("最后播出2025-05-25");
     expect(container.querySelector(".lux-media-file-summary")?.textContent).toContain("状态Ended");
@@ -805,7 +816,15 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("大漠路远");
+    const taglineEl = container.querySelector(".lux-detail-tagline");
+    const castEl = container.querySelector(".lux-detail-cast");
+    expect(taglineEl?.textContent).toContain("大漠路远");
+    expect(taglineEl && castEl && Boolean(taglineEl.compareDocumentPosition(castEl) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
+    expect(container.querySelector(".lux-media-nfo-content")).not.toBeNull();
+    expect(container.querySelector(".lux-media-nfo-content")?.querySelector(".lux-surface-panel, .lux-media-nfo-card")).toBeNull();
+    expect(container.querySelector(".lux-media-nfo-taxonomy")?.className).not.toContain("border-b");
+    expect(container.querySelector(".lux-media-nfo-secondary")?.className).not.toContain("border-t");
+    expect(container.querySelector(".lux-media-nfo-tagline")?.className).toContain("font-serif");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("动作");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("导演甲");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("编剧甲");
@@ -1255,6 +1274,9 @@ describe("MediaDetailPage series hierarchy", () => {
     const sourceSelect = container.querySelector<HTMLButtonElement>(".lux-source-selector [role=\"combobox\"]");
     expect(sourceSelect?.textContent).toContain("1080p · H.264 · SDR · 8-bit");
     expect(sourceSelect?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".lux-detail-meta-badges")?.textContent).toContain("1080P");
+    expect(container.querySelector(".lux-detail-meta-badges")?.textContent).toContain("H.264");
+    expect(container.querySelector(".lux-detail-meta-badges")?.textContent).toContain("SDR");
 
     await act(async () => sourceSelect?.click());
 
@@ -1266,6 +1288,9 @@ describe("MediaDetailPage series hierarchy", () => {
 
     expect(sourceSelect?.textContent).toContain("2160p · HEVC · HDR10 · 10-bit");
     expect(sourceSelect?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".lux-detail-meta-badges")?.textContent).toContain("4K UHD");
+    expect(container.querySelector(".lux-detail-meta-badges")?.textContent).toContain("HEVC");
+    expect(container.querySelector(".lux-detail-meta-badges")?.textContent).toContain("HDR10");
     expect(container.querySelector<HTMLAnchorElement>("a.lux-button-primary")?.getAttribute("href"))
       .toBe("/watch/episode-1?sourceId=source-hdr");
   });
@@ -1468,10 +1493,11 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.textContent).not.toContain("暂无可播放版本");
   });
 
-  it("places an available media logo above the poster", async () => {
+  it("places an available media logo above the bilingual title", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
+      originalTitle: "Example Movie",
       itemType: "MOVIE",
       mediaSources: [],
     });
@@ -1516,8 +1542,10 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/items/movie-1/images/logo");
     expect(titleRow?.getAttribute("data-has-logo")).toBe("true");
     expect(titleRow?.children[0]?.className).toBe("lux-detail-logo");
-    expect(titleRow?.children[1]?.tagName).toBe("H1");
-    expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
+    expect(titleRow?.children[1]?.className).toBe("lux-detail-title-names");
+    const titleNames = titleRow?.querySelector(".lux-detail-title-names");
+    expect(titleNames?.children[0]?.textContent).toBe("示例电影");
+    expect(titleNames?.children[1]?.textContent).toBe("Example Movie");
     expect(posterColumn?.querySelector(".lux-detail-logo")).toBeNull();
     expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
   });
@@ -1749,5 +1777,46 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/collections/collection-1");
     expect(rendered.querySelector<HTMLAnchorElement>("a[href^='/watch/']")?.getAttribute("href"))
       .toBe("/watch/movie-1?sourceId=source-picked");
+  });
+
+  it("renders refined movie metadata with year, rating star, and badges while omitting added time and tmdb id", async () => {
+    const item: MediaItem = {
+      id: "movie-pegasus",
+      libraryId: "library-1",
+      title: "飞驰人生",
+      itemType: "MOVIE",
+      premiereDate: "2019-02-05",
+      addedAt: Date.parse("2026-08-09T15:35:00+08:00") / 1000,
+      rating: 6.6,
+      ratingSource: "NFO",
+      providerIds: { tmdb: "575219" },
+      runtimeTicks: 58800000000,
+      mediaSources: [
+        {
+          id: "source-1",
+          qualityLabel: "1080p",
+          container: "mkv",
+          isDefault: true,
+          streams: [
+            { index: 0, type: "VIDEO", codec: "h264", details: { VideoRangeType: "SDR", BitDepth: 8 } },
+            { index: 1, type: "AUDIO", codec: "dts", title: "Chinese DTS-HD MA 5.1", details: { Channels: 6 } },
+          ],
+        },
+      ],
+    };
+    const rendered = await renderDetail(item, []);
+    const meta = rendered.querySelector(".lux-detail-meta");
+    expect(meta?.textContent).toContain("2019");
+    expect(meta?.textContent).not.toContain("首播 2019-02-05");
+    expect(meta?.textContent).not.toContain("添加于");
+    expect(meta?.textContent).not.toContain("TMDb");
+    expect(meta?.textContent).not.toContain("NFO 评分");
+    expect(meta?.textContent).toContain("6.6 评分");
+    expect(meta?.textContent).toContain("1h 38m");
+    const badges = rendered.querySelector(".lux-detail-meta-badges");
+    expect(badges?.textContent).toContain("1080P");
+    expect(badges?.textContent).toContain("H.264");
+    expect(badges?.textContent).toContain("SDR");
+    expect(badges?.textContent).toContain("DTS-HD MA 5.1");
   });
 });

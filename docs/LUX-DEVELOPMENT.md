@@ -1304,6 +1304,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 7. 确认。
 8. 写回 NFO/图片并重新索引该条目。
 
+重新匹配或元数据匹配写回电影、剧集 NFO 时，必须同时刷新该条目的本地 NFO 详情投影；详情页应在本次选择完成后直接展示新字段，不要求管理员再扫描媒体库或所在文件夹。投影由已确认的候选内容与仍有效的本地详情生成，并与候选选择结果在同一数据库事务中提交；不得在详情请求中解析 NFO。
+
 指定条目的批量重新识别仍使用持久化任务队列：管理员一次提交 1-100 个条目，服务端去重后以 `QUEUED` 创建任务并在后台逐条处理；每条记录 `PENDING/RUNNING/COMPLETED/FAILED`、候选数量和稳定错误代码，任务通过 `GET /api/v1/admin/metadata/reidentify/{jobId}` 查询。条目级失败不会把整批伪装成基础设施失败，父任务以 `COMPLETED_WITH_ISSUES` 完成；只有任务无法收尾等基础设施故障才使用 `FAILED`。刮削器暂不可用的批次可以使用 `DEFERRED` 表示延后。该指定条目接口只负责重新搜索并生成 pending 候选，供管理员处理；失败、有问题或延后的任务可通过 `POST /api/v1/admin/metadata/reidentify/{jobId}` 重新排队未完成条目。
 
 每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务；服务重启时遗留的活动任务标记为 `CANCELLED`，不会自动重新进入 `PENDING`。
@@ -3186,6 +3188,9 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 - 元数据匹配确认时通过所选刮削器抓取主要演员及角色名；详情页以圆形头像卡片展示演员，头像使用
   `/config/metadata/people` 中的本地缓存。
 - 详情页存在本地 logo/clearlogo 时显示在标题前；没有徽标时仅显示标题。
+- 存在徽标时，徽标单独占一行；中文标题和原始语言标题显示在徽标下方的同一行。
+- 剧集详情页中，播出季排在演职人员之后、剧照之前；剧照与“更多信息”之间保留留白。
+- 详情页的演职人员、播出季、剧照、更多信息和媒体文件等区块标题使用一致的字号、字重与行高。
 - 多版本选择。
 
 验证：组件与 Playwright。
@@ -4365,6 +4370,22 @@ provider 切换由后台身份解析任务处理：优先使用已知 provider �
 
 验证：人物关系单测、NFO 扫描集成测试、跨 provider 自动合并/隔离/撤销测试、生日精度匹配测试、
 图片内容去重和损坏恢复测试、旧布局兼容测试、数据库清空后重新扫描重建测试、详情 API 和 Web 占位图测试。
+
+PostgreSQL 补充修复（2026-10-15）：SQLite 0076 已提供人物匹配决定的目标和原人物字段，
+但 PostgreSQL 遗漏了对应结构。新增前向迁移 `0176_person_match_decisions.sql`，为
+`person_match_candidates` 补齐可空的 `target_person_id`、`previous_person_id` 及目标人物索引，
+保留既有迁移内容、校验和及候选记录。PostgreSQL schema version 升至 176，SQLite 保持 175。
+`build.rs` 同时监听两套迁移目录。回归覆盖 PostgreSQL 空库、0175 旧库升级、人物确认、
+快照重复恢复和撤销后还原原身份；FNOS 上线后的恢复结果需另行验证。
+
+验证结果：本机 `uname -m=arm64`，隔离 PostgreSQL 16.15 的 `postgres_database` 17/17
+通过；新增回归先复现缺列错误，再验证空库和 0175 升级、旧迁移校验和保留、快照恢复及撤销。
+`storage` 59/59、`people_api` 10/10、`ready_version` 2/2、Rust build、fmt 和全目标全
+feature Clippy 通过。全量 `cargo test --locked --all-targets` 的 lib 为 874 passed、23 ignored，
+随后在 `scanned_metadata::failed_local_poster_insert_does_not_mark_image_stage_complete`
+失败（本地海报数实际 2、期望 1）；未包含本修复的 `a42fa723` 隔离基线定向复跑得到相同失败。
+完整 Rust gate 未通过，后续 integration targets 未由该全量命令执行；该 SQLite 扫描问题不在
+本次 PostgreSQL 结构修复范围内。本次未部署 FNOS，也不代表生产快照恢复已验证。
 
 依赖：LUX-164、LUX-170、LUX-172。
 
@@ -11271,6 +11292,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证结果：目标测试 10/10、production build、定向浏览器检查和 `git diff --check` 通过。完整 `pnpm test` 的 Node 检查 137/137 通过；默认并行 Vitest 全量运行中，`tests/home-page.test.tsx` 的 5 个轮播用例失败，其余 583/588 通过。单 worker Vitest 全量运行中，另有 `tests/library-page.test.ts` 的 1 个排序恢复断言失败，其余 587/588 通过；这两个失败文件分别单独运行均为 17/17 通过，显示全量运行结果不稳定。阶段 23 的 A/B 性能门仍开放；LUX-533 PostgreSQL live query 受 Docker Hub EOF 阻塞，尚未取得 PostgreSQL runtime 证据。
 
+产品调整（2026-10-15）：项目所有者决定从管理员活动弹层移除库级入库阶段状态列表。右上角活动入口仅在存在活动单项作业时显示；库级阶段状态不再作为活动入口的显示条件。LUX-533/LUX-534 的只读聚合与 API 保留，不改任务执行路径。
+
 阶段 27 阶段门（2026-10-14）：在 Toshiba 挂载、`arm64` 环境下，通过 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `scripts/check-all.sh`。Cargo build、fmt、all-target/all-feature Clippy、shell 语法、两组 Python 工具测试均通过；`cargo test --locked --all-targets` 在 lib target 停止，854 通过、1 失败、22 ignored。失败 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation` 在隔离重跑时仍因 `Superseded` 失败，位于本阶段未修改的 HLS 播放代码。Web frozen-lockfile install 和 production build 通过；完整 Web 测试波动详见 LUX-535 结果。PostgreSQL live query 未验证，阶段 23 的 5% A/B 门仍开放。本阶段按门停在项目所有者确认点，不将失败检查记为通过。
 
 #### LUX-536：在媒体详情展示剧照
@@ -11294,7 +11317,9 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 详情页视觉补充验收（2026-10-14）：
 
-- [x] “更多信息”面板在深色和浅色主题使用半透明表面及背景模糊，可透出页面图片。
+- [x] “更多信息”区域不使用外围面板，直接沿用详情页背景；内部评分及单项信息卡继续保留。
+- [x] 类型行与五项信息卡之间、信息卡与制作来源之间不显示分割线；信息卡上下留白采用紧凑间距。
+- [x] Tagline 字号增加 2px 并保留原衬线字体；官方网站链接上方不显示短分割线。
 - [x] 浅色模式下评分和合集标题正确挂接深色文字样式，底层浅色渐变与信息面板透明度进一步降低，能看见背景图内容。
 - [x] 浅色模式下媒体文件摘要框和视频、音频、字幕轨道卡片采用与“更多信息”一致的透明度和背景模糊。
 - [x] 媒体摘要、折叠标题和展开后的地址共用一个外框；“媒体源地址与技术详情”作为无框按钮显示。
@@ -11303,6 +11328,10 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 补充实现与回归文件（5 个）：`web/src/features/detail/MediaInfoPanel.tsx`、`web/src/react.css`、`web/tests/media-detail.test.tsx`、`web/tests/detail-layout.test.mjs`、`web/tests/light-theme-contrast.test.ts`。本文档作为独立文档增量更新。
 
 补充验证：冻结锁文件安装通过；媒体详情组件测试 32/32、详情布局检查 31/31、浅色主题测试 19/19；完整 Web 测试 Node 139/139、Vitest 593/593、production build 和 `git diff --check` 通过。浏览器本地预览确认剧照、半透明“更多信息”面板及媒体地址展开/收起和复制按钮位置。
+
+后续样式更新（2026-10-15，经项目所有者确认）：上述 2026-10-14 浏览器预览记录的是首版半透明面板；当前验收以无外围面板、紧凑分区间距、无指定分割线及放大后的原字体 tagline 为准。
+
+更新实现与验证（2026-10-15）：`MediaNfoPanel.tsx` 移除外围卡片并收紧分区留白；`react.css` 移除对应边框样式、将 tagline 调至 `1rem`，并去掉官方网站上方短线。新增的渲染回归和布局检查分别为 33/33、31/31；冻结锁文件安装和 Web production build 通过，`git diff --check` 通过。Web 全量检查仍有不相关失败：静态 Node 检查 137/139（首页卡片尺寸、触屏操作规则 2 项）；完整 Vitest 596/600（首页继续观看评分、首页媒体库焦点预取、媒体库卡片预取与合集链接 4 项）。
 
 #### LUX-537：对齐 Emby 鉴权凭据优先级与重复 query 行为
 
@@ -11554,6 +11583,84 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 实施记录（2026-10-15）：本机为 macOS `arm64`，Cargo target 使用项目共享目录。设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 后，`cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings`、`git diff --check` 及 `RUST_TEST_THREADS=4 cargo test --locked --target aarch64-apple-darwin --all-targets` 通过。测试时让 `shutdown` 子进程使用临时 UDP 发现端口；查询计数 fixture 使用不启动周期 worker 的专用构造器。全量门禁中的 PostgreSQL 专用用例按设计忽略；随后在临时 PostgreSQL 16 实例单独运行 `postgres_database` 目标，16 项通过。Web 检查和 mock API 的浏览器流程沿用兼容记录。VidHub、SenPlayer、Infuse 客户端实测仍未完成，阶段门停在项目所有者确认点。
 
 2026-10-15 续查：VidHub 2.1.8、SenPlayer 6.0.6、Infuse 8.5.1 均已安装并启动，但 CUA 绑定原生窗口均返回 `-10005 cgWindowNotFound`，无法执行合集浏览、来源切换和进度回写。隔离浏览器访问本机服务停留在登录页；未改动现有本地用户或媒体数据。客户端验收继续保持未完成。
+
+#### LUX-546：持续协调数据库中的合集身份
+
+范围：后台持续检查数据库中已保存 NFO 合集身份、但尚未生成规范合集关系的电影；身份可靠时不受资源入库时间或元数据完整状态限制。引用写入后复用现有合集同步 outbox。不同来源命名空间仍独立，跨库副本仍归并成一个逻辑作品。任务不扫描媒体目录、不调用刮削器或 `ffprobe`。
+
+验收：
+
+- [x] 升级前已存在的电影只要数据库缓存含可靠合集 ID 和可匹配的影片来源 ID，就会被后台分页协调入合集；元数据仍待确认、合集名缺失时也可加入。
+- [x] 缺少合集名时用稳定占位名建关系；后续名称到达后更新现有合集，不重复建合集或作品。
+- [x] NFO 缓存变化会重新进入协调；任务按有界批次持续运行、可重启、幂等，失败记录可重试。
+- [x] 不同合集命名空间不会合并；同片跨库副本只计作一部作品，资源删除或合集 ID 修正继续由现有关系/outbox 流程收敛。
+- [x] SQLite/PostgreSQL 空库与升级迁移可用，待协调查询有索引；测试覆盖旧缓存、未完成元数据、缺失合集名、重复处理及名称补齐。
+
+预计文件（15 个，分四个可独立验证代码增量和一个文档增量，每个提交不超过 5 个文件）：SQLite/PostgreSQL 迁移、合集存储和 worker、候选与 NFO 回归、迁移/健康/扫描/兼容性测试中的 schema 版本断言，以及本文档。
+
+实施结果（2026-10-15）：全局合集 worker 每轮从带部分索引的查询读取至多 32 条电影缓存，解析数据库中已缓存的 NFO，不扫描媒体目录、不调用刮削器或 `ffprobe`。它按来源命名空间合并 NFO 与数据库影片 ID，允许 `PENDING` 资源及无合集名称的可靠 ID；合集引用和协调标记在同一事务写入，之后由现有 outbox 同步逻辑合集。缓存 JSON 变化会清空标记，让新快照重新进入协调；失败行不会阻断同批其他条目，仍可重试。缺名称时内部保存占位标记、对外显示稳定的 `合集 <来源>:<ID>`；后续名称到达会更新现有合集。待确认候选也会保存可靠合集引用。迁移 `0175` 为 SQLite 与 PostgreSQL 增加相同的局部待协调索引。
+
+验证：macOS `arm64`，Cargo 输出位于项目共享 target。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；`cargo test --locked --test storage` 为 59 passed；PostgreSQL 16 临时实例下 `cargo test --locked --test postgres_database -- --include-ignored` 为 16 passed，覆盖空库启动、旧迁移升级和新索引存在；合集 worker 回归与名称补齐用例通过。全量 `cargo test --locked --all-targets --no-fail-fast --quiet` 的 874 个库测试通过、23 个按设计忽略。唯一稳定复现的失败是 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete`：实际 2 张、预期 1 张；在干净基线 `8f9defcf` 上相同失败，属于本任务开始前已有问题。另一个 `local_nfo_retry_excludes_non_retryable_conflict_item` 仅在全目标并行运行时出现过一次 `RowNotFound`，定向复跑通过。Rust 静态 Web 用例首次因隔离 worktree 尚无 `web/dist` 返回 404；生成 Web 构建产物后定向用例通过。未部署、未访问或修改 FNOS 数据。
+
+#### LUX-547：索引媒体目录中的 extrafanart 图片
+
+范围：电影和剧集的本地图片扫描除资源目录直系图片外，也读取同目录 `extrafanart` 子目录中的直系图片，并把支持格式登记为 `FANART`，供媒体详情剧照栏使用。继续支持资源目录中的 `fanart1.jpg`、`fanart2.jpg` 及 `fanart-1.jpg` 等编号命名；只读取 `extrafanart` 下一级普通图片文件，不递归其他目录、不跟随符号链接。增量新增、修改、删除同样只更新所属电影或剧集的图片记录。
+
+验收：
+
+- [x] 电影全量扫描登记根目录中的编号 fanart 和 `extrafanart` 中的 JPG/JPEG/PNG/WebP 图片，图片类型均为 FANART，序号稳定。
+- [x] 剧集扫描将剧集目录 `extrafanart` 图片登记到剧集条目，不登记到季或分集；编号 fanart 继续有效。
+- [x] `extrafanart` 图片的增量新增、修改和删除更新对应剧集/电影图片记录；同目录其他媒体和条目 metadata 状态不变。
+- [x] 支持类型、文件层级、symlink 边界与详情页使用的本地 `item_images` 记录有自动化回归覆盖。
+
+预计文件（4 个）：`src/application/metadata.rs`、`src/storage/jobs/local_metadata/sources.rs`、`tests/scanning_jobs.rs`、本文档。
+
+实现边界：电影图片继续按资源目录归属，因此同一资源目录中的多个电影源共享该目录的图片，与现有直系图片行为一致。扫描时可见的 `extrafanart` 目录符号链接和其中的图片符号链接会被忽略；文件系统枚举沿用路径式 API，不承诺抵御另一进程在检查和读取之间替换目录的竞态。
+
+验证：macOS `arm64`，Cargo 输出位于 Toshiba 共享 target。本任务新增的 `manifest_scan_indexes_extrafanart_image_add_change_and_remove` 定向回归通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 通过。`cargo test --locked --all-targets` 在 lib 测试目标结束：862 passed、13 failed、23 ignored，因此后续目标未运行；失败集中于字幕/播放子进程和插件运行时超时或缺文件，涉及文件不在本任务改动范围内。单独运行 `tests/scanning_jobs.rs` 为 86 passed、2 failed：`completed_scan_runs_pending_ffprobe_before_worker_returns` 收到空 BIGINT，`incremental_scan_probes_only_changed_local_sources` 的 ffprobe 结果超时。未部署或访问 FNOS。Cargo 命令须设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`，并先确认 Toshiba 已挂载。
+
+#### LUX-548：兼容 iOS 爆米花 HideFromResume 请求
+
+范围：基于 iOS 抓包实现 `POST /Users/{UserId}/Items/{Id}/HideFromResume` 及 `/emby` 前缀；接受标准 query `Hide=true/false` 和 JSON `{"Hide": false}`。按用户/条目持久化隐藏标记，继续观看在聚合、计数与分页前排除隐藏条目；不清空进度、不修改收藏或已看状态。隐藏状态由显式 Hide 请求切换。
+
+验收：
+
+- [x] JSON 与 query 均支持 true/false，返回标准 UserItemDataDto；缺失、非法、冲突的值返回 400。
+- [x] root 与 `/emby` 路由、数字和 UUID 条目 ID 可用；匿名、跨用户、不可访问条目不能修改状态。
+- [x] 隐藏后 Emby Resume 和 Lux 继续观看排除该条目，恢复后保留原进度；重复请求幂等且其他用户不受影响。
+- [x] SQLite/PostgreSQL 空库和旧库升级保留原播放状态；相关定向测试与 Rust 完成检查有记录。
+- [x] 兼容记录明确区分抓包证据、自动化测试与部署后 iOS 实测，未实测不得标记客户端通过。
+
+预计文件：按会话计划拆分迁移与 schema 断言、状态 DTO、存储/应用逻辑、HTTP 接口与回归、文档五类增量，每个提交不超过 5 个文件。
+
+实现与验证（2026-10-15）：新增 SQLite/PostgreSQL 0177 迁移和按用户/条目的持久化隐藏标记；
+HTTP 接口兼容标准 query 与 iOS JSON，请求成功返回含 `HideFromResume` 的 UserItemDataDto。
+继续观看在聚合、计数、分页前排除隐藏条目，显式恢复保留原进度、已看、收藏、播放次数和时间。
+JSON 请求先复现原实现的 405，再通过集成回归；库测试验证按用户隔离、幂等和隐藏最新单集后的回退。
+`resume_favorites` 4/4、SQLite `storage` 60/60、临时 PostgreSQL 18/18 通过；build/fmt/clippy
+通过，本机为 arm64。为静态资源检查执行的冻结锁文件安装与 Web production build 通过。
+完整检查受共享 target 并发覆盖影响后，改用仍位于指定 target 内的专用 Cargo profile：
+112 个测试目标编译成功，库测试 875 passed、23 ignored；对并行失败目标和继续观看目标通过 Cargo
+串行复跑为 179 passed、1 failed。唯一持续失败是未改动的 NFO 海报回滚用例，预期 1、实际 2，
+修复前干净基线 b5cbab81 同样复现，因此 Rust 全量 gate 未全绿。详细边界与检查过程见
+`docs/COMPATIBILITY.md` 的 LUX-548 记录。未部署，未将 iOS 客户端真实页面标记为兼容通过。
+
+#### LUX-549：修复图像编辑器当前图片的陈旧缓存
+
+范围：图像编辑器展示当前图片时，在图片 URL 加上由 `contentTag` 派生的 `tag` 参数；缺少内容标签时使用图片记录 ID。
+这样图片内容更新后浏览器会请求新 URL，同时保持服务端缓存与详情页使用的版本键约定。不改变数据库、图片 API 或图片写入方式。
+
+验收：
+
+- [x] 图片编辑器当前图片 URL 含有当前 `contentTag`；无内容标签时使用当前图片记录 ID。
+- [x] 自动化回归覆盖两个版本键来源；选中的新版本不会复用旧 URL 的浏览器缓存。
+- [x] 图像编辑器定向 Web 测试与 production build 通过；全量 Web 测试已执行，失败项记录在实施结果中。
+
+预计文件（3 个）：`web/src/features/media/MediaImageEditor.tsx`、`web/tests/media-editors.test.tsx`、本文档。
+
+实施结果（2026-10-15）：图像编辑器当前图片 URL 追加 `?tag=<contentTag>`，内容标签缺失时使用图片行 ID。TDD 回归在修复前因缺少版本参数失败，修复后 `media-editors.test.tsx` 7/7 通过。冻结锁文件安装与 Web production build 通过。
+
+全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
 ## 29. 参考资料
 

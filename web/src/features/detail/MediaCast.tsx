@@ -9,7 +9,10 @@ export function MediaCast({ actors }: { actors: MediaActor[] }) {
   return (
     <section className="lux-media-cast" aria-labelledby="media-cast-heading">
       <div className="lux-media-cast-heading">
-        <h2 id="media-cast-heading">演职人员</h2>
+        <div className="lux-heading-lead">
+          <h2 id="media-cast-heading">演职人员</h2>
+          <span className="lux-section-heading-sub">CAST & CREW</span>
+        </div>
         <span>{actors.length} 位</span>
       </div>
       <HorizontalScrollRail className="lux-media-cast-rail" ariaLabel="演员列表">

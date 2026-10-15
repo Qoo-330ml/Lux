@@ -1,5 +1,9 @@
 use super::*;
-use crate::storage::{GlobalMovieCollectionReference, GlobalMovieCollectionReferenceUpdate};
+use crate::storage::{
+    GlobalMovieCollectionReference, GlobalMovieCollectionReferenceUpdate,
+    StoredMovieNfoCollectionReferenceReconciliation, global_collection_title_fallback,
+    global_collection_title_is_placeholder,
+};
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
@@ -1725,7 +1729,7 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
                    AND mi.library_id IN ({library_placeholders})
              ),
              eligible AS (
@@ -1854,7 +1858,7 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
                    AND mi.library_id IN ({library_placeholders})
              ), eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
@@ -5998,6 +6002,29 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        self.list_global_collection_cards_page_ordered(user_id, is_admin, offset, limit, false)
+            .await
+    }
+
+    pub(crate) async fn list_recent_global_collection_cards_page(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        self.list_global_collection_cards_page_ordered(user_id, is_admin, offset, limit, true)
+            .await
+    }
+
+    async fn list_global_collection_cards_page_ordered(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+        recently_updated_first: bool,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
         let visible_source = |work_item_id: &str| {
             format!(
                 "EXISTS (
@@ -6078,6 +6105,11 @@ impl Database {
                 )"
             )
         };
+        let ordering = if recently_updated_first {
+            "collection.updated_at DESC, collection_item.sort_title, collection.item_id"
+        } else {
+            "collection_item.sort_title, collection.item_id"
+        };
         let query = format!(
             "SELECT collection.item_id, collection_item.title,
                     (SELECT COUNT(DISTINCT member.item_id)
@@ -6100,7 +6132,7 @@ impl Database {
                    WHERE visible_member.collection_id = collection.id
                      AND {}
                )
-             ORDER BY collection_item.sort_title, collection.item_id
+             ORDER BY {ordering}
              LIMIT ? OFFSET ?",
             visible_fallback_poster("source_item.id"),
             visible_fallback_poster("poster.id"),
@@ -6735,14 +6767,26 @@ impl Database {
             })?;
         let active_collection_title = members
             .values()
-            .next()
-            .map(|member| member.collection_title.clone());
+            .map(|member| member.collection_title.as_str())
+            .find(|title| !global_collection_title_is_placeholder(title))
+            .map(str::to_owned);
+        let stored_title_is_placeholder = stored_collection_title
+            .as_deref()
+            .is_some_and(global_collection_title_is_placeholder);
+        let stored_collection_title =
+            stored_collection_title.filter(|title| !global_collection_title_is_placeholder(title));
+        let existing_collection_title = existing_collection
+            .as_ref()
+            .map(|(_, _, title)| title)
+            .filter(|title| !global_collection_title_is_placeholder(title))
+            .cloned();
         let collection_title = active_collection_title
             .or(stored_collection_title)
+            .or(existing_collection_title)
             .or_else(|| {
-                existing_collection
-                    .as_ref()
-                    .map(|(_, _, title)| title.clone())
+                (!members.is_empty() || stored_title_is_placeholder).then(|| {
+                    global_collection_title_fallback(collection_provider, collection_provider_id)
+                })
             });
         if let Some(collection_title) = collection_title {
             let is_visible = members.len() >= 2;
@@ -6950,6 +6994,158 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn list_pending_movie_nfo_collection_reference_reconciliations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredMovieNfoCollectionReferenceReconciliation>, StorageError> {
+        if !(1..=64).contains(&limit) {
+            return Err(StorageError::Conflict(
+                "invalid NFO collection reference reconciliation page size".to_owned(),
+            ));
+        }
+        let rows: Vec<StoredMovieNfoCollectionReferenceReconciliation> = self
+            .query_as(
+                "SELECT item.id AS item_id, item.provider_ids_json, item.metadata_scraper_id,
+                        library.scraper_id AS library_scraper_id,
+                        item.production_year, item.nfo_metadata_json
+                 FROM media_items item
+                 JOIN libraries library ON library.id = item.library_id
+                 WHERE item.item_type = 'MOVIE'
+                   AND item.removed_at IS NULL
+                   AND item.nfo_metadata_json IS NOT NULL
+                   AND item.nfo_collection_reference_key IS NULL
+                 ORDER BY item.id
+                 LIMIT ?",
+            )
+            .bind(i64::try_from(limit).map_err(|_| {
+                StorageError::Conflict(
+                    "NFO collection reference reconciliation page size overflow".to_owned(),
+                )
+            })?)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows)
+    }
+
+    pub(crate) async fn commit_movie_nfo_collection_reference_reconciliation(
+        &self,
+        candidate: &StoredMovieNfoCollectionReferenceReconciliation,
+        reference: Option<&GlobalMovieCollectionReference>,
+        reference_key: &str,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let current_query = format!(
+            "SELECT item.provider_ids_json, item.metadata_scraper_id,
+                    library.scraper_id, item.production_year, item.nfo_metadata_json,
+                    item.nfo_collection_reference_key
+             FROM media_items item
+             JOIN libraries library ON library.id = item.library_id
+             WHERE item.id = ? AND item.item_type = 'MOVIE'
+               AND item.removed_at IS NULL{lock_clause}"
+        );
+        let current = self
+            .query_as::<(
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+            )>(sqlx::AssertSqlSafe(current_query))
+            .bind(&candidate.item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((
+            provider_ids_json,
+            metadata_scraper_id,
+            library_scraper_id,
+            production_year,
+            nfo_metadata_json,
+            current_reference_key,
+        )) = current
+        else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+        if current_reference_key.is_some()
+            || provider_ids_json != candidate.provider_ids_json
+            || metadata_scraper_id != candidate.metadata_scraper_id
+            || library_scraper_id != candidate.library_scraper_id
+            || production_year != candidate.production_year
+            || nfo_metadata_json.as_deref() != Some(candidate.nfo_metadata_json.as_str())
+        {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        let marked = self
+            .query(
+                "UPDATE media_items
+                 SET nfo_collection_reference_key = ?
+                 WHERE id = ? AND nfo_collection_reference_key IS NULL",
+            )
+            .bind(reference_key)
+            .bind(&candidate.item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if marked.rows_affected() != 1 {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        if let Some(reference) = reference {
+            self.replace_global_movie_collection_reference_in_transaction(
+                &mut transaction,
+                &candidate.item_id,
+                Some(reference),
+                None,
+            )
+            .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
     }
 
     pub(crate) async fn update_media_item_metadata_with_collection_reference(
@@ -7401,10 +7597,15 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
-             SET nfo_metadata_json = ?, nfo_metadata_fingerprint = ?,
+             SET nfo_collection_reference_key = CASE
+                     WHEN nfo_metadata_json IS DISTINCT FROM ? THEN NULL
+                     ELSE nfo_collection_reference_key
+                 END,
+                 nfo_metadata_json = ?, nfo_metadata_fingerprint = ?,
                  updated_at = unixepoch()
              WHERE id = ?",
         )
+        .bind(nfo_metadata_json)
         .bind(nfo_metadata_json)
         .bind(source_fingerprint)
         .bind(item_id)

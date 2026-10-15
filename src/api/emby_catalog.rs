@@ -3504,6 +3504,14 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             "Played".to_owned(),
             json!(user_state.map(|state| state.is_played).unwrap_or(false)),
         ),
+        (
+            "HideFromResume".to_owned(),
+            json!(
+                user_state
+                    .map(|state| state.hide_from_resume)
+                    .unwrap_or(false)
+            ),
+        ),
     ]);
     if let Some(played_percentage) = played_percentage {
         user_data.insert("PlayedPercentage".to_owned(), json!(played_percentage));

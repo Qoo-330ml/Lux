@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
-import { lazy, Suspense, useEffect } from "react";
+import { Component, lazy, Suspense, useEffect } from "react";
+import type { ReactNode } from "react";
 import { api, ApiError } from "../lib/api/client";
 import { queryKeys } from "../lib/api/query-keys";
 import type { LuxUser } from "../lib/api/types";
@@ -105,35 +106,64 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
   }, []);
 
   return (
-    <Suspense fallback={<LoadingScreen label="正在打开页面" />}>
-      <Routes>
-        <Route path="watch/:itemId" element={<PlayerPage />} />
-        <Route element={<LuxShell user={user} serverName={serverName} />}>
-          <Route index element={<HomePage user={user} />} />
-          <Route path="libraries" element={<LibrariesPage />} />
-          <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
-          <Route path="favorites" element={<FavoritesPage />} />
-          <Route path="items/:itemId" element={<MediaDetailPage />} />
-          <Route path="collections/:collectionId" element={<CollectionDetailPage />} />
-          <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
-          <Route path="search" element={<SearchPage />} />
-          <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
-          <Route path="account/:userId" element={<AccountRoute user={user} />} />
-          <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
-            <Route index element={<AdminDashboardPage />} />
-            <Route path="libraries" element={<AdminLibrariesPage />} />
-            <Route path="plugins" element={<AdminPluginsPage />} />
-            <Route path="notifications" element={<AdminNotificationsPage />} />
-            <Route path="users" element={<AdminUsersPage />} />
-            <Route path="jobs" element={<AdminOperationsPage />} />
-            <Route path="settings" element={<AdminSettingsPage />} />
-            <Route path="changelog" element={<AdminChangelogPage />} />
+    <RouteErrorBoundary>
+      <Suspense fallback={<LoadingScreen label="正在打开页面" />}>
+        <Routes>
+          <Route path="watch/:itemId" element={<PlayerPage />} />
+          <Route element={<LuxShell user={user} serverName={serverName} />}>
+            <Route index element={<HomePage user={user} />} />
+            <Route path="libraries" element={<LibrariesPage />} />
+            <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
+            <Route path="favorites" element={<FavoritesPage />} />
+            <Route path="items/:itemId" element={<MediaDetailPage />} />
+            <Route path="collections/:collectionId" element={<CollectionDetailPage />} />
+            <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
+            <Route path="search" element={<SearchPage />} />
+            <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
+            <Route path="account/:userId" element={<AccountRoute user={user} />} />
+            <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
+              <Route index element={<AdminDashboardPage />} />
+              <Route path="libraries" element={<AdminLibrariesPage />} />
+              <Route path="plugins" element={<AdminPluginsPage />} />
+              <Route path="notifications" element={<AdminNotificationsPage />} />
+              <Route path="users" element={<AdminUsersPage />} />
+              <Route path="jobs" element={<AdminOperationsPage />} />
+              <Route path="settings" element={<AdminSettingsPage />} />
+              <Route path="changelog" element={<AdminChangelogPage />} />
+            </Route>
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-    </Suspense>
+        </Routes>
+      </Suspense>
+    </RouteErrorBoundary>
   );
+}
+
+class RouteErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <main className="lux-state-screen" role="alert">
+          <h1>页面加载失败</h1>
+          <p>页面资源可能已更新，请重新加载后继续。</p>
+          <button
+            className="lux-button lux-button-secondary"
+            type="button"
+            onClick={() => window.location.reload()}
+          >
+            重新加载
+          </button>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 function AccountRoute({ user }: { user: LuxUser }) {

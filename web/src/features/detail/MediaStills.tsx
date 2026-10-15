@@ -23,7 +23,10 @@ export function MediaStills({ images, title }: { images: ItemImage[]; title: str
   return (
     <section className="lux-detail-stills" aria-labelledby="media-stills-heading">
       <div className="lux-media-stills-heading">
-        <h2 id="media-stills-heading">剧照</h2>
+        <div className="lux-heading-lead">
+          <h2 id="media-stills-heading">剧照</h2>
+          <span className="lux-section-heading-sub">STILLS</span>
+        </div>
         <span>{stills.length} 张</span>
       </div>
       <HorizontalScrollRail className="lux-media-stills-rail" ariaLabel="剧照列表">

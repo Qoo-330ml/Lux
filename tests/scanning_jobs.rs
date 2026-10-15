@@ -2355,7 +2355,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 174);
+    assert_eq!(database.schema_version().await?, 177);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -4144,6 +4144,436 @@ async fn manifest_scan_updates_only_the_changed_nfo_metadata()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(remaining_fanart, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_scan_indexes_extrafanart_image_add_change_and_remove()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    let root = temp_dir.path().join("Mixed");
+    let movie_dir = root.join("Extrafanart Movie (2024)");
+    let extrafanart_dir = movie_dir.join("extrafanart");
+    tokio::fs::create_dir_all(&extrafanart_dir).await?;
+    tokio::fs::write(movie_dir.join("Extrafanart.Movie.2024.mkv"), b"video").await?;
+    tokio::fs::write(movie_dir.join("fanart.jpg"), b"existing fanart").await?;
+    tokio::fs::write(movie_dir.join("fanart1.jpg"), b"numbered fanart one").await?;
+    tokio::fs::write(movie_dir.join("fanart2.webp"), b"numbered fanart two").await?;
+    tokio::fs::write(movie_dir.join("fanart-3.jpeg"), b"dash numbered fanart").await?;
+    let poster_named_extrafanart = extrafanart_dir.join("Extrafanart.Movie.2024-poster.jpg");
+    tokio::fs::write(
+        &poster_named_extrafanart,
+        b"extra fanart with poster-like name",
+    )
+    .await?;
+    tokio::fs::write(extrafanart_dir.join("2.JPEG"), b"extra jpeg fanart").await?;
+    tokio::fs::write(extrafanart_dir.join("3.png"), b"extra png fanart").await?;
+    tokio::fs::write(extrafanart_dir.join("4.webp"), b"extra webp fanart").await?;
+
+    let series_dir = root.join("Extrafanart Series (2024)");
+    let season_dir = series_dir.join("Season 01");
+    let series_extrafanart_dir = series_dir.join("extrafanart");
+    let nested_extrafanart_dir = extrafanart_dir.join("nested");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    tokio::fs::create_dir_all(&series_extrafanart_dir).await?;
+    tokio::fs::create_dir_all(&nested_extrafanart_dir).await?;
+    tokio::fs::write(season_dir.join("Extrafanart.Series.S01E01.mkv"), b"episode").await?;
+    tokio::fs::write(series_dir.join("fanart.jpg"), b"series fanart").await?;
+    tokio::fs::write(series_dir.join("fanart1.jpg"), b"series numbered fanart").await?;
+    tokio::fs::write(series_extrafanart_dir.join("1.jpg"), b"series extra fanart").await?;
+    tokio::fs::write(series_extrafanart_dir.join("2.jpeg"), b"series extra jpeg").await?;
+    tokio::fs::write(series_extrafanart_dir.join("3.png"), b"series extra png").await?;
+    tokio::fs::write(series_extrafanart_dir.join("4.webp"), b"series extra webp").await?;
+    tokio::fs::write(nested_extrafanart_dir.join("3.jpg"), b"nested extra image").await?;
+    #[cfg(unix)]
+    {
+        let outside_image = movie_dir.join("outside.jpg");
+        tokio::fs::write(&outside_image, b"outside image").await?;
+        std::os::unix::fs::symlink(&outside_image, extrafanart_dir.join("linked.jpg"))?;
+
+        let symlink_movie_dir = root.join("Symlink Extra Movie (2024)");
+        let outside_extrafanart = temp_dir.path().join("external-extrafanart");
+        tokio::fs::create_dir_all(&outside_extrafanart).await?;
+        tokio::fs::write(outside_extrafanart.join("external.jpg"), b"external image").await?;
+        tokio::fs::create_dir_all(&symlink_movie_dir).await?;
+        tokio::fs::write(
+            symlink_movie_dir.join("Symlink.Extra.Movie.2024.mkv"),
+            b"video",
+        )
+        .await?;
+        std::os::unix::fs::symlink(&outside_extrafanart, symlink_movie_dir.join("extrafanart"))?;
+    }
+    let extrafanart_relative_path = "Extrafanart Movie (2024)/extrafanart/1.jpg";
+    let series_extrafanart_relative_path = "Extrafanart Series (2024)/extrafanart/1.jpg";
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    wait_for_local_metadata_batches(&database, &initial.id).await?;
+
+    let item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Extrafanart Movie (2024)/Extrafanart.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    let series_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES'")
+            .fetch_one(database.pool())
+            .await?;
+    let initial_movie_fanart: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT image_index, local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(initial_movie_fanart.len(), 8);
+    assert!(
+        initial_movie_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/fanart.jpg"))
+    );
+    assert!(
+        initial_movie_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/fanart1.jpg"))
+    );
+    assert!(
+        initial_movie_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/fanart2.webp"))
+    );
+    assert!(
+        initial_movie_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/fanart-3.jpeg"))
+    );
+    assert!(
+        initial_movie_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/extrafanart/Extrafanart.Movie.2024-poster.jpg"))
+    );
+    for path in ["2.JPEG", "3.png", "4.webp"] {
+        assert!(
+            initial_movie_fanart
+                .iter()
+                .any(|(_, indexed_path)| indexed_path.ends_with(&format!("/extrafanart/{path}")))
+        );
+    }
+    let initial_poster_named_extrafanart_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND local_path LIKE ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .bind("%/extrafanart/Extrafanart.Movie.2024-poster.jpg")
+    .fetch_one(database.pool())
+    .await?;
+    let initial_series_fanart: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT image_index, local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&series_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(initial_series_fanart.len(), 6);
+    assert!(initial_series_fanart[0].1.ends_with("/extrafanart/1.jpg"));
+    for path in ["2.jpeg", "3.png", "4.webp"] {
+        assert!(
+            initial_series_fanart
+                .iter()
+                .any(|(_, indexed_path)| indexed_path.ends_with(&format!("/extrafanart/{path}")))
+        );
+    }
+    assert!(
+        initial_series_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/fanart.jpg"))
+    );
+    assert!(
+        initial_series_fanart
+            .iter()
+            .any(|(_, path)| path.ends_with("/fanart1.jpg"))
+    );
+    let misplaced_extrafanart: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images
+         WHERE local_path LIKE '%/Extrafanart Series (2024)/extrafanart/%'
+           AND image_type = 'FANART' AND item_id != ?",
+    )
+    .bind(&series_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(misplaced_extrafanart, 0);
+    #[cfg(unix)]
+    {
+        let symlink_movie_id: String = sqlx::query_scalar(
+            "SELECT ms.item_id FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE fe.library_root_id = ?
+               AND fe.relative_path = 'Symlink Extra Movie (2024)/Symlink.Extra.Movie.2024.mkv'",
+        )
+        .bind(root_record.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        let symlink_extra_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND local_path LIKE '%/extrafanart/%'",
+        )
+        .bind(symlink_movie_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(symlink_extra_count, 0);
+    }
+    let initial_series_identification: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&series_id)
+            .fetch_one(database.pool())
+            .await?;
+    let initial_identification: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+
+    tokio::fs::write(root.join(extrafanart_relative_path), b"first extra image").await?;
+    let added = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+    let added_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(extrafanart_relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(added_event, ("ADD".to_owned(), "DONE".to_owned()));
+    let added_fanart: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT image_index, local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(added_fanart.len(), 9);
+    let added_image = added_fanart
+        .iter()
+        .find(|(_, path)| path.ends_with(extrafanart_relative_path))
+        .ok_or("incremental extrafanart image was not indexed")?;
+    assert_eq!(added_image.0, 8);
+    let added_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND local_path LIKE ?",
+    )
+    .bind(&item_id)
+    .bind(format!("%{extrafanart_relative_path}"))
+    .fetch_one(database.pool())
+    .await?;
+
+    tokio::fs::write(root.join(extrafanart_relative_path), b"changed extra image").await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&changed.id, 100, None).await?;
+    let changed_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&changed.id)
+    .bind(extrafanart_relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_event, ("CHANGE".to_owned(), "DONE".to_owned()));
+    let changed_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND local_path LIKE ?",
+    )
+    .bind(&item_id)
+    .bind(format!("%{extrafanart_relative_path}"))
+    .fetch_one(database.pool())
+    .await?;
+    assert!(changed_tag.is_some());
+    assert_ne!(changed_tag, added_tag);
+
+    tokio::fs::remove_file(root.join(extrafanart_relative_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&removed.id)
+    .bind(extrafanart_relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_event, ("REMOVE".to_owned(), "DONE".to_owned()));
+    let remaining_fanart: Vec<String> = sqlx::query_scalar(
+        "SELECT local_path FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(remaining_fanart.len(), 8);
+    assert!(
+        remaining_fanart
+            .iter()
+            .any(|path| path.ends_with("/fanart.jpg"))
+    );
+    assert!(
+        remaining_fanart
+            .iter()
+            .any(|path| path.ends_with("/fanart1.jpg"))
+    );
+    assert!(
+        remaining_fanart
+            .iter()
+            .any(|path| path.ends_with("/fanart2.webp"))
+    );
+    assert!(
+        remaining_fanart
+            .iter()
+            .any(|path| path.ends_with("/fanart-3.jpeg"))
+    );
+
+    tokio::fs::write(
+        &poster_named_extrafanart,
+        b"changed extra fanart with poster-like name",
+    )
+    .await?;
+    let poster_named_changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&poster_named_changed.id, 100, None)
+        .await?;
+    let changed_poster_named_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND local_path LIKE ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .bind("%/extrafanart/Extrafanart.Movie.2024-poster.jpg")
+    .fetch_one(database.pool())
+    .await?;
+    assert!(changed_poster_named_tag.is_some());
+    assert_ne!(
+        changed_poster_named_tag,
+        initial_poster_named_extrafanart_tag
+    );
+    let poster_named_indexed_as_poster: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND local_path LIKE ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .bind("%/extrafanart/Extrafanart.Movie.2024-poster.jpg")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(poster_named_indexed_as_poster, 0);
+
+    let initial_series_extrafanart_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND local_path LIKE ?",
+    )
+    .bind(&series_id)
+    .bind(format!("%{series_extrafanart_relative_path}"))
+    .fetch_one(database.pool())
+    .await?;
+    tokio::fs::write(
+        root.join(series_extrafanart_relative_path),
+        b"changed series extra fanart",
+    )
+    .await?;
+    let series_changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&series_changed.id, 100, None)
+        .await?;
+    let series_change_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&series_changed.id)
+    .bind(series_extrafanart_relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        series_change_event,
+        ("CHANGE".to_owned(), "DONE".to_owned())
+    );
+    let series_fanart_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&series_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(series_fanart_count, 6);
+    let changed_series_extrafanart_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND local_path LIKE ?",
+    )
+    .bind(&series_id)
+    .bind(format!("%{series_extrafanart_relative_path}"))
+    .fetch_one(database.pool())
+    .await?;
+    assert!(changed_series_extrafanart_tag.is_some());
+    assert_ne!(
+        changed_series_extrafanart_tag,
+        initial_series_extrafanart_tag
+    );
+    let updated_series_identification: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&series_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(updated_series_identification, initial_series_identification);
+    let misplaced_movie_extrafanart: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images
+         WHERE local_path LIKE '%/Extrafanart Series (2024)/extrafanart/%'
+           AND item_id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(misplaced_movie_extrafanart, 0);
+
+    tokio::fs::remove_file(root.join(series_extrafanart_relative_path)).await?;
+    let series_removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&series_removed.id, 100, None)
+        .await?;
+    let series_remove_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&series_removed.id)
+    .bind(series_extrafanart_relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        series_remove_event,
+        ("REMOVE".to_owned(), "DONE".to_owned())
+    );
+    let remaining_series_fanart: Vec<String> = sqlx::query_scalar(
+        "SELECT local_path FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&series_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(remaining_series_fanart.len(), 5);
+    assert!(
+        remaining_series_fanart
+            .iter()
+            .all(|path| !path.ends_with(series_extrafanart_relative_path))
+    );
+    let final_series_identification: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&series_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_series_identification, initial_series_identification);
+    let final_identification: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_identification, initial_identification);
     Ok(())
 }
 

@@ -135,7 +135,16 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 174);
+    assert_eq!(database.schema_version().await?, 177);
+    let reconciliation_index: Option<String> = sqlx::query_scalar(
+        "SELECT to_regclass('idx_media_items_nfo_collection_reference_pending')::text",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        reconciliation_index.as_deref(),
+        Some("idx_media_items_nfo_collection_reference_pending")
+    );
     let global_collection_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables
          WHERE table_schema = current_schema()
@@ -694,6 +703,184 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
+-> Result<(), Box<dyn std::error::Error>> {
+    for upgrade_from_175 in [true, false] {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let (connection, database_name) = create_postgres_test_database().await?;
+        let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+        let outcome: Result<(), Box<dyn std::error::Error>> = async {
+            let source =
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+            let migrations = temp_dir.path().join("migrations");
+            fs::create_dir(&migrations)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let filename = entry.file_name();
+                let version = filename
+                    .to_str()
+                    .and_then(|name| name.split_once('_'))
+                    .ok_or("invalid migration filename")?
+                    .0
+                    .parse::<i64>()?;
+                if !upgrade_from_175 || version <= 175 {
+                    fs::copy(entry.path(), migrations.join(filename))?;
+                }
+            }
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await?;
+            sqlx::migrate::Migrator::new(migrations.as_path())
+                .await?
+                .run(&pool)
+                .await?;
+            let history: Vec<(i64, Vec<u8>)> =
+                sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                    .fetch_all(&pool)
+                    .await?;
+            if upgrade_from_175 {
+                assert_eq!(history.last().map(|row| row.0), Some(175));
+                let missing_columns: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.columns
+                     WHERE table_schema = 'public' AND table_name = 'person_match_candidates'
+                       AND column_name IN ('target_person_id', 'previous_person_id')",
+                )
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(missing_columns, 0);
+            }
+            sqlx::raw_sql(
+                r#"INSERT INTO libraries (id, name, kind)
+                 VALUES ('match-library', 'People matches', 'MOVIE');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('match-item', 'match-library', 'MOVIE', 'Match', 'match',
+                           'LOCAL_CONFIRMED');
+                 INSERT INTO people (id, display_name, directory_name, normalized_name,
+                                     created_at, updated_at)
+                 VALUES ('lux-000001', 'Previous', 'Previous-lux-000001', 'previous', 1, 1),
+                        ('lux-000002', 'Target', 'Target-lux-000002', 'target', 1, 1);
+                 INSERT INTO person_identities (person_id, provider, provider_id, match_method,
+                                                created_at, updated_at)
+                 VALUES ('lux-000001', 'tmdb', 'actor-match', 'MANUAL_CONFIRM', 1, 1);
+                 INSERT INTO person_match_candidates (
+                     id, item_id, provider, provider_id, candidate_person_ids_json,
+                     status, score, evidence_json, created_at, updated_at
+                 ) VALUES ('match-candidate', 'match-item', 'tmdb', 'actor-match',
+                           '["lux-000002"]', 'PENDING', 0.5, '{}', 1, 1);"#,
+            )
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+
+            let database = Database::connect_with_configuration(&config, &connection).await?;
+            let service =
+                PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+            let (candidates, total) = service.list_pending_person_match_candidates(0, 10).await?;
+            assert_eq!(total, 1);
+            assert_eq!(candidates[0].id, "match-candidate");
+            assert_eq!(candidates[0].score, Some(0.5));
+            let columns: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT column_name::text, data_type::text, is_nullable::text
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'person_match_candidates'
+                   AND column_name IN ('target_person_id', 'previous_person_id')
+                 ORDER BY column_name",
+            )
+            .fetch_all(database.pool())
+            .await?;
+            assert_eq!(
+                columns,
+                [
+                    (
+                        "previous_person_id".to_owned(),
+                        "text".to_owned(),
+                        "YES".to_owned()
+                    ),
+                    (
+                        "target_person_id".to_owned(),
+                        "text".to_owned(),
+                        "YES".to_owned()
+                    ),
+                ]
+            );
+            assert_eq!(database.schema_version().await?, 177);
+            let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT version, checksum FROM _sqlx_migrations
+                 WHERE version <= $1 ORDER BY version",
+            )
+            .bind(history.last().ok_or("missing migration history")?.0)
+            .fetch_all(database.pool())
+            .await?;
+            assert_eq!(preserved_history, history);
+            let index: Option<String> = sqlx::query_scalar(
+                "SELECT to_regclass('idx_person_match_candidates_target')::text",
+            )
+            .fetch_one(database.pool())
+            .await?;
+            assert_eq!(index.as_deref(), Some("idx_person_match_candidates_target"));
+
+            let movement = service
+                .confirm_person_match_candidate("match-candidate", "lux-000002", "{}")
+                .await?;
+            assert_eq!(movement.previous_person_id.as_deref(), Some("lux-000001"));
+            let snapshot = config
+                .config_dir
+                .join("metadata/people/matches/match-candidate.json");
+            let snapshot_bytes = fs::read(&snapshot)?;
+            let snapshot_value: serde_json::Value = serde_json::from_slice(&snapshot_bytes)?;
+            assert_eq!(snapshot_value["targetPersonId"], "lux-000002");
+            assert_eq!(snapshot_value["previousPersonId"], "lux-000001");
+            sqlx::query("DELETE FROM person_match_candidates WHERE id = 'match-candidate'")
+                .execute(database.pool())
+                .await?;
+            // Repeated rebuilds must preserve one candidate recovered from the snapshot.
+            let restarted =
+                PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+            restarted.rebuild_person_credit_index().await?;
+            restarted.rebuild_person_credit_index().await?;
+            let restored: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT status, target_person_id, previous_person_id
+                 FROM person_match_candidates WHERE id = 'match-candidate'",
+            )
+            .fetch_all(database.pool())
+            .await?;
+            assert_eq!(
+                restored,
+                [(
+                    "CONFIRMED".to_owned(),
+                    "lux-000002".to_owned(),
+                    "lux-000001".to_owned()
+                )]
+            );
+            assert_eq!(fs::read(snapshot)?, snapshot_bytes);
+            restarted
+                .undo_person_match_candidate("match-candidate", "{}")
+                .await?;
+            let owner: String = sqlx::query_scalar(
+                "SELECT person_id FROM person_identities
+                 WHERE provider = 'tmdb' AND provider_id = 'actor-match'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+            assert_eq!(owner, "lux-000001");
+            database.close().await;
+            Ok(())
+        }
+        .await;
+        drop_postgres_test_database(&database_name).await?;
+        outcome?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -751,7 +938,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 174);
+        assert_eq!(upgraded_database.schema_version().await?, 177);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -872,7 +1059,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 174);
+    assert_eq!(database.schema_version().await?, 177);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -1608,7 +1795,7 @@ async fn postgres_strm_probe_job_accepts_boolean_options() -> Result<(), Box<dyn
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_resume_order_puts_recent_timestamp_before_legacy_nulls()
+async fn postgres_resume_visibility_preserves_progress_and_recent_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1690,6 +1877,70 @@ async fn postgres_resume_order_puts_recent_timestamp_before_legacy_nulls()
     assert_eq!(page.total, 11);
     assert_eq!(page.items.len(), 10);
     assert_eq!(page.items[0].id, fresh_item_id);
+
+    let app = luxd::api::app_with_state(luxd::api::AppState::ready(
+        config,
+        database.clone(),
+        SetupService::new(database.clone())?,
+        WebAuthService::new(database.clone())?,
+        luxd::auth::emby::EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let login: serde_json::Value = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            r#"Emby Client="ResumeTest", Device="Mac", DeviceId="postgres-resume", Version="1""#,
+        )
+        .json(&json!({"Username": "postgres-admin", "Pw": "test-password"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let token = login["AccessToken"].as_str().ok_or("missing token")?;
+    let item_id = Uuid::parse_str(&fresh_item_id)?.as_u128().to_string();
+    for hidden in [true, true, false, false] {
+        let response = client
+            .post(format!(
+                "http://{address}/emby/Users/{user_id}/Items/{item_id}/HideFromResume"
+            ))
+            .header("X-Emby-Token", token)
+            .json(&json!({"Hide": hidden}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(body["HideFromResume"], hidden);
+        assert_eq!(body["PlaybackPositionTicks"], 6_000_000_000_i64);
+        assert_eq!(body["Played"], false);
+        let page = catalog
+            .list_continue_watching(AccessPrincipal::new(admin.id, true), &user_id, 0, 10)
+            .await?;
+        assert_eq!(page.total, if hidden { 10 } else { 11 });
+        assert_eq!(
+            page.items.iter().any(|item| item.id == fresh_item_id),
+            !hidden
+        );
+        let empty = catalog
+            .list_continue_watching(AccessPrincipal::new(admin.id, true), &user_id, 100, 10)
+            .await?;
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.total, page.total);
+    }
+    let state: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT position_ticks, last_played_at, hide_from_resume, version
+         FROM user_item_state WHERE user_id = $1 AND item_id = $2",
+    )
+    .bind(&user_id)
+    .bind(&fresh_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(state, (6_000_000_000, 100, 0, 2));
+    server.abort();
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
@@ -2177,7 +2428,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 174);
+    assert_eq!(database.schema_version().await?, 177);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
@@ -2471,5 +2722,83 @@ async fn insert_postgres_homevideos_video(
     .bind(library_id)
     .execute(database.pool())
     .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL test server"]
+async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("old-migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 176 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let (configuration, database_name) = create_postgres_test_database().await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(
+            &configuration
+                .postgres_url()?
+                .ok_or("missing PostgreSQL URL")?,
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES ('resume-user', 'resume-user', 'Resume User', 'test-only')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('resume-library', 'Resume', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+                 VALUES ('resume-item', 'resume-library', 'MOVIE', 'Resume', 'resume', 'LOCAL_CONFIRMED')")
+        .execute(&pool).await?;
+    sqlx::query("INSERT INTO user_item_state (user_id, item_id, position_ticks, is_favorite,
+                 play_count, last_played_at, version) VALUES ('resume-user', 'resume-item', 1300000000, 1, 2, 12345, 7)")
+        .execute(&pool).await?;
+    sqlx::migrate::Migrator::new(source_dir)
+        .await?
+        .run(&pool)
+        .await?;
+    let row: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT position_ticks, is_played, is_favorite, play_count, last_played_at,
+                version, hide_from_resume FROM user_item_state WHERE item_id = 'resume-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(row, (1300000000, 0, 1, 2, 12345, 7, 0));
+    assert!(
+        sqlx::query("UPDATE user_item_state SET hide_from_resume = 2")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(version, 177);
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
     Ok(())
 }

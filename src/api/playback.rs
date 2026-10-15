@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "emby_resume_visibility.rs"]
+mod resume_visibility;
+pub(super) use resume_visibility::emby_hide_from_resume;
+
 use crate::application::playback::{
     decision::ServerTier,
     hls::{HlsSegmentContainer, HlsStartOptions},
@@ -4305,6 +4309,14 @@ fn emby_user_item_data_json(
         (
             "Played".to_owned(),
             json!(user_state.map(|state| state.is_played).unwrap_or(false)),
+        ),
+        (
+            "HideFromResume".to_owned(),
+            json!(
+                user_state
+                    .map(|state| state.hide_from_resume)
+                    .unwrap_or(false)
+            ),
         ),
         ("ItemId".to_owned(), json!(emby_public_id(item_id))),
         ("Key".to_owned(), json!(emby_public_id(item_id))),

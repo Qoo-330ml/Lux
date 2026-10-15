@@ -17,8 +17,8 @@ use crate::{
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{
-            LocalNfoProjectionCache, MovieNfoCredit, MovieNfoMetadata, NfoWriteError,
-            NfoWriteService, local_nfo_details_from_cache_json,
+            LocalNfoCredit, LocalNfoDetails, LocalNfoProjectionCache, MovieNfoCredit,
+            MovieNfoMetadata, NfoWriteError, NfoWriteService, local_nfo_details_from_cache_json,
         },
         people::{ActorCredit, LocalActorRelationPageCache, PeopleError},
         scraper::{
@@ -2914,7 +2914,7 @@ impl MetadataSelectionService {
             ));
         }
         let mut payload = candidate_payload(&candidate)?;
-        let collection_reference = (current.item_type == "MOVIE" && !options.keep_pending)
+        let collection_reference = (current.item_type == "MOVIE")
             .then(|| {
                 let current_provider_ids = current_provider_ids(&current);
                 let (movie_provider, movie_provider_id) = if options.preserve_identity {
@@ -3060,37 +3060,55 @@ impl MetadataSelectionService {
         }
         let provider_ids_json = serde_json::to_string(&provider_ids)
             .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))?;
-        let selected = self
-            .database
-            .select_metadata_candidate_with_collection_reference(
-                SelectedMetadataUpdate {
-                    item_id,
-                    candidate_id,
-                    title: state.metadata.title.as_deref().unwrap_or(&current.title),
-                    original_title: state.metadata.original_title.as_deref(),
-                    overview: state.metadata.overview.as_deref(),
-                    production_year: state.metadata.production_year.map(i64::from),
-                    premiere_date: payload.premiere_date.as_deref(),
-                    last_air_date: payload.end_date.as_deref(),
-                    status: payload.status.as_deref(),
-                    original_language: payload.original_language.as_deref(),
-                    rating: payload.rating,
-                    rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
-                    provider_ids_json: &provider_ids_json,
-                    metadata_scraper_id: (!options.supplemental
-                        && !options.preserve_identity
-                        && !options.keep_pending)
-                        .then_some(options.scraper_id)
-                        .flatten(),
-                    metadata_fingerprint: &nfo_report.fingerprint,
-                    provenance_json: &state.provenance_json(),
-                    locked_fields_json: &state.locked_fields_json(),
-                    poster_fallback_required: !has_primary_artwork,
-                    keep_pending: options.keep_pending,
-                },
-                collection_reference.as_ref(),
-            )
-            .await?;
+        let update = SelectedMetadataUpdate {
+            item_id,
+            candidate_id,
+            title: state.metadata.title.as_deref().unwrap_or(&current.title),
+            original_title: state.metadata.original_title.as_deref(),
+            overview: state.metadata.overview.as_deref(),
+            production_year: state.metadata.production_year.map(i64::from),
+            premiere_date: payload.premiere_date.as_deref(),
+            last_air_date: payload.end_date.as_deref(),
+            status: payload.status.as_deref(),
+            original_language: payload.original_language.as_deref(),
+            rating: payload.rating,
+            rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
+            provider_ids_json: &provider_ids_json,
+            metadata_scraper_id: (!options.supplemental
+                && !options.preserve_identity
+                && !options.keep_pending)
+                .then_some(options.scraper_id)
+                .flatten(),
+            metadata_fingerprint: &nfo_report.fingerprint,
+            provenance_json: &state.provenance_json(),
+            locked_fields_json: &state.locked_fields_json(),
+            poster_fallback_required: !has_primary_artwork,
+            keep_pending: options.keep_pending,
+        };
+        let nfo_details_json = matches!(current.item_type.as_str(), "MOVIE" | "SERIES")
+            .then(|| selected_nfo_details(&current, &movie_nfo))
+            .map(|details| {
+                serde_json::to_string(&details)
+                    .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))
+            })
+            .transpose()?;
+        let selected = if let Some(nfo_details_json) = nfo_details_json.as_deref() {
+            self.database
+                .select_metadata_candidate_with_nfo_cache_and_collection_reference(
+                    update,
+                    collection_reference.as_ref(),
+                    nfo_details_json,
+                    &nfo_report.content_fingerprint,
+                )
+                .await?
+        } else {
+            self.database
+                .select_metadata_candidate_with_collection_reference(
+                    update,
+                    collection_reference.as_ref(),
+                )
+                .await?
+        };
         if !selected {
             return Err(MetadataSelectionError::CandidateNotPending(
                 "CONCURRENTLY_SELECTED".to_owned(),
@@ -3425,6 +3443,92 @@ fn merge_supplemental_movie_nfo(
             .provider_ids
             .entry(provider.clone())
             .or_insert_with(|| id.clone());
+    }
+}
+
+fn selected_nfo_details(
+    current: &StoredMediaMetadata,
+    selected: &MovieNfoMetadata,
+) -> LocalNfoDetails {
+    let mut details = current
+        .nfo_metadata_json
+        .as_deref()
+        .and_then(local_nfo_details_from_cache_json)
+        .unwrap_or_default();
+    merge_nfo_detail_text(&mut details.tagline, selected.tagline.as_deref());
+    merge_nfo_detail_text(&mut details.premiered, selected.premiered.as_deref());
+    merge_nfo_detail_text(&mut details.release_date, selected.releasedate.as_deref());
+    merge_nfo_detail_text(
+        &mut details.last_air_date,
+        selected.last_air_date.as_deref(),
+    );
+    merge_nfo_detail_text(&mut details.status, selected.status.as_deref());
+    merge_nfo_detail_text(
+        &mut details.original_language,
+        selected.original_language.as_deref(),
+    );
+    merge_nfo_detail_text(&mut details.website, selected.website.as_deref());
+    merge_nfo_detail_text(&mut details.set_name, selected.set_name.as_deref());
+    merge_nfo_detail_text(&mut details.set_id, selected.set_id.as_deref());
+    merge_nfo_detail_text(
+        &mut details.certification,
+        selected.certification.as_deref(),
+    );
+    if let Some(rating) = selected.rating {
+        details.rating = Some(rating);
+    }
+    if let Some(votes) = selected.votes {
+        details.votes = Some(votes);
+    }
+    if let Some(runtime) = selected.runtime {
+        details.runtime = Some(runtime);
+    }
+    if !selected.countries.is_empty() {
+        details.countries.clone_from(&selected.countries);
+    }
+    if !selected.genres.is_empty() {
+        details.genres.clone_from(&selected.genres);
+    }
+    if !selected.studios.is_empty() {
+        details.studios.clone_from(&selected.studios);
+    }
+    if !selected.directors.is_empty() {
+        details.directors = selected
+            .directors
+            .iter()
+            .map(|credit| LocalNfoCredit {
+                provider_id: credit.provider_id.clone(),
+                name: credit.name.clone(),
+            })
+            .collect();
+    }
+    if !selected.writers.is_empty() {
+        details.writers = selected
+            .writers
+            .iter()
+            .map(|credit| LocalNfoCredit {
+                provider_id: credit.provider_id.clone(),
+                name: credit.name.clone(),
+            })
+            .collect();
+    }
+    if !selected.trailers.is_empty() {
+        details.trailers.clone_from(&selected.trailers);
+    }
+    for (provider, id) in &selected.provider_ids {
+        let provider = provider.trim().to_ascii_lowercase();
+        let id = id.trim();
+        if id.is_empty() || !matches!(provider.as_str(), "tmdb" | "imdb" | "tvdb" | "wikidata") {
+            continue;
+        }
+        details.provider_ids.insert(provider, id.to_owned());
+    }
+    details
+}
+
+fn merge_nfo_detail_text(target: &mut Option<String>, incoming: Option<&str>) {
+    if let Some(value) = incoming.map(str::trim).filter(|value| !value.is_empty()) {
+        *target = Some(value.to_owned());
     }
 }
 

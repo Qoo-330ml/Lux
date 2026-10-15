@@ -5,12 +5,15 @@ use tokio::{sync::watch, task::JoinHandle};
 use crate::{
     application::{
         metadata_objects::{MetadataObjectError, MetadataObjectSnapshot, MetadataObjectStore},
+        nfo::local_nfo_details_from_cache_json,
         scraper::{
             ScraperError, ScraperGetRequest, ScraperItemType, ScraperProvider, ScraperResolver,
             provider_id_for_key,
         },
     },
-    storage::{Database, NewCollection, StorageError, StoredEmbyCollection},
+    storage::{
+        Database, GlobalMovieCollectionReference, NewCollection, StorageError, StoredEmbyCollection,
+    },
 };
 
 #[derive(Clone)]
@@ -226,6 +229,7 @@ impl From<MetadataObjectError> for CollectionError {
 }
 
 const GLOBAL_COLLECTION_SYNC_BATCH_SIZE: usize = 32;
+const GLOBAL_COLLECTION_REFERENCE_RECONCILIATION_BATCH_SIZE: usize = 32;
 const GLOBAL_COLLECTION_SYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
@@ -265,6 +269,16 @@ async fn run_global_collection_sync_worker(
         if *shutdown_receiver.borrow() {
             return;
         }
+        let reconciled = match reconcile_pending_movie_nfo_collection_references(&database).await {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                tracing::warn!(%error, "failed to reconcile pending movie NFO collection identities; will retry");
+                if wait_for_global_collection_sync_retry(&mut shutdown_receiver).await {
+                    return;
+                }
+                continue;
+            }
+        };
         let pending = match database
             .list_pending_global_collection_syncs(GLOBAL_COLLECTION_SYNC_BATCH_SIZE)
             .await
@@ -279,6 +293,9 @@ async fn run_global_collection_sync_worker(
             }
         };
         if pending.is_empty() {
+            if reconciled > 0 {
+                continue;
+            }
             if wait_for_global_collection_sync_retry(&mut shutdown_receiver).await {
                 return;
             }
@@ -307,6 +324,82 @@ async fn run_global_collection_sync_worker(
             return;
         }
     }
+}
+
+async fn reconcile_pending_movie_nfo_collection_references(
+    database: &Database,
+) -> Result<usize, StorageError> {
+    let candidates = database
+        .list_pending_movie_nfo_collection_reference_reconciliations(
+            GLOBAL_COLLECTION_REFERENCE_RECONCILIATION_BATCH_SIZE,
+        )
+        .await?;
+    let mut completed = 0;
+    for candidate in &candidates {
+        let details = local_nfo_details_from_cache_json(&candidate.nfo_metadata_json);
+        let reference = details.as_ref().and_then(|details| {
+            let provider_ids = provider_ids_for_collection_reconciliation(
+                candidate.provider_ids_json.as_deref(),
+                &details.provider_ids,
+            );
+            GlobalMovieCollectionReference::from_nfo(
+                &provider_ids,
+                candidate
+                    .metadata_scraper_id
+                    .as_deref()
+                    .or(candidate.library_scraper_id.as_deref()),
+                details.set_id.as_deref(),
+                details.set_name.as_deref(),
+                candidate.production_year,
+            )
+        });
+        let reference_key = reference
+            .as_ref()
+            .map(GlobalMovieCollectionReference::identity_key)
+            .unwrap_or_default();
+        match database
+            .commit_movie_nfo_collection_reference_reconciliation(
+                candidate,
+                reference.as_ref(),
+                &reference_key,
+            )
+            .await
+        {
+            Ok(true) => completed += 1,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                item_id = candidate.item_id,
+                %error,
+                "movie NFO collection identity could not be reconciled; item remains retryable"
+            ),
+        }
+    }
+    Ok(completed)
+}
+
+fn provider_ids_for_collection_reconciliation(
+    current_json: Option<&str>,
+    incoming: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut provider_ids = current_json
+        .and_then(|value| {
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(value).ok()
+        })
+        .unwrap_or_default();
+    for (provider, provider_id) in incoming {
+        let provider = provider.trim();
+        let provider_id = provider_id.trim();
+        if provider.is_empty()
+            || provider_id.is_empty()
+            || provider_ids
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(provider))
+        {
+            continue;
+        }
+        provider_ids.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+    }
+    provider_ids
 }
 
 async fn wait_for_global_collection_sync_retry(
@@ -406,6 +499,163 @@ mod global_sync_worker_tests {
         let worker = GlobalCollectionSyncWorker::start(database.clone());
         wait_for_completed_sync(&database).await?;
         worker.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_worker_reconciles_existing_nfo_collection_ids_while_metadata_is_pending()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8100".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Pending Movie Metadata", LibraryKind::Movie, false)
+            .await?;
+
+        for (item_id, movie_id, title) in [
+            ("pending-collection-a", "movie-a", "未完成电影 A"),
+            ("pending-collection-b", "movie-b", "未完成电影 B"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     provider_ids_json, metadata_scraper_id, nfo_metadata_json,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'org.lux.scraper.tmdb', ?, 'PENDING', 1)",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(title)
+            .bind(title.to_lowercase())
+            .bind(format!("{{\"tmdb\":\"{movie_id}\"}}"))
+            .bind(r#"{"setId":"1281825"}"#)
+            .execute(database.pool())
+            .await?;
+        }
+
+        sqlx::query(
+            "CREATE TRIGGER fail_one_pending_collection_reference
+             BEFORE INSERT ON collection_item_references
+             WHEN NEW.item_id = 'pending-collection-a'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected collection reference failure');
+             END",
+        )
+        .execute(database.pool())
+        .await?;
+        let worker = GlobalCollectionSyncWorker::start(database.clone());
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let pending_reference_b: Option<String> = sqlx::query_scalar(
+                    "SELECT nfo_collection_reference_key FROM media_items
+                     WHERE id = 'pending-collection-b'",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                let pending_reference_a: Option<String> = sqlx::query_scalar(
+                    "SELECT nfo_collection_reference_key FROM media_items
+                     WHERE id = 'pending-collection-a'",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                let pending_syncs: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM collection_sync_outbox")
+                        .fetch_one(database.pool())
+                        .await?;
+                if pending_reference_b.is_some()
+                    && pending_reference_a.is_none()
+                    && pending_syncs == 0
+                {
+                    return Ok::<(), sqlx::Error>(());
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        sqlx::query("DROP TRIGGER fail_one_pending_collection_reference")
+            .execute(database.pool())
+            .await?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let pending_references: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM media_items
+                     WHERE id IN ('pending-collection-a', 'pending-collection-b')
+                       AND nfo_collection_reference_key IS NOT NULL",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                let collection_members: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM collection_items member
+                     JOIN collections collection ON collection.id = member.collection_id
+                     WHERE collection.provider = 'tmdb'
+                       AND collection.provider_id = '1281825'",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                let pending_syncs: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM collection_sync_outbox")
+                        .fetch_one(database.pool())
+                        .await?;
+                if pending_references == 2 && collection_members == 2 && pending_syncs == 0 {
+                    return Ok::<(), sqlx::Error>(());
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        let initial_collection: (String, String) = sqlx::query_as(
+            "SELECT id, title FROM collections
+             WHERE provider = 'tmdb' AND provider_id = '1281825'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(initial_collection.1, "合集 tmdb:1281825");
+
+        let source_fingerprint = [7_u8; 32];
+        for item_id in ["pending-collection-a", "pending-collection-b"] {
+            database
+                .update_media_item_nfo_metadata(
+                    item_id,
+                    Some(r#"{"setId":"1281825","setName":"飞驰人生（系列）"}"#),
+                    Some(&source_fingerprint),
+                )
+                .await?;
+        }
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let current_collection: Option<(String, String)> = sqlx::query_as(
+                    "SELECT id, title FROM collections
+                     WHERE provider = 'tmdb' AND provider_id = '1281825'",
+                )
+                .fetch_optional(database.pool())
+                .await?;
+                let pending_syncs: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM collection_sync_outbox")
+                        .fetch_one(database.pool())
+                        .await?;
+                if current_collection
+                    .as_ref()
+                    .is_some_and(|(_, title)| title == "飞驰人生（系列）")
+                    && pending_syncs == 0
+                {
+                    return Ok::<(), sqlx::Error>(());
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        let updated_collection: (String, String) = sqlx::query_as(
+            "SELECT id, title FROM collections
+             WHERE provider = 'tmdb' AND provider_id = '1281825'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(updated_collection.0, initial_collection.0);
+        worker.shutdown().await;
+
         Ok(())
     }
 

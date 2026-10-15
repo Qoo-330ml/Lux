@@ -736,12 +736,82 @@ where
 }
 
 fn image_type_for(path: &Path) -> Option<ImageType> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+    if !is_supported_local_image_path(path) {
         return None;
     }
     let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
     image_type_for_stem(&stem)
+}
+
+fn is_supported_local_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp"
+            )
+        })
+}
+
+fn is_resource_extrafanart_image(path: &Path, resource_directory: &Path) -> bool {
+    if !is_supported_local_image_path(path) {
+        return false;
+    }
+    let Some(extrafanart_directory) = path.parent() else {
+        return false;
+    };
+    extrafanart_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("extrafanart"))
+        && extrafanart_directory.parent() == Some(resource_directory)
+}
+
+fn is_extrafanart_image_path(path: &Path) -> bool {
+    is_supported_local_image_path(path)
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("extrafanart"))
+}
+
+async fn is_regular_extrafanart_image_path(path: &Path) -> Result<bool, MetadataError> {
+    if !is_extrafanart_image_path(path) {
+        return Ok(false);
+    }
+    let Some(directory) = path.parent() else {
+        return Ok(false);
+    };
+    let directory_metadata =
+        fs::symlink_metadata(directory)
+            .await
+            .map_err(|source| MetadataError::Io {
+                path: directory.to_owned(),
+                source,
+            })?;
+    if !directory_metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let image_metadata = fs::symlink_metadata(path)
+        .await
+        .map_err(|source| MetadataError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(image_metadata.file_type().is_file())
+}
+
+fn extrafanart_local_images(paths: &[PathBuf], resource_directory: &Path) -> Vec<LocalImage> {
+    paths
+        .iter()
+        .filter(|path| is_resource_extrafanart_image(path, resource_directory))
+        .map(|path| LocalImage {
+            image_type: ImageType::Fanart,
+            path: path.clone(),
+        })
+        .collect()
 }
 
 fn image_type_for_media(path: &Path, media_stem: &str) -> Option<ImageType> {
@@ -1678,6 +1748,12 @@ impl MetadataEnricher {
         image_path: &Path,
         remove: bool,
     ) -> Result<usize, MetadataError> {
+        if !remove
+            && is_extrafanart_image_path(image_path)
+            && !is_regular_extrafanart_image_path(image_path).await?
+        {
+            return Ok(0);
+        }
         let mut candidates = Vec::<(String, LocalImage)>::new();
         for source in source_snapshot {
             let root = Path::new(&source.root_path);
@@ -1686,8 +1762,15 @@ impl MetadataEnricher {
                 "MOVIE" | "VIDEO" => {
                     if let Some(media_stem) =
                         media_path.file_stem().and_then(|value| value.to_str())
-                        && let Some(image_type) = image_type_for_media(image_path, media_stem)
-                            .or_else(|| image_type_for(image_path))
+                        && let Some(image_type) = if is_resource_extrafanart_image(
+                            image_path,
+                            media_path.parent().unwrap_or(Path::new(".")),
+                        ) {
+                            Some(ImageType::Fanart)
+                        } else {
+                            image_type_for_media(image_path, media_stem)
+                                .or_else(|| image_type_for(image_path))
+                        }
                     {
                         push_changed_local_image_candidate(
                             &mut candidates,
@@ -1705,6 +1788,16 @@ impl MetadataEnricher {
                     let season_dir = media_path.parent().unwrap_or(&series_dir);
                     let image_parent = image_path.parent();
                     let one_path = [image_path.to_owned()];
+                    if is_resource_extrafanart_image(image_path, &series_dir)
+                        && let Some(series_id) = source.series_id.as_deref()
+                    {
+                        push_changed_local_image_candidate(
+                            &mut candidates,
+                            series_id,
+                            ImageType::Fanart,
+                            image_path,
+                        );
+                    }
                     if image_parent == Some(series_dir.as_path())
                         && let Some(series_id) = source.series_id.as_deref()
                     {
@@ -2755,8 +2848,8 @@ impl MetadataEnricher {
                 continue;
             };
             let series_paths = if process_images {
-                match context.directory_cache.get(&series_dir).await {
-                    Ok(paths) => Some(paths),
+                let mut paths = match context.directory_cache.get(&series_dir).await {
+                    Ok(paths) => paths.as_ref().clone(),
                     Err(error) => {
                         tracing::warn!(
                             item_id = %source.episode_id,
@@ -2764,9 +2857,24 @@ impl MetadataEnricher {
                             "local series directory could not be read"
                         );
                         report.mark_item_error(&source.episode_id, &error);
-                        continue;
+                        Vec::new()
                     }
+                };
+                if let Err(error) = append_extrafanart_image_paths(
+                    &mut paths,
+                    &series_dir,
+                    &mut context.directory_cache,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        item_id = %source.episode_id,
+                        %error,
+                        "local series extrafanart directory could not be read"
+                    );
+                    report.mark_item_error(&source.episode_id, &error);
                 }
+                Some(Arc::new(paths))
             } else {
                 None
             };
@@ -2799,7 +2907,10 @@ impl MetadataEnricher {
                     });
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
-                    let images = find_series_images(series_paths, None);
+                    let mut images = find_series_images(series_paths, None);
+                    images.retain(|image| !is_resource_extrafanart_image(&image.path, &series_dir));
+                    images.extend(extrafanart_local_images(series_paths, &series_dir));
+                    images.sort_by(|left, right| left.path.cmp(&right.path));
                     if !images.is_empty() && queued_image_items.insert(source.series_id.clone()) {
                         image_candidates.push((source.series_id.clone(), images));
                     }
@@ -2826,8 +2937,13 @@ impl MetadataEnricher {
                 .map(|paths| paths.as_ref().clone())
                 .unwrap_or_default();
             if process_images && season_dir != series_dir {
+                season_paths = season_paths
+                    .iter()
+                    .filter(|path| is_prefixed_season_image(path, season_number))
+                    .cloned()
+                    .collect();
                 let directory_paths = match context.directory_cache.get(season_dir).await {
-                    Ok(paths) => paths,
+                    Ok(paths) => Some(paths),
                     Err(error) => {
                         tracing::warn!(
                             item_id = %source.episode_id,
@@ -2835,15 +2951,12 @@ impl MetadataEnricher {
                             "local season directory could not be read"
                         );
                         report.mark_item_error(&source.episode_id, &error);
-                        continue;
+                        None
                     }
                 };
-                season_paths = season_paths
-                    .iter()
-                    .filter(|path| is_prefixed_season_image(path, season_number))
-                    .cloned()
-                    .collect();
-                season_paths.extend(directory_paths.iter().cloned());
+                if let Some(directory_paths) = directory_paths {
+                    season_paths.extend(directory_paths.iter().cloned());
+                }
             }
             if new_season {
                 let nfo_path = if process_nfo {
@@ -3777,22 +3890,42 @@ async fn prepare_scan_local_movie_image_batch_item(
     report: &mut MetadataReport,
 ) -> Option<ItemImageBatchInsert> {
     let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-    let image_paths = match directory_cache
+    let mut image_paths = match directory_cache
         .get(media_path.parent().unwrap_or(Path::new(".")))
         .await
     {
-        Ok(paths) => paths,
+        Ok(paths) => paths.as_ref().clone(),
         Err(error) => {
             tracing::warn!(item_id = %source.item_id, %error, "local movie image directory failed");
             report.mark_item_failed(&source.item_id);
             return None;
         }
     };
-    let images = if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
-        find_local_images_for_media(image_paths.iter(), media_stem)
-    } else {
-        find_local_images(image_paths.iter())
-    };
+    let resource_directory = media_path.parent().unwrap_or(Path::new("."));
+    if let Err(error) =
+        append_extrafanart_image_paths(&mut image_paths, resource_directory, directory_cache).await
+    {
+        tracing::warn!(
+            item_id = %source.item_id,
+            %error,
+            "local movie extrafanart directory could not be read"
+        );
+        report.mark_item_failed(&source.item_id);
+        return None;
+    }
+    let local_image_paths = image_paths
+        .iter()
+        .filter(|path| !is_resource_extrafanart_image(path, resource_directory))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut images =
+        if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
+            find_local_images_for_media(local_image_paths.iter(), media_stem)
+        } else {
+            find_local_images(local_image_paths.iter())
+        };
+    images.extend(extrafanart_local_images(&image_paths, resource_directory));
+    images.sort_by(|left, right| left.path.cmp(&right.path));
     let clear_poster_fallback = images
         .iter()
         .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
@@ -5617,6 +5750,10 @@ mod tests {
                 &details,
             )
             .await?;
+        sqlx::query("UPDATE media_items SET nfo_collection_reference_key = '' WHERE id = ?")
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
         let metadata = database
             .find_media_item_metadata(item_id)
             .await?
@@ -5767,6 +5904,10 @@ mod tests {
                 Some(&raw_content_fingerprint),
                 &details,
             )
+            .await?;
+        sqlx::query("UPDATE media_items SET nfo_collection_reference_key = '' WHERE id = ?")
+            .bind(item_id)
+            .execute(database.pool())
             .await?;
 
         let enricher = MetadataEnricher::new(database.clone())
@@ -6072,6 +6213,55 @@ impl DirectoryPathCache {
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+async fn append_extrafanart_image_paths(
+    resource_paths: &mut Vec<PathBuf>,
+    resource_directory: &Path,
+    directory_cache: &mut DirectoryPathCache,
+) -> Result<(), MetadataError> {
+    let extrafanart_directories = resource_paths
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("extrafanart"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for directory in extrafanart_directories {
+        let metadata =
+            fs::symlink_metadata(&directory)
+                .await
+                .map_err(|source| MetadataError::Io {
+                    path: directory.clone(),
+                    source,
+                })?;
+        if !metadata.file_type().is_dir() || directory.parent() != Some(resource_directory) {
+            continue;
+        }
+        let child_paths = directory_cache.get(&directory).await?;
+        for path in child_paths.iter() {
+            if !is_supported_local_image_path(path) {
+                continue;
+            }
+            let metadata =
+                fs::symlink_metadata(path)
+                    .await
+                    .map_err(|source| MetadataError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+            if metadata.file_type().is_file() {
+                resource_paths.push(path.clone());
+            }
+        }
+    }
+
+    resource_paths.sort();
+    resource_paths.dedup();
+    Ok(())
 }
 
 pub(crate) fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {

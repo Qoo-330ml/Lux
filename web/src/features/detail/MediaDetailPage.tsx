@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, Star, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
@@ -169,14 +169,15 @@ export function MediaDetailPage() {
     : mediaTitle(seriesContext.data ?? media);
   const detailOriginalTitle = media.originalTitle?.trim();
   const localNfo = media.nfo;
-  const providerIds = { ...localNfo?.providerIds, ...media.providerIds };
-  const tmdbId = providerId(providerIds, "tmdb");
   const premiereDate = media.premiereDate ?? localNfo?.premiered ?? localNfo?.releaseDate;
+  const releaseYear = media.productionYear
+    ?? (premiereDate ? String(premiereDate).match(/^\d{4}/)?.[0] : undefined);
+  const badges = sourceBadges(source, selectedAudioStreamIndex);
   const rating = media.rating ?? localNfo?.rating;
-  const ratingSource = media.ratingSource ?? (localNfo?.rating != null ? "NFO" : undefined);
   const runtimeTicks = media.runtimeTicks ?? runtimeTicksFromMinutes(localNfo?.runtime);
   const status = media.status ?? localNfo?.status;
   const originalLanguage = media.originalLanguage ?? localNfo?.originalLanguage;
+  const mediaTagline = localNfo?.tagline?.trim();
   const detailSubtitle = isSeason
     ? `第 ${media.parentIndexNumber ?? ""} 季`
     : isEpisode
@@ -313,30 +314,50 @@ export function MediaDetailPage() {
             {collectionId ? <Link className="lux-detail-collection-return" to={`/collections/${encodeURIComponent(collectionId)}`}><ArrowLeft size={15} aria-hidden="true" /> 返回合集</Link> : null}
             <div className="lux-detail-title-row" data-has-logo={logoUrl ? "true" : undefined}>
               {logoUrl ? <img className="lux-detail-logo" src={logoUrl} alt={`${mediaTitle(media)} 徽标`} /> : null}
-              <h1>{detailTitle}</h1>
-              {detailOriginalTitle && detailOriginalTitle !== detailTitle
-                ? <p className="lux-detail-original-title">{detailOriginalTitle}</p>
-                : null}
+              <div className="lux-detail-title-names">
+                <h1>{detailTitle}</h1>
+                {detailOriginalTitle && detailOriginalTitle !== detailTitle
+                  ? <span className="lux-detail-original-title">{detailOriginalTitle}</span>
+                  : null}
+              </div>
               {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
             </div>
             <div className="lux-detail-meta">
               {isVideo ? <span>其他视频</span> : null}
-              {premiereDate
-                ? <span>首播 {premiereDate}</span>
-                : media.productionYear
-                  ? <span>{media.productionYear}</span>
-                  : null}
-              {addedAt && addedAtLabel
-                ? <span>添加于 <time dateTime={addedAt.toISOString()}>{addedAtLabel}</time></span>
-                : null}
+              {isSeries ? (
+                premiereDate ? (
+                  <span>首播 {premiereDate}</span>
+                ) : releaseYear ? (
+                  <span>{releaseYear}</span>
+                ) : null
+              ) : releaseYear ? (
+                <span>{releaseYear}</span>
+              ) : null}
+              {isVideo && !releaseYear && addedAt && addedAtLabel ? (
+                <span>添加于 <time dateTime={addedAt.toISOString()}>{addedAtLabel}</time></span>
+              ) : null}
               {isSeries && media.seasonCount != null ? <span>{media.seasonCount} 季</span> : null}
               {isSeries && media.episodeCount != null ? <span>{media.episodeCount} 集</span> : null}
-              {tmdbId ? <span>TMDb {tmdbId}</span> : null}
-              {rating != null && Number.isFinite(rating)
-                ? <span>{ratingSource ? `${ratingSource} 评分` : "评分"} {rating.toFixed(1)}</span>
-                : null}
+              {rating != null && Number.isFinite(rating) ? (
+                <span className="lux-detail-meta-rating">
+                  <Star size={13} className="lux-rating-star" fill="currentColor" aria-hidden="true" />
+                  <span>{rating.toFixed(1)} 评分</span>
+                </span>
+              ) : null}
               {runtimeLabel(runtimeTicks) ? <span>{runtimeLabel(runtimeTicks)}</span> : null}
-              {source?.qualityLabel ? <span>{source.qualityLabel}</span> : null}
+              {badges.length ? (
+                <span className="lux-detail-meta-badges" aria-label="音画规格">
+                  {badges.map((badge) => (
+                    <span
+                      key={badge.key}
+                      className={`lux-badge-pill lux-detail-badge ${badge.className ?? ""}`}
+                      title={badge.title}
+                    >
+                      {badge.label}
+                    </span>
+                  ))}
+                </span>
+              ) : null}
             </div>
             <ExpandableOverview overview={media.overview || "暂无简介。"} />
             <div className="lux-hero-actions">
@@ -411,9 +432,9 @@ export function MediaDetailPage() {
           </div>
         </div>
         <div className="lux-detail-sections">
-          <div className="lux-detail-hierarchy">
-            {isSeries ? (
-              singleSeason ? (
+          {(!isSeries || singleSeason) ? (
+            <div className="lux-detail-hierarchy">
+              {isSeries && singleSeason ? (
                 <SeasonEpisodes
                   episodes={episodeItems}
                   total={episodes.data?.pages[0]?.total}
@@ -425,19 +446,31 @@ export function MediaDetailPage() {
                   error={episodes.error}
                   onLoadMore={() => void episodes.fetchNextPage()}
                 />
-              ) : (
-                <SeriesChildren
-                  seasons={seasons.data?.items ?? []}
-                  series={media}
-                />
-              )
-            ) : null}
-            {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
-            {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
-          </div>
+              ) : null}
+              {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
+              {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+            </div>
+          ) : null}
+          {mediaTagline ? (
+            <div className="lux-detail-tagline-wrap">
+              <div className="lux-detail-tagline lux-media-nfo-tagline font-serif">
+                <span className="lux-tagline-quote" aria-hidden="true">“</span>
+                <span className="lux-tagline-text">{mediaTagline}</span>
+                <span className="lux-tagline-quote" aria-hidden="true">”</span>
+              </div>
+            </div>
+          ) : null}
           <div className="lux-detail-cast">
             <MediaCast actors={media.actors ?? []} />
           </div>
+          {isSeries && !singleSeason ? (
+            <div className="lux-detail-series-seasons">
+              <SeriesChildren
+                seasons={seasons.data?.items ?? []}
+                series={media}
+              />
+            </div>
+          ) : null}
           {showStills ? <MediaStills images={itemImages.data?.images ?? []} title={detailTitle} /> : null}
           <div className="lux-detail-nfo">
             <MediaNfoPanel
@@ -815,8 +848,99 @@ function uniqueSourceLabels(labels: Array<string | undefined>) {
   });
 }
 
-function providerId(providerIds: Record<string, string> | null | undefined, provider: string) {
-  return Object.entries(providerIds ?? {}).find(([name]) => name.toLowerCase() === provider.toLowerCase())?.[1];
+type SourceBadge = {
+  key: string;
+  label: string;
+  className?: string;
+  title?: string;
+};
+
+function audioBadgeLabel(stream?: MediaStream) {
+  if (!stream) return undefined;
+  const codec = stream.codec?.trim().toUpperCase();
+  const title = stream.title?.trim() ?? "";
+  if (/atmos/i.test(title)) {
+    return "Atmos";
+  }
+  const rawChannels = stream.details?.Channels;
+  const channels = typeof rawChannels === "number" ? rawChannels : Number(rawChannels);
+  const channelText = channels === 8 ? "7.1" : channels === 6 ? "5.1" : channels === 2 ? "2.0" : undefined;
+
+  if (codec === "TRUEHD") return channelText ? `TrueHD ${channelText}` : "TrueHD";
+  if (codec === "DTS" || codec === "DCA") {
+    if (/dts-hd\s*ma/i.test(title)) return channelText ? `DTS-HD MA ${channelText}` : "DTS-HD MA";
+    return channelText ? `DTS ${channelText}` : "DTS";
+  }
+  if (codec === "EAC3") return channelText ? `E-AC3 ${channelText}` : "E-AC3";
+  if (codec === "AC3") return channelText ? `AC3 ${channelText}` : "AC3";
+  if (codec === "AAC") return channelText ? `AAC ${channelText}` : "AAC";
+  if (codec === "FLAC") return channelText ? `FLAC ${channelText}` : "FLAC";
+  return codec ? (channelText ? `${codec} ${channelText}` : codec) : undefined;
+}
+
+function sourceBadges(source?: MediaSource, selectedAudioStreamIndex?: string): SourceBadge[] {
+  if (!source) return [];
+  const videoStream = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
+  const audioStreams = streamsOfType(source, "AUDIO");
+  const activeAudioStream = audioStreams.find((stream) => String(stream.index) === selectedAudioStreamIndex) ?? audioStreams[0];
+
+  const qualityTokens = splitSourceInfo(source.qualityLabel);
+  const qualityRange = qualityTokens.find(dynamicRangeToken);
+  const rawResolution = qualityTokens.find((token) => !dynamicRangeToken(token)) || source.qualityLabel?.trim();
+  const codec = videoCodecLabel(videoStream);
+  const range = dynamicRangeLabel(videoStream) ?? qualityRange;
+  const bitDepth = bitDepthLabel(videoStream);
+  const audio = audioBadgeLabel(activeAudioStream);
+
+  const badges: SourceBadge[] = [];
+
+  if (rawResolution) {
+    const is4k = /4k|2160/i.test(rawResolution);
+    const is1080p = /1080/i.test(rawResolution);
+    badges.push({
+      key: "resolution",
+      label: is4k ? "4K UHD" : is1080p ? "1080P" : rawResolution.toUpperCase(),
+      className: is4k ? "is-4k" : is1080p ? "is-1080p" : undefined,
+      title: "分辨率",
+    });
+  }
+
+  if (codec) {
+    badges.push({
+      key: "codec",
+      label: codec,
+      title: "视频编码",
+    });
+  }
+
+  if (range) {
+    const isHdr = /hdr|dolby|dovi|hlg/i.test(range);
+    badges.push({
+      key: "range",
+      label: range,
+      className: isHdr ? "is-hdr" : undefined,
+      title: "动态范围",
+    });
+  }
+
+  if (bitDepth) {
+    badges.push({
+      key: "bitDepth",
+      label: bitDepth,
+      title: "色深",
+    });
+  }
+
+  if (audio) {
+    badges.push({
+      key: "audio",
+      label: audio,
+      className: "is-audio",
+      title: "音频格式",
+    });
+  }
+
+  return badges;
 }
 
 function SeriesChildren({
@@ -829,7 +953,10 @@ function SeriesChildren({
   return (
     <section className="lux-series-children" aria-labelledby="series-children-heading">
       <div className="lux-section-heading">
-        <h2 id="series-children-heading">播出季</h2>
+        <div className="lux-heading-lead">
+          <h2 id="series-children-heading">播出季</h2>
+          <span className="lux-section-heading-sub">SEASONS</span>
+        </div>
         <span>{seasons.length} 个季度</span>
       </div>
       <div className="lux-season-rail" role="list" aria-label="播出季">
@@ -880,7 +1007,10 @@ function SeasonEpisodes({
   return (
     <section className="lux-season-episodes" aria-labelledby="season-episodes-heading">
       <div className="lux-section-heading">
-        <h2 id="season-episodes-heading">单集</h2>
+        <div className="lux-heading-lead">
+          <h2 id="season-episodes-heading">单集</h2>
+          <span className="lux-section-heading-sub">EPISODES</span>
+        </div>
         <span>{total ?? episodes.length} 集</span>
       </div>
       {episodesPending ? <p className="lux-muted-copy">正在加载单集…</p> : null}
@@ -946,7 +1076,10 @@ function EpisodeRail({
   return (
     <section className="lux-episode-rail" aria-labelledby="episode-rail-heading">
       <div className="lux-section-heading">
-        <h2 id="episode-rail-heading">更多来自第 {seasonNumber ?? ""} 季</h2>
+        <div className="lux-heading-lead">
+          <h2 id="episode-rail-heading">更多来自第 {seasonNumber ?? ""} 季</h2>
+          <span className="lux-section-heading-sub">MORE EPISODES</span>
+        </div>
         <span>{otherEpisodes.length} 集</span>
       </div>
       <div className="lux-episode-card-rail" role="list">

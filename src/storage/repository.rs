@@ -2411,6 +2411,7 @@ pub(crate) struct StoredUserItemState {
     pub(crate) position_ticks: i64,
     pub(crate) is_played: bool,
     pub(crate) is_favorite: bool,
+    pub(crate) hide_from_resume: bool,
     pub(crate) play_count: i64,
     pub(crate) last_played_at: Option<i64>,
     pub(crate) version: i64,

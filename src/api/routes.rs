@@ -152,6 +152,59 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 )
                 .propagate_x_request_id(),
         )
+        .layer(middleware::from_fn(web_asset_cache_policy))
+}
+
+async fn web_asset_cache_policy(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if let Some(policy) = web_asset_cache_control(&path, content_type) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(policy));
+    }
+    response
+}
+
+fn web_asset_cache_control(path: &str, content_type: &str) -> Option<&'static str> {
+    if is_api_or_emby_namespace_path(path) {
+        return None;
+    }
+    if content_type.starts_with("text/html") {
+        return Some("no-store");
+    }
+    if !path.starts_with("/assets/") {
+        return None;
+    }
+
+    if has_content_hash(path) {
+        Some("public, max-age=31536000, immutable")
+    } else {
+        Some("no-cache")
+    }
+}
+
+fn has_content_hash(path: &str) -> bool {
+    let Some(file_name) = path.rsplit('/').next() else {
+        return false;
+    };
+    let Some((stem, _extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+
+    stem.match_indices('-').any(|(index, _)| {
+        let suffix = &stem[index + 1..];
+        suffix.len() >= 8
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    })
 }
 
 fn add_performance_probe_headers(
@@ -275,6 +328,27 @@ fn catalog_route_class(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_documents_and_assets_receive_version_aware_cache_policy() {
+        assert_eq!(
+            web_asset_cache_control("/admin/changelog", "text/html; charset=utf-8"),
+            Some("no-store")
+        );
+        assert_eq!(
+            web_asset_cache_control("/assets/AdminChangelogPage-a1b2c3d4.js", "text/javascript"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            web_asset_cache_control("/assets/lux.js", "text/javascript"),
+            Some("no-cache")
+        );
+        assert_eq!(
+            web_asset_cache_control("/api/v1/me", "application/json"),
+            None
+        );
+        assert_eq!(web_asset_cache_control("/emby/Users", "text/html"), None);
+    }
 
     #[test]
     fn homepage_carousel_uses_the_isolated_home_worker_pool() {

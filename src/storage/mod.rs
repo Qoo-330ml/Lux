@@ -117,15 +117,17 @@ mod tests {
             )
             .is_none()
         );
-        assert!(
-            GlobalMovieCollectionReference::from_nfo(
-                &provider_ids,
-                Some("TMDB"),
-                Some("tmdb:1281825"),
-                Some("  "),
-                None,
-            )
-            .is_none()
+        let unnamed = GlobalMovieCollectionReference::from_nfo(
+            &provider_ids,
+            Some("TMDB"),
+            Some("tmdb:1281825"),
+            Some("  "),
+            None,
+        )
+        .expect("reliable set ID remains usable without a collection title");
+        assert_eq!(
+            unnamed.collection_title,
+            "__lux_pending_collection_title__:tmdb:1281825"
         );
     }
 
@@ -249,7 +251,7 @@ mod tests {
             database
                 .select_metadata_candidate_with_collection_reference(
                     selection_update(item_id, second_candidate_id, "Review", true),
-                    None,
+                    Some(&reference),
                 )
                 .await?
         );
@@ -263,7 +265,7 @@ mod tests {
                 .bind(item_id)
                 .fetch_one(database.pool())
                 .await?;
-        assert_eq!(reference_count, 0);
+        assert_eq!(reference_count, 1);
         assert_eq!(identification_status, "PENDING");
 
         let third_candidate_id = "collection-reference-third";
@@ -334,6 +336,16 @@ pub(crate) struct GlobalMovieCollectionReference {
     pub(crate) sort_order: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub(crate) struct StoredMovieNfoCollectionReferenceReconciliation {
+    pub(crate) item_id: String,
+    pub(crate) provider_ids_json: Option<String>,
+    pub(crate) metadata_scraper_id: Option<String>,
+    pub(crate) library_scraper_id: Option<String>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) nfo_metadata_json: String,
+}
+
 impl GlobalMovieCollectionReference {
     pub(crate) fn identity_key(&self) -> String {
         global_movie_collection_reference_identity_key(
@@ -383,12 +395,17 @@ impl GlobalMovieCollectionReference {
             } else {
                 reliable_external_id(raw_set_id)?
             };
+        let collection_title = collection_title
+            .and_then(reliable_collection_title)
+            .unwrap_or_else(|| {
+                collection_title_placeholder(&movie_provider, &collection_provider_id)
+            });
         Some(Self {
             movie_provider: movie_provider.clone(),
             movie_provider_id,
             collection_provider: movie_provider,
             collection_provider_id,
-            collection_title: reliable_collection_title(collection_title?)?,
+            collection_title,
             sort_order: sort_order.filter(|value| *value > 0),
         })
     }
@@ -421,7 +438,11 @@ impl GlobalMovieCollectionReference {
         if !namespace_is_recognized {
             return None;
         }
-        let collection_title = reliable_collection_title(collection_title?)?;
+        let collection_title = collection_title
+            .and_then(reliable_collection_title)
+            .unwrap_or_else(|| {
+                collection_title_placeholder(&collection_provider, &collection_provider_id)
+            });
         let movie_identity =
             unique_provider_id(movie_provider_ids, &collection_provider).or_else(|| {
                 selected_movie_provider.and_then(|provider| {
@@ -456,6 +477,16 @@ pub(crate) fn global_movie_collection_reference_identity_key(
     format!("{movie_provider}:{movie_provider_id}:{collection_provider}:{collection_provider_id}")
 }
 
+const PENDING_GLOBAL_COLLECTION_TITLE_PREFIX: &str = "__lux_pending_collection_title__:";
+
+pub(crate) fn global_collection_title_is_placeholder(title: &str) -> bool {
+    title.starts_with(PENDING_GLOBAL_COLLECTION_TITLE_PREFIX)
+}
+
+pub(crate) fn global_collection_title_fallback(provider: &str, collection_id: &str) -> String {
+    format!("合集 {provider}:{collection_id}")
+}
+
 fn reliable_provider_namespace(value: &str) -> Option<String> {
     let provider = value
         .trim()
@@ -484,6 +515,10 @@ fn reliable_external_id(value: &str) -> Option<String> {
 fn reliable_collection_title(value: &str) -> Option<String> {
     let title = value.trim();
     (!title.is_empty() && title.len() <= 1024).then(|| title.to_owned())
+}
+
+fn collection_title_placeholder(provider: &str, collection_id: &str) -> String {
+    format!("{PENDING_GLOBAL_COLLECTION_TITLE_PREFIX}{provider}:{collection_id}")
 }
 
 fn unique_provider_id(

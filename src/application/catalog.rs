@@ -424,15 +424,46 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<GlobalCollectionPage, CatalogError> {
-        let (stored_cards, total) = self
-            .database
-            .list_global_collection_cards_page(
-                &principal.user_id_string(),
-                principal.is_admin,
-                offset,
-                limit,
-            )
-            .await?;
+        self.list_global_collection_cards_ordered(principal, offset, limit, false)
+            .await
+    }
+
+    pub async fn list_recent_global_collection_cards(
+        &self,
+        principal: AccessPrincipal,
+        offset: i64,
+        limit: i64,
+    ) -> Result<GlobalCollectionPage, CatalogError> {
+        self.list_global_collection_cards_ordered(principal, offset, limit, true)
+            .await
+    }
+
+    async fn list_global_collection_cards_ordered(
+        &self,
+        principal: AccessPrincipal,
+        offset: i64,
+        limit: i64,
+        recently_updated_first: bool,
+    ) -> Result<GlobalCollectionPage, CatalogError> {
+        let (stored_cards, total) = if recently_updated_first {
+            self.database
+                .list_recent_global_collection_cards_page(
+                    &principal.user_id_string(),
+                    principal.is_admin,
+                    offset,
+                    limit,
+                )
+                .await?
+        } else {
+            self.database
+                .list_global_collection_cards_page(
+                    &principal.user_id_string(),
+                    principal.is_admin,
+                    offset,
+                    limit,
+                )
+                .await?
+        };
         let item_ids = stored_cards
             .iter()
             .map(|card| card.item_id.clone())
@@ -1182,6 +1213,25 @@ impl CatalogService {
     ) -> Result<CatalogPage, CatalogError> {
         self.list_progress_items(principal, user_id, series_id, offset, limit, &["EPISODE"])
             .await
+    }
+
+    pub(crate) async fn set_resume_hidden(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+        hidden: bool,
+    ) -> Result<Option<crate::storage::StoredUserItemState>, CatalogError> {
+        if !self.access.can_view_item(principal, item_id).await? {
+            return Err(CatalogError::AccessDenied);
+        }
+        let user_id = principal.user_id_string();
+        self.database
+            .set_user_item_resume_hidden(&user_id, item_id, hidden)
+            .await?;
+        Ok(self
+            .database
+            .find_user_item_state(&user_id, item_id)
+            .await?)
     }
 
     pub async fn list_continue_watching(
@@ -2757,6 +2807,110 @@ mod tests {
             .await
             .expect("a failed search flight must wake waiters");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_visibility_is_user_scoped_and_filtered_before_series_ranking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                access::{AccessPrincipal, MediaAccessService},
+                libraries::LibraryService,
+            },
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::Database,
+        };
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let users = UserStore::new(database.clone())?;
+        let owner = users
+            .create_user("resume-owner", "Owner", "test password", true)
+            .await?;
+        let other = users
+            .create_user("resume-other", "Other", "test password", true)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Series", LibraryKind::Series, false)
+            .await?;
+        let series_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+                     VALUES (?, ?, 'SERIES', 'Series', 'series', 'LOCAL_CONFIRMED')")
+            .bind(&series_id).bind(library.id.to_string()).execute(database.pool()).await?;
+        let mut episodes = Vec::new();
+        for number in [1_i64, 2] {
+            let item_id = uuid::Uuid::now_v7().to_string();
+            sqlx::query("INSERT INTO media_items (id, library_id, item_type, series_id, season_number,
+                         episode_number, title, sort_title, runtime_ticks, identification_status, has_available_source)
+                         VALUES (?, ?, 'EPISODE', ?, 1, ?, 'Episode', 'episode', 36000000000, 'LOCAL_CONFIRMED', 1)")
+                .bind(&item_id).bind(library.id.to_string()).bind(&series_id).bind(number)
+                .execute(database.pool()).await?;
+            for user_id in [owner.id, other.id] {
+                sqlx::query("INSERT INTO user_item_state (user_id, item_id, position_ticks, is_favorite, last_played_at)
+                             VALUES (?, ?, 6000000000, 1, 12345)")
+                    .bind(user_id.to_string()).bind(&item_id).execute(database.pool()).await?;
+            }
+            episodes.push(item_id);
+        }
+        let catalog =
+            super::CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+        let principal = AccessPrincipal::new(owner.id, true);
+        // The marked episode must not suppress the earlier eligible episode.
+        let hidden = catalog
+            .set_resume_hidden(principal, &episodes[1], true)
+            .await?
+            .ok_or("missing state")?;
+        let duplicate = catalog
+            .set_resume_hidden(principal, &episodes[1], true)
+            .await?
+            .ok_or("missing state")?;
+        assert_eq!(hidden, duplicate);
+        assert_eq!(hidden.position_ticks, 6_000_000_000);
+        assert!(hidden.is_favorite);
+        assert!(!hidden.is_played);
+        let page = catalog
+            .list_continue_watching(principal, &owner.id.to_string(), 0, 1)
+            .await?;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, episodes[0]);
+        let other_page = catalog
+            .list_continue_watching(
+                AccessPrincipal::new(other.id, true),
+                &other.id.to_string(),
+                0,
+                1,
+            )
+            .await?;
+        assert_eq!(other_page.items[0].id, episodes[1]);
+        catalog
+            .set_resume_hidden(principal, &episodes[0], true)
+            .await?;
+        let empty = catalog
+            .list_continue_watching(principal, &owner.id.to_string(), 10, 1)
+            .await?;
+        assert_eq!(empty.total, 0);
+        assert!(empty.items.is_empty());
+        let restored = catalog
+            .set_resume_hidden(principal, &episodes[1], false)
+            .await?
+            .ok_or("missing state")?;
+        assert_eq!(restored.position_ticks, hidden.position_ticks);
+        assert_eq!(restored.last_played_at, hidden.last_played_at);
+        let page = catalog
+            .list_continue_watching(principal, &owner.id.to_string(), 0, 1)
+            .await?;
+        assert_eq!(page.items[0].id, episodes[1]);
+        let empty = catalog
+            .list_continue_watching(principal, &owner.id.to_string(), 10, 1)
+            .await?;
+        assert_eq!(empty.total, 1);
+        database.close().await;
+        Ok(())
     }
 
     #[tokio::test]

@@ -246,7 +246,18 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     assert_eq!(detail.status(), StatusCode::OK);
     let detail_body: Value = detail.json().await?;
     assert_eq!(detail_body["rating"], 8.6);
-    assert_eq!(detail_body["ratingSource"], "TMDB");
+    assert_eq!(detail_body["ratingSource"], "NFO");
+    assert_eq!(detail_body["nfo"]["tagline"], "速度与信念");
+    assert_eq!(
+        detail_body["nfo"]["website"],
+        "https://example.invalid/movie"
+    );
+    assert_eq!(detail_body["nfo"]["genres"], json!(["剧情", "喜剧"]));
+    assert_eq!(detail_body["nfo"]["directors"][0]["name"], "导演甲");
+    assert_eq!(
+        detail_body["nfo"]["trailers"][0],
+        "https://www.youtube.com/watch?v=abc123"
+    );
     let candidate_status: String =
         sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
             .bind(&candidate_id)
@@ -396,6 +407,8 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
         json!({
             "title": "Online Title",
             "overview": "Online Overview",
+            "tagline": "Full refresh tagline",
+            "genres": ["New genre"],
             "posterUrl": format!("{image_url}/poster")
         }),
     )
@@ -415,6 +428,14 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
     let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>本地标题</title>"));
     assert!(nfo.contains("<plot>Online Overview</plot>"));
+    let nfo_details_json: String =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&fixture.item_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let nfo_details: Value = serde_json::from_str(&nfo_details_json)?;
+    assert_eq!(nfo_details["tagline"], "Full refresh tagline");
+    assert_eq!(nfo_details["genres"], json!(["New genre"]));
     assert_eq!(
         tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
         PNG_1X1

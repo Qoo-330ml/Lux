@@ -2086,6 +2086,34 @@ fn append_movie_nfo_fields(
     writer: &mut Writer<Vec<u8>>,
     patch: &MovieNfoMetadata,
 ) -> Result<(), NfoWriteError> {
+    const FRAGMENT_ROOT: &str = "lux-nfo-fragment";
+    const FRAGMENT_PREFIX: &[u8] = b"<lux-nfo-fragment>";
+    const FRAGMENT_SUFFIX: &[u8] = b"</lux-nfo-fragment>";
+
+    let mut fragment_writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    start_element(&mut fragment_writer, FRAGMENT_ROOT, None)?;
+    write_movie_nfo_fields(&mut fragment_writer, patch)?;
+    end_element(&mut fragment_writer, FRAGMENT_ROOT)?;
+
+    let fragment = fragment_writer.into_inner();
+    let Some(inner) = fragment
+        .strip_prefix(FRAGMENT_PREFIX)
+        .and_then(|fragment| fragment.strip_suffix(FRAGMENT_SUFFIX))
+    else {
+        return Err(NfoWriteError::InvalidXml(
+            "failed to format generated movie NFO fields".to_owned(),
+        ));
+    };
+    if !inner.iter().all(u8::is_ascii_whitespace) {
+        writer.get_mut().extend_from_slice(inner);
+    }
+    Ok(())
+}
+
+fn write_movie_nfo_fields(
+    writer: &mut Writer<Vec<u8>>,
+    patch: &MovieNfoMetadata,
+) -> Result<(), NfoWriteError> {
     for actor in patch.actors.iter().take(MAX_MOVIE_NFO_ACTORS) {
         start_element(writer, "actor", None)?;
         write_simple_element(writer, "name", actor.name.trim())?;

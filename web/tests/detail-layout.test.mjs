@@ -179,15 +179,29 @@ test("media cast has no separator line", () => {
   assert.doesNotMatch(castRule, /border-top/);
 });
 
-test("media metadata surface shows the page image through in both themes", () => {
+test("media metadata uses an unframed surface with compact spacing", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const darkPanelRule = stylesheet.match(/\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
-  const lightPanelRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const component = readFileSync(new URL("../src/features/detail/MediaNfoPanel.tsx", import.meta.url), "utf8");
+  const taxonomyRule = stylesheet.match(/\.lux-media-nfo-taxonomy\s*\{([^}]*)\}/)?.[1] ?? "";
+  const secondaryRule = stylesheet.match(/\.lux-media-nfo-secondary\s*\{([^}]*)\}/)?.[1] ?? "";
+  const linksRule = stylesheet.match(/\.lux-media-nfo-links\s*\{([^}]*)\}/)?.[1] ?? "";
+  const taglineRule = stylesheet.match(/\.lux-media-nfo-tagline\s*\{([^}]*)\}/)?.[1] ?? "";
   const lightOverlayRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-detail-overlay\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(darkPanelRule, /background:\s*rgba\(22,\s*22,\s*25,\s*\.5\)/);
-  assert.match(darkPanelRule, /backdrop-filter:\s*blur\(12px\)/);
-  assert.match(lightPanelRule, /background:\s*rgba\(255,\s*255,\s*255,\s*\.22\)/);
+  assert.match(component, /lux-media-nfo-content space-y-3/);
+  assert.doesNotMatch(component, /lux-surface-panel|lux-media-nfo-card/);
+  assert.doesNotMatch(stylesheet, /\.lux-media-nfo-card/);
+  assert.doesNotMatch(component, /lux-media-nfo-taxonomy[^\"]*border-b/);
+  assert.doesNotMatch(component, /lux-media-nfo-secondary[^\"]*border-t/);
+  assert.doesNotMatch(taxonomyRule, /border-bottom/);
+  assert.match(taxonomyRule, /padding-bottom:\s*4px/);
+  assert.doesNotMatch(secondaryRule, /border-top/);
+  assert.match(secondaryRule, /padding:\s*4px 0 0/);
+  assert.doesNotMatch(linksRule, /border-top/);
+  assert.match(linksRule, /padding:\s*0/);
+  assert.match(taglineRule, /font-size:\s*1rem/);
+  assert.match(component, /lux-media-nfo-tagline[^\"]*font-serif/);
+  assert.doesNotMatch(component, /lux-media-nfo-tagline[^\"]*text-xs/);
   assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.4\)/);
   assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.28\)/);
 });
@@ -269,7 +283,7 @@ test("media detail track selectors fit without overlap and use compact controls"
   assert.match(menuOptionRule, /font-size:\s*\.72rem/);
 });
 
-test("mobile detail pages use a full-bleed portrait poster and logo-first identity", () => {
+test("mobile detail pages use a full-bleed portrait poster and keep the logo above bilingual titles", () => {
   const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
@@ -285,7 +299,42 @@ test("mobile detail pages use a full-bleed portrait poster and logo-first identi
   assert.match(posterRule, /border-radius:\s*0/);
   assert.match(posterRule, /box-shadow:\s*none/);
   assert.match(mobileStyles, /\.lux-detail-backdrop\s*\{[^}]*display:\s*none/);
-  assert.match(mobileStyles, /\.lux-detail-title-row\[data-has-logo="true"\]\s+h1\s*\{[^}]*display:\s*none/);
+  assert.doesNotMatch(mobileStyles, /\.lux-detail-title-row\[data-has-logo="true"\]\s+h1\s*\{[^}]*display:\s*none/);
+  assert.match(stylesheet, /\.lux-detail-title-names\s*\{[^}]*display:\s*flex/);
+});
+
+test("detail logos use a separate row above the bilingual title group", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const titleRowStart = source.indexOf('className="lux-detail-title-row"');
+  const logoStart = source.indexOf('className="lux-detail-logo"', titleRowStart);
+  const titleNamesStart = source.indexOf('className="lux-detail-title-names"', titleRowStart);
+  const titleNamesEnd = source.indexOf("</div>", titleNamesStart);
+  const titleNames = titleNamesStart >= 0 && titleNamesEnd > titleNamesStart
+    ? source.slice(titleNamesStart, titleNamesEnd)
+    : "";
+  const titleRowRule = stylesheet.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.ok(logoStart >= titleRowStart && titleNamesStart > logoStart);
+  assert.ok(titleNames.includes("<h1>") && titleNames.includes('className="lux-detail-original-title"'));
+  assert.match(titleRowRule, /flex-direction:\s*column/);
+  assert.match(stylesheet, /\.lux-detail-title-names\s*\{[^}]*display:\s*flex/);
+});
+
+test("series seasons sit between cast and stills with a gap before more information", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const desktopSeasonRule = stylesheet.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
+  const desktopNfoRule = stylesheet.match(/\.lux-detail-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileSeasonRule = mobileStyles.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileNfoRule = mobileStyles.match(/\.lux-detail-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(source, /className="lux-detail-series-seasons"/);
+  assert.match(desktopSeasonRule, /order:\s*2/);
+  assert.match(desktopNfoRule, /margin-top:\s*32px/);
+  assert.match(mobileSeasonRule, /order:\s*3/);
+  assert.match(mobileNfoRule, /margin-top:\s*32px/);
 });
 
 test("mobile episode details switch their landscape hero to a portrait poster when available", () => {
@@ -372,12 +421,12 @@ test("mobile detail lower sections reuse the page gutter", () => {
   assert.match(sectionRule, /margin-inline:\s*auto/);
 });
 
-test("mobile NFO headings follow the shared section scale", () => {
+test("detail section headings share the same type scale", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
-  const nfoHeading = mobileStyles.match(/\.lux-media-nfo-heading h2\s*\{([^}]*)\}/)?.[1] ?? "";
-  const mediaHeading = mobileStyles.match(/\.lux-media-nfo-media-heading h3\s*\{([^}]*)\}/)?.[1] ?? "";
+  const headingRule = stylesheet.match(/\.lux-detail-page \.lux-media-cast-heading h2,\s*\.lux-detail-page \.lux-media-stills-heading h2,\s*\.lux-detail-page \.lux-section-heading h2,\s*\.lux-detail-page \.lux-media-nfo-heading h2,\s*\.lux-detail-page \.lux-media-nfo-media-heading h3\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(nfoHeading, /font-size:\s*1\.18rem/);
-  assert.match(mediaHeading, /font-size:\s*1rem/);
+  assert.ok(headingRule, "cast, stills, detail sections, more information, and media file headings share one rule");
+  assert.match(headingRule, /font-size:\s*1\.15rem/);
+  assert.match(headingRule, /font-weight:\s*700/);
+  assert.match(headingRule, /letter-spacing:\s*\.02em/);
 });

@@ -195,7 +195,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
 - `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`metadataStatus=PENDING`、`sortBy=Name|DateCreated|PremiereDate|CommunityRating` 和 `sortOrder=Ascending|Descending`（同时兼容下划线参数名），筛选、排序和分页在 SQLite 查询中完成；发行日期排序优先使用完整 `premiere_date`，缺少发行日期时回退到 `production_year`，两者都缺少的条目稳定排在最后；评分排序将无评分条目稳定放在有评分条目之后。`metadataStatus=PENDING` 返回仍有待确认候选的条目。
 - `GET /api/v1/libraries/{libraryId}/latest`：返回该可见媒体库最新的最多 12 条资源，按有效入库时间倒序；剧集使用自身加入时间与最新可用分集加入时间的较大值。
-- `GET /api/v1/home/libraries/latest?libraryId=<id>&libraryId=<id>`：批量返回最多 100 个当前用户可访问媒体库的最新资源，每库最多 12 条；响应为 `{ "libraries": [{ "libraryId": "...", "items": [...] }] }`，空库也返回空 `items`。重复 ID 去重并保留首次出现顺序；缺少 ID、无效 ID 或超过上限返回 400，任何 ID 不可访问时返回 403。每条资源包含当前用户状态、图片标记及元数据待处理标记。
+- `GET /api/v1/home/libraries/latest?libraryId=<id>&libraryId=<id>`：批量返回最多 100 个当前用户可访问媒体库的最新资源，每库最多 12 条；也接受虚拟合集库 ID `00000000-0000-7000-8000-000000000538`，并按当前用户可见的来源媒体库过滤合集、按最近更新时间倒序排列。响应为 `{ "libraries": [{ "libraryId": "...", "items": [...] }] }`，空库也返回空 `items`。重复 ID 去重并保留首次出现顺序；缺少 ID、无效 ID 或超过上限返回 400，普通媒体库 ID 不可访问或合集库没有当前用户可见合集时返回 403。每条资源包含当前用户状态、图片标记及元数据待处理标记；合集卡片还包含 `memberCount` 和 `posterItemId`。
 - `GET /api/v1/favorites?page=1&pageSize=50`：返回当前用户跨可见媒体库的收藏条目，按最近添加倒序分页；服务端执行用户状态和媒体库 ACL。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，默认只返回电影和整剧，不返回季度或单集；结果执行媒体库 ACL。剧集季度/单集通过条目层级接口读取。
 - `GET /api/v1/home/carousel`：返回当前用户最多 7 条推荐轮播资源（`recommended`），执行媒体库 ACL。服务端只缓存这一组推荐数据，并按用户、权限与可见媒体库范围隔离；`home` 更新事件会使其失效。

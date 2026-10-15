@@ -10,6 +10,21 @@ pub(in crate::storage::repository::jobs) fn escape_sql_like_pattern(value: &str)
         .replace('_', "\\_")
 }
 
+fn is_extrafanart_image_relative_path(relative_path: &str) -> bool {
+    let Some((parent, file_name)) = relative_path.rsplit_once('/') else {
+        return false;
+    };
+    let extrafanart_directory = parent.rsplit_once('/').map_or(parent, |(_, name)| name);
+    let Some((_, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    extrafanart_directory.eq_ignore_ascii_case("extrafanart")
+        && matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "webp"
+        )
+}
+
 impl Database {
     pub(crate) async fn list_scan_local_metadata_sources(
         &self,
@@ -72,6 +87,18 @@ impl Database {
                 let directory = (library_root_id, directory_path);
                 if seen_directories.insert(directory.clone()) {
                     referenced_directories.push(directory);
+                }
+                if include_missing_directory_anchors
+                    && is_extrafanart_image_relative_path(&relative_path)
+                {
+                    let parent_path = relative_path
+                        .rsplit_once('/')
+                        .and_then(|(directory, _)| directory.rsplit_once('/'))
+                        .map_or_else(String::new, |(parent, _)| parent.to_owned());
+                    let parent_directory = (row.get("library_root_id"), parent_path);
+                    if seen_directories.insert(parent_directory.clone()) {
+                        referenced_directories.push(parent_directory);
+                    }
                 }
             }
         }

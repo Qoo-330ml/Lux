@@ -30,6 +30,12 @@ const sourceOptions = [
   { value: "", label: "不限来源" },
 ];
 
+function currentImageUrl(image: ItemImage): string {
+  const tag = image.contentTag || image.id;
+  const separator = image.url.includes("?") ? "&" : "?";
+  return `${image.url}${separator}tag=${encodeURIComponent(tag)}`;
+}
+
 export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [imageType, setImageType] = useState("POSTER");
@@ -129,7 +135,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
           <div className="lux-image-editor-current">
             <span className="lux-editor-section-label">当前{selectedLabel}</span>
             <div className="lux-image-current-card" data-image-type={imageType}>
-              {currentImage ? <img src={currentImage.url} alt={`${selectedLabel} 当前图片`} /> : <div><ImageIcon size={26} /><span>尚未设置</span></div>}
+              {currentImage ? <img src={currentImageUrl(currentImage)} alt={`${selectedLabel} 当前图片`} /> : <div><ImageIcon size={26} /><span>尚未设置</span></div>}
             </div>
           </div>
           <div className="lux-image-results" aria-busy={searching}>

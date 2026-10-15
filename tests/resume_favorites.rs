@@ -142,6 +142,114 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(filmly_resume_body["TotalRecordCount"], 1);
     assert_eq!(filmly_resume_body["Items"][0]["Id"], emby_eligible_id);
 
+    // iOS Filmly restores visibility using a JSON body after reading Resume.
+    let original_state: (i64, i64, i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT position_ticks, is_played, is_favorite, play_count, last_played_at
+         FROM user_item_state WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(&admin_id)
+    .bind(&eligible_id)
+    .fetch_one(database.pool())
+    .await?;
+    for prefix in ["/emby", ""] {
+        let flag_url =
+            format!("{base_url}{prefix}/Users/{admin_id}/Items/{emby_eligible_id}/HideFromResume");
+        for use_query in [false, true] {
+            for hidden in [true, true, false, false] {
+                let mut request = client.post(&flag_url).header("X-Emby-Token", &token);
+                request = if use_query {
+                    request.query(&[("Hide", hidden.to_string())])
+                } else {
+                    request.json(&json!({ "Hide": hidden }))
+                };
+                let response = request.send().await?;
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let body = response.json::<Value>().await?;
+                assert_eq!(body["HideFromResume"], hidden);
+                assert_eq!(body["ItemId"], emby_eligible_id);
+                assert_eq!(body["PlaybackPositionTicks"], 1_300_000_000_i64);
+                assert_eq!(body["Played"], false);
+                let resume = client
+                    .get(format!("{base_url}{prefix}/Users/{admin_id}/Items/Resume"))
+                    .header("X-Emby-Token", &token)
+                    .send()
+                    .await?
+                    .json::<Value>()
+                    .await?;
+                assert_eq!(resume["TotalRecordCount"], if hidden { 0 } else { 1 });
+                assert_eq!(
+                    resume["Items"].as_array().map(Vec::len),
+                    Some(if hidden { 0 } else { 1 })
+                );
+                // Empty pages must still count after hidden-item filtering.
+                let empty_page = client
+                    .get(format!("{base_url}{prefix}/Users/{admin_id}/Items/Resume"))
+                    .header("X-Emby-Token", &token)
+                    .query(&[("StartIndex", "100")])
+                    .send()
+                    .await?
+                    .json::<Value>()
+                    .await?;
+                assert_eq!(empty_page["TotalRecordCount"], if hidden { 0 } else { 1 });
+            }
+        }
+        for invalid_body in [
+            json!({}),
+            json!({"Hide": null}),
+            json!({"Hide": "false"}),
+            json!({"Hide": 0}),
+        ] {
+            let response = client
+                .post(&flag_url)
+                .header("X-Emby-Token", &token)
+                .json(&invalid_body)
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        for invalid_query in ["", "Hide=", "Hide=0", "Hide=no", "Hide=true&Hide=false"] {
+            let response = client
+                .post(format!("{flag_url}?{invalid_query}"))
+                .header("X-Emby-Token", &token)
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        let conflicting = client
+            .post(&flag_url)
+            .header("X-Emby-Token", &token)
+            .query(&[("Hide", "true")])
+            .json(&json!({"Hide": false}))
+            .send()
+            .await?;
+        assert_eq!(conflicting.status(), reqwest::StatusCode::BAD_REQUEST);
+        let anonymous = client
+            .post(&flag_url)
+            .json(&json!({"Hide": true}))
+            .send()
+            .await?;
+        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let missing_item = client
+            .post(format!(
+                "{base_url}{prefix}/Users/{admin_id}/Items/{}/HideFromResume",
+                uuid::Uuid::now_v7()
+            ))
+            .header("X-Emby-Token", &token)
+            .json(&json!({"Hide": true}))
+            .send()
+            .await?;
+        assert_eq!(missing_item.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+    let final_state: (i64, i64, i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT position_ticks, is_played, is_favorite, play_count, last_played_at
+         FROM user_item_state WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(&admin_id)
+    .bind(&eligible_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(final_state, original_state);
+
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
@@ -149,6 +257,37 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .await?;
     let session = cookie_value(&web_login, "lux_session")?;
     let csrf = cookie_value(&web_login, "lux_csrf")?;
+    for hidden in [true, false] {
+        let response = client
+            .post(format!(
+                "{base_url}/emby/Users/{admin_id}/Items/{eligible_id}/HideFromResume"
+            ))
+            .query(&[("api_key", token.as_str())])
+            .json(&json!({"Hide": hidden}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let web_resume = client
+            .get(format!(
+                "{base_url}/api/v1/continue-watching?page=1&pageSize=10"
+            ))
+            .header(COOKIE, format!("lux_session={session}"))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        assert_eq!(web_resume["total"], if hidden { 0 } else { 1 });
+        let detail = client
+            .get(format!(
+                "{base_url}/Users/{admin_id}/Items/{emby_eligible_id}"
+            ))
+            .header("X-Emby-Token", &token)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        assert_eq!(detail["UserData"]["HideFromResume"], hidden);
+    }
     let settings = client
         .patch(format!("{base_url}/api/v1/admin/settings"))
         .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
@@ -489,6 +628,20 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .as_str()
         .ok_or("missing viewer token")?
         .to_owned();
+    for (target_user, expected) in [
+        (admin_id.clone(), reqwest::StatusCode::FORBIDDEN),
+        (viewer.id.to_string(), reqwest::StatusCode::NOT_FOUND),
+    ] {
+        let response = client
+            .post(format!(
+                "{base_url}/emby/Users/{target_user}/Items/{emby_eligible_id}/HideFromResume"
+            ))
+            .header("X-Emby-Token", &viewer_token)
+            .json(&json!({"Hide": true}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), expected);
+    }
     let denied_favorites = client
         .get(format!("{base_url}/Users/{admin_id}/FavoriteItems"))
         .header("X-Emby-Token", &viewer_token)
