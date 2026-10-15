@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
@@ -17,6 +17,9 @@ import {
 } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
+
+const EMPTY_LIBRARIES: Library[] = [];
+const EMPTY_MEDIA_ITEMS: MediaItem[] = [];
 
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
@@ -48,8 +51,8 @@ export function HomePage({ user }: { user: LuxUser }) {
     refetchInterval: (query) => homeRefetchInterval(query.state.data),
     refetchIntervalInBackground: false,
   });
-  const libraries = librariesQuery.data?.libraries ?? [];
-  const libraryIds = libraries.map((library) => library.id);
+  const libraries = librariesQuery.data?.libraries ?? EMPTY_LIBRARIES;
+  const libraryIds = useMemo(() => libraries.map((library) => library.id), [libraries]);
   const latestLibrariesQuery = useQuery({
     queryKey: queryKeys.homeLatestLibraries(libraryIds),
     queryFn: ({ signal }) => api.homeLibrariesLatest(libraryIds, signal),
@@ -71,11 +74,11 @@ export function HomePage({ user }: { user: LuxUser }) {
     if (carousel.data) writeHomeCarouselCache(user.id, carousel.data);
   }, [carousel.data, user.id]);
 
-  const continueWatching = continueWatchingQuery.data?.items ?? [];
-  const slides = heroSlides({
-    recommended: carousel.data?.recommended ?? [],
+  const continueWatching = continueWatchingQuery.data?.items ?? EMPTY_MEDIA_ITEMS;
+  const slides = useMemo(() => heroSlides({
+    recommended: carousel.data?.recommended ?? EMPTY_MEDIA_ITEMS,
     continueWatching,
-  });
+  }), [carousel.data?.recommended, continueWatching]);
   const heroIsLoading = slides.length === 0 && (
     carousel.isPending || carousel.isFetching ||
     librariesQuery.isPending || librariesQuery.isFetching ||
@@ -180,14 +183,14 @@ function HomeLatestRail({
   return <MediaRail title={title} items={items ?? []} linkTo={`/libraries/${library.id}`} />;
 }
 
-function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
+const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
   items: MediaItem[];
   continueWatching: MediaItem[];
   isLoading: boolean;
   showEmptyState: boolean;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
-  const slideKey = items.map((item) => item.id).join("|");
+  const slideKey = useMemo(() => items.map((item) => item.id).join("|"), [items]);
 
   useEffect(() => setActiveIndex(0), [slideKey]);
 
@@ -247,7 +250,7 @@ function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
       </AnimatePresence>
     </section>
   );
-}
+});
 
 function heroPlaybackItem(item: MediaItem, continueWatching: MediaItem[]) {
   if (item.itemType === "SERIES") {
