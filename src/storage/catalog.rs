@@ -1729,7 +1729,7 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
                    AND mi.library_id IN ({library_placeholders})
              ),
              eligible AS (
@@ -1858,7 +1858,7 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
                    AND mi.library_id IN ({library_placeholders})
              ), eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
