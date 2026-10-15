@@ -135,7 +135,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 176);
+    assert_eq!(database.schema_version().await?, 177);
     let reconciliation_index: Option<String> = sqlx::query_scalar(
         "SELECT to_regclass('idx_media_items_nfo_collection_reference_pending')::text",
     )
@@ -809,7 +809,7 @@ async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
                     ),
                 ]
             );
-            assert_eq!(database.schema_version().await?, 176);
+            assert_eq!(database.schema_version().await?, 177);
             let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
                 "SELECT version, checksum FROM _sqlx_migrations
                  WHERE version <= $1 ORDER BY version",
@@ -938,7 +938,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 176);
+        assert_eq!(upgraded_database.schema_version().await?, 177);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -1059,7 +1059,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 176);
+    assert_eq!(database.schema_version().await?, 177);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2364,7 +2364,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 176);
+    assert_eq!(database.schema_version().await?, 177);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
@@ -2658,5 +2658,83 @@ async fn insert_postgres_homevideos_video(
     .bind(library_id)
     .execute(database.pool())
     .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL test server"]
+async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("old-migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 176 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let (configuration, database_name) = create_postgres_test_database().await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(
+            &configuration
+                .postgres_url()?
+                .ok_or("missing PostgreSQL URL")?,
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES ('resume-user', 'resume-user', 'Resume User', 'test-only')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('resume-library', 'Resume', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+                 VALUES ('resume-item', 'resume-library', 'MOVIE', 'Resume', 'resume', 'LOCAL_CONFIRMED')")
+        .execute(&pool).await?;
+    sqlx::query("INSERT INTO user_item_state (user_id, item_id, position_ticks, is_favorite,
+                 play_count, last_played_at, version) VALUES ('resume-user', 'resume-item', 1300000000, 1, 2, 12345, 7)")
+        .execute(&pool).await?;
+    sqlx::migrate::Migrator::new(source_dir)
+        .await?
+        .run(&pool)
+        .await?;
+    let row: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT position_ticks, is_played, is_favorite, play_count, last_played_at,
+                version, hide_from_resume FROM user_item_state WHERE item_id = 'resume-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(row, (1300000000, 0, 1, 2, 12345, 7, 0));
+    assert!(
+        sqlx::query("UPDATE user_item_state SET hide_from_resume = 2")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(version, 177);
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
