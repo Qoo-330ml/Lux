@@ -29,6 +29,7 @@ export const changelogReleases: ChangelogRelease[] = [
       ] },
       { kind: "fixed", items: [
         "修复媒体状态、元数据及相关配置变化后，其他登录会话中的页面数据不能及时更新的问题。",
+        "Emby API 在根路径和 `/emby` 前缀下对已注册路径的静态部分不区分 ASCII 大小写，同时保留动态参数、query 和 Lux 原生 API 路径语义。",
       ] },
     ],
   },
