@@ -433,7 +433,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-sections { display: flex; flex-direction: column; }
 .lux-detail-cast { order: 1; }
 .lux-detail-stills { order: 2; }
-.lux-detail-nfo { order: 2; }
+.lux-detail-nfo { order: 2; margin-top: 32px; }
+.lux-detail-series-seasons { order: 2; }
 .lux-detail-hierarchy { order: 3; }
 .lux-hero-actions > .lux-media-actions { position: relative; top: auto; right: auto; align-self: center; }
 .lux-hero-actions > .lux-media-actions .lux-media-actions-trigger { width: 48px; height: 48px; }
@@ -450,11 +451,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-poster-portrait { display: none; }
 .lux-detail-poster span { display: grid; place-items: center; align-content: center; gap: 14px; height: 100%; padding: 25px; color: var(--lux-muted); text-align: center; }
 .lux-detail-title-row { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 14px; }
-.lux-detail-title-row:has(.lux-detail-original-title) { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; }
-.lux-detail-logo { display: block; flex: 0 0 100%; max-width: min(360px, 100%); max-height: 96px; width: auto; height: auto; object-fit: contain; filter: drop-shadow(0 4px 12px rgba(0,0,0,.28)); margin-bottom: 4px; }
+.lux-detail-logo { display: block; flex: 0 0 auto; max-width: min(360px, 100%); max-height: 96px; width: auto; height: auto; object-fit: contain; filter: drop-shadow(0 4px 12px rgba(0,0,0,.28)); margin-bottom: 4px; }
+.lux-detail-title-names { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; width: fit-content; max-width: 100%; min-width: 0; }
 .lux-detail-title-row h1 { min-width: 0; margin: 0; color: #fff; font-size: 26px; font-family: "Songti SC", "STSong", "Songti TC", "SimSun", serif; font-weight: 700; letter-spacing: 0.01em; line-height: 1.15; }
 .lux-detail-original-title { margin: 0; color: rgba(255,255,255,.72); font-family: "Didot", "Bodoni 72", "Bodoni MT", serif; font-size: 1.18rem; font-weight: 300; letter-spacing: .06em; line-height: 1.2; }
-.lux-detail-subtitle { flex: 0 0 100%; margin: -3px 0 0; color: rgba(255,255,255,.72); font-size: .9rem; line-height: 1.4; }
+.lux-detail-subtitle { width: 100%; margin: -3px 0 0; color: rgba(255,255,255,.72); font-size: .9rem; line-height: 1.4; }
 .lux-detail-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--lux-muted); }
 .lux-detail-meta > span + span::before { margin-right: 10px; color: var(--lux-subtle); content: "·"; }
 .lux-detail-meta-rating { display: inline-flex; align-items: center; gap: 4px; color: #fbbf24; font-weight: 550; }
@@ -2039,7 +2040,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-copy { position: relative; z-index: 2; width: 92%; margin: 0 auto; }
   .lux-detail-title-row { position: relative; z-index: 2; align-items: center; margin-top: -168px; text-align: center; }
   .lux-detail-title-row h1 { justify-content: center; }
-  .lux-detail-title-row[data-has-logo="true"] h1 { display: none; }
   .lux-detail-logo { max-width: min(78vw, 360px); max-height: 84px; }
   .lux-detail-original-title, .lux-detail-subtitle { text-align: center; }
   .lux-detail-meta { justify-content: center; text-align: center; }
@@ -2071,7 +2071,9 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-cast { order: 2; }
   .lux-media-cast { margin-top: 32px; padding-top: 12px; }
   .lux-detail-stills { order: 3; margin-top: 32px; padding-top: 12px; }
-  .lux-detail-nfo { order: 3; }
+  .lux-detail-nfo { order: 3; margin-top: 32px; }
+  .lux-detail-series-seasons { order: 3; margin-top: 32px; }
+  .lux-detail-series-seasons > .lux-series-children { margin-top: 0; padding-top: 0; }
   .lux-season-episode-row { grid-template-columns: minmax(120px, 36vw) minmax(0, 1fr); gap: 12px; }
   .lux-season-episode-arrow { display: none; }
   .lux-media-info { margin-top: 52px; }

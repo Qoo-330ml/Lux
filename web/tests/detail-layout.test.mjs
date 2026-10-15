@@ -283,7 +283,7 @@ test("media detail track selectors fit without overlap and use compact controls"
   assert.match(menuOptionRule, /font-size:\s*\.72rem/);
 });
 
-test("mobile detail pages use a full-bleed portrait poster and logo-first identity", () => {
+test("mobile detail pages use a full-bleed portrait poster and keep the logo above bilingual titles", () => {
   const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
@@ -299,7 +299,42 @@ test("mobile detail pages use a full-bleed portrait poster and logo-first identi
   assert.match(posterRule, /border-radius:\s*0/);
   assert.match(posterRule, /box-shadow:\s*none/);
   assert.match(mobileStyles, /\.lux-detail-backdrop\s*\{[^}]*display:\s*none/);
-  assert.match(mobileStyles, /\.lux-detail-title-row\[data-has-logo="true"\]\s+h1\s*\{[^}]*display:\s*none/);
+  assert.doesNotMatch(mobileStyles, /\.lux-detail-title-row\[data-has-logo="true"\]\s+h1\s*\{[^}]*display:\s*none/);
+  assert.match(stylesheet, /\.lux-detail-title-names\s*\{[^}]*display:\s*flex/);
+});
+
+test("detail logos use a separate row above the bilingual title group", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const titleRowStart = source.indexOf('className="lux-detail-title-row"');
+  const logoStart = source.indexOf('className="lux-detail-logo"', titleRowStart);
+  const titleNamesStart = source.indexOf('className="lux-detail-title-names"', titleRowStart);
+  const titleNamesEnd = source.indexOf("</div>", titleNamesStart);
+  const titleNames = titleNamesStart >= 0 && titleNamesEnd > titleNamesStart
+    ? source.slice(titleNamesStart, titleNamesEnd)
+    : "";
+  const titleRowRule = stylesheet.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.ok(logoStart >= titleRowStart && titleNamesStart > logoStart);
+  assert.ok(titleNames.includes("<h1>") && titleNames.includes('className="lux-detail-original-title"'));
+  assert.match(titleRowRule, /flex-direction:\s*column/);
+  assert.match(stylesheet, /\.lux-detail-title-names\s*\{[^}]*display:\s*flex/);
+});
+
+test("series seasons sit between cast and stills with a gap before more information", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const desktopSeasonRule = stylesheet.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
+  const desktopNfoRule = stylesheet.match(/\.lux-detail-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileSeasonRule = mobileStyles.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileNfoRule = mobileStyles.match(/\.lux-detail-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(source, /className="lux-detail-series-seasons"/);
+  assert.match(desktopSeasonRule, /order:\s*2/);
+  assert.match(desktopNfoRule, /margin-top:\s*32px/);
+  assert.match(mobileSeasonRule, /order:\s*3/);
+  assert.match(mobileNfoRule, /margin-top:\s*32px/);
 });
 
 test("mobile episode details switch their landscape hero to a portrait poster when available", () => {

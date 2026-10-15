@@ -313,10 +313,12 @@ export function MediaDetailPage() {
             {collectionId ? <Link className="lux-detail-collection-return" to={`/collections/${encodeURIComponent(collectionId)}`}><ArrowLeft size={15} aria-hidden="true" /> 返回合集</Link> : null}
             <div className="lux-detail-title-row" data-has-logo={logoUrl ? "true" : undefined}>
               {logoUrl ? <img className="lux-detail-logo" src={logoUrl} alt={`${mediaTitle(media)} 徽标`} /> : null}
-              <h1>{detailTitle}</h1>
-              {detailOriginalTitle && detailOriginalTitle !== detailTitle
-                ? <span className="lux-detail-original-title">{detailOriginalTitle}</span>
-                : null}
+              <div className="lux-detail-title-names">
+                <h1>{detailTitle}</h1>
+                {detailOriginalTitle && detailOriginalTitle !== detailTitle
+                  ? <span className="lux-detail-original-title">{detailOriginalTitle}</span>
+                  : null}
+              </div>
               {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
             </div>
             <div className="lux-detail-meta">
@@ -429,9 +431,9 @@ export function MediaDetailPage() {
           </div>
         </div>
         <div className="lux-detail-sections">
-          <div className="lux-detail-hierarchy">
-            {isSeries ? (
-              singleSeason ? (
+          {(!isSeries || singleSeason) ? (
+            <div className="lux-detail-hierarchy">
+              {isSeries && singleSeason ? (
                 <SeasonEpisodes
                   episodes={episodeItems}
                   total={episodes.data?.pages[0]?.total}
@@ -443,19 +445,22 @@ export function MediaDetailPage() {
                   error={episodes.error}
                   onLoadMore={() => void episodes.fetchNextPage()}
                 />
-              ) : (
-                <SeriesChildren
-                  seasons={seasons.data?.items ?? []}
-                  series={media}
-                />
-              )
-            ) : null}
-            {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
-            {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
-          </div>
+              ) : null}
+              {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
+              {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+            </div>
+          ) : null}
           <div className="lux-detail-cast">
             <MediaCast actors={media.actors ?? []} />
           </div>
+          {isSeries && !singleSeason ? (
+            <div className="lux-detail-series-seasons">
+              <SeriesChildren
+                seasons={seasons.data?.items ?? []}
+                series={media}
+              />
+            </div>
+          ) : null}
           {showStills ? <MediaStills images={itemImages.data?.images ?? []} title={detailTitle} /> : null}
           <div className="lux-detail-nfo">
             <MediaNfoPanel
