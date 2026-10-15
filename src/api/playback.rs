@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "emby_resume_visibility.rs"]
+mod resume_visibility;
+pub(super) use resume_visibility::emby_hide_from_resume;
+
 use crate::application::playback::{
     decision::ServerTier,
     hls::{HlsSegmentContainer, HlsStartOptions},
