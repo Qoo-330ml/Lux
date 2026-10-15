@@ -432,6 +432,8 @@ describe("HomePage shelves", () => {
     });
 
     await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
+    expect(container.querySelector(".lux-hero-copy")?.getAttribute("aria-label")).toContain("精选电影");
+    expect(container.querySelector(".lux-hero-copy-animated")).not.toBeNull();
     const controls = container.querySelector(".lux-hero-carousel-controls");
     expect(controls?.querySelectorAll(".lux-hero-carousel-arrow")).toHaveLength(0);
     expect(controls?.querySelectorAll(".lux-hero-dot")).toHaveLength(2);
@@ -443,6 +445,8 @@ describe("HomePage shelves", () => {
     });
     await waitForHomeUpdate(() => expect(container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.getAttribute("aria-current"))
       .toBe("true"));
+    await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-copy")?.getAttribute("aria-label"))
+      .toContain("精选剧集"));
     const nextDots = container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
     expect(nextDots[1].getAttribute("aria-current")).toBe("true");
     expect(nextDots[1].querySelector(".lux-hero-dot-progress")).not.toBeNull();
@@ -483,6 +487,9 @@ describe("HomePage shelves", () => {
       vi.useFakeTimers();
       await act(async () => {
         container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.click();
+        await Promise.resolve();
+      });
+      await act(async () => {
         vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS);
         vi.advanceTimersByTime(450);
       });
