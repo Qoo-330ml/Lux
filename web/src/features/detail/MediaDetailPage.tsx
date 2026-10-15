@@ -6,9 +6,7 @@ import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
-import { MediaCast } from "./MediaCast";
-import { MediaNfoPanel } from "./MediaNfoPanel";
-import { MediaStills } from "./MediaStills";
+import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
@@ -175,8 +173,6 @@ export function MediaDetailPage() {
   const badges = sourceBadges(source, selectedAudioStreamIndex);
   const rating = media.rating ?? localNfo?.rating;
   const runtimeTicks = media.runtimeTicks ?? runtimeTicksFromMinutes(localNfo?.runtime);
-  const status = media.status ?? localNfo?.status;
-  const originalLanguage = media.originalLanguage ?? localNfo?.originalLanguage;
   const mediaTagline = localNfo?.tagline?.trim();
   const detailSubtitle = isSeason
     ? `第 ${media.parentIndexNumber ?? ""} 季`
@@ -461,7 +457,7 @@ export function MediaDetailPage() {
             </div>
           ) : null}
           <div className="lux-detail-cast">
-            <MediaCast actors={media.actors ?? []} />
+            <MediaCastSection actors={media.actors} />
           </div>
           {isSeries && !singleSeason ? (
             <div className="lux-detail-series-seasons">
@@ -471,21 +467,9 @@ export function MediaDetailPage() {
               />
             </div>
           ) : null}
-          {showStills ? <MediaStills images={itemImages.data?.images ?? []} title={detailTitle} /> : null}
+          {showStills ? <MediaStillsSection itemId={media.id} title={detailTitle} /> : null}
           <div className="lux-detail-nfo">
-            <MediaNfoPanel
-              details={localNfo}
-              originalTitle={detailOriginalTitle !== detailTitle ? detailOriginalTitle : undefined}
-              productionYear={media.productionYear}
-              addedAtLabel={addedAtLabel}
-              mediaInfo={source ? {
-                source,
-                itemType: media.itemType,
-                lastAirDate: media.lastAirDate,
-                status,
-                originalLanguage,
-              } : undefined}
-            />
+            <MediaNfoSection item={media} source={source} detailTitle={detailTitle} addedAtLabel={addedAtLabel} />
           </div>
         </div>
       </div>

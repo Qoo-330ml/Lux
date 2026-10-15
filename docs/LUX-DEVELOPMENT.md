@@ -11662,6 +11662,41 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
+#### LUX-550：拆分媒体卡片并按需加载编辑器
+
+范围：执行前端重构方案第一项。将 MediaCard 拆为 memo 外壳、纯展示层、操作触发层及条件加载的编辑器层；五种编辑器按打开动作动态导入。库页多选传递稳定回调和条目 ID，单张卡片选择不重绘其余卡片。保持首页、库页、搜索、收藏、文件夹和只读合集卡片的既有展示及操作语义。
+
+验收：
+
+- [ ] 无关父状态更新不重绘 props 未变的卡片；选择单项只更新目标卡片，操作状态不重绘展示层。
+- [ ] 五种编辑器初次展示卡片时均不加载，仅打开对应功能时加载和挂载；关闭卸载，删除保留默认源选择及成功移除行为。
+- [ ] 标题、年份、图片版本、评分、集数、进度、待确认标记、导航、错误提示及只读/文件夹限制保留并有回归。
+- [ ] 冻结依赖安装、Web 测试、生产构建及相关 Playwright 流程验证完成；记录本机 ARM 性能与首屏 bundle 前后数据，不把方案预期比例当作实测结果。
+
+预计增量：一（4 文件）：本文档、`web/src/features/home/media.tsx`、`media-card-editors.tsx`、`web/tests/media-card-loading.test.tsx`；二（至多 5 文件）：`media.tsx`、`media-card.tsx`、`media-card-visual.tsx`、`media-card-overlay.tsx`、`web/tests/media-card-performance.test.tsx`；三（至多 5 文件）：`web/src/features/library/LibraryPage.tsx`、库页性能回归、随组件搬迁调整的静态布局测试、本文档和性能记录。每个增量测试通过后独立提交。
+
+#### LUX-550：隔离媒体详情页查询与交互渲染
+
+范围：落实项目所有者提供的前端重构方案第三项。路由入口仅订阅当前 item；Hero、操作区、版本/轨道选择、剧集、演员、剧照和 NFO 按关注点拆分。操作区独立持有 playback query、操作及编辑器状态，编辑器按需动态导入；剧集和剧照查询只更新相关子树。保留 15 秒刷新、API、布局与现有用户流程；SSE 刷新策略属于方案第五项，不在本任务引入。
+
+验收：
+
+- [ ] playback、剧集、剧照查询变化不重渲染无关 Hero、演员和 NFO；真实数据变化仍展示最新值。
+- [ ] 保留电影/视频/剧集/季度/单集布局、季海报回退、单季展开、分集分页和下一集播放。
+- [ ] 保留版本/音轨/字幕切换、收藏/已看、元数据确认、下一个待确认、编辑与删除流程。
+- [ ] 编辑器仅在打开时动态加载；保持加载和失败反馈。
+- [ ] 针对性回归、完整 Web 检查及真实浏览器验证完成，记录优化前后渲染次数与限制。
+
+预计文件按四个代码增量与最终验证增量拆分，每次提交不超过五个文件：
+
+1. 本文档、`web/src/features/detail/MediaDetailPage.tsx`、`MediaDetailSections.tsx`、`web/tests/media-detail-performance.test.tsx`：隔离演员/剧照/NFO。
+2. `MediaDetailPage.tsx`、`MediaEpisodesSection.tsx`、`useMediaEpisodes.ts`、性能回归：隔离剧集查询与列表。
+3. `MediaDetailPage.tsx`、`MediaDetailHero.tsx`、`MediaSourcePanel.tsx`、`media-source.ts`、`web/tests/detail-layout.test.mjs`：拆分 Hero 与版本轨道状态。
+4. `MediaDetailPage.tsx`、`MediaDetailActions.tsx`、`MediaDetailEditors.tsx`、`web/tests/detail-logo-layout.test.mjs`、详情回归：操作区和编辑器延迟加载。
+5. 本文档、`docs/COMPATIBILITY.md`、性能回归与浏览器验证脚本：验收与证据。
+
+验证环境：本机 macOS arm64；仅前端修改，不声称 NAS/x86 或生产性能。Cargo 命令统一使用 Toshiba 上的共享 target。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
