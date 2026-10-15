@@ -424,15 +424,46 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<GlobalCollectionPage, CatalogError> {
-        let (stored_cards, total) = self
-            .database
-            .list_global_collection_cards_page(
-                &principal.user_id_string(),
-                principal.is_admin,
-                offset,
-                limit,
-            )
-            .await?;
+        self.list_global_collection_cards_ordered(principal, offset, limit, false)
+            .await
+    }
+
+    pub async fn list_recent_global_collection_cards(
+        &self,
+        principal: AccessPrincipal,
+        offset: i64,
+        limit: i64,
+    ) -> Result<GlobalCollectionPage, CatalogError> {
+        self.list_global_collection_cards_ordered(principal, offset, limit, true)
+            .await
+    }
+
+    async fn list_global_collection_cards_ordered(
+        &self,
+        principal: AccessPrincipal,
+        offset: i64,
+        limit: i64,
+        recently_updated_first: bool,
+    ) -> Result<GlobalCollectionPage, CatalogError> {
+        let (stored_cards, total) = if recently_updated_first {
+            self.database
+                .list_recent_global_collection_cards_page(
+                    &principal.user_id_string(),
+                    principal.is_admin,
+                    offset,
+                    limit,
+                )
+                .await?
+        } else {
+            self.database
+                .list_global_collection_cards_page(
+                    &principal.user_id_string(),
+                    principal.is_admin,
+                    offset,
+                    limit,
+                )
+                .await?
+        };
         let item_ids = stored_cards
             .iter()
             .map(|card| card.item_id.clone())

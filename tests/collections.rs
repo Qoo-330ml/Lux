@@ -1035,6 +1035,46 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
         "viewer-visible-movie"
     );
 
+    let latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookie)
+        .query(&[
+            ("libraryId", visible_library.id.to_string()),
+            ("libraryId", collection_library_id.clone()),
+        ])
+        .send()
+        .await?;
+    let latest_batch_status = latest_batch.status();
+    let latest_batch_text = latest_batch.text().await?;
+    assert_eq!(
+        latest_batch_status,
+        reqwest::StatusCode::OK,
+        "{latest_batch_text}"
+    );
+    let latest_batch: Value = serde_json::from_str(&latest_batch_text)?;
+    assert_eq!(latest_batch["libraries"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        latest_batch["libraries"][0]["libraryId"],
+        visible_library.id.to_string()
+    );
+    assert_eq!(
+        latest_batch["libraries"][0]["items"][0]["id"],
+        "viewer-visible-movie"
+    );
+    assert_eq!(
+        latest_batch["libraries"][1]["libraryId"],
+        collection_library_id
+    );
+    assert_eq!(
+        latest_batch["libraries"][1]["items"][0]["title"],
+        "Viewer Series"
+    );
+    assert_eq!(latest_batch["libraries"][1]["items"][0]["memberCount"], 1);
+    assert_eq!(
+        latest_batch["libraries"][1]["items"][0]["posterItemId"],
+        "viewer-visible-movie"
+    );
+
     let collection_item_id = global_page["items"][0]["id"]
         .as_str()
         .ok_or("missing collection item id")?;
@@ -1142,6 +1182,16 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
         .send()
         .await?;
     let isolated_cookie = cookie_pair(isolated_login.headers());
+    let isolated_collection_latest = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &isolated_cookie)
+        .query(&[("libraryId", collection_library_id)])
+        .send()
+        .await?;
+    assert_eq!(
+        isolated_collection_latest.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
     let isolated_libraries = client
         .get(format!("{base_url}/api/v1/libraries"))
         .header(COOKIE, &isolated_cookie)
