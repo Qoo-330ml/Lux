@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 test("detail logo sits above the title in the copy column", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailHero.tsx", import.meta.url), "utf8");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const titleRowStart = source.indexOf('className="lux-detail-title-row"');
   const titleRowEnd = source.indexOf("</div>", titleRowStart);

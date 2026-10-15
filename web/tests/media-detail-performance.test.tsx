@@ -117,3 +117,17 @@ it("updates episode data without recalculating the hero or rendering unrelated s
   expect(heroRenders() - beforeHero).toBe(0);
   expect(renderCounts()).toEqual(before);
 });
+
+it.each(["playback", "stills"])("keeps hero artwork stable during %s query updates", async (query) => {
+  const poster = vi.spyOn(mediaVisuals, "posterUrlWithFallback");
+  await renderDetail();
+  const before = poster.mock.calls.length;
+  if (query === "playback") client.setQueryData(queryKeys.playback("movie-1"), { isFavorite: true });
+  else client.setQueryData(queryKeys.itemImages("movie-1"), { images: [{
+    id: "still-2", itemId: "movie-1", imageType: "FANART", imageIndex: 0, url: "/new-still.png",
+  }] });
+  await flushQueries();
+  if (query === "stills") expect(container.querySelector(".lux-detail-stills img")?.getAttribute("src")).toBe("/new-still.png");
+  else expect(container.querySelector("[data-action='toggle-favorite']")?.getAttribute("aria-pressed")).toBe("true");
+  expect(poster.mock.calls.length - before).toBe(0);
+});

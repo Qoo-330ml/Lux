@@ -1,14 +1,14 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, Star, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { ArrowLeft, Check, Heart, Play, Radio } from "lucide-react";
+import { useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
 import { MediaSourcePanel, MediaSourceProvider, useMediaSource } from "./MediaSourcePanel";
-import { sourceBadges, streamsOfType } from "./media-source";
+import { streamsOfType } from "./media-source";
 import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
-import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
+import { mediaTitle } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
@@ -16,6 +16,7 @@ import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
 import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
 import { MediaEpisodesSection, MediaEpisodePlayButton } from "./MediaEpisodesSection";
+import { MediaDetailArtwork, MediaDetailHero } from "./MediaDetailHero";
 import { LuxLogo } from "../../components/LuxLogo";
 
 export function MediaDetailPage() {
@@ -42,12 +43,6 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
   const collectionId = searchParams.get("collectionId") ?? undefined;
   const queryClient = useQueryClient();
   const { source, selectedAudioStreamIndex, selectedSubtitleStreamIndex } = useMediaSource();
-  const itemImages = useQuery({
-    queryKey: queryKeys.itemImages(itemId),
-    queryFn: () => api.itemImages(itemId),
-    enabled: Boolean(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
-  });
   const playback = useQuery({
     queryKey: queryKeys.playback(itemId),
     queryFn: () => api.playback(itemId),
@@ -66,59 +61,9 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
   const [confirmingMetadata, setConfirmingMetadata] = useState(false);
   const [pendingPlaybackAction, setPendingPlaybackAction] = useState<"favorite" | "played">();
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const isSeries = media.itemType === "SERIES";
-  const isSeason = media.itemType === "SEASON";
-  const isEpisode = media.itemType === "EPISODE";
-  const isVideo = media.itemType === "VIDEO";
-  const hierarchySeriesId = media && !isSeries
-    ? media.seriesId ?? media.parentId ?? undefined
-    : undefined;
-  const seriesContext = useQuery({
-    queryKey: queryKeys.item(hierarchySeriesId ?? ""),
-    queryFn: () => api.item(hierarchySeriesId ?? ""),
-    enabled: Boolean(hierarchySeriesId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
-  });
-  const addedAtCandidate = typeof media.addedAt === "number" && Number.isFinite(media.addedAt)
-    ? new Date(media.addedAt * 1000)
-    : undefined;
-  const addedAt = addedAtCandidate && Number.isFinite(addedAtCandidate.getTime())
-    ? addedAtCandidate
-    : undefined;
-  const addedAtLabel = addedAt?.toLocaleString("zh-CN", {
-    year: "numeric",
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  });
-  const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
-  const logoUrl = logo?.url ?? imageUrl(media, "logo");
-  const seriesImageFallback = isSeason ? seriesContext.data : undefined;
-  const backdrop = imageUrl(media, "fanart")
-    ?? imageUrl(media)
-    ?? (seriesImageFallback ? imageUrl(seriesImageFallback, "fanart") ?? imageUrl(seriesImageFallback) : undefined);
-  const poster = posterUrlWithFallback(media, seriesImageFallback);
-  const detailKind = isVideo ? "video" : isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
+  const detailKind = ({ VIDEO: "video", SERIES: "series", SEASON: "season", EPISODE: "episode" } as Record<string, string>)[media.itemType ?? ""] ?? "movie";
   const showStills = media.itemType === "MOVIE" || media.itemType === "SERIES";
-  const detailTitle = isSeries || (!isSeason && !isEpisode)
-    ? mediaTitle(media)
-    : mediaTitle(seriesContext.data ?? media);
-  const detailOriginalTitle = media.originalTitle?.trim();
-  const localNfo = media.nfo;
-  const premiereDate = media.premiereDate ?? localNfo?.premiered ?? localNfo?.releaseDate;
-  const releaseYear = media.productionYear
-    ?? (premiereDate ? String(premiereDate).match(/^\d{4}/)?.[0] : undefined);
-  const badges = sourceBadges(source, selectedAudioStreamIndex);
-  const rating = media.rating ?? localNfo?.rating;
-  const runtimeTicks = media.runtimeTicks ?? runtimeTicksFromMinutes(localNfo?.runtime);
-  const mediaTagline = localNfo?.tagline?.trim();
-  const detailSubtitle = isSeason
-    ? `第 ${media.parentIndexNumber ?? ""} 季`
-    : isEpisode
-      ? episodeTitle(media)
-      : undefined;
+  const mediaTagline = media.nfo?.tagline?.trim();
   const watchQuery = source ? new URLSearchParams({ sourceId: source.id }) : undefined;
   const firstAudioStreamIndex = streamsOfType(source, "AUDIO")[0]?.index;
   if (watchQuery && selectedAudioStreamIndex && selectedAudioStreamIndex !== String(firstAudioStreamIndex ?? "")) {
@@ -228,72 +173,13 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
         </Link>
         <MediaActionMenu item={media} className="lux-detail-mobile-menu" sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
       </div>
-      {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
+      <MediaDetailArtwork media={media} placement="backdrop" />
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
         <div className="lux-detail-grid">
-          <div className="lux-detail-poster-column">
-            <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}${isEpisode && poster ? " has-portrait" : ""}`}>
-              {isEpisode && backdrop
-                ? <>
-                  <img className="lux-detail-poster-landscape" src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
-                  {poster ? <img className="lux-detail-poster-portrait" src={poster} alt={`${mediaTitle(media)} 海报`} /> : null}
-                </>
-                : poster
-                  ? <img src={poster} alt={`${mediaTitle(media)} 海报`} />
-                  : <span><Sparkles size={32} />{mediaTitle(media)}</span>}
-            </div>
-          </div>
+          <MediaDetailArtwork media={media} placement="poster" />
           <div className="lux-detail-copy">
-            {collectionId ? <Link className="lux-detail-collection-return" to={`/collections/${encodeURIComponent(collectionId)}`}><ArrowLeft size={15} aria-hidden="true" /> 返回合集</Link> : null}
-            <div className="lux-detail-title-row" data-has-logo={logoUrl ? "true" : undefined}>
-              {logoUrl ? <img className="lux-detail-logo" src={logoUrl} alt={`${mediaTitle(media)} 徽标`} /> : null}
-              <div className="lux-detail-title-names">
-                <h1>{detailTitle}</h1>
-                {detailOriginalTitle && detailOriginalTitle !== detailTitle
-                  ? <span className="lux-detail-original-title">{detailOriginalTitle}</span>
-                  : null}
-              </div>
-              {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
-            </div>
-            <div className="lux-detail-meta">
-              {isVideo ? <span>其他视频</span> : null}
-              {isSeries ? (
-                premiereDate ? (
-                  <span>首播 {premiereDate}</span>
-                ) : releaseYear ? (
-                  <span>{releaseYear}</span>
-                ) : null
-              ) : releaseYear ? (
-                <span>{releaseYear}</span>
-              ) : null}
-              {isVideo && !releaseYear && addedAt && addedAtLabel ? (
-                <span>添加于 <time dateTime={addedAt.toISOString()}>{addedAtLabel}</time></span>
-              ) : null}
-              {isSeries && media.seasonCount != null ? <span>{media.seasonCount} 季</span> : null}
-              {isSeries && media.episodeCount != null ? <span>{media.episodeCount} 集</span> : null}
-              {rating != null && Number.isFinite(rating) ? (
-                <span className="lux-detail-meta-rating">
-                  <Star size={13} className="lux-rating-star" fill="currentColor" aria-hidden="true" />
-                  <span>{rating.toFixed(1)} 评分</span>
-                </span>
-              ) : null}
-              {runtimeLabel(runtimeTicks) ? <span>{runtimeLabel(runtimeTicks)}</span> : null}
-              {badges.length ? (
-                <span className="lux-detail-meta-badges" aria-label="音画规格">
-                  {badges.map((badge) => (
-                    <span
-                      key={badge.key}
-                      className={`lux-badge-pill lux-detail-badge ${badge.className ?? ""}`}
-                      title={badge.title}
-                    >
-                      {badge.label}
-                    </span>
-                  ))}
-                </span>
-              ) : null}
-            </div>
-            <ExpandableOverview overview={media.overview || "暂无简介。"} />
+            <MediaDetailHero media={media} collectionId={collectionId} />
             <div className="lux-hero-actions">
               {watchHref ? (
                 <Link className="lux-button lux-button-large lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
@@ -345,9 +231,9 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
             <MediaCastSection actors={media.actors} />
           </div>
           </MediaEpisodesSection>
-          {showStills ? <MediaStillsSection itemId={media.id} title={detailTitle} /> : null}
+          {showStills ? <MediaStillsSection itemId={media.id} title={mediaTitle(media)} /> : null}
           <div className="lux-detail-nfo">
-            <MediaNfoSection item={media} source={source} detailTitle={detailTitle} addedAtLabel={addedAtLabel} />
+            <MediaNfoSection item={media} source={source} />
           </div>
         </div>
       </div>
@@ -360,100 +246,5 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
       {deleteOpen ? <MediaDeleteDialog item={media} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(media.id, source?.id)} onDeleted={() => navigate("/libraries")} /> : null}
       {editor === "identify" ? <MediaIdentifier item={media} onClose={() => setEditor(undefined)} onSaved={() => { void queryClient.invalidateQueries({ queryKey: queryKeys.item(media.id) }); void queryClient.invalidateQueries({ queryKey: pendingItemsQueryKey }); }} /> : null}
     </article>
-  );
-}
-
-function runtimeTicksFromMinutes(minutes?: number | null) {
-  if (minutes == null || !Number.isFinite(minutes) || minutes < 0) return undefined;
-  return minutes * 60 * 10_000_000;
-}
-
-function ExpandableOverview({ overview }: { overview: string }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [isOverflowing, setIsOverflowing] = useState(overview.length > 120);
-  const overviewTextRef = useRef<HTMLParagraphElement>(null);
-  const moreButtonRef = useRef<HTMLButtonElement>(null);
-  const closeButtonRef = useRef<HTMLButtonElement>(null);
-  const wasOpenRef = useRef(false);
-
-  useEffect(() => {
-    const element = overviewTextRef.current;
-    if (!element) return undefined;
-
-    const measureOverflow = () => {
-      if (element.scrollHeight === 0 && element.clientHeight === 0) return;
-      setIsOverflowing(element.scrollHeight > element.clientHeight + 1);
-    };
-    measureOverflow();
-    if (typeof ResizeObserver === "undefined") return undefined;
-    const observer = new ResizeObserver(measureOverflow);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [overview]);
-
-  useEffect(() => {
-    if (!isOpen) {
-      if (wasOpenRef.current) moreButtonRef.current?.focus();
-      wasOpenRef.current = false;
-      return undefined;
-    }
-
-    wasOpenRef.current = true;
-    closeButtonRef.current?.focus();
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIsOpen(false);
-    };
-    document.addEventListener("keydown", closeOnEscape);
-
-    return () => {
-      document.removeEventListener("keydown", closeOnEscape);
-      document.body.style.overflow = previousOverflow;
-    };
-  }, [isOpen]);
-
-  return (
-    <>
-      <div className="lux-detail-overview">
-        <p ref={overviewTextRef} className="lux-detail-overview-text">{overview}</p>
-        {isOverflowing ? (
-          <span className="lux-detail-overview-more-wrap">
-            <span aria-hidden="true">...</span>
-            <button
-              ref={moreButtonRef}
-              className="lux-detail-overview-more is-underlined"
-              type="button"
-              onClick={() => setIsOpen(true)}
-              aria-haspopup="dialog"
-            >
-              更多
-            </button>
-          </span>
-        ) : null}
-      </div>
-      {isOpen ? (
-        <div
-          className="lux-detail-overview-dialog-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setIsOpen(false);
-          }}
-        >
-          <section className="lux-detail-overview-dialog" role="dialog" aria-modal="true" aria-labelledby="detail-overview-heading">
-            <header className="lux-detail-overview-dialog-header">
-              <div>
-                <h2 id="detail-overview-heading">详细简介</h2>
-              </div>
-              <button ref={closeButtonRef} className="lux-detail-overview-dialog-close" type="button" aria-label="关闭详细信息" onClick={() => setIsOpen(false)}>
-                <X size={19} />
-              </button>
-            </header>
-            <div className="lux-detail-overview-dialog-body">
-              <p>{overview}</p>
-            </div>
-          </section>
-        </div>
-      ) : null}
-    </>
   );
 }

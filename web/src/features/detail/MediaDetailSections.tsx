@@ -3,6 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaActor, MediaItem, MediaSource } from "../../lib/api/types";
+import { detailAddedAt, useSeriesContext } from "./MediaDetailHero";
+import { mediaTitle } from "../home/media";
 import { MediaCast } from "./MediaCast";
 import { MediaNfoPanel } from "./MediaNfoPanel";
 import { MediaStills } from "./MediaStills";
@@ -22,13 +24,14 @@ export const MediaStillsSection = memo(function MediaStillsSection({ itemId, tit
   return <MediaStills images={images.data?.images ?? []} title={title} />;
 });
 
-export const MediaNfoSection = memo(function MediaNfoSection({ item, source, detailTitle, addedAtLabel }: {
+export const MediaNfoSection = memo(function MediaNfoSection({ item, source }: {
   item: MediaItem;
   source?: MediaSource;
-  detailTitle: string;
-  addedAtLabel?: string;
 }) {
   const originalTitle = item.originalTitle?.trim();
+  const series = useSeriesContext(item);
+  const detailTitle = item.itemType === "SEASON" || item.itemType === "EPISODE" ? mediaTitle(series ?? item) : mediaTitle(item);
+  const { addedAtLabel } = detailAddedAt(item);
   return <MediaNfoPanel
     details={item.nfo}
     originalTitle={originalTitle !== detailTitle ? originalTitle : undefined}
