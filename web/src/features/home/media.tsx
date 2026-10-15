@@ -7,11 +7,8 @@ import { api } from "../../lib/api/client";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
-import { MediaImageEditor } from "../media/MediaImageEditor";
-import { MediaIdentifier } from "../media/MediaIdentifier";
-import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
-import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
-import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
+
+import { MediaCardEditors } from "./media-card-editors";
 
 export function mediaTitle(item: MediaItem) {
   return item.title || item.name || "未命名媒体";
@@ -216,11 +213,7 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
-      {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-      {editor === "images" ? <MediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-      {editor === "subtitles" ? <MediaSubtitleEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-      {deleteOpen ? <MediaDeleteDialog item={item} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(item.id, item.mediaSources?.find((source) => source.isDefault)?.id)} onDeleted={() => setDeleted(true)} /> : null}
-      {editor === "identify" ? <MediaIdentifier item={item} onClose={() => setEditor(undefined)} /> : null}
+      <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={() => setEditor(undefined)} onDeleteClose={() => setDeleteOpen(false)} onDeleted={() => setDeleted(true)} />
     </>
   );
 }
