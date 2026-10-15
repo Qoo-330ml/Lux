@@ -56,6 +56,11 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert!(response.text().await?.is_empty());
     }
+    for path in ["/sYsTeM/pInG", "/eMbY/sYsTeM/pInG"] {
+        let response = client.get(format!("http://{address}{path}")).send().await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await?.is_empty());
+    }
     for path in ["/System/Ping", "/emby/System/Ping"] {
         let response = client
             .post(format!("http://{address}{path}"))
@@ -66,7 +71,7 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     }
 
     let login = client
-        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .post(format!("http://{address}/users/authenticatebyname"))
         .header(
             "Authorization",
             r#"Emby Client="Infuse", Device="iPhone", DeviceId="device-1", Version="1.2.3""#,
@@ -74,11 +79,45 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
         .json(&serde_json::json!({ "Username": "Admin", "Pw": "correct password" }))
         .send()
         .await?;
+    assert!(
+        login
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+    );
     let login_body: serde_json::Value = login.json().await?;
     let token = login_body["AccessToken"]
         .as_str()
         .ok_or("missing token")?
         .to_owned();
+    let user_id = login_body["User"]["Id"]
+        .as_str()
+        .ok_or("missing authenticated user id")?;
+
+    let mixed_case_login = client
+        .post(format!("http://{address}/eMbY/uSeRs/aUtHeNtIcAtEbYnAmE"))
+        .header(
+            "Authorization",
+            r#"Emby Client="Infuse", Device="iPhone", DeviceId="device-2", Version="1.2.3""#,
+        )
+        .json(&serde_json::json!({ "Username": "Admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(mixed_case_login.status(), reqwest::StatusCode::OK,);
+    let mixed_case_login_body: serde_json::Value = mixed_case_login.json().await?;
+    assert!(mixed_case_login_body["AccessToken"].as_str().is_some());
+
+    let mixed_case_user = client
+        .get(format!(
+            "http://{address}/eMbY/uSeRs/{}/iTeMs/rOoT?api_key={token}",
+            user_id.to_ascii_uppercase()
+        ))
+        .send()
+        .await?;
+    assert_eq!(mixed_case_user.status(), reqwest::StatusCode::OK);
+    let mixed_case_user_body: serde_json::Value = mixed_case_user.json().await?;
+    assert!(mixed_case_user_body.is_object());
 
     let public = client
         .get(format!("http://{address}/System/Info/Public"))

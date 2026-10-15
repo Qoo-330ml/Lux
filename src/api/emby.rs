@@ -5,19 +5,50 @@ use axum::extract::DefaultBodyLimit;
 mod credentials;
 pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-credential";
 
-pub(super) fn api_routes() -> Router<AppState> {
+struct EmbyRouteBuilder {
+    router: Router<AppState>,
+    path_templates: Vec<String>,
+}
+
+impl EmbyRouteBuilder {
+    fn new() -> Self {
+        Self {
+            router: Router::new(),
+            path_templates: Vec::new(),
+        }
+    }
+
+    fn route(mut self, path: &str, methods: axum::routing::MethodRouter<AppState>) -> Self {
+        if self
+            .path_templates
+            .iter()
+            .any(|registered| registered.eq_ignore_ascii_case(path))
+        {
+            return self;
+        }
+        self.path_templates.push(path.to_owned());
+        self.router = self.router.route(path, methods);
+        self
+    }
+
+    fn finish(self) -> (Router<AppState>, Vec<String>) {
+        (self.router, self.path_templates)
+    }
+}
+
+pub(super) fn api_routes() -> (Router<AppState>, Vec<String>) {
     // Discovery and password login do not consume token credentials.
-    let public_routes = Router::new()
+    let (public_routes, public_path_templates) = EmbyRouteBuilder::new()
         .route("/System/Info/Public", get(emby_public_system_info))
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
-        .route("/Users/authenticatebyname", post(emby_authenticate))
         .route(
             "/Users/{user_id}/Authenticate",
             post(emby_authenticate_user_id),
-        );
-    Router::new()
+        )
+        .finish();
+    let (routes, path_templates) = EmbyRouteBuilder::new()
         .route("/System/Info", get(emby_system_info))
         .route(
             "/DisplayPreferences/{display_preferences_id}",
@@ -155,34 +186,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(emby_transcoding_asset).head(emby_transcoding_asset),
         )
         .route(
-            "/videos/{item_id}/stream",
-            get(emby_stream).head(emby_stream),
-        )
-        .route(
-            "/videos/{item_id}/original.strm",
-            get(emby_stream).head(emby_stream),
-        )
-        .route(
-            "/videos/{item_id}/stream.{container}",
-            get(emby_stream_with_container).head(emby_stream_with_container),
-        )
-        .route(
-            "/videos/{item_id}/{media_source_id}/stream",
-            get(emby_stream_with_source).head(emby_stream_with_source),
-        )
-        .route(
-            "/videos/{item_id}/{media_source_id}/stream.{container}",
-            get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
-        )
-        .route(
-            "/videos/{item_id}/master.m3u8",
-            get(emby_transcoding_master).head(emby_transcoding_master),
-        )
-        .route(
-            "/videos/{item_id}/transcoding/{session_id}/{asset}",
-            get(emby_transcoding_asset).head(emby_transcoding_asset),
-        )
-        .route(
             "/Items/{item_id}/PlaybackInfo",
             get(emby_playback_info).post(emby_playback_info),
         )
@@ -212,6 +215,11 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(emby_mark_favorite).delete(emby_unmark_favorite),
         )
         .route("/Sessions/Logout", post(emby_logout))
+        .finish();
+    let routes = routes
         .route_layer(middleware::from_fn(credentials::normalize_credentials))
-        .merge(public_routes)
+        .merge(public_routes);
+    let mut path_templates = path_templates;
+    path_templates.extend(public_path_templates);
+    (routes, path_templates)
 }

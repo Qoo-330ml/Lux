@@ -11845,6 +11845,22 @@ Rust 完成门禁（macOS `arm64`，Toshiba 已挂载，Cargo 输出使用 `/Vol
 
 Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 613 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 65 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
 
+#### LUX-551：Emby API 路径大小写不敏感
+
+范围：Emby 兼容路由在根路径和 `/emby` 前缀下均按 ASCII 大小写不敏感匹配。只归一化已注册 Emby 路由的静态路径片段，保留动态路径参数、query、HTTP 方法和 Lux 原生 `/api/v1` 路由语义；未知路由继续走原有 fallback。
+
+验收：
+
+- [x] Emby 登录、公开发现和受保护接口对静态路径段的大小写变体返回相同的 JSON/状态语义，根路径及 `/emby` 前缀均覆盖。
+- [x] 动态用户/条目 ID 与 query 内容保持原值；原生 Lux API 路径不参与大小写归一化。
+- [x] 自动化回归先在现有实现下失败，修复后通过；兼容性记录仅陈述本机集成测试证据，不声称第三方客户端实测通过。
+
+预计文件（5 个）：本文档、`src/api/emby.rs`、`src/api/routes.rs`、`tests/emby_system.rs`、`docs/COMPATIBILITY.md`。
+
+实现结果：Emby 路由表记录注册路径模板；请求进入 Axum 路由器前，只对已注册 Emby 路由的静态片段恢复其规范大小写。根路径和 `/emby` 共用同一组路由模板，动态参数、query、方法和原生 API 路径保持不变。
+
+验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
