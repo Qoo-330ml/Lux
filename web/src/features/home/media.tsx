@@ -162,7 +162,6 @@ export function positionLibraryActionMenu(
 export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefetch?: () => void }) {
   const isSystemCollection = library.id === GLOBAL_COLLECTION_LIBRARY_ID;
   const cardRef = useRef<HTMLElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuAnchor, setMenuAnchor] = useState<LibraryMenuPosition>({ left: 12, top: 12 });
