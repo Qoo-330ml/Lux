@@ -368,11 +368,11 @@ describe("LuxShell user control", () => {
     act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
 
     expect(sessionStorage.getItem("lux.home-carousel.v2:user-1")).toBeNull();
-    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual(expect.arrayContaining([
       { queryKey: ["home"], refetchType: "none" },
-      { queryKey: ["libraries"] },
-      { queryKey: ["library"] },
-    ]);
+      { queryKey: ["libraries"], refetchType: "none" },
+      { queryKey: ["library"], refetchType: "none" },
+    ]));
   });
 
   it("renders the first catalog batch and poster URL after invalidating an empty home page", async () => {
@@ -499,7 +499,7 @@ describe("LuxShell user control", () => {
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = { id: "user-1", usernameNormalized: "test" };
-    queryClient.setQueryData(queryKeys.homeCarousel, response);
+    queryClient.setQueryData(queryKeys.homeCarousel, response, { updatedAt: Date.now() - 60_000 });
 
     await act(async () => {
       root.render(

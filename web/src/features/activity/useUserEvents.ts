@@ -1,9 +1,9 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, type QueryKey } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { clearHomeCarouselCache } from "../home/carousel";
 import { queryKeys } from "../../lib/api/query-keys";
 
-type UserEventScope = "home";
+type UserEvent = { scope: "home" | "item" | "library" | "favorites"; itemId?: string; libraryId?: string };
 
 export type SseConnectionState = "connected" | "disconnected";
 export const SseConnectionContext = createContext<SseConnectionState>("disconnected");
@@ -15,27 +15,27 @@ export function useSseConnectionState(): SseConnectionState {
 export function useUserEvents() {
   const queryClient = useQueryClient();
   const [connectionState, setConnectionState] = useState<SseConnectionState>("disconnected");
-  const pendingHomeRefreshes = useRef(new Set<string>());
-  const refreshHome = useCallback(() => {
-    const homeQueries = queryClient.getQueryCache().findAll({ queryKey: queryKeys.home });
-    if (!homeQueries.length) {
+  const pendingRefreshes = useRef(new Set<string>());
+  const refreshQueries = useCallback((queryKey: QueryKey) => {
+    const queries = queryClient.getQueryCache().findAll({ queryKey });
+    if (!queries.length) {
       void queryClient.invalidateQueries({
-        queryKey: queryKeys.home,
+        queryKey,
         refetchType: "none",
       });
       return;
     }
-    for (const query of homeQueries) {
+    for (const query of queries) {
       const filters = { queryKey: query.queryKey, exact: true };
-      if (query.state.error && query.state.data === undefined) {
+      if (queryKey[0] === "home" && query.state.error && query.state.data === undefined) {
         void queryClient.invalidateQueries({ ...filters, refetchType: "none" });
       } else if (query.state.fetchStatus === "fetching") {
-        if (pendingHomeRefreshes.current.has(query.queryHash)) continue;
-        pendingHomeRefreshes.current.add(query.queryHash);
+        if (pendingRefreshes.current.has(query.queryHash)) continue;
+        pendingRefreshes.current.add(query.queryHash);
         void queryClient
           .invalidateQueries(filters, { cancelRefetch: false })
           .finally(() => {
-            pendingHomeRefreshes.current.delete(query.queryHash);
+            pendingRefreshes.current.delete(query.queryHash);
             const current = queryClient.getQueryCache().find({
               queryKey: query.queryKey,
               exact: true,
@@ -54,21 +54,30 @@ export function useUserEvents() {
     if (typeof EventSource === "undefined") return undefined;
 
     const source = new EventSource("/api/v1/events");
-    const invalidate = (scope: UserEventScope) => {
-      if (scope !== "home") return;
+    const invalidate = (event: UserEvent) => {
       clearHomeCarouselCache();
-      refreshHome();
-      void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
-      void queryClient.invalidateQueries({ queryKey: ["library"] });
+      // Legacy home notifications also cover metadata, images and user state.
+      // The server may send scope-only events; IDs narrow updates when available.
+      const itemId = event.scope === "item" ? event.itemId : undefined;
+      const libraryId = event.scope === "library" ? event.libraryId : undefined;
+      const keys: QueryKey[] = [
+        queryKeys.home, queryKeys.libraries,
+        libraryId ? ["library", libraryId] : ["library"],
+        itemId ? queryKeys.item(itemId) : ["item"],
+        itemId ? queryKeys.itemImages(itemId) : ["item-images"],
+        itemId ? queryKeys.playback(itemId) : ["playback"],
+        ["children"], queryKeys.favorites, ["collection"], ["person"],
+      ];
+      for (const key of keys) refreshQueries(key);
     };
     const handleOpen = () => {
       setConnectionState("connected");
-      invalidate("home");
+      invalidate({ scope: "home" });
     };
     const handleError = () => setConnectionState("disconnected");
     const handleInvalidate = (event: Event) => {
-      const scope = parseScope((event as MessageEvent<string>).data);
-      if (scope) invalidate(scope);
+      const payload = parseUserEvent((event as MessageEvent<string>).data);
+      if (payload) invalidate(payload);
     };
 
     source.addEventListener("open", handleOpen);
@@ -80,16 +89,23 @@ export function useUserEvents() {
       source.removeEventListener("invalidate", handleInvalidate);
       source.close();
     };
-  }, [queryClient, refreshHome]);
+  }, [refreshQueries]);
 
   return connectionState;
 }
 
-function parseScope(data: string): UserEventScope | null {
+function parseUserEvent(data: string): UserEvent | null {
   try {
     const payload: unknown = JSON.parse(data);
     if (!payload || typeof payload !== "object" || !("scope" in payload)) return null;
-    return payload.scope === "home" ? "home" : null;
+    if (typeof payload.scope !== "string" || !["home", "item", "library", "favorites"].includes(payload.scope)) return null;
+    for (const key of ["itemId", "libraryId"] as const) {
+      if (key in payload) {
+        const value = (payload as Record<string, unknown>)[key];
+        if (typeof value !== "string" || !value.trim() || value.length > 256) return null;
+      }
+    }
+    return payload as UserEvent;
   } catch {
     return null;
   }

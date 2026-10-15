@@ -70,7 +70,6 @@ it("shares one SSE connection and returns to disconnected on error", () => {
   expect(FakeEventSource.instances).toHaveLength(1);
   act(() => root.unmount());
   expect(source.closed).toBe(true);
-  // A second unmount in cleanup is harmless.
 });
 
 it("keeps fallback mode when EventSource is unavailable", () => {
@@ -78,4 +77,36 @@ it("keeps fallback mode when EventSource is unavailable", () => {
   renderShell();
   expect(container.querySelector("output")?.textContent).toBe("disconnected");
   expect(FakeEventSource.instances).toHaveLength(0);
+});
+
+const mediaKeys = [["home", "carousel"], ["libraries"], ["library", "library-1"],
+  ["item", "item-1"], ["item-images", "item-1"], ["playback", "item-1"],
+  ["children", "series-1", "EPISODE"], ["favorites"], ["collection", "collection-1"]];
+
+it.each(["home", "item", "library", "favorites"])("refreshes media caches for a %s event without touching player sessions", (scope) => {
+  for (const key of mediaKeys) client.setQueryData(key, { value: "old" });
+  const playerKey = ["web-playback-session", "item-1"];
+  client.setQueryData(playerKey, { sessionId: "active-session" });
+  renderShell();
+  act(() => FakeEventSource.instances[0].emit("invalidate", { scope }));
+  for (const key of mediaKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(true);
+  expect(client.getQueryState(playerKey)?.isInvalidated).toBe(false);
+});
+
+it("ignores malformed and unknown invalidations", () => {
+  client.setQueryData(["item", "item-1"], { title: "old" });
+  renderShell();
+  for (const payload of [null, {}, { scope: "unknown" }, { scope: "item", itemId: 12 }]) {
+    act(() => FakeEventSource.instances[0].emit("invalidate", payload));
+  }
+  expect(client.getQueryState(["item", "item-1"])?.isInvalidated).toBe(false);
+});
+
+it("limits a targeted item event to that item and related list caches", () => {
+  client.setQueryData(["item", "item-1"], { title: "old" });
+  client.setQueryData(["item", "item-2"], { title: "other" });
+  renderShell();
+  act(() => FakeEventSource.instances[0].emit("invalidate", { scope: "item", itemId: "item-1" }));
+  expect(client.getQueryState(["item", "item-1"])?.isInvalidated).toBe(true);
+  expect(client.getQueryState(["item", "item-2"])?.isInvalidated).toBe(false);
 });

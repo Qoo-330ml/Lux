@@ -11682,6 +11682,14 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 验收：连接、断连、重连、浏览器不支持与卸载关闭均有组件回归。后续任务接入条件轮询。
 
+#### LUX-552：用户事件覆盖详情与收藏缓存
+
+范围：接收 home/item/library/favorites 事件；兼容既有仅带 home 的服务器，并刷新详情、图像、播放信息、子项、收藏、人物与合集缓存。可选 itemId/libraryId 收窄相应缓存；不失效正在播放的 bootstrap/session。所有媒体查询保留在途请求与尾随刷新，首页首次失败仍保留手动重试，防止事件风暴反复启动失败请求。
+
+预计文件（4 个）：`web/src/features/activity/useUserEvents.ts`、`web/tests/user-events.test.tsx`、`web/tests/lux-shell.test.tsx`、本文档。
+
+验收：各作用域、可选 ID、无效 payload、会话缓存保留及已有首页在途请求保护均有回归。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
