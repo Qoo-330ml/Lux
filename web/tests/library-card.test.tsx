@@ -150,4 +150,38 @@ describe("LibraryCard", () => {
     expect(scan).toHaveBeenCalledWith("library-1");
     expect(container.querySelector("[role=status]")?.textContent).toContain("扫描");
   });
+
+  it("keeps its portaled menu open for inside pointer events and closes outside", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LibraryCard library={{ id: "library-1", name: "电影", kind: "MOVIE" }} />
+        </MemoryRouter>,
+      );
+    });
+    await act(async () => {
+      container.querySelector<HTMLElement>(".lux-library-card")?.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: 100,
+        clientY: 120,
+      }));
+    });
+
+    const menu = document.body.querySelector<HTMLElement>("[role=menu]");
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    await act(async () => menu?.querySelector<HTMLElement>("[data-library-action=scan]")
+      ?.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(document.body.querySelector("[role=menu]")).not.toBeNull();
+
+    await act(async () => outside.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+
+    expect(document.body.querySelector("[role=menu]")).toBeNull();
+    outside.remove();
+  });
 });

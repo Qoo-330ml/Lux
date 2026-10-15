@@ -1,12 +1,13 @@
 import { Database, Folder, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { lazy, Suspense, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
+import { usePopoverPosition } from "../media/usePopoverPosition";
 
 const LazyMediaImageEditor = lazy(() => import("../media/MediaImageEditor").then(({ MediaImageEditor }) => ({ default: MediaImageEditor })));
 const LazyMediaIdentifier = lazy(() => import("../media/MediaIdentifier").then(({ MediaIdentifier }) => ({ default: MediaIdentifier })));
@@ -309,58 +310,26 @@ export function positionLibraryActionMenu(
 export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefetch?: () => void }) {
   const isSystemCollection = library.id === GLOBAL_COLLECTION_LIBRARY_ID;
   const cardRef = useRef<HTMLElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [menuPosition, setMenuPosition] = useState<LibraryMenuPosition>({ left: 12, top: 12 });
+  const [menuAnchor, setMenuAnchor] = useState<LibraryMenuPosition>({ left: 12, top: 12 });
   const [pendingAction, setPendingAction] = useState<LibraryAction>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [actionError, setActionError] = useState<string>();
-
-  useEffect(() => {
-    if (!menuOpen) return undefined;
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (event.target instanceof Node && !cardRef.current?.contains(event.target) && !menuRef.current?.contains(event.target)) setMenuOpen(false);
-    };
-    const closeOnOutsideContextMenu = (event: globalThis.MouseEvent) => {
-      if (event.target instanceof Node && !cardRef.current?.contains(event.target) && !menuRef.current?.contains(event.target)) setMenuOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMenuOpen(false);
-    };
-    const closeOnResize = () => setMenuOpen(false);
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    document.addEventListener("contextmenu", closeOnOutsideContextMenu);
-    document.addEventListener("keydown", closeOnEscape);
-    window.addEventListener("resize", closeOnResize);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-      document.removeEventListener("contextmenu", closeOnOutsideContextMenu);
-      document.removeEventListener("keydown", closeOnEscape);
-      window.removeEventListener("resize", closeOnResize);
-    };
-  }, [menuOpen]);
-
-  useLayoutEffect(() => {
-    if (!menuOpen || !menuRef.current) return undefined;
-    const menu = menuRef.current;
-    const updatePosition = () => {
-      const rect = menu.getBoundingClientRect();
-      setMenuPosition((point) => positionLibraryActionMenu(
-        point,
-        { width: rect.width || 240, height: rect.height || 160 },
-        { width: window.innerWidth, height: window.innerHeight },
-      ));
-    };
-    updatePosition();
-    window.addEventListener("scroll", updatePosition, true);
-    return () => window.removeEventListener("scroll", updatePosition, true);
-  }, [menuOpen]);
+  const { menuRef, position: menuPosition } = usePopoverPosition({
+    open: menuOpen,
+    onClose: () => setMenuOpen(false),
+    isInside: (target) => Boolean(cardRef.current?.contains(target)),
+    closeOnResize: true,
+    closeOnContextMenu: true,
+    fallbackMenuSize: { width: 240, height: 160 },
+    getPosition: (menu, viewport) => positionLibraryActionMenu(menuAnchor, menu, viewport),
+  });
 
   function openMenu(point: LibraryMenuPosition) {
     setActionError(undefined);
     setActionNotice(undefined);
-    setMenuPosition(point);
+    setMenuAnchor(point);
     setMenuOpen(true);
   }
 
