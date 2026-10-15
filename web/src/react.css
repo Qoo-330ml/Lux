@@ -431,6 +431,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
 .lux-detail-content { width: 92%; min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 .lux-detail-sections { display: flex; flex-direction: column; }
+.lux-detail-page .lux-media-cast-heading h2,
+.lux-detail-page .lux-media-stills-heading h2,
+.lux-detail-page .lux-section-heading h2,
+.lux-detail-page .lux-media-nfo-heading h2,
+.lux-detail-page .lux-media-nfo-media-heading h3 { font-size: 1.15rem; font-weight: 700; letter-spacing: .02em; line-height: 1.2; }
 .lux-detail-cast { order: 1; }
 .lux-detail-stills { order: 2; }
 .lux-detail-nfo { order: 2; margin-top: 32px; }
@@ -509,7 +514,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-nfo-media-heading h3 { font-family: "Songti SC", "STSong", "Songti TC", "SimSun", serif; font-weight: 700; letter-spacing: .02em; }
 .lux-media-cast { max-width: none; margin-top: 64px; padding-top: 24px; }
 .lux-media-cast-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
-.lux-media-cast-heading h2 { margin: 0; color: #fff; font-size: 1.15rem; font-weight: 700; }
+.lux-media-cast-heading h2 { margin: 0; color: #fff; }
 .lux-media-cast-heading > span { color: var(--lux-subtle); font-size: .72rem; }
 .lux-media-cast-rail { margin-top: 22px; }
 .lux-media-cast-list { display: flex; gap: 24px; width: max-content; min-width: 100%; margin: 0; padding: 0 2px 12px; list-style: none; }
@@ -524,7 +529,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-cast-link > span { margin-top: 5px; color: var(--lux-subtle); font-size: .68rem; }
 .lux-detail-stills { max-width: none; min-width: 0; margin-top: 64px; padding-top: 24px; }
 .lux-media-stills-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
-.lux-media-stills-heading h2 { margin: 0; color: #fff; font-size: 1.15rem; font-weight: 700; }
+.lux-media-stills-heading h2 { margin: 0; color: #fff; }
 .lux-media-stills-heading > span { color: var(--lux-subtle); font-size: .72rem; }
 .lux-media-stills-rail { margin-top: 22px; }
 .lux-media-stills-list { display: flex; gap: 16px; width: max-content; min-width: 100%; margin: 0; padding: 0 2px 12px; list-style: none; }
@@ -627,7 +632,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-info-address code { min-width: 0; flex: 1; color: rgba(255,255,255,.72); font: inherit; overflow-wrap: anywhere; }
 .lux-media-nfo { max-width: none; }
 .lux-media-nfo-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
-.lux-media-nfo-heading h2 { margin: 0; color: #fff; font-size: 1.5rem; font-weight: 700; letter-spacing: -.025em; }
+.lux-media-nfo-heading h2 { margin: 0; color: #fff; }
 .lux-media-nfo-heading > span { color: var(--lux-subtle); font-size: .75rem; }
 .lux-surface-panel { background: var(--lux-surface); border: 1px solid var(--lux-line-soft); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-radius: 12px; }
 .lux-badge-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid var(--lux-line-soft); border-radius: 5px; font-size: .75rem; color: var(--lux-muted); background: rgba(255,255,255,.03); transition: all .2s var(--lux-ease); }
@@ -694,7 +699,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-media-nfo-links a:hover { border-color: var(--lux-line); color: #fff; background: rgba(255,255,255,.07); }
 .lux-media-nfo-media { margin-top: 48px; }
 .lux-media-nfo-media-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
-.lux-media-nfo-media-heading h3 { margin: 0; color: #fff; font-size: 1.5rem; font-weight: 700; }
+.lux-media-nfo-media-heading h3 { margin: 0; color: #fff; }
 .lux-media-nfo-media-heading > span { color: var(--lux-subtle); font-size: .75rem; }
 .lux-media-file-summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 22px; }
 .lux-media-file-summary.is-compact { gap: 0; margin-top: 0; }
@@ -2097,9 +2102,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-media-info-summary { grid-template-columns: 1fr; }
   .lux-media-info-address { align-items: flex-start; flex-direction: column; gap: 5px; }
   .lux-media-nfo { margin-top: 32px; padding-top: 12px; }
-  .lux-media-nfo-heading h2 { font-size: 1.18rem; font-weight: 650; }
   .lux-media-nfo-heading > span { font-size: .72rem; }
-  .lux-media-nfo-media-heading h3 { font-size: 1rem; }
   .lux-media-nfo-media-heading > span { font-size: .72rem; }
   .lux-media-nfo-summary { grid-template-columns: 1fr; }
   .lux-media-nfo-taxonomy { align-items: flex-start; flex-direction: column; gap: 10px; }
