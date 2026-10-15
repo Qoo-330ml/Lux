@@ -11704,7 +11704,7 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 预计文件（5 个）：`web/src/features/home/HomePage.tsx`、`web/src/features/detail/MediaDetailPage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/media-query-polling.test.tsx`、本文档。
 
-验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 64 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
+验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
 
 #### LUX-555：用户状态修改向其他会话发送失效
 
@@ -11716,15 +11716,15 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 实施结果（2026-10-15）：按用户选择保留首页独立区块；已有缓存库 ID 时并发请求最新资源，不恢复聚合请求。首页 30 秒 freshness、共享单条 SSE、媒体缓存失效及断线 30 秒前台兜底已实现。后端补齐管理员修改及用户状态修改通知，仅广播 scope，不传业务数据。
 
-验证：定向 Web 5 文件 / 64 项、TypeScript 和 production build 通过；事件中心库测试 7/7，`admin_events` 3/3，`user_query_events`、`resume_favorites`、`web_playback` 共 6/6 通过。Web 全量静态检查 141 passed、2 failed，完整 Vitest 612 passed、4 failed；6 个失败在原始基线同样复现，涉及未修改的卡片尺寸、触控按钮可见性、继续观看评分及旧卡片链接选择器。未修改这些无关 UI 行为或测试。
+验证：定向 Web 5 文件 / 65 项、TypeScript 和 production build 通过；事件中心库测试 7/7，`admin_events` 3/3，`user_query_events`、`resume_favorites`、`web_playback` 共 6/6 通过。Web 全量静态检查 141 passed、2 failed，完整 Vitest 613 passed、4 failed；6 个失败在原始基线同样复现，涉及未修改的卡片尺寸、触控按钮可见性、继续观看评分及旧卡片链接选择器。未修改这些无关 UI 行为或测试。
 
-真实 Chromium 使用固定本地 API/SSE fixture：基线 65 秒产生 12 次详情周期请求，新实现 83 秒为 0；首页进入详情后 30 秒内返回为 0 次首页请求。SSE 事件立即刷新标题/收藏状态；断线约 30 秒后详情、图片、播放信息各请求一次；原生 SSE 重连触发媒体缓存重新同步并保持单条连接，随后 69 秒为 0 次周期请求。此为本机 arm64 的请求策略验证，不是生产数据集、NAS CPU 或滚动帧率结论。
+真实 Chromium 使用固定本地 API/SSE fixture：基线 65 秒产生 12 次详情周期请求，新实现 83 秒为 0；首页进入详情后 30 秒内返回为 0 次首页请求。初始 SSE 握手不会重复已加载的 item/images/playback 请求；SSE 事件立即刷新标题/收藏状态；断线约 30 秒后详情、图片、播放信息各请求一次；原生 SSE 重连触发媒体缓存重新同步并保持单条连接，随后 69 秒为 0 次周期请求。此为本机 arm64 的请求策略验证，不是生产数据集、NAS CPU 或滚动帧率结论。
 
 Rust 完成门禁（macOS `arm64`，Toshiba 已挂载，Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`）：`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。目标回归 `application::admin_events::tests` 7/7、`admin_events` 3/3、`user_query_events` 1/1、`resume_favorites` 4/4、`web_playback` 1/1、`scanned_series_metadata` 3/3、`scanning_jobs` 88/88 通过。
 
-完整 `cargo test --locked --all-targets` 在 `scanned_metadata::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 停滞超过 23 分钟后中断；此前 1,311 项通过、0 项失败、47 项忽略。该目标按单线程复跑为 22/23：唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 得到 2 张图片、预期 1 张，是此前已有的 NFO 海报回滚问题。相关阶段记录也报告 FIFO 用例在并行运行时可能超过 60 秒；本轮全量测试因此不能标为通过。串行 `scanned_series_metadata`、`scanning_jobs` 的定向回归通过。
+完整 `cargo test --locked --all-targets` 在 `scanned_metadata::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 停滞超过 23 分钟后中断；此前 1,311 项通过、0 项失败、47 项忽略。该目标按单线程复跑为 22/23：唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 得到 2 张图片、预期 1 张，是此前已有的 NFO 海报回滚问题；按 4 线程复跑为 20/23，另有 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound` 和 `blocked_first_local_poster_does_not_block_manifest_scan` 的 FIFO 超时。相关阶段记录也报告 FIFO 用例在并行运行时可能超过 60 秒；本轮全量测试因此不能标为通过。串行 `scanned_series_metadata`、`scanning_jobs` 的定向回归通过。
 
-Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 612 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 64 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
+Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 613 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 65 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
 
 ## 29. 参考资料
 

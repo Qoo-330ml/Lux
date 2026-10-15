@@ -16,6 +16,7 @@ export function useUserEvents() {
   const queryClient = useQueryClient();
   const [connectionState, setConnectionState] = useState<SseConnectionState>("disconnected");
   const pendingRefreshes = useRef(new Set<string>());
+  const hadConnectionError = useRef(false);
   const refreshQueries = useCallback((queryKey: QueryKey) => {
     const queries = queryClient.getQueryCache().findAll({ queryKey });
     if (!queries.length) {
@@ -71,10 +72,15 @@ export function useUserEvents() {
       for (const key of keys) refreshQueries(key);
     };
     const handleOpen = () => {
+      const reconnecting = hadConnectionError.current;
+      hadConnectionError.current = false;
       setConnectionState("connected");
-      invalidate({ scope: "home" });
+      if (reconnecting) invalidate({ scope: "home" });
     };
-    const handleError = () => setConnectionState("disconnected");
+    const handleError = () => {
+      hadConnectionError.current = true;
+      setConnectionState("disconnected");
+    };
     const handleInvalidate = (event: Event) => {
       const payload = parseUserEvent((event as MessageEvent<string>).data);
       if (payload) invalidate(payload);

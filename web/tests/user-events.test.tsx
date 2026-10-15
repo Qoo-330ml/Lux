@@ -83,6 +83,17 @@ const mediaKeys = [["home", "carousel"], ["libraries"], ["library", "library-1"]
   ["item", "item-1"], ["item-images", "item-1"], ["playback", "item-1"],
   ["children", "series-1", "EPISODE"], ["favorites"], ["collection", "collection-1"]];
 
+it("does not invalidate loaded media caches on the initial SSE connection", () => {
+  for (const key of mediaKeys) client.setQueryData(key, { value: "fresh" });
+  renderShell();
+  const source = FakeEventSource.instances[0];
+  act(() => source.emit("open"));
+  for (const key of mediaKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(false);
+  act(() => source.emit("error"));
+  act(() => source.emit("open"));
+  for (const key of mediaKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(true);
+});
+
 it.each(["home", "item", "library", "favorites"])("refreshes media caches for a %s event without touching player sessions", (scope) => {
   for (const key of mediaKeys) client.setQueryData(key, { value: "old" });
   const playerKey = ["web-playback-session", "item-1"];
