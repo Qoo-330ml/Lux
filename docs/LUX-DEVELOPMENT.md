@@ -11698,6 +11698,14 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 验收：作用域 wire names、管理员修改桥接、进度不转发有库测试；执行最窄 `cargo test --locked --lib application::admin_events::tests`，再以 `--test admin_events` 验证鉴权与 SSE 帧。所有 Cargo 命令使用 Toshiba 统一 target。
 
+#### LUX-554：媒体页在线停轮询与断线兜底
+
+范围：首页四项查询和详情六项查询读取共享 SSE 状态；在线不做周期请求，断线/不支持 EventSource 时前台每 30 秒轮询。首页未有成功数据的失败请求仍由显式重试恢复。QueryClient 默认 60 秒 staleTime、单次重试及禁止焦点刷新保持既有配置；首页覆盖为 30 秒。
+
+预计文件（5 个）：`web/src/features/home/HomePage.tsx`、`web/src/features/detail/MediaDetailPage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/media-query-polling.test.tsx`、本文档。
+
+验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 64 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

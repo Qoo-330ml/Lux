@@ -16,6 +16,7 @@ import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
 import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
+import { useSseConnectionState } from "../activity/useUserEvents";
 import { LuxLogo } from "../../components/LuxLogo";
 
 export function MediaDetailPage() {
@@ -26,23 +27,28 @@ export function MediaDetailPage() {
   const requestedSourceId = searchParams.get("sourceId") ?? undefined;
   const collectionId = searchParams.get("collectionId") ?? undefined;
   const queryClient = useQueryClient();
+  const sseState = useSseConnectionState();
+  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
     queryFn: () => api.item(itemId),
     enabled: Boolean(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const itemImages = useQuery({
     queryKey: queryKeys.itemImages(itemId),
     queryFn: () => api.itemImages(itemId),
     enabled: Boolean(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const playback = useQuery({
     queryKey: queryKeys.playback(itemId),
     queryFn: () => api.playback(itemId),
     enabled: Boolean(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const pendingItemsQueryKey = queryKeys.library(item.data?.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING", 100);
   const pendingItems = useQuery({
@@ -68,7 +74,8 @@ export function MediaDetailPage() {
     queryKey: queryKeys.children(itemId, "SEASON"),
     queryFn: () => api.children(itemId, { itemType: "SEASON" }),
     enabled: isSeries,
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const activeSeasonId = seasons.data?.items?.[0]?.id;
   const singleSeason = seasons.data?.items?.length === 1 ? seasons.data.items[0] : undefined;
@@ -79,7 +86,8 @@ export function MediaDetailPage() {
     queryKey: queryKeys.item(hierarchySeriesId ?? ""),
     queryFn: () => api.item(hierarchySeriesId ?? ""),
     enabled: Boolean(hierarchySeriesId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const episodeSeriesId = isSeries ? itemId : hierarchySeriesId;
   const episodeSeasonId = isSeries
@@ -104,7 +112,8 @@ export function MediaDetailPage() {
       return page * pageSize < total ? page + 1 : undefined;
     },
     enabled: Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const episodeItems = episodes.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const episodeQueryEnabled = Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode);
