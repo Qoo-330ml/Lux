@@ -4,6 +4,7 @@ import test from "node:test";
 
 const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
 const mediaSource = readFileSync(new URL("../src/features/home/media.tsx", import.meta.url), "utf8");
+const mediaVisualSource = readFileSync(new URL("../src/features/home/media-card-visual.tsx", import.meta.url), "utf8");
 const homeSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
 
 test("home media actions are hidden until the poster is hovered and sit in its lower-right corner", () => {
@@ -12,9 +13,9 @@ test("home media actions are hidden until the poster is hovered and sit in its l
   const triggerSurfaceRule = stylesheet.match(/\.lux-media-art-shell\s*>\s*\.lux-media-actions\s+\.lux-media-actions-trigger::before\s*\{([^}]*)\}/)?.[1] ?? "";
   const visibleRule = stylesheet.match(/\.lux-media-art-shell:hover\s*>\s*\.lux-media-actions,\s*\.lux-media-art-shell:focus-within\s*>\s*\.lux-media-actions\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(mediaSource, /className="lux-media-art-shell"/);
-  assert.match(mediaSource, /<Rating value=\{item\.rating\} placement="card" \/>/);
-  assert.doesNotMatch(mediaSource, /compactRating/);
+  assert.match(readFileSync(new URL("../src/features/home/media-card-overlay.tsx", import.meta.url), "utf8"), /className="lux-media-art-shell"/);
+  assert.match(mediaVisualSource, /<Rating value=\{item\.rating\} placement="card" \/>/);
+  assert.doesNotMatch(mediaVisualSource, /compactRating/);
   assert.match(actionsRule, /top:\s*auto/);
   assert.match(actionsRule, /right:\s*9px/);
   assert.match(actionsRule, /bottom:\s*9px/);
@@ -41,7 +42,7 @@ test("detail ratings stay upper-right while home and library card ratings move u
 });
 
 test("series cards render the episode count in the poster upper-right corner", () => {
-  assert.equal((mediaSource.match(/<EpisodeCount item=\{item\} \/>/g) ?? []).length, 2);
+  assert.equal((`${mediaSource}\n${mediaVisualSource}`.match(/<EpisodeCount item=\{item\} \/>/g) ?? []).length, 2);
 
   const episodeCountRule = stylesheet.match(/\.lux-media-episode-count\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.match(episodeCountRule, /position:\s*absolute/);

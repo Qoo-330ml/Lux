@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api, type LibrarySortBy, type LibrarySortOrder } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -129,6 +129,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   }));
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const handleSelectionChange = useCallback((itemId: string, selected: boolean) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (selected) next.add(itemId);
+      else next.delete(itemId);
+      return next;
+    });
+  }, []);
   const [confirmNotice, setConfirmNotice] = useState<string>();
   const [mergeOpen, setMergeOpen] = useState(false);
   const [mergePrimaryId, setMergePrimaryId] = useState<string>();
@@ -326,7 +334,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div> : null}
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} key={item.id} detailHref={isGlobalCollectionLibrary ? `/collections/${encodeURIComponent(item.id)}` : undefined} readOnly={isGlobalCollectionLibrary} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={!isGlobalCollectionLibrary && showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={!isGlobalCollectionLibrary && selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
+        {loadedItems.map((item) => <MediaCard item={item} key={item.id} detailHref={isGlobalCollectionLibrary ? `/collections/${encodeURIComponent(item.id)}` : undefined} readOnly={isGlobalCollectionLibrary} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={!isGlobalCollectionLibrary && showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={!isGlobalCollectionLibrary && selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={handleSelectionChange} />)}
       </div>
       {mergeOpen ? (
         <div className="lux-library-dialog-backdrop" role="presentation">

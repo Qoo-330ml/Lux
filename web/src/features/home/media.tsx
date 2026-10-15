@@ -1,7 +1,7 @@
 import { Database, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { memo, useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
@@ -9,17 +9,18 @@ import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaCardEditors } from "./media-card-editors";
 import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
 import { MediaCardOverlay } from "./media-card-overlay";
+import type { MediaCardEditor } from "./media-card-editors";
 import { EpisodeCount, MediaPlaceholder, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, remainingRuntimeLabel } from "./media-display";
 export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
-export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (selected: boolean) => void }) {
+export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (itemId: string, selected: boolean) => void }) {
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleted, setDeleted] = useState(false);
 
-  async function setMetadataLock(locked: boolean) {
+  const setMetadataLock = useCallback(async (locked: boolean) => {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
@@ -27,9 +28,9 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据锁定状态更新失败，请重试。");
     }
-  }
+  }, [item.id]);
 
-  async function refreshMetadata() {
+  const refreshMetadata = useCallback(async () => {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
@@ -38,9 +39,9 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
     }
-  }
+  }, [item.id]);
 
-  async function scanLibrary() {
+  const scanLibrary = useCallback(async () => {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
@@ -49,22 +50,32 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "媒体库扫描任务提交失败，请重试。");
     }
-  }
+  }, [item.id]);
 
-  if (deleted) return null;
   const detailHref = detailHrefOverride ?? `/items/${item.id}${detailSearch ?? ""}`;
+  const openEditor = useCallback((next: MediaCardEditor) => setEditor(next), []);
+  const openDeleteDialog = useCallback(() => setDeleteOpen(true), []);
+  const closeEditor = useCallback(() => setEditor(undefined), []);
+  const closeDeleteDialog = useCallback(() => setDeleteOpen(false), []);
+  const markDeleted = useCallback(() => setDeleted(true), []);
+  const refresh = useCallback(() => void refreshMetadata(), [refreshMetadata]);
+  const scan = useCallback(() => void scanLibrary(), [scanLibrary]);
+  const lockMetadata = useCallback(() => void setMetadataLock(true), [setMetadataLock]);
+  const unlockMetadata = useCallback(() => void setMetadataLock(false), [setMetadataLock]);
+  const visual = useMemo(() => <MediaCardVisual item={item} landscape={landscape} href={item.itemType === "FOLDER" ? folderHref : detailHref} />, [detailHref, folderHref, item, landscape]);
+  if (deleted) return null;
 
   return (
     <>
       <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
-        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={setEditor} onDelete={() => setDeleteOpen(true)} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)}>
-          <MediaCardVisual item={item} landscape={landscape} href={item.itemType === "FOLDER" ? folderHref : detailHref} />
+        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={openEditor} onDelete={openDeleteDialog} onRefreshMetadata={refresh} onScanFolder={scan} onLockMetadata={lockMetadata} onUnlockMetadata={unlockMetadata}>
+          {visual}
         </MediaCardOverlay>
         <MediaCardCopy item={item} metadataAttention={metadataAttention} href={item.itemType === "FOLDER" ? folderHref : detailHref} />
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
-      <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={() => setEditor(undefined)} onDeleteClose={() => setDeleteOpen(false)} onDeleted={() => setDeleted(true)} />
+      <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={closeEditor} onDeleteClose={closeDeleteDialog} onDeleted={markDeleted} />
     </>
   );
 });

@@ -11668,12 +11668,18 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 验收：
 
-- [ ] 无关父状态更新不重绘 props 未变的卡片；选择单项只更新目标卡片，操作状态不重绘展示层。
-- [ ] 五种编辑器初次展示卡片时均不加载，仅打开对应功能时加载和挂载；关闭卸载，删除保留默认源选择及成功移除行为。
-- [ ] 标题、年份、图片版本、评分、集数、进度、待确认标记、导航、错误提示及只读/文件夹限制保留并有回归。
-- [ ] 冻结依赖安装、Web 测试、生产构建及相关 Playwright 流程验证完成；记录本机 ARM 性能与首屏 bundle 前后数据，不把方案预期比例当作实测结果。
+- [x] 无关父状态更新不重绘 props 未变的卡片；选择单项只更新目标卡片，操作状态不重绘展示层。
+- [x] 五种编辑器初次展示卡片时均不加载，仅打开对应功能时加载和挂载；关闭卸载，删除保留默认源选择及成功移除行为。
+- [x] 标题、年份、图片版本、评分、集数、进度、待确认标记、导航、错误提示及只读/文件夹限制保留并有回归。
+- [x] 冻结依赖安装、Web 测试、生产构建及相关 Playwright 流程验证完成；记录本机 ARM 性能与首屏 bundle 前后数据，不把方案预期比例当作实测结果。
 
 预计增量：一（4 文件）：本文档、`web/src/features/home/media.tsx`、`media-card-editors.tsx`、`web/tests/media-card-loading.test.tsx`；二（至多 5 文件）：`media.tsx`、`media-card.tsx`、`media-card-visual.tsx`、`media-card-overlay.tsx`、`web/tests/media-card-performance.test.tsx`；三（至多 5 文件）：`web/src/features/library/LibraryPage.tsx`、库页性能回归、随组件搬迁调整的静态布局测试、本文档和性能记录。每个增量测试通过后独立提交。
+
+实施结果（2026-10-16）：在 `codex/lux-551-media-card-performance` 分支完成三个独立增量。`MediaCard` 现在由 memo 外壳、`MediaCardVisual`、`MediaCardCopy`、`MediaCardOverlay` 和 `MediaCardEditors` 组成；五个编辑器改为动态导入，仅对应操作打开时请求。操作回调保持稳定，库页选择回调按条目 ID 复用，避免选择一个条目时为全部卡片创建新闭包。新增加载、显示状态、操作状态、文件夹/只读限制、库页选择和媒体卡片性能回归。
+
+验证：Toshiba 已挂载，本机 `uname -m=arm64`。`CI=true corepack pnpm@10 --dir web install --frozen-lockfile`、`CI=true corepack pnpm@10 --dir web build` 通过；媒体卡片和库页选择定向 Vitest 5/5 通过。120 张卡片的 Playwright 基准中，12 次无关父级更新的展示读取从基线 1,440 次降为 0，React 提交耗时由每次约 5.4–18.1ms 降为 0–0.2ms；编辑器动态模块在卡片初次展示时未请求，打开元数据编辑器后只请求对应模块。桌面和 320px 移动视口截图确认编辑器布局可见且无重叠。
+
+全量 `pnpm test` 的 Node 静态检查在基线 `c05d0eb0` 和本分支均为 141/143：两项旧断言分别期待已变更的首页媒体库卡片尺寸，以及旧的触控操作 CSS 选择器。Vitest 单独运行时，基线为 599/603，本分支为 605/609；四项相同的既有失败位于继续观看评分断言、首页库卡片预取，以及库卡片预取和虚拟合集旧选择器。此次新增/修改的媒体卡片与库页选择测试均通过。未部署或访问 FNOS。
 
 ## 29. 参考资料
 
