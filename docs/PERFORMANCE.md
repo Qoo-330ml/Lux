@@ -1909,6 +1909,32 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 
 补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes` 通过 `lux-*` 人物路径覆盖 canonical index unchanged write；相同字节保留 inode，metadata 变化仍更新 NFO。`local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets` 覆盖改名目录和同一 canonical person 新增 identity；分别遗漏两个指纹字段时测试均能复现错误复用，恢复后通过。回归只验证写入结果，不提供系统调用耗时或生产性能数据。
 
+### LUX-550 Web 详情页渲染隔离（2026-10-16）
+
+环境：本机 macOS `arm64`，相同锁文件依赖。对照为干净快照 `8c8d5c13`，优化代码为 `5c5661ab`。详情入口从 1102 行拆为 80 行的组合层，其余逻辑按关注点移入子组件；没有改变 15 秒轮询策略。
+
+固定 Vitest 场景使用 100 个合成人物，初次渲染后对 playback query cache 连续写入五次不同收藏状态，统计展示组件调用增量：
+
+| 展示区域 | 对照额外渲染 | 优化后额外渲染 |
+| --- | ---: | ---: |
+| 演员 | 5 | 0 |
+| 剧照 | 5 | 0 |
+| NFO | 5 | 0 |
+
+收藏按钮实际状态仍随五次更新变化。其他回归确认剧集数据更新不会重算海报或更新无关区域，剧照变化不会重算海报，item 变化仍刷新标题/人物/NFO。拆分中间版本 `da70cd64` 曾产生父剧 4 个、剧集 2 个 observer，provider 共享后分别为 1 个；这是防止拆分引入重复订阅的回归，原始未拆分基线本就各为 1 个，不能将 4→1、2→1 当作相对原始基线的请求收益。
+
+相同 production build 的 JS 文件大小（Vite 十进制 kB；不含公共 vendor、CSS、图片和随后打开的编辑器）：
+
+| 产物 | 对照 | 优化后 | 对照 gzip | 优化后 gzip |
+| --- | ---: | ---: | ---: | ---: |
+| 应用入口 | 124.09 kB | 105.58 kB | 33.47 kB | 28.73 kB |
+| 详情路由 | 54.31 kB | 58.74 kB | 16.05 kB | 17.20 kB |
+| 两项合计 | 178.40 kB | 164.32 kB | 49.52 kB | 45.93 kB |
+
+详情路由自身增加了边界与 provider 代码。提取纯展示工具并移除媒体卡片对编辑器的静态依赖后，五个编辑器分别生成约 2.64–6.40 kB 的动态 JS chunk；入口与详情两项合计减少 14.08 kB。Playwright 对生产 bundle 的合成页面记录到初次进入详情请求编辑器数量为 0，首次打开五种编辑器时分别请求对应 chunk。关闭后组件卸载，chunk 会留在浏览器模块缓存中。
+
+复现使用 `web/tests/media-detail-performance.test.tsx`、`scripts/detail-browser-smoke.mjs` 和 `scripts/detail-editor-failure-smoke.mjs`；详情相关 Vitest 43/43、静态回归 35/35 与生产构建通过。完整 Web 检查仍有基线已复现的两项静态和四项 Vitest 失败，详见 `COMPATIBILITY.md`。这里测量的是组件调用、observer 数和构建产物体积，不是浏览器 FPS、主线程耗时、网络墙钟或生产 CPU 收益；未进行真实后端、移动设备、FNOS/NAS 或 x86 性能测量。
+
 ### LUX-CPU NAS 部署复测
 
 2026-10-08 在飞牛 NAS（Intel Core i9-12900H，16 CPU，`uname -m=x86_64`）部署提交 `5a542b36`。数据集为现有 PostgreSQL 媒体库（约 890,000 条 filesystem entry、367,000 条 media source；来自修复前 `EXPLAIN` 估算）。部署前 `docker stats --no-stream` 两次采样间隔 12 秒，PostgreSQL 分别占用 1439% 和 1469% CPU；`pg_stat_activity` 同时观察到 21 条相同的 `COUNT(DISTINCT media_sources...)` 全库计数查询，最长运行约 96 秒。

@@ -11662,6 +11662,35 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
+#### LUX-550：隔离媒体详情页查询与交互渲染
+
+范围：落实项目所有者提供的前端重构方案第三项。路由入口仅订阅当前 item；Hero、操作区、版本/轨道选择、剧集、演员、剧照和 NFO 按关注点拆分。操作区独立持有 playback query、操作及编辑器状态，编辑器按需动态导入；剧集和剧照查询只更新相关子树。保留 15 秒刷新、API、布局与现有用户流程；SSE 刷新策略属于方案第五项，不在本任务引入。
+
+验收：
+
+- [x] playback、剧集、剧照查询变化不重渲染无关 Hero、演员和 NFO；真实数据变化仍展示最新值。
+- [x] 保留电影/视频/剧集/季度/单集布局、季海报回退、单季展开、分集分页和下一集播放。
+- [x] 保留版本/音轨/字幕切换、收藏/已看、元数据确认、下一个待确认、编辑与删除流程。
+- [x] 编辑器仅在打开时动态加载；保持加载和失败反馈。
+- [x] 针对性回归、完整 Web 检查及真实浏览器验证已执行，优化前后数据与既有失败均记录；完整 Web 门禁尚未全绿，见下方结果。
+
+预计文件按四个代码增量与最终验证增量拆分，每次提交不超过五个文件：
+
+1. 本文档、`web/src/features/detail/MediaDetailPage.tsx`、`MediaDetailSections.tsx`、`web/tests/media-detail-performance.test.tsx`：隔离演员/剧照/NFO。
+2. `MediaDetailPage.tsx`、`MediaEpisodesSection.tsx`、`useMediaEpisodes.ts`、性能回归：隔离剧集查询与列表。
+3. `MediaDetailPage.tsx`、`MediaDetailHero.tsx`、`MediaSourcePanel.tsx`、`media-source.ts`、`web/tests/detail-layout.test.mjs`：拆分 Hero 与版本轨道状态。
+4. `MediaDetailPage.tsx`、`MediaDetailActions.tsx`、共享 `MediaEditorBoundary.tsx`、`web/tests/detail-logo-layout.test.mjs`、详情回归：操作区和编辑器延迟加载。
+5. 本文档、`docs/COMPATIBILITY.md`、`docs/PERFORMANCE.md` 与两个浏览器验证脚本：验收与证据。
+
+实施中另按至多五文件的独立提交提取 `home/media-display.tsx`，移除详情和编辑器对媒体卡片模块的静态依赖；卡片入口仅调整共享编辑器的动态导入和加载边界，未执行方案第一项的卡片结构或多选重构。父剧查询与剧集查询各由一个 provider 持有，避免拆分后增加轮询 observer；Hero 仅订阅图片查询中的 logo 值。
+
+验证结果（2026-10-16，代码 `5c5661ab`，对照 `8c8d5c13`）：100 演员、五次 playback 更新时，演员/剧照/NFO 各自额外渲染从 5 次降为 0 次，实际收藏状态仍更新。详情入口从 1102 行降到 80 行。生产构建的入口与详情 JS 合计从 178.40 kB 降为 164.32 kB（不含公共 vendor；gzip 49.52→45.93 kB），五个编辑器各自形成动态 chunk。具体测量边界见 `docs/PERFORMANCE.md`。
+
+- 冻结依赖安装、TypeScript、生产构建通过；详情/性能/编辑器边界 Vitest 43/43，相关 Node 静态回归 35/35 通过。
+- 完整 `pnpm --dir web test` 的 Node 阶段 142 passed、2 failed，脚本因此未进入 Vitest；随后单独完整 Vitest 为 608 passed、4 failed。六项失败均在干净基线 `8c8d5c13` 复现：移动卡片尺寸和 touch selector 静态断言两项，继续观看评分、首页库卡片预取、库卡片预取及虚拟合集旧链接断言四项。完整门禁不能记为通过。
+- Playwright Chrome `155.0.8059.41` 使用本分支 production bundle 和合成 API，验证 1440/390 px 无横向溢出、五编辑器按需下载与关闭卸载、版本/音轨、收藏/已看、元数据保存、指定版本删除失败反馈、单季展开、分页、下一集和季海报回退；额外模拟 chunk 延迟/失败，确认详情保留且错误可关闭。无非预期浏览器错误；删除 fixture 的一次 HTTP 409 属预期。
+- 本机 macOS `arm64`；`cargo fmt --all -- --check` 通过，Cargo 输出目录指定 Toshiba 共享 target。无 Rust/API/数据库/依赖变更，未运行 Rust build/test/clippy，未部署或验证 FNOS/x86、真实服务器与客户端性能。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

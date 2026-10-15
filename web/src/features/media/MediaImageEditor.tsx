@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import type { ImageSearchResult, ItemImage, MediaItem } from "../../lib/api/types";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 
 type MediaImageEditorProps = {
   item: MediaItem;

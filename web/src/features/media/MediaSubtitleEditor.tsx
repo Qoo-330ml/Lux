@@ -2,7 +2,7 @@ import { LoaderCircle, Save, Subtitles, X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 import "./MediaSubtitleEditor.css";
 
 type MediaSubtitleEditorProps = {

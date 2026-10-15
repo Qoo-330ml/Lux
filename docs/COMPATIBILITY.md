@@ -14,6 +14,18 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-550 Web 详情页查询与渲染隔离（2026-10-16）
+
+代码 `5c5661ab` 将详情页拆为 Hero、操作区、版本/轨道、剧集、演员、剧照与 NFO，保留原 API、15 秒刷新和布局。父剧与剧集列表查询各共享一个 observer；五个编辑器仅在打开时动态导入。共享媒体卡片入口也改为动态导入，避免静态引用把编辑器带回应用入口。
+
+本机 macOS `arm64`：详情功能 34/34、性能隔离 7/7、编辑器加载边界 2/2，以及相关 Node 布局/导入检查 35/35 通过。回归覆盖电影、视频、剧集、季度、单集、季海报回退、版本/音频/字幕、收藏/已看、确认与下一个待确认、编辑和删除行为；冻结安装、TypeScript 和生产构建通过。
+
+Playwright Chrome `155.0.8059.41` 对本分支 production bundle 使用合成 API，1440 和 390 px 均无横向溢出。验证首屏不请求编辑器、五编辑器分别按需请求并在关闭后卸载、指定版本播放/删除、音轨、收藏/已看、元数据保存、删除失败提示、单季展开、分集分页、下一集与季海报回退。另模拟编辑器 JS 延迟及失败，详情保持可见，错误可关闭，未出现未捕获页面错误。主流程无非预期控制台错误；刻意返回的删除 HTTP 409 单独计为预期。
+
+复现入口为 `scripts/detail-browser-smoke.mjs` 和同一 Playwright session 中随后执行的 `scripts/detail-editor-failure-smoke.mjs`，使用本地 `vite preview` 的 5199 端口。该结果不代表真实后端、生产库、移动设备或其他客户端兼容性；尚无线上帧率或交互延迟测量。
+
+完整 Web 门禁尚未全绿：`pnpm --dir web test` 静态阶段 142 passed、2 failed；另行完整 Vitest 608 passed、4 failed。失败均在干净 `8c8d5c13` 基线上复现，涉及 `home-media-layout.test.mjs`、`responsive-layout.test.mjs`，及 `home-media.test.tsx` 一项评分、`home-page.test.tsx` 一项预取、`library-card.test.tsx` 两项预取/虚拟合集旧链接断言。本任务未调整这些既有行为或断言。
+
 ## LUX-548 iOS 爆米花继续观看（2026-10-15）
 
 本机 Reqable 抓包显示 iOS 爆米花能从 `/emby/Users/{UserId}/Items/Resume` 收到

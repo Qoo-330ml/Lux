@@ -3,7 +3,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import "./MediaIdentifier.css";
 import { api } from "../../lib/api/client";
 import type { AdminMetadataCandidate, MediaItem } from "../../lib/api/types";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 
 type MediaIdentifierProps = {
   item: MediaItem;
