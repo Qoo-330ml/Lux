@@ -11619,6 +11619,32 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证：macOS `arm64`，Cargo 输出位于 Toshiba 共享 target。本任务新增的 `manifest_scan_indexes_extrafanart_image_add_change_and_remove` 定向回归通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 通过。`cargo test --locked --all-targets` 在 lib 测试目标结束：862 passed、13 failed、23 ignored，因此后续目标未运行；失败集中于字幕/播放子进程和插件运行时超时或缺文件，涉及文件不在本任务改动范围内。单独运行 `tests/scanning_jobs.rs` 为 86 passed、2 failed：`completed_scan_runs_pending_ffprobe_before_worker_returns` 收到空 BIGINT，`incremental_scan_probes_only_changed_local_sources` 的 ffprobe 结果超时。未部署或访问 FNOS。Cargo 命令须设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`，并先确认 Toshiba 已挂载。
 
+#### LUX-548：兼容 iOS 爆米花 HideFromResume 请求
+
+范围：基于 iOS 抓包实现 `POST /Users/{UserId}/Items/{Id}/HideFromResume` 及 `/emby` 前缀；接受标准 query `Hide=true/false` 和 JSON `{"Hide": false}`。按用户/条目持久化隐藏标记，继续观看在聚合、计数与分页前排除隐藏条目；不清空进度、不修改收藏或已看状态。隐藏状态由显式 Hide 请求切换。
+
+验收：
+
+- [x] JSON 与 query 均支持 true/false，返回标准 UserItemDataDto；缺失、非法、冲突的值返回 400。
+- [x] root 与 `/emby` 路由、数字和 UUID 条目 ID 可用；匿名、跨用户、不可访问条目不能修改状态。
+- [x] 隐藏后 Emby Resume 和 Lux 继续观看排除该条目，恢复后保留原进度；重复请求幂等且其他用户不受影响。
+- [x] SQLite/PostgreSQL 空库和旧库升级保留原播放状态；相关定向测试与 Rust 完成检查有记录。
+- [x] 兼容记录明确区分抓包证据、自动化测试与部署后 iOS 实测，未实测不得标记客户端通过。
+
+预计文件：按会话计划拆分迁移与 schema 断言、状态 DTO、存储/应用逻辑、HTTP 接口与回归、文档五类增量，每个提交不超过 5 个文件。
+
+实现与验证（2026-10-15）：新增 SQLite/PostgreSQL 0177 迁移和按用户/条目的持久化隐藏标记；
+HTTP 接口兼容标准 query 与 iOS JSON，请求成功返回含 `HideFromResume` 的 UserItemDataDto。
+继续观看在聚合、计数、分页前排除隐藏条目，显式恢复保留原进度、已看、收藏、播放次数和时间。
+JSON 请求先复现原实现的 405，再通过集成回归；库测试验证按用户隔离、幂等和隐藏最新单集后的回退。
+`resume_favorites` 4/4、SQLite `storage` 60/60、临时 PostgreSQL 18/18 通过；build/fmt/clippy
+通过，本机为 arm64。为静态资源检查执行的冻结锁文件安装与 Web production build 通过。
+完整检查受共享 target 并发覆盖影响后，改用仍位于指定 target 内的专用 Cargo profile：
+112 个测试目标编译成功，库测试 875 passed、23 ignored；对并行失败目标和继续观看目标通过 Cargo
+串行复跑为 179 passed、1 failed。唯一持续失败是未改动的 NFO 海报回滚用例，预期 1、实际 2，
+修复前干净基线 b5cbab81 同样复现，因此 Rust 全量 gate 未全绿。详细边界与检查过程见
+`docs/COMPATIBILITY.md` 的 LUX-548 记录。未部署，未将 iOS 客户端真实页面标记为兼容通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

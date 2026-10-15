@@ -14,6 +14,46 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-548 iOS 爆米花继续观看（2026-10-15）
+
+本机 Reqable 抓包显示 iOS 爆米花能从 `/emby/Users/{UserId}/Items/Resume` 收到
+`200` 和有效播放进度，随后向 `POST /emby/Users/{UserId}/Items/{Id}/HideFromResume`
+发送 JSON `{"Hide": false}`。原 Lux 未注册该接口，抓包中相应请求返回 `405`
+（另一次为 `502`）。这些证据不能将其他服务端的 `Hide must be true or false`
+错误归因于 Lux，也不能证明该缺口是客户端未显示整个区块的唯一原因。
+
+Lux 现支持有无 `/emby` 前缀的该接口、数字及 UUID 条目 ID，并同时接受
+Emby 文档规定的 query `Hide=true/false` 和抓包中的 JSON 布尔值。成功返回 `200`
+与 `UserItemDataDto`，包括 `HideFromResume`、原进度、已看及收藏状态；缺失、非法
+或互相冲突的 Hide 值返回 `400`。沿用 Emby 鉴权、目标用户和媒体库访问控制。
+
+SQLite/PostgreSQL 新增前向迁移 `0177_user_item_resume_visibility.sql`，两者当前
+schema version 均为 `177`。隐藏标记按用户和条目持久化，默认不隐藏；在继续观看的
+剧集聚合、计数与分页前过滤。`Hide=false` 恢复显示，不清空进度，不改变已看、收藏、
+播放次数或最近播放时间；重复请求不递增状态版本。只有显式 Hide 请求改变此标记。
+旧二进制可能不接受新迁移版本，不能把更换旧镜像视为数据库回滚。
+
+自动化证据（macOS `arm64`）：`resume_favorites` 4/4、SQLite `storage` 60/60、
+临时 PostgreSQL 16 的 `postgres_database --include-ignored` 18/18 通过；覆盖 JSON/query、
+两种路由前缀、数字/UUID ID、权限、非法输入、重复请求、按用户隔离、剧集聚合与空页总数。
+旧库升级测试确认原播放状态保留。`cargo build --locked`、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；为静态资源测试在
+隔离工作区执行的冻结锁文件安装和 Web production build 通过，Web 源码未改动。
+
+全量检查不能记录为通过：默认 `cargo test --locked --all-targets --no-fail-fast --quiet`
+运行期间，共享 target 中部分二进制被其他工作区构建覆盖，因此该轮不作为本分支的完整证据。
+随后使用继承 dev 的专用 `ios-resume-20261015` profile，仍将所有 Cargo 输出置于指定的
+`/Volumes/Toshiba/mywork/Lux/target`；`cargo test --locked --all-targets --no-run` 编译
+112 个测试目标，再运行这些固定来源的测试产物。库测试 875 passed、23 ignored，零失败。
+集成目标并行运行出现后台任务/子进程超时等失败；通过 Cargo 对 14 个失败目标及
+`resume_favorites` 串行复跑后为 179 passed、1 failed。静态资源用例在使用本分支自己的
+Web 构建后通过。唯一仍失败的是 `scanned_metadata` 的
+`failed_local_poster_insert_does_not_mark_image_stage_complete`（预期 1 张、实际 2 张）；
+在修复前的干净基线 `b5cbab81` 上定向复测得到相同失败，未在本任务中修改该行为。
+
+部署后的 iOS 爆米花页面尚未复测，客户端版本也未在本次记录中确认，不能将真实
+客户端兼容性标记为通过。
+
 ## LUX-178 PostgreSQL 人物匹配决定补充迁移（2026-10-15）
 
 PostgreSQL 新增前向迁移 `0176_person_match_decisions.sql`，补齐 SQLite 0076 已有的

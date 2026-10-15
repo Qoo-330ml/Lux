@@ -36,6 +36,32 @@ impl Database {
         })
     }
 
+    pub(crate) async fn set_user_item_resume_hidden(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        hidden: bool,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_item_state (user_id, item_id, hide_from_resume)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                 hide_from_resume = excluded.hide_from_resume,
+                 version = user_item_state.version + CASE
+                     WHEN excluded.hide_from_resume != user_item_state.hide_from_resume THEN 1 ELSE 0 END",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .bind(database_flag(hidden))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_user_item_favorite(
         &self,
         user_id: &str,

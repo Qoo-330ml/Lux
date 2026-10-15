@@ -199,6 +199,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(emby_stop_session),
         )
         .route(
+            "/Users/{user_id}/Items/{item_id}/HideFromResume",
+            post(emby_hide_from_resume).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/Users/{user_id}/PlayedItems/{item_id}",
             post(emby_mark_played).delete(emby_unmark_played),
         )
