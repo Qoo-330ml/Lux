@@ -4306,6 +4306,14 @@ fn emby_user_item_data_json(
             "Played".to_owned(),
             json!(user_state.map(|state| state.is_played).unwrap_or(false)),
         ),
+        (
+            "HideFromResume".to_owned(),
+            json!(
+                user_state
+                    .map(|state| state.hide_from_resume)
+                    .unwrap_or(false)
+            ),
+        ),
         ("ItemId".to_owned(), json!(emby_public_id(item_id))),
         ("Key".to_owned(), json!(emby_public_id(item_id))),
     ]);

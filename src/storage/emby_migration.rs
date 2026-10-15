@@ -1922,7 +1922,7 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredUserItemState>, StorageError> {
         self.query(
-            "SELECT position_ticks, is_played, is_favorite, play_count,
+            "SELECT position_ticks, is_played, is_favorite, hide_from_resume, play_count,
                     last_played_at, version
              FROM user_item_state WHERE user_id = ? AND item_id = ?",
         )
@@ -1935,6 +1935,7 @@ impl Database {
                 position_ticks: row.get("position_ticks"),
                 is_played: row.get::<i64, _>("is_played") != 0,
                 is_favorite: row.get::<i64, _>("is_favorite") != 0,
+                hide_from_resume: row.get::<i64, _>("hide_from_resume") != 0,
                 play_count: row.get("play_count"),
                 last_played_at: row.get("last_played_at"),
                 version: row.get("version"),
