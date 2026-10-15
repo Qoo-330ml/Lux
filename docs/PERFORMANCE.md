@@ -1948,3 +1948,19 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 2026-10-16 在本机 `arm64` 工作区比较 `origin/test` 基线提交 `8c8d5c13` 与优化提交 `0ca53559`。两边均使用仓库锁定的 Web 依赖，并运行 `corepack pnpm@10 --dir web build`。Vite 入口 JS 从 124.09 kB（gzip 33.47 kB）降到 104.19 kB（gzip 28.67 kB），减少 19.90 kB（16.0%）及 gzip 4.80 kB（14.3%）。五个媒体卡编辑器现在各自进入按需 chunk；例如 metadata editor 为 3.90 kB、subtitle editor 为 4.98 kB、image editor 为 5.08 kB、identifier 为 6.40 kB、delete dialog 为 2.64 kB（均为 Vite 输出的未压缩大小）。
 
 这是一项相同本机、锁定依赖下的静态产物对比，不是运行时 LCP/INP、网络传输或用户交互时延测量；也不代表 NAS/x86 性能。浏览器中的真实触屏拖动与菜单点击尚未验证，因此这里不据此声称设备端体验验收完成。
+
+### LUX-550–555 Web 首页缓存与事件查询策略（2026-10-15）
+
+首页四区块保持独立加载，QueryClient 的库列表缓存直接提供旧库 ID，让最新资源与过期库列表刷新并发；新的库 ID 到达后切换 query key。首页 staleTime 为 30 秒，默认 QueryClient 60 秒配置不变。SSE 在线时首页/详情停止周期请求；断线或不支持 EventSource 时前台每 30 秒兜底，后台不轮询。首次失败且没有首页数据时仍由用户显式重试。
+
+本机 macOS arm64 / Chromium / 固定本地 HTTP+原生 SSE fixture，同一电影详情启用 item、images、playback 三个查询。基线来源固定为 `8c8d5c13` 的 Web 代码；初始加载与 SSE 初次同步完成后清零计数，无数据事件和导航：
+
+| 场景 | 观察窗口 | 详情周期 HTTP 请求 |
+| --- | --- | --- |
+| 基线，SSE 在线 | 65 秒 | 12（每个查询 4 次） |
+| 本次实现，SSE 在线 | 83 秒 | 0 |
+| 本次实现，SSE 断线 | 约 30 秒 | 3（每个查询 1 次） |
+
+浏览器还验证了首页进入已加载详情路由后立即返回不新增四区块请求，以及 SSE 失效更新详情、原生重连重新同步后 69 秒零周期请求。首次 SSE 握手不会再次失效已加载的详情缓存，因此初始 item/images/playback 各请求一次；只有断线重连才触发一次全量媒体展示同步。自动化真实 QueryClient/组件时钟回归覆盖在线 60 秒零周期、断线 30 秒刷新和重连后再停轮询；缓存回归覆盖 30 秒内/外回访及库 ID 变化。
+
+计数不包含初次读取、重连同步或真实业务事件引起的请求；事件驱动刷新仍会发起 HTTP。没有测量 Core Web Vitals、滚动帧率、生产库查询耗时或 FNOS/NAS CPU，不将本机 fixture 结果外推为生产收益。

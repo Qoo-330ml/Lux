@@ -9,15 +9,19 @@ import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
 import { MediaEpisodesProvider, MediaEpisodesSection } from "./MediaEpisodesSection";
 import { MediaDetailArtwork, MediaDetailHero, MediaSeriesProvider } from "./MediaDetailHero";
+import { useSseConnectionState } from "../activity/useUserEvents";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
+  const sseState = useSseConnectionState();
+  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const [routeParams] = useSearchParams();
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
     queryFn: () => api.item(itemId),
     enabled: Boolean(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
   if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;

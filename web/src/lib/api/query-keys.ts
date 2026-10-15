@@ -68,5 +68,5 @@ export const queryKeys = {
 
 export const queryRefreshIntervals = {
   liveDashboard: 15_000,
-  mediaSurface: 15_000,
+  mediaSurface: 30_000,
 } as const;

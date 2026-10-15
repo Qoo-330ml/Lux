@@ -11,6 +11,7 @@ import { useMediaSource } from "./MediaSourcePanel";
 import { MediaEpisodePlayButton } from "./MediaEpisodesSection";
 import { streamsOfType } from "./media-source";
 import { LuxLogo } from "../../components/LuxLogo";
+import { useSseConnectionState } from "../activity/useUserEvents";
 
 const LazyMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then((module) => ({ default: module.MediaMetadataEditor })));
 const LazyImageEditor = lazy(() => import("../media/MediaImageEditor").then((module) => ({ default: module.MediaImageEditor })));
@@ -50,10 +51,13 @@ export function MediaDetailActions({ item, pendingReview, children }: {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { source, selectedAudioStreamIndex, selectedSubtitleStreamIndex } = useMediaSource();
+  const sseState = useSseConnectionState();
+  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const playback = useQuery({
     queryKey: queryKeys.playback(item.id),
     queryFn: () => api.playback(item.id),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval,
+    refetchIntervalInBackground: false,
   });
   const pendingItemsQueryKey = queryKeys.library(item.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING", 100);
   const pendingItems = useQuery({

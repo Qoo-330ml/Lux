@@ -8,6 +8,27 @@ Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在�
 
 相关定向测试 24/24、冻结依赖安装、TypeScript、production build 与 fmt 通过；全量 Web 检查的 2 个静态失败和 4 个 Vitest 失败均在原始基线复现，详见 LUX-DEVELOPMENT.md 的 LUX-551 验收记录。新增依赖 `@tanstack/react-virtual` 使用独立库页 chunk（约 8.42KB gzip）。
 
+## LUX-550–555 Web 用户事件与查询策略（2026-10-15）
+
+同源、已登录 `/api/v1/events` 继续以 version 1 ready 帧开始，失效 scope 扩展为
+home/item/library/favorites。服务端只广播作用域，不包含用户、媒体、媒体库 ID 或业务数据；
+客户端收到 home 或丢帧恢复通知时重新读取全部媒体展示缓存，响应仍执行原有鉴权和 ACL。
+可选 itemId/libraryId 仅作为客户端收窄能力，当前服务器不发送它们。播放 bootstrap 和 session
+不在失效范围内，避免正在播放的会话被重建。
+
+Web 与通知服务端应一起发布：元数据/图像/媒体库/权限/设置、任务关键状态和收藏/已看/播放进度
+等成功修改会发送用户失效；高频 jobs progress 不转发。SSE 在线时首页/详情无周期请求；
+连接错误或 EventSource 不可用时前台 30 秒兜底，原生重连后全量同步并停止轮询。
+首页四区块仍独立加载，30 秒内回访复用缓存。Emby DTO、数据库 schema、播放票据与认证未变。
+
+macOS arm64 自动化：事件中心库测试 7/7、HTTP/SSE `admin_events` 3/3、用户状态/继续观看/
+Web 播放相关目标 6/6、定向 Web 64/64 通过。Chromium 本地固定 API/SSE fixture 验证在线停轮询、
+断线约 30 秒刷新、事件更新、原生重连和首页快速回访；前后请求计数见 `PERFORMANCE.md`。
+该浏览器 fixture 与 Rust HTTP/SSE 合同测试是独立证据，不代表 FNOS 或真实媒体库已部署验证。
+
+Web 全量存在基线已有的 2 项静态布局断言和 4 项组件断言失败；相同用例在原始基线复现。
+Rust 完整检查最终结果见 `LUX-DEVELOPMENT.md` 的 LUX-555 实施记录。
+
 ## LUX-195 元数据刮削器边界
 
 元数据插件通过 `providerKey` 声明身份命名空间，`pluginId` 只表示安装/运行时实现。应用层统一调用

@@ -8,6 +8,7 @@ import type { MediaItem } from "../../lib/api/types";
 import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media-display";
 import { useMediaSource } from "./MediaSourcePanel";
 import { sourceBadges } from "./media-source";
+import { useSseConnectionState } from "../activity/useUserEvents";
 
 export function detailAddedAt(media: MediaItem) {
   const addedAtCandidate = typeof media.addedAt === "number" && Number.isFinite(media.addedAt)
@@ -29,10 +30,12 @@ export function detailAddedAt(media: MediaItem) {
 const SeriesContext = createContext<MediaItem | undefined>(undefined);
 
 export function MediaSeriesProvider({ media, children }: { media: MediaItem; children: ReactNode }) {
+  const sseState = useSseConnectionState();
+  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const seriesId = media.itemType !== "SERIES" ? media.seriesId ?? media.parentId ?? undefined : undefined;
   const series = useQuery({
     queryKey: queryKeys.item(seriesId ?? ""), queryFn: () => api.item(seriesId ?? ""),
-    enabled: Boolean(seriesId), refetchInterval: queryRefreshIntervals.mediaSurface,
+    enabled: Boolean(seriesId), refetchInterval, refetchIntervalInBackground: false,
   }).data;
   return <SeriesContext value={series}>{children}</SeriesContext>;
 }
@@ -76,9 +79,11 @@ const selectLogo = (response: Awaited<ReturnType<typeof api.itemImages>>) =>
 export const MediaDetailHero = memo(function MediaDetailHero({ media, collectionId }: { media: MediaItem; collectionId?: string }) {
   const series = useSeriesContext();
   const { source, selectedAudioStreamIndex } = useMediaSource();
+  const sseState = useSseConnectionState();
+  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const logo = useQuery({
     queryKey: queryKeys.itemImages(media.id), queryFn: () => api.itemImages(media.id),
-    refetchInterval: queryRefreshIntervals.mediaSurface, select: selectLogo,
+    refetchInterval, refetchIntervalInBackground: false, select: selectLogo,
   });
   const logoUrl = logo.data ?? imageUrl(media, "logo");
   const isSeries = media.itemType === "SERIES";

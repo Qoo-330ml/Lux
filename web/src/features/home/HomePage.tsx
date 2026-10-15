@@ -16,6 +16,7 @@ import {
   writeHomeCarouselCache,
 } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
+import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
 
 const EMPTY_LIBRARIES: Library[] = [];
@@ -23,6 +24,7 @@ const EMPTY_MEDIA_ITEMS: MediaItem[] = [];
 
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
+  const sseState = useSseConnectionState();
   const accountSettings = useMemo(() => readAccountSettings(user.id), [user.id]);
   const cachedCarousel = useMemo(() => readHomeCarouselCache(user.id), [user.id]);
   const carousel = useQuery({
@@ -30,25 +32,25 @@ export function HomePage({ user }: { user: LuxUser }) {
     queryFn: ({ signal }) => api.homeCarousel(signal),
     initialData: cachedCarousel?.data,
     initialDataUpdatedAt: cachedCarousel?.savedAt,
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const librariesQuery = useQuery({
     queryKey: queryKeys.libraries,
     queryFn: ({ signal }) => api.homeLibraries(signal),
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const continueWatchingQuery = useQuery({
     queryKey: queryKeys.homeContinueWatching,
     queryFn: ({ signal }) => api.homeContinueWatching(signal),
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const libraries = librariesQuery.data?.libraries ?? EMPTY_LIBRARIES;
@@ -57,9 +59,9 @@ export function HomePage({ user }: { user: LuxUser }) {
     queryKey: queryKeys.homeLatestLibraries(libraryIds),
     queryFn: ({ signal }) => api.homeLibrariesLatest(libraryIds, signal),
     enabled: libraryIds.length > 0,
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const latestItemsByLibraryId = useMemo(() => {
@@ -143,8 +145,8 @@ export function HomePage({ user }: { user: LuxUser }) {
   );
 }
 
-export function homeRefetchInterval(data: unknown): number | false {
-  return data === undefined ? false : queryRefreshIntervals.mediaSurface;
+export function homeRefetchInterval(data: unknown, sseState: SseConnectionState = "disconnected"): number | false {
+  return data === undefined || sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
 }
 
 function HomeLatestRail({

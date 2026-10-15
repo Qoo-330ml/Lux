@@ -11733,6 +11733,70 @@ TDD：原实现加载 504 项时实际挂载 504 张卡片，节点上限回归�
 
 全量检查边界：`pnpm test` 的静态测试 141 passed、2 failed，脚本在此停止；独立运行完整 Vitest 为 605 passed、4 failed（75 文件通过、3 文件失败）。失败为首页卡片紧凑宽度、触屏操作控件静态断言、继续观看评分、首页预取入口，以及 LibraryCard 预取和只读合集入口。六个失败均用原始基线的 `LibraryPage.tsx` 与 `react.css` 复现，相关其他源码和测试与基线一致，未扩展本任务处理。完整 Web gate 因既有失败未全绿。未推送、合并或部署；Safari/iOS 真实设备未验证。
 
+#### LUX-550：首页查询缓存与缓存媒体库并发
+
+范围：落实前端重构方案第四项的短期方案及第五项的首页 staleTime。首页四个独立区块的查询保持 30 秒新鲜；回访期间复用 QueryClient 缓存。现有 `librariesQuery.data` 已同步提供缓存库 ID，不额外复制缓存或恢复慢聚合请求。冷启动无库 ID 时仍先加载媒体库，不声称消除冷启动 waterfall。
+
+预计文件（3 个）：`web/src/features/home/HomePage.tsx`、`web/tests/home-query-policy.test.tsx`、本文档。
+
+验收：
+
+- [x] 30 秒内回访不重新请求四个首页区块；过期后正常刷新。
+- [x] 有缓存库 ID 时最新资源与媒体库刷新并发；服务器返回不同 ID 后请求新的分组。
+- [x] 首页定向回归、Web 全量检查和浏览器验证均已执行；全量基线失败在后续实施记录中单独列出。
+
+#### LUX-551：共享用户 SSE 连接状态
+
+范围：Shell 继续独占一条用户事件连接，以 React context 向内容页共享连接状态。未连接、不支持 EventSource 或 error 时为 disconnected；open 后 connected，重连仍复用同一 EventSource；卸载移除监听并关闭连接。
+
+预计文件（4 个）：`web/src/features/activity/useUserEvents.ts`、`web/src/components/layout/LuxShell.tsx`、`web/tests/user-events.test.tsx`、本文档。
+
+验收：连接、断连、重连、浏览器不支持与卸载关闭均有组件回归。后续任务接入条件轮询。
+
+#### LUX-552：用户事件覆盖详情与收藏缓存
+
+范围：接收 home/item/library/favorites 事件；兼容既有仅带 home 的服务器，并刷新详情、图像、播放信息、子项、收藏、人物与合集缓存。可选 itemId/libraryId 收窄相应缓存；不失效正在播放的 bootstrap/session。所有媒体查询保留在途请求与尾随刷新，首页首次失败仍保留手动重试，防止事件风暴反复启动失败请求。
+
+预计文件（4 个）：`web/src/features/activity/useUserEvents.ts`、`web/tests/user-events.test.tsx`、`web/tests/lux-shell.test.tsx`、本文档。
+
+验收：各作用域、可选 ID、无效 payload、会话缓存保留及已有首页在途请求保护均有回归。
+
+#### LUX-553：为用户查询补齐服务端失效来源
+
+范围：UserEventScope 增加 item/library/favorites 字符串，仍只发送无业务数据的 scope。应用状态将用户 hub 装配到管理员事件中心；元数据修改、库/访问权限/设置修改及任务关键状态向普通用户发送失效，高频 jobs progress 不转发。服务端广播丢帧仍回退 home，前端按全部媒体展示缓存处理。
+
+预计文件（5 个）：`src/application/admin_events.rs`（含库测试）、`src/api/legacy.rs`、`tests/admin_events.rs`、`docs/API.md`、本文档。
+
+验收：作用域 wire names、管理员修改桥接、进度不转发有库测试；执行最窄 `cargo test --locked --lib application::admin_events::tests`，再以 `--test admin_events` 验证鉴权与 SSE 帧。所有 Cargo 命令使用 Toshiba 统一 target。
+
+#### LUX-554：媒体页在线停轮询与断线兜底
+
+范围：首页四项查询和详情六项查询读取共享 SSE 状态；在线不做周期请求，断线/不支持 EventSource 时前台每 30 秒轮询。首页未有成功数据的失败请求仍由显式重试恢复。QueryClient 默认 60 秒 staleTime、单次重试及禁止焦点刷新保持既有配置；首页覆盖为 30 秒。
+
+预计文件（5 个）：`web/src/features/home/HomePage.tsx`、`web/src/features/detail/MediaDetailPage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/media-query-polling.test.tsx`、本文档。
+
+验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
+
+#### LUX-555：用户状态修改向其他会话发送失效
+
+范围：Web/Emby 收藏、已看修改在状态持久化及容器状态同步成功后发布无 ID 的 favorites/item 用户事件；Web 两种播放事件路径、账户库顺序和排序策略更新发布合并 home 事件。人物收藏同样发 favorites。HTTP 响应和认证/CSRF/ACL 保持既有合同。
+
+预计文件（5 个）：`src/api/playback.rs`、`src/api/users.rs`、`src/api/legacy.rs`、`tests/user_query_events.rs`、本文档。
+
+验收：真实 HTTP/SSE 回归先复现收藏写入后收不到事件的超时，随后验证事件到达后数据库已反映收藏/已看状态，并覆盖播放进度和媒体库排序。最窄目标 `cargo test --locked --test user_query_events --test resume_favorites --test web_playback`。
+
+实施结果（2026-10-15）：按用户选择保留首页独立区块；已有缓存库 ID 时并发请求最新资源，不恢复聚合请求。首页 30 秒 freshness、共享单条 SSE、媒体缓存失效及断线 30 秒前台兜底已实现。后端补齐管理员修改及用户状态修改通知，仅广播 scope，不传业务数据。
+
+验证：定向 Web 5 文件 / 65 项、TypeScript 和 production build 通过；事件中心库测试 7/7，`admin_events` 3/3，`user_query_events`、`resume_favorites`、`web_playback` 共 6/6 通过。Web 全量静态检查 141 passed、2 failed，完整 Vitest 613 passed、4 failed；6 个失败在原始基线同样复现，涉及未修改的卡片尺寸、触控按钮可见性、继续观看评分及旧卡片链接选择器。未修改这些无关 UI 行为或测试。
+
+真实 Chromium 使用固定本地 API/SSE fixture：基线 65 秒产生 12 次详情周期请求，新实现 83 秒为 0；首页进入详情后 30 秒内返回为 0 次首页请求。初始 SSE 握手不会重复已加载的 item/images/playback 请求；SSE 事件立即刷新标题/收藏状态；断线约 30 秒后详情、图片、播放信息各请求一次；原生 SSE 重连触发媒体缓存重新同步并保持单条连接，随后 69 秒为 0 次周期请求。此为本机 arm64 的请求策略验证，不是生产数据集、NAS CPU 或滚动帧率结论。
+
+Rust 完成门禁（macOS `arm64`，Toshiba 已挂载，Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`）：`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。目标回归 `application::admin_events::tests` 7/7、`admin_events` 3/3、`user_query_events` 1/1、`resume_favorites` 4/4、`web_playback` 1/1、`scanned_series_metadata` 3/3、`scanning_jobs` 88/88 通过。
+
+完整 `cargo test --locked --all-targets` 在 `scanned_metadata::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 停滞超过 23 分钟后中断；此前 1,311 项通过、0 项失败、47 项忽略。该目标按单线程复跑为 22/23：唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 得到 2 张图片、预期 1 张，是此前已有的 NFO 海报回滚问题；按 4 线程复跑为 20/23，另有 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound` 和 `blocked_first_local_poster_does_not_block_manifest_scan` 的 FIFO 超时。相关阶段记录也报告 FIFO 用例在并行运行时可能超过 60 秒；本轮全量测试因此不能标为通过。串行 `scanned_series_metadata`、`scanning_jobs` 的定向回归通过。
+
+Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 613 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 65 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
