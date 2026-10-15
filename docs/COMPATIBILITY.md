@@ -14,6 +14,23 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-178 PostgreSQL 人物匹配决定补充迁移（2026-10-15）
+
+PostgreSQL 新增前向迁移 `0176_person_match_decisions.sql`，补齐 SQLite 0076 已有的
+`person_match_candidates.target_person_id`、`previous_person_id` 和目标人物索引。
+两个字段均可空，旧候选记录和已应用迁移校验和保留。PostgreSQL schema version 为 176，
+SQLite 仍为 175；两套迁移的编号不要求逐项对应。
+
+补齐结构后，现有人物索引重建流程会再次尝试恢复配置卷上的匹配快照。恢复按媒体条目、
+provider 和 provider ID 合并记录；重复恢复不新增重复候选。该修复不自动确认待处理候选，
+不要求重新刮削，也不改变 Emby 或 Lux API 的请求和响应格式。部署前应备份数据库和
+`metadata/people/matches`；部署后核对恢复日志、候选状态及缺列警告。升级到 176 后不能直接
+换回不包含此迁移的旧镜像，旧 SQLx migrator 可能报 `VersionMissing(176)`。
+
+本地 ARM64 / PostgreSQL 16.15 的 `postgres_database` 17/17 通过，覆盖空库初始化、0175
+升级和旧记录/校验和保留，以及人物确认、快照重复恢复和撤销。此为本地后端运行时证据，
+FNOS 部署后的实际恢复日志和候选状态尚未验证。
+
 ## LUX-532 在线 FILL_MISSING 并发配置
 
 服务启动时读取 `LUX_METADATA_CONCURRENCY`，仅控制在线 `FILL_MISSING`。默认值为 4，硬上限为 12；可用范围是 1–12。未设置或空字符串使用默认值，0 和负数夹到 1，超过 12 夹到 12，非整数回退到默认值。无效或越界配置会记录有效 worker 数和硬上限，不记录原始环境变量值。该值在进程内只解析一次，并同时决定全局 semaphore 容量与 worker 请求上限；重启服务后才会采用新值。

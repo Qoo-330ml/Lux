@@ -4368,6 +4368,22 @@ provider 切换由后台身份解析任务处理：优先使用已知 provider �
 验证：人物关系单测、NFO 扫描集成测试、跨 provider 自动合并/隔离/撤销测试、生日精度匹配测试、
 图片内容去重和损坏恢复测试、旧布局兼容测试、数据库清空后重新扫描重建测试、详情 API 和 Web 占位图测试。
 
+PostgreSQL 补充修复（2026-10-15）：SQLite 0076 已提供人物匹配决定的目标和原人物字段，
+但 PostgreSQL 遗漏了对应结构。新增前向迁移 `0176_person_match_decisions.sql`，为
+`person_match_candidates` 补齐可空的 `target_person_id`、`previous_person_id` 及目标人物索引，
+保留既有迁移内容、校验和及候选记录。PostgreSQL schema version 升至 176，SQLite 保持 175。
+`build.rs` 同时监听两套迁移目录。回归覆盖 PostgreSQL 空库、0175 旧库升级、人物确认、
+快照重复恢复和撤销后还原原身份；FNOS 上线后的恢复结果需另行验证。
+
+验证结果：本机 `uname -m=arm64`，隔离 PostgreSQL 16.15 的 `postgres_database` 17/17
+通过；新增回归先复现缺列错误，再验证空库和 0175 升级、旧迁移校验和保留、快照恢复及撤销。
+`storage` 59/59、`people_api` 10/10、`ready_version` 2/2、Rust build、fmt 和全目标全
+feature Clippy 通过。全量 `cargo test --locked --all-targets` 的 lib 为 874 passed、23 ignored，
+随后在 `scanned_metadata::failed_local_poster_insert_does_not_mark_image_stage_complete`
+失败（本地海报数实际 2、期望 1）；未包含本修复的 `a42fa723` 隔离基线定向复跑得到相同失败。
+完整 Rust gate 未通过，后续 integration targets 未由该全量命令执行；该 SQLite 扫描问题不在
+本次 PostgreSQL 结构修复范围内。本次未部署 FNOS，也不代表生产快照恢复已验证。
+
 依赖：LUX-164、LUX-170、LUX-172。
 
 #### LUX-173：片头片尾章节标记存储
