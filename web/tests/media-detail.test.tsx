@@ -253,8 +253,13 @@ describe("MediaDetailPage series hierarchy", () => {
       itemType: "SERIES",
       rating: 7.6,
       ratingSource: "TMDb",
+      productionYear: 2020,
+      actors: [{ id: "actor-1", name: "演员甲" }],
       mediaSources: [],
     }, { addedAt: Number.NaN }));
+    vi.mocked(api.itemImages).mockResolvedValue({
+      images: [mediaImage("series-1", "series-fanart", "FANART")],
+    });
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
@@ -301,6 +306,13 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-card .lux-rating")).not.toBeNull();
     expect(container.querySelector(".lux-season-card .lux-rating svg")).toBeNull();
     expect(container.querySelector(".lux-season-card .lux-media-episode-count")?.textContent).toBe("8 集");
+    const castSection = container.querySelector(".lux-detail-cast");
+    const seasonSection = container.querySelector(".lux-detail-series-seasons");
+    const stillsSection = container.querySelector(".lux-detail-stills");
+    const nfoSection = container.querySelector(".lux-detail-nfo");
+    expect(castSection && seasonSection && (castSection.compareDocumentPosition(seasonSection) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+    expect(seasonSection && stillsSection && (seasonSection.compareDocumentPosition(stillsSection) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
+    expect(stillsSection && nfoSection && (stillsSection.compareDocumentPosition(nfoSection) & Node.DOCUMENT_POSITION_FOLLOWING)).toBeTruthy();
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.item("series-1") })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.mediaSurface);
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.itemImages("series-1") })?.options.refetchInterval)
@@ -1478,10 +1490,11 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.textContent).not.toContain("暂无可播放版本");
   });
 
-  it("places an available media logo above the poster", async () => {
+  it("places an available media logo above the bilingual title", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
+      originalTitle: "Example Movie",
       itemType: "MOVIE",
       mediaSources: [],
     });
@@ -1526,8 +1539,10 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/items/movie-1/images/logo");
     expect(titleRow?.getAttribute("data-has-logo")).toBe("true");
     expect(titleRow?.children[0]?.className).toBe("lux-detail-logo");
-    expect(titleRow?.children[1]?.tagName).toBe("H1");
-    expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
+    expect(titleRow?.children[1]?.className).toBe("lux-detail-title-names");
+    const titleNames = titleRow?.querySelector(".lux-detail-title-names");
+    expect(titleNames?.children[0]?.textContent).toBe("示例电影");
+    expect(titleNames?.children[1]?.textContent).toBe("Example Movie");
     expect(posterColumn?.querySelector(".lux-detail-logo")).toBeNull();
     expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
   });
