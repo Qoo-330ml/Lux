@@ -11662,6 +11662,18 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
+#### LUX-550：首页查询缓存与缓存媒体库并发
+
+范围：落实前端重构方案第四项的短期方案及第五项的首页 staleTime。首页四个独立区块的查询保持 30 秒新鲜；回访期间复用 QueryClient 缓存。现有 `librariesQuery.data` 已同步提供缓存库 ID，不额外复制缓存或恢复慢聚合请求。冷启动无库 ID 时仍先加载媒体库，不声称消除冷启动 waterfall。
+
+预计文件（3 个）：`web/src/features/home/HomePage.tsx`、`web/tests/home-query-policy.test.tsx`、本文档。
+
+验收：
+
+- [x] 30 秒内回访不重新请求四个首页区块；过期后正常刷新。
+- [x] 有缓存库 ID 时最新资源与媒体库刷新并发；服务器返回不同 ID 后请求新的分组。
+- [ ] 首页定向回归、Web 全量检查和浏览器验证，结果在后续实施记录中汇总。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
