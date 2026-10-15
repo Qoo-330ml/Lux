@@ -11602,6 +11602,20 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证：macOS `arm64`，Cargo 输出位于项目共享 target。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；`cargo test --locked --test storage` 为 59 passed；PostgreSQL 16 临时实例下 `cargo test --locked --test postgres_database -- --include-ignored` 为 16 passed，覆盖空库启动、旧迁移升级和新索引存在；合集 worker 回归与名称补齐用例通过。全量 `cargo test --locked --all-targets --no-fail-fast --quiet` 的 874 个库测试通过、23 个按设计忽略。唯一稳定复现的失败是 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete`：实际 2 张、预期 1 张；在干净基线 `8f9defcf` 上相同失败，属于本任务开始前已有问题。另一个 `local_nfo_retry_excludes_non_retryable_conflict_item` 仅在全目标并行运行时出现过一次 `RowNotFound`，定向复跑通过。Rust 静态 Web 用例首次因隔离 worktree 尚无 `web/dist` 返回 404；生成 Web 构建产物后定向用例通过。未部署、未访问或修改 FNOS 数据。
 
+#### LUX-547：兼容 iOS 爆米花 HideFromResume 请求
+
+范围：基于 iOS 抓包实现 `POST /Users/{UserId}/Items/{Id}/HideFromResume` 及 `/emby` 前缀；接受标准 query `Hide=true/false` 和 JSON `{"Hide": false}`。按用户/条目持久化隐藏标记，继续观看在聚合、计数与分页前排除隐藏条目；不清空进度、不修改收藏或已看状态。隐藏状态由显式 Hide 请求切换。
+
+验收：
+
+- [ ] JSON 与 query 均支持 true/false，返回标准 UserItemDataDto；缺失、非法、冲突的值返回 400。
+- [ ] root 与 `/emby` 路由、数字和 UUID 条目 ID 可用；匿名、跨用户、不可访问条目不能修改状态。
+- [ ] 隐藏后 Emby Resume 和 Lux 继续观看排除该条目，恢复后保留原进度；重复请求幂等且其他用户不受影响。
+- [ ] SQLite/PostgreSQL 空库和旧库升级保留原播放状态；相关定向测试与 Rust 完成检查有记录。
+- [ ] 兼容记录明确区分抓包证据、自动化测试与部署后 iOS 实测，未实测不得标记客户端通过。
+
+预计文件：按会话计划拆分迁移与 schema 断言、状态 DTO、存储/应用逻辑、HTTP 接口与回归、文档五类增量，每个提交不超过 5 个文件。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
