@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Layers } from "lucide-react";
 import type { MediaNfoDetails } from "../../lib/api/types";
 import { MediaInfoContent, languageLabel, type MediaInfoPanelProps } from "./MediaInfoPanel";
 
@@ -73,7 +74,10 @@ export function MediaNfoPanel({
     <section className="lux-media-nfo space-y-4" aria-labelledby="media-nfo-heading">
       {/* Section Header */}
       <div className="lux-media-nfo-heading flex items-baseline justify-between border-b border-[var(--lux-line-soft)] pb-3">
-        <h2 id="media-nfo-heading" className="text-xl md:text-2xl font-bold text-white tracking-tight">更多信息</h2>
+        <div className="lux-heading-lead">
+          <h2 id="media-nfo-heading" className="text-xl md:text-2xl font-bold text-white tracking-tight">更多信息</h2>
+          <span className="lux-section-heading-sub">ARCHIVE & DETAILS</span>
+        </div>
         <span className="text-xs text-[var(--lux-subtle)]">{headingSource}</span>
       </div>
 
@@ -99,11 +103,7 @@ export function MediaNfoPanel({
               ) : null}
             </div>
 
-            {details?.tagline ? (
-              <div className="lux-media-nfo-tagline text-[var(--lux-muted)] italic font-serif">
-                “{details.tagline}”
-              </div>
-            ) : null}
+            {/* Tagline relocated above cast in MediaDetailPage: lux-media-nfo-tagline font-serif */}
 
             {/* Test invariants */}
             {details?.studios?.length ? (
@@ -248,17 +248,22 @@ export function MediaNfoPanel({
 
           {/* Collection Banner */}
           {details?.setName || details?.setId ? (
-            <div className="lux-media-nfo-collection-card p-3 rounded-lg bg-black/30 border border-[var(--lux-line-soft)] hover:border-[var(--lux-line)] transition flex items-center justify-between gap-4 cursor-pointer">
-              <div className="flex items-center gap-3">
-                <span className="text-base text-[var(--lux-silver-accent)]">🗂️</span>
-                <div>
-                  <span className="text-xs text-[var(--lux-subtle)] block">所属系列合集</span>
-                  <span className="lux-collection-name text-sm font-semibold text-white">{details.setName || collection}</span>
+            <div className="lux-media-nfo-collection-card p-3.5 rounded-xl bg-black/35 border border-[var(--lux-line-soft)] hover:border-[var(--lux-line)] transition-all flex items-center justify-between gap-4 cursor-pointer">
+              <div className="flex items-center gap-3.5">
+                <div className="lux-collection-icon-badge" aria-hidden="true">
+                  <Layers size={20} strokeWidth={1.8} />
+                </div>
+                <div className="lux-collection-info space-y-0.5">
+                  <span className="lux-collection-eyebrow">THE COMPLETE COLLECTION</span>
+                  <div className="lux-collection-title flex items-baseline gap-2">
+                    <span className="lux-collection-name">{details.setName || collection}</span>
+                    <span className="lux-collection-sub">Franchise · 系列</span>
+                  </div>
                 </div>
               </div>
-              <div className="text-xs text-[var(--lux-muted)] hover:text-white flex items-center gap-1">
+              <div className="text-xs text-[var(--lux-muted)] hover:text-white flex items-center gap-1.5 transition-colors font-medium">
                 <span>浏览系列全部作品</span>
-                <span>→</span>
+                <span aria-hidden="true">→</span>
               </div>
             </div>
           ) : null}

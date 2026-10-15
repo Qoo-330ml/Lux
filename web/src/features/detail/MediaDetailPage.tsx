@@ -177,6 +177,7 @@ export function MediaDetailPage() {
   const runtimeTicks = media.runtimeTicks ?? runtimeTicksFromMinutes(localNfo?.runtime);
   const status = media.status ?? localNfo?.status;
   const originalLanguage = media.originalLanguage ?? localNfo?.originalLanguage;
+  const mediaTagline = localNfo?.tagline?.trim();
   const detailSubtitle = isSeason
     ? `第 ${media.parentIndexNumber ?? ""} 季`
     : isEpisode
@@ -448,6 +449,15 @@ export function MediaDetailPage() {
               ) : null}
               {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
               {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+            </div>
+          ) : null}
+          {mediaTagline ? (
+            <div className="lux-detail-tagline-wrap">
+              <div className="lux-detail-tagline lux-media-nfo-tagline font-serif">
+                <span className="lux-tagline-quote" aria-hidden="true">“</span>
+                <span className="lux-tagline-text">{mediaTagline}</span>
+                <span className="lux-tagline-quote" aria-hidden="true">”</span>
+              </div>
             </div>
           ) : null}
           <div className="lux-detail-cast">
@@ -943,7 +953,10 @@ function SeriesChildren({
   return (
     <section className="lux-series-children" aria-labelledby="series-children-heading">
       <div className="lux-section-heading">
-        <h2 id="series-children-heading">播出季</h2>
+        <div className="lux-heading-lead">
+          <h2 id="series-children-heading">播出季</h2>
+          <span className="lux-section-heading-sub">SEASONS</span>
+        </div>
         <span>{seasons.length} 个季度</span>
       </div>
       <div className="lux-season-rail" role="list" aria-label="播出季">
@@ -994,7 +1007,10 @@ function SeasonEpisodes({
   return (
     <section className="lux-season-episodes" aria-labelledby="season-episodes-heading">
       <div className="lux-section-heading">
-        <h2 id="season-episodes-heading">单集</h2>
+        <div className="lux-heading-lead">
+          <h2 id="season-episodes-heading">单集</h2>
+          <span className="lux-section-heading-sub">EPISODES</span>
+        </div>
         <span>{total ?? episodes.length} 集</span>
       </div>
       {episodesPending ? <p className="lux-muted-copy">正在加载单集…</p> : null}
@@ -1060,7 +1076,10 @@ function EpisodeRail({
   return (
     <section className="lux-episode-rail" aria-labelledby="episode-rail-heading">
       <div className="lux-section-heading">
-        <h2 id="episode-rail-heading">更多来自第 {seasonNumber ?? ""} 季</h2>
+        <div className="lux-heading-lead">
+          <h2 id="episode-rail-heading">更多来自第 {seasonNumber ?? ""} 季</h2>
+          <span className="lux-section-heading-sub">MORE EPISODES</span>
+        </div>
         <span>{otherEpisodes.length} 集</span>
       </div>
       <div className="lux-episode-card-rail" role="list">

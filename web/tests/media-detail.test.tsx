@@ -816,7 +816,10 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("大漠路远");
+    const taglineEl = container.querySelector(".lux-detail-tagline");
+    const castEl = container.querySelector(".lux-detail-cast");
+    expect(taglineEl?.textContent).toContain("大漠路远");
+    expect(taglineEl && castEl && Boolean(taglineEl.compareDocumentPosition(castEl) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
     expect(container.querySelector(".lux-media-nfo-content")).not.toBeNull();
     expect(container.querySelector(".lux-media-nfo-content")?.querySelector(".lux-surface-panel, .lux-media-nfo-card")).toBeNull();
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.className).not.toContain("border-b");

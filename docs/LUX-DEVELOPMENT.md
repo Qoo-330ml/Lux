@@ -11273,6 +11273,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证结果：目标测试 10/10、production build、定向浏览器检查和 `git diff --check` 通过。完整 `pnpm test` 的 Node 检查 137/137 通过；默认并行 Vitest 全量运行中，`tests/home-page.test.tsx` 的 5 个轮播用例失败，其余 583/588 通过。单 worker Vitest 全量运行中，另有 `tests/library-page.test.ts` 的 1 个排序恢复断言失败，其余 587/588 通过；这两个失败文件分别单独运行均为 17/17 通过，显示全量运行结果不稳定。阶段 23 的 A/B 性能门仍开放；LUX-533 PostgreSQL live query 受 Docker Hub EOF 阻塞，尚未取得 PostgreSQL runtime 证据。
 
+产品调整（2026-10-15）：项目所有者决定从管理员活动弹层移除库级入库阶段状态列表。右上角活动入口仅在存在活动单项作业时显示；库级阶段状态不再作为活动入口的显示条件。LUX-533/LUX-534 的只读聚合与 API 保留，不改任务执行路径。
+
 阶段 27 阶段门（2026-10-14）：在 Toshiba 挂载、`arm64` 环境下，通过 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target` 运行 `scripts/check-all.sh`。Cargo build、fmt、all-target/all-feature Clippy、shell 语法、两组 Python 工具测试均通过；`cargo test --locked --all-targets` 在 lib target 停止，854 通过、1 失败、22 ignored。失败 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation` 在隔离重跑时仍因 `Superseded` 失败，位于本阶段未修改的 HLS 播放代码。Web frozen-lockfile install 和 production build 通过；完整 Web 测试波动详见 LUX-535 结果。PostgreSQL live query 未验证，阶段 23 的 5% A/B 门仍开放。本阶段按门停在项目所有者确认点，不将失败检查记为通过。
 
 #### LUX-536：在媒体详情展示剧照

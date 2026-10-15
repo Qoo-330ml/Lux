@@ -84,6 +84,7 @@ export function MediaInfoContent({
             <div className="lux-media-nfo-media-heading">
               <h3 id="media-file-heading" className="text-xl md:text-2xl font-bold text-white tracking-tight">媒体文件</h3>
             </div>
+            <span className="lux-section-heading-sub">MEDIA FILES</span>
             {compactSummaryValues.length ? (
               <span id="media-source-pill" className="lux-media-file-summary is-compact text-xs text-[var(--lux-subtle)]">
                 {compactSummaryValues.join(" · ")}
