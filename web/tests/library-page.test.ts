@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LibraryPage, libraryItemTypeFilter } from "../src/features/library/LibraryPage";
 import { useUserEvents } from "../src/features/activity/useUserEvents";
 import { api } from "../src/lib/api/client";
@@ -63,6 +63,7 @@ describe("libraryItemTypeFilter", () => {
 });
 
 describe("LibraryPage infinite scroll", () => {
+  beforeEach(() => { vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
   let triggerIntersection: (() => void) | undefined;
@@ -75,6 +76,33 @@ describe("LibraryPage infinite scroll", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     triggerIntersection = undefined;
+  });
+
+  it("bounds mounted cards when 504 library items are already loaded", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "large-library", name: "大库", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: Array.from({ length: 504 }, (_, index) => ({
+        id: `movie-${index}`, title: `Movie ${index}`, itemType: "MOVIE",
+      })),
+      total: 504, page: 1, pageSize: 504,
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(createElement(QueryClientProvider, { client: queryClient },
+        createElement(MemoryRouter, { initialEntries: ["/libraries/large-library"] },
+          createElement(Routes, null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) })))));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card").length).toBeGreaterThan(0));
+    });
+    expect(container.querySelectorAll(".lux-media-card").length).toBeLessThan(50);
+    expect(container.textContent).toContain("已加载全部 504 项");
   });
 
   it("browses HomeVideos folders and keeps videos as playable media", async () => {

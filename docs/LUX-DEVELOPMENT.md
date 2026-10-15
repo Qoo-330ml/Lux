@@ -11710,6 +11710,29 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的 Node 静态检查在基线 `c05d0eb0` 和本分支均为 141/143：两项旧断言分别期待已变更的首页媒体库卡片尺寸，以及旧的触控操作 CSS 选择器。Vitest 单独运行时，基线为 599/603，本分支为 605/609；四项相同的既有失败位于继续观看评分断言、首页库卡片预取，以及库卡片预取和虚拟合集旧选择器。此次新增/修改的媒体卡片与库页选择测试均通过。未部署或访问 FNOS。
 
+#### LUX-551：媒体库网格虚拟化
+
+范围：落实用户提供的前端重构方案第二项，使用 `@tanstack/react-virtual` 按行虚拟化 LibraryPage 已加载的媒体；上下各缓冲两行，沿用现有 CSS 响应式列宽和窗口滚动。分页查询与底部 IntersectionObserver 继续负责加载，不扩大到其他页面或其他重构项。
+
+验收：
+
+- [x] 500+ 已加载条目只挂载可视行与缓冲行，首尾条目均可滚动访问。
+- [x] 响应式列数与真实行高同步，元数据徽章、窗口缩放和不满行不重叠、不裁切。
+- [x] 排序、筛选、文件夹、合集、跨屏批量选择及原有分页/失败重试行为继续可用。
+- [x] 增加自动化回归并完成本机浏览器前后对比、Web 单测与构建；记录失败和未验证边界。
+
+预计文件分三个增量：依赖及登记（`web/package.json`、`web/pnpm-lock.yaml`、本文档）；实现及回归（`web/src/features/library/LibraryGrid.tsx`、`web/src/features/library/LibraryPage.tsx`、`web/src/react.css`、`web/tests/library-grid.test.tsx`，必要时扩展 `web/tests/library-page.test.ts`）；验收记录（本文档、`docs/COMPATIBILITY.md`）。每个增量不超过 5 个文件。
+
+参考：[TanStack Virtualizer API](https://tanstack.com/virtual/latest/docs/api/virtualizer) 的 `scrollMargin`、`measureElement`、`gap` 与 `rangeExtractor`。
+
+实现与验证（2026-10-15）：`LibraryGrid` 使用窗口虚拟化和真实行高测量，响应式列数直接读取现有 CSS 网格，包含上下两行缓冲；保留聚焦卡片所在行，窗口列数变化时保留其父节点身份和编辑草稿。行使用 `top` 定位，避免 transform 改变卡片内 fixed 对话框的包含块。列表提供位置/总数语义，库页继续持有跨屏选择。虚拟化依赖单独分包，只随库页加载（production gzip 约 8.42KB）。追加增量仅涉及 `web/vite.config.ts` 的分包规则，以及 `LibraryGrid.tsx`/回归测试中的聚焦卡片身份保留。
+
+TDD：原实现加载 504 项时实际挂载 504 张卡片，节点上限回归先失败；列数变化导致编辑草稿丢失的回归同样先失败再修复。最终 `library-grid.test.tsx` 5/5、`library-page.test.ts` 19/19 通过。冻结锁文件安装、TypeScript 检查、Web production build、`cargo fmt --all -- --check` 和 `git diff --check` 通过。本任务没有 Rust 行为变化，未运行 Cargo 编译、Clippy 或 Rust 测试；Cargo fmt 使用 Toshiba 共享 target。
+
+浏览器验证：本机 macOS arm64、Headless Chrome 155、Playwright。504 项模拟数据在 320/768/1024/1440px 宽度的首屏分别挂载 8/12/20/28 张卡片；首尾可达、无水平溢出和行间重叠。跨屏多选、从 24 项连续分页至 504 项（最后 42 张卡片）、打开实际卡片编辑器后从 1440px 缩至 320px 保留草稿均通过，无 pageerror。1440×900 下三轮交替 A/B 中，基线 `c05d0eb0` 的卡片/DOM 节点数为 504/10294，本实现为 28/648；初始 React Profiler 各次提交耗时总和的中位数从 138.2ms 降至 47.6ms（约 65.6%）。此数据来自开发构建、内存缓存、无真实海报的本机模拟数据，不代表真实网络、NAS 或移动设备性能，也不是 INP/LCP 指标。
+
+全量检查边界：`pnpm test` 的静态测试 141 passed、2 failed，脚本在此停止；独立运行完整 Vitest 为 605 passed、4 failed（75 文件通过、3 文件失败）。失败为首页卡片紧凑宽度、触屏操作控件静态断言、继续观看评分、首页预取入口，以及 LibraryCard 预取和只读合集入口。六个失败均用原始基线的 `LibraryPage.tsx` 与 `react.css` 复现，相关其他源码和测试与基线一致，未扩展本任务处理。完整 Web gate 因既有失败未全绿。未推送、合并或部署；Safari/iOS 真实设备未验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

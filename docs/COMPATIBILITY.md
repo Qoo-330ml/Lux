@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-551 Web 媒体库虚拟化（2026-10-15）
+
+Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在行。列数沿用现有 CSS 网格，行高含待确认徽章与操作提示并动态测量；窗口缩放保留聚焦卡片和未保存的编辑草稿。分页仍由原 `useInfiniteQuery` 和列表底部 sentinel 驱动，选择状态仍由库页持有。文件夹、只读合集、排序、元数据筛选、分页失败重试及批量操作由 19 个库页测试覆盖。
+
+本机 arm64 / Headless Chrome 155 的 Playwright 检查覆盖 320、768、1024、1440px、504 项首尾访问、跨屏多选、24 项起步连续分页，以及实际元数据编辑器缩放后的草稿保留；没有 pageerror。504 项桌面首屏的卡片节点从 504 降至 28。测试数据和 API 返回值为本地模拟，未访问 FNOS；Safari、iOS 与真实大库网络体验仍待实测。
+
+相关定向测试 24/24、冻结依赖安装、TypeScript、production build 与 fmt 通过；全量 Web 检查的 2 个静态失败和 4 个 Vitest 失败均在原始基线复现，详见 LUX-DEVELOPMENT.md 的 LUX-551 验收记录。新增依赖 `@tanstack/react-virtual` 使用独立库页 chunk（约 8.42KB gzip）。
+
 ## LUX-195 元数据刮削器边界
 
 元数据插件通过 `providerKey` 声明身份命名空间，`pluginId` 只表示安装/运行时实现。应用层统一调用
