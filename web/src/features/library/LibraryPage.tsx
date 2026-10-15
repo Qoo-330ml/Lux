@@ -7,6 +7,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library } from "../../lib/api/types";
 import { MediaCard, mediaTitle } from "../home/media";
+import { LibraryGrid } from "./LibraryGrid";
 
 const LIBRARY_SORT_STORAGE_KEY = "lux.library.sort";
 const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
@@ -325,9 +326,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div> : null}
-      <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} key={item.id} detailHref={isGlobalCollectionLibrary ? `/collections/${encodeURIComponent(item.id)}` : undefined} readOnly={isGlobalCollectionLibrary} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={!isGlobalCollectionLibrary && showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={!isGlobalCollectionLibrary && selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
-      </div>
+      <LibraryGrid key={JSON.stringify([libraryQueryKey, parentId])} items={loadedItems} renderItem={(item) => <MediaCard item={item} key={item.id} detailHref={isGlobalCollectionLibrary ? `/collections/${encodeURIComponent(item.id)}` : undefined} readOnly={isGlobalCollectionLibrary} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={!isGlobalCollectionLibrary && showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={!isGlobalCollectionLibrary && selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />} />
       {mergeOpen ? (
         <div className="lux-library-dialog-backdrop" role="presentation">
           <section
