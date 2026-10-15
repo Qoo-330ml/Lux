@@ -1,68 +1,26 @@
-import { Database, Folder, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
+import { Database, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { lazy, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
-import { MediaActionMenu } from "../media/MediaActionMenu";
-import { MediaEditorBoundary } from "../media/MediaEditorBoundary";
-import { EpisodeCount, imageUrl, mediaTitle, mediaTypeLabel, Rating, runtimeLabel } from "./media-display";
-export { EpisodeCount, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, posterUrlWithFallback, Rating, runtimeLabel } from "./media-display";
+import { MediaCardEditors } from "./media-card-editors";
+import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
+import { MediaCardOverlay } from "./media-card-overlay";
+import type { MediaCardEditor } from "./media-card-editors";
+import { EpisodeCount, MediaPlaceholder, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, remainingRuntimeLabel } from "./media-display";
+export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
-const LazyImageEditor = lazy(() => import("../media/MediaImageEditor").then(({ MediaImageEditor }) => ({ default: MediaImageEditor })));
-const LazyIdentifier = lazy(() => import("../media/MediaIdentifier").then(({ MediaIdentifier }) => ({ default: MediaIdentifier })));
-const LazyMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then(({ MediaMetadataEditor }) => ({ default: MediaMetadataEditor })));
-const LazySubtitleEditor = lazy(() => import("../media/MediaSubtitleEditor").then(({ MediaSubtitleEditor }) => ({ default: MediaSubtitleEditor })));
-const LazyDeleteDialog = lazy(() => import("../media/MediaDeleteDialog").then(({ MediaDeleteDialog }) => ({ default: MediaDeleteDialog })));
-
-export function playbackPositionTicks(item: MediaItem) {
-  return item.userData?.positionTicks ?? item.userData?.playbackPositionTicks ?? 0;
-}
-
-function runtimeTicks(item: MediaItem) {
-  return item.runtimeTicks
-    ?? item.mediaSources?.find((source) => source.isDefault)?.durationTicks
-    ?? item.mediaSources?.[0]?.durationTicks
-    ?? 0;
-}
-
-export function playbackProgress(item: MediaItem) {
-  const duration = runtimeTicks(item);
-  const position = playbackPositionTicks(item);
-  return duration > 0 ? Math.min(100, Math.round((position / duration) * 100)) : 0;
-}
-
-export function remainingRuntimeLabel(item: MediaItem) {
-  const duration = runtimeTicks(item);
-  const remaining = duration - playbackPositionTicks(item);
-  return remaining > 0 ? runtimeLabel(remaining) : undefined;
-}
-
-function MediaPlaceholder({ item }: { item: MediaItem }) {
-  const pending = item.localMetadataPending === true;
-  return (
-    <div className="lux-media-placeholder">
-      {item.itemType === "FOLDER" ? <Folder size={30} aria-hidden="true" /> : pending ? (
-        <span className="lux-media-placeholder-status" role="status" aria-label="正在读取本地海报和元数据">
-          <LoaderCircle className="lux-media-placeholder-spinner" size={24} aria-hidden="true" />
-        </span>
-      ) : null}
-      <span>{mediaTitle(item)}</span>
-    </div>
-  );
-}
-export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (selected: boolean) => void }) {
-  const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
-  const progress = playbackProgress(item);
+export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (itemId: string, selected: boolean) => void }) {
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleted, setDeleted] = useState(false);
 
-  async function setMetadataLock(locked: boolean) {
+  const setMetadataLock = useCallback(async (locked: boolean) => {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
@@ -70,9 +28,9 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据锁定状态更新失败，请重试。");
     }
-  }
+  }, [item.id]);
 
-  async function refreshMetadata() {
+  const refreshMetadata = useCallback(async () => {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
@@ -81,9 +39,9 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
     }
-  }
+  }, [item.id]);
 
-  async function scanLibrary() {
+  const scanLibrary = useCallback(async () => {
     setActionError(undefined);
     setActionNotice(undefined);
     try {
@@ -92,70 +50,35 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "媒体库扫描任务提交失败，请重试。");
     }
-  }
+  }, [item.id]);
 
-  if (deleted) return null;
   const detailHref = detailHrefOverride ?? `/items/${item.id}${detailSearch ?? ""}`;
-  const isFolder = item.itemType === "FOLDER";
-  const folderLabel = `打开文件夹 ${mediaTitle(item)}`;
-
-  function mediaCardLink(children: ReactNode) {
-    if (isFolder) {
-      return folderHref
-        ? <Link className="lux-media-card-link" to={folderHref} aria-label={folderLabel}>{children}</Link>
-        : <div className="lux-media-card-link">{children}</div>;
-    }
-    return <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>{children}</Link>;
-  }
+  const openEditor = useCallback((next: MediaCardEditor) => setEditor(next), []);
+  const openDeleteDialog = useCallback(() => setDeleteOpen(true), []);
+  const closeEditor = useCallback(() => setEditor(undefined), []);
+  const closeDeleteDialog = useCallback(() => setDeleteOpen(false), []);
+  const markDeleted = useCallback(() => setDeleted(true), []);
+  const refresh = useCallback(() => void refreshMetadata(), [refreshMetadata]);
+  const scan = useCallback(() => void scanLibrary(), [scanLibrary]);
+  const lockMetadata = useCallback(() => void setMetadataLock(true), [setMetadataLock]);
+  const unlockMetadata = useCallback(() => void setMetadataLock(false), [setMetadataLock]);
+  const visual = useMemo(() => <MediaCardVisual item={item} landscape={landscape} href={item.itemType === "FOLDER" ? folderHref : detailHref} />, [detailHref, folderHref, item, landscape]);
+  if (deleted) return null;
 
   return (
     <>
       <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
-        <div className="lux-media-art-shell">
-          {selectionMode && !readOnly && !isFolder ? (
-            <label className="lux-media-selection-control">
-              <input
-                className="lux-media-selection-checkbox"
-                type="checkbox"
-                aria-label={`选择 ${mediaTitle(item)}`}
-                checked={selected}
-                onChange={(event) => onSelectionChange?.(event.target.checked)}
-                onClick={(event) => event.stopPropagation()}
-              />
-              <span aria-hidden="true" />
-            </label>
-          ) : null}
-          {mediaCardLink(
-            <div className="lux-media-art">
-              {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
-              {!isFolder ? <Rating value={item.rating} placement="card" /> : null}
-              <EpisodeCount item={item} />
-              {!isFolder ? <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span> : null}
-              {!isFolder && progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
-            </div>
-          )}
-          {!isFolder && !readOnly ? <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} /> : null}
-        </div>
-        {mediaCardLink(
-          <div className="lux-media-copy">
-            <strong>{mediaTitle(item)}</strong>
-            <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
-            {metadataAttention && !isFolder ? <span className="lux-metadata-attention-badge">待确认</span> : null}
-          </div>
-        )}
+        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={openEditor} onDelete={openDeleteDialog} onRefreshMetadata={refresh} onScanFolder={scan} onLockMetadata={lockMetadata} onUnlockMetadata={unlockMetadata}>
+          {visual}
+        </MediaCardOverlay>
+        <MediaCardCopy item={item} metadataAttention={metadataAttention} href={item.itemType === "FOLDER" ? folderHref : detailHref} />
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
-      {editor || deleteOpen ? <MediaEditorBoundary key={editor ?? "delete"} onClose={() => { setEditor(undefined); setDeleteOpen(false); }}>
-        {editor === "metadata" ? <LazyMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-        {editor === "images" ? <LazyImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-        {editor === "subtitles" ? <LazySubtitleEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-        {deleteOpen ? <LazyDeleteDialog item={item} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(item.id, item.mediaSources?.find((source) => source.isDefault)?.id)} onDeleted={() => setDeleted(true)} /> : null}
-        {editor === "identify" ? <LazyIdentifier item={item} onClose={() => setEditor(undefined)} /> : null}
-      </MediaEditorBoundary> : null}
+      <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={closeEditor} onDeleteClose={closeDeleteDialog} onDeleted={markDeleted} />
     </>
   );
-}
+});
 
 export function ContinueWatchingRail({ items, total }: { items: MediaItem[]; total?: number }) {
   if (!items.length) return null;

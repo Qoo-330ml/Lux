@@ -1,3 +1,4 @@
+import { Folder, LoaderCircle } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
 
 export function mediaTitle(item: MediaItem) {
@@ -62,6 +63,29 @@ export function runtimeLabel(ticks?: number | null) {
   return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
 }
 
+export function playbackPositionTicks(item: MediaItem) {
+  return item.userData?.positionTicks ?? item.userData?.playbackPositionTicks ?? 0;
+}
+
+function runtimeTicks(item: MediaItem) {
+  return item.runtimeTicks
+    ?? item.mediaSources?.find((source) => source.isDefault)?.durationTicks
+    ?? item.mediaSources?.[0]?.durationTicks
+    ?? 0;
+}
+
+export function playbackProgress(item: MediaItem) {
+  const duration = runtimeTicks(item);
+  const position = playbackPositionTicks(item);
+  return duration > 0 ? Math.min(100, Math.round((position / duration) * 100)) : 0;
+}
+
+export function remainingRuntimeLabel(item: MediaItem) {
+  const duration = runtimeTicks(item);
+  const remaining = duration - playbackPositionTicks(item);
+  return remaining > 0 ? runtimeLabel(remaining) : undefined;
+}
+
 export function EpisodeCount({ item }: { item: MediaItem }) {
   if (item.itemType === "BOX_SET" && item.memberCount != null && Number.isFinite(item.memberCount) && item.memberCount >= 0) {
     const label = `${item.memberCount} 部`;
@@ -71,6 +95,20 @@ export function EpisodeCount({ item }: { item: MediaItem }) {
   if (item.episodeCount == null || !Number.isFinite(item.episodeCount) || item.episodeCount < 0) return null;
   const label = `${item.episodeCount} 集`;
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
+}
+
+export function MediaPlaceholder({ item }: { item: MediaItem }) {
+  const pending = item.localMetadataPending === true;
+  return (
+    <div className="lux-media-placeholder">
+      {item.itemType === "FOLDER" ? <Folder size={30} aria-hidden="true" /> : pending ? (
+        <span className="lux-media-placeholder-status" role="status" aria-label="正在读取本地海报和元数据">
+          <LoaderCircle className="lux-media-placeholder-spinner" size={24} aria-hidden="true" />
+        </span>
+      ) : null}
+      <span>{mediaTitle(item)}</span>
+    </div>
+  );
 }
 
 export function Rating({ value, placement = "default" }: { value?: number | null; placement?: "default" | "card" }) {
