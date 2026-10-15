@@ -11678,7 +11678,7 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 实施结果（2026-10-16）：浏览器在 2.5 秒延迟媒体库模块时确认 header/nav 可见且没有全屏 loading；延迟管理 dashboard 模块时确认 LuxShell 与管理侧栏可见，内容 skeleton 在模块加载后消失。目标回归：`app-code-splitting.test.mjs` 5/5，`login-page.test.tsx` 14/14，管理事件/预加载 15/15，LuxShell 17/17、路由预加载 1/1；`pnpm install --frozen-lockfile` 与 `pnpm build` 通过。
 
-全量 `pnpm test` 的静态检查为 143/145，既有失败在 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；单独 Vitest 为 601/605，4 个失败在 `home-page.test.tsx`、`home-media.test.tsx` 和 `library-card.test.tsx`。这些测试与实现文件相对 `test` 基线均未修改。本任务没有 Rust/API/数据库变更；完整 Web 完成门仍未全绿，未部署。
+全量 `pnpm test` 的静态检查为 143/145，失败在 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；单独 Vitest 为 601/605，4 个失败在 `home-page.test.tsx`、`home-media.test.tsx` 和 `library-card.test.tsx`。在干净 `test` 基线 `8c8d5c13` 重跑这 5 个失败目标，静态目标为 38/40、Vitest 目标为 28/32，完全重现同一组失败；相关测试与组件文件相对基线均未修改。本任务没有 Rust/API/数据库变更；全量 Web 完成门仍未全绿，未部署。
 
 ## 29. 参考资料
 
