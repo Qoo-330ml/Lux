@@ -77,6 +77,7 @@ export default defineConfig({
         manualChunks(id) {
           if (!id.includes("node_modules")) return undefined;
           if (id.includes("hls.js")) return "hls";
+          if (id.includes("@tanstack/react-virtual") || id.includes("@tanstack/virtual-core")) return "react-virtual";
           if (id.includes("@tanstack/react-query")) return "react-query";
           if (id.includes("framer-motion")) return "motion";
           if (id.includes("lucide-react")) return "icons";
