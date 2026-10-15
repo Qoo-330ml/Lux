@@ -1,4 +1,3 @@
-import { AnimatePresence, motion } from "framer-motion";
 import {
   Heart,
   Home,
@@ -125,41 +124,36 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
           </div>
         </header>
 
-        <AnimatePresence>
-          {mobileOpen ? (
-            <motion.nav
-              className="lux-mobile-nav"
-              aria-label="移动端导航"
-              initial={{ opacity: 0, y: -12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -12 }}
-              transition={{ duration: 0.18 }}
-            >
-              <NavLink className={mobileNavClass} to="/" onClick={() => setMobileOpen(false)}>
-                <span className="lux-mobile-nav-icon" aria-hidden="true"><Home size={18} /></span>
-                <span className="lux-mobile-nav-label">首页</span>
-              </NavLink>
-              <NavLink className={mobileNavClass} to="/libraries" onClick={() => setMobileOpen(false)}>
-                <span className="lux-mobile-nav-icon" aria-hidden="true"><Library size={18} /></span>
-                <span className="lux-mobile-nav-label">媒体库</span>
-              </NavLink>
-              <NavLink className={mobileNavClass} to="/favorites" onClick={() => setMobileOpen(false)}>
-                <span className="lux-mobile-nav-icon" aria-hidden="true"><Heart size={18} /></span>
-                <span className="lux-mobile-nav-label">收藏</span>
-              </NavLink>
-              <NavLink className={mobileNavClass} to="/search" onClick={() => setMobileOpen(false)}>
-                <span className="lux-mobile-nav-icon" aria-hidden="true"><Search size={18} /></span>
-                <span className="lux-mobile-nav-label">搜索</span>
-              </NavLink>
-              {user.canManageServer ? (
-                <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}>
-                  <span className="lux-mobile-nav-icon" aria-hidden="true"><Settings2 size={18} /></span>
-                  <span className="lux-mobile-nav-label">管理控制台</span>
-                </NavLink>
-              ) : null}
-            </motion.nav>
+        <nav
+          className="lux-mobile-nav"
+          data-state={mobileOpen ? "open" : "closed"}
+          aria-label="移动端导航"
+          aria-hidden={!mobileOpen}
+          inert={!mobileOpen}
+        >
+          <NavLink className={mobileNavClass} to="/" onClick={() => setMobileOpen(false)}>
+            <span className="lux-mobile-nav-icon" aria-hidden="true"><Home size={18} /></span>
+            <span className="lux-mobile-nav-label">首页</span>
+          </NavLink>
+          <NavLink className={mobileNavClass} to="/libraries" onClick={() => setMobileOpen(false)}>
+            <span className="lux-mobile-nav-icon" aria-hidden="true"><Library size={18} /></span>
+            <span className="lux-mobile-nav-label">媒体库</span>
+          </NavLink>
+          <NavLink className={mobileNavClass} to="/favorites" onClick={() => setMobileOpen(false)}>
+            <span className="lux-mobile-nav-icon" aria-hidden="true"><Heart size={18} /></span>
+            <span className="lux-mobile-nav-label">收藏</span>
+          </NavLink>
+          <NavLink className={mobileNavClass} to="/search" onClick={() => setMobileOpen(false)}>
+            <span className="lux-mobile-nav-icon" aria-hidden="true"><Search size={18} /></span>
+            <span className="lux-mobile-nav-label">搜索</span>
+          </NavLink>
+          {user.canManageServer ? (
+            <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}>
+              <span className="lux-mobile-nav-icon" aria-hidden="true"><Settings2 size={18} /></span>
+              <span className="lux-mobile-nav-label">管理控制台</span>
+            </NavLink>
           ) : null}
-        </AnimatePresence>
+        </nav>
 
         <main className={isDetail ? "lux-main lux-main-detail" : "lux-main"}>
           <Outlet />

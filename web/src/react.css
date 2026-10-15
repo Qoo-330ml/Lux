@@ -186,6 +186,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-nav-link:hover, .lux-nav-link.is-active { color: #fff; }
 .lux-nav-link.is-active::after { position: absolute; right: 0; bottom: -10px; left: 0; height: 2px; border-radius: 4px; background: #fff; content: ""; }
 .lux-menu-button, .lux-mobile-nav { display: none; }
+.lux-mobile-nav { opacity: 0; transform: translateY(-12px); pointer-events: none; visibility: hidden; transition: opacity .18s ease, transform .18s ease, visibility 0s linear .18s; }
+.lux-mobile-nav[data-state="open"] { opacity: 1; transform: translateY(0); pointer-events: auto; visibility: visible; transition-delay: 0s; }
 
 .lux-main { min-height: 100vh; min-height: 100dvh; }
 .lux-main-detail { background: radial-gradient(circle at 50% -10%, rgba(56, 34, 50, .22), transparent 42%), var(--lux-bg); }
