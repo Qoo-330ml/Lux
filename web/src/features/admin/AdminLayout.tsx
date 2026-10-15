@@ -1,5 +1,6 @@
 import { Activity, BellRing, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { Suspense } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { prefetchAdminPage } from "./admin-navigation";
 import { useAdminEvents } from "./useAdminEvents";
@@ -46,8 +47,22 @@ export function AdminLayout() {
           ))}
         </nav>
       </aside>
-      <div className="lux-admin-content"><Outlet /></div>
+      <div className="lux-admin-content">
+        <Suspense fallback={<AdminPageSkeleton />}>
+          <Outlet />
+        </Suspense>
+      </div>
     </section>
+  );
+}
+
+function AdminPageSkeleton() {
+  return (
+    <div className="lux-admin-page-skeleton" role="status" aria-busy="true" aria-label="正在加载管理页面">
+      <span className="lux-skeleton-line lux-admin-page-skeleton-title" aria-hidden="true" />
+      <span className="lux-skeleton-line lux-admin-page-skeleton-description" aria-hidden="true" />
+      <div className="lux-skeleton-row lux-admin-page-skeleton-content" aria-hidden="true" />
+    </div>
   );
 }
 

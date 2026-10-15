@@ -11827,6 +11827,24 @@ Web 全量检查未全绿：`pnpm test` 的静态层为 141 passed、2 failed，
 
 ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 kB / 33.47 kB gzip，另有静态依赖的 motion chunk 128.88 kB / 42.37 kB gzip；优化后入口 JS 为 124.49 kB / 33.70 kB gzip，motion chunk 已移除。按入口和该静态 motion chunk 合计，构建 JS 体积约减少 128.48 kB / 42.14 kB gzip；该数据只表示构建产物体积，不代表运行帧率或 RUM 表现。
 
+#### LUX-552：路由切换时保留 Lux 导航
+
+范围：普通懒加载页面的 Suspense fallback 放在 LuxShell 内容区，路由 chunk 加载时 header 和主导航保持可见；管理页子路由的 fallback 限定在 `.lux-admin-content`，管理侧栏保持可见。常用主导航和账户入口在指针进入或键盘聚焦时预加载目标页面 chunk。播放器路由继续使用全屏加载态。不改变页面数据、API 或路由权限。
+
+验收：
+
+- [x] 延迟加载媒体库页面 chunk 时，LuxShell header 和主导航保持可见，内容区显示轻量 skeleton；加载完成后页面正常替换。
+- [x] 延迟加载管理页 chunk 时，主导航、管理侧栏保持可见，只有管理内容区显示 skeleton；加载完成后 dashboard 正常替换。
+- [x] 桌面与移动导航，以及账户入口的焦点/指针预加载有回归；播放器路由仍位于全屏 Suspense fallback 下。
+- [x] 冻结依赖安装、生产构建、相关 Web 回归和真实浏览器流程已运行；浏览器使用 2.5 秒本地 chunk 延迟及 mock API，未据此声称生产性能数值。
+- [x] 已执行全量 Web 检查，并在干净 `test` 基线复现相同的 6 个既有失败；项目所有者于 2026-10-16 确认仅对 LUX-552 按基线例外关闭。全局 Web 完成门仍未通过。
+
+预计文件：`web/src/app/App.tsx`、`web/src/features/admin/AdminLayout.tsx`、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、相关 Web 测试及本文档。实现拆为路由边界与导航预加载两个独立提交。
+
+实施结果（2026-10-16）：浏览器在 2.5 秒延迟媒体库模块时确认 header/nav 可见且没有全屏 loading；延迟管理 dashboard 模块时确认 LuxShell 与管理侧栏可见，内容 skeleton 在模块加载后消失。目标回归：`app-code-splitting.test.mjs` 5/5，`login-page.test.tsx` 14/14，管理事件/预加载 15/15，LuxShell 17/17、路由预加载 1/1；`pnpm install --frozen-lockfile` 与 `pnpm build` 通过。
+
+全量 `pnpm test` 的静态检查为 143/145，失败在 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；单独 Vitest 为 601/605，4 个失败在 `home-page.test.tsx`、`home-media.test.tsx` 和 `library-card.test.tsx`。在干净 `test` 基线 `8c8d5c13` 重跑这 5 个失败目标，静态目标为 38/40、Vitest 目标为 28/32，完全重现同一组失败；相关测试与组件文件相对基线均未修改。本任务没有 Rust/API/数据库变更；全量 Web 完成门仍未全绿，未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

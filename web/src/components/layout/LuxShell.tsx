@@ -18,6 +18,14 @@ import { LuxLogo } from "../LuxLogo";
 
 const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
 
+const shellRouteLoaders: Record<string, () => Promise<unknown>> = {
+  "/libraries": () => import("../../features/library/LibrariesPage"),
+  "/favorites": () => import("../../features/favorites/FavoritesPage"),
+  "/search": () => import("../../features/search/SearchPage"),
+  "/account": () => import("../../features/account/AccountPage"),
+  "/admin": () => import("../../features/admin/AdminLayout"),
+};
+
 type LuxShellProps = { user: LuxUser; serverName?: string | null };
 type AvatarContextValue = {
   avatarUrl: string | null;
@@ -84,16 +92,20 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               <NavLink className={navClass} to="/">
                 首页
               </NavLink>
-              <NavLink className={navClass} to="/libraries">
+              <NavLink className={navClass} to="/libraries" onPointerEnter={() => preloadShellRoute("/libraries")} onFocus={() => preloadShellRoute("/libraries")}>
                 媒体库
               </NavLink>
-              <NavLink className={navClass} to="/favorites">
+              <NavLink className={navClass} to="/favorites" onPointerEnter={() => preloadShellRoute("/favorites")} onFocus={() => preloadShellRoute("/favorites")}>
                 收藏
               </NavLink>
-              <NavLink className={navClass} to="/search">
+              <NavLink className={navClass} to="/search" onPointerEnter={() => preloadShellRoute("/search")} onFocus={() => preloadShellRoute("/search")}>
                 搜索
               </NavLink>
-              {user.canManageServer ? <NavLink className={navClass} to="/admin">管理</NavLink> : null}
+              {user.canManageServer ? (
+                <NavLink className={navClass} to="/admin" onPointerEnter={() => preloadShellRoute("/admin")} onFocus={() => preloadShellRoute("/admin")}>
+                  管理
+                </NavLink>
+              ) : null}
             </nav>
           </div>
 
@@ -103,6 +115,8 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               className="lux-user-button"
               type="button"
               aria-label="打开账户"
+              onPointerEnter={() => preloadShellRoute("/account")}
+              onFocus={() => preloadShellRoute("/account")}
               onClick={() => navigate(`/account/${encodeURIComponent(user.id)}`)}
             >
               <span className="lux-avatar">
@@ -136,20 +150,20 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Home size={18} /></span>
             <span className="lux-mobile-nav-label">首页</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/libraries" onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/libraries" onPointerEnter={() => preloadShellRoute("/libraries")} onFocus={() => preloadShellRoute("/libraries")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Library size={18} /></span>
             <span className="lux-mobile-nav-label">媒体库</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/favorites" onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/favorites" onPointerEnter={() => preloadShellRoute("/favorites")} onFocus={() => preloadShellRoute("/favorites")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Heart size={18} /></span>
             <span className="lux-mobile-nav-label">收藏</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/search" onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/search" onPointerEnter={() => preloadShellRoute("/search")} onFocus={() => preloadShellRoute("/search")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Search size={18} /></span>
             <span className="lux-mobile-nav-label">搜索</span>
           </NavLink>
           {user.canManageServer ? (
-            <NavLink className={mobileNavClass} to="/admin" onClick={() => setMobileOpen(false)}>
+            <NavLink className={mobileNavClass} to="/admin" onPointerEnter={() => preloadShellRoute("/admin")} onFocus={() => preloadShellRoute("/admin")} onClick={() => setMobileOpen(false)}>
               <span className="lux-mobile-nav-icon" aria-hidden="true"><Settings2 size={18} /></span>
               <span className="lux-mobile-nav-label">管理控制台</span>
             </NavLink>
@@ -171,4 +185,9 @@ function navClass({ isActive }: { isActive: boolean }) {
 
 function mobileNavClass({ isActive }: { isActive: boolean }) {
   return isActive ? "lux-nav-link lux-mobile-nav-link is-active" : "lux-nav-link lux-mobile-nav-link";
+}
+
+function preloadShellRoute(to: string) {
+  const load = shellRouteLoaders[to];
+  if (load) void load().catch(() => undefined);
 }

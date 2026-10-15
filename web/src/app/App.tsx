@@ -87,16 +87,19 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
           <Route path="watch/:itemId" element={<PlayerPage />} />
           <Route element={<LuxShell user={user} serverName={serverName} />}>
             <Route index element={<HomePage user={user} />} />
-            <Route path="libraries" element={<LibrariesPage />} />
-            <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
-            <Route path="favorites" element={<FavoritesPage />} />
-            <Route path="items/:itemId" element={<MediaDetailPage />} />
-            <Route path="collections/:collectionId" element={<CollectionDetailPage />} />
-            <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
-            <Route path="search" element={<SearchPage />} />
+            <Route path="libraries" element={<SuspensePage><LibrariesPage /></SuspensePage>} />
+            <Route path="libraries/:libraryId" element={<SuspensePage><LibraryPage serverName={serverName} /></SuspensePage>} />
+            <Route path="favorites" element={<SuspensePage><FavoritesPage /></SuspensePage>} />
+            <Route path="items/:itemId" element={<SuspensePage><MediaDetailPage /></SuspensePage>} />
+            <Route path="collections/:collectionId" element={<SuspensePage><CollectionDetailPage /></SuspensePage>} />
+            <Route path="people/:personId" element={<SuspensePage><PersonDetailPage user={user} /></SuspensePage>} />
+            <Route path="search" element={<SuspensePage><SearchPage /></SuspensePage>} />
             <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
-            <Route path="account/:userId" element={<AccountRoute user={user} />} />
-            <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
+            <Route path="account/:userId" element={<SuspensePage><AccountRoute user={user} /></SuspensePage>} />
+            <Route path="admin" element={user.canManageServer
+              ? <SuspensePage><AdminLayout /></SuspensePage>
+              : <Navigate to="/" replace />
+            }>
               <Route index element={<AdminDashboardPage />} />
               <Route path="libraries" element={<AdminLibrariesPage />} />
               <Route path="plugins" element={<AdminPluginsPage />} />
@@ -111,6 +114,24 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
         </Routes>
       </Suspense>
     </RouteErrorBoundary>
+  );
+}
+
+function SuspensePage({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<PageSkeleton />}>
+      {children}
+    </Suspense>
+  );
+}
+
+function PageSkeleton() {
+  return (
+    <div className="lux-route-skeleton" role="status" aria-busy="true" aria-label="正在加载页面">
+      <span className="lux-skeleton-line lux-route-skeleton-title" aria-hidden="true" />
+      <span className="lux-skeleton-line lux-route-skeleton-description" aria-hidden="true" />
+      <div className="lux-skeleton-row lux-route-skeleton-content" aria-hidden="true" />
+    </div>
   );
 }
 
