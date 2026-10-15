@@ -415,6 +415,93 @@ async fn sqlite_media_item_timestamps_upgrade_handles_legacy_and_new_rows()
     Ok(())
 }
 
+#[tokio::test]
+async fn sqlite_upgrade_accepts_the_original_applied_timestamp_migration_checksum()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ORIGINAL_MIGRATION: &str = "ALTER TABLE media_items\nADD COLUMN updated_at INTEGER NOT NULL DEFAULT (unixepoch());\n\nCREATE INDEX idx_media_items_updated_at\nON media_items(updated_at, id);\n";
+
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir_all(&config_dir)?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let migration_dir = temp_dir.path().join("legacy-migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?;
+        if version.is_some_and(|version| version <= 125) {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration filename")?),
+            )?;
+        }
+    }
+    fs::write(
+        migration_dir.join("0126_emby_item_timestamps.sql"),
+        ORIGINAL_MIGRATION,
+    )?;
+
+    let database_path = config_dir.join("lux.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('timestamp-library', 'Legacy', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('legacy-item', 'timestamp-library', 'MOVIE', 'Legacy', 'legacy', 'LOCAL_CONFIRMED')",
+    )
+    .execute(&pool)
+    .await?;
+    let original_checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 126")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        original_checksum,
+        Sha384::digest(ORIGINAL_MIGRATION.as_bytes()).to_vec()
+    );
+    pool.close().await;
+
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 174);
+    let preserved_checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 126")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_checksum, original_checksum);
+    let updated_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'legacy-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(updated_at > 0);
+
+    database.close().await;
+    Ok(())
+}
+
 #[test]
 fn postgres_migration_0158_preserves_legacy_media_chapters_version() {
     let legacy = include_str!("../migrations-postgres/0158_media_info_chapters.sql");
