@@ -2,10 +2,11 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, Star, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { MediaSource, MediaStream } from "../../lib/api/types";
+import type { MediaItem } from "../../lib/api/types";
+import { MediaSourcePanel, MediaSourceProvider, useMediaSource } from "./MediaSourcePanel";
+import { sourceBadges, streamsOfType } from "./media-source";
 import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
 import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
@@ -19,18 +20,28 @@ import { LuxLogo } from "../../components/LuxLogo";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
-  const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const pendingReview = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING";
-  const requestedSourceId = searchParams.get("sourceId") ?? undefined;
-  const collectionId = searchParams.get("collectionId") ?? undefined;
-  const queryClient = useQueryClient();
+  const [routeParams] = useSearchParams();
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
     queryFn: () => api.item(itemId),
     enabled: Boolean(itemId),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
+  if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
+  if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
+  return <MediaSourceProvider key={itemId} item={item.data} requestedSourceId={routeParams.get("sourceId") ?? undefined}>
+    <MediaDetailContent media={item.data} />
+  </MediaSourceProvider>;
+}
+
+function MediaDetailContent({ media }: { media: MediaItem }) {
+  const itemId = media.id;
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const pendingReview = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING";
+  const collectionId = searchParams.get("collectionId") ?? undefined;
+  const queryClient = useQueryClient();
+  const { source, selectedAudioStreamIndex, selectedSubtitleStreamIndex } = useMediaSource();
   const itemImages = useQuery({
     queryKey: queryKeys.itemImages(itemId),
     queryFn: () => api.itemImages(itemId),
@@ -43,27 +54,24 @@ export function MediaDetailPage() {
     enabled: Boolean(itemId),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
-  const pendingItemsQueryKey = queryKeys.library(item.data?.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING", 100);
+  const pendingItemsQueryKey = queryKeys.library(media.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING", 100);
   const pendingItems = useQuery({
     queryKey: pendingItemsQueryKey,
-    queryFn: () => api.libraryItems(item.data?.libraryId ?? "", 1, undefined, { metadataStatus: "PENDING", pageSize: 100 }),
-    enabled: pendingReview && Boolean(item.data?.libraryId),
+    queryFn: () => api.libraryItems(media.libraryId ?? "", 1, undefined, { metadataStatus: "PENDING", pageSize: 100 }),
+    enabled: pendingReview && Boolean(media.libraryId),
   });
-  const [selectedSourceId, setSelectedSourceId] = useState<string>();
-  const [selectedAudioStreamIndex, setSelectedAudioStreamIndex] = useState<string>();
-  const [selectedSubtitleStreamIndex, setSelectedSubtitleStreamIndex] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [confirmingMetadata, setConfirmingMetadata] = useState(false);
   const [pendingPlaybackAction, setPendingPlaybackAction] = useState<"favorite" | "played">();
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const isSeries = item.data?.itemType === "SERIES";
-  const isSeason = item.data?.itemType === "SEASON";
-  const isEpisode = item.data?.itemType === "EPISODE";
-  const isVideo = item.data?.itemType === "VIDEO";
-  const hierarchySeriesId = item.data && !isSeries
-    ? item.data.seriesId ?? item.data.parentId ?? undefined
+  const isSeries = media.itemType === "SERIES";
+  const isSeason = media.itemType === "SEASON";
+  const isEpisode = media.itemType === "EPISODE";
+  const isVideo = media.itemType === "VIDEO";
+  const hierarchySeriesId = media && !isSeries
+    ? media.seriesId ?? media.parentId ?? undefined
     : undefined;
   const seriesContext = useQuery({
     queryKey: queryKeys.item(hierarchySeriesId ?? ""),
@@ -71,23 +79,6 @@ export function MediaDetailPage() {
     enabled: Boolean(hierarchySeriesId),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
-  const sources = item.data?.mediaSources ?? [];
-  const source = sources.find((entry) => entry.id === selectedSourceId)
-    ?? sources.find((entry) => entry.id === requestedSourceId)
-    ?? sources.find((entry) => entry.isDefault)
-    ?? sources[0];
-  useEffect(() => {
-    setSelectedAudioStreamIndex(defaultStreamIndex(source, "AUDIO"));
-    setSelectedSubtitleStreamIndex(defaultStreamIndex(source, "SUBTITLE"));
-  }, [source?.id]);
-  useEffect(() => {
-    setSelectedSourceId(requestedSourceId);
-  }, [itemId, requestedSourceId]);
-
-  if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
-  if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
-
-  const media = item.data;
   const addedAtCandidate = typeof media.addedAt === "number" && Number.isFinite(media.addedAt)
     ? new Date(media.addedAt * 1000)
     : undefined;
@@ -336,27 +327,7 @@ export function MediaDetailPage() {
             </div>
             {actionError ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actionError}</p> : null}
             {actionNotice ? <p className="lux-muted-copy lux-detail-action-error" role="status">{actionNotice}</p> : null}
-            {sources.length > 1 ? (
-              <MediaSourceSelector
-                sources={sources}
-                selectedSourceId={source?.id}
-                selectedAudioStreamIndex={selectedAudioStreamIndex}
-                selectedSubtitleStreamIndex={selectedSubtitleStreamIndex}
-                onSelect={(sourceId) => setSelectedSourceId(sourceId)}
-                onAudioSelect={setSelectedAudioStreamIndex}
-                onSubtitleSelect={setSelectedSubtitleStreamIndex}
-              />
-            ) : source && (source.streams ?? []).some((stream) => isTrackType(stream, "AUDIO") || isTrackType(stream, "SUBTITLE")) ? (
-              <MediaSourceSelector
-                sources={sources}
-                selectedSourceId={source.id}
-                selectedAudioStreamIndex={selectedAudioStreamIndex}
-                selectedSubtitleStreamIndex={selectedSubtitleStreamIndex}
-                onSelect={(sourceId) => setSelectedSourceId(sourceId)}
-                onAudioSelect={setSelectedAudioStreamIndex}
-                onSubtitleSelect={setSelectedSubtitleStreamIndex}
-              />
-            ) : null}
+            <MediaSourcePanel />
           </div>
         </div>
         <div className="lux-detail-sections">
@@ -486,344 +457,3 @@ function ExpandableOverview({ overview }: { overview: string }) {
     </>
   );
 }
-
-function MediaSourceSelector({
-  sources,
-  selectedSourceId,
-  selectedAudioStreamIndex,
-  selectedSubtitleStreamIndex,
-  onSelect,
-  onAudioSelect,
-  onSubtitleSelect,
-}: {
-  sources: MediaSource[];
-  selectedSourceId?: string;
-  selectedAudioStreamIndex?: string;
-  selectedSubtitleStreamIndex?: string;
-  onSelect: (sourceId: string) => void;
-  onAudioSelect: (streamIndex: string) => void;
-  onSubtitleSelect: (streamIndex: string) => void;
-}) {
-  const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
-  const audioStreams = streamsOfType(selectedSource, "AUDIO");
-  const subtitleStreams = streamsOfType(selectedSource, "SUBTITLE");
-  const versionSources = versionSelectableSources(sources);
-  const options = versionSources.map((source, index) => ({
-    value: source.id,
-    label: (
-      <span className="lux-source-option-content">
-        <span className="lux-source-option-label">{sourceLabel(source, index)}</span>
-        <span className="lux-source-option-detail">{source.editionName || source.container || "DIRECT PLAY"}</span>
-      </span>
-    ),
-  }));
-
-  return (
-    <section
-      className="lux-source-selector"
-      aria-labelledby={versionSources.length > 1 ? "media-source-heading" : undefined}
-      aria-label={versionSources.length > 1 ? undefined : "播放轨道选择"}
-    >
-      {versionSources.length > 1 ? <div className="lux-track-selector">
-        <div className="lux-section-heading">
-          <h2 id="media-source-heading">选择版本</h2>
-          <span>{versionSources.length} 个版本</span>
-        </div>
-        <div className="lux-source-select lux-track-select">
-          <LuxSelect
-            value={selectedSourceId ?? sources[0]?.id ?? ""}
-            options={options}
-            menuClassName="lux-track-select-menu"
-            onChange={onSelect}
-            aria-labelledby="media-source-heading"
-          />
-        </div>
-      </div> : null}
-      {audioStreams.length || subtitleStreams.length ? (
-        <div className="lux-track-selectors">
-          {audioStreams.length ? (
-            <MediaTrackSelector
-              type="AUDIO"
-              streams={audioStreams}
-              selectedStreamIndex={selectedAudioStreamIndex}
-              onSelect={onAudioSelect}
-            />
-          ) : null}
-          {subtitleStreams.length ? (
-            <MediaTrackSelector
-              type="SUBTITLE"
-              streams={subtitleStreams}
-              selectedStreamIndex={selectedSubtitleStreamIndex}
-              onSelect={onSubtitleSelect}
-            />
-          ) : null}
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function MediaTrackSelector({
-  type,
-  streams,
-  selectedStreamIndex,
-  onSelect,
-}: {
-  type: "AUDIO" | "SUBTITLE";
-  streams: MediaStream[];
-  selectedStreamIndex?: string;
-  onSelect: (streamIndex: string) => void;
-}) {
-  const label = type === "AUDIO" ? "音频" : "字幕";
-  const headingId = `media-${type.toLowerCase()}-heading`;
-  const options = streams.map((stream, index) => ({
-    value: String(stream.index),
-    label: streamLabel(stream, label, index),
-  }));
-  return (
-    <div className="lux-track-selector" data-track-selector={type.toLowerCase()}>
-      <div className="lux-section-heading">
-        <h2 id={headingId}>选择{label}</h2>
-        <span>{streams.length} 条{label}轨</span>
-      </div>
-      <div className="lux-track-select">
-        <LuxSelect
-          id={`media-${type.toLowerCase()}-select`}
-          value={selectedStreamIndex ?? String(streams[0]?.index ?? "")}
-          options={options}
-          menuClassName="lux-track-select-menu"
-          disabled={streams.length <= 1}
-          onChange={onSelect}
-          aria-labelledby={headingId}
-        />
-      </div>
-    </div>
-  );
-}
-
-/** Parts of one version (cd1, cd2 ...) are not alternative versions: list only the first part. */
-function versionSelectableSources(sources: MediaSource[]) {
-  return sources.filter(
-    (source) =>
-      source.partIndex == null ||
-      !sources.some(
-        (other) =>
-          other.versionKey === source.versionKey &&
-          other.partIndex != null &&
-          other.partIndex < source.partIndex!,
-      ),
-  );
-}
-
-function sourceLabel(source: MediaSource, index: number) {
-  const videoStream = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
-  const qualityTokens = splitSourceInfo(source.qualityLabel);
-  const qualityRange = qualityTokens.find(dynamicRangeToken);
-  const labels = uniqueSourceLabels([
-    ...qualityTokens.filter((token) => !dynamicRangeToken(token)),
-    videoCodecLabel(videoStream),
-    dynamicRangeLabel(videoStream) ?? qualityRange,
-    bitDepthLabel(videoStream),
-  ]);
-  return labels.join(" · ") || source.editionName || `${source.container?.toUpperCase() || "视频"} · 版本 ${index + 1}`;
-}
-
-function streamsOfType(source: MediaSource | undefined, type: "AUDIO" | "SUBTITLE") {
-  return source?.streams?.filter((stream) => isTrackType(stream, type)) ?? [];
-}
-
-function isTrackType(stream: MediaStream, type: "AUDIO" | "SUBTITLE") {
-  return stream.type?.toUpperCase() === type;
-}
-
-function defaultStreamIndex(source: MediaSource | undefined, type: "AUDIO" | "SUBTITLE") {
-  const streams = streamsOfType(source, type);
-  const stream = streams.find((candidate) => candidate.isDefault) ?? streams[0];
-  return stream ? String(stream.index) : undefined;
-}
-
-function streamLabel(stream: MediaStream, typeLabel: string, index: number) {
-  const labels = uniqueSourceLabels([
-    stream.title ?? undefined,
-    stream.language ? languageLabel(stream.language) : undefined,
-    stream.codec?.trim().toUpperCase(),
-  ]);
-  return labels.join(" · ") || `${typeLabel}轨道 ${index + 1}`;
-}
-
-function languageLabel(value: string) {
-  const normalized = value.trim().toLowerCase();
-  return ({
-    en: "英语",
-    chi: "中文",
-    zho: "中文",
-    eng: "英语",
-    jpn: "日语",
-    kor: "韩语",
-    zh: "中文",
-    "zh-cn": "中文",
-    "zh-hk": "中文",
-    "zh-sg": "中文",
-    "zh-tw": "中文",
-    und: "未知语言",
-  } as Record<string, string>)[normalized] ?? value;
-}
-
-function splitSourceInfo(value?: string | null) {
-  return value?.split(/\s*[·•|/,]\s*|\s+/).map((part) => part.trim()).filter(Boolean) ?? [];
-}
-
-function dynamicRangeToken(value: string) {
-  const normalized = value.toLowerCase().replace(/[\s_-]+/g, "");
-  if (normalized === "sdr") return "SDR";
-  if (normalized === "hdr10+") return "HDR10+";
-  if (normalized === "hdr10") return "HDR10";
-  if (normalized === "hdr") return "HDR";
-  if (normalized === "hlg") return "HLG";
-  if (normalized === "dv" || normalized === "dovi" || normalized === "dolbyvision") return "Dolby Vision";
-  return undefined;
-}
-
-function videoCodecLabel(stream?: MediaStream) {
-  const codec = stream?.codec?.trim();
-  if (!codec) return undefined;
-  const normalized = codec.toLowerCase().replace(/[^a-z0-9]+/g, "");
-  if (normalized === "hevc" || normalized === "h265" || normalized === "x265") return "HEVC";
-  if (normalized === "h264" || normalized === "avc" || normalized === "x264") return "H.264";
-  if (normalized === "mpeg4") return "MPEG-4";
-  if (normalized === "av1") return "AV1";
-  if (normalized === "vp9") return "VP9";
-  if (normalized === "vp8") return "VP8";
-  return codec.toUpperCase();
-}
-
-function dynamicRangeLabel(stream?: MediaStream) {
-  if (!stream) return undefined;
-  const detailText = Object.entries(stream.details ?? {})
-    .filter(([key]) => /videorange|extendedvideotype|extendedvideosubtype|colortransfer|colorprimaries/i.test(key))
-    .map(([, value]) => String(value))
-    .join(" ");
-  const value = `${stream.title ?? ""} ${detailText}`.toLowerCase().replace(/[_-]+/g, " ");
-  if (/\bdolby\s+vision\b|\bdovi\b|\bdv\b/.test(value)) return "Dolby Vision";
-  if (/\bhdr10\+?\b|\bhdr10plus\b/.test(value)) return value.includes("hdr10+") || value.includes("hdr10plus") ? "HDR10+" : "HDR10";
-  if (/\bhdr\b|\bsmpte\s*2084\b|\bpq\b/.test(value)) return "HDR";
-  if (/\bhlg\b|arib\s+std\s+b67/.test(value)) return "HLG";
-  if (/\bsdr\b/.test(value)) return "SDR";
-  return undefined;
-}
-
-function bitDepthLabel(stream?: MediaStream) {
-  const rawValue = stream?.details?.BitDepth;
-  if (rawValue === undefined || rawValue === null) return undefined;
-  const match = String(rawValue).match(/\d+/);
-  const bitDepth = match ? Number(match[0]) : Number.NaN;
-  return Number.isFinite(bitDepth) && bitDepth > 0 ? `${bitDepth}-bit` : undefined;
-}
-
-function uniqueSourceLabels(labels: Array<string | undefined>) {
-  const seen = new Set<string>();
-  return labels.filter((label): label is string => {
-    const trimmed = label?.trim();
-    if (!trimmed) return false;
-    const key = trimmed.toLowerCase().replace(/[\s.·-]+/g, "");
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-type SourceBadge = {
-  key: string;
-  label: string;
-  className?: string;
-  title?: string;
-};
-
-function audioBadgeLabel(stream?: MediaStream) {
-  if (!stream) return undefined;
-  const codec = stream.codec?.trim().toUpperCase();
-  const title = stream.title?.trim() ?? "";
-  if (/atmos/i.test(title)) {
-    return "Atmos";
-  }
-  const rawChannels = stream.details?.Channels;
-  const channels = typeof rawChannels === "number" ? rawChannels : Number(rawChannels);
-  const channelText = channels === 8 ? "7.1" : channels === 6 ? "5.1" : channels === 2 ? "2.0" : undefined;
-
-  if (codec === "TRUEHD") return channelText ? `TrueHD ${channelText}` : "TrueHD";
-  if (codec === "DTS" || codec === "DCA") {
-    if (/dts-hd\s*ma/i.test(title)) return channelText ? `DTS-HD MA ${channelText}` : "DTS-HD MA";
-    return channelText ? `DTS ${channelText}` : "DTS";
-  }
-  if (codec === "EAC3") return channelText ? `E-AC3 ${channelText}` : "E-AC3";
-  if (codec === "AC3") return channelText ? `AC3 ${channelText}` : "AC3";
-  if (codec === "AAC") return channelText ? `AAC ${channelText}` : "AAC";
-  if (codec === "FLAC") return channelText ? `FLAC ${channelText}` : "FLAC";
-  return codec ? (channelText ? `${codec} ${channelText}` : codec) : undefined;
-}
-
-function sourceBadges(source?: MediaSource, selectedAudioStreamIndex?: string): SourceBadge[] {
-  if (!source) return [];
-  const videoStream = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
-  const audioStreams = streamsOfType(source, "AUDIO");
-  const activeAudioStream = audioStreams.find((stream) => String(stream.index) === selectedAudioStreamIndex) ?? audioStreams[0];
-
-  const qualityTokens = splitSourceInfo(source.qualityLabel);
-  const qualityRange = qualityTokens.find(dynamicRangeToken);
-  const rawResolution = qualityTokens.find((token) => !dynamicRangeToken(token)) || source.qualityLabel?.trim();
-  const codec = videoCodecLabel(videoStream);
-  const range = dynamicRangeLabel(videoStream) ?? qualityRange;
-  const bitDepth = bitDepthLabel(videoStream);
-  const audio = audioBadgeLabel(activeAudioStream);
-
-  const badges: SourceBadge[] = [];
-
-  if (rawResolution) {
-    const is4k = /4k|2160/i.test(rawResolution);
-    const is1080p = /1080/i.test(rawResolution);
-    badges.push({
-      key: "resolution",
-      label: is4k ? "4K UHD" : is1080p ? "1080P" : rawResolution.toUpperCase(),
-      className: is4k ? "is-4k" : is1080p ? "is-1080p" : undefined,
-      title: "分辨率",
-    });
-  }
-
-  if (codec) {
-    badges.push({
-      key: "codec",
-      label: codec,
-      title: "视频编码",
-    });
-  }
-
-  if (range) {
-    const isHdr = /hdr|dolby|dovi|hlg/i.test(range);
-    badges.push({
-      key: "range",
-      label: range,
-      className: isHdr ? "is-hdr" : undefined,
-      title: "动态范围",
-    });
-  }
-
-  if (bitDepth) {
-    badges.push({
-      key: "bitDepth",
-      label: bitDepth,
-      title: "色深",
-    });
-  }
-
-  if (audio) {
-    badges.push({
-      key: "audio",
-      label: audio,
-      className: "is-audio",
-      title: "音频格式",
-    });
-  }
-
-  return badges;
-}
-

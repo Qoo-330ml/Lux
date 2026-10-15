@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, notifyManager } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
@@ -19,6 +19,7 @@ describe("MediaDetailPage series hierarchy", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    notifyManager.setScheduler(queueMicrotask);
     mockPlaybackBootstrap();
     vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
     vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (itemId, sourceId, capabilities) => ({
@@ -42,6 +43,7 @@ describe("MediaDetailPage series hierarchy", () => {
     if (root) act(() => root?.unmount());
     container?.remove();
     vi.restoreAllMocks();
+    notifyManager.setScheduler((callback) => setTimeout(callback, 0));
   });
 
   async function renderDetail(item: MediaItem, images: ItemImage[] = [], initialEntry = `/items/${item.id}`) {

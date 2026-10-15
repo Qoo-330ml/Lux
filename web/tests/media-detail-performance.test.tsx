@@ -2,9 +2,9 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, notifyManager } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
 import { MediaCast } from "../src/features/detail/MediaCast";
 import { MediaStills } from "../src/features/detail/MediaStills";
@@ -32,12 +32,15 @@ let root: Root | undefined;
 let container: HTMLDivElement;
 let client: QueryClient;
 
+beforeEach(() => { notifyManager.setScheduler(queueMicrotask); });
+
 afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
   client?.clear();
   vi.restoreAllMocks();
   vi.clearAllMocks();
+  notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 });
 
 async function renderDetail(overrides: Partial<MediaItem> = {}) {
