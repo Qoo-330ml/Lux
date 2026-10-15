@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.5",
+    date: "2026-10-15",
+    sections: [
+      { kind: "changed", items: [
+        "详情页将徽标置于中文与原始标题上方，并在移动端保留标题文字；剧集详情页将播出季排在演职人员和剧照之间，并增加剧照与“更多信息”之间的留白。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.4",
     date: "2026-10-15",
     sections: [
