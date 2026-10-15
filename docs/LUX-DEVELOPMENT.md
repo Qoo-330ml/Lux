@@ -11602,6 +11602,23 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 验证：macOS `arm64`，Cargo 输出位于项目共享 target。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；`cargo test --locked --test storage` 为 59 passed；PostgreSQL 16 临时实例下 `cargo test --locked --test postgres_database -- --include-ignored` 为 16 passed，覆盖空库启动、旧迁移升级和新索引存在；合集 worker 回归与名称补齐用例通过。全量 `cargo test --locked --all-targets --no-fail-fast --quiet` 的 874 个库测试通过、23 个按设计忽略。唯一稳定复现的失败是 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete`：实际 2 张、预期 1 张；在干净基线 `8f9defcf` 上相同失败，属于本任务开始前已有问题。另一个 `local_nfo_retry_excludes_non_retryable_conflict_item` 仅在全目标并行运行时出现过一次 `RowNotFound`，定向复跑通过。Rust 静态 Web 用例首次因隔离 worktree 尚无 `web/dist` 返回 404；生成 Web 构建产物后定向用例通过。未部署、未访问或修改 FNOS 数据。
 
+#### LUX-547：索引媒体目录中的 extrafanart 图片
+
+范围：电影和剧集的本地图片扫描除资源目录直系图片外，也读取同目录 `extrafanart` 子目录中的直系图片，并把支持格式登记为 `FANART`，供媒体详情剧照栏使用。继续支持资源目录中的 `fanart1.jpg`、`fanart2.jpg` 及 `fanart-1.jpg` 等编号命名；只读取 `extrafanart` 下一级普通图片文件，不递归其他目录、不跟随符号链接。增量新增、修改、删除同样只更新所属电影或剧集的图片记录。
+
+验收：
+
+- [x] 电影全量扫描登记根目录中的编号 fanart 和 `extrafanart` 中的 JPG/JPEG/PNG/WebP 图片，图片类型均为 FANART，序号稳定。
+- [x] 剧集扫描将剧集目录 `extrafanart` 图片登记到剧集条目，不登记到季或分集；编号 fanart 继续有效。
+- [x] `extrafanart` 图片的增量新增、修改和删除更新对应剧集/电影图片记录；同目录其他媒体和条目 metadata 状态不变。
+- [x] 支持类型、文件层级、symlink 边界与详情页使用的本地 `item_images` 记录有自动化回归覆盖。
+
+预计文件（4 个）：`src/application/metadata.rs`、`src/storage/jobs/local_metadata/sources.rs`、`tests/scanning_jobs.rs`、本文档。
+
+实现边界：电影图片继续按资源目录归属，因此同一资源目录中的多个电影源共享该目录的图片，与现有直系图片行为一致。扫描时可见的 `extrafanart` 目录符号链接和其中的图片符号链接会被忽略；文件系统枚举沿用路径式 API，不承诺抵御另一进程在检查和读取之间替换目录的竞态。
+
+验证：macOS `arm64`，Cargo 输出位于 Toshiba 共享 target。本任务新增的 `manifest_scan_indexes_extrafanart_image_add_change_and_remove` 定向回归通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 通过。`cargo test --locked --all-targets` 在 lib 测试目标结束：862 passed、13 failed、23 ignored，因此后续目标未运行；失败集中于字幕/播放子进程和插件运行时超时或缺文件，涉及文件不在本任务改动范围内。单独运行 `tests/scanning_jobs.rs` 为 86 passed、2 failed：`completed_scan_runs_pending_ffprobe_before_worker_returns` 收到空 BIGINT，`incremental_scan_probes_only_changed_local_sources` 的 ffprobe 结果超时。未部署或访问 FNOS。Cargo 命令须设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`，并先确认 Toshiba 已挂载。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
