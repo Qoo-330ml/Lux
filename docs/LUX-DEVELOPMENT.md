@@ -11662,6 +11662,26 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
+#### LUX-552：优化横向滚动栏与前端动画
+
+范围：落实前端重构方案第七项和第八项。横向滚动栏在滚动时不再逐事件同步读取元素几何信息；移动端导航、首页 Hero 轮播和登录卡片使用 CSS 动画，消除应用主入口对 `framer-motion` 的依赖。保留滚动按钮、导航开关、轮播切换、视觉布局和现有文案；动画遵从减少动态效果设置。
+
+验收：
+
+- [ ] `HorizontalScrollRail` 通过 `IntersectionObserver` 更新首尾边界状态，滚动事件路径不调用 `getBoundingClientRect()`；内容或尺寸变化后箭头状态仍正确。
+- [ ] 不支持 `IntersectionObserver` 的环境有节流回退；滚动按钮仍按视口比例平滑滚动，到达边界后正确隐藏对应按钮。
+- [ ] 移动导航和 Hero 背景/文案在状态变化时平滑过渡；关闭导航后不可点击、聚焦或被辅助技术访问。
+- [ ] 登录、首页和移动导航动画使用 CSS，所有 `framer-motion` 调用点移除后依赖可删除；减少动态效果模式禁用新增动画。
+- [ ] 自动化回归覆盖滚动边界、导航开关、轮播切换和动画减少策略；Web 全量检查与真实浏览器流程通过。
+- [ ] 记录 ARM64 环境优化前后主入口 JS/gzip 体积；不得将构建体积差异表述为真实设备帧率或 RUM 数据。
+
+预计分四个增量，每次不超过五个文件：
+
+1. 本文档、`web/src/components/layout/HorizontalScrollRail.tsx`、`web/tests/horizontal-scroll-rail.test.tsx`。
+2. 本文档、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、`web/tests/lux-shell.test.tsx`。
+3. 本文档、`web/src/features/home/HomePage.tsx`、`web/src/react.css`、`web/tests/home-page.test.tsx`。
+4. 本文档、`web/src/features/auth/LoginPage.tsx`、`web/tests/login-page.test.tsx`、`web/package.json`、`web/pnpm-lock.yaml`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
