@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { MediaSource, MediaStream } from "../../lib/api/types";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
-import { mediaTypeLabel, runtimeLabel } from "../home/media";
+import { mediaTypeLabel, runtimeLabel } from "../home/media-display";
 
 const LANGUAGE_NAMES: Record<string, string> = {
   en: "英语",

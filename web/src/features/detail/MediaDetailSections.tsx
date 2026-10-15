@@ -4,7 +4,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaActor, MediaItem, MediaSource } from "../../lib/api/types";
 import { detailAddedAt, useSeriesContext } from "./MediaDetailHero";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 import { MediaCast } from "./MediaCast";
 import { MediaNfoPanel } from "./MediaNfoPanel";
 import { MediaStills } from "./MediaStills";

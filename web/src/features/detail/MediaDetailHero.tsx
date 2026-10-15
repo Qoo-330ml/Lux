@@ -5,7 +5,7 @@ import { ArrowLeft, Sparkles, Star, X } from "lucide-react";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
-import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
+import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media-display";
 import { useMediaSource } from "./MediaSourcePanel";
 import { sourceBadges } from "./media-source";
 

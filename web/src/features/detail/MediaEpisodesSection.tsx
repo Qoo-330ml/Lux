@@ -2,7 +2,7 @@ import { memo, useEffect, useState, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Play } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
-import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback } from "../home/media";
+import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback } from "../home/media-display";
 import { useMediaEpisodes } from "./useMediaEpisodes";
 
 export const MediaEpisodesSection = memo(function MediaEpisodesSection({ item: media, children }: { item: MediaItem; children: ReactNode }) {
