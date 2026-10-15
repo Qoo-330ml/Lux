@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
@@ -260,6 +261,15 @@ use crate::observability::logs::{LogStore, NewAuditLogEvent};
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
+// SQLite migration 0126 used this checksum before the ALTER TABLE default was made compatible
+// with populated databases. Accept only this exact already-applied version; new databases keep
+// applying the current migration and its backfill/trigger.
+const LEGACY_SQLITE_MIGRATION_0126_CHECKSUM: &[u8] = &[
+    0xfb, 0x25, 0x0e, 0x26, 0x1d, 0xf5, 0x07, 0xa3, 0x2a, 0xa8, 0xca, 0xdf, 0x24, 0x7b, 0x2d, 0x69,
+    0x5e, 0x0f, 0x65, 0xdf, 0x7b, 0x0f, 0xc9, 0x4f, 0x29, 0xb8, 0x7f, 0xd6, 0x38, 0x9a, 0x49, 0x8d,
+    0x0f, 0xc3, 0x31, 0xf4, 0x74, 0x1e, 0x5b, 0xd2, 0xc2, 0x6b, 0x71, 0xfa, 0x67, 0x67, 0xda, 0xd6,
+];
+
 pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 pub(crate) const MAX_PLAYBACK_SESSION_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
@@ -455,11 +465,25 @@ impl Database {
             return Err(error);
         }
 
-        let migrator = match backend {
-            DatabaseBackend::Sqlite => &SQLITE_MIGRATOR,
-            DatabaseBackend::Postgres => &POSTGRES_MIGRATOR,
+        let migration_result = match backend {
+            DatabaseBackend::Sqlite => {
+                match sqlite_has_legacy_timestamp_migration_checksum(&pool).await {
+                    Ok(true) => {
+                        if let Some(legacy_migrator) =
+                            sqlite_migrator_with_legacy_timestamp_checksum()
+                        {
+                            legacy_migrator.run(&pool).await
+                        } else {
+                            SQLITE_MIGRATOR.run(&pool).await
+                        }
+                    }
+                    Ok(false) => SQLITE_MIGRATOR.run(&pool).await,
+                    Err(source) => Err(MigrateError::Execute(source)),
+                }
+            }
+            DatabaseBackend::Postgres => POSTGRES_MIGRATOR.run(&pool).await,
         };
-        if let Err(source) = migrator.run(&pool).await {
+        if let Err(source) = migration_result {
             pool.close().await;
             return Err(StorageError::Migration { path, source });
         }
@@ -901,6 +925,38 @@ impl Database {
             sql,
         )))
     }
+}
+
+async fn sqlite_has_legacy_timestamp_migration_checksum(
+    pool: &AnyPool,
+) -> Result<bool, sqlx::Error> {
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = '_sqlx_migrations'
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if migrations_table_exists == 0 {
+        return Ok(false);
+    }
+
+    let checksum: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT checksum FROM _sqlx_migrations WHERE version = 126 AND success = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(checksum.as_deref() == Some(LEGACY_SQLITE_MIGRATION_0126_CHECKSUM))
+}
+
+fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {
+    let mut migrations = SQLITE_MIGRATOR.iter().cloned().collect::<Vec<_>>();
+    let timestamp_migration = migrations
+        .iter_mut()
+        .find(|migration| migration.version == 126)?;
+    timestamp_migration.checksum = Cow::Borrowed(LEGACY_SQLITE_MIGRATION_0126_CHECKSUM);
+    Some(Migrator::with_migrations(migrations))
 }
 
 #[derive(Debug, Eq, PartialEq)]
