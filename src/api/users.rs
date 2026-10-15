@@ -1352,6 +1352,7 @@ pub(super) async fn auth_update_settings(
         if let Some(home) = state.home.as_ref() {
             home.invalidate();
         }
+        state.user_events.publish_home_coalesced().await;
     }
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1552,6 +1553,7 @@ pub(super) async fn auth_update_library_order(
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
+            state.user_events.publish_home_coalesced().await;
             Json(json!({ "libraryOrder": library_order })).into_response()
         }
         Err(LibraryServiceError::InvalidLibraryOrder(message)) => api_error(

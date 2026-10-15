@@ -49,7 +49,7 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
-        admin_events::{AdminEventHub, AdminEventScope, UserEventHub},
+        admin_events::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope},
         candidates::{
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
@@ -1325,7 +1325,10 @@ async fn lux_set_person_favorite(
         .set_user_person_favorite(&user.id.to_string(), &person.id, request.favorite)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.user_events.publish(UserEventScope::Favorites);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

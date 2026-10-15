@@ -11706,6 +11706,14 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 64 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
 
+#### LUX-555：用户状态修改向其他会话发送失效
+
+范围：Web/Emby 收藏、已看修改在状态持久化及容器状态同步成功后发布无 ID 的 favorites/item 用户事件；Web 两种播放事件路径、账户库顺序和排序策略更新发布合并 home 事件。人物收藏同样发 favorites。HTTP 响应和认证/CSRF/ACL 保持既有合同。
+
+预计文件（5 个）：`src/api/playback.rs`、`src/api/users.rs`、`src/api/legacy.rs`、`tests/user_query_events.rs`、本文档。
+
+验收：真实 HTTP/SSE 回归先复现收藏写入后收不到事件的超时，随后验证事件到达后数据库已反映收藏/已看状态，并覆盖播放进度和媒体库排序。最窄目标 `cargo test --locked --test user_query_events --test resume_favorites --test web_playback`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

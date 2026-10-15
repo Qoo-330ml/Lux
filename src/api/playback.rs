@@ -3899,6 +3899,7 @@ pub(super) async fn lux_web_playback_event(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        state.user_events.publish_home_coalesced().await;
         if let Some(event_type) = activity_event {
             record_activity_event(
                 Some(database),
@@ -4130,6 +4131,7 @@ pub(super) async fn lux_post_progress(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            state.user_events.publish_home_coalesced().await;
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
@@ -4275,6 +4277,11 @@ pub(super) async fn handle_emby_user_flag(
                 Ok(user_state) => user_state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
+            state.user_events.publish(if played {
+                UserEventScope::Item
+            } else {
+                UserEventScope::Favorites
+            });
             Json(emby_user_item_data_json(&item_id, user_state.as_ref())).into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -4372,7 +4379,10 @@ pub(super) async fn lux_set_favorite(
         .set_user_item_favorite(&user.id.to_string(), &item_id, request.favorite)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.user_events.publish(UserEventScope::Favorites);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -4416,6 +4426,7 @@ pub(super) async fn lux_set_played(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            state.user_events.publish(UserEventScope::Item);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
