@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.6",
+    date: "2026-10-15",
+    sections: [
+      { kind: "added", items: [
+        "媒体详情页展示 NFO 标语，并为演职人员、播出季、剧照及媒体信息区块添加辅助标题。",
+      ] },
+      { kind: "changed", items: [
+        "统一详情页区块标题样式，改善浅色主题下详情文字、标签和播放状态的可读性。",
+      ] },
+      { kind: "fixed", items: [
+        "NFO 回写时将新增元数据字段按层级格式化为独立行。",
+        "为 PostgreSQL 人物匹配决定数据补齐目标人物和原人物字段及索引，支持旧数据库升级并保留现有候选记录。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.5",
     date: "2026-10-15",
     sections: [
