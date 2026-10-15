@@ -78,9 +78,9 @@ export function MediaNfoPanel({
       </div>
 
       {hasCardContent ? (
-        <div className="lux-surface-panel lux-media-nfo-card p-5 md:p-6 space-y-5">
+        <div className="lux-media-nfo-content space-y-3">
           {/* Taxonomy Row: Genres, Rating Certification, and Tagline */}
-          <div className="lux-media-nfo-taxonomy flex flex-col md:flex-row md:items-center justify-between gap-3 pb-4 border-b border-[var(--lux-line-soft)]">
+          <div className="lux-media-nfo-taxonomy flex flex-col md:flex-row md:items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
               {genreTags.length ? (
                 <div className="lux-media-nfo-genre-tags flex flex-wrap gap-1.5" aria-label="类型">
@@ -100,7 +100,7 @@ export function MediaNfoPanel({
             </div>
 
             {details?.tagline ? (
-              <div className="lux-media-nfo-tagline text-xs text-[var(--lux-muted)] italic font-serif">
+              <div className="lux-media-nfo-tagline text-[var(--lux-muted)] italic font-serif">
                 “{details.tagline}”
               </div>
             ) : null}
@@ -204,7 +204,7 @@ export function MediaNfoPanel({
 
           {/* Directors, Writers & Studios */}
           {details?.directors?.length || details?.writers?.length || details?.studios?.length ? (
-            <div className="lux-media-nfo-secondary grid grid-cols-1 md:grid-cols-2 gap-4 pt-3.5 border-t border-[var(--lux-line-soft)] text-xs" aria-label="制作与来源信息">
+            <div className="lux-media-nfo-secondary grid grid-cols-1 md:grid-cols-2 gap-4 text-xs" aria-label="制作与来源信息">
               <div className="space-y-1.5">
                 {details?.directors?.length ? (
                   <div className="flex items-baseline gap-3">

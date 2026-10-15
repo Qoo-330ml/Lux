@@ -179,15 +179,29 @@ test("media cast has no separator line", () => {
   assert.doesNotMatch(castRule, /border-top/);
 });
 
-test("media metadata surface shows the page image through in both themes", () => {
+test("media metadata uses an unframed surface with compact spacing", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const darkPanelRule = stylesheet.match(/\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
-  const lightPanelRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-surface-panel\.lux-media-nfo-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const component = readFileSync(new URL("../src/features/detail/MediaNfoPanel.tsx", import.meta.url), "utf8");
+  const taxonomyRule = stylesheet.match(/\.lux-media-nfo-taxonomy\s*\{([^}]*)\}/)?.[1] ?? "";
+  const secondaryRule = stylesheet.match(/\.lux-media-nfo-secondary\s*\{([^}]*)\}/)?.[1] ?? "";
+  const linksRule = stylesheet.match(/\.lux-media-nfo-links\s*\{([^}]*)\}/)?.[1] ?? "";
+  const taglineRule = stylesheet.match(/\.lux-media-nfo-tagline\s*\{([^}]*)\}/)?.[1] ?? "";
   const lightOverlayRule = stylesheet.match(/html\[data-lux-theme="light"\]\s+\.lux-detail-overlay\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(darkPanelRule, /background:\s*rgba\(22,\s*22,\s*25,\s*\.5\)/);
-  assert.match(darkPanelRule, /backdrop-filter:\s*blur\(12px\)/);
-  assert.match(lightPanelRule, /background:\s*rgba\(255,\s*255,\s*255,\s*\.22\)/);
+  assert.match(component, /lux-media-nfo-content space-y-3/);
+  assert.doesNotMatch(component, /lux-surface-panel|lux-media-nfo-card/);
+  assert.doesNotMatch(stylesheet, /\.lux-media-nfo-card/);
+  assert.doesNotMatch(component, /lux-media-nfo-taxonomy[^\"]*border-b/);
+  assert.doesNotMatch(component, /lux-media-nfo-secondary[^\"]*border-t/);
+  assert.doesNotMatch(taxonomyRule, /border-bottom/);
+  assert.match(taxonomyRule, /padding-bottom:\s*4px/);
+  assert.doesNotMatch(secondaryRule, /border-top/);
+  assert.match(secondaryRule, /padding:\s*4px 0 0/);
+  assert.doesNotMatch(linksRule, /border-top/);
+  assert.match(linksRule, /padding:\s*0/);
+  assert.match(taglineRule, /font-size:\s*1rem/);
+  assert.match(component, /lux-media-nfo-tagline[^\"]*font-serif/);
+  assert.doesNotMatch(component, /lux-media-nfo-tagline[^\"]*text-xs/);
   assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.4\)/);
   assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.28\)/);
 });
