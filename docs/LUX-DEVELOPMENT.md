@@ -11555,6 +11555,20 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 2026-10-15 续查：VidHub 2.1.8、SenPlayer 6.0.6、Infuse 8.5.1 均已安装并启动，但 CUA 绑定原生窗口均返回 `-10005 cgWindowNotFound`，无法执行合集浏览、来源切换和进度回写。隔离浏览器访问本机服务停留在登录页；未改动现有本地用户或媒体数据。客户端验收继续保持未完成。
 
+#### LUX-546：持续协调数据库中的合集身份
+
+范围：后台持续检查数据库中已保存 NFO 合集身份、但尚未生成规范合集关系的电影；身份可靠时不受资源入库时间或元数据完整状态限制。引用写入后复用现有合集同步 outbox。不同来源命名空间仍独立，跨库副本仍归并成一个逻辑作品。任务不扫描媒体目录、不调用刮削器或 `ffprobe`。
+
+验收：
+
+- [ ] 升级前已存在的电影只要数据库缓存含可靠合集 ID 和可匹配的影片来源 ID，就会被后台分页协调入合集；元数据仍待确认、合集名缺失时也可加入。
+- [ ] 缺少合集名时用稳定占位名建关系；后续名称到达后更新现有合集，不重复建合集或作品。
+- [ ] NFO 缓存变化会重新进入协调；任务按有界批次持续运行、可重启、幂等，失败记录可重试。
+- [ ] 不同合集命名空间不会合并；同片跨库副本只计作一部作品，资源删除或合集 ID 修正继续由现有关系/outbox 流程收敛。
+- [ ] SQLite/PostgreSQL 空库与升级迁移可用，待协调查询有索引；测试覆盖旧缓存、未完成元数据、缺失合集名、重复处理及名称补齐。
+
+预计文件（8 个，分两个可独立验证增量，每个提交不超过 5 个文件）：`migrations/0175_global_collection_reference_reconciliation_index.sql`、`migrations-postgres/0175_global_collection_reference_reconciliation_index.sql`、`src/storage/mod.rs`、`src/storage/catalog.rs`、`tests/storage.rs`、`src/application/collections.rs`、`src/application/candidates.rs` 及本文档。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
