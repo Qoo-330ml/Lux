@@ -15,6 +15,18 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.4",
+    date: "2026-10-15",
+    sections: [
+      { kind: "added", items: [
+        "全局电影合集增加后台持续校准：根据已缓存的 NFO 和元数据修复合集引用、补齐合集名称，无需扫描媒体文件。",
+      ] },
+      { kind: "changed", items: [
+        "优化媒体详情页的年份、评分、时长和音视频规格展示；收紧 NFO 信息区间距，移除外围面板并增大标语字号。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.3",
     date: "2026-10-15",
     sections: [
