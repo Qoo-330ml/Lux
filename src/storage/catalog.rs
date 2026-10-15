@@ -6977,17 +6977,11 @@ impl Database {
                 "invalid NFO collection reference reconciliation page size".to_owned(),
             ));
         }
-        let rows: Vec<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            String,
-        )> = self
+        let rows: Vec<StoredMovieNfoCollectionReferenceReconciliation> = self
             .query_as(
-                "SELECT item.id, item.provider_ids_json, item.metadata_scraper_id,
-                        library.scraper_id, item.production_year, item.nfo_metadata_json
+                "SELECT item.id AS item_id, item.provider_ids_json, item.metadata_scraper_id,
+                        library.scraper_id AS library_scraper_id,
+                        item.production_year, item.nfo_metadata_json
                  FROM media_items item
                  JOIN libraries library ON library.id = item.library_id
                  WHERE item.item_type = 'MOVIE'
@@ -7008,26 +7002,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    item_id,
-                    provider_ids_json,
-                    metadata_scraper_id,
-                    library_scraper_id,
-                    production_year,
-                    nfo_metadata_json,
-                )| StoredMovieNfoCollectionReferenceReconciliation {
-                    item_id,
-                    provider_ids_json,
-                    metadata_scraper_id,
-                    library_scraper_id,
-                    production_year,
-                    nfo_metadata_json,
-                },
-            )
-            .collect())
+        Ok(rows)
     }
 
     pub(crate) async fn commit_movie_nfo_collection_reference_reconciliation(

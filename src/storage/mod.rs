@@ -336,7 +336,7 @@ pub(crate) struct GlobalMovieCollectionReference {
     pub(crate) sort_order: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct StoredMovieNfoCollectionReferenceReconciliation {
     pub(crate) item_id: String,
     pub(crate) provider_ids_json: Option<String>,
