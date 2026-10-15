@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.3",
+    date: "2026-10-15",
+    sections: [
+      { kind: "fixed", items: [
+        "修复已应用原始时间戳迁移 0126 的 SQLite 数据库因迁移校验和不匹配而无法继续升级的问题；保留原有校验记录和数据，并继续应用后续迁移。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.2",
     date: "2026-10-15",
     sections: [
