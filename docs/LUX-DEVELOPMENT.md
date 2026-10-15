@@ -11681,7 +11681,7 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 2. 本文档、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、`web/tests/lux-shell.test.tsx`。
 3. 本文档、`web/src/features/home/HomePage.tsx`、`web/src/react.css`、`web/tests/home-page.test.tsx`、`web/tests/home-hero-layout.test.mjs`。
 4. 本文档、`web/src/features/auth/LoginPage.tsx`、`web/src/react.css`、`web/tests/login-page.test.tsx`。
-5. 本文档、`web/package.json`、`web/pnpm-lock.yaml`。
+5. 本文档、`web/package.json`、`web/pnpm-lock.yaml`、`web/vite.config.ts`。
 
 ## 29. 参考资料
 
