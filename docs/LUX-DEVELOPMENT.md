@@ -11561,6 +11561,24 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 2026-10-15 续查：VidHub 2.1.8、SenPlayer 6.0.6、Infuse 8.5.1 均已安装并启动，但 CUA 绑定原生窗口均返回 `-10005 cgWindowNotFound`，无法执行合集浏览、来源切换和进度回写。隔离浏览器访问本机服务停留在登录页；未改动现有本地用户或媒体数据。客户端验收继续保持未完成。
 
+#### LUX-546：持续协调数据库中的合集身份
+
+范围：后台持续检查数据库中已保存 NFO 合集身份、但尚未生成规范合集关系的电影；身份可靠时不受资源入库时间或元数据完整状态限制。引用写入后复用现有合集同步 outbox。不同来源命名空间仍独立，跨库副本仍归并成一个逻辑作品。任务不扫描媒体目录、不调用刮削器或 `ffprobe`。
+
+验收：
+
+- [x] 升级前已存在的电影只要数据库缓存含可靠合集 ID 和可匹配的影片来源 ID，就会被后台分页协调入合集；元数据仍待确认、合集名缺失时也可加入。
+- [x] 缺少合集名时用稳定占位名建关系；后续名称到达后更新现有合集，不重复建合集或作品。
+- [x] NFO 缓存变化会重新进入协调；任务按有界批次持续运行、可重启、幂等，失败记录可重试。
+- [x] 不同合集命名空间不会合并；同片跨库副本只计作一部作品，资源删除或合集 ID 修正继续由现有关系/outbox 流程收敛。
+- [x] SQLite/PostgreSQL 空库与升级迁移可用，待协调查询有索引；测试覆盖旧缓存、未完成元数据、缺失合集名、重复处理及名称补齐。
+
+预计文件（15 个，分四个可独立验证代码增量和一个文档增量，每个提交不超过 5 个文件）：SQLite/PostgreSQL 迁移、合集存储和 worker、候选与 NFO 回归、迁移/健康/扫描/兼容性测试中的 schema 版本断言，以及本文档。
+
+实施结果（2026-10-15）：全局合集 worker 每轮从带部分索引的查询读取至多 32 条电影缓存，解析数据库中已缓存的 NFO，不扫描媒体目录、不调用刮削器或 `ffprobe`。它按来源命名空间合并 NFO 与数据库影片 ID，允许 `PENDING` 资源及无合集名称的可靠 ID；合集引用和协调标记在同一事务写入，之后由现有 outbox 同步逻辑合集。缓存 JSON 变化会清空标记，让新快照重新进入协调；失败行不会阻断同批其他条目，仍可重试。缺名称时内部保存占位标记、对外显示稳定的 `合集 <来源>:<ID>`；后续名称到达会更新现有合集。待确认候选也会保存可靠合集引用。迁移 `0175` 为 SQLite 与 PostgreSQL 增加相同的局部待协调索引。
+
+验证：macOS `arm64`，Cargo 输出位于项目共享 target。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；`cargo test --locked --test storage` 为 59 passed；PostgreSQL 16 临时实例下 `cargo test --locked --test postgres_database -- --include-ignored` 为 16 passed，覆盖空库启动、旧迁移升级和新索引存在；合集 worker 回归与名称补齐用例通过。全量 `cargo test --locked --all-targets --no-fail-fast --quiet` 的 874 个库测试通过、23 个按设计忽略。唯一稳定复现的失败是 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete`：实际 2 张、预期 1 张；在干净基线 `8f9defcf` 上相同失败，属于本任务开始前已有问题。另一个 `local_nfo_retry_excludes_non_retryable_conflict_item` 仅在全目标并行运行时出现过一次 `RowNotFound`，定向复跑通过。Rust 静态 Web 用例首次因隔离 worktree 尚无 `web/dist` 返回 404；生成 Web 构建产物后定向用例通过。未部署、未访问或修改 FNOS 数据。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
