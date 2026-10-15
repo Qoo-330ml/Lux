@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.7",
+    date: "2026-10-15",
+    sections: [
+      { kind: "added", items: [
+        "按用户隐藏或恢复继续观看条目，兼容 Emby query 与 iOS JSON 请求；恢复显示时保留原播放进度和用户状态。",
+        "扫描电影和剧集目录下 extrafanart 子目录的图片，并将其登记为详情页剧照。",
+      ] },
+      { kind: "fixed", items: [
+        "修复选择元数据后详情页仍显示旧数据的问题。",
+        "修复浏览器加载旧版前端分块时路由页可能空白的问题，并提供重新加载恢复入口。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.6",
     date: "2026-10-15",
     sections: [
