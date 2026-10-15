@@ -221,4 +221,31 @@ describe("MediaActionMenu", () => {
     });
     expect(document.body.querySelector("[role=menu]")).toBeNull();
   });
+
+  it("keeps the portaled menu open for inside pointer events and closes outside", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu item={{ id: "item-1", title: "二毛" }} onEditMetadata={() => undefined} onEditImages={() => undefined} />
+        </MemoryRouter>,
+      );
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const menu = document.body.querySelector<HTMLElement>("[role=menu]");
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    await act(async () => menu?.querySelector<HTMLElement>("[data-action=edit-metadata]")
+      ?.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(document.body.querySelector("[role=menu]")).not.toBeNull();
+
+    await act(async () => outside.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+
+    expect(document.body.querySelector("[role=menu]")).toBeNull();
+    outside.remove();
+  });
 });

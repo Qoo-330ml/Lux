@@ -12,6 +12,19 @@ import type { HomeResponse } from "../src/lib/api/types";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 
+const heroSlidesTracker = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/features/home/carousel", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/features/home/carousel")>();
+  return {
+    ...actual,
+    heroSlides: (...args: Parameters<typeof actual.heroSlides>) => {
+      heroSlidesTracker(...args);
+      return actual.heroSlides(...args);
+    },
+  };
+});
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 function mockHomeSections(response: HomeResponse) {
@@ -766,5 +779,57 @@ describe("HomePage shelves", () => {
       queryKey: queryKeys.library("library-1", 1, "MOVIE", "Name", "Ascending", "all"),
       initialPageParam: 1,
     }));
+  });
+
+  it("reuses hero slides when only the latest-library shelf changes", async () => {
+    const latestRequest = mockHomeSections({
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE", latest: [] }],
+      recommended: [{ id: "hero-1", title: "精选影片", itemType: "MOVIE" }],
+      continueWatching: [],
+    });
+    heroSlidesTracker.mockClear();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await waitForHomeUpdate(() => expect(container.querySelector(".lux-hero-title-text")?.textContent)
+        .toContain("精选影片"));
+      await waitForHomeUpdate(() => expect(latestRequest).toHaveBeenCalledWith(["library-1"], expect.anything()));
+      await waitForHomeUpdate(() => {
+        expect(queryClient.getQueryData(queryKeys.homeLatestLibraries(["library-1"]))).toEqual({
+          libraries: [{ libraryId: "library-1", items: [] }],
+        });
+        expect(queryClient.getQueryState(queryKeys.homeCarousel)?.fetchStatus).toBe("idle");
+        expect(queryClient.getQueryState(queryKeys.homeContinueWatching)?.fetchStatus).toBe("idle");
+        expect(queryClient.getQueryState(queryKeys.homeLatestLibraries(["library-1"]))?.fetchStatus).toBe("idle");
+      });
+    });
+    heroSlidesTracker.mockClear();
+
+    await act(async () => {
+      queryClient.setQueryData(queryKeys.homeLatestLibraries(["library-1"]), {
+        libraries: [{
+          libraryId: "library-1",
+          items: [{ id: "latest-2", title: "新到影片", itemType: "MOVIE" }],
+        }],
+      });
+    });
+
+    await act(async () => {
+      await waitForHomeUpdate(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
+        .toContain("新到影片"));
+    });
+    expect(heroSlidesTracker).not.toHaveBeenCalled();
   });
 });

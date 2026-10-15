@@ -1,7 +1,8 @@
 import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Trash2, Unlock, X } from "lucide-react";
 import { createPortal } from "react-dom";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
+import { usePopoverPosition } from "./usePopoverPosition";
 
 type MediaActionMenuProps = {
   item: MediaItem;
@@ -58,10 +59,20 @@ function canDeleteMediaSource(item: MediaItem) {
 
 export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId, showLabel = false }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
-  const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
+  const { menuRef, position: menuPosition } = usePopoverPosition({
+    open,
+    onClose: () => setOpen(false),
+    isInside: (target) => Boolean(rootRef.current?.contains(target)),
+    fallbackMenuSize: { width: 246, height: 360 },
+    getPosition: (menu, viewport) => {
+      const trigger = triggerRef.current?.getBoundingClientRect();
+      return trigger
+        ? positionMediaActionMenu(trigger, menu, viewport)
+        : { left: 16, top: 16 };
+    },
+  });
   const title = item.title || item.name || "媒体";
   const isFolder = item.itemType === "FOLDER";
   const isVideo = item.itemType === "VIDEO";
@@ -69,46 +80,6 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
     ? `/api/v1/items/${encodeURIComponent(item.id)}/images/poster`
     : undefined;
   const downloadUrl = mediaDownloadUrl(item, sourceId);
-
-  useEffect(() => {
-    if (!open) return undefined;
-
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (event.target instanceof Node && !rootRef.current?.contains(event.target) && !menuRef.current?.contains(event.target)) setOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open]);
-
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) return undefined;
-    const updatePosition = () => {
-      const menu = menuRef.current;
-      const menuSize = {
-        width: menu?.getBoundingClientRect().width || 246,
-        height: menu?.getBoundingClientRect().height || 360,
-      };
-      setMenuPosition(positionMediaActionMenu(
-        triggerRef.current!.getBoundingClientRect(),
-        menuSize,
-        { width: window.innerWidth, height: window.innerHeight },
-      ));
-    };
-    updatePosition();
-    window.addEventListener("resize", updatePosition);
-    window.addEventListener("scroll", updatePosition, true);
-    return () => {
-      window.removeEventListener("resize", updatePosition);
-      window.removeEventListener("scroll", updatePosition, true);
-    };
-  }, [open]);
 
   if (isFolder) return null;
 

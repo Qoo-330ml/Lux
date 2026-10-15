@@ -1942,3 +1942,9 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 新 amd64 镜像在 NAS 使用 `docker buildx bake --load --set app.platform=linux/amd64 ... app` 构建，revision 标签为 `5a542b36`；以 `docker compose up -d --no-deps lux` 替换 Lux，PostgreSQL 未重建。容器内 `/health/live`、`/health/ready`，主机映射端口 readiness 和公网 readiness 均成功；ready 报告 `databaseWritable=true`、`schemaVersion=157`。重启后首个 12 秒窗口 PostgreSQL CPU 从 424% 降到 10.06%；再观察 45 秒后降至 1.32%，Lux 为 20.64%。此时活跃查询列表中不再有全库计数，最近 60 秒没有 metadata refresh 调度或 `.nfo`/`.tmp` 日志。
 
 这是目标 NAS 生产库上的短时前后观测，不是固定负载下的 A/B 或长期 p95 基准。重启后的首分钟仍有本地 metadata backfill 与缺少 `org.lux.tmdb` 插件的告警，因此 Lux CPU 数字包含启动后工作；没有据此声称所有扫描/刮削负载下 CPU 恒定。观察窗口内，原先持续占满 PostgreSQL 的重复全库计数停止，修复达到本次线上复测目标。
+
+### Web 首页懒加载与交互更新（refactoring plan 9–12）
+
+2026-10-16 在本机 `arm64` 工作区比较 `origin/test` 基线提交 `8c8d5c13` 与优化提交 `0ca53559`。两边均使用仓库锁定的 Web 依赖，并运行 `corepack pnpm@10 --dir web build`。Vite 入口 JS 从 124.09 kB（gzip 33.47 kB）降到 104.19 kB（gzip 28.67 kB），减少 19.90 kB（16.0%）及 gzip 4.80 kB（14.3%）。五个媒体卡编辑器现在各自进入按需 chunk；例如 metadata editor 为 3.90 kB、subtitle editor 为 4.98 kB、image editor 为 5.08 kB、identifier 为 6.40 kB、delete dialog 为 2.64 kB（均为 Vite 输出的未压缩大小）。
+
+这是一项相同本机、锁定依赖下的静态产物对比，不是运行时 LCP/INP、网络传输或用户交互时延测量；也不代表 NAS/x86 性能。浏览器中的真实触屏拖动与菜单点击尚未验证，因此这里不据此声称设备端体验验收完成。
