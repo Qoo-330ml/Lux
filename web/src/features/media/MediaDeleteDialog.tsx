@@ -1,7 +1,7 @@
 import { LoaderCircle, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 import "./MediaDeleteDialog.css";
 
 type MediaDeleteDialogProps = {
