@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { api, ApiError } from "../lib/api/client";
 import { queryKeys } from "../lib/api/query-keys";
 import type { LuxUser } from "../lib/api/types";
@@ -24,6 +24,7 @@ const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({
 const SearchPage = lazy(() => import("../features/search/SearchPage").then(({ SearchPage }) => ({ default: SearchPage })));
 const FavoritesPage = lazy(() => import("../features/favorites/FavoritesPage").then(({ FavoritesPage }) => ({ default: FavoritesPage })));
 const MediaDetailPage = lazy(() => import("../features/detail/MediaDetailPage").then(({ MediaDetailPage }) => ({ default: MediaDetailPage })));
+const CollectionDetailPage = lazy(() => import("../features/detail/CollectionDetailPage").then(({ CollectionDetailPage }) => ({ default: CollectionDetailPage })));
 const PersonDetailPage = lazy(() => import("../features/detail/PersonDetailPage").then(({ PersonDetailPage }) => ({ default: PersonDetailPage })));
 const PlayerPage = lazy(() => import("../features/player/PlayerPage").then(({ PlayerPage }) => ({ default: PlayerPage })));
 const AccountPage = lazy(() => import("../features/account/AccountPage").then(({ AccountPage }) => ({ default: AccountPage })));
@@ -75,6 +76,34 @@ function SessionRoutes() {
 }
 
 function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {
+  useEffect(() => {
+    let activeCard: HTMLElement | null = null;
+    const cardAt = (x: number, y: number) => document.elementFromPoint(x, y)
+      ?.closest<HTMLElement>(".lux-media-art-shell, .lux-library-card-cover-shell") ?? null;
+    const setActiveCard = (nextCard: HTMLElement | null) => {
+      if (activeCard === nextCard) return;
+      activeCard?.classList.remove("is-touch-hovered");
+      activeCard = nextCard;
+      activeCard?.classList.add("is-touch-hovered");
+    };
+    const revealCardAtPointer = (event: PointerEvent) => {
+      if (event.pointerType !== "touch" || !event.isPrimary) return;
+      setActiveCard(cardAt(event.clientX, event.clientY));
+    };
+    const clearCardWhenTouchingElsewhere = (event: PointerEvent) => {
+      if (event.pointerType !== "touch" || !event.isPrimary) return;
+      if (cardAt(event.clientX, event.clientY) !== activeCard) setActiveCard(null);
+    };
+
+    document.addEventListener("pointermove", revealCardAtPointer, { passive: true });
+    document.addEventListener("pointerdown", clearCardWhenTouchingElsewhere, { passive: true });
+    return () => {
+      document.removeEventListener("pointermove", revealCardAtPointer);
+      document.removeEventListener("pointerdown", clearCardWhenTouchingElsewhere);
+      setActiveCard(null);
+    };
+  }, []);
+
   return (
     <Suspense fallback={<LoadingScreen label="正在打开页面" />}>
       <Routes>
@@ -85,6 +114,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
           <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
           <Route path="favorites" element={<FavoritesPage />} />
           <Route path="items/:itemId" element={<MediaDetailPage />} />
+          <Route path="collections/:collectionId" element={<CollectionDetailPage />} />
           <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
           <Route path="search" element={<SearchPage />} />
           <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />

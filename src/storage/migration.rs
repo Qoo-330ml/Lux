@@ -111,7 +111,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 media_strategy_json TEXT,
                 realtime_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 0 CHECK (realtime_metadata_auto_match_enabled IN (0, 1)),
                 scan_missing_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 1 CHECK (scan_missing_metadata_auto_match_enabled IN (0, 1)),
-                chapter_source_id TEXT
+                chapter_source_id TEXT,
+                system_kind TEXT CHECK (system_kind IS NULL OR system_kind = 'COLLECTIONS')
             )",
             "INSERT INTO libraries_new (
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
@@ -119,7 +120,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
                 realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
-                chapter_source_id
+                chapter_source_id, system_kind
              )
              SELECT
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
@@ -127,10 +128,13 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
                 realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
-                chapter_source_id
+                chapter_source_id, system_kind
              FROM libraries",
             "DROP TABLE libraries",
             "ALTER TABLE libraries_new RENAME TO libraries",
+            "CREATE UNIQUE INDEX idx_libraries_system_kind
+             ON libraries(system_kind)
+             WHERE system_kind IS NOT NULL",
             "DROP TRIGGER IF EXISTS media_items_search_ai",
             "DROP TRIGGER IF EXISTS media_items_search_au",
             "DROP TRIGGER IF EXISTS media_items_search_ad",
@@ -178,7 +182,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 poster_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (poster_fallback_required IN (0, 1)),
                 merged_into_item_id TEXT REFERENCES media_items(id) ON DELETE SET NULL,
                 nfo_metadata_json TEXT,
-                nfo_metadata_fingerprint BLOB
+                nfo_metadata_fingerprint BLOB,
+                nfo_collection_reference_key TEXT
             )",
             "INSERT INTO media_items_new (
                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
@@ -189,7 +194,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 merged_into_item_id,
-                nfo_metadata_json, nfo_metadata_fingerprint
+                nfo_metadata_json, nfo_metadata_fingerprint,
+                nfo_collection_reference_key
              )
              SELECT
                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
@@ -200,7 +206,8 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
                 merged_into_item_id,
-                nfo_metadata_json, nfo_metadata_fingerprint
+                nfo_metadata_json, nfo_metadata_fingerprint,
+                nfo_collection_reference_key
              FROM media_items",
             "DROP TABLE media_items",
             "ALTER TABLE media_items_new RENAME TO media_items",
@@ -376,6 +383,69 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                      FROM media_sources
                      WHERE filesystem_entry_id = NEW.id
                  );
+             END",
+            "CREATE TRIGGER collection_media_item_sync_au
+             AFTER UPDATE OF removed_at, has_available_source, library_id, item_type ON media_items
+             WHEN OLD.removed_at IS NOT NEW.removed_at
+               OR OLD.has_available_source IS NOT NEW.has_available_source
+               OR OLD.library_id IS NOT NEW.library_id
+               OR OLD.item_type IS NOT NEW.item_type
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM collection_item_references reference
+                 WHERE reference.item_id = NEW.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
+            "CREATE TRIGGER collection_media_item_sync_bd
+             BEFORE DELETE ON media_items
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM collection_item_references reference
+                 WHERE reference.item_id = OLD.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
+            "CREATE TRIGGER collection_library_sync_au
+             AFTER UPDATE OF is_enabled ON libraries
+             WHEN OLD.is_enabled IS NOT NEW.is_enabled
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM media_items item
+                 JOIN collection_item_references reference ON reference.item_id = item.id
+                 WHERE item.library_id = NEW.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
+             END",
+            "CREATE TRIGGER collection_library_sync_bd
+             BEFORE DELETE ON libraries
+             BEGIN
+                 INSERT INTO collection_sync_outbox (
+                     collection_provider, collection_provider_id, generation, updated_at
+                 )
+                 SELECT DISTINCT reference.collection_provider, reference.collection_provider_id,
+                        1, unixepoch()
+                 FROM media_items item
+                 JOIN collection_item_references reference ON reference.item_id = item.id
+                 WHERE item.library_id = OLD.id
+                 ON CONFLICT (collection_provider, collection_provider_id) DO UPDATE SET
+                     generation = collection_sync_outbox.generation + 1,
+                     updated_at = excluded.updated_at;
              END",
         ];
         for statement in statements {

@@ -2347,6 +2347,9 @@ pub(super) async fn resolve_emby_user_with_auth(
 }
 
 pub(super) fn emby_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get(super::emby::NORMALIZED_CREDENTIAL_HEADER) {
+        return value.to_str().ok().map(str::to_owned);
+    }
     headers
         .get("X-Lux-Api-Key")
         .and_then(|value| value.to_str().ok())
@@ -2575,11 +2578,7 @@ pub(super) async fn emby_logout(
     let Some(auth) = state.emby_auth else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
-    let token = headers
-        .get("X-Emby-Token")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or(query.api_key);
+    let token = emby_token_from_headers(&headers).or(query.api_key);
     let Some(token) = token else {
         return StatusCode::UNAUTHORIZED;
     };

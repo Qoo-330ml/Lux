@@ -1078,7 +1078,9 @@ impl ScanJobService {
                         .removed_media_paths
                         .push(delta.relative_path.clone());
                 }
-                if is_supported_sidecar_file(Path::new(&delta.relative_path)) {
+                if super::super::library::is_supported_incremental_sidecar_file(Path::new(
+                    &delta.relative_path,
+                )) {
                     validation
                         .removed_sidecar_paths
                         .push(delta.relative_path.clone());

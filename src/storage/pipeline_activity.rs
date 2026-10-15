@@ -62,7 +62,10 @@ impl Database {
             })?;
 
         let total_libraries = self
-            .query_scalar("SELECT COUNT(*) FROM libraries WHERE is_enabled = 1")
+            .query_scalar(
+                "SELECT COUNT(*) FROM libraries
+                 WHERE is_enabled = 1 AND system_kind IS NULL",
+            )
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -75,7 +78,7 @@ impl Database {
                 "WITH selected_libraries AS (
                      SELECT id, name
                      FROM libraries
-                     WHERE is_enabled = 1
+                     WHERE is_enabled = 1 AND system_kind IS NULL
                      ORDER BY lower(name), id
                      LIMIT ? OFFSET ?
                  ),

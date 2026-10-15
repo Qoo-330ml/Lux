@@ -52,6 +52,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(lux_get_collection),
         )
         .route(
+            "/api/v1/collections/{collection_id}/items/{work_item_id}/source",
+            put(lux_set_collection_source),
+        )
+        .route(
             "/api/v1/items/{item_id}/images/{image_type}",
             get(lux_image).head(lux_image),
         )

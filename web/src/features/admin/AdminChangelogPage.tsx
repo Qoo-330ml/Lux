@@ -15,6 +15,32 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.3",
+    date: "2026-10-15",
+    sections: [
+      { kind: "fixed", items: [
+        "修复已应用原始时间戳迁移 0126 的 SQLite 数据库因迁移校验和不匹配而无法继续升级的问题；保留原有校验记录和数据，并继续应用后续迁移。",
+      ] },
+    ],
+  },
+  {
+    version: "0.6.2",
+    date: "2026-10-15",
+    sections: [
+      { kind: "added", items: [
+        "新增全局电影合集和用户合集来源偏好；Web 与 Emby 可浏览合集并播放其中的影片，合集访问遵循媒体库权限。",
+        "媒体扫描追踪 NFO、本地图片、弹幕 XML、字幕、STRM 媒体信息等侧车文件变更，并在扫描过程中同步更新或清理对应数据。",
+      ] },
+      { kind: "changed", items: [
+        "优化移动端首页媒体卡片和操作控件布局，继续观看卡片不再显示评分，媒体库卡片操作菜单收纳到右下角。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Emby 认证来源优先级与播放代理链接中的用户令牌处理；公开发现和密码登录请求保持原有认证行为。",
+        "修复扫描期间侧车文件变更未能可靠进入处理队列的问题。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.1",
     date: "2026-10-14",
     sections: [

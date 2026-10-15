@@ -23,6 +23,8 @@ export function MediaDetailPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const pendingReview = searchParams.get("metadataStatus")?.toUpperCase() === "PENDING";
+  const requestedSourceId = searchParams.get("sourceId") ?? undefined;
+  const collectionId = searchParams.get("collectionId") ?? undefined;
   const queryClient = useQueryClient();
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
@@ -109,6 +111,7 @@ export function MediaDetailPage() {
   const episodeLookupPending = (isSeries && seasons.isPending) || (episodes.isPending && episodeQueryEnabled);
   const sources = item.data?.mediaSources ?? [];
   const source = sources.find((entry) => entry.id === selectedSourceId)
+    ?? sources.find((entry) => entry.id === requestedSourceId)
     ?? sources.find((entry) => entry.isDefault)
     ?? sources[0];
   useEffect(() => {
@@ -120,9 +123,9 @@ export function MediaDetailPage() {
     : undefined;
 
   useEffect(() => {
-    setSelectedSourceId(undefined);
+    setSelectedSourceId(requestedSourceId);
     setPlayRequested(false);
-  }, [itemId]);
+  }, [itemId, requestedSourceId]);
 
   useEffect(() => {
     if (!playRequested || episodeLookupPending) return;
@@ -307,6 +310,7 @@ export function MediaDetailPage() {
             </div>
           </div>
           <div className="lux-detail-copy">
+            {collectionId ? <Link className="lux-detail-collection-return" to={`/collections/${encodeURIComponent(collectionId)}`}><ArrowLeft size={15} aria-hidden="true" /> 返回合集</Link> : null}
             <div className="lux-detail-title-row" data-has-logo={logoUrl ? "true" : undefined}>
               {logoUrl ? <img className="lux-detail-logo" src={logoUrl} alt={`${mediaTitle(media)} 徽标`} /> : null}
               <h1>{detailTitle}</h1>

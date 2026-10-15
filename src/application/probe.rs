@@ -1374,8 +1374,32 @@ fn is_strm_path(path: &Path) -> bool {
 async fn read_media_info_sidecar(path: &Path) -> Option<MediaProbeResult> {
     let stem = path.file_stem()?.to_str()?;
     let sidecar = path.with_file_name(format!("{stem}-mediainfo.json"));
-    let bytes = fs::read(sidecar).await.ok()?;
-    parse_media_info_json(&bytes).ok()
+    read_media_info_sidecar_file(&sidecar).await.ok()
+}
+
+pub(crate) async fn read_media_info_sidecar_file(
+    path: &Path,
+) -> Result<MediaProbeResult, ProbeError> {
+    let file = fs::File::open(path).await.map_err(ProbeError::Io)?;
+    let bytes = read_limited(file, MAX_OUTPUT_BYTES).await?;
+    parse_media_info_json(&bytes)
+}
+
+pub(crate) async fn read_media_info_sidecar_from_root(
+    root_path: &str,
+    relative_path: &str,
+) -> Result<MediaProbeResult, ProbeError> {
+    let path = safe_media_path(root_path, relative_path).map_err(|_| {
+        ProbeError::InvalidOutput("media info path is outside its library root".to_owned())
+    })?;
+    let root = fs::canonicalize(root_path).await.map_err(ProbeError::Io)?;
+    let path = fs::canonicalize(path).await.map_err(ProbeError::Io)?;
+    if !path.starts_with(root) {
+        return Err(ProbeError::InvalidOutput(
+            "media info path is outside its library root".to_owned(),
+        ));
+    }
+    read_media_info_sidecar_file(&path).await
 }
 
 async fn read_existing_media_info_sidecar(target: &Path) -> Result<Option<Value>, ProbeError> {
@@ -1702,13 +1726,13 @@ pub(crate) fn safe_media_path(
 }
 
 #[derive(Clone, Debug)]
-struct ExternalSubtitle {
-    relative_path: String,
-    codec: Option<String>,
-    language: Option<String>,
-    title: Option<String>,
-    is_default: bool,
-    is_forced: bool,
+pub(crate) struct ExternalSubtitle {
+    pub(crate) relative_path: String,
+    pub(crate) codec: Option<String>,
+    pub(crate) language: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) is_default: bool,
+    pub(crate) is_forced: bool,
 }
 
 async fn enumerate_external_subtitle_paths(directory: &Path) -> Vec<PathBuf> {
@@ -1749,45 +1773,67 @@ async fn discover_external_subtitles(
     let Some(directory) = media_path.parent() else {
         return Vec::new();
     };
-    let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
-        return Vec::new();
-    };
     let paths = cache.paths_for(directory).await;
     paths
         .into_iter()
-        .filter_map(|path| {
-            let stem = path.file_stem()?.to_str()?;
-            if stem != media_stem && !stem.starts_with(&format!("{media_stem}.")) {
-                return None;
-            }
-            let suffix = stem.strip_prefix(media_stem).unwrap_or_default();
-            let tokens = suffix
-                .trim_start_matches('.')
-                .split(['.', '_', '-'])
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            let language = tokens.iter().find_map(|token| subtitle_language(token));
-            let is_forced = tokens
-                .iter()
-                .any(|token| token.eq_ignore_ascii_case("forced"));
-            let is_default = tokens
-                .iter()
-                .any(|token| token.eq_ignore_ascii_case("default"));
-            let codec = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|value| value.to_ascii_lowercase());
-            let relative_path = path.strip_prefix(root_path).ok()?.to_str()?.to_owned();
-            Some(ExternalSubtitle {
-                relative_path,
-                codec,
-                language,
-                title: (!tokens.is_empty()).then(|| tokens.join(" ")),
-                is_default,
-                is_forced,
-            })
-        })
+        .filter_map(|path| external_subtitle_for_media(media_path, &path, root_path))
         .collect()
+}
+
+pub(crate) fn is_external_subtitle_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup"
+            )
+        })
+}
+
+pub(crate) fn external_subtitle_for_media(
+    media_path: &Path,
+    subtitle_path: &Path,
+    root_path: &str,
+) -> Option<ExternalSubtitle> {
+    if !is_external_subtitle_path(subtitle_path) {
+        return None;
+    }
+    let media_stem = media_path.file_stem()?.to_str()?;
+    let subtitle_stem = subtitle_path.file_stem()?.to_str()?;
+    if subtitle_stem != media_stem && !subtitle_stem.starts_with(&format!("{media_stem}.")) {
+        return None;
+    }
+    let suffix = subtitle_stem.strip_prefix(media_stem).unwrap_or_default();
+    let tokens = suffix
+        .trim_start_matches('.')
+        .split(['.', '_', '-'])
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let language = tokens.iter().find_map(|token| subtitle_language(token));
+    let is_forced = tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("forced"));
+    let is_default = tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("default"));
+    let codec = subtitle_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let relative_path = subtitle_path
+        .strip_prefix(root_path)
+        .ok()?
+        .to_str()?
+        .to_owned();
+    Some(ExternalSubtitle {
+        relative_path,
+        codec,
+        language,
+        title: (!tokens.is_empty()).then(|| tokens.join(" ")),
+        is_default,
+        is_forced,
+    })
 }
 
 fn subtitle_language(value: &str) -> Option<String> {

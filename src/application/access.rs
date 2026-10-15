@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     domain::ids::UserId,
-    storage::{Database, StorageError, StoredPlaybackSource},
+    storage::{Database, GLOBAL_COLLECTION_LIBRARY_ID, StorageError, StoredPlaybackSource},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +46,9 @@ impl MediaAccessService {
         principal: AccessPrincipal,
         library_id: &str,
     ) -> Result<bool, AccessError> {
+        if library_id == GLOBAL_COLLECTION_LIBRARY_ID {
+            return Ok(false);
+        }
         if principal.is_admin {
             return Ok(true);
         }
@@ -63,12 +66,15 @@ impl MediaAccessService {
         principal: AccessPrincipal,
         item_id: &str,
     ) -> Result<bool, AccessError> {
-        if principal.is_admin {
-            return Ok(self.database.find_item_library_id(item_id).await?.is_some());
-        }
         let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
             return Ok(false);
         };
+        if library_id == GLOBAL_COLLECTION_LIBRARY_ID {
+            return Ok(false);
+        }
+        if principal.is_admin {
+            return Ok(true);
+        }
         self.can_view_library(principal, &library_id).await
     }
 
@@ -77,7 +83,7 @@ impl MediaAccessService {
         principal: AccessPrincipal,
     ) -> Result<Vec<String>, AccessError> {
         if principal.is_admin {
-            return Ok(self.database.list_enabled_library_ids().await?);
+            return Ok(self.database.list_enabled_media_library_ids().await?);
         }
         let Some(user_id) = principal.user_id else {
             return Ok(Vec::new());

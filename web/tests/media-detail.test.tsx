@@ -44,7 +44,7 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.restoreAllMocks();
   });
 
-  async function renderDetail(item: MediaItem, images: ItemImage[] = []) {
+  async function renderDetail(item: MediaItem, images: ItemImage[] = [], initialEntry = `/items/${item.id}`) {
     if (root) act(() => root?.unmount());
     container?.remove();
     vi.spyOn(api, "item").mockResolvedValue(item);
@@ -61,7 +61,7 @@ describe("MediaDetailPage series hierarchy", () => {
     await act(async () => {
       root?.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={[`/items/${item.id}`]}>
+          <MemoryRouter initialEntries={[initialEntry]}>
             <Routes>
               <Route path="items/:itemId" element={<MediaDetailPage />} />
             </Routes>
@@ -1726,5 +1726,28 @@ describe("MediaDetailPage series hierarchy", () => {
 
     await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith(["movie-1"]));
     expect(container.textContent).toContain("元数据已确认");
+  });
+
+  it("returns to the source collection and uses the selected version", async () => {
+    const item: MediaItem = {
+      id: "movie-1",
+      libraryId: "library-1",
+      title: "飞驰人生",
+      itemType: "MOVIE",
+      mediaSources: [
+        { id: "source-picked", container: "mkv", isDefault: true },
+        { id: "source-other", container: "mp4" },
+      ],
+    };
+    const rendered = await renderDetail(
+      item,
+      [],
+      "/items/movie-1?collectionId=collection-1&sourceId=source-picked",
+    );
+
+    expect(rendered.querySelector<HTMLAnchorElement>(".lux-detail-collection-return")?.getAttribute("href"))
+      .toBe("/collections/collection-1");
+    expect(rendered.querySelector<HTMLAnchorElement>("a[href^='/watch/']")?.getAttribute("href"))
+      .toBe("/watch/movie-1?sourceId=source-picked");
   });
 });

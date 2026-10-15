@@ -4049,7 +4049,10 @@ mod plugin_discovery_tests {
         )
         .await?;
 
-        let service = PluginService::new(database.clone(), config_dir);
+        let service = PluginService::new_without_login_background_worker_for_test(
+            database.clone(),
+            config_dir,
+        );
         service.install(PLUGIN_ID).await?;
 
         database.reset_query_count();

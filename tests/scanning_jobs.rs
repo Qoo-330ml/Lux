@@ -2355,7 +2355,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 169);
+    assert_eq!(database.schema_version().await?, 174);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -3140,6 +3140,1344 @@ async fn unchanged_incremental_media_and_sidecar_skip_postprocessing_targets()
 }
 
 #[tokio::test]
+async fn incremental_attachment_additions_only_record_changed_file_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Indexed Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Indexed.Movie.2024.mkv"), b"video").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let (source_id, item_id): (String, String) = sqlx::query_as(
+        "SELECT ms.id, ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Indexed Movie (2024)/Indexed.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_sources SET probe_status = 'READY' WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, codec)
+         VALUES ('existing-video-stream', ?, 0, 'VIDEO', 'h264')",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
+    let subtitle_path = "Indexed Movie (2024)/Indexed.Movie.2024.en.srt";
+    let media_info_path = "Indexed Movie (2024)/Indexed.Movie.2024-mediainfo.json";
+    let edl_path = "Indexed Movie (2024)/Indexed.Movie.2024.edl";
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .await?;
+    tokio::fs::write(root.join(media_info_path), br#"{"streams":[]}"#).await?;
+    tokio::fs::write(root.join(edl_path), b"0.0 1.0 0\n").await?;
+    tokio::fs::write(root.join("notes.json"), br#"{"unrelated":true}"#).await?;
+
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![
+                IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: subtitle_path.to_owned(),
+                    kind: ChangeKind::Create,
+                },
+                IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: media_info_path.to_owned(),
+                    kind: ChangeKind::Create,
+                },
+                IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: edl_path.to_owned(),
+                    kind: ChangeKind::Create,
+                },
+                IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: "notes.json".to_owned(),
+                    kind: ChangeKind::Create,
+                },
+            ],
+        )
+        .await?;
+    let report = jobs.run_batch(&incremental.id, 3).await?;
+    assert_eq!(report.processed, 3);
+
+    let file_changes: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT relative_path, change_kind, revision
+         FROM scan_job_file_changes WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&incremental.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        file_changes,
+        vec![
+            (media_info_path.to_owned(), "ADD".to_owned(), 1),
+            (edl_path.to_owned(), "ADD".to_owned(), 1),
+            (subtitle_path.to_owned(), "ADD".to_owned(), 1),
+        ]
+    );
+    let target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&incremental.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(target_count, 0);
+    let source_state: String =
+        sqlx::query_scalar("SELECT probe_status FROM media_sources WHERE id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(source_state, "READY");
+    let metadata_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(metadata_state, "LOCAL_CONFIRMED");
+    let embedded_stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND stream_type = 'VIDEO' AND is_external = 0",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(embedded_stream_count, 1);
+    jobs.run_to_completion(&incremental.id, 100, None).await?;
+    let edl_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT processing_state, error FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&incremental.id)
+    .bind(edl_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(edl_state, ("DONE".to_owned(), None));
+    let indexed_subtitle: (String, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT id, stream_index, codec, language FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_subtitle.1, 1);
+    assert_eq!(indexed_subtitle.2, "srt");
+    assert_eq!(indexed_subtitle.3.as_deref(), Some("eng"));
+    let subtitle_event_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&incremental.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(subtitle_event_state, "DONE");
+
+    let vtt_path = "Indexed Movie (2024)/Indexed.Movie.2024.fr.vtt";
+    tokio::fs::write(
+        root.join(vtt_path),
+        b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nBonjour\n",
+    )
+    .await?;
+    let directory_scan = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Indexed Movie (2024)".to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&directory_scan.id, 100, None)
+        .await?;
+    let directory_file_changes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&directory_scan.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        directory_file_changes,
+        vec![(vtt_path.to_owned(), "ADD".to_owned())]
+    );
+    let directory_target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&directory_scan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(directory_target_count, 0);
+    let directory_subtitle_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(vtt_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(directory_subtitle_count, 1);
+
+    let unchanged = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: subtitle_path.to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&unchanged.id, 100, None).await?;
+    let unchanged_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unchanged.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unchanged_count, 0);
+
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nChanged\n",
+    )
+    .await?;
+    let modified = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: subtitle_path.to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&modified.id, 100, None).await?;
+    let modified_kind: String = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&modified.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(modified_kind, "CHANGE");
+    let modified_subtitle: (String, i64) = sqlx::query_as(
+        "SELECT id, stream_index FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        modified_subtitle,
+        (indexed_subtitle.0.clone(), indexed_subtitle.1)
+    );
+
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    let removed = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: subtitle_path.to_owned(),
+                kind: ChangeKind::Remove,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_change: (String, i64) = sqlx::query_as(
+        "SELECT change_kind, revision FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&removed.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_change, ("REMOVE".to_owned(), 1));
+    let removed_track_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_track_count, 0);
+
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nChanged\n",
+    )
+    .await?;
+    let reappeared = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: subtitle_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&reappeared.id, 100, None).await?;
+    let reappeared_kind: String = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&reappeared.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(reappeared_kind, "ADD");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manifest_scan_queues_attachment_changes_without_reprobing_unchanged_video()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Manifest Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Manifest.Movie.2024.mkv"), b"video").await?;
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+printf called > "$0.called"
+printf '%s' '{"format":{"format_name":"matroska","duration":"30","bit_rate":"128000"},"streams":[]}'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+    let ffprobe_marker = fake_ffprobe.with_file_name("fake-ffprobe.called");
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let (source_id, item_id): (String, String) = sqlx::query_as(
+        "SELECT ms.id, ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Manifest Movie (2024)/Manifest.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_sources
+         SET probe_status = 'PENDING', container = 'mkv', duration_ticks = 300000000,
+             bitrate = 128000
+         WHERE id = ?",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, codec)
+         VALUES ('manifest-existing-video-stream', ?, 0, 'VIDEO', 'h264')",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+             id, media_source_id, stream_index, stream_type, codec,
+             external_path, is_external
+         ) VALUES ('manifest-existing-external-track', ?, 7, 'SUBTITLE', 'ass', ?, 1)",
+    )
+    .bind(&source_id)
+    .bind("Manifest Movie (2024)/Manifest.Movie.2024.existing.ass")
+    .execute(database.pool())
+    .await?;
+
+    let subtitle_path = "Manifest Movie (2024)/Manifest.Movie.2024.en.srt";
+    let media_info_path = "Manifest Movie (2024)/Manifest.Movie.2024-mediainfo.json";
+    let unrelated_path = "Manifest Movie (2024)/notes.json";
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .await?;
+    tokio::fs::write(root.join(media_info_path), br#"{"streams":[]}"#).await?;
+    tokio::fs::write(root.join(unrelated_path), br#"{"unrelated":true}"#).await?;
+
+    let added = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&added.id, 100, Some(probe.clone()))
+        .await?;
+    let added_events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT library_root_id, relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&added.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        added_events,
+        vec![
+            (
+                root_record.id.to_string(),
+                media_info_path.to_owned(),
+                "ADD".to_owned(),
+            ),
+            (
+                root_record.id.to_string(),
+                subtitle_path.to_owned(),
+                "ADD".to_owned(),
+            ),
+        ]
+    );
+    let unrelated_entry_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind(unrelated_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unrelated_entry_count, 0);
+    let added_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(added_targets, 0);
+    let subtitle_track: (String, i64, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT id, stream_index, codec, language, title FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        subtitle_track.1, 8,
+        "a new subtitle gets the next stream index without probing the video"
+    );
+    assert_eq!(subtitle_track.2, "srt");
+    assert_eq!(subtitle_track.3.as_deref(), Some("eng"));
+    let subtitle_stream_id = subtitle_track.0.clone();
+    let existing_external_track: (String, i64) = sqlx::query_as(
+        "SELECT id, stream_index FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind("Manifest Movie (2024)/Manifest.Movie.2024.existing.ass")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        existing_external_track,
+        ("manifest-existing-external-track".to_owned(), 7)
+    );
+    let subtitle_change_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(subtitle_change_state, "DONE");
+
+    let unchanged = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&unchanged.id, 100, Some(probe.clone()))
+        .await?;
+    let unchanged_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unchanged.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unchanged_events, 0);
+
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nChanged subtitle\n",
+    )
+    .await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&changed.id, 100, Some(probe.clone()))
+        .await?;
+    let changed_kind: String = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&changed.id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_kind, "CHANGE");
+    let changed_subtitle_track: (String, i64) = sqlx::query_as(
+        "SELECT id, stream_index FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_subtitle_track, (subtitle_stream_id, 8));
+
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, Some(probe.clone()))
+        .await?;
+    let removed_external_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND external_path = ? AND is_external = 1",
+    )
+    .bind(&source_id)
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_external_count, 0);
+
+    let source_state: (String, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT probe_status, container, duration_ticks, bitrate FROM media_sources WHERE id = ?",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        source_state,
+        (
+            "PENDING".to_owned(),
+            Some("mkv".to_owned()),
+            Some(300000000),
+            Some(128000)
+        )
+    );
+    let video_stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND stream_type = 'VIDEO' AND is_external = 0",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(video_stream_count, 1);
+    let item_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(item_state, "LOCAL_CONFIRMED");
+    assert!(
+        !ffprobe_marker.exists(),
+        "ffprobe must not run for sidecar-only changes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_scan_syncs_only_the_changed_danmaku_xml_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Danmaku Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Danmaku.Movie.2024.mkv"), b"video").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let (source_id, item_id): (String, String) = sqlx::query_as(
+        "SELECT ms.id, ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Danmaku Movie (2024)/Danmaku.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, codec)
+         VALUES ('danmaku-unchanged-video', ?, 0, 'VIDEO', 'h264')",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
+    let xml_path = "Danmaku Movie (2024)/Danmaku.Movie.2024.xml";
+    let valid_xml = br#"<i><d p="1,1,25,16777215,0,0,0,0">hello</d></i>"#;
+    tokio::fs::write(root.join(xml_path), valid_xml).await?;
+    let added = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: xml_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+    let added_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(added_event, ("ADD".to_owned(), "DONE".to_owned()));
+    let added_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(added_targets, 0);
+    let indexed_track: (String, Option<Vec<u8>>, String) = sqlx::query_as(
+        "SELECT relative_path, fingerprint, status FROM danmaku_tracks
+         WHERE media_source_id = ?",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_track.0, xml_path);
+    assert!(indexed_track.1.is_some());
+    assert_eq!(indexed_track.2, "READY");
+
+    tokio::fs::write(root.join(xml_path), b"<html>invalid</html>").await?;
+    let invalid = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: xml_path.to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&invalid.id, 100, None).await?;
+    let invalid_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT processing_state, error FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&invalid.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        invalid_state,
+        ("FAILED".to_owned(), Some("INVALID_DANMAKU_XML".to_owned()))
+    );
+    let preserved_fingerprint: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_fingerprint, indexed_track.1);
+
+    tokio::fs::remove_file(root.join(xml_path)).await?;
+    let removed = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: xml_path.to_owned(),
+                kind: ChangeKind::Remove,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_state: (String, String) = sqlx::query_as(
+        "SELECT processing_state, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&removed.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_state, ("DONE".to_owned(), "REMOVE".to_owned()));
+    let removed_track_state: String =
+        sqlx::query_scalar("SELECT status FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(removed_track_state, "MISSING");
+    let source_streams: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id, stream_index FROM media_streams WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        source_streams,
+        vec![("danmaku-unchanged-video".to_owned(), 0)]
+    );
+    let metadata_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(metadata_state, "LOCAL_CONFIRMED");
+
+    tokio::fs::write(root.join(xml_path), valid_xml).await?;
+    let full_rescan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&full_rescan.id, 100, None).await?;
+    let full_rescan_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&full_rescan.id)
+    .bind(xml_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(full_rescan_event, ("ADD".to_owned(), "DONE".to_owned()));
+    let full_rescan_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&full_rescan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(full_rescan_targets, 0);
+    let full_rescan_track: (Option<Vec<u8>>, String) =
+        sqlx::query_as("SELECT fingerprint, status FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(&source_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(full_rescan_track.0.is_some());
+    assert_eq!(full_rescan_track.1, "READY");
+    let final_metadata_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_metadata_state, "LOCAL_CONFIRMED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_scan_updates_only_the_changed_nfo_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("NFO Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("NFO.Movie.2024.mkv"), b"video").await?;
+    let mut fanart_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([0, 255, 0, 255]),
+    ))
+    .write_to(&mut fanart_bytes, image::ImageFormat::Png)?;
+    tokio::fs::write(movie_dir.join("fanart.png"), fanart_bytes.get_ref()).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let local_nfo = LocalNfoMetadataStore::new(database.clone());
+    let jobs = ScanJobService::new(database.clone()).with_nfo_store(local_nfo);
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("NFO Movie (2024)/NFO.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    let original_fanart: (String, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT id, image_index, local_path, content_tag FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+    let nfo_path = "NFO Movie (2024)/movie.nfo";
+    tokio::fs::write(
+        root.join(nfo_path),
+        "<movie><title>来自新 NFO 的标题</title></movie>",
+    )
+    .await?;
+    let added = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+
+    let event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&added.id)
+    .bind(nfo_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(event, ("ADD".to_owned(), "DONE".to_owned()));
+    let item_state: (String, String) =
+        sqlx::query_as("SELECT title, identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        item_state,
+        ("来自新 NFO 的标题".to_owned(), "LOCAL_CONFIRMED".to_owned())
+    );
+    let targets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+        .bind(&added.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(targets, 0);
+    let metadata_batches: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(metadata_batches, 0);
+
+    let poster_path = "NFO Movie (2024)/NFO.Movie.2024-poster.png";
+    let mut poster_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([255, 0, 0, 255]),
+    ))
+    .write_to(&mut poster_bytes, image::ImageFormat::Png)?;
+    tokio::fs::write(root.join(poster_path), poster_bytes.get_ref()).await?;
+    let image_added = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&image_added.id, 100, None).await?;
+    let image_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&image_added.id)
+    .bind(poster_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(image_event, ("ADD".to_owned(), "DONE".to_owned()));
+    let poster: (String, i64, String) = sqlx::query_as(
+        "SELECT image_type, image_index, local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(poster.0, "POSTER");
+    assert_eq!(poster.1, 0);
+    assert!(poster.2.ends_with(poster_path));
+    let retained_fanart: (String, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT id, image_index, local_path, content_tag FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(retained_fanart, original_fanart);
+    let image_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&image_added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(image_targets, 0);
+    let image_metadata_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(image_metadata_state, "LOCAL_CONFIRMED");
+
+    let valid_poster_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    let mut changed_poster_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        1,
+        image::Rgba([0, 0, 255, 255]),
+    ))
+    .write_to(&mut changed_poster_bytes, image::ImageFormat::Png)?;
+    tokio::fs::write(root.join(poster_path), changed_poster_bytes.get_ref()).await?;
+    let image_changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&image_changed.id, 100, None).await?;
+    let changed_image_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&image_changed.id)
+    .bind(poster_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        changed_image_event,
+        ("CHANGE".to_owned(), "DONE".to_owned())
+    );
+    let changed_poster_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_ne!(changed_poster_tag, valid_poster_tag);
+
+    tokio::fs::write(root.join(poster_path), b"changed image bytes").await?;
+    let opaque_image = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&opaque_image.id, 100, None).await?;
+    let opaque_image_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&opaque_image.id)
+    .bind(poster_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(opaque_image_event, ("CHANGE".to_owned(), "DONE".to_owned()));
+    let opaque_poster_tag: Option<String> = sqlx::query_scalar(
+        "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_ne!(opaque_poster_tag, changed_poster_tag);
+
+    tokio::fs::remove_file(root.join(poster_path)).await?;
+    let image_removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&image_removed.id, 100, None).await?;
+    let removed_image_event: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&image_removed.id)
+    .bind(poster_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        removed_image_event,
+        ("REMOVE".to_owned(), "DONE".to_owned())
+    );
+    let remaining_posters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_posters, 0);
+    let remaining_fanart: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_fanart, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_scan_queues_attachment_removal_only_after_root_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Removal Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Removal.Movie.2024.mkv"), b"video").await?;
+    let subtitle_path = "Removal Movie (2024)/Removal.Movie.2024.en.srt";
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let moved_root = temp_dir.path().join("Movies-unmounted");
+    tokio::fs::rename(&root, &moved_root).await?;
+    let unavailable = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&unavailable.id, 100, None).await?;
+    let unavailable_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unavailable.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unavailable_events, 0);
+    let root_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&unavailable.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(root_state, "UNAVAILABLE");
+
+    tokio::fs::rename(&moved_root, &root).await?;
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_event: (String, String) = sqlx::query_as(
+        "SELECT relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND library_root_id = ?",
+    )
+    .bind(&removed.id)
+    .bind(root_record.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        removed_event,
+        (subtitle_path.to_owned(), "REMOVE".to_owned())
+    );
+    let missing: i64 = sqlx::query_scalar(
+        "SELECT is_missing FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing, 1);
+    let removal_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&removed.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(removal_targets, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_queues_attachment_changes_without_directory_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Reconcile Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Reconcile.Movie.2024.mkv"), b"video").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    let (source_id, item_id): (String, String) = sqlx::query_as(
+        "SELECT ms.id, ms.item_id FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.library_root_id = ? AND fe.relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Reconcile Movie (2024)/Reconcile.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_sources
+         SET probe_status = 'READY', container = 'mkv', duration_ticks = 300000000,
+             bitrate = 128000
+         WHERE id = ?",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET identification_status = 'LOCAL_CONFIRMED' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, codec)
+         VALUES ('reconciliation-existing-video-stream', ?, 0, 'VIDEO', 'h264')",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
+    let subtitle_path = "Reconcile Movie (2024)/Reconcile.Movie.2024.en.srt";
+    let media_info_path = "Reconcile Movie (2024)/Reconcile.Movie.2024-mediainfo.json";
+    let unrelated_path = "Reconcile Movie (2024)/notes.json";
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .await?;
+    tokio::fs::write(root.join(media_info_path), br#"{"streams":[]}"#).await?;
+    tokio::fs::write(root.join(unrelated_path), br#"{"unrelated":true}"#).await?;
+
+    let added = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&added.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &added.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&added.id, 100, None).await?;
+    let added_events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT library_root_id, relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&added.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        added_events,
+        vec![
+            (
+                root_record.id.to_string(),
+                media_info_path.to_owned(),
+                "ADD".to_owned(),
+            ),
+            (
+                root_record.id.to_string(),
+                subtitle_path.to_owned(),
+                "ADD".to_owned(),
+            ),
+        ]
+    );
+    let unrelated_entry_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind(unrelated_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unrelated_entry_count, 0);
+    let added_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&added.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(added_targets, 0);
+
+    let unchanged = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&unchanged.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &unchanged.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&unchanged.id, 100, None).await?;
+    let unchanged_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unchanged.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unchanged_events, 0);
+
+    tokio::fs::write(
+        root.join(subtitle_path),
+        b"1\n00:00:01,000 --> 00:00:02,000\nChanged subtitle\n",
+    )
+    .await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&changed.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &changed.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&changed.id, 100, None).await?;
+    let changed_kind: String = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_file_changes
+         WHERE job_id = ? AND library_root_id = ? AND relative_path = ?",
+    )
+    .bind(&changed.id)
+    .bind(root_record.id.to_string())
+    .bind(subtitle_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_kind, "CHANGE");
+
+    let moved_root = temp_dir.path().join("Movies-unmounted");
+    tokio::fs::rename(&root, &moved_root).await?;
+    let unavailable = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&unavailable.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &unavailable.id, &root_record.id.to_string())
+        .await?;
+    jobs.run_to_completion(&unavailable.id, 100, None).await?;
+    let unavailable_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_file_changes WHERE job_id = ?")
+            .bind(&unavailable.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unavailable_events, 0);
+
+    tokio::fs::rename(&moved_root, &root).await?;
+    tokio::fs::remove_file(root.join(subtitle_path)).await?;
+    tokio::fs::remove_file(root.join(media_info_path)).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("DELETE FROM scan_manifests WHERE job_id = ?")
+        .bind(&removed.id)
+        .execute(database.pool())
+        .await?;
+    queue_legacy_reconciliation_root(&database, &removed.id, &root_record.id.to_string()).await?;
+    jobs.run_to_completion(&removed.id, 100, None).await?;
+    let removed_events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT relative_path, change_kind FROM scan_job_file_changes
+         WHERE job_id = ? ORDER BY relative_path",
+    )
+    .bind(&removed.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        removed_events,
+        vec![
+            (media_info_path.to_owned(), "REMOVE".to_owned()),
+            (subtitle_path.to_owned(), "REMOVE".to_owned()),
+        ]
+    );
+    let removal_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&removed.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(removal_targets, 0);
+
+    let source_state: (String, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT probe_status, container, duration_ticks, bitrate FROM media_sources WHERE id = ?",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        source_state,
+        (
+            "READY".to_owned(),
+            Some("mkv".to_owned()),
+            Some(300000000),
+            Some(128000)
+        )
+    );
+    let video_stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         WHERE media_source_id = ? AND stream_type = 'VIDEO' AND is_external = 0",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(video_stream_count, 1);
+    let item_state: String =
+        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(item_state, "LOCAL_CONFIRMED");
+    Ok(())
+}
+
+async fn queue_legacy_reconciliation_root(
+    database: &Database,
+    job_id: &str,
+    root_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type
+         ) VALUES (?, ?, '', 'DIRECTORY')",
+    )
+    .bind(job_id)
+    .bind(root_id)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_commits_positive_manifest_indexes_during_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -3672,18 +5010,13 @@ async fn unchanged_reconciliation_skips_index_targets() -> Result<(), Box<dyn st
     jobs.run_to_completion(&first.id, 100, None).await?;
 
     let second = jobs.create_movie_scan_job(library.id).await?;
-    loop {
-        if jobs.run_batch(&second.id, 100).await?.completed {
-            break;
-        }
-    }
+    jobs.run_to_completion(&second.id, 100, None).await?;
     let second_target_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
             .bind(&second.id)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(second_target_count, 0);
-    jobs.run_to_completion(&second.id, 100, None).await?;
 
     let movie_item_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
@@ -3797,13 +5130,13 @@ async fn reconciliation_persists_removed_media_and_sidecar_targets()
     .bind(&second.id)
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(targets.len(), 3);
+    assert_eq!(targets.len(), 2);
     assert_eq!(
         targets
             .iter()
             .filter(|target| target.0 == "ITEM" && target.2 == "SIDECAR")
             .count(),
-        1
+        0
     );
     assert_eq!(
         targets
@@ -3819,18 +5152,24 @@ async fn reconciliation_persists_removed_media_and_sidecar_targets()
             .count(),
         1
     );
-    assert!(targets.iter().all(|target| {
-        if target.2 == "SIDECAR" {
-            target.3 == "PENDING" && target.4 == "PENDING"
-        } else {
-            target.3 == "SKIPPED" && target.4 == "SKIPPED"
-        }
-    }));
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.3 == "SKIPPED" && target.4 == "SKIPPED")
+    );
+    let removed_sidecar: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = 'Kept.Movie.2024.nfo'",
+    )
+    .bind(&second.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_sidecar, ("REMOVE".to_owned(), "PENDING".to_owned()));
     Ok(())
 }
 
 #[tokio::test]
-async fn reconciliation_sidecar_targets_do_not_cross_directory_prefixes()
+async fn reconciliation_nfo_changes_use_file_queue_without_directory_targets()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -3881,21 +5220,34 @@ async fn reconciliation_sidecar_targets_do_not_cross_directory_prefixes()
             break;
         }
     }
-    let targeted_paths: Vec<String> = sqlx::query_scalar(
-        "SELECT fe.relative_path
-         FROM scan_job_targets targets
-         JOIN media_sources ms ON ms.item_id = targets.item_id
-         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-         WHERE targets.job_id = ? AND targets.change_kind = 'SIDECAR'
-         ORDER BY fe.relative_path",
+    let nfo_changes: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT relative_path, change_kind, processing_state
+         FROM scan_job_file_changes WHERE job_id = ? ORDER BY relative_path",
     )
     .bind(&second.id)
     .fetch_all(database.pool())
     .await?;
     assert_eq!(
-        targeted_paths,
-        vec!["A/Alpha.Movie.2020.mkv", "中文/Chinese.Movie.2022.mkv"]
+        nfo_changes,
+        vec![
+            (
+                "A/Alpha.Movie.2020.nfo".to_owned(),
+                "CHANGE".to_owned(),
+                "PENDING".to_owned()
+            ),
+            (
+                "中文/Chinese.Movie.2022.nfo".to_owned(),
+                "CHANGE".to_owned(),
+                "PENDING".to_owned()
+            ),
+        ]
     );
+    let target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&second.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(target_count, 0);
     Ok(())
 }
 
@@ -6027,14 +7379,18 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
         br#"[{"MediaSourceInfo":{"Container":"mp4","RunTimeTicks":300000000,"Bitrate":128000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"h264"}]}}]"#,
     )
     .await?;
+    let mut poster_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+        .write_to(&mut poster_bytes, image::ImageFormat::Jpeg)?;
     tokio::fs::write(
         movie_dir.join("Remote.Movie.2022-poster.jpg"),
-        b"poster fixture",
+        poster_bytes.get_ref(),
     )
     .await?;
-    libraries
+    let root_record = libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
-        .await?;
+        .await?
+        .root;
 
     let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
     fs::write(
@@ -6051,7 +7407,8 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
     );
-    jobs.run_to_completion(&job.id, 100, Some(probe)).await?;
+    jobs.run_to_completion(&job.id, 100, Some(probe.clone()))
+        .await?;
 
     let source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
         "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
@@ -6100,10 +7457,168 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
     source_paths.sort();
     assert_eq!(
         source_paths,
+        vec!["Remote Movie (2022)/Remote.Movie.2022.strm".to_owned()]
+    );
+    let poster_change: (String, String) = sqlx::query_as(
+        "SELECT change_kind, processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = 'Remote Movie (2022)/Remote.Movie.2022-poster.jpg'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(poster_change, ("ADD".to_owned(), "DONE".to_owned()));
+    let indexed_poster_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images
+         WHERE image_type = 'POSTER' AND local_path LIKE '%Remote.Movie.2022-poster.jpg'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_poster_count, 1);
+
+    tokio::fs::write(
+        movie_dir.join("Remote.Movie.2022-mediainfo.json"),
+        br#"[{"MediaSourceInfo":{"Container":"mkv","RunTimeTicks":600000000,"Bitrate":256000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"hevc"},{"Index":1,"Type":"Audio","Codec":"aac"}]}}]"#,
+    )
+    .await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&changed.id, 100, Some(probe.clone()))
+        .await?;
+    let changed_source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        changed_source,
+        (
+            "mkv".to_owned(),
+            Some(600000000),
+            Some(256000),
+            "READY".to_owned()
+        )
+    );
+    let changed_streams: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT mts.stream_index, mts.stream_type, mts.codec
+         FROM media_streams mts
+         JOIN media_sources ms ON ms.id = mts.media_source_id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'
+         ORDER BY mts.stream_index",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        changed_streams,
         vec![
-            "Remote Movie (2022)/Remote.Movie.2022-poster.jpg".to_owned(),
-            "Remote Movie (2022)/Remote.Movie.2022.strm".to_owned(),
+            (0, "VIDEO".to_owned(), "hevc".to_owned()),
+            (1, "AUDIO".to_owned(), "aac".to_owned()),
         ]
+    );
+    let sidecar_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&changed.id)
+    .bind("Remote Movie (2022)/Remote.Movie.2022-mediainfo.json")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(sidecar_state, "DONE");
+
+    let sidecar_path = movie_dir.join("Remote.Movie.2022-mediainfo.json");
+    tokio::fs::write(&sidecar_path, b"{not valid JSON").await?;
+    let invalid = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&invalid.id, 100, Some(probe.clone()))
+        .await?;
+    let invalid_source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(invalid_source, changed_source);
+    let invalid_state: (String, Option<String>) = sqlx::query_as(
+        "SELECT processing_state, error FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&invalid.id)
+    .bind("Remote Movie (2022)/Remote.Movie.2022-mediainfo.json")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        invalid_state,
+        ("FAILED".to_owned(), Some("INVALID_MEDIA_INFO".to_owned()))
+    );
+
+    tokio::fs::remove_file(&sidecar_path).await?;
+    let removed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&removed.id, 100, Some(probe.clone()))
+        .await?;
+    let removed_source: (Option<String>, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_source, (None, None, None, "PENDING".to_owned()));
+    let removed_stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         JOIN media_sources ON media_sources.id = media_streams.media_source_id
+         JOIN filesystem_entries fe ON fe.id = media_sources.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_stream_count, 0);
+    let removed_state: String = sqlx::query_scalar(
+        "SELECT processing_state FROM scan_job_file_changes
+         WHERE job_id = ? AND relative_path = ?",
+    )
+    .bind(&removed.id)
+    .bind("Remote Movie (2022)/Remote.Movie.2022-mediainfo.json")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_state, "DONE");
+
+    tokio::fs::write(
+        &sidecar_path,
+        br#"[{"MediaSourceInfo":{"Container":"webm","RunTimeTicks":900000000,"Bitrate":512000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"vp9"}]}}]"#,
+    )
+    .await?;
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Remote Movie (2022)/Remote.Movie.2022-mediainfo.json".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&incremental.id, 100, Some(probe.clone()))
+        .await?;
+    let incremental_source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        incremental_source,
+        (
+            "webm".to_owned(),
+            Some(900000000),
+            Some(512000),
+            "READY".to_owned()
+        )
     );
     Ok(())
 }

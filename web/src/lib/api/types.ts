@@ -25,6 +25,8 @@ export type DatabaseSetupInput =
 
 export type LibraryKind = "MOVIE" | "SERIES" | "MIXED" | "HOMEVIDEOS";
 
+export const GLOBAL_COLLECTION_LIBRARY_ID = "00000000-0000-7000-8000-000000000538";
+
 export type LuxUser = {
   id: string;
   usernameNormalized: string;
@@ -231,8 +233,40 @@ export type MediaItem = {
   seriesName?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
+  memberCount?: number | null;
+  posterItemId?: string | null;
   metadataPending?: boolean;
   localMetadataPending?: boolean;
+};
+
+export type CollectionSourceVersion = {
+  id: string;
+  editionName?: string | null;
+  qualityLabel?: string | null;
+  container?: string | null;
+};
+
+export type CollectionSourceCopy = {
+  itemId: string;
+  libraryId: string;
+  libraryName: string;
+  title: string;
+  posterImageTag?: string | null;
+  versions: CollectionSourceVersion[];
+};
+
+export type CollectionMember = MediaItem & {
+  sources: CollectionSourceCopy[];
+  preferredSourceItemId?: string | null;
+  preferredMediaSourceId?: string | null;
+};
+
+export type CollectionDetailResponse = {
+  collection: MediaItem;
+  items: CollectionMember[];
+  page: number;
+  pageSize: number;
+  total: number;
 };
 
 export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";

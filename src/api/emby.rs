@@ -1,24 +1,30 @@
 use super::*;
 use axum::extract::DefaultBodyLimit;
 
+#[path = "emby_credentials.rs"]
+mod credentials;
+pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-credential";
+
 pub(super) fn api_routes() -> Router<AppState> {
-    Router::new()
+    // Discovery and password login do not consume token credentials.
+    let public_routes = Router::new()
         .route("/System/Info/Public", get(emby_public_system_info))
-        .route("/System/Info", get(emby_system_info))
         .route("/System/Ping", get(emby_ping).post(emby_ping))
-        .route(
-            "/DisplayPreferences/{display_preferences_id}",
-            get(emby_display_preferences),
-        )
         .route("/Users/Public", get(emby_public_users))
-        .route("/Users", get(emby_users))
-        .route("/Users/Query", get(emby_query_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/authenticatebyname", post(emby_authenticate))
         .route(
             "/Users/{user_id}/Authenticate",
             post(emby_authenticate_user_id),
+        );
+    Router::new()
+        .route("/System/Info", get(emby_system_info))
+        .route(
+            "/DisplayPreferences/{display_preferences_id}",
+            get(emby_display_preferences),
         )
+        .route("/Users", get(emby_users))
+        .route("/Users/Query", get(emby_query_users))
         .route("/Users/New", post(emby_create_user))
         .route("/Collections", post(emby_create_collection))
         .route(
@@ -202,4 +208,6 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(emby_mark_favorite).delete(emby_unmark_favorite),
         )
         .route("/Sessions/Logout", post(emby_logout))
+        .route_layer(middleware::from_fn(credentials::normalize_credentials))
+        .merge(public_routes)
 }

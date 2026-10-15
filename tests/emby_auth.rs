@@ -1074,3 +1074,331 @@ fn emby_device_info_parser_keeps_only_expected_fields() {
     assert_eq!(info.user_id.as_deref(), Some("user-1"));
     assert!(!format!("{info:?}").contains("token"));
 }
+
+#[tokio::test]
+async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let viewer = UserStore::new(database.clone())?
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let auth = EmbyAuthService::new(database.clone())?;
+    let token = auth
+        .authenticate("Viewer", "viewer password", &EmbyDeviceInfo::default())
+        .await?
+        .ok_or("viewer login failed")?
+        .token;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database)?,
+        auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+    let invalid = "invalid-test-credential";
+    for prefix in ["", "/emby"] {
+        // Public discovery and password login do not authenticate with query tokens.
+        let public = client
+            .get(format!("http://{address}{prefix}/System/Info/Public"))
+            .query(&[("api_key", invalid), ("api_key", invalid)])
+            .send()
+            .await?;
+        assert_eq!(public.status(), reqwest::StatusCode::OK);
+        let password_login = client
+            .post(format!("http://{address}{prefix}/Users/AuthenticateByName"))
+            .query(&[("api_key", invalid), ("api_key", invalid)])
+            .json(&json!({"Username": "Viewer", "Pw": "viewer password"}))
+            .send()
+            .await?;
+        assert_eq!(password_login.status(), reqwest::StatusCode::OK);
+        for (label, query, expected) in [
+            (
+                "same values",
+                vec![
+                    ("X-Emby-Token", token.as_str()),
+                    ("api_key", token.as_str()),
+                ],
+                200,
+            ),
+            (
+                "viewer wins",
+                vec![("X-Emby-Token", token.as_str()), ("api_key", key.as_str())],
+                200,
+            ),
+            (
+                "reverse order",
+                vec![("api_key", key.as_str()), ("X-Emby-Token", token.as_str())],
+                200,
+            ),
+            (
+                "invalid higher",
+                vec![("X-Emby-Token", invalid), ("api_key", key.as_str())],
+                401,
+            ),
+            (
+                "empty higher",
+                vec![("X-Emby-Token", ""), ("api_key", key.as_str())],
+                200,
+            ),
+            (
+                "same name twice",
+                vec![("api_key", token.as_str()), ("api_key", token.as_str())],
+                401,
+            ),
+            (
+                "repeated higher",
+                vec![
+                    ("X-Emby-Token", token.as_str()),
+                    ("x-emby-token", token.as_str()),
+                    ("api_key", key.as_str()),
+                ],
+                401,
+            ),
+            (
+                "query higher ignores repeated lower",
+                vec![
+                    ("api_key", key.as_str()),
+                    ("api_key", invalid),
+                    ("X-Emby-Token", token.as_str()),
+                ],
+                200,
+            ),
+            (
+                "different repeated values",
+                vec![("api_key", token.as_str()), ("api_key", invalid)],
+                401,
+            ),
+            (
+                "legacy media browser fallback",
+                vec![("X-MediaBrowser-Token", token.as_str())],
+                200,
+            ),
+            ("legacy fallback", vec![("apiKey", token.as_str())], 200),
+            (
+                "legacy lower",
+                vec![("X-MediaBrowser-Token", invalid), ("api_key", key.as_str())],
+                200,
+            ),
+        ] {
+            let response = client
+                .get(format!("http://{address}{prefix}/System/Info"))
+                .query(&query)
+                .send()
+                .await?;
+            assert_eq!(response.status().as_u16(), expected, "{prefix}: {label}");
+        }
+        // A proxy's administrator key must not promote the selected user token.
+        let response = client
+            .get(format!("http://{address}{prefix}/Users"))
+            .query(&[("X-Emby-Token", token.as_str()), ("api_key", key.as_str())])
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let reverse_response = client
+            .get(format!("http://{address}{prefix}/Users"))
+            .query(&[("api_key", key.as_str()), ("X-Emby-Token", token.as_str())])
+            .send()
+            .await?;
+        assert_eq!(reverse_response.status(), reqwest::StatusCode::FORBIDDEN);
+        let administrator_response = client
+            .get(format!("http://{address}{prefix}/Users"))
+            .query(&[("api_key", token.as_str()), ("X-Emby-Token", key.as_str())])
+            .send()
+            .await?;
+        assert_eq!(administrator_response.status(), reqwest::StatusCode::OK);
+        let bearer_query = format!("Bearer {token}");
+        let opaque_response = client
+            .get(format!("http://{address}{prefix}/System/Info"))
+            .query(&[("api_key", bearer_query.as_str())])
+            .send()
+            .await?;
+        assert_eq!(opaque_response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let authorization = format!("MediaBrowser Token=\"{token}\"");
+        for (headers, query, expected) in [
+            (
+                vec![("X-Emby-Token", key.as_str())],
+                vec![
+                    ("X-Emby-Token", invalid),
+                    ("api_key", token.as_str()),
+                    ("api_key", invalid),
+                ],
+                200,
+            ),
+            (
+                vec![("X-Emby-Token", invalid)],
+                vec![("api_key", key.as_str())],
+                401,
+            ),
+            (
+                vec![("X-MediaBrowser-Token", key.as_str())],
+                vec![("X-Emby-Token", invalid)],
+                401,
+            ),
+            (
+                vec![
+                    ("Authorization", authorization.as_str()),
+                    ("X-MediaBrowser-Token", invalid),
+                ],
+                vec![],
+                200,
+            ),
+            (
+                vec![("X-Lux-Api-Key", key.as_str())],
+                vec![("X-Emby-Token", invalid)],
+                401,
+            ),
+        ] {
+            let mut request = client
+                .get(format!("http://{address}{prefix}/System/Info"))
+                .query(&query);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            assert_eq!(request.send().await?.status().as_u16(), expected);
+        }
+        let invalid_authorization = "MediaBrowser Token=\"invalid-test-credential\"";
+        for (headers, query, expected) in [
+            (
+                vec![("Authorization", invalid_authorization)],
+                vec![("X-Emby-Token", token.as_str())],
+                200,
+            ),
+            (
+                vec![("Authorization", invalid_authorization)],
+                vec![("api_key", token.as_str())],
+                401,
+            ),
+            (
+                vec![("X-MediaBrowser-Token", invalid)],
+                vec![("api_key", token.as_str())],
+                401,
+            ),
+            (
+                vec![("X-Emby-Token", ""), ("X-MediaBrowser-Token", invalid)],
+                vec![("X-Emby-Token", token.as_str())],
+                200,
+            ),
+            (
+                vec![
+                    ("X-Emby-Authorization", invalid_authorization),
+                    ("Authorization", authorization.as_str()),
+                ],
+                vec![],
+                401,
+            ),
+            (
+                vec![
+                    ("X-Emby-Token", key.as_str()),
+                    ("X-Emby-Authorization", invalid_authorization),
+                ],
+                vec![],
+                200,
+            ),
+        ] {
+            let mut request = client
+                .get(format!("http://{address}{prefix}/System/Info"))
+                .query(&query);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            assert_eq!(request.send().await?.status().as_u16(), expected);
+        }
+        // External callers cannot set the internal selected-credential header.
+        let forged = client
+            .get(format!("http://{address}{prefix}/System/Info"))
+            .header("x-lux-internal-emby-credential", key.as_str())
+            .send()
+            .await?;
+        assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let head = client
+            .head(format!("http://{address}{prefix}/Items/{}", viewer.id))
+            .query(&[("api_key", key.as_str()), ("X-Emby-Token", token.as_str())])
+            .send()
+            .await?;
+        assert_eq!(head.status(), reqwest::StatusCode::OK);
+        let post = client
+            .post(format!(
+                "http://{address}{prefix}/Items/{}/PlaybackInfo",
+                viewer.id
+            ))
+            .query(&[("api_key", key.as_str()), ("X-Emby-Token", token.as_str())])
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(post.status(), reqwest::StatusCode::NOT_FOUND);
+        // All credential-bearing route shapes must match their single-token baseline.
+        for path in [
+            format!("/Users/{}/Items/Root", viewer.id),
+            "/Items?Limit=1".to_owned(),
+            "/Items/Counts".to_owned(),
+            "/Search/Hints?SearchTerm=example".to_owned(),
+            format!("/Items/{}/Images/Primary", viewer.id),
+            format!("/Items/{}/PlaybackInfo", viewer.id),
+            format!("/Videos/{}/original.strm", viewer.id),
+            format!("/Users/{}/Items/{}", viewer.id, viewer.id),
+        ] {
+            let url = format!("http://{address}{prefix}{path}");
+            let baseline = client
+                .get(&url)
+                .query(&[("api_key", token.as_str())])
+                .send()
+                .await?;
+            assert_ne!(
+                baseline.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path}"
+            );
+            assert_ne!(
+                baseline.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+            let mixed = client
+                .get(&url)
+                .query(&[("api_key", key.as_str()), ("X-Emby-Token", token.as_str())])
+                .send()
+                .await?;
+            assert_eq!(mixed.status(), baseline.status(), "{prefix}{path}");
+            let invalid_response = client
+                .get(&url)
+                .query(&[("api_key", key.as_str()), ("X-Emby-Token", invalid)])
+                .send()
+                .await?;
+            assert_eq!(
+                invalid_response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{prefix}{path}"
+            );
+        }
+    }
+    // The native API retains its own key selection contract.
+    let response = client
+        .get(format!("http://{address}/api/v1/admin/api-key"))
+        .query(&[("api_key", key.as_str()), ("X-Emby-Token", invalid)])
+        .send()
+        .await?;
+    let native_baseline = client
+        .get(format!("http://{address}/api/v1/admin/api-key"))
+        .query(&[("api_key", key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(native_baseline.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), native_baseline.status());
+    Ok(())
+}

@@ -44,6 +44,7 @@ import type {
   AdminWebhookDestination,
   ChapterSource,
   ApiErrorBody,
+  CollectionDetailResponse,
   DatabaseSetupInput,
   LibraryKind,
   HomeCarouselResponse,
@@ -448,6 +449,24 @@ export class LuxApiClient {
     if (options.parentId) params.set("parentId", options.parentId);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
+    );
+  }
+
+  collection(collectionId: string, page = 1, pageSize = 24) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<CollectionDetailResponse>(
+      `/api/v1/collections/${encodeURIComponent(collectionId)}?${params}`,
+    );
+  }
+
+  setCollectionSourcePreference(
+    collectionId: string,
+    workItemId: string,
+    selection: { sourceItemId: string; mediaSourceId?: string | null },
+  ) {
+    return this.request<void>(
+      `/api/v1/collections/${encodeURIComponent(collectionId)}/items/${encodeURIComponent(workItemId)}/source`,
+      { method: "PUT", body: JSON.stringify(selection) },
     );
   }
 

@@ -1192,6 +1192,30 @@ async fn safe_danmaku_source_paths(source: &StoredDanmakuSource) -> Result<(Path
     Ok((media_path, sidecar_path))
 }
 
+pub(crate) async fn read_danmaku_sidecar_from_root(
+    root_path: &Path,
+    relative_path: &Path,
+) -> Result<Vec<u8>, ()> {
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(());
+    }
+    let root = fs::canonicalize(root_path).await.map_err(|_| ())?;
+    let sidecar_path = fs::canonicalize(root.join(relative_path))
+        .await
+        .map_err(|_| ())?;
+    if !sidecar_path.starts_with(&root) {
+        return Err(());
+    }
+    if !fs::metadata(&sidecar_path).await.map_err(|_| ())?.is_file() {
+        return Err(());
+    }
+    read_danmaku_file(&sidecar_path).await
+}
+
 async fn read_danmaku_file(path: &Path) -> Result<Vec<u8>, ()> {
     let metadata = fs::metadata(path).await.map_err(|_| ())?;
     if metadata.len() > MAX_DANMAKU_XML_BYTES as u64 {
@@ -1209,7 +1233,7 @@ async fn read_danmaku_file(path: &Path) -> Result<Vec<u8>, ()> {
     Ok(bytes)
 }
 
-fn fingerprint(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn fingerprint(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 

@@ -30,6 +30,12 @@ Lux 管理 API 新增 `GET /api/v1/admin/library-pipeline-activity`，沿用现�
 
 聚合只返回当前页启用媒体库的阶段摘要；响应不包含媒体标题、文件路径、凭据、上游错误文本或 scan activity 的 `currentItem`。本接口独立于已有 `/api/v1/admin/task-activity`，不改变 Emby、ScanCompleted 或 Webhook DTO。
 
+## LUX-538–543 入库后文件变化同步（2026-10-15）
+
+入库后的文件变化以独立 `scan_job_file_changes` 队列持久化，按 root 与相对路径合并 ADD、CHANGE、REMOVE；事件不复用媒体项 metadata、媒体源 probe 或 thumbnail 状态。增量扫描、Manifest 全量扫描和持久 reconciliation 使用相同分类与 change kind。外挂字幕只更新对应外部轨道；`*-mediainfo.json` 只更新其 STRM 媒体源；NFO、图片和 danmaku XML 各自更新对应本地结果。视频文件 fingerprint 未变时保留内嵌轨道及技术信息；EDL 目前无消费者，作为 no-op 完成，不生成 metadata/thumbnail 任务。
+
+自动化证据：`tests/scanning_jobs.rs` 87/87、`tests/storage.rs` 54/54、`tests/ready_version.rs` 2/2 通过，覆盖扫描发现、确认删除、局部结果同步、不探测未变化视频、队列 revision CAS、合并、稳定分页和运行项恢复。SQLite 与 PostgreSQL 0170 migrations 的结构合同测试通过；另有 PostgreSQL 队列 revision/恢复合同测试，但它标记为需要 disposable local PostgreSQL，本次没有运行，因为本机 PostgreSQL/OrbStack Docker daemon 不可用。最终全量 `cargo test --locked --all-targets` 的 lib target 为 855 passed、2 failed、23 ignored：未修改的 NFO actor-credit 时序用例与 HLS `Superseded` 竞争用例失败；NFO 隔离重跑通过，HLS 隔离运行结果有通过和失败两种。全量命令因此未运行后续 integration targets；上述相关 integration targets 已分别通过。不能据此记录完整 Rust gate 通过，也不代表部署后媒体库或 PostgreSQL runtime 已验证。
+
 ## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
 
 Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有
@@ -148,6 +154,34 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 跨条目和篡改签名拒绝、播放回调刷新/停止清理，以及 URL/路径型 `.strm` 对外声明转码能力但不创建 HLS 会话。该自动化证据
 只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
 部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。
+
+## LUX-544 Emby 跨库合集版本播放（2026-10-15）
+
+合集逻辑电影的 `PlaybackInfo` 以标准 `MediaSources[]` 返回当前用户可访问的原电影副本和版本。每个媒体源的 `ItemId`、直放/转码 URL、媒体流与字幕均指向该 source 所属的原电影；默认 source 使用用户已保存的副本/版本偏好，其后按默认版本和媒体库顺序排列。显式撤销媒体库权限后，合集 `PlaybackInfo` 不再提供该 source；已签名的原 source 播放 URL 也会在媒体入口重新执行 ACL/source 授权。
+
+使用合集逻辑 `ItemId` 的播放回调按登录用户可见的原副本和 `MediaSourceId` 解析后，只更新原电影的播放会话和进度。缺少 source 时仅在原副本/已有会话能唯一定位时接受；多个可见副本无法唯一定位时返回 `400`。已有合集播放会话还绑定原电影、source 和设备，错配回调或撤权后的旧回调返回 `404`。
+
+`tests/emby_global_collection_playback.rs` 验证了两份跨库原件的 DTO 和真实直放字节、外置字幕路由、显式 source 选择、单副本 source 缺省回调、歧义回调拒绝、不同设备并发会话、暂停/停止、source/device/会话错配拒绝及撤权后旧流和回调拒绝。Rust 自动化结果只证明服务端合同。该记录未进行 VidHub、SenPlayer 或 Infuse 的合集真实 UI/source 切换测试，不能据此声明这些客户端能浏览合集、选择版本或回写对应原电影进度；这些实机结果留待 LUX-545 阶段门逐项记录。
+
+## LUX-545 合集阶段门（2026-10-15）
+
+本机为 macOS `arm64`（`uname -m`）；所有 Cargo 构建和测试均将 `CARGO_TARGET_DIR` 指向项目共享目录 `/Volumes/Toshiba/mywork/Lux/target`。SQLite 存储目标从空库和已有 schema 迁移的检查通过（`cargo test --locked --test storage`：56 passed）；合集逻辑、NFO 修复及 Emby 播放测试包含在全量 Rust 门禁中。最终代码的 `cargo build --locked --target aarch64-apple-darwin`、`cargo fmt --all -- --check`、`cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。
+
+PostgreSQL 16 运行时补测：使用临时 PostgreSQL 16 实例运行 `cargo test --locked --target aarch64-apple-darwin --test postgres_database -- --include-ignored`，16 passed、0 failed。空库启动测试实际应用全部迁移到 v173，并断言六张合集表、无根路径系统合集库和 `media_items.nfo_collection_reference_key` 列存在。该结果验证 PostgreSQL 16 的迁移和 schema，不代表生产数据库实例或其他 PostgreSQL 版本。
+
+Rust 全量门禁通过：设置 `RUST_TEST_THREADS=4` 后运行 `cargo test --locked --target aarch64-apple-darwin --all-targets`，库测试为 872 passed、22 ignored、0 failed，所有可运行的 integration targets 均通过。为让 shutdown 子进程不与本机常驻 Lux 的 UDP 7359 发现端口冲突，该测试使用临时发现端口；插件查询计数测试使用不启动周期 worker 的测试构造器，避免无关查询污染计数。该全量运行按设计忽略 PostgreSQL 专用用例；上述 PostgreSQL 16 补测单独提供了数据库运行时证据。
+
+Web 检查通过：冻结依赖安装、Web 测试（Node 139/139，Vitest 600/600，77 个文件）和生产构建均通过。Playwright 浏览器流程打开 `/libraries` 的“合集”，进入“飞驰人生”，选择 4K 来源，随后链接包含 `collectionId`/`sourceId`，并发出来源偏好写入请求；浏览器控制台 0 errors、0 warnings。该流程的 API 路由使用 mock，因此只作为真实浏览器 UI 流程证据；服务端接口由 Rust 集成测试覆盖。
+
+| 客户端 | 合集浏览 | 来源选择 | 进度回写 | 结果 |
+|---|---|---|---|---|
+| VidHub | 未实测 | 未实测 | 未实测 | VidHub 2.1.8 已安装并启动；CUA 绑定原生窗口返回 `cgWindowNotFound` |
+| SenPlayer | 未实测 | 未实测 | 未实测 | SenPlayer 6.0.6 已安装并启动；CUA 绑定原生窗口返回 `cgWindowNotFound` |
+| Infuse | 未实测 | 未实测 | 未实测 | Infuse 8.5.1 已安装并启动；CUA 绑定原生窗口返回 `cgWindowNotFound` |
+
+阶段风险：VidHub、SenPlayer、Infuse 的合集 UI、跨库来源选择和原电影进度回写仍缺少实机证据。PostgreSQL 迁移已在临时 PostgreSQL 16 实例验证，但没有生产实例或其他 PostgreSQL 版本的证据。LUX-545 阶段门未完成，停在项目所有者确认点。
+
+2026-10-15 续查：三款客户端均可在本机启动，系统窗口枚举也能找到各自窗口，但 CUA 对三个应用的原生窗口绑定均返回 `-10005 cgWindowNotFound`，因此无法可靠完成客户端交互。隔离浏览器访问本机 `127.0.0.1:8097` 只显示登录页，`127.0.0.1:5173` 当前没有监听；未使用已有个人浏览器登录态，也未对现有本地数据库写入测试用户或媒体。客户端兼容性验收仍未完成。
 
 2026-09-20 播放状态兼容：Emby `GET /Sessions` 和 Lux 管理仪表盘现在根据活动 HLS 会话报告
 `DirectStream` 或 `Transcode`，不再把服务端转码固定报告为 `DirectPlay`；可用时同时返回/展示 HLS 容器、视频/音频输出 codec
@@ -875,3 +909,46 @@ Rust 回归由 `tests/metadata_selection.rs`、`tests/nfo_writer.rs` 覆盖；�
 成功的本地电影探测会把实际探测到的视频、音频和字幕轨写入主媒体 source 对应的 NFO，并按媒体库策略同步配置卷镜像。重复探测会替换旧 streamdetails，同时保留 NFO 其他字段。宽高、codec、帧率、aspect、语言、声道、采样率、默认/强制标志和时长都来自 Lux 探测结果；`.strm` 仅使用旁车数据供播放信息读取，不据此生成本地 NFO 技术信息。
 
 回归由 `tests/probe.rs` 与 `tests/nfo_writer.rs` 覆盖，包含真实媒体 source 的 NFO 回写、重探测去重、镜像同步和 `.strm` 不写回；尚未部署到实际媒体库与 Emby 对照验证。
+
+## LUX-537：Emby 鉴权来源优先级（2026-10-14）
+
+依据官方 [Emby 4.10.1.0 ARM64 发布包](https://github.com/MediaBrowser/Emby.Releases/releases/tag/4.10.1.0) 的临时原生实例实测：在 `/System/Info` 和 `/Users/{user_id}/Items/{root_item_id}` 对比有效/无效用户 token、静态 key、不同 URL 顺序与普通用户权限；`/emby` 前缀详情结果一致。安装包 SHA256 为 `12974f6833d01953733274b52d4396200cf8ff7852135eb8ed91b27fe0b68281`。凭据含义参考官方 [API Key 认证](https://dev.emby.media/doc/restapi/API-Key-Authentication.html) 与 [用户认证](https://dev.emby.media/doc/restapi/User-Authentication.html)；下面的优先级与重复参数结果来自运行时实测，不能仅从官方文档或 2018 年历史源码推断，也不声称覆盖其他 Emby 版本。
+
+标准来源按以下顺序选择首个非空凭据：
+
+| 优先级 | 来源 |
+| --- | --- |
+| 1 | HTTP header `X-Emby-Token` |
+| 2 | query `X-Emby-Token` |
+| 3 | `X-Emby-Authorization` 的 `Token`，其次 `Authorization` 的 `Token` |
+| 4 | HTTP header `X-MediaBrowser-Token` |
+| 5 | query `api_key` |
+
+authorization 两个 header 的比较只实测了都含非空 `Token` 的情况。Lux 在前一个 header 没有非空 `Token` 时继续读取后一个；该细节不声称已完成 Emby 对照。
+
+不同 query 名称各自代表来源，不再作为同一 Serde 字段参与反序列化。选中后仍由既有服务验证身份和权限；标准 token 无效返回 401，不尝试低优先级凭据。不同来源不要求值相同，不合并权限。普通用户 query token 与代理补入的管理员 key 并存时，仍使用普通用户权限。
+
+| 请求组合 | 标准 token 鉴权结果 |
+| --- | --- |
+| query `X-Emby-Token=U&api_key=U` | 接受 U，不再返回重复字段 400 |
+| query `X-Emby-Token=U&api_key=K`，任意顺序 | 使用 U 的身份 |
+| query `X-Emby-Token=无效&api_key=K` | 401 |
+| query `X-Emby-Token=&api_key=K` | 使用 K |
+| query 同名 `api_key` 两次，即使值相同 | 401 |
+| 更高优先级有效 header / query `X-Emby-Token` 与重复 query `api_key` | 使用高优先级来源 |
+
+U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不敏感；同一来源的重复出现不会取首值或末值。非鉴权参数保留原编码、顺序与原有重复参数语义，例如媒体入口重复 `MediaSourceId` 仍取首值。根路径和 `/emby` 下的受保护路由统一处理，涵盖 GET/HEAD/POST、详情、列表、Counts、搜索、图片、PlaybackInfo、登出与媒体入口。公开发现、Ping、公开用户和密码登录沿用原规则，不因为未使用的 query token 重复而拒绝请求。原生 `/api/v1` 的鉴权规则不变。
+
+实测 Emby 不把 query `apiKey` 或 query `X-MediaBrowser-Token` 当作标准来源。为保留现有 Lux 客户端合同，Lux 将它们作为所有标准来源为空时的扩展回退；历史 `X-Lux-Api-Key`、`X-Emby-Authentication` 和 Authorization 的 Bearer/原始 token 也仅作扩展回退。选中的 query token 按原始凭据处理，不把其中的 `Bearer ` 或 `Token=` 当作 header 语法。
+
+请求内选中的凭据只在 Emby 路由内部传递，外部同名内部 header 会被清除；该内部 header 不会转发给插件，也不会作为 header 输出到响应或日志。既有用户、媒体库 ACL 与 HMAC 播放票据验证保持不变；签名播放票据继续使用原有独立授权路径。PlaybackInfo 使用实际选中的用户 token 生成 `.strm` 签名播放 URL，低优先级 Lux key header 不再抑制它；管理员共享 key 仍禁止写入播放 URL。
+
+本机验证（Toshiba 已挂载，macOS `arm64`，所有 Cargo 命令使用 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`）：
+
+- 修复前回归明确复现不同 query 名称但相同 token 返回 400；统一提取后通过。播放 URL 补充回归也先复现用户 token 丢失，再修复；公开发现/密码登录边界回归先复现 401，再修复。
+- 11 个相关 integration target 共 27/27 通过，新增凭据解析单元测试 3/3 通过。收尾再次运行 `emby_auth`、`strm`、`playback`、`web_playback`、`subtitles`、`strm_resolver_playback`、`shutdown`，共 17/17 通过。
+- `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 通过。
+- 第一轮 `cargo test --locked --all-targets` 在 `shutdown` 停止：1451 通过、1 失败、44 ignored。单独复现启动错误为 `AddrInUse`，本机已有 Lux 占用默认 UDP 7359；只对测试临时设置 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0` 后，shutdown 通过，原服务未停止或重启，代码默认端口不变。
+- 在该临时发现端口下重跑全量，库测试 858 通过、1 失败、22 ignored；失败是项目此前已记录的 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation`，在 `src/application/playback/hls.rs:2290` 遇到 `Superseded`。该用例第一轮全量通过、第二轮失败、随后单独运行通过，HLS 文件本任务未修改。全量完成门保留失败，不能由定向通过或单跑通过替代。
+
+本次没有推送或部署，不代表 NanShare/Caddy/Hills 的已部署链路已通过实机验证；也不外推 NAS/x86 或其他 Emby 版本的结果。
