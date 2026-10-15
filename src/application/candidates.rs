@@ -2914,7 +2914,7 @@ impl MetadataSelectionService {
             ));
         }
         let mut payload = candidate_payload(&candidate)?;
-        let collection_reference = (current.item_type == "MOVIE" && !options.keep_pending)
+        let collection_reference = (current.item_type == "MOVIE")
             .then(|| {
                 let current_provider_ids = current_provider_ids(&current);
                 let (movie_provider, movie_provider_id) = if options.preserve_identity {

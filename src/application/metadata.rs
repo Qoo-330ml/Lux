@@ -5617,6 +5617,10 @@ mod tests {
                 &details,
             )
             .await?;
+        sqlx::query("UPDATE media_items SET nfo_collection_reference_key = '' WHERE id = ?")
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
         let metadata = database
             .find_media_item_metadata(item_id)
             .await?
@@ -5767,6 +5771,10 @@ mod tests {
                 Some(&raw_content_fingerprint),
                 &details,
             )
+            .await?;
+        sqlx::query("UPDATE media_items SET nfo_collection_reference_key = '' WHERE id = ?")
+            .bind(item_id)
+            .execute(database.pool())
             .await?;
 
         let enricher = MetadataEnricher::new(database.clone())
