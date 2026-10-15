@@ -11720,7 +11720,11 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 真实 Chromium 使用固定本地 API/SSE fixture：基线 65 秒产生 12 次详情周期请求，新实现 83 秒为 0；首页进入详情后 30 秒内返回为 0 次首页请求。SSE 事件立即刷新标题/收藏状态；断线约 30 秒后详情、图片、播放信息各请求一次；原生 SSE 重连触发媒体缓存重新同步并保持单条连接，随后 69 秒为 0 次周期请求。此为本机 arm64 的请求策略验证，不是生产数据集、NAS CPU 或滚动帧率结论。
 
-Rust 完整检查仍在执行，最终结果将在本记录补充。所有 Cargo 输出使用已挂载 Toshiba 的统一 target。未推送、合并或部署。
+Rust 完成门禁（macOS `arm64`，Toshiba 已挂载，Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`）：`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。目标回归 `application::admin_events::tests` 7/7、`admin_events` 3/3、`user_query_events` 1/1、`resume_favorites` 4/4、`web_playback` 1/1、`scanned_series_metadata` 3/3、`scanning_jobs` 88/88 通过。
+
+完整 `cargo test --locked --all-targets` 在 `scanned_metadata::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 停滞超过 23 分钟后中断；此前 1,311 项通过、0 项失败、47 项忽略。该目标按单线程复跑为 22/23：唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 得到 2 张图片、预期 1 张，是此前已有的 NFO 海报回滚问题。相关阶段记录也报告 FIFO 用例在并行运行时可能超过 60 秒；本轮全量测试因此不能标为通过。串行 `scanned_series_metadata`、`scanning_jobs` 的定向回归通过。
+
+Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 612 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 64 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
 
 ## 29. 参考资料
 
