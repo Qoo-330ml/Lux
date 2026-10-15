@@ -1,17 +1,18 @@
 import { Database, Folder, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
-import { MediaImageEditor } from "../media/MediaImageEditor";
-import { MediaIdentifier } from "../media/MediaIdentifier";
-import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
-import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
-import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
+
+const LazyMediaImageEditor = lazy(() => import("../media/MediaImageEditor").then(({ MediaImageEditor }) => ({ default: MediaImageEditor })));
+const LazyMediaIdentifier = lazy(() => import("../media/MediaIdentifier").then(({ MediaIdentifier }) => ({ default: MediaIdentifier })));
+const LazyMediaMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then(({ MediaMetadataEditor }) => ({ default: MediaMetadataEditor })));
+const LazyMediaSubtitleEditor = lazy(() => import("../media/MediaSubtitleEditor").then(({ MediaSubtitleEditor }) => ({ default: MediaSubtitleEditor })));
+const LazyMediaDeleteDialog = lazy(() => import("../media/MediaDeleteDialog").then(({ MediaDeleteDialog }) => ({ default: MediaDeleteDialog })));
 
 export function mediaTitle(item: MediaItem) {
   return item.title || item.name || "未命名媒体";
@@ -216,11 +217,13 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
-      {editor === "metadata" ? <MediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-      {editor === "images" ? <MediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-      {editor === "subtitles" ? <MediaSubtitleEditor item={item} onClose={() => setEditor(undefined)} /> : null}
-      {deleteOpen ? <MediaDeleteDialog item={item} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(item.id, item.mediaSources?.find((source) => source.isDefault)?.id)} onDeleted={() => setDeleted(true)} /> : null}
-      {editor === "identify" ? <MediaIdentifier item={item} onClose={() => setEditor(undefined)} /> : null}
+      <Suspense fallback={null}>
+        {editor === "metadata" ? <LazyMediaMetadataEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+        {editor === "images" ? <LazyMediaImageEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+        {editor === "subtitles" ? <LazyMediaSubtitleEditor item={item} onClose={() => setEditor(undefined)} /> : null}
+        {deleteOpen ? <LazyMediaDeleteDialog item={item} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(item.id, item.mediaSources?.find((source) => source.isDefault)?.id)} onDeleted={() => setDeleted(true)} /> : null}
+        {editor === "identify" ? <LazyMediaIdentifier item={item} onClose={() => setEditor(undefined)} /> : null}
+      </Suspense>
     </>
   );
 }
