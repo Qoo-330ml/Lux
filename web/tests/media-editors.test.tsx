@@ -78,6 +78,53 @@ describe("media editors", () => {
     expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "POSTER", language: "en-US", source: "" });
   });
 
+  it("versions the current image URL with its content tag", async () => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({
+      images: [{
+        id: "image-v2",
+        itemId: "item-1",
+        imageType: "POSTER",
+        imageIndex: 0,
+        contentTag: "poster-v2",
+        url: "/api/v1/items/item-1/images/poster",
+      }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaImageEditor item={{ id: "item-1", title: "示例电影" }} onClose={() => undefined} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    expect(container.querySelector<HTMLImageElement>(".lux-image-current-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/item-1/images/poster?tag=poster-v2");
+  });
+
+  it("falls back to the image record ID when no content tag is available", async () => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({
+      images: [{
+        id: "image-v3",
+        itemId: "item-1",
+        imageType: "POSTER",
+        imageIndex: 0,
+        url: "/api/v1/items/item-1/images/poster",
+      }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaImageEditor item={{ id: "item-1", title: "示例电影" }} onClose={() => undefined} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    expect(container.querySelector<HTMLImageElement>(".lux-image-current-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/item-1/images/poster?tag=image-v3");
+  });
+
   it("ignores image search results from a type that is no longer selected", async () => {
     vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
     let resolveSearch!: (value: { images: ImageSearchResult[] }) => void;

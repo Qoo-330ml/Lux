@@ -11645,6 +11645,23 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 修复前干净基线 b5cbab81 同样复现，因此 Rust 全量 gate 未全绿。详细边界与检查过程见
 `docs/COMPATIBILITY.md` 的 LUX-548 记录。未部署，未将 iOS 客户端真实页面标记为兼容通过。
 
+#### LUX-549：修复图像编辑器当前图片的陈旧缓存
+
+范围：图像编辑器展示当前图片时，在图片 URL 加上由 `contentTag` 派生的 `tag` 参数；缺少内容标签时使用图片记录 ID。
+这样图片内容更新后浏览器会请求新 URL，同时保持服务端缓存与详情页使用的版本键约定。不改变数据库、图片 API 或图片写入方式。
+
+验收：
+
+- [x] 图片编辑器当前图片 URL 含有当前 `contentTag`；无内容标签时使用当前图片记录 ID。
+- [x] 自动化回归覆盖两个版本键来源；选中的新版本不会复用旧 URL 的浏览器缓存。
+- [x] 图像编辑器定向 Web 测试与 production build 通过；全量 Web 测试已执行，失败项记录在实施结果中。
+
+预计文件（3 个）：`web/src/features/media/MediaImageEditor.tsx`、`web/tests/media-editors.test.tsx`、本文档。
+
+实施结果（2026-10-15）：图像编辑器当前图片 URL 追加 `?tag=<contentTag>`，内容标签缺失时使用图片行 ID。TDD 回归在修复前因缺少版本参数失败，修复后 `media-editors.test.tsx` 7/7 通过。冻结锁文件安装与 Web production build 通过。
+
+全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
