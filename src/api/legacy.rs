@@ -244,8 +244,8 @@ impl AppState {
             config.clone(),
             database.backend(),
         ));
-        let admin_events = AdminEventHub::new();
         let user_events = UserEventHub::new();
+        let admin_events = AdminEventHub::new().with_user_events(user_events.clone());
         let web_playback = Some(WebPlaybackSessionService::new(
             database.clone(),
             config_dir.clone(),

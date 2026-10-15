@@ -178,7 +178,7 @@ async fn user_event_stream_is_authenticated_and_does_not_expose_admin_events()
     );
     let mut response = client
         .get(format!("http://{address}/api/v1/events"))
-        .header(COOKIE, cookies)
+        .header(COOKIE, &cookies)
         .send()
         .await?;
 
@@ -196,6 +196,21 @@ async fn user_event_stream_is_authenticated_and_does_not_expose_admin_events()
     assert!(!first_chunk.contains("jobs"));
     assert!(!first_chunk.contains("currentItem"));
 
+    let update = client
+        .patch(format!("http://{address}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", cookie_value(login.headers(), "lux_csrf"))
+        .json(&json!({ "serverName": "User Event Test" }))
+        .send()
+        .await?;
+    assert_eq!(update.status(), reqwest::StatusCode::OK);
+    let chunk = tokio::time::timeout(Duration::from_secs(1), response.chunk())
+        .await??
+        .ok_or("missing user invalidation")?;
+    let chunk = String::from_utf8(chunk.to_vec())?;
+    assert!(chunk.contains("event: invalidate\ndata: {\"scope\":\"home\"}"));
+    assert!(!chunk.contains("serverName"));
+    assert!(!chunk.contains("User Event Test"));
     server.abort();
     Ok(())
 }

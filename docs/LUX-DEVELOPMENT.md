@@ -11690,6 +11690,14 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 验收：各作用域、可选 ID、无效 payload、会话缓存保留及已有首页在途请求保护均有回归。
 
+#### LUX-553：为用户查询补齐服务端失效来源
+
+范围：UserEventScope 增加 item/library/favorites 字符串，仍只发送无业务数据的 scope。应用状态将用户 hub 装配到管理员事件中心；元数据修改、库/访问权限/设置修改及任务关键状态向普通用户发送失效，高频 jobs progress 不转发。服务端广播丢帧仍回退 home，前端按全部媒体展示缓存处理。
+
+预计文件（5 个）：`src/application/admin_events.rs`（含库测试）、`src/api/legacy.rs`、`tests/admin_events.rs`、`docs/API.md`、本文档。
+
+验收：作用域 wire names、管理员修改桥接、进度不转发有库测试；执行最窄 `cargo test --locked --lib application::admin_events::tests`，再以 `--test admin_events` 验证鉴权与 SSE 帧。所有 Cargo 命令使用 Toshiba 统一 target。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
