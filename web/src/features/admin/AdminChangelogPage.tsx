@@ -24,6 +24,9 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "changed", items: [
         "优化媒体详情页的年份、评分、时长和音视频规格展示；收紧 NFO 信息区间距，移除外围面板并增大标语字号。",
       ] },
+      { kind: "fixed", items: [
+        "修复首页“最近添加”接口遗漏全局电影合集的问题；现在按用户可访问的媒体库权限返回近期合集卡片及其可见成员数、海报来源。",
+      ] },
     ],
   },
   {
