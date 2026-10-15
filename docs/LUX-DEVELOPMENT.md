@@ -11674,6 +11674,14 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 - [x] 有缓存库 ID 时最新资源与媒体库刷新并发；服务器返回不同 ID 后请求新的分组。
 - [ ] 首页定向回归、Web 全量检查和浏览器验证，结果在后续实施记录中汇总。
 
+#### LUX-551：共享用户 SSE 连接状态
+
+范围：Shell 继续独占一条用户事件连接，以 React context 向内容页共享连接状态。未连接、不支持 EventSource 或 error 时为 disconnected；open 后 connected，重连仍复用同一 EventSource；卸载移除监听并关闭连接。
+
+预计文件（4 个）：`web/src/features/activity/useUserEvents.ts`、`web/src/components/layout/LuxShell.tsx`、`web/tests/user-events.test.tsx`、本文档。
+
+验收：连接、断连、重连、浏览器不支持与卸载关闭均有组件回归。后续任务接入条件轮询。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
