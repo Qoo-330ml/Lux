@@ -5,7 +5,7 @@ import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
 import { MediaSourcePanel, MediaSourceProvider, useMediaSource } from "./MediaSourcePanel";
 import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
 import { MediaEpisodesSection } from "./MediaEpisodesSection";
 import { MediaDetailArtwork, MediaDetailHero } from "./MediaDetailHero";

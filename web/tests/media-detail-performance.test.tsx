@@ -12,7 +12,7 @@ import { MediaNfoPanel } from "../src/features/detail/MediaNfoPanel";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import type { MediaItem } from "../src/lib/api/types";
-import * as mediaVisuals from "../src/features/home/media";
+import * as mediaVisuals from "../src/features/home/media-display";
 
 vi.mock("../src/features/detail/MediaCast", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/features/detail/MediaCast")>();
@@ -107,6 +107,7 @@ it("updates episode data without recalculating the hero or rendering unrelated s
   expect(container.querySelector(".lux-season-episode-copy")?.textContent).toContain("旧集名");
   const heroRenders = () => poster.mock.calls.filter(([item]) => item.id === "movie-1").length;
   const beforeHero = heroRenders();
+  expect(beforeHero).toBeGreaterThan(0);
   const before = renderCounts();
   client.setQueryData(queryKeys.children("movie-1", "EPISODE", "season-1"), {
     pages: [{ items: [{ id: "episode-1", itemType: "EPISODE", title: "新集名", mediaSources: [{ id: "episode-source" }] }], total: 1, page: 1, pageSize: 100 }],
@@ -122,6 +123,7 @@ it.each(["playback", "stills"])("keeps hero artwork stable during %s query updat
   const poster = vi.spyOn(mediaVisuals, "posterUrlWithFallback");
   await renderDetail();
   const before = poster.mock.calls.length;
+  expect(before).toBeGreaterThan(0);
   if (query === "playback") client.setQueryData(queryKeys.playback("movie-1"), { isFavorite: true });
   else client.setQueryData(queryKeys.itemImages("movie-1"), { images: [{
     id: "still-2", itemId: "movie-1", imageType: "FANART", imageIndex: 0, url: "/new-still.png",

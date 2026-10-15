@@ -207,9 +207,7 @@ describe("MediaDetailPage series hierarchy", () => {
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-detail-inline-menu .lux-media-actions-trigger")?.click());
     expect(document.body.querySelector("[data-action=edit-metadata]")).not.toBeNull();
     await act(async () => document.body.querySelector<HTMLElement>("[data-action=edit-metadata]")?.click());
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
+    await act(async () => { await vi.dynamicImportSettled(); });
     expect(container.querySelector(".lux-metadata-editor[role=dialog]")).not.toBeNull();
   });
 
