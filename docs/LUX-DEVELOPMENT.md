@@ -11672,7 +11672,7 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 - [x] 延迟加载管理页 chunk 时，主导航、管理侧栏保持可见，只有管理内容区显示 skeleton；加载完成后 dashboard 正常替换。
 - [x] 桌面与移动导航，以及账户入口的焦点/指针预加载有回归；播放器路由仍位于全屏 Suspense fallback 下。
 - [x] 冻结依赖安装、生产构建、相关 Web 回归和真实浏览器流程已运行；浏览器使用 2.5 秒本地 chunk 延迟及 mock API，未据此声称生产性能数值。
-- [ ] 全量 Web 测试通过；当前已有未修改页面/布局测试失败，需先由对应任务修复后才能满足全局完成门。
+- [x] 已执行全量 Web 检查，并在干净 `test` 基线复现相同的 6 个既有失败；项目所有者于 2026-10-16 确认仅对 LUX-552 按基线例外关闭。全局 Web 完成门仍未通过。
 
 预计文件：`web/src/app/App.tsx`、`web/src/features/admin/AdminLayout.tsx`、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、相关 Web 测试及本文档。实现拆为路由边界与导航预加载两个独立提交。
 
