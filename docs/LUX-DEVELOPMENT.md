@@ -11662,6 +11662,24 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
+#### LUX-552：路由切换时保留 Lux 导航
+
+范围：普通懒加载页面的 Suspense fallback 放在 LuxShell 内容区，路由 chunk 加载时 header 和主导航保持可见；管理页子路由的 fallback 限定在 `.lux-admin-content`，管理侧栏保持可见。常用主导航和账户入口在指针进入或键盘聚焦时预加载目标页面 chunk。播放器路由继续使用全屏加载态。不改变页面数据、API 或路由权限。
+
+验收：
+
+- [x] 延迟加载媒体库页面 chunk 时，LuxShell header 和主导航保持可见，内容区显示轻量 skeleton；加载完成后页面正常替换。
+- [x] 延迟加载管理页 chunk 时，主导航、管理侧栏保持可见，只有管理内容区显示 skeleton；加载完成后 dashboard 正常替换。
+- [x] 桌面与移动导航，以及账户入口的焦点/指针预加载有回归；播放器路由仍位于全屏 Suspense fallback 下。
+- [x] 冻结依赖安装、生产构建、相关 Web 回归和真实浏览器流程已运行；浏览器使用 2.5 秒本地 chunk 延迟及 mock API，未据此声称生产性能数值。
+- [ ] 全量 Web 测试通过；当前已有未修改页面/布局测试失败，需先由对应任务修复后才能满足全局完成门。
+
+预计文件：`web/src/app/App.tsx`、`web/src/features/admin/AdminLayout.tsx`、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、相关 Web 测试及本文档。实现拆为路由边界与导航预加载两个独立提交。
+
+实施结果（2026-10-16）：浏览器在 2.5 秒延迟媒体库模块时确认 header/nav 可见且没有全屏 loading；延迟管理 dashboard 模块时确认 LuxShell 与管理侧栏可见，内容 skeleton 在模块加载后消失。目标回归：`app-code-splitting.test.mjs` 5/5，`login-page.test.tsx` 14/14，管理事件/预加载 15/15，LuxShell 17/17、路由预加载 1/1；`pnpm install --frozen-lockfile` 与 `pnpm build` 通过。
+
+全量 `pnpm test` 的静态检查为 143/145，既有失败在 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；单独 Vitest 为 601/605，4 个失败在 `home-page.test.tsx`、`home-media.test.tsx` 和 `library-card.test.tsx`。这些测试与实现文件相对 `test` 基线均未修改。本任务没有 Rust/API/数据库变更；完整 Web 完成门仍未全绿，未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
