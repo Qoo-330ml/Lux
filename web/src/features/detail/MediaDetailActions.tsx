@@ -1,4 +1,4 @@
-import { createContext, lazy, memo, Suspense, useContext, useState, type ReactNode } from "react";
+import { createContext, lazy, memo, useContext, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, Heart, Play, Radio } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
@@ -6,6 +6,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
+import { MediaEditorBoundary } from "../media/MediaEditorBoundary";
 import { useMediaSource } from "./MediaSourcePanel";
 import { MediaEpisodePlayButton } from "./MediaEpisodesSection";
 import { streamsOfType } from "./media-source";
@@ -184,7 +185,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
 
   return <ActionContext value={value}>
     {children}
-    <Suspense fallback={null}>
+    {editor || deleteOpen ? <MediaEditorBoundary key={editor ?? "delete"} onClose={() => { closeEditor(); setDeleteOpen(false); }}>
       {editor === "metadata" ? <LazyMetadataEditor item={item} onClose={closeEditor} /> : null}
       {editor === "images" ? <LazyImageEditor item={item} onClose={() => {
         closeEditor();
@@ -196,7 +197,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
         void queryClient.invalidateQueries({ queryKey: queryKeys.item(item.id) });
         void queryClient.invalidateQueries({ queryKey: pendingItemsQueryKey });
       }} /> : null}
-    </Suspense>
+    </MediaEditorBoundary> : null}
   </ActionContext>;
 }
 

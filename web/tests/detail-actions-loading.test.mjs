@@ -5,9 +5,13 @@ import test from "node:test";
 test("detail editors are split into lazy chunks and are not eagerly imported by the page", () => {
   const page = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
   const actions = readFileSync(new URL("../src/features/detail/MediaDetailActions.tsx", import.meta.url), "utf8");
+  const cards = readFileSync(new URL("../src/features/home/media.tsx", import.meta.url), "utf8");
   for (const editor of ["MediaMetadataEditor", "MediaImageEditor", "MediaSubtitleEditor", "MediaIdentifier", "MediaDeleteDialog"]) {
     assert.doesNotMatch(page, new RegExp(`import \\{?[^;]*${editor}[^;]* from \\"\\.\\./media/${editor}\\"`));
     assert.match(actions, new RegExp(`lazy\\(\\(\\) => import\\(\\"\\.\\./media/${editor}\\"\\)`));
+    assert.doesNotMatch(cards, new RegExp(`import \\{?[^;]*${editor}[^;]* from \\"\\.\\./media/${editor}\\"`));
+    assert.match(cards, new RegExp(`lazy\\(\\(\\) => import\\(\\"\\.\\./media/${editor}\\"\\)`));
   }
-  assert.match(actions, /<Suspense fallback=\{null\}>/);
+  assert.match(actions, /editor \|\| deleteOpen \? <MediaEditorBoundary/);
+  assert.match(cards, /editor \|\| deleteOpen \? <MediaEditorBoundary/);
 });
