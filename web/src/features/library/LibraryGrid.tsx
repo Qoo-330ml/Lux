@@ -1,5 +1,5 @@
 import { defaultRangeExtractor, useWindowVirtualizer } from "@tanstack/react-virtual";
-import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type Key, type ReactNode } from "react";
 import type { MediaItem } from "../../lib/api/types";
 
 type LibraryGridProps = {
@@ -10,9 +10,16 @@ type LibraryGridProps = {
 export function LibraryGrid({ items, renderItem }: LibraryGridProps) {
   const gridRef = useRef<HTMLDivElement>(null);
   const [layout, setLayout] = useState({ columns: 2, width: 0, gap: 34, margin: 0 });
-  const [focusedRow, setFocusedRow] = useState<number>();
+  const [focusedCard, setFocusedCard] = useState<{ id: string; rowKey: Key }>();
+  const focusedIndex = focusedCard ? items.findIndex((item) => item.id === focusedCard.id) : -1;
+  const focusedRow = focusedIndex >= 0 ? Math.floor(focusedIndex / layout.columns) : undefined;
   const estimatedHeight = layout.width ? layout.width * 1.5 + 90 : 360;
-  const getItemKey = useCallback((index: number) => items[index * layout.columns]?.id ?? index, [items, layout.columns]);
+  const getItemKey = useCallback((index: number) => {
+    // Preserve the active card's parent when a resize moves it into a new row.
+    if (index === focusedRow && focusedCard) return focusedCard.rowKey;
+    const key = items[index * layout.columns]?.id ?? index;
+    return key === focusedCard?.rowKey ? `unfocused:${key}` : key;
+  }, [items, layout.columns, focusedRow, focusedCard]);
   const virtualizer = useWindowVirtualizer<HTMLDivElement>({
     count: Math.ceil(items.length / layout.columns),
     estimateSize: () => estimatedHeight,
@@ -73,7 +80,7 @@ export function LibraryGrid({ items, renderItem }: LibraryGridProps) {
       aria-label="媒体库内容"
       style={{ height: virtualizer.getTotalSize() }}
       onBlurCapture={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusedRow(undefined);
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusedCard(undefined);
       }}
     >
       {virtualizer.getVirtualItems().map((row) => (
@@ -83,12 +90,17 @@ export function LibraryGrid({ items, renderItem }: LibraryGridProps) {
           data-index={row.index}
           className="lux-library-virtual-row"
           role="presentation"
-          onFocusCapture={() => setFocusedRow(row.index)}
           // top preserves viewport positioning of the cards' fixed dialogs.
           style={{ top: row.start - layout.margin }}
         >
           {items.slice(row.index * layout.columns, (row.index + 1) * layout.columns).map((item, column) => (
-            <div key={item.id} role="listitem" aria-posinset={row.index * layout.columns + column + 1} aria-setsize={items.length}>
+            <div
+              key={item.id}
+              role="listitem"
+              aria-posinset={row.index * layout.columns + column + 1}
+              aria-setsize={items.length}
+              onFocusCapture={() => setFocusedCard((current) => current?.id === item.id && current.rowKey === row.key ? current : { id: item.id, rowKey: row.key })}
+            >
               {renderItem(item)}
             </div>
           ))}

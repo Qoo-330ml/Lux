@@ -101,6 +101,23 @@ describe("LibraryGrid", () => {
     expect(container.textContent).not.toContain("Movie 0");
   });
 
+  it("keeps an active card's local state when responsive columns change", () => {
+    function EditableCard({ item }: { item: MediaItem }) {
+      const [editing, setEditing] = useState(false);
+      return editing ? <input aria-label={`Editing ${item.id}`} defaultValue="draft" /> : <button onClick={() => setEditing(true)}>{item.title}</button>;
+    }
+    act(() => root.render(<LibraryGrid items={items} renderItem={(item) => <EditableCard item={item} />} />));
+    act(() => container.querySelectorAll("button")[8].click());
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Editing item-8"]')!;
+    act(() => input.focus());
+    act(() => {
+      columns = 2;
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(container.querySelector('input[aria-label="Editing item-8"]')).toBe(input);
+    expect(document.activeElement).toBe(input);
+  });
+
   it("preserves parent-owned selection after a row unmounts and remounts", () => {
     function SelectableGrid() {
       const [selected, setSelected] = useState<string>();
