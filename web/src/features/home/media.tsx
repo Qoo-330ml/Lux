@@ -1,128 +1,18 @@
-import { Database, Folder, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
+import { Database, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
-import { MediaActionMenu } from "../media/MediaActionMenu";
-
 import { MediaCardEditors } from "./media-card-editors";
+import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
+import { MediaCardOverlay } from "./media-card-overlay";
+import { EpisodeCount, MediaPlaceholder, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, remainingRuntimeLabel } from "./media-display";
+export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
-export function mediaTitle(item: MediaItem) {
-  return item.title || item.name || "未命名媒体";
-}
-
-export function episodeTitle(
-  item: MediaItem,
-  seasonNumber?: number | null,
-  fallbackEpisodeNumber?: number,
-) {
-  const season = paddedEpisodeNumber(seasonNumber ?? item.parentIndexNumber);
-  const episode = paddedEpisodeNumber(item.indexNumber ?? fallbackEpisodeNumber);
-  if (item.itemType !== "EPISODE" || season == null || episode == null) {
-    return mediaTitle(item);
-  }
-  return `S${season}E${episode} · ${mediaTitle(item)}`;
-}
-
-function paddedEpisodeNumber(value?: number | null) {
-  return value != null && Number.isInteger(value) && value >= 0
-    ? String(value).padStart(2, "0")
-    : undefined;
-}
-
-export function mediaTypeLabel(itemType?: string | null) {
-  switch (itemType) {
-    case "MOVIE": return "电影";
-    case "SERIES": return "剧集";
-    case "SEASON": return "季度";
-    case "EPISODE": return "单集";
-    case "BOX_SET": return "合集";
-    case "VIDEO": return "其他视频";
-    case "FOLDER": return "文件夹";
-    default: return "媒体";
-  }
-}
-
-export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" | "logo" = "poster") {
-  const resolvedType = item.imageTags?.[type]
-    ? type
-    : type === "fanart" && item.imageTags?.thumb
-      ? "thumb"
-      : undefined;
-  if (!resolvedType) return undefined;
-  const tag = item.imageTags?.[resolvedType];
-  const imageItemId = resolvedType === "poster" ? item.posterItemId ?? item.id : item.id;
-  const path = `/api/v1/items/${encodeURIComponent(imageItemId)}/images/${resolvedType}`;
-  return tag ? `${path}?tag=${encodeURIComponent(tag)}` : path;
-}
-
-export function posterUrlWithFallback(item: MediaItem, series?: MediaItem) {
-  return imageUrl(item)
-    ?? (item.itemType === "SEASON" && series?.itemType === "SERIES" ? imageUrl(series) : undefined);
-}
-
-export function runtimeLabel(ticks?: number | null) {
-  if (!ticks) return undefined;
-  const minutes = Math.round(ticks / 10_000_000 / 60);
-  if (!minutes) return undefined;
-  const hours = Math.floor(minutes / 60);
-  return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
-}
-
-export function playbackPositionTicks(item: MediaItem) {
-  return item.userData?.positionTicks ?? item.userData?.playbackPositionTicks ?? 0;
-}
-
-function runtimeTicks(item: MediaItem) {
-  return item.runtimeTicks
-    ?? item.mediaSources?.find((source) => source.isDefault)?.durationTicks
-    ?? item.mediaSources?.[0]?.durationTicks
-    ?? 0;
-}
-
-export function playbackProgress(item: MediaItem) {
-  const duration = runtimeTicks(item);
-  const position = playbackPositionTicks(item);
-  return duration > 0 ? Math.min(100, Math.round((position / duration) * 100)) : 0;
-}
-
-export function remainingRuntimeLabel(item: MediaItem) {
-  const duration = runtimeTicks(item);
-  const remaining = duration - playbackPositionTicks(item);
-  return remaining > 0 ? runtimeLabel(remaining) : undefined;
-}
-
-export function EpisodeCount({ item }: { item: MediaItem }) {
-  if (item.itemType === "BOX_SET" && item.memberCount != null && Number.isFinite(item.memberCount) && item.memberCount >= 0) {
-    const label = `${item.memberCount} 部`;
-    return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
-  }
-  if (item.itemType !== "SERIES" && item.itemType !== "SEASON") return null;
-  if (item.episodeCount == null || !Number.isFinite(item.episodeCount) || item.episodeCount < 0) return null;
-  const label = `${item.episodeCount} 集`;
-  return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
-}
-
-function MediaPlaceholder({ item }: { item: MediaItem }) {
-  const pending = item.localMetadataPending === true;
-  return (
-    <div className="lux-media-placeholder">
-      {item.itemType === "FOLDER" ? <Folder size={30} aria-hidden="true" /> : pending ? (
-        <span className="lux-media-placeholder-status" role="status" aria-label="正在读取本地海报和元数据">
-          <LoaderCircle className="lux-media-placeholder-spinner" size={24} aria-hidden="true" />
-        </span>
-      ) : null}
-      <span>{mediaTitle(item)}</span>
-    </div>
-  );
-}
-
-export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (selected: boolean) => void }) {
-  const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
-  const progress = playbackProgress(item);
+export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (selected: boolean) => void }) {
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
@@ -163,60 +53,21 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
 
   if (deleted) return null;
   const detailHref = detailHrefOverride ?? `/items/${item.id}${detailSearch ?? ""}`;
-  const isFolder = item.itemType === "FOLDER";
-  const folderLabel = `打开文件夹 ${mediaTitle(item)}`;
-
-  function mediaCardLink(children: ReactNode) {
-    if (isFolder) {
-      return folderHref
-        ? <Link className="lux-media-card-link" to={folderHref} aria-label={folderLabel}>{children}</Link>
-        : <div className="lux-media-card-link">{children}</div>;
-    }
-    return <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>{children}</Link>;
-  }
 
   return (
     <>
       <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
-        <div className="lux-media-art-shell">
-          {selectionMode && !readOnly && !isFolder ? (
-            <label className="lux-media-selection-control">
-              <input
-                className="lux-media-selection-checkbox"
-                type="checkbox"
-                aria-label={`选择 ${mediaTitle(item)}`}
-                checked={selected}
-                onChange={(event) => onSelectionChange?.(event.target.checked)}
-                onClick={(event) => event.stopPropagation()}
-              />
-              <span aria-hidden="true" />
-            </label>
-          ) : null}
-          {mediaCardLink(
-            <div className="lux-media-art">
-              {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
-              {!isFolder ? <Rating value={item.rating} placement="card" /> : null}
-              <EpisodeCount item={item} />
-              {!isFolder ? <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span> : null}
-              {!isFolder && progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
-            </div>
-          )}
-          {!isFolder && !readOnly ? <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} /> : null}
-        </div>
-        {mediaCardLink(
-          <div className="lux-media-copy">
-            <strong>{mediaTitle(item)}</strong>
-            <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
-            {metadataAttention && !isFolder ? <span className="lux-metadata-attention-badge">待确认</span> : null}
-          </div>
-        )}
+        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={setEditor} onDelete={() => setDeleteOpen(true)} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)}>
+          <MediaCardVisual item={item} landscape={landscape} href={item.itemType === "FOLDER" ? folderHref : detailHref} />
+        </MediaCardOverlay>
+        <MediaCardCopy item={item} metadataAttention={metadataAttention} href={item.itemType === "FOLDER" ? folderHref : detailHref} />
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
       <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={() => setEditor(undefined)} onDeleteClose={() => setDeleteOpen(false)} onDeleted={() => setDeleted(true)} />
     </>
   );
-}
+});
 
 export function ContinueWatchingRail({ items, total }: { items: MediaItem[]; total?: number }) {
   if (!items.length) return null;
@@ -442,15 +293,5 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
         document.body,
       ) : null}
     </article>
-  );
-}
-
-export function Rating({ value, placement = "default" }: { value?: number | null; placement?: "default" | "card" }) {
-  if (value == null || !Number.isFinite(value) || value < 0 || value > 10) return null;
-  const score = value.toFixed(1);
-  return (
-    <span className={["lux-rating", placement === "card" ? "lux-card-rating" : ""].filter(Boolean).join(" ")} aria-label={`评分 ${score}`} title={`评分 ${score}`}>
-      <strong>{score}</strong>
-    </span>
   );
 }
