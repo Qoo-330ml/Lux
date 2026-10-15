@@ -140,6 +140,51 @@ describe("HorizontalScrollRail", () => {
     expect(container.querySelector('[aria-label="向右滚动演员列表"]')).toBeNull();
   });
 
+  it("observes the new edge cards when rail content changes", async () => {
+    vi.stubGlobal("IntersectionObserver", ControlledIntersectionObserver);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        <HorizontalScrollRail ariaLabel="演员列表">
+          <div className="rail-content" key="initial-content">
+            <div>第一张</div>
+            <div>第二张</div>
+          </div>
+        </HorizontalScrollRail>,
+      );
+    });
+
+    const observer = ControlledIntersectionObserver.instances[0];
+    const initialContent = container.querySelector(".rail-content");
+    const initialFirst = initialContent?.firstElementChild;
+    const initialLast = initialContent?.lastElementChild;
+    expect(observer?.targets.has(initialFirst!)).toBe(true);
+    expect(observer?.targets.has(initialLast!)).toBe(true);
+
+    await act(async () => {
+      root?.render(
+        <HorizontalScrollRail ariaLabel="演员列表">
+          <div className="rail-content" key="updated-content">
+            <div>更新后的第一张</div>
+            <div>更新后的第二张</div>
+            <div>更新后的第三张</div>
+          </div>
+        </HorizontalScrollRail>,
+      );
+    });
+
+    const updatedContent = container.querySelector(".rail-content");
+    const updatedFirst = updatedContent?.firstElementChild;
+    const updatedLast = updatedContent?.lastElementChild;
+    expect(observer?.targets.has(initialFirst!)).toBe(false);
+    expect(observer?.targets.has(initialLast!)).toBe(false);
+    expect(observer?.targets.has(updatedFirst!)).toBe(true);
+    expect(observer?.targets.has(updatedLast!)).toBe(true);
+  });
+
   it("shows a right arrow only when the rail overflows and scrolls one viewport", async () => {
     container = document.createElement("div");
     document.body.append(container);

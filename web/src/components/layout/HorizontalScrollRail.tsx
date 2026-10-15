@@ -91,15 +91,6 @@ export function HorizontalScrollRail({ ariaLabel, children, className }: Horizon
         if (lastTarget && lastTarget !== firstTarget) intersectionObserver.observe(lastTarget);
       }
 
-      if (resizeObserver) {
-        if (previousFirst && (refresh || previousFirst !== next.first)) resizeObserver.unobserve(previousFirst);
-        if (previousLast && previousLast !== previousFirst && (refresh || previousLast !== next.last)) {
-          resizeObserver.unobserve(previousLast);
-        }
-        if (firstTarget) resizeObserver.observe(firstTarget);
-        if (lastTarget && lastTarget !== firstTarget) resizeObserver.observe(lastTarget);
-      }
-
       if (!firstTarget && !lastTarget) scheduleMetricUpdate();
     };
 
