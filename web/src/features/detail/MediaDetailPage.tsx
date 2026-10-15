@@ -1,19 +1,20 @@
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, Star, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
+import type { MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
-import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
+import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
 import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
+import { MediaEpisodesSection, MediaEpisodePlayButton } from "./MediaEpisodesSection";
 import { LuxLogo } from "../../components/LuxLogo";
 
 export function MediaDetailPage() {
@@ -56,20 +57,11 @@ export function MediaDetailPage() {
   const [actionNotice, setActionNotice] = useState<string>();
   const [confirmingMetadata, setConfirmingMetadata] = useState(false);
   const [pendingPlaybackAction, setPendingPlaybackAction] = useState<"favorite" | "played">();
-  const [playRequested, setPlayRequested] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isSeries = item.data?.itemType === "SERIES";
   const isSeason = item.data?.itemType === "SEASON";
   const isEpisode = item.data?.itemType === "EPISODE";
   const isVideo = item.data?.itemType === "VIDEO";
-  const seasons = useQuery({
-    queryKey: queryKeys.children(itemId, "SEASON"),
-    queryFn: () => api.children(itemId, { itemType: "SEASON" }),
-    enabled: isSeries,
-    refetchInterval: queryRefreshIntervals.mediaSurface,
-  });
-  const activeSeasonId = seasons.data?.items?.[0]?.id;
-  const singleSeason = seasons.data?.items?.length === 1 ? seasons.data.items[0] : undefined;
   const hierarchySeriesId = item.data && !isSeries
     ? item.data.seriesId ?? item.data.parentId ?? undefined
     : undefined;
@@ -79,34 +71,6 @@ export function MediaDetailPage() {
     enabled: Boolean(hierarchySeriesId),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
-  const episodeSeriesId = isSeries ? itemId : hierarchySeriesId;
-  const episodeSeasonId = isSeries
-    ? activeSeasonId
-    : isSeason
-      ? item.data?.id
-      : isEpisode
-        ? item.data?.parentId ?? undefined
-        : undefined;
-  const episodes = useInfiniteQuery({
-    queryKey: queryKeys.children(episodeSeriesId ?? itemId, "EPISODE", episodeSeasonId),
-    queryFn: ({ pageParam }) => api.children(episodeSeriesId ?? itemId, {
-      page: pageParam,
-      itemType: "EPISODE",
-      seasonId: episodeSeasonId,
-    }),
-    initialPageParam: 1,
-    getNextPageParam: (lastPage) => {
-      const page = lastPage.page ?? 1;
-      const pageSize = lastPage.pageSize ?? 100;
-      const total = lastPage.total ?? 0;
-      return page * pageSize < total ? page + 1 : undefined;
-    },
-    enabled: Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
-  });
-  const episodeItems = episodes.data?.pages.flatMap((page) => page.items ?? []) ?? [];
-  const episodeQueryEnabled = Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode);
-  const episodeLookupPending = (isSeries && seasons.isPending) || (episodes.isPending && episodeQueryEnabled);
   const sources = item.data?.mediaSources ?? [];
   const source = sources.find((entry) => entry.id === selectedSourceId)
     ?? sources.find((entry) => entry.id === requestedSourceId)
@@ -116,24 +80,9 @@ export function MediaDetailPage() {
     setSelectedAudioStreamIndex(defaultStreamIndex(source, "AUDIO"));
     setSelectedSubtitleStreamIndex(defaultStreamIndex(source, "SUBTITLE"));
   }, [source?.id]);
-  const nextPlayableEpisodeId = !source && (isSeries || isSeason)
-    ? selectNextPlayableEpisode(episodeItems)?.id
-    : undefined;
-
   useEffect(() => {
     setSelectedSourceId(requestedSourceId);
-    setPlayRequested(false);
   }, [itemId, requestedSourceId]);
-
-  useEffect(() => {
-    if (!playRequested || episodeLookupPending) return;
-    if (nextPlayableEpisodeId) {
-      navigate(`/watch/${nextPlayableEpisodeId}`);
-    } else {
-      setPlayRequested(false);
-      setActionNotice("没有可播放的单集。");
-    }
-  }, [episodeLookupPending, navigate, nextPlayableEpisodeId, playRequested]);
 
   if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
   if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
@@ -187,9 +136,7 @@ export function MediaDetailPage() {
   if (watchQuery && selectedSubtitleStreamIndex) watchQuery.set("subtitleStreamIndex", selectedSubtitleStreamIndex);
   const watchHref = source
     ? `/watch/${media.id}?${watchQuery?.toString()}`
-    : nextPlayableEpisodeId
-      ? `/watch/${nextPlayableEpisodeId}`
-      : undefined;
+    : undefined;
   const pendingReviewItems = pendingItems.data?.items ?? [];
   const pendingIndex = pendingReviewItems.findIndex((entry) => entry.id === media.id);
   const nextPendingItem = pendingIndex >= 0
@@ -360,22 +307,7 @@ export function MediaDetailPage() {
               {watchHref ? (
                 <Link className="lux-button lux-button-large lux-button-primary" to={watchHref}><Play size={17} fill="currentColor" /> 播放</Link>
               ) : (
-                <button
-                  className="lux-button lux-button-large lux-button-primary"
-                  type="button"
-                  onClick={() => {
-                    if (episodeLookupPending) {
-                      setPlayRequested(true);
-                      setActionNotice("正在查找可播放单集，请稍候。");
-                    } else if (nextPlayableEpisodeId) {
-                      navigate(`/watch/${nextPlayableEpisodeId}`);
-                    } else {
-                      setActionNotice("没有可播放的单集。");
-                    }
-                  }}
-                >
-                  <Play size={17} fill="currentColor" /> 播放
-                </button>
+                <MediaEpisodePlayButton item={media} onNotice={setActionNotice} />
               )}
               <button className="lux-button lux-button-large lux-button-glass lux-detail-action-control" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
                 <span className="lux-detail-action-icon"><Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /></span>
@@ -428,25 +360,7 @@ export function MediaDetailPage() {
           </div>
         </div>
         <div className="lux-detail-sections">
-          {(!isSeries || singleSeason) ? (
-            <div className="lux-detail-hierarchy">
-              {isSeries && singleSeason ? (
-                <SeasonEpisodes
-                  episodes={episodeItems}
-                  total={episodes.data?.pages[0]?.total}
-                  seasonNumber={singleSeason.parentIndexNumber}
-                  episodesPending={episodes.isPending}
-                  hasNextPage={episodes.hasNextPage}
-                  isFetchingNextPage={episodes.isFetchingNextPage}
-                  isFetchNextPageError={episodes.isFetchNextPageError}
-                  error={episodes.error}
-                  onLoadMore={() => void episodes.fetchNextPage()}
-                />
-              ) : null}
-              {isSeason ? <SeasonEpisodes episodes={episodeItems} total={episodes.data?.pages[0]?.total} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} hasNextPage={episodes.hasNextPage} isFetchingNextPage={episodes.isFetchingNextPage} isFetchNextPageError={episodes.isFetchNextPageError} error={episodes.error} onLoadMore={() => void episodes.fetchNextPage()} /> : null}
-              {isEpisode ? <EpisodeRail episodes={episodeItems} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
-            </div>
-          ) : null}
+          <MediaEpisodesSection item={media}>
           {mediaTagline ? (
             <div className="lux-detail-tagline-wrap">
               <div className="lux-detail-tagline lux-media-nfo-tagline font-serif">
@@ -459,14 +373,7 @@ export function MediaDetailPage() {
           <div className="lux-detail-cast">
             <MediaCastSection actors={media.actors} />
           </div>
-          {isSeries && !singleSeason ? (
-            <div className="lux-detail-series-seasons">
-              <SeriesChildren
-                seasons={seasons.data?.items ?? []}
-                series={media}
-              />
-            </div>
-          ) : null}
+          </MediaEpisodesSection>
           {showStills ? <MediaStillsSection itemId={media.id} title={detailTitle} /> : null}
           <div className="lux-detail-nfo">
             <MediaNfoSection item={media} source={source} detailTitle={detailTitle} addedAtLabel={addedAtLabel} />
@@ -488,13 +395,6 @@ export function MediaDetailPage() {
 function runtimeTicksFromMinutes(minutes?: number | null) {
   if (minutes == null || !Number.isFinite(minutes) || minutes < 0) return undefined;
   return minutes * 60 * 10_000_000;
-}
-
-function selectNextPlayableEpisode(episodes: MediaItem[]) {
-  const playableEpisodes = episodes.filter((episode) =>
-    episode.itemType === "EPISODE" && (episode.mediaSources?.length ?? 0) > 0,
-  );
-  return playableEpisodes.find((episode) => !episode.userData?.isPlayed) ?? playableEpisodes[0];
 }
 
 function ExpandableOverview({ overview }: { overview: string }) {
@@ -927,160 +827,3 @@ function sourceBadges(source?: MediaSource, selectedAudioStreamIndex?: string): 
   return badges;
 }
 
-function SeriesChildren({
-  seasons,
-  series,
-}: {
-  seasons: MediaItem[];
-  series: MediaItem;
-}) {
-  return (
-    <section className="lux-series-children" aria-labelledby="series-children-heading">
-      <div className="lux-section-heading">
-        <div className="lux-heading-lead">
-          <h2 id="series-children-heading">播出季</h2>
-          <span className="lux-section-heading-sub">SEASONS</span>
-        </div>
-        <span>{seasons.length} 个季度</span>
-      </div>
-      <div className="lux-season-rail" role="list" aria-label="播出季">
-        {seasons.map((season) => {
-          const poster = posterUrlWithFallback(season, series);
-          return (
-            <Link
-              className="lux-season-card"
-              key={season.id}
-              role="listitem"
-              to={`/items/${season.id}`}
-            >
-              <span className="lux-season-card-art">
-                {poster ? <img src={poster} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span className="lux-season-card-placeholder">{mediaTitle(season)}</span>}
-                <Rating value={season.rating} placement="card" />
-                <EpisodeCount item={season} />
-              </span>
-              <strong>{mediaTitle(season)}</strong>
-            </Link>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function SeasonEpisodes({
-  episodes,
-  total,
-  seasonNumber,
-  episodesPending,
-  hasNextPage,
-  isFetchingNextPage,
-  isFetchNextPageError,
-  error,
-  onLoadMore,
-}: {
-  episodes: MediaItem[];
-  total?: number;
-  seasonNumber?: number | null;
-  episodesPending: boolean;
-  hasNextPage: boolean;
-  isFetchingNextPage: boolean;
-  isFetchNextPageError: boolean;
-  error: Error | null;
-  onLoadMore: () => void;
-}) {
-  return (
-    <section className="lux-season-episodes" aria-labelledby="season-episodes-heading">
-      <div className="lux-section-heading">
-        <div className="lux-heading-lead">
-          <h2 id="season-episodes-heading">单集</h2>
-          <span className="lux-section-heading-sub">EPISODES</span>
-        </div>
-        <span>{total ?? episodes.length} 集</span>
-      </div>
-      {episodesPending ? <p className="lux-muted-copy">正在加载单集…</p> : null}
-      {error && !isFetchNextPageError ? <p className="lux-error-copy" role="alert">单集加载失败：{error.message}</p> : null}
-      {!episodesPending && episodes.length ? (
-        <div className="lux-season-episode-list" role="list">
-          {episodes.map((episode, index) => <SeasonEpisodeRow episode={episode} seasonNumber={seasonNumber} fallbackNumber={index + 1} key={episode.id} />)}
-        </div>
-      ) : null}
-      {isFetchNextPageError ? <p className="lux-error-copy" role="alert">加载更多单集失败：{error?.message || "请重试"}</p> : null}
-      {!episodesPending && !episodes.length && !error ? <p className="lux-muted-copy">这个季度还没有可播放的单集。</p> : null}
-      {hasNextPage ? (
-        <div className="lux-person-works-actions">
-          <button
-            className="lux-button lux-button-secondary"
-            type="button"
-            data-action="load-more-episodes"
-            onClick={onLoadMore}
-            disabled={isFetchingNextPage}
-          >
-            {isFetchingNextPage ? "加载中…" : isFetchNextPageError ? "重试加载" : `加载更多单集（${Math.max(0, (total ?? episodes.length) - episodes.length)} 集）`}
-          </button>
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function SeasonEpisodeRow({ episode, seasonNumber, fallbackNumber }: { episode: MediaItem; seasonNumber?: number | null; fallbackNumber: number }) {
-  const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
-  const number = episode.indexNumber ?? fallbackNumber;
-  const detailHref = `/items/${episode.id}`;
-  const watchHref = `/watch/${episode.id}`;
-  return (
-    <article className="lux-season-episode-row" role="listitem">
-      <Link className="lux-season-episode-thumb lux-season-episode-play" to={watchHref} aria-label={`播放 ${mediaTitle(episode)}`}>
-        {image ? <img src={image} alt="" loading="lazy" /> : <span className="lux-season-episode-placeholder">{mediaTitle(episode)}</span>}
-        <span className="lux-season-episode-play-icon" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
-      </Link>
-      <Link className="lux-season-episode-copy" to={detailHref}>
-        <strong>{episodeTitle(episode, seasonNumber, number)}</strong>
-        {episode.productionYear ? <small>{episode.productionYear}</small> : null}
-        {episode.overview ? <p>{episode.overview}</p> : null}
-      </Link>
-      <Link className="lux-season-episode-arrow" to={detailHref}>查看详情 →</Link>
-    </article>
-  );
-}
-
-function EpisodeRail({
-  episodes,
-  currentEpisodeId,
-  seasonNumber,
-  episodesPending,
-}: {
-  episodes: MediaItem[];
-  currentEpisodeId: string;
-  seasonNumber?: number | null;
-  episodesPending: boolean;
-}) {
-  const otherEpisodes = episodes.filter((episode) => episode.id !== currentEpisodeId);
-  if (episodesPending || !otherEpisodes.length) return null;
-  return (
-    <section className="lux-episode-rail" aria-labelledby="episode-rail-heading">
-      <div className="lux-section-heading">
-        <div className="lux-heading-lead">
-          <h2 id="episode-rail-heading">更多来自第 {seasonNumber ?? ""} 季</h2>
-          <span className="lux-section-heading-sub">MORE EPISODES</span>
-        </div>
-        <span>{otherEpisodes.length} 集</span>
-      </div>
-      <div className="lux-episode-card-rail" role="list">
-        {otherEpisodes.map((episode) => {
-          const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
-          const detailHref = `/items/${episode.id}`;
-          return (
-            <article className="lux-episode-card" role="listitem" key={episode.id}>
-              <Link className="lux-episode-card-art lux-episode-card-play" to={`/watch/${episode.id}`} aria-label={`播放 ${mediaTitle(episode)}`}>
-                {image ? <img src={image} alt="" loading="lazy" /> : <span className="lux-episode-card-placeholder">{mediaTitle(episode)}</span>}
-                <span className="lux-episode-card-play-icon" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
-              </Link>
-              <Link className="lux-episode-card-copy" to={detailHref}><strong>{episodeTitle(episode, seasonNumber)}</strong></Link>
-            </article>
-          );
-        })}
-      </div>
-    </section>
-  );
-}

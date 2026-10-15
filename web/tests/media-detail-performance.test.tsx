@@ -12,6 +12,7 @@ import { MediaNfoPanel } from "../src/features/detail/MediaNfoPanel";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import type { MediaItem } from "../src/lib/api/types";
+import * as mediaVisuals from "../src/features/home/media";
 
 vi.mock("../src/features/detail/MediaCast", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/features/detail/MediaCast")>();
@@ -39,15 +40,22 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function renderDetail() {
+async function renderDetail(overrides: Partial<MediaItem> = {}) {
   const item: MediaItem = {
     id: "movie-1", itemType: "MOVIE", title: "性能回归电影",
     actors: Array.from({ length: 100 }, (_, index) => ({ id: `actor-${index}`, name: `演员 ${index}` })),
     nfo: { studios: ["测试公司"], genres: ["剧情"] },
     mediaSources: [{ id: "source-1", container: "mkv", isDefault: true }],
+    ...overrides,
   };
   vi.spyOn(api, "item").mockResolvedValue(item);
   vi.spyOn(api, "playback").mockResolvedValue({ isFavorite: false });
+  vi.spyOn(api, "children").mockImplementation(async (_id, options) => ({
+    items: options?.itemType === "SEASON"
+      ? [{ id: "season-1", itemType: "SEASON", title: "第一季", parentIndexNumber: 1 }]
+      : [{ id: "episode-1", itemType: "EPISODE", title: "旧集名", mediaSources: [{ id: "episode-source" }] }],
+    total: 1, page: 1, pageSize: 100,
+  }));
   vi.spyOn(api, "itemImages").mockResolvedValue({ images: [{
     id: "still-1", itemId: item.id, imageType: "FANART", imageIndex: 0, url: "/still.png",
   }] });
@@ -87,4 +95,22 @@ it("updates playback controls without rendering cast, stills, or NFO again", asy
   const extraRenders = renderCounts().map((count, index) => count - before[index]);
   console.info("Five playback updates: extra cast/stills/NFO renders", extraRenders);
   expect(extraRenders).toEqual([0, 0, 0]);
+});
+
+it("updates episode data without recalculating the hero or rendering unrelated sections", async () => {
+  const poster = vi.spyOn(mediaVisuals, "posterUrlWithFallback");
+  await renderDetail({ itemType: "SERIES", mediaSources: [] });
+  await flushQueries();
+  expect(container.querySelector(".lux-season-episode-copy")?.textContent).toContain("旧集名");
+  const heroRenders = () => poster.mock.calls.filter(([item]) => item.id === "movie-1").length;
+  const beforeHero = heroRenders();
+  const before = renderCounts();
+  client.setQueryData(queryKeys.children("movie-1", "EPISODE", "season-1"), {
+    pages: [{ items: [{ id: "episode-1", itemType: "EPISODE", title: "新集名", mediaSources: [{ id: "episode-source" }] }], total: 1, page: 1, pageSize: 100 }],
+    pageParams: [1],
+  });
+  await flushQueries();
+  expect(container.querySelector(".lux-season-episode-copy")?.textContent).toContain("新集名");
+  expect(heroRenders() - beforeHero).toBe(0);
+  expect(renderCounts()).toEqual(before);
 });

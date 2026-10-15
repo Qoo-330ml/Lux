@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 
 test("detail copy starts at the poster top with the logo above its title", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const titleRowStart = source.indexOf('className="lux-detail-title-row"');
   const titleRowEnd = source.indexOf("</div>", titleRowStart);
@@ -23,7 +25,9 @@ test("detail actions leave space below the overview", () => {
 });
 
 test("detail actions center controls instead of stretching around tall artwork", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const actionRule = stylesheet.match(/^\.lux-hero-actions\s*\{([^}]*)\}/m)?.[1] ?? "";
   const artworkRule = stylesheet.match(/^\.lux-hero-actions\s*>\s*img,\s*\.lux-hero-actions\s*>\s*\.lux-theme-logo\s*\{([^}]*)\}/m)?.[1] ?? "";
@@ -229,7 +233,9 @@ test("series seasons follow the cast without a separator line", () => {
 
 test("season poster placeholder styles do not stretch rating or episode badges", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
 
   assert.match(stylesheet, /\.lux-season-card-art\s*>\s*\.lux-season-card-placeholder\s*\{/);
   assert.doesNotMatch(stylesheet, /\.lux-season-card-art\s*>\s*span\s*\{/);
@@ -284,7 +290,9 @@ test("media detail track selectors fit without overlap and use compact controls"
 });
 
 test("mobile detail pages use a full-bleed portrait poster and keep the logo above bilingual titles", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
   const posterRule = mobileStyles.match(/\.lux-detail-poster\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -304,7 +312,9 @@ test("mobile detail pages use a full-bleed portrait poster and keep the logo abo
 });
 
 test("detail logos use a separate row above the bilingual title group", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const titleRowStart = source.indexOf('className="lux-detail-title-row"');
   const logoStart = source.indexOf('className="lux-detail-logo"', titleRowStart);
@@ -322,7 +332,9 @@ test("detail logos use a separate row above the bilingual title group", () => {
 });
 
 test("series seasons sit between cast and stills with a gap before more information", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
   const desktopSeasonRule = stylesheet.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -338,7 +350,9 @@ test("series seasons sit between cast and stills with a gap before more informat
 });
 
 test("mobile episode details switch their landscape hero to a portrait poster when available", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
 
@@ -387,7 +401,9 @@ test("mobile detail actions share one row and sit directly above the hierarchy",
 });
 
 test("mobile detail actions fit a compact more action beside favorite and watched", () => {
-  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
+    .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
+    .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
   const actionRule = mobileStyles.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*\{([^}]*)\}/)?.[1] ?? "";
