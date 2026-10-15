@@ -1,12 +1,25 @@
-import { memo, useEffect, useState, type ReactNode } from "react";
+import { createContext, memo, useContext, useEffect, useState, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Play } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback } from "../home/media-display";
 import { useMediaEpisodes } from "./useMediaEpisodes";
 
+const EpisodesContext = createContext<ReturnType<typeof useMediaEpisodes> | undefined>(undefined);
+
+export function MediaEpisodesProvider({ item, children }: { item: MediaItem; children: ReactNode }) {
+  const episodes = useMediaEpisodes(item);
+  return <EpisodesContext value={episodes}>{children}</EpisodesContext>;
+}
+
+function useEpisodeData() {
+  const episodes = useContext(EpisodesContext);
+  if (!episodes) throw new Error("Episode data requires MediaEpisodesProvider");
+  return episodes;
+}
+
 export const MediaEpisodesSection = memo(function MediaEpisodesSection({ item: media, children }: { item: MediaItem; children: ReactNode }) {
-  const { seasons, singleSeason, episodes, episodeItems } = useMediaEpisodes(media);
+  const { seasons, singleSeason, episodes, episodeItems } = useEpisodeData();
   const isSeries = media.itemType === "SERIES";
   const isSeason = media.itemType === "SEASON";
   const isEpisode = media.itemType === "EPISODE";
@@ -43,7 +56,7 @@ export const MediaEpisodesSection = memo(function MediaEpisodesSection({ item: m
 });
 
 export function MediaEpisodePlayButton({ item, onNotice }: { item: MediaItem; onNotice: (notice: string) => void }) {
-  const { episodeItems, pending } = useMediaEpisodes(item);
+  const { episodeItems, pending } = useEpisodeData();
   const navigate = useNavigate();
   const [playRequested, setPlayRequested] = useState(false);
   const nextId = item.itemType === "SERIES" || item.itemType === "SEASON"

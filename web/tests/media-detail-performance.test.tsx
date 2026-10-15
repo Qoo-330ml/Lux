@@ -51,7 +51,7 @@ async function renderDetail(overrides: Partial<MediaItem> = {}) {
     mediaSources: [{ id: "source-1", container: "mkv", isDefault: true }],
     ...overrides,
   };
-  vi.spyOn(api, "item").mockResolvedValue(item);
+  vi.spyOn(api, "item").mockImplementation(async (id) => id === item.id ? item : { id, itemType: "SERIES", title: "父剧集" });
   vi.spyOn(api, "playback").mockResolvedValue({ isFavorite: false });
   vi.spyOn(api, "children").mockImplementation(async (_id, options) => ({
     items: options?.itemType === "SEASON"
@@ -86,6 +86,16 @@ function renderCounts() {
   return [MediaCast, MediaStills, MediaNfoPanel].map((component) => vi.mocked(component).mock.calls.length);
 }
 
+it("shares one observer for parent series data between detail sections", async () => {
+  await renderDetail({ itemType: "SEASON", seriesId: "series-1", parentId: "series-1", mediaSources: [] });
+  expect(client.getQueryCache().find({ queryKey: queryKeys.item("series-1") })?.getObserversCount()).toBe(1);
+});
+
+it("shares one observer for episode data between the list and playback controls", async () => {
+  await renderDetail({ itemType: "SEASON", seriesId: "series-1", parentId: "series-1", mediaSources: [] });
+  expect(client.getQueryCache().find({ queryKey: queryKeys.children("series-1", "EPISODE", "movie-1") })?.getObserversCount()).toBe(1);
+});
+
 it("updates playback controls without rendering cast, stills, or NFO again", async () => {
   await renderDetail();
   expect(container.querySelectorAll(".lux-media-cast-card")).toHaveLength(100);
@@ -98,6 +108,17 @@ it("updates playback controls without rendering cast, stills, or NFO again", asy
   const extraRenders = renderCounts().map((count, index) => count - before[index]);
   console.info("Five playback updates: extra cast/stills/NFO renders", extraRenders);
   expect(extraRenders).toEqual([0, 0, 0]);
+});
+
+it("renders changed item metadata and actor data after a refresh", async () => {
+  await renderDetail();
+  client.setQueryData<MediaItem>(queryKeys.item("movie-1"), (item) => item ? {
+    ...item, title: "更新后的标题", actors: [{ id: "new-actor", name: "新演员" }], nfo: { studios: ["新工作室"] },
+  } : item);
+  await flushQueries();
+  expect(container.querySelector("h1")?.textContent).toBe("更新后的标题");
+  expect(container.querySelector(".lux-detail-cast")?.textContent).toContain("新演员");
+  expect(container.querySelector(".lux-detail-nfo")?.textContent).toContain("新工作室");
 });
 
 it("updates episode data without recalculating the hero or rendering unrelated sections", async () => {

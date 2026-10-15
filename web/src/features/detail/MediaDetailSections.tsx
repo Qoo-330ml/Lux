@@ -29,7 +29,7 @@ export const MediaNfoSection = memo(function MediaNfoSection({ item, source }: {
   source?: MediaSource;
 }) {
   const originalTitle = item.originalTitle?.trim();
-  const series = useSeriesContext(item);
+  const series = useSeriesContext();
   const detailTitle = item.itemType === "SEASON" || item.itemType === "EPISODE" ? mediaTitle(series ?? item) : mediaTitle(item);
   const { addedAtLabel } = detailAddedAt(item);
   return <MediaNfoPanel

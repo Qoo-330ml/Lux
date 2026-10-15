@@ -7,8 +7,8 @@ import { MediaSourcePanel, MediaSourceProvider, useMediaSource } from "./MediaSo
 import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
 import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
-import { MediaEpisodesSection } from "./MediaEpisodesSection";
-import { MediaDetailArtwork, MediaDetailHero } from "./MediaDetailHero";
+import { MediaEpisodesProvider, MediaEpisodesSection } from "./MediaEpisodesSection";
+import { MediaDetailArtwork, MediaDetailHero, MediaSeriesProvider } from "./MediaDetailHero";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
@@ -22,9 +22,13 @@ export function MediaDetailPage() {
   if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
   if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
   return <MediaSourceProvider key={itemId} item={item.data} requestedSourceId={routeParams.get("sourceId") ?? undefined}>
+    <MediaSeriesProvider media={item.data}>
+    <MediaEpisodesProvider item={item.data}>
     <MediaDetailActions item={item.data} pendingReview={routeParams.get("metadataStatus")?.toUpperCase() === "PENDING"}>
       <MediaDetailContent media={item.data} />
     </MediaDetailActions>
+    </MediaEpisodesProvider>
+    </MediaSeriesProvider>
   </MediaSourceProvider>;
 }
 

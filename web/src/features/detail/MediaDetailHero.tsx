@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { createContext, memo, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { ArrowLeft, Sparkles, Star, X } from "lucide-react";
@@ -26,16 +26,23 @@ export function detailAddedAt(media: MediaItem) {
   });
   return { addedAt, addedAtLabel };
 }
-export function useSeriesContext(media: MediaItem) {
+const SeriesContext = createContext<MediaItem | undefined>(undefined);
+
+export function MediaSeriesProvider({ media, children }: { media: MediaItem; children: ReactNode }) {
   const seriesId = media.itemType !== "SERIES" ? media.seriesId ?? media.parentId ?? undefined : undefined;
-  return useQuery({
+  const series = useQuery({
     queryKey: queryKeys.item(seriesId ?? ""), queryFn: () => api.item(seriesId ?? ""),
     enabled: Boolean(seriesId), refetchInterval: queryRefreshIntervals.mediaSurface,
   }).data;
+  return <SeriesContext value={series}>{children}</SeriesContext>;
+}
+
+export function useSeriesContext() {
+  return useContext(SeriesContext);
 }
 
 function useDetailIdentity(media: MediaItem) {
-  const series = useSeriesContext(media);
+  const series = useSeriesContext();
   const seriesImageFallback = media.itemType === "SEASON" ? series : undefined;
   const backdrop = imageUrl(media, "fanart") ?? imageUrl(media)
     ?? (seriesImageFallback ? imageUrl(seriesImageFallback, "fanart") ?? imageUrl(seriesImageFallback) : undefined);
@@ -67,7 +74,7 @@ const selectLogo = (response: Awaited<ReturnType<typeof api.itemImages>>) =>
   response.images?.find((image) => image.imageType.toUpperCase() === "LOGO")?.url ?? null;
 
 export const MediaDetailHero = memo(function MediaDetailHero({ media, collectionId }: { media: MediaItem; collectionId?: string }) {
-  const series = useSeriesContext(media);
+  const series = useSeriesContext();
   const { source, selectedAudioStreamIndex } = useMediaSource();
   const logo = useQuery({
     queryKey: queryKeys.itemImages(media.id), queryFn: () => api.itemImages(media.id),
