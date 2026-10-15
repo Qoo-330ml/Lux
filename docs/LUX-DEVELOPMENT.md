@@ -11675,12 +11675,13 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 - [ ] 自动化回归覆盖滚动边界、导航开关、轮播切换和动画减少策略；Web 全量检查与真实浏览器流程通过。
 - [ ] 记录 ARM64 环境优化前后主入口 JS/gzip 体积；不得将构建体积差异表述为真实设备帧率或 RUM 数据。
 
-预计分四个增量，每次不超过五个文件：
+预计分五个增量，每次不超过五个文件：
 
 1. 本文档、`web/src/components/layout/HorizontalScrollRail.tsx`、`web/tests/horizontal-scroll-rail.test.tsx`。
 2. 本文档、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、`web/tests/lux-shell.test.tsx`。
-3. 本文档、`web/src/features/home/HomePage.tsx`、`web/src/react.css`、`web/tests/home-page.test.tsx`。
-4. 本文档、`web/src/features/auth/LoginPage.tsx`、`web/tests/login-page.test.tsx`、`web/package.json`、`web/pnpm-lock.yaml`。
+3. 本文档、`web/src/features/home/HomePage.tsx`、`web/src/react.css`、`web/tests/home-page.test.tsx`、`web/tests/home-hero-layout.test.mjs`。
+4. 本文档、`web/src/features/auth/LoginPage.tsx`、`web/src/react.css`、`web/tests/login-page.test.tsx`。
+5. 本文档、`web/package.json`、`web/pnpm-lock.yaml`。
 
 ## 29. 参考资料
 
