@@ -421,12 +421,12 @@ test("mobile detail lower sections reuse the page gutter", () => {
   assert.match(sectionRule, /margin-inline:\s*auto/);
 });
 
-test("mobile NFO headings follow the shared section scale", () => {
+test("detail section headings share the same type scale", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
-  const nfoHeading = mobileStyles.match(/\.lux-media-nfo-heading h2\s*\{([^}]*)\}/)?.[1] ?? "";
-  const mediaHeading = mobileStyles.match(/\.lux-media-nfo-media-heading h3\s*\{([^}]*)\}/)?.[1] ?? "";
+  const headingRule = stylesheet.match(/\.lux-detail-page \.lux-media-cast-heading h2,\s*\.lux-detail-page \.lux-media-stills-heading h2,\s*\.lux-detail-page \.lux-section-heading h2,\s*\.lux-detail-page \.lux-media-nfo-heading h2,\s*\.lux-detail-page \.lux-media-nfo-media-heading h3\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(nfoHeading, /font-size:\s*1\.18rem/);
-  assert.match(mediaHeading, /font-size:\s*1rem/);
+  assert.ok(headingRule, "cast, stills, detail sections, more information, and media file headings share one rule");
+  assert.match(headingRule, /font-size:\s*1rem/);
+  assert.match(headingRule, /font-weight:\s*650/);
+  assert.match(headingRule, /letter-spacing:\s*normal/);
 });
