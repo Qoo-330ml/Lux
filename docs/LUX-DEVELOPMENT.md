@@ -11662,6 +11662,21 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
 
+#### LUX-551：媒体库网格虚拟化
+
+范围：落实用户提供的前端重构方案第二项，使用 `@tanstack/react-virtual` 按行虚拟化 LibraryPage 已加载的媒体；上下各缓冲两行，沿用现有 CSS 响应式列宽和窗口滚动。分页查询与底部 IntersectionObserver 继续负责加载，不扩大到其他页面或其他重构项。
+
+验收：
+
+- [ ] 500+ 已加载条目只挂载可视行与缓冲行，首尾条目均可滚动访问。
+- [ ] 响应式列数与真实行高同步，元数据徽章、窗口缩放和不满行不重叠、不裁切。
+- [ ] 排序、筛选、文件夹、合集、跨屏批量选择及原有分页/失败重试行为继续可用。
+- [ ] 增加自动化回归并完成本机浏览器前后对比、Web 单测与构建；记录失败和未验证边界。
+
+预计文件分三个增量：依赖及登记（`web/package.json`、`web/pnpm-lock.yaml`、本文档）；实现及回归（`web/src/features/library/LibraryGrid.tsx`、`web/src/features/library/LibraryPage.tsx`、`web/src/react.css`、`web/tests/library-grid.test.tsx`，必要时扩展 `web/tests/library-page.test.ts`）；验收记录（本文档、`docs/COMPATIBILITY.md`）。每个增量不超过 5 个文件。
+
+参考：[TanStack Virtualizer API](https://tanstack.com/virtual/latest/docs/api/virtualizer) 的 `scrollMargin`、`measureElement`、`gap` 与 `rangeExtractor`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
