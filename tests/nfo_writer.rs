@@ -141,7 +141,7 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
         "<thumb aspect=\"poster\">https://image.tmdb.org/t/p/original/poster.jpg</thumb>"
     ));
     assert!(text.contains(
-        "<fanart><thumb>https://image.tmdb.org/t/p/original/backdrop.jpg</thumb></fanart>"
+        "<fanart>\n    <thumb>https://image.tmdb.org/t/p/original/backdrop.jpg</thumb>\n  </fanart>"
     ));
     assert!(text.contains("<mpaa>PG-13</mpaa>"));
     assert!(text.contains("<country>中国</country>"));
@@ -163,6 +163,25 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
     assert!(!text.contains("https://old.example/movie"));
     assert!(!text.contains("<genre>旧类型</genre>"));
     assert!(!text.contains("<name>旧演员</name>"));
+    Ok(())
+}
+
+#[test]
+fn movie_nfo_rewrite_formats_appended_rich_fields_on_separate_lines()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rewritten = rewrite_movie_nfo(
+        "<movie><title>黑暗侵袭2</title><rating>1</rating><genre>旧类型</genre></movie>".as_bytes(),
+        &MovieNfoMetadata {
+            rating: Some(5.974),
+            genres: vec!["恐怖".to_owned(), "惊悚".to_owned()],
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+
+    assert_eq!(
+        String::from_utf8(rewritten)?,
+        "<movie><title>黑暗侵袭2</title>\n  <rating>5.974</rating>\n  <genre>恐怖</genre>\n  <genre>惊悚</genre>\n</movie>"
+    );
     Ok(())
 }
 
