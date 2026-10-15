@@ -1795,7 +1795,7 @@ async fn postgres_strm_probe_job_accepts_boolean_options() -> Result<(), Box<dyn
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_resume_order_puts_recent_timestamp_before_legacy_nulls()
+async fn postgres_resume_visibility_preserves_progress_and_recent_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1877,6 +1877,70 @@ async fn postgres_resume_order_puts_recent_timestamp_before_legacy_nulls()
     assert_eq!(page.total, 11);
     assert_eq!(page.items.len(), 10);
     assert_eq!(page.items[0].id, fresh_item_id);
+
+    let app = luxd::api::app_with_state(luxd::api::AppState::ready(
+        config,
+        database.clone(),
+        SetupService::new(database.clone())?,
+        WebAuthService::new(database.clone())?,
+        luxd::auth::emby::EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+    let login: serde_json::Value = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            r#"Emby Client="ResumeTest", Device="Mac", DeviceId="postgres-resume", Version="1""#,
+        )
+        .json(&json!({"Username": "postgres-admin", "Pw": "test-password"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let token = login["AccessToken"].as_str().ok_or("missing token")?;
+    let item_id = Uuid::parse_str(&fresh_item_id)?.as_u128().to_string();
+    for hidden in [true, true, false, false] {
+        let response = client
+            .post(format!(
+                "http://{address}/emby/Users/{user_id}/Items/{item_id}/HideFromResume"
+            ))
+            .header("X-Emby-Token", token)
+            .json(&json!({"Hide": hidden}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(body["HideFromResume"], hidden);
+        assert_eq!(body["PlaybackPositionTicks"], 6_000_000_000_i64);
+        assert_eq!(body["Played"], false);
+        let page = catalog
+            .list_continue_watching(AccessPrincipal::new(admin.id, true), &user_id, 0, 10)
+            .await?;
+        assert_eq!(page.total, if hidden { 10 } else { 11 });
+        assert_eq!(
+            page.items.iter().any(|item| item.id == fresh_item_id),
+            !hidden
+        );
+        let empty = catalog
+            .list_continue_watching(AccessPrincipal::new(admin.id, true), &user_id, 100, 10)
+            .await?;
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.total, page.total);
+    }
+    let state: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT position_ticks, last_played_at, hide_from_resume, version
+         FROM user_item_state WHERE user_id = $1 AND item_id = $2",
+    )
+    .bind(&user_id)
+    .bind(&fresh_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(state, (6_000_000_000, 100, 0, 2));
+    server.abort();
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
