@@ -1009,3 +1009,9 @@ U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不
 - 在该临时发现端口下重跑全量，库测试 858 通过、1 失败、22 ignored；失败是项目此前已记录的 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation`，在 `src/application/playback/hls.rs:2290` 遇到 `Superseded`。该用例第一轮全量通过、第二轮失败、随后单独运行通过，HLS 文件本任务未修改。全量完成门保留失败，不能由定向通过或单跑通过替代。
 
 本次没有推送或部署，不代表 NanShare/Caddy/Hills 的已部署链路已通过实机验证；也不外推 NAS/x86 或其他 Emby 版本的结果。
+
+## LUX-551：Emby 路径大小写不敏感（2026-10-16）
+
+Lux 在根路径和 `/emby` 前缀下，对已注册 Emby 路由的静态路径片段按 ASCII 大小写不敏感匹配。动态路径参数和 query 保持原值；Lux 原生 `/api/v1` 路由不做此归一化。大小写混合的发现、密码登录和带 query token 的用户接口由 `tests/emby_system.rs` 覆盖；路径归一化单测验证动态片段与 query 保留，以及原生 API 路径不变。
+
+这是本机自动化服务端验证，不代表 MoviePilot 插件或第三方播放器的实机链路已经复测，也不代表 FNOS 已部署此版本。
