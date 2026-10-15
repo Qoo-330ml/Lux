@@ -1844,7 +1844,39 @@ impl Database {
         update: SelectedMetadataUpdate<'_>,
         collection_reference: Option<&GlobalMovieCollectionReference>,
     ) -> Result<bool, StorageError> {
+        self.select_metadata_candidate_with_cache_and_collection_reference(
+            update,
+            collection_reference,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn select_metadata_candidate_with_nfo_cache_and_collection_reference(
+        &self,
+        update: SelectedMetadataUpdate<'_>,
+        collection_reference: Option<&GlobalMovieCollectionReference>,
+        nfo_metadata_json: &str,
+        nfo_metadata_fingerprint: &[u8],
+    ) -> Result<bool, StorageError> {
+        self.select_metadata_candidate_with_cache_and_collection_reference(
+            update,
+            collection_reference,
+            Some((nfo_metadata_json, nfo_metadata_fingerprint)),
+        )
+        .await
+    }
+
+    async fn select_metadata_candidate_with_cache_and_collection_reference(
+        &self,
+        update: SelectedMetadataUpdate<'_>,
+        collection_reference: Option<&GlobalMovieCollectionReference>,
+        nfo_cache: Option<(&str, &[u8])>,
+    ) -> Result<bool, StorageError> {
         let sort_title = update.title.to_lowercase();
+        let (nfo_metadata_json, nfo_metadata_fingerprint) = nfo_cache
+            .map(|(json, fingerprint)| (Some(json), Some(fingerprint)))
+            .unwrap_or((None, None));
         let _write_guard = self.acquire_metadata_write_lock().await;
         // SQLite WAL can reject a deferred read-to-write upgrade with
         // SQLITE_BUSY_SNAPSHOT; reserve the single writer before this short
@@ -1863,6 +1895,8 @@ impl Database {
                  metadata_scraper_id = CASE WHEN ? IS NULL THEN metadata_scraper_id ELSE ? END,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
+                 nfo_metadata_json = COALESCE(?, nfo_metadata_json),
+                 nfo_metadata_fingerprint = COALESCE(?, nfo_metadata_fingerprint),
                  poster_fallback_required = ?, updated_at = unixepoch()
              WHERE id = ? AND removed_at IS NULL",
         )
@@ -1886,6 +1920,8 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
+        .bind(nfo_metadata_json)
+        .bind(nfo_metadata_fingerprint)
         .bind(database_flag(update.poster_fallback_required))
         .bind(update.item_id)
         .execute(&mut *transaction)
