@@ -286,38 +286,76 @@ pub(super) async fn lux_list_home_library_latest(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let accessible_library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if library_ids
+    let regular_library_ids = library_ids
+        .iter()
+        .filter(|library_id| *library_id != crate::storage::GLOBAL_COLLECTION_LIBRARY_ID)
+        .cloned()
+        .collect::<Vec<_>>();
+    if regular_library_ids
         .iter()
         .any(|library_id| !accessible_library_ids.contains(library_id))
     {
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let latest_groups = match catalog
-        .list_recently_added_by_library_ids(&library_ids, HOME_LATEST_ITEMS_PER_LIBRARY)
-        .await
-    {
-        Ok(groups) => groups,
-        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    };
-    let latest_items = latest_groups
-        .into_iter()
-        .flat_map(|(library_id, items)| {
+    let mut latest_items = Vec::new();
+    if !regular_library_ids.is_empty() {
+        let latest_groups = match catalog
+            .list_recently_added_by_library_ids(&regular_library_ids, HOME_LATEST_ITEMS_PER_LIBRARY)
+            .await
+        {
+            Ok(groups) => groups,
+            Err(CatalogError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        };
+        latest_items.extend(latest_groups.into_iter().flat_map(|(library_id, items)| {
             items
                 .into_iter()
                 .map(move |item| (library_id.clone(), item))
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
+
+    let mut collection_card_fields = HashMap::new();
+    if library_ids
+        .iter()
+        .any(|library_id| library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID)
+    {
+        let collection_page = match catalog
+            .list_recent_global_collection_cards(principal, 0, HOME_LATEST_ITEMS_PER_LIBRARY)
+            .await
+        {
+            Ok(page) => page,
+            Err(CatalogError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        };
+        if collection_page.total == 0 {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        for card in collection_page.cards {
+            collection_card_fields.insert(
+                card.item.id.clone(),
+                (card.member_count, card.poster_item_id.clone()),
+            );
+            latest_items.push((
+                crate::storage::GLOBAL_COLLECTION_LIBRARY_ID.to_owned(),
+                card.item,
+            ));
+        }
+    }
+
     let catalog_items = latest_items
         .iter()
         .map(|(_, item)| item.clone())
@@ -329,7 +367,16 @@ pub(super) async fn lux_list_home_library_latest(
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
     let mut values_by_library = HashMap::<String, Vec<Value>>::new();
-    for ((library_id, _), value) in latest_items.into_iter().zip(item_values) {
+    for ((library_id, item), mut value) in latest_items.into_iter().zip(item_values) {
+        if library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID {
+            if let Some((member_count, poster_item_id)) = collection_card_fields.get(&item.id) {
+                add_global_collection_card_fields(
+                    &mut value,
+                    *member_count,
+                    poster_item_id.as_deref(),
+                );
+            }
+        }
         values_by_library.entry(library_id).or_default().push(value);
     }
     let libraries = library_ids

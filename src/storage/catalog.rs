@@ -6002,6 +6002,29 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        self.list_global_collection_cards_page_ordered(user_id, is_admin, offset, limit, false)
+            .await
+    }
+
+    pub(crate) async fn list_recent_global_collection_cards_page(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        self.list_global_collection_cards_page_ordered(user_id, is_admin, offset, limit, true)
+            .await
+    }
+
+    async fn list_global_collection_cards_page_ordered(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+        recently_updated_first: bool,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
         let visible_source = |work_item_id: &str| {
             format!(
                 "EXISTS (
@@ -6082,6 +6105,11 @@ impl Database {
                 )"
             )
         };
+        let ordering = if recently_updated_first {
+            "collection.updated_at DESC, collection_item.sort_title, collection.item_id"
+        } else {
+            "collection_item.sort_title, collection.item_id"
+        };
         let query = format!(
             "SELECT collection.item_id, collection_item.title,
                     (SELECT COUNT(DISTINCT member.item_id)
@@ -6104,7 +6132,7 @@ impl Database {
                    WHERE visible_member.collection_id = collection.id
                      AND {}
                )
-             ORDER BY collection_item.sort_title, collection.item_id
+             ORDER BY {ordering}
              LIMIT ? OFFSET ?",
             visible_fallback_poster("source_item.id"),
             visible_fallback_poster("poster.id"),
