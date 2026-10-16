@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::{fs, process::Command};
+use tokio::{fs, process::Command, sync::Mutex as AsyncMutex};
 
 mod cpu_capacity;
 
@@ -23,21 +23,62 @@ const MEDIA_PATH: &str = "/media";
 const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;
 const HOME_P95_DEGRADED_MS: u64 = 300;
 const HOME_P95_TARGET_MS: u64 = 400;
-const PROBE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
+const PROBE_HOME_LATENCY_WINDOW: Duration = Duration::from_secs(30);
+const PROBE_MEMORY_SAMPLE_TTL: Duration = Duration::from_secs(5);
+const PROBE_PRESSURE_MAX_AGE: Duration = Duration::from_secs(10);
 const METADATA_METRIC_SAMPLE_CAPACITY: usize = 128;
 const METADATA_GLOBAL_HARD_CAP: usize = 16;
 const METADATA_P95_SEVERE_MS: u64 = 1_000;
 const METADATA_QUEUE_CLAIM_DEGRADED_MS: u64 = 250;
 const METADATA_QUEUE_CLAIM_SEVERE_MS: u64 = 1_000;
-const PROBE_IO_CONCURRENCY_MULTIPLIER: usize = 32;
-const PROBE_STARTUP_CONCURRENCY_CAP: usize = 16;
+
+#[derive(Clone, Copy)]
+struct HomeLatencySample {
+    recorded_at: Instant,
+    duration_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CachedProbeMemory {
+    sampled_at: Instant,
+    usage_percent: Option<f64>,
+}
+
+impl CachedProbeMemory {
+    fn is_fresh_at(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.sampled_at) < PROBE_MEMORY_SAMPLE_TTL
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProbePressure {
+    pub(crate) home_p95_ms: Option<u64>,
+    pub(crate) container_memory_usage_percent: Option<f64>,
+    pub(crate) sampled_at: Instant,
+}
+
+impl ProbePressure {
+    pub(crate) fn is_fresh_at(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.sampled_at) < PROBE_PRESSURE_MAX_AGE
+    }
+}
+
+fn percentile95_values(values: impl Iterator<Item = u64>) -> Option<u64> {
+    let mut sorted = values.collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_unstable();
+    let index = (sorted.len() * 95).div_ceil(100).saturating_sub(1);
+    sorted.get(index).copied()
+}
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
     started_at: Instant,
     cpu_sample: Arc<Mutex<Option<CpuSample>>>,
-    home_latency_ms: Arc<Mutex<VecDeque<u64>>>,
-    probe_state: Arc<Mutex<ProbeConcurrencyState>>,
+    home_latency_samples: Arc<Mutex<VecDeque<HomeLatencySample>>>,
+    probe_memory: Arc<AsyncMutex<Option<CachedProbeMemory>>>,
     metadata: Arc<Mutex<MetadataMetricState>>,
 }
 
@@ -52,36 +93,68 @@ impl ResourceMetrics {
         Self {
             started_at: Instant::now(),
             cpu_sample: Arc::new(Mutex::new(None)),
-            home_latency_ms: Arc::new(Mutex::new(VecDeque::with_capacity(
+            home_latency_samples: Arc::new(Mutex::new(VecDeque::with_capacity(
                 HOME_LATENCY_SAMPLE_CAPACITY,
             ))),
-            probe_state: Arc::new(Mutex::new(ProbeConcurrencyState::default())),
+            probe_memory: Arc::new(AsyncMutex::new(None)),
             metadata: Arc::new(Mutex::new(MetadataMetricState::default())),
         }
     }
 
     pub fn record_home_latency(&self, duration: Duration) {
-        let Ok(mut samples) = self.home_latency_ms.lock() else {
+        let Ok(mut samples) = self.home_latency_samples.lock() else {
             return;
         };
         let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        if samples.len() == HOME_LATENCY_SAMPLE_CAPACITY {
+        if samples.len() >= HOME_LATENCY_SAMPLE_CAPACITY {
             samples.pop_front();
         }
-        samples.push_back(duration_ms);
+        samples.push_back(HomeLatencySample {
+            recorded_at: Instant::now(),
+            duration_ms,
+        });
     }
 
     pub fn home_latency_p95_ms(&self) -> Option<u64> {
-        let Ok(samples) = self.home_latency_ms.lock() else {
+        let Ok(samples) = self.home_latency_samples.lock() else {
             return None;
         };
-        if samples.is_empty() {
-            return None;
+        percentile95_values(samples.iter().map(|sample| sample.duration_ms))
+    }
+
+    pub(crate) async fn probe_pressure(&self) -> ProbePressure {
+        let now = Instant::now();
+        let home_p95_ms = self.home_latency_p95_since(now, PROBE_HOME_LATENCY_WINDOW);
+        let memory = {
+            let mut cached = self.probe_memory.lock().await;
+            let now = Instant::now();
+            if let Some(sample) = *cached
+                && sample.is_fresh_at(now)
+            {
+                sample
+            } else {
+                let usage_percent = memory_snapshot().await.usage_percent;
+                let sample = CachedProbeMemory {
+                    sampled_at: Instant::now(),
+                    usage_percent,
+                };
+                *cached = Some(sample);
+                sample
+            }
+        };
+        ProbePressure {
+            home_p95_ms,
+            container_memory_usage_percent: memory.usage_percent,
+            sampled_at: Instant::now(),
         }
-        let mut sorted = samples.iter().copied().collect::<Vec<_>>();
-        sorted.sort_unstable();
-        let index = (sorted.len() * 95).div_ceil(100).saturating_sub(1);
-        sorted.get(index).copied()
+    }
+
+    fn home_latency_p95_since(&self, now: Instant, window: Duration) -> Option<u64> {
+        let samples = self.home_latency_samples.lock().ok()?;
+        percentile95_values(samples.iter().filter_map(|sample| {
+            (now.saturating_duration_since(sample.recorded_at) < window)
+                .then_some(sample.duration_ms)
+        }))
     }
 
     pub fn record_metadata_stage(&self, stage: &str, duration: Duration) {
@@ -351,38 +424,6 @@ impl ResourceMetrics {
     fn metadata_stage_p95_ms(&self, stage: &str) -> Option<u64> {
         let metrics = self.metadata.lock().ok()?;
         percentile95(metrics.durations_ms.get(stage)?)
-    }
-
-    pub async fn probe_concurrency(&self, configured: usize, hard_cap: usize) -> usize {
-        let available_parallelism = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1);
-        let (cpu, memory) = tokio::join!(
-            cpu_snapshot(Arc::clone(&self.cpu_sample)),
-            memory_snapshot(),
-        );
-        // `configured` is the library/requested limit. The returned value is
-        // the current effective limit after the process hard cap and resource
-        // backpressure have been applied.
-        let target = recommended_probe_concurrency(
-            configured,
-            available_parallelism,
-            self.home_latency_p95_ms(),
-            cpu.limit_cores,
-            memory.usage_percent,
-            cpu.usage_percent,
-            hard_cap,
-        );
-        let Ok(mut state) = self.probe_state.lock() else {
-            return target;
-        };
-        stabilize_probe_concurrency(
-            &mut state,
-            target,
-            hard_cap,
-            Instant::now(),
-            PROBE_RECOVERY_COOLDOWN,
-        )
     }
 
     pub async fn snapshot(&self) -> ResourceSnapshot {
@@ -886,105 +927,15 @@ pub fn recommended_metadata_concurrency(
     base
 }
 
-#[derive(Default)]
-struct ProbeConcurrencyState {
-    effective: Option<usize>,
-    last_change_at: Option<Instant>,
-}
-
-fn stabilize_probe_concurrency(
-    state: &mut ProbeConcurrencyState,
-    target: usize,
-    hard_cap: usize,
-    now: Instant,
-    recovery_cooldown: Duration,
-) -> usize {
-    let target = target.clamp(1, hard_cap.max(1));
-    let Some(current) = state.effective else {
-        state.effective = Some(target);
-        return target;
-    };
-    if target < current {
-        state.effective = Some(target);
-        state.last_change_at = Some(now);
-        return target;
-    }
-    if target == current {
-        return current;
-    }
-    if state
-        .last_change_at
-        .is_some_and(|last_change| now.duration_since(last_change) < recovery_cooldown)
-    {
-        return current;
-    }
-    let next = current
-        .saturating_mul(2)
-        .max(current.saturating_add(1))
-        .min(target);
-    state.effective = Some(next);
-    state.last_change_at = (next < target).then_some(now);
-    next
-}
-
-pub fn recommended_probe_concurrency(
-    configured: usize,
-    available_parallelism: usize,
-    home_p95_ms: Option<u64>,
-    container_cpu_limit: Option<f64>,
-    container_memory_usage_percent: Option<f64>,
-    cpu_usage_percent: Option<f64>,
-    hard_cap: usize,
-) -> usize {
-    let hard_cap = hard_cap.max(1);
-    let configured = configured.clamp(1, hard_cap);
-    let container_parallelism = container_cpu_limit
-        .filter(|limit| limit.is_finite() && *limit > 0.0)
-        .map_or(available_parallelism, |limit| {
-            limit.ceil().min(usize::MAX as f64) as usize
-        })
-        .max(1);
-    // ffprobe spends a meaningful amount of time waiting on media storage, so
-    // it gets an I/O-oriented cap instead of reserving one worker per CPU.
-    let io_cap = container_parallelism
-        .saturating_mul(PROBE_IO_CONCURRENCY_MULTIPLIER)
-        .clamp(1, hard_cap);
-    // The first cgroup sample has no delta and therefore no CPU percentage.
-    // Start at a small, CPU-relative stage cap and let the stabilizer grow it
-    // after a healthy sample. This prevents a fresh process from immediately
-    // launching CPU*32 probes.
-    let startup_cap = container_parallelism
-        .saturating_mul(2)
-        .clamp(1, PROBE_STARTUP_CONCURRENCY_CAP);
-    let base = configured.min(io_cap).min(if cpu_usage_percent.is_none() {
-        startup_cap
-    } else {
-        hard_cap
-    });
-    let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
-        || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
-        || home_p95_ms.is_some_and(|value| value >= 2_000);
-    if severe_pressure {
-        return base.div_ceil(4).max(1);
-    }
-    let degraded = cpu_usage_percent.is_some_and(|value| value >= 75.0)
-        || container_memory_usage_percent.is_some_and(|value| value >= 85.0)
-        || home_p95_ms.is_some_and(|value| value >= 1_000);
-    if degraded {
-        return base.div_ceil(2).max(1);
-    }
-    base.max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ResourceMetrics, calculate_cpu_usage_cores, calculate_cpu_usage_percent,
-        memory_usage_percent, parse_cgroup_limit, parse_media_storage_values, process_is_member,
-        recommended_background_concurrency, recommended_metadata_concurrency,
-        recommended_probe_concurrency, select_cpu_capacity,
+        CachedProbeMemory, HomeLatencySample, ResourceMetrics, calculate_cpu_usage_cores,
+        calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
+        parse_media_storage_values, process_is_member, recommended_background_concurrency,
+        recommended_metadata_concurrency, select_cpu_capacity,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn cgroup_max_is_an_unlimited_container_limit() {
@@ -1074,6 +1025,45 @@ mod tests {
         assert_eq!(snapshot.metadata.stage_p95_ms["images"], 20);
         assert_eq!(snapshot.metadata.stage_p95_ms["queue_claim"], 300);
         assert_eq!(snapshot.metadata.stage_p95_ms["cache_persist"], 12);
+    }
+
+    #[tokio::test]
+    async fn probe_pressure_excludes_home_samples_older_than_thirty_seconds() {
+        let metrics = ResourceMetrics::new();
+        let now = Instant::now();
+        {
+            let mut samples = metrics
+                .home_latency_samples
+                .lock()
+                .expect("home latency samples should be available");
+            samples.push_back(HomeLatencySample {
+                recorded_at: now - Duration::from_secs(31),
+                duration_ms: 5_000,
+            });
+            samples.push_back(HomeLatencySample {
+                recorded_at: now - Duration::from_secs(2),
+                duration_ms: 250,
+            });
+            samples.push_back(HomeLatencySample {
+                recorded_at: now - Duration::from_secs(1),
+                duration_ms: 400,
+            });
+        }
+
+        let pressure = metrics.probe_pressure().await;
+        assert_eq!(pressure.home_p95_ms, Some(400));
+    }
+
+    #[test]
+    fn probe_memory_cache_expires_after_five_seconds() {
+        let now = Instant::now();
+        let sample = CachedProbeMemory {
+            sampled_at: now,
+            usage_percent: Some(85.0),
+        };
+
+        assert!(sample.is_fresh_at(now + Duration::from_secs(4)));
+        assert!(!sample.is_fresh_at(now + Duration::from_secs(5)));
     }
 
     #[tokio::test]
@@ -1262,134 +1252,6 @@ mod tests {
         assert_eq!(
             recommended_metadata_concurrency(8, None, None, None, Some(1_000), 16),
             2
-        );
-    }
-
-    #[test]
-    fn probe_concurrency_uses_io_parallelism_before_backing_off() {
-        assert_eq!(
-            recommended_probe_concurrency(256, 4, None, None, None, Some(0.0), 512),
-            128
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 4, None, None, None, Some(0.0), 512),
-            128
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 8, None, None, None, Some(0.0), 512),
-            256
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 16, None, None, None, Some(0.0), 512),
-            512
-        );
-    }
-
-    #[test]
-    fn probe_concurrency_starts_conservatively_without_a_cpu_sample() {
-        assert_eq!(
-            recommended_probe_concurrency(512, 4, None, None, None, None, 512),
-            8
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 16, None, None, None, None, 512),
-            16
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 4, None, Some(1.5), None, None, 512),
-            4
-        );
-    }
-
-    #[test]
-    fn probe_concurrency_backs_off_for_cpu_memory_and_frontend_pressure() {
-        assert_eq!(
-            recommended_probe_concurrency(512, 4, Some(1_000), None, None, Some(0.0), 512),
-            64
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 4, None, None, Some(90.0), Some(0.0), 512),
-            64
-        );
-        assert_eq!(
-            recommended_probe_concurrency(512, 4, None, None, None, Some(90.0), 512),
-            32
-        );
-    }
-
-    #[test]
-    fn probe_concurrency_recovers_in_steps_after_a_cooldown() {
-        let mut state = super::ProbeConcurrencyState::default();
-        let start = std::time::Instant::now();
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                512,
-                512,
-                start,
-                Duration::from_secs(30),
-            ),
-            512
-        );
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                16,
-                64,
-                start + Duration::from_secs(1),
-                Duration::from_secs(30),
-            ),
-            16
-        );
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                512,
-                512,
-                start + Duration::from_secs(2),
-                Duration::from_secs(30),
-            ),
-            16
-        );
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                512,
-                512,
-                start + Duration::from_secs(31),
-                Duration::from_secs(30),
-            ),
-            32
-        );
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                512,
-                512,
-                start + Duration::from_secs(62),
-                Duration::from_secs(30),
-            ),
-            64
-        );
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                512,
-                512,
-                start + Duration::from_secs(93),
-                Duration::from_secs(30),
-            ),
-            128
-        );
-        assert_eq!(
-            super::stabilize_probe_concurrency(
-                &mut state,
-                512,
-                512,
-                start + Duration::from_secs(124),
-                Duration::from_secs(30),
-            ),
-            256
         );
     }
 }
