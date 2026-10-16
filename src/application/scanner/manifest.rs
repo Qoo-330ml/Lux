@@ -1348,7 +1348,6 @@ pub(super) fn manifest_file_observation_matches(
         && expected.modified_at == observed.modified_at
         && expected.device == observed.device
         && expected.inode == observed.inode
-        && expected.fingerprint == observed.fingerprint
 }
 
 pub(super) fn manifest_discovery_index_from_preparation(
@@ -1433,6 +1432,7 @@ pub(super) async fn prepare_manifest_delta(
         device,
         inode,
         fingerprint,
+        fingerprint_pending: false,
     };
     let filename_input = if library_kind == "HOMEVIDEOS" {
         ManifestFilenameInput::HomeVideos

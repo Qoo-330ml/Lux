@@ -11863,18 +11863,21 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 #### LUX-561：stat 短路与 XXH3-128 扫描指纹优化
 
-状态：设计提案，尚未实施。仅处理 CPU 热点分析的第二点；2026-10-16 项目所有者选择 A+C，取代先前的 B 主方案。风险与规避见 [A+C 扫描指纹方案](SCAN-FINGERPRINT-A-C-DESIGN.md)；原 B 比较及 SHA 微基准保留在 [原设计记录](SHA256-FINGERPRINT-OPTIMIZATION.md)。
+状态：实现中，代码位于 `codex/sha256-fingerprint-optimization`。仅处理 CPU 热点分析的第二点；2026-10-16 项目所有者选择 A+C，取代先前的 B 主方案。风险与规避见 [A+C 扫描指纹方案](SCAN-FINGERPRINT-A-C-DESIGN.md)；原 B 比较及 SHA 微基准保留在 [原设计记录](SHA256-FINGERPRINT-OPTIMIZATION.md)。
 
 决策：可靠的完整 stat 快照命中时复用原指纹；新文件或确认变化使用 XXH3-128。前台扫描对旧 SHA 行按需验证并预热快照，未变化时不因算法不同产生后处理目标。按项目所有者追加要求，服务就绪后以一个全局串行 worker 低速逐库、逐文件迁移旧 SHA；等价性验证、消费者重绑定和二次 stat/CAS 成功后原位替换并清除该条临时旧 SHA，不常驻保存双指纹。迁移不是媒体变化，不能触发整库 probe/NFO/章节重检测；限速、忙库让步、断点续跑、依赖迁移失败延期和旧引用生命周期必须明确。新格式显式版本化，旧任务/旧值可读；NFO 等共用 SHA helper 保留。inode 不能单独判等，缓存与规范行的指纹/路径锚定并在既有事务中有界更新，原根身份、二次 stat 和 CAS 防护保留。严格抵抗碰撞/ABA 需要独立 source revision，不能宣称仅靠非加密摘要保证。
 
-本次启动后台迁移设计修订预计文件（2 个）：本文档、`docs/SCAN-FINGERPRINT-A-C-DESIGN.md`。实施前按新方案拆分依赖、双读兼容、snapshot 存储、扫描入口和后台迁移；每个实现增量不超过 5 个文件。
+当前实现包括版本化的 SHA-v1/XXH3-v2 扫描指纹、Manifest 的惰性计算与 size/mtime/device/inode 基线短路、SQLite/PostgreSQL 迁移、单个后台迁移 worker、持久游标/延期记录和每库短租约。worker 启动延迟 60 秒，全局最多每 50ms 处理一个条目；迁移前后各检查一次 stat，并验证现有 v1 值后通过 CAS 原位替换规范指纹。章节输入与人物媒体关系读取保留经过 stat 验证的旧值兼容路径。
 
-验收（以下均指未来实现，尚未完成）：
+本轮验证：`cargo fmt --all -- --check` 与 `git diff --check` 通过；在 Toshiba 挂载的共享 target 上，`cargo check --locked --lib --bin luxd` 通过。按项目所有者要求未运行测试。旧 schema 升级测试、SQLite/PostgreSQL 运行时迁移、并发/崩溃回归和 CPU/墙钟/前台 p95 实测仍待验证。迁移 0180 增加 missing fingerprint 的候选索引和数据库触发器：以后被标记为 missing 的 FILE 会立即清空 fingerprint，历史 missing 行由现有 worker 每次清一条，并在清完前阻止该库标记完成。相同的 30 天保留期清理会在媒体项级联清理后，低速分批删除超期、无 `media_sources` 引用的 missing FILE tombstone；有 PENDING/RUNNING 扫描任务的媒体库会暂缓清理，仍被媒体源引用的记录保留以支持文件恢复和改名身份恢复。人物关系快照中的旧引用目前由兼容读取验证，不会随规范 filesystem entry 迁移而主动重写，因此那些 JSON 文件仍可能保留旧摘要。worker 采用固定节流与忙库让步，尚无基于 CPU、IO 或前台 p95 的动态降速反馈。
+
+验收（实现已落地但尚待验证的项目保持未勾选）：
 
 - [ ] v1/v2 格式和稳定编码有 golden vectors；所有入口双读兼容后才启用 v2 写入，旧 unchanged 数据不因迁移重处理。
 - [ ] 可靠暖命中不计算摘要；未知字段、不可靠根和损坏快照回退；两种数据库迁移、批量 snapshot 读取与原子提交通过。
 - [ ] 移动/硬链接、并发、取消、根替换、CAS 与旧任务恢复回归通过；NFO/人物/章节合同无意外变化，内容改写检测边界明确。
 - [ ] 服务就绪后一个全局串行迁移 worker 低速逐库、逐文件工作；限速/资源暂停、忙库让步、断点恢复和候选索引通过，完成条目清除旧扫描 SHA，延期/失败不伪报完成。
+- [ ] missing FILE 的扫描指纹立即清空；超过媒体保留期后，仅清理没有媒体源引用且所属媒体库没有活跃扫描的文件系统墓碑，按有界批次执行并覆盖 SQLite/PostgreSQL。
 - [ ] 纯算法迁移不产生媒体变化/后处理目标；活跃任务、章节派生 input 和人物关系引用有等价性迁移及崩溃恢复，旧值删除不破坏已有结果，普通扫描不能回写 v1。
 - [ ] 完成定向与全量 Rust 检查，分别记录冷升级与暖重扫的 CPU、墙钟、SQL/DML、体积和前台 p95；不得把摘要内核时间当作 NAS 扫描收益。
 

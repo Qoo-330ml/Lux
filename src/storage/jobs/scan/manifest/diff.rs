@@ -326,7 +326,8 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT id, relative_path, entry_kind, fingerprint, is_missing
+                "SELECT id, relative_path, entry_kind, size, modified_at, device, inode,
+                        fingerprint, is_missing
                  FROM filesystem_entries
                  WHERE library_root_id = ? AND relative_path IN ({placeholders})"
             );
@@ -346,6 +347,10 @@ impl Database {
                 let baseline = StoredScanManifestFilesystemBaseline {
                     id: row.get("id"),
                     entry_kind: row.get("entry_kind"),
+                    size: row.get("size"),
+                    modified_at: row.get("modified_at"),
+                    device: row.get("device"),
+                    inode: row.get("inode"),
                     fingerprint: row.get("fingerprint"),
                     is_missing: row.get::<i64, _>("is_missing") != 0,
                 };

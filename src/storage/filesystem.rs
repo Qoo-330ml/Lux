@@ -28,7 +28,8 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         self.query(
-            "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation,
+            "SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                    fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
                     fe.is_missing, ms.item_id,
                     CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                         AS parent_identity_key,
@@ -68,7 +69,8 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation,
+                "SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                        fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
                         fe.is_missing, ms.item_id,
                         CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                             AS parent_identity_key,
@@ -126,12 +128,14 @@ impl Database {
         &self,
         library_id: &str,
         target_root_id: &str,
+        device: i64,
         inode: i64,
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         let rows = self
             .query(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation,
+                "SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                        fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
                         fe.is_missing, ms.item_id,
                         CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                             AS parent_identity_key,
@@ -145,11 +149,12 @@ impl Database {
                  LEFT JOIN media_items item ON item.id = ms.item_id
                  LEFT JOIN media_items parent ON parent.id = item.parent_id
                  LEFT JOIN media_items series ON series.id = item.series_id
-                 WHERE lr.library_id = ? AND fe.inode = ?
+                 WHERE lr.library_id = ? AND fe.device = ? AND fe.inode = ?
                    AND NOT (fe.library_root_id = ? AND fe.relative_path = ?)
                  LIMIT 2",
             )
             .bind(library_id)
+            .bind(device)
             .bind(inode)
             .bind(target_root_id)
             .bind(relative_path)
@@ -179,8 +184,8 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET library_root_id = ?, relative_path = ?, size = ?, modified_at = ?, inode = ?,
-                 fingerprint = ?, last_seen_generation = ?, is_missing = 0,
+             SET library_root_id = ?, relative_path = ?, size = ?, modified_at = ?,
+                 device = ?, inode = ?, fingerprint = ?, last_seen_generation = ?, is_missing = 0,
                  updated_at = unixepoch()
              WHERE id = ?",
         )
@@ -188,6 +193,7 @@ impl Database {
         .bind(entry.relative_path)
         .bind(entry.size)
         .bind(entry.modified_at)
+        .bind(entry.device)
         .bind(entry.inode)
         .bind(entry.fingerprint)
         .bind(entry.generation)
@@ -333,6 +339,7 @@ impl Database {
         size: i64,
         modified_at: i64,
         fingerprint: &[u8],
+        device: Option<i64>,
         inode: Option<i64>,
         last_seen_generation: &str,
     ) -> Result<(), StorageError> {
@@ -346,13 +353,14 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET size = ?, modified_at = ?, fingerprint = ?, inode = ?, last_seen_generation = ?,
+             SET size = ?, modified_at = ?, fingerprint = ?, device = ?, inode = ?, last_seen_generation = ?,
                  is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(size)
         .bind(modified_at)
         .bind(fingerprint)
+        .bind(device)
         .bind(inode)
         .bind(last_seen_generation)
         .bind(id)
@@ -377,6 +385,7 @@ impl Database {
         &self,
         id: &str,
         last_seen_generation: &str,
+        device: Option<i64>,
         inode: Option<i64>,
     ) -> Result<(), StorageError> {
         let mut transaction = self
@@ -389,10 +398,11 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET last_seen_generation = ?, inode = ?, is_missing = 0, updated_at = unixepoch()
+             SET last_seen_generation = ?, device = ?, inode = ?, is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(last_seen_generation)
+        .bind(device)
         .bind(inode)
         .bind(id)
         .execute(&mut *transaction)

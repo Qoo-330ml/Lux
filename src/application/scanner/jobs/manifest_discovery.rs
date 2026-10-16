@@ -1,5 +1,74 @@
 use super::*;
 
+fn complete_pending_manifest_fingerprints(
+    entries: &mut [NewScanManifestEntry],
+    baselines: &HashMap<String, crate::storage::StoredScanManifestFilesystemBaseline>,
+) {
+    for entry in entries {
+        if !entry.fingerprint_pending {
+            continue;
+        }
+
+        let reusable_fingerprint = baselines
+            .get(&entry.relative_path)
+            .filter(|baseline| {
+                entry.size >= 0
+                    && entry.modified_at > 0
+                    && entry.device.is_some()
+                    && entry.inode.is_some()
+                    && baseline.entry_kind == "FILE"
+                    && !baseline.is_missing
+                    && baseline.size == entry.size
+                    && baseline.modified_at == entry.modified_at
+                    && baseline.device == entry.device
+                    && baseline.inode == entry.inode
+            })
+            .and_then(|baseline| baseline.fingerprint.as_deref())
+            .filter(|fingerprint| {
+                crate::application::scanner::is_supported_scan_fingerprint(fingerprint)
+            });
+
+        entry.fingerprint = reusable_fingerprint
+            .or_else(|| {
+                baselines
+                    .get(&entry.relative_path)
+                    .filter(|baseline| {
+                        baseline.entry_kind == "FILE"
+                            && !baseline.is_missing
+                            && baseline
+                                .fingerprint
+                                .as_deref()
+                                .is_some_and(|fingerprint| fingerprint.len() == 32)
+                    })
+                    .and_then(|baseline| {
+                        let current_legacy_fingerprint =
+                            crate::application::scanner::compute_file_fingerprint(
+                                &entry.relative_path,
+                                entry.size,
+                                entry.modified_at,
+                                entry.device.and_then(|value| u64::try_from(value).ok()),
+                                entry.inode.and_then(|value| u64::try_from(value).ok()),
+                            );
+                        (baseline.fingerprint.as_deref()
+                            == Some(current_legacy_fingerprint.as_slice()))
+                        .then(|| baseline.fingerprint.as_deref())
+                        .flatten()
+                    })
+            })
+            .map(<[u8]>::to_vec)
+            .unwrap_or_else(|| {
+                crate::application::scanner::compute_scan_fingerprint_v2(
+                    &entry.relative_path,
+                    entry.size,
+                    entry.modified_at,
+                    entry.device.and_then(|value| u64::try_from(value).ok()),
+                    entry.inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            });
+        entry.fingerprint_pending = false;
+    }
+}
+
 impl ScanJobService {
     pub(in crate::application::scanner) async fn discover_scan_manifest_directory_batches(
         &self,
@@ -12,6 +81,7 @@ impl ScanJobService {
             root,
             cancellation,
             stream_files_during_discovery,
+            skip_baseline_queries,
             library_kind,
             preparation_concurrency,
             expected_root_identity,
@@ -127,13 +197,14 @@ impl ScanJobService {
                 .map(|entry| entry.relative_path.clone())
                 .collect::<Vec<_>>();
             let baseline_started = Instant::now();
-            let baselines = if stream_files_during_discovery {
+            let baselines = if !skip_baseline_queries && !file_paths.is_empty() {
                 self.database
                     .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
                     .await?
             } else {
                 HashMap::new()
             };
+            complete_pending_manifest_fingerprints(&mut observations, &baselines);
             record_manifest_scan_stage(
                 "baseline_query",
                 baseline_started,
@@ -319,6 +390,10 @@ impl ScanJobService {
                         seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
                             filesystem_entry_id: baseline.id.clone(),
                             relative_path: observation.relative_path.clone(),
+                            size: observation.size,
+                            modified_at: observation.modified_at,
+                            device: observation.device,
+                            inode: observation.inode,
                             fingerprint: observation.fingerprint.clone(),
                         });
                         if is_media || is_sidecar {
@@ -750,14 +825,13 @@ impl ScanJobService {
             .map(|entry| entry.relative_path.clone())
             .collect::<Vec<_>>();
         let baseline_started = Instant::now();
-        let baselines =
-            if stream_files_during_discovery && !skip_baseline_queries && !file_paths.is_empty() {
-                self.database
-                    .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
-                    .await?
-            } else {
-                HashMap::new()
-            };
+        let baselines = if !skip_baseline_queries && !file_paths.is_empty() {
+            self.database
+                .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
+                .await?
+        } else {
+            HashMap::new()
+        };
         record_manifest_scan_stage(
             "baseline_query",
             baseline_started,
@@ -768,10 +842,13 @@ impl ScanJobService {
         let mut positive_indexes_by_chunk = Vec::with_capacity(chunks.len());
         let mut unchanged_paths_by_chunk = Vec::with_capacity(chunks.len());
         let mut seen_filesystem_entries_by_chunk = Vec::with_capacity(chunks.len());
+        let mut prepared_entries_by_chunk = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             if cancellation.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            let mut entries = chunk.entries.clone();
+            complete_pending_manifest_fingerprints(&mut entries, &baselines);
             if stream_files_during_discovery {
                 let Some((positive_indexes, unchanged_paths, seen_filesystem_entries)) = self
                     .prepare_manifest_discovery_positive_indexes(
@@ -784,7 +861,7 @@ impl ScanJobService {
                             expected_root_identity,
                             expected_root_observation: &chunk.root_observation,
                             expected_directory_observation: &chunk.directory_observation,
-                            entries: &chunk.entries,
+                            entries: &entries,
                             cancellation,
                         },
                     )
@@ -800,6 +877,7 @@ impl ScanJobService {
                 unchanged_paths_by_chunk.push(Vec::new());
                 seen_filesystem_entries_by_chunk.push(Vec::new());
             }
+            prepared_entries_by_chunk.push(entries);
         }
         if stream_files_during_discovery {
             let observations = chunks
@@ -829,14 +907,18 @@ impl ScanJobService {
             .zip(&positive_indexes_by_chunk)
             .zip(&unchanged_paths_by_chunk)
             .zip(&seen_filesystem_entries_by_chunk)
+            .zip(&prepared_entries_by_chunk)
             .map(
-                |(((chunk, positive_indexes), unchanged_paths), seen_filesystem_entries)| {
+                |(
+                    (((chunk, positive_indexes), unchanged_paths), seen_filesystem_entries),
+                    entries,
+                )| {
                     NewScanManifestDiscoveryChunk {
                         manifest_id,
                         job_id,
                         library_root_id: &root.id,
                         child_directories: &chunk.child_directories,
-                        entries: &chunk.entries,
+                        entries,
                         positive_indexes,
                         unchanged_paths,
                         seen_filesystem_entries,

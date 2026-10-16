@@ -5119,7 +5119,8 @@ impl Database {
         };
         let query_with_fingerprint = format!(
             "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
-                    fe.fingerprint, ms.duration_ticks,
+                    fe.fingerprint, fe.relative_path, fe.size, fe.modified_at,
+                    fe.device, fe.inode, ms.duration_ticks,
                     episode.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
                     episode.season_number, episode.episode_number,
@@ -5155,7 +5156,8 @@ impl Database {
         );
         let query_without_fingerprint = format!(
             "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
-                    fe.fingerprint, ms.duration_ticks,
+                    fe.fingerprint, fe.relative_path, fe.size, fe.modified_at,
+                    fe.device, fe.inode, ms.duration_ticks,
                     episode.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
                     episode.season_number, episode.episode_number,
@@ -5229,6 +5231,11 @@ impl Database {
                     item_id: row.get("item_id"),
                     season_id: row.get("season_id"),
                     fingerprint: row.get("fingerprint"),
+                    relative_path: row.get("relative_path"),
+                    size: row.get("size"),
+                    modified_at: row.get("modified_at"),
+                    device: row.get("device"),
+                    inode: row.get("inode"),
                     duration_ticks: row.get("duration_ticks"),
                     provider_ids_json: row.get("provider_ids_json"),
                     series_provider_ids_json: row.get("series_provider_ids_json"),
@@ -5253,28 +5260,57 @@ impl Database {
         &self,
         job: NewChapterDetectionJob<'_>,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "INSERT INTO chapter_detection_jobs (
-                id, library_id, plugin_id, status, concurrency,
-                intro_window_seconds, credits_window_seconds, match_threshold, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(job.id)
-        .bind(job.library_id)
-        .bind(job.plugin_id)
-        .bind(job.concurrency)
-        .bind(job.intro_window_seconds)
-        .bind(job.credits_window_seconds)
-        .bind(job.match_threshold)
-        .bind(job.total_count)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if !self
+            .lock_scan_fingerprint_migration_state(&mut transaction, job.library_id)
+            .await?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        let result = self
+            .query(
+                "INSERT INTO chapter_detection_jobs (
+                    id, library_id, plugin_id, status, concurrency,
+                    intro_window_seconds, credits_window_seconds, match_threshold, total_count
+                 ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(job.id)
+            .bind(job.library_id)
+            .bind(job.plugin_id)
+            .bind(job.concurrency)
+            .bind(job.intro_window_seconds)
+            .bind(job.credits_window_seconds)
+            .bind(job.match_threshold)
+            .bind(job.total_count)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn insert_chapter_detection_job_items(

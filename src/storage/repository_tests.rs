@@ -207,6 +207,7 @@ async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_sc
                 entry_kind: "FILE",
                 size: 1,
                 modified_at: 1,
+                device: None,
                 inode: None,
                 fingerprint: b"fingerprint",
                 last_seen_generation: "strm-count-generation",
@@ -11844,6 +11845,8 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
             relative_path: "Movie/Movie.2024.mkv".to_owned(),
             size: 1,
             modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![1],
             title: "Movie".to_owned(),
             sort_title: "movie".to_owned(),
@@ -11863,6 +11866,8 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
             relative_path: "Movie/Movie.2024.Directors.Cut.mkv".to_owned(),
             size: 2,
             modified_at: 2,
+            device: None,
+            inode: None,
             fingerprint: vec![2],
             title: "Movie".to_owned(),
             sort_title: "movie".to_owned(),
@@ -11937,6 +11942,8 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
         relative_path: "Another.Movie.2025.mkv".to_owned(),
         size: 3,
         modified_at: 3,
+        device: None,
+        inode: None,
         fingerprint: vec![3],
         title: "Another Movie".to_owned(),
         sort_title: "another movie".to_owned(),
@@ -11995,6 +12002,8 @@ async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
             relative_path: "First.Remote.2024.strm".to_owned(),
             size: 1,
             modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![1],
             title: "First Remote".to_owned(),
             sort_title: "first remote".to_owned(),
@@ -12014,6 +12023,8 @@ async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
             relative_path: "Second.Remote.2025.strm".to_owned(),
             size: 1,
             modified_at: 2,
+            device: None,
+            inode: None,
             fingerprint: vec![2],
             title: "Second Remote".to_owned(),
             sort_title: "second remote".to_owned(),
@@ -12083,6 +12094,8 @@ async fn movie_batch_insert_refreshes_existing_parent_folders_as_a_set() {
         relative_path: format!("{folder}/{name}.202{index}.mkv"),
         size: 1,
         modified_at: index as i64,
+        device: None,
+        inode: None,
         fingerprint: vec![index as u8],
         title: format!("{name} {index}"),
         sort_title: format!("{name} {index}"),
@@ -13938,6 +13951,7 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
             entry_kind: "FILE",
             size: 10,
             modified_at: 20,
+            device: None,
             inode: Some(30),
             fingerprint: b"old-fingerprint",
             last_seen_generation: "old-generation",
@@ -13958,6 +13972,7 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
             40,
             50,
             b"new-fingerprint",
+            None,
             Some(60),
             "new-generation",
         )
@@ -13992,7 +14007,7 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
     .expect("mark filesystem entry missing again");
     database.reset_query_count();
     database
-        .mark_filesystem_entry_seen("filesystem-entry-update", "seen-generation", Some(70))
+        .mark_filesystem_entry_seen("filesystem-entry-update", "seen-generation", None, Some(70))
         .await
         .expect("mark filesystem entry seen");
     assert_eq!(database.query_count(), 2);
@@ -14005,6 +14020,231 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
     .await
     .expect("seen filesystem entry");
     assert_eq!(seen, (Some(70), "seen-generation".to_owned(), 0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filesystem_entry_inode_match_requires_the_same_device()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Device scoped inode lookup", LibraryKind::Movie, false)
+        .await?;
+    let first_root_path = temp_dir.path().join("first-root");
+    let second_root_path = temp_dir.path().join("second-root");
+    tokio::fs::create_dir_all(&first_root_path).await?;
+    tokio::fs::create_dir_all(&second_root_path).await?;
+    let first_root = libraries
+        .add_root(library.id, first_root_path.to_str().ok_or("non-UTF8 root")?)
+        .await?
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let second_root = libraries
+        .add_root(
+            library.id,
+            second_root_path.to_str().ok_or("non-UTF8 root")?,
+        )
+        .await?
+        .root;
+    let second_root_id = second_root.id.to_string();
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "same-inode-on-another-device",
+            library_root_id: &first_root_id,
+            relative_path: "old-name.mkv",
+            entry_kind: "FILE",
+            size: 10,
+            modified_at: 20,
+            device: Some(1),
+            inode: Some(42),
+            fingerprint: b"fingerprint",
+            last_seen_generation: "generation",
+        })
+        .await?;
+
+    let entry = database
+        .find_filesystem_entry_by_inode(
+            &library.id.to_string(),
+            &second_root_id,
+            2,
+            42,
+            "new-name.mkv",
+        )
+        .await?;
+
+    assert!(entry.is_none());
+    database.close().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scan_fingerprint_migration_replaces_legacy_token_and_persists_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Fingerprint migration", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(
+        media_root.join("movie.mkv"),
+        b"metadata-only fingerprint fixture",
+    )
+    .await?;
+    let root = libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-UTF8 root")?)
+        .await?
+        .root;
+    let root_id = root.id.to_string();
+    let metadata = std::fs::metadata(media_root.join("movie.mkv"))?;
+    let size = i64::try_from(metadata.len())?;
+    let modified_at = i64::try_from(
+        metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+    )?;
+    let device = i64::try_from(metadata.dev())?;
+    let inode = i64::try_from(metadata.ino())?;
+    let legacy = crate::application::scanner::compute_file_fingerprint(
+        "movie.mkv",
+        size,
+        modified_at,
+        Some(device as u64),
+        Some(inode as u64),
+    );
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "migration-entry",
+            library_root_id: &root_id,
+            relative_path: "movie.mkv",
+            entry_kind: "FILE",
+            size,
+            modified_at,
+            device: Some(device),
+            inode: Some(inode),
+            fingerprint: &legacy,
+            last_seen_generation: "migration-generation",
+        })
+        .await?;
+
+    let library_id = library.id.to_string();
+    let cursor = database
+        .ensure_scan_fingerprint_migration_state(&library_id)
+        .await?;
+    let candidate = database
+        .find_scan_fingerprint_migration_candidate(&library_id, &cursor)
+        .await?
+        .ok_or("legacy candidate not found")?;
+    let lease_token = "migration-lease";
+    assert!(
+        database
+            .claim_scan_fingerprint_migration_lease(&library_id, lease_token)
+            .await?
+    );
+    let fingerprint_v2 = crate::application::scanner::compute_scan_fingerprint_v2(
+        "movie.mkv",
+        size,
+        modified_at,
+        Some(device as u64),
+        Some(inode as u64),
+    );
+    assert!(
+        database
+            .migrate_scan_fingerprint_candidate(
+                &candidate,
+                &fingerprint_v2,
+                size,
+                modified_at,
+                device,
+                inode,
+                lease_token,
+            )
+            .await?
+    );
+
+    let stored: (Vec<u8>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT fingerprint, device, inode FROM filesystem_entries WHERE id = 'migration-entry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored.0, fingerprint_v2);
+    assert_ne!(stored.0, legacy);
+    assert_eq!((stored.1, stored.2), (Some(device), Some(inode)));
+    let persisted_cursor = database
+        .ensure_scan_fingerprint_migration_state(&library_id)
+        .await?;
+    assert_eq!(persisted_cursor.root_id.as_deref(), Some(root_id.as_str()));
+    assert_eq!(persisted_cursor.relative_path.as_deref(), Some("movie.mkv"));
+    assert!(
+        database
+            .find_scan_fingerprint_migration_candidate(&library_id, &persisted_cursor)
+            .await?
+            .is_none()
+    );
+
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "migration-missing-entry",
+            library_root_id: &root_id,
+            relative_path: "gone.mkv",
+            entry_kind: "FILE",
+            size,
+            modified_at,
+            device: Some(device),
+            inode: Some(inode),
+            fingerprint: &legacy,
+            last_seen_generation: "migration-generation",
+        })
+        .await?;
+    sqlx::query("DROP TRIGGER trg_filesystem_entries_clear_missing_fingerprint_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1
+         WHERE id = 'migration-missing-entry'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .scan_fingerprint_migration_has_pending_entries(&library_id)
+            .await?
+    );
+    assert!(
+        database
+            .clear_one_missing_scan_fingerprint(&library_id)
+            .await?
+    );
+    let missing_fingerprint: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT fingerprint FROM filesystem_entries
+         WHERE id = 'migration-missing-entry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing_fingerprint, None);
+    assert!(
+        !database
+            .scan_fingerprint_migration_has_pending_entries(&library_id)
+            .await?
+    );
+    database.close().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -15842,6 +16082,8 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
         relative_path: first_path.to_owned(),
         size: 7,
         modified_at: 1,
+        device: None,
+        inode: None,
         fingerprint: vec![1, 2, 3],
         title: "Atomic Movie".to_owned(),
         sort_title: "atomic movie".to_owned(),
@@ -17898,6 +18140,8 @@ fn strm_file(index: i64, relative_path: &str) -> NewMovieFile {
         relative_path: relative_path.to_owned(),
         size: 1,
         modified_at: index,
+        device: None,
+        inode: None,
         fingerprint: vec![index as u8],
         title: format!("Scope {index}"),
         sort_title: format!("scope {index}"),
@@ -18980,6 +19224,145 @@ async fn assert_removed_media_item_purge(
             .await?,
         1
     );
+    assert_missing_filesystem_entry_purge(database).await?;
+    Ok(())
+}
+
+async fn assert_missing_filesystem_entry_purge(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_service = LibraryService::new(database.clone());
+    let library = library_service
+        .create_library("Missing entry purge", LibraryKind::Movie, false)
+        .await?;
+    let active_library = library_service
+        .create_library("Active scan purge", LibraryKind::Movie, false)
+        .await?;
+    let root_dir = tempfile::tempdir()?;
+    let active_root_dir = tempfile::tempdir()?;
+    let root_id = uuid::Uuid::now_v7().to_string();
+    let active_root_id = uuid::Uuid::now_v7().to_string();
+    for (root_id, library_id, path) in [
+        (root_id.as_str(), library.id.to_string(), root_dir.path()),
+        (
+            active_root_id.as_str(),
+            active_library.id.to_string(),
+            active_root_dir.path(),
+        ),
+    ] {
+        let path = path.to_str().ok_or("non-UTF8 test root")?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES (?, ?, ?, ?, 1, 0)",
+            )
+            .bind(root_id)
+            .bind(library_id)
+            .bind(path)
+            .bind(path)
+            .execute(database.pool())
+            .await?;
+    }
+    ScanJobService::new(database.clone())
+        .create_movie_scan_job(active_library.id)
+        .await?;
+
+    let mut expected_retained_entries = Vec::new();
+    for (relative_path, missing, age_days, linked) in [
+        ("expired-oldest.mkv", 1_i64, 90_i64, false),
+        ("expired-middle.mkv", 1, 60, false),
+        ("expired-newest.mkv", 1, 45, false),
+        ("recent.mkv", 1, 2, false),
+        ("live.mkv", 0, 90, false),
+        ("source-linked.mkv", 1, 90, true),
+    ] {
+        let entry_id = uuid::Uuid::now_v7().to_string();
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation, is_missing, updated_at
+                 ) VALUES (?, ?, ?, 'FILE', 1, 1, 'purge-test', ?,
+                           unixepoch() - ? * 86400)",
+            )
+            .bind(&entry_id)
+            .bind(&root_id)
+            .bind(relative_path)
+            .bind(missing)
+            .bind(age_days)
+            .execute(database.pool())
+            .await?;
+        if missing == 0 || age_days < 30 || linked {
+            expected_retained_entries.push(entry_id.clone());
+        }
+        if linked {
+            let item_id = uuid::Uuid::now_v7().to_string();
+            database
+                .query(
+                    "INSERT INTO media_items (
+                         id, library_id, item_type, title, sort_title, identification_status
+                     ) VALUES (?, ?, 'MOVIE', 'Retained source', 'retained source',
+                               'LOCAL_CONFIRMED')",
+                )
+                .bind(&item_id)
+                .bind(library.id.to_string())
+                .execute(database.pool())
+                .await?;
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+                     VALUES (?, ?, 'LOCAL_FILE', ?)",
+                )
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(item_id)
+                .bind(&entry_id)
+                .execute(database.pool())
+                .await?;
+        }
+    }
+
+    let active_entry_id = uuid::Uuid::now_v7().to_string();
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing, updated_at
+             ) VALUES (?, ?, 'active-scan.mkv', 'FILE', 1, 1, 'purge-test', 1,
+                       unixepoch() - 90 * 86400)",
+        )
+        .bind(&active_entry_id)
+        .bind(&active_root_id)
+        .execute(database.pool())
+        .await?;
+    expected_retained_entries.push(active_entry_id.clone());
+
+    let retention = 30 * 86_400;
+    assert_eq!(
+        database
+            .purge_expired_missing_filesystem_entries(retention, 1, 2, std::time::Duration::ZERO,)
+            .await?,
+        2
+    );
+    assert_eq!(
+        database
+            .purge_expired_missing_filesystem_entries(retention, 1, 2, std::time::Duration::ZERO,)
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .purge_expired_missing_filesystem_entries(retention, 1, 2, std::time::Duration::ZERO,)
+            .await?,
+        0
+    );
+
+    expected_retained_entries.sort();
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM filesystem_entries ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(remaining, expected_retained_entries);
     Ok(())
 }
 

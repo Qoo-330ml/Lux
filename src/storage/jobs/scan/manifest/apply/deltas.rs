@@ -77,6 +77,7 @@ impl Database {
                                         .to_owned(),
                                 )
                             })?,
+                            delta.device,
                             delta.inode,
                             delta.fingerprint.as_deref().ok_or_else(|| {
                                 StorageError::Conflict(
@@ -90,7 +91,7 @@ impl Database {
 
                 let applied = match delta.delta_kind.as_str() {
                     "ADD" => {
-                        let Some((entry_kind, _, _, _, _)) = observation else {
+                        let Some((entry_kind, _, _, _, _, _)) = observation else {
                             return Err(StorageError::Conflict(
                                 "add delta is missing its observation".to_owned(),
                             ));
@@ -135,7 +136,8 @@ impl Database {
                                 "change delta has no baseline entry".to_owned(),
                             ));
                         };
-                        let Some((entry_kind, size, modified_at, inode, fingerprint)) = observation
+                        let Some((entry_kind, size, modified_at, device, inode, fingerprint)) =
+                            observation
                         else {
                             return Err(StorageError::Conflict(
                                 "change delta is missing its observation".to_owned(),
@@ -159,6 +161,7 @@ impl Database {
                                     expected_missing,
                                     size,
                                     modified_at,
+                                    device,
                                     inode,
                                     fingerprint,
                                     generation: batch.generation,
@@ -183,6 +186,7 @@ impl Database {
                                     expected_missing,
                                     size,
                                     modified_at,
+                                    device,
                                     inode,
                                     fingerprint,
                                     generation: batch.generation,
@@ -209,6 +213,7 @@ impl Database {
                                     expected_missing,
                                     size,
                                     modified_at,
+                                    device,
                                     inode,
                                     fingerprint,
                                     generation: batch.generation,
@@ -225,7 +230,7 @@ impl Database {
                         } else {
                             self.query(
                                 "UPDATE filesystem_entries
-                                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                                SET size = ?, modified_at = ?, device = ?, inode = ?, fingerprint = ?,
                                      last_seen_generation = ?, is_missing = 0,
                                      updated_at = unixepoch()
                                  WHERE id = ? AND library_root_id = ? AND relative_path = ?
@@ -234,6 +239,7 @@ impl Database {
                             )
                             .bind(size)
                             .bind(modified_at)
+                            .bind(device)
                             .bind(inode)
                             .bind(fingerprint)
                             .bind(batch.generation)

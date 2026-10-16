@@ -18,7 +18,7 @@ async fn global_movie_collection_storage_is_migrated_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
 
     let system_library: (String, String) = sqlx::query_as(
         "SELECT kind, system_kind FROM libraries
@@ -505,7 +505,7 @@ async fn sqlite_upgrade_accepts_the_original_applied_timestamp_migration_checksu
     pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     let preserved_checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 126")
             .fetch_one(database.pool())
@@ -518,6 +518,139 @@ async fn sqlite_upgrade_accepts_the_original_applied_timestamp_migration_checksu
     assert!(updated_at > 0);
 
     database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_upgrade_and_missing_transitions_clear_file_fingerprints()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database_path = temp_dir.path().join("missing-fingerprint-upgrade.db");
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 179 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration filename")?),
+            )?;
+        }
+    }
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('missing-library', 'Missing', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('missing-root', 'missing-library', '/missing', '/missing', 1, 0)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             fingerprint, last_seen_generation, is_missing
+         ) VALUES
+             ('old-missing', 'missing-root', 'gone.mkv', 'FILE', 10, 20, zeroblob(32), 'old', 1),
+             ('old-live', 'missing-root', 'live.mkv', 'FILE', 10, 20, zeroblob(32), 'old', 0)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_fingerprint_migration_state (library_id, completed_at)
+         VALUES ('missing-library', 123)",
+    )
+    .execute(&pool)
+    .await?;
+
+    fs::copy(
+        source_dir.join("0180_clear_missing_file_fingerprints.sql"),
+        migration_dir.join("0180_clear_missing_file_fingerprints.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+
+    let upgraded_missing: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM filesystem_entries WHERE id = 'old-missing'")
+            .fetch_one(&pool)
+            .await?;
+    let upgraded_live: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM filesystem_entries WHERE id = 'old-live'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(upgraded_missing, Some(vec![0; 32]));
+    assert_eq!(upgraded_live, Some(vec![0; 32]));
+    let reset_completion: Option<i64> = sqlx::query_scalar(
+        "SELECT completed_at FROM scan_fingerprint_migration_state
+         WHERE library_id = 'missing-library'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(reset_completion, None);
+
+    sqlx::query("UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'old-live'")
+        .execute(&pool)
+        .await?;
+    let newly_missing: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM filesystem_entries WHERE id = 'old-live'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(newly_missing, None);
+
+    sqlx::query(
+        "UPDATE filesystem_entries SET fingerprint = zeroblob(32)
+         WHERE id = 'old-live'",
+    )
+    .execute(&pool)
+    .await?;
+    let still_missing: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM filesystem_entries WHERE id = 'old-live'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(still_missing, None);
+
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             fingerprint, last_seen_generation, is_missing
+         ) VALUES ('new-missing', 'missing-root', 'new-gone.mkv', 'FILE', 10, 20,
+                   zeroblob(32), 'new', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    let inserted_missing: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT fingerprint FROM filesystem_entries WHERE id = 'new-missing'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(inserted_missing, None);
+
+    pool.close().await;
     Ok(())
 }
 
@@ -1251,7 +1384,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -1271,7 +1404,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 177);
+    assert_eq!(second_database.schema_version().await?, 180);
     second_database.close().await;
     Ok(())
 }
@@ -1356,7 +1489,7 @@ async fn sqlite_fill_request_snapshot_migration_preserves_queued_jobs()
     old_pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     let job_state: (String, i64, i64) = sqlx::query_as(
         "SELECT status, processed_count, total_count
          FROM metadata_reidentify_jobs WHERE id = 'snapshot-job'",
@@ -1505,7 +1638,7 @@ async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
     old_pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     let jobs: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
                 items.automatic_retry_count, items.automatic_retry_consumed
@@ -1650,7 +1783,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 177);
+    assert_eq!(schema_version, 180);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -2011,7 +2144,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 177);
+    assert_eq!(schema_version, 180);
     database.close().await;
     Ok(())
 }
@@ -2359,7 +2492,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
 
     database.close().await;
     Ok(())
@@ -3053,7 +3186,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     Ok(())
 }
 
@@ -3225,7 +3358,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     Ok(())
 }
 
@@ -3312,7 +3445,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     database.close().await;
     Ok(())
 }
@@ -3444,7 +3577,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -3626,7 +3759,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
@@ -3860,7 +3993,7 @@ async fn resume_visibility_upgrade_preserves_existing_playback_state()
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 177);
+    assert_eq!(version, 180);
     pool.close().await;
     Ok(())
 }

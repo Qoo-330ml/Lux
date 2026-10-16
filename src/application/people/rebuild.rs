@@ -880,7 +880,11 @@ impl PeopleService {
                     return Ok(false);
                 };
                 let mut candidates = database
-                    .find_items_by_source_fingerprint(&fingerprint)
+                    .find_items_by_source_fingerprint(
+                        &fingerprint,
+                        relation.media_size,
+                        relation.media_modified_at,
+                    )
                     .await
                     .map_err(|error| PeopleError::Storage(error.to_string()))?;
                 candidates.retain(|candidate| relation_media_snapshot_matches(relation, candidate));

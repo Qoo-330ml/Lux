@@ -77,6 +77,8 @@ impl LibraryScanner {
             relative_path: observation.relative_path.clone(),
             size: observation.size,
             modified_at: observation.modified_at,
+            device: observation.device,
+            inode: observation.inode,
             fingerprint: observation.fingerprint.clone(),
             title: parsed_name.title.clone(),
             sort_title: parsed_name.sort_title,
@@ -162,7 +164,7 @@ impl LibraryScanner {
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+            compute_scan_fingerprint_v2(&relative_path, size, modified_at, device, inode);
         let container = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -174,6 +176,8 @@ impl LibraryScanner {
             relative_path,
             size,
             modified_at,
+            device: device.and_then(|value| i64::try_from(value).ok()),
+            inode: inode.and_then(|value| i64::try_from(value).ok()),
             fingerprint,
             title: parsed_name.title.clone(),
             sort_title: parsed_name.sort_title,
@@ -242,6 +246,7 @@ impl LibraryScanner {
             relative_path: observation.relative_path.clone(),
             size: observation.size,
             modified_at: observation.modified_at,
+            device: observation.device,
             inode: observation.inode,
             fingerprint: observation.fingerprint.clone(),
             series_identity,
@@ -317,7 +322,7 @@ impl LibraryScanner {
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+            compute_scan_fingerprint_v2(&relative_path, size, modified_at, device, inode);
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let series_identity = format!("series:{root_id}:{}", hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
@@ -336,6 +341,7 @@ impl LibraryScanner {
             relative_path,
             size,
             modified_at,
+            device: device.and_then(|value| i64::try_from(value).ok()),
             inode: inode.and_then(|value| i64::try_from(value).ok()),
             fingerprint,
             series_identity,
@@ -652,8 +658,7 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let device = device.and_then(|value| i64::try_from(value).ok());
         let inode = inode.and_then(|value| i64::try_from(value).ok());
         let mut report = ScanReport {
             discovered_files: 1,
@@ -663,6 +668,28 @@ impl LibraryScanner {
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?;
+        let fingerprint = existing_entry
+            .as_ref()
+            .filter(|entry| {
+                scan_fingerprint_matches_observation(
+                    entry,
+                    &relative_path,
+                    size,
+                    modified_at,
+                    device.and_then(|value| u64::try_from(value).ok()),
+                    inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            })
+            .and_then(|entry| entry.fingerprint.clone())
+            .unwrap_or_else(|| {
+                compute_scan_fingerprint_v2(
+                    &relative_path,
+                    size,
+                    modified_at,
+                    device.and_then(|value| u64::try_from(value).ok()),
+                    inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            });
         let expected_parent_identity = movie_parent_folder_identity(&root.id, &relative_path);
         if let Some(existing_entry) = existing_entry.as_ref()
             && existing_entry.item_type.as_deref() == Some("MOVIE")
@@ -689,7 +716,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, device, inode)
                     .await?;
                 report.skipped_files = 1;
                 return Ok(report);
@@ -700,6 +727,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    device,
                     inode,
                     generation,
                 )
@@ -790,7 +818,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, device, inode)
                     .await?;
                 report.created_items = usize::from(created_item);
                 report.changed_files = usize::from(reassigned);
@@ -803,6 +831,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    device,
                     inode,
                     generation,
                 )
@@ -833,6 +862,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
+                device: device.and_then(|value| i64::try_from(value).ok()),
                 inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,

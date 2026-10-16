@@ -888,7 +888,7 @@ const SECONDS_PER_DAY: i64 = 86_400;
 static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Retention window for soft-deleted media items, in days. `0` disables the purge.
+/// Retention window for soft-deleted media records, in days. `0` disables the purges.
 pub fn removed_item_retention_days() -> i64 {
     std::env::var(REMOVED_ITEM_RETENTION_ENV)
         .ok()
@@ -909,20 +909,39 @@ impl Database {
         }
         let database = self.clone();
         tokio::spawn(async move {
+            let retention_seconds = retention_days.saturating_mul(SECONDS_PER_DAY);
             let result = database
                 .purge_expired_removed_media_items(
-                    retention_days.saturating_mul(SECONDS_PER_DAY),
+                    retention_seconds,
                     REMOVED_ITEM_PURGE_BATCH_SIZE,
                     REMOVED_ITEM_PURGE_MAX_BATCHES,
                     REMOVED_ITEM_PURGE_PAUSE,
                 )
                 .await;
-            REMOVED_ITEM_PURGE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
             match result {
                 Ok(0) => {}
                 Ok(purged) => tracing::info!(purged, "expired soft-deleted media items purged"),
                 Err(error) => tracing::warn!(%error, "soft-deleted media item purge failed"),
             }
+            let result = database
+                .purge_expired_missing_filesystem_entries(
+                    retention_seconds,
+                    REMOVED_ITEM_PURGE_BATCH_SIZE,
+                    REMOVED_ITEM_PURGE_MAX_BATCHES,
+                    REMOVED_ITEM_PURGE_PAUSE,
+                )
+                .await;
+            match result {
+                Ok(0) => {}
+                Ok(purged) => {
+                    tracing::info!(purged, "expired orphaned missing filesystem entries purged")
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "orphaned missing filesystem entry purge failed"
+                ),
+            }
+            REMOVED_ITEM_PURGE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
         });
     }
 
@@ -953,6 +972,62 @@ impl Database {
                            AND NOT EXISTS (
                                SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
                          ORDER BY mi.removed_at
+                         LIMIT ?
+                     )",
+                )
+                .bind(retention_seconds)
+                .bind(batch_size)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            purged = purged.saturating_add(count);
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Hard-deletes expired missing file entries that no longer have a media source.
+    /// Entries with a source remain as identity tombstones so scans can restore them;
+    /// active libraries are skipped while a scan may still hold a baseline reference.
+    pub async fn purge_expired_missing_filesystem_entries(
+        &self,
+        retention_seconds: i64,
+        batch_size: i64,
+        max_batches: u32,
+        pause: std::time::Duration,
+    ) -> Result<u64, StorageError> {
+        let mut purged = 0_u64;
+        for _ in 0..max_batches {
+            let count = self
+                .query(
+                    "DELETE FROM filesystem_entries
+                     WHERE id IN (
+                         SELECT entry.id
+                         FROM filesystem_entries entry
+                         JOIN library_roots library_root
+                           ON library_root.id = entry.library_root_id
+                         WHERE entry.entry_kind = 'FILE'
+                           AND entry.is_missing = 1
+                           AND entry.updated_at < unixepoch() - ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM media_sources source
+                               WHERE source.filesystem_entry_id = entry.id
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM scan_jobs job
+                               WHERE job.library_id = library_root.library_id
+                                 AND job.status IN ('PENDING', 'RUNNING')
+                           )
+                         ORDER BY entry.updated_at, entry.id
                          LIMIT ?
                      )",
                 )
