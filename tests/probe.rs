@@ -277,7 +277,9 @@ async fn canceled_probe_runner_reaps_its_child_process() -> Result<(), Box<dyn s
     let probe = tokio::spawn(async move { runner.probe_path(&probe_path).await });
     let pid_text = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+            if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await
+                && pid.trim().parse::<u32>().is_ok()
+            {
                 break pid;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -285,7 +287,7 @@ async fn canceled_probe_runner_reaps_its_child_process() -> Result<(), Box<dyn s
     })
     .await
     .expect("fake ffprobe should start and record its pid");
-    let pid = pid_text.parse::<u32>()?;
+    let pid = pid_text.trim().parse::<u32>()?;
 
     probe.abort();
     assert!(
