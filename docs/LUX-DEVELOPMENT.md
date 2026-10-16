@@ -452,9 +452,11 @@ Lux 的核心价值不是功能数量，而是：
 - 默认扫描时常驻内存目标小于 750 MB。
 - 所有后台队列有界；队列满时合并事件或施加背压，不无限增长。
 - 元数据补全使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 的 worker 默认并发均为 4；`FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
-- ffprobe 默认并发 256，可按媒体库配置 1 至 512；实际运行的单库有效上限为 512、进程全局硬上限为 512，
-  并根据 CPU、内存和前台 p95 动态降档。4 核 NAS 的默认有效并发目标为 128，8 核目标为 256，16 核及以上目标为 512；ffprobe 只处理本轮
-  fingerprint 变化或新增的 source，未变化 source 不得重复探测。
+- ffprobe 自动进程预算为 `ceil(effective_cpu_cores × 4)`，范围 1 至 512；没有 cgroup 限额时使用标准库
+  `available_parallelism`，Linux 可见的 v1/v2 quota 与 cpuset 共同取较小容量。新库将自动预算写入每库设置；
+  已有每库配置保留，但运行时不能超过进程预算。`LUX_PROBE_CONCURRENCY` 数值覆盖自动进程预算。
+  本地 ffprobe 的活动并发从约有效 CPU 核数起步，后续仅依据成功完成速率试探和回退，并结合近期前台延迟及内存保护；
+  CPU 使用率不参与 probe 控制，进程全局硬上限为 512。ffprobe 只处理本轮 fingerprint 变化或新增的 source，未变化 source 不得重复探测。
 - TMDb 请求必须经过 `org.lux.tmdb` 插件；插件统一限制最多 16 个并发请求、每秒最多发起 32 次请求，并实现指数退避和抖动。
 - SQLite 写事务短小，批次默认 100 至 500 项；禁止把整个库放入单个事务。
 
@@ -520,7 +522,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_FFMPEG_CONCURRENCY=2`。ffprobe 默认按有效 CPU 容量自动设置进程预算为 `ceil(CPU 核数 × 4)`，上限 512；Compose 未设置 `LUX_PROBE_CONCURRENCY` 时传空值启用自动预算。活动并发从约 CPU 核数起步，再按本地 ffprobe 成功完成速率自适应调整；首页延迟或 cgroup 内存压力升高时保护性降档，不依赖 CPU 使用率。管理员可通过 `LUX_PROBE_CONCURRENCY` 显式覆盖预算。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立控制 ffprobe 和 ffmpeg 子进程。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -1855,7 +1857,6 @@ services:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
       LUX_SCAN_CONCURRENCY: "2"
-      LUX_PROBE_CONCURRENCY: "8"
       LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
       TZ: "Asia/Shanghai"
@@ -11896,6 +11897,13 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 - [x] 项目所有者评审并批准设计（2026-10-16）；代码接入 Discovery/Manifest、指纹、NFO/图片、probe 和 thumbnail。
 - [x] 取消后的 blocking 工作和受监督子进程在清理完成前继续占用预算；设置日志与有界指标。
 - [ ] 完整 Rust 完成门全部通过；性能 A/B 按项目所有者明确指示免除，不把 CPU 收益或自动默认容量作为实测结论。
+##### ffprobe CPU 容量与完成速率自适应
+
+本地 ffprobe 的自动进程预算使用 ceil(effective_cpu_cores × 4) 并限制在 1 至 512；Linux 有可见的 cgroup v1/v2 quota 与 cpuset 时取保守交集，并缓存容量结果。首次活动并发从约 CPU 核数起步，之后只按本地 ffprobe 成功完成速率调整；首页延迟和可见 cgroup 内存压力只用于保护性降档，不读取 CPU 使用率。每库配置上限、LUX_PROBE_CONCURRENCY 环境变量覆盖、分页持久化和正常关停边界保留；远程 STRM 插件仍走独立调度。容器默认不再注入固定 probe 并发 8，共享后台 CPU 预算还会限制本地 ffprobe 实际活动量。
+
+实现方案与分步记录见 [FFPROBE-CONCURRENCY-DESIGN.md](FFPROBE-CONCURRENCY-DESIGN.md) 和 [FFPROBE-CONCURRENCY-CODE-PLAN.md](FFPROBE-CONCURRENCY-CODE-PLAN.md)。子进程所有权由独立 runner 管理；自适应 probe permit 与共享后台 CPU permit 都在确认进程退出后释放。
+
+ffprobe 分支的验证记录：定向探测器测试通过；cargo build --locked、fmt 和全 targets/all-features Clippy 通过。该分支全量 Cargo 测试在 lib 阶段 914 passed、1 failed、23 ignored 后停止，唯一失败为旧断言期待 1/8 步长下并发 6；更新断言后该定向用例通过。之后的集成 targets 未执行，Linux 交叉构建因缺少 x86_64-linux-gnu-gcc 未启动。ARM64 模拟负载发现忙碌时重置 sleep 导致采样 tick 不推进，修复为固定 tick；后续将上调步长改为 1/4，但真实 ffprobe A/B 尚未测量。具体数据和限制见 docs/PERFORMANCE.md；本机结果不外推为 NAS/x86 性能。
 
 
 ## 29. 参考资料

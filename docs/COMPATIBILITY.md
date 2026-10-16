@@ -1,10 +1,12 @@
 # Lux 客户端兼容性矩阵
 
-## LUX-561 后台预算运行时兼容性（2026-10-16）
+## LUX-561 后台预算与本地 ffprobe 调度兼容性（2026-10-16）
 
-多管线共享预算只改变 Lux 进程内后台重工作片段的准入；现有 API/Emby DTO、数据库 schema、媒体指纹格式和扫描完成合同不变。ffprobe、ffmpeg 与扫描等既有局部并发上限继续生效。`LUX_BACKGROUND_CPU_BUDGET` 留空或未设置时使用 CPU/cgroup 推导值，显式整数夹到 1–32；该值在进程初始化时读取。
+扫描指纹的 stat 命中和 v2 编码不改变 API/Emby DTO、数据库对外模型或扫描完成合同。后台预算只控制 Lux 进程内重工作片段的准入；Discovery/Manifest preparation、扫描指纹、本地 NFO/图片计算、ffprobe 与缩略图共享进程级 CPU 名额，原有每管线和子进程上限继续生效。LUX_BACKGROUND_CPU_BUDGET 留空时按 CPU/cgroup 推导，显式整数夹到 1–32，并在进程初始化时读取。ffprobe 自适应调度只调整内置本地 ffprobe；不读取 CPU 使用率，远程 STRM 插件调度独立。
 
-本机定向 Rust 回归覆盖预算原语 9/9、`probe` 20/20、`thumbnails` 18/18、跨服务/跨库混合用例 1/1、`metadata` 21/21、`scanned_series_metadata` 3/3 及图片计算等价性 1/1；混合用例还验证后台预算占用期间前台 metadata 可继续完成。Discovery/fingerprint 目标的 G=1 结果见 `LUX-DEVELOPMENT.md`。`scanned_metadata` 22/23，唯一失败也在干净基线 `1e7c2ea8` 复现。按项目所有者要求不执行混合负载性能 A/B；本任务未部署到 FNOS，这些功能测试不能证明 NAS CPU 降幅或第三方客户端体验变化。
+.strm 的 mediainfo/NFO 旁车仍独立读取，不启动或计入本地 ffprobe；本地视频内容变化仍派生对应探测目标，未变化视频不会因扫描附件变化而重探测。服务关停等待探测会话与活动子进程回收后，再完成后台 worker 关停。
+
+分支合并前的本机定向 Rust 回归覆盖预算原语 9/9、probe 20/20、thumbnails 18/18、跨服务/跨库混合用例 1/1、metadata 21/21、scanned_series_metadata 3/3，混合用例还验证后台预算占用期间前台 metadata 可继续完成。scanned_metadata 22/23，唯一失败也在干净基线 1e7c2ea8 复现。ffprobe 分支的自动化与探测器定向检查记录在开发文档及性能记录中。按项目所有者要求不执行后台混合负载性能 A/B；本任务未部署到 FNOS，这些功能测试不能证明 NAS CPU 降幅或第三方客户端体验变化。
 
 ## LUX-552 Web 媒体库虚拟化（2026-10-15）
 

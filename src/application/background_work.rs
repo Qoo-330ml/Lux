@@ -371,6 +371,7 @@ impl BackgroundWorkWaiter {
             stage: self.stage,
             started_at: Instant::now(),
             wait_duration,
+            cancelled_running: false,
         }
     }
 }
@@ -395,6 +396,20 @@ pub(crate) struct BackgroundWorkPermit {
     stage: BackgroundWorkStage,
     started_at: Instant,
     wait_duration: Duration,
+    cancelled_running: bool,
+}
+
+impl BackgroundWorkPermit {
+    pub(crate) fn mark_cancelled_running(&mut self) {
+        if self.cancelled_running {
+            return;
+        }
+        let mut metrics = self.budget.lock_metrics();
+        metrics.cancelled_running = metrics.cancelled_running.saturating_add(1);
+        let stage_metrics = &mut metrics.stages[self.stage.index()];
+        stage_metrics.cancelled_running = stage_metrics.cancelled_running.saturating_add(1);
+        self.cancelled_running = true;
+    }
 }
 
 impl Drop for BackgroundWorkPermit {
@@ -402,6 +417,11 @@ impl Drop for BackgroundWorkPermit {
         {
             let mut metrics = self.budget.lock_metrics();
             metrics.active = metrics.active.saturating_sub(1);
+            if self.cancelled_running {
+                metrics.cancelled_running = metrics.cancelled_running.saturating_sub(1);
+                let stage_metrics = &mut metrics.stages[self.stage.index()];
+                stage_metrics.cancelled_running = stage_metrics.cancelled_running.saturating_sub(1);
+            }
             let stage_metrics = &mut metrics.stages[self.stage.index()];
             stage_metrics.active = stage_metrics.active.saturating_sub(1);
             push_duration(&mut stage_metrics.work_ms, self.started_at.elapsed());
@@ -810,6 +830,25 @@ mod tests {
         drop(cleanup);
         assert_eq!(budget.snapshot().child_cleanup_pending, 0);
         assert_eq!(budget.snapshot().child_cleanup_pending_by_stage[6].1, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_process_retains_its_stage_count_until_its_permit_drops() {
+        let budget = Arc::new(BackgroundWorkBudget::with_capacity(1, "test"));
+        let mut permit = budget
+            .acquire(BackgroundWorkStage::Probe)
+            .await
+            .expect("probe permit should be granted");
+
+        permit.mark_cancelled_running();
+        assert_eq!(budget.snapshot().active, 1);
+        assert_eq!(budget.snapshot().cancelled_running, 1);
+        assert_eq!(budget.snapshot().cancelled_running_by_stage[5].1, 1);
+
+        drop(permit);
+        assert_eq!(budget.snapshot().active, 0);
+        assert_eq!(budget.snapshot().cancelled_running, 0);
+        assert_eq!(budget.snapshot().cancelled_running_by_stage[5].1, 0);
     }
 
     #[tokio::test]

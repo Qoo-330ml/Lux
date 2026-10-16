@@ -215,6 +215,12 @@ mod tests {
     }
 
     #[test]
+    fn probe_concurrency_treats_blank_process_overrides_as_auto() {
+        assert_eq!(parse_probe_concurrency(Some("")).unwrap(), None);
+        assert_eq!(parse_probe_concurrency(Some(" \t\n ")).unwrap(), None);
+    }
+
+    #[test]
     fn probe_concurrency_accepts_values_through_the_effective_limit() {
         assert_eq!(parse_probe_concurrency(Some("8")).unwrap(), Some(8));
         assert_eq!(

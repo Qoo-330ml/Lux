@@ -206,7 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = discovery_task.await;
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
-    shutdown_state.shutdown_background_workers().await;
+    if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
+        return Err(std::io::Error::other(error).into());
+    }
 
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
@@ -278,7 +280,9 @@ async fn shutdown_signal(
         }
     }
 
-    app_state.shutdown_background_workers().await;
+    if let Err(error) = app_state.shutdown_background_workers_checked().await {
+        error!(%error, "background workers could not drain before graceful shutdown");
+    }
     let _ = shutdown.send(true);
 }
 
