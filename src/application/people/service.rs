@@ -836,7 +836,63 @@ impl PeopleService {
             .as_deref()
             .and_then(decode_fingerprint)
             .is_some_and(|stored| stored == source_fingerprint);
-        if !relation_is_current {
+        let legacy_relation_is_current = if !relation_is_current
+            && crate::application::scanner::is_supported_scan_fingerprint(source_fingerprint)
+            && source_fingerprint.len() == 25
+        {
+            let stored = relation
+                .source_fingerprint
+                .as_deref()
+                .and_then(decode_fingerprint);
+            let Some(database) = &self.database else {
+                return Ok(false);
+            };
+            let mut locator = match (
+                relation.source_root.as_deref(),
+                relation.source_relative_path.as_deref(),
+            ) {
+                (Some(root), Some(relative)) => database
+                    .find_item_by_source_locator(root, relative)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?,
+                _ => None,
+            };
+            if locator.is_none()
+                && let (Some(media_fingerprint), Some(size), Some(modified_at)) = (
+                    relation
+                        .media_fingerprint
+                        .as_deref()
+                        .and_then(decode_fingerprint),
+                    relation.media_size,
+                    relation.media_modified_at,
+                )
+            {
+                let mut matches = database
+                    .find_items_by_source_fingerprint(
+                        &media_fingerprint,
+                        Some(size),
+                        Some(modified_at),
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                    .into_iter()
+                    .filter(|candidate| relation_media_snapshot_matches(&relation, candidate));
+                locator = matches.next();
+                if matches.next().is_some() {
+                    locator = None;
+                }
+            }
+            match (stored, locator, relation.source_relative_path.as_deref()) {
+                (Some(stored), Some(locator), Some(old_relative_path)) => {
+                    legacy_scan_fingerprint_for_path(&locator, old_relative_path)
+                        .is_some_and(|legacy| stored == legacy)
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !relation_is_current && !legacy_relation_is_current {
             return Ok(false);
         }
         if let Some(database) = &self.database {
@@ -868,7 +924,9 @@ impl PeopleService {
             .source_fingerprint
             .as_deref()
             .and_then(decode_fingerprint)
-            .filter(|fingerprint| fingerprint.len() == 32);
+            .filter(|fingerprint| {
+                crate::application::scanner::is_supported_scan_fingerprint(fingerprint)
+            });
         let Some(source_fingerprint) = source_fingerprint else {
             return Ok(false);
         };
@@ -882,7 +940,9 @@ impl PeopleService {
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()));
         }
-        Ok(source_fingerprint.len() == 32)
+        Ok(crate::application::scanner::is_supported_scan_fingerprint(
+            &source_fingerprint,
+        ))
     }
 
     pub async fn list_item_actors(&self, item_id: &str) -> Result<Vec<ActorView>, PeopleError> {
@@ -1620,6 +1680,8 @@ mod tests {
             fingerprint: Some(b"new-fingerprint".to_vec()),
             size: 100,
             modified_at: 10,
+            device: None,
+            inode: None,
             title: "Old Movie".to_owned(),
             production_year: Some(2020),
         };

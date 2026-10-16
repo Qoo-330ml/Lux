@@ -323,6 +323,93 @@ pub fn compute_file_fingerprint(
     hasher.finalize().to_vec()
 }
 
+const SCAN_FINGERPRINT_V2_PREFIX: &[u8; 9] = b"LUX-FP-2\0";
+
+pub fn compute_scan_fingerprint_v2(
+    relative_path: &str,
+    size: i64,
+    modified_at: i64,
+    device: Option<u64>,
+    inode: Option<u64>,
+) -> Vec<u8> {
+    let path_bytes = relative_path.as_bytes();
+    let mut input = Vec::with_capacity(path_bytes.len().saturating_add(64));
+    input.extend_from_slice(b"LUX-SCAN-FP-2-INPUT\0");
+    input.extend_from_slice(&(path_bytes.len() as u64).to_be_bytes());
+    input.extend_from_slice(path_bytes);
+    input.extend_from_slice(b"FILE");
+    input.push(u8::from(size >= 0));
+    input.extend_from_slice(&size.to_be_bytes());
+    input.push(u8::from(modified_at > 0));
+    input.extend_from_slice(&modified_at.to_be_bytes());
+    for value in [device, inode] {
+        match value {
+            Some(value) => {
+                input.push(1);
+                input.extend_from_slice(&value.to_be_bytes());
+            }
+            None => {
+                input.push(0);
+                input.extend_from_slice(&0_u64.to_be_bytes());
+            }
+        }
+    }
+    let digest = xxhash_rust::xxh3::xxh3_128_with_seed(&input, 0).to_be_bytes();
+    let mut fingerprint = Vec::with_capacity(SCAN_FINGERPRINT_V2_PREFIX.len() + digest.len());
+    fingerprint.extend_from_slice(SCAN_FINGERPRINT_V2_PREFIX);
+    fingerprint.extend_from_slice(&digest);
+    fingerprint
+}
+
+pub(crate) fn is_supported_scan_fingerprint(fingerprint: &[u8]) -> bool {
+    fingerprint.len() == 32
+        || fingerprint.len() == SCAN_FINGERPRINT_V2_PREFIX.len() + 16
+            && fingerprint.starts_with(SCAN_FINGERPRINT_V2_PREFIX)
+}
+
+pub(crate) fn scan_fingerprint_matches_observation(
+    baseline: &crate::storage::StoredFilesystemEntry,
+    relative_path: &str,
+    size: i64,
+    modified_at: i64,
+    device: Option<u64>,
+    inode: Option<u64>,
+) -> bool {
+    let Some(fingerprint) = baseline.fingerprint.as_deref() else {
+        return false;
+    };
+    if baseline.is_missing
+        || baseline.entry_kind != "FILE"
+        || baseline.relative_path != relative_path
+        || !is_supported_scan_fingerprint(fingerprint)
+    {
+        return false;
+    }
+
+    let Some(device) = device else {
+        return false;
+    };
+    let Some(inode) = inode else {
+        return false;
+    };
+    if size < 0 || modified_at <= 0 {
+        return false;
+    }
+
+    let stat_matches = baseline.size == size
+        && baseline.modified_at == modified_at
+        && baseline.device == i64::try_from(device).ok()
+        && baseline.inode == i64::try_from(inode).ok();
+    if stat_matches {
+        return true;
+    }
+
+    fingerprint.len() == 32
+        && fingerprint
+            == compute_file_fingerprint(relative_path, size, modified_at, Some(device), Some(inode))
+                .as_slice()
+}
+
 fn manifest_entry_observation(
     relative_path: String,
     entry_kind: &str,
@@ -338,7 +425,12 @@ fn manifest_entry_observation(
         .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0);
     let (device, inode) = file_identity(metadata);
-    let fingerprint = compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+    let fingerprint_pending = entry_kind == "FILE";
+    let fingerprint = if fingerprint_pending {
+        Vec::new()
+    } else {
+        compute_file_fingerprint(&relative_path, size, modified_at, device, inode)
+    };
     Ok(NewScanManifestEntry {
         relative_path,
         entry_kind: entry_kind.to_owned(),
@@ -347,6 +439,7 @@ fn manifest_entry_observation(
         device: device.and_then(|device| i64::try_from(device).ok()),
         inode: inode.and_then(|inode| i64::try_from(inode).ok()),
         fingerprint,
+        fingerprint_pending,
     })
 }
 
@@ -376,12 +469,17 @@ fn manifest_entry_observation_from_stat(
     let modified_at = if modified_at < 0 {
         0
     } else {
-        i64::try_from(modified_at).unwrap_or(i64::MAX)
+        // Zero marks a timestamp that cannot safely participate in baseline reuse.
+        i64::try_from(modified_at).unwrap_or(0)
     };
     let device = u64::try_from(metadata.st_dev).ok();
     let inode: u64 = metadata.st_ino;
-    let fingerprint =
-        compute_file_fingerprint(&relative_path, size, modified_at, device, Some(inode));
+    let fingerprint_pending = entry_kind == "FILE";
+    let fingerprint = if fingerprint_pending {
+        Vec::new()
+    } else {
+        compute_file_fingerprint(&relative_path, size, modified_at, device, Some(inode))
+    };
     Ok(NewScanManifestEntry {
         relative_path,
         entry_kind: entry_kind.to_owned(),
@@ -390,13 +488,46 @@ fn manifest_entry_observation_from_stat(
         device: device.and_then(|device| i64::try_from(device).ok()),
         inode: i64::try_from(inode).ok(),
         fingerprint,
+        fingerprint_pending,
     })
 }
 
-async fn current_file_fingerprint(
+#[derive(Clone, Debug)]
+struct CurrentFileObservation {
+    relative_path: String,
+    size: i64,
+    modified_at: i64,
+    device: Option<u64>,
+    inode: Option<u64>,
+}
+
+impl CurrentFileObservation {
+    fn fingerprint_v2(&self) -> Vec<u8> {
+        compute_scan_fingerprint_v2(
+            &self.relative_path,
+            self.size,
+            self.modified_at,
+            self.device,
+            self.inode,
+        )
+    }
+
+    fn matches(&self, baseline: &crate::storage::StoredFilesystemEntry) -> bool {
+        scan_fingerprint_matches_observation(
+            baseline,
+            &self.relative_path,
+            self.size,
+            self.modified_at,
+            self.device,
+            self.inode,
+        )
+    }
+}
+
+async fn current_file_observation(
     root_path: &Path,
     path: &Path,
-) -> Result<(String, Vec<u8>), ScannerError> {
+) -> Result<CurrentFileObservation, ScannerError> {
     let relative_path = path
         .strip_prefix(root_path)
         .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -418,8 +549,13 @@ async fn current_file_fingerprint(
         .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0);
     let (device, inode) = file_identity(&metadata);
-    let fingerprint = compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
-    Ok((relative_path, fingerprint))
+    Ok(CurrentFileObservation {
+        relative_path,
+        size,
+        modified_at,
+        device,
+        inode,
+    })
 }
 
 fn file_identity(metadata: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {

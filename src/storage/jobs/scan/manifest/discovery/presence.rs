@@ -38,15 +38,22 @@ impl Database {
                 if entries.is_empty() {
                     continue;
                 }
-                let values = std::iter::repeat_n("(?, ?, ?)", entries.len())
+                let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
                     .collect::<Vec<_>>()
                     .join(", ");
                 let postgres_update_from = self.backend() == DatabaseBackend::Postgres;
                 let query = if postgres_update_from {
                     format!(
-                        "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES {values})
+                        "WITH incoming(
+                             filesystem_entry_id, relative_path, fingerprint, size,
+                             modified_at, device, inode
+                         ) AS (VALUES {values})
                          UPDATE filesystem_entries AS current
-                         SET last_seen_generation = ?,
+                         SET size = incoming.size,
+                             modified_at = incoming.modified_at,
+                             device = incoming.device,
+                             inode = incoming.inode,
+                             last_seen_generation = ?,
                              last_seen_change_kind = NULL
                          FROM incoming
                          WHERE current.id = incoming.filesystem_entry_id
@@ -55,13 +62,15 @@ impl Database {
                            AND current.fingerprint = incoming.fingerprint
                            AND current.entry_kind = 'FILE'
                            AND current.is_missing = 0
-                           AND (current.last_seen_generation IS NULL
-                                OR current.last_seen_generation <> ?
-                                OR current.last_seen_change_kind IS NOT NULL)"
+                           AND current.entry_kind = 'FILE'
+                           AND current.is_missing = 0"
                     )
                 } else {
                     format!(
-                        "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES {values}),
+                        "WITH incoming(
+                                  filesystem_entry_id, relative_path, fingerprint, size,
+                                  modified_at, device, inode
+                              ) AS (VALUES {values}),
                               matching(filesystem_entry_id) AS (
                                   SELECT incoming.filesystem_entry_id
                                   FROM incoming
@@ -74,12 +83,13 @@ impl Database {
                                     AND current.is_missing = 0
                               )
                          UPDATE filesystem_entries
-                         SET last_seen_generation = ?,
+                         SET size = (SELECT size FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                             modified_at = (SELECT modified_at FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                             device = (SELECT device FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                             inode = (SELECT inode FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                             last_seen_generation = ?,
                              last_seen_change_kind = NULL
-                         WHERE id IN (SELECT filesystem_entry_id FROM matching)
-                           AND (last_seen_generation IS NULL
-                                OR last_seen_generation <> ?
-                                OR last_seen_change_kind IS NOT NULL)"
+                         WHERE id IN (SELECT filesystem_entry_id FROM matching)"
                     )
                 };
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -87,18 +97,16 @@ impl Database {
                     statement = statement
                         .bind(&entry.filesystem_entry_id)
                         .bind(&entry.relative_path)
-                        .bind(&entry.fingerprint);
+                        .bind(&entry.fingerprint)
+                        .bind(entry.size)
+                        .bind(entry.modified_at)
+                        .bind(entry.device)
+                        .bind(entry.inode);
                 }
                 statement = if postgres_update_from {
-                    statement
-                        .bind(generation)
-                        .bind(chunk.library_root_id)
-                        .bind(generation)
+                    statement.bind(generation).bind(chunk.library_root_id)
                 } else {
-                    statement
-                        .bind(chunk.library_root_id)
-                        .bind(generation)
-                        .bind(generation)
+                    statement.bind(chunk.library_root_id).bind(generation)
                 };
                 let updated = statement
                     .execute(&mut **transaction)

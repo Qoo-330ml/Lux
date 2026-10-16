@@ -266,8 +266,14 @@ impl ChapterDetectionService {
                 }
                 let input_fingerprint = chapter_input_fingerprint(source, remote_lookup, options)?;
                 let state = source.state.as_ref();
-                let input_changed =
-                    state.is_none_or(|value| value.input_fingerprint != input_fingerprint);
+                let input_changed = state.is_none_or(|value| {
+                    !chapter_source_state_matches(
+                        source,
+                        remote_lookup,
+                        options,
+                        &value.input_fingerprint,
+                    )
+                });
                 let retry_blocked = !force_refresh
                     && !input_changed
                     && state
@@ -316,8 +322,11 @@ impl ChapterDetectionService {
                         && source.state.as_ref().is_some_and(|state| {
                             state.intro_fingerprint.is_some()
                                 && state.credits_fingerprint.is_some()
-                                && chapter_input_fingerprint(source, false, options).is_some_and(
-                                    |fingerprint| fingerprint == state.input_fingerprint,
+                                && chapter_source_state_matches(
+                                    source,
+                                    false,
+                                    options,
+                                    &state.input_fingerprint,
                                 )
                         })
                 }) else {
@@ -1518,6 +1527,53 @@ fn chapter_input_fingerprint(
     remote_lookup: bool,
     options: ChapterDetectionOptions,
 ) -> Option<Vec<u8>> {
+    chapter_input_fingerprint_with_local_source(
+        source,
+        remote_lookup,
+        options,
+        source.fingerprint.as_deref(),
+    )
+}
+
+fn chapter_source_state_matches(
+    source: &crate::storage::StoredChapterDetectionSource,
+    remote_lookup: bool,
+    options: ChapterDetectionOptions,
+    state_fingerprint: &[u8],
+) -> bool {
+    chapter_input_fingerprint(source, remote_lookup, options)
+        .is_some_and(|fingerprint| fingerprint == state_fingerprint)
+        || (!remote_lookup
+            && legacy_chapter_input_fingerprint(source, options)
+                .is_some_and(|fingerprint| fingerprint == state_fingerprint))
+}
+
+fn legacy_chapter_input_fingerprint(
+    source: &crate::storage::StoredChapterDetectionSource,
+    options: ChapterDetectionOptions,
+) -> Option<Vec<u8>> {
+    let (Some(device), Some(inode)) = (source.device, source.inode) else {
+        return None;
+    };
+    if source.size < 0 || source.modified_at <= 0 {
+        return None;
+    }
+    let legacy_source = crate::application::scanner::compute_file_fingerprint(
+        &source.relative_path,
+        source.size,
+        source.modified_at,
+        Some(u64::try_from(device).ok()?),
+        Some(u64::try_from(inode).ok()?),
+    );
+    chapter_input_fingerprint_with_local_source(source, false, options, Some(&legacy_source))
+}
+
+fn chapter_input_fingerprint_with_local_source(
+    source: &crate::storage::StoredChapterDetectionSource,
+    remote_lookup: bool,
+    options: ChapterDetectionOptions,
+    local_source_fingerprint: Option<&[u8]>,
+) -> Option<Vec<u8>> {
     let mut input = Vec::new();
     if remote_lookup {
         let ids = provider_ids(source.provider_ids_json.as_deref());
@@ -1567,10 +1623,7 @@ fn chapter_input_fingerprint(
                 .as_bytes(),
         );
     } else {
-        let fingerprint = source
-            .fingerprint
-            .as_deref()
-            .filter(|value| !value.is_empty())?;
+        let fingerprint = local_source_fingerprint.filter(|value| !value.is_empty())?;
         input.extend_from_slice(b"local\0");
         input.extend_from_slice(fingerprint);
     }
@@ -1633,9 +1686,10 @@ fn should_refresh_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        FingerprintError, StoredChapterDetectionItem, canonicalize_raw_fingerprint,
-        chapter_batch_ranges, chapter_batch_ranges_with_limit, minimum_episode_count, provider_ids,
-        remote_lookup_episode, should_refresh_source,
+        ChapterDetectionOptions, FingerprintError, StoredChapterDetectionItem,
+        canonicalize_raw_fingerprint, chapter_batch_ranges, chapter_batch_ranges_with_limit,
+        chapter_input_fingerprint, chapter_source_state_matches, minimum_episode_count,
+        provider_ids, remote_lookup_episode, should_refresh_source,
     };
 
     #[test]
@@ -1703,6 +1757,63 @@ mod tests {
             false
         ));
         assert!(should_refresh_source(Some("FOUND"), Some(100), 200, true));
+    }
+
+    #[test]
+    fn legacy_chapter_cache_matches_after_scan_fingerprint_migration() {
+        let relative_path = "Series/S01E01.mkv";
+        let size = 1_024;
+        let modified_at = 100_000_000;
+        let device = 8_u64;
+        let inode = 13_u64;
+        let legacy_source = crate::application::scanner::compute_file_fingerprint(
+            relative_path,
+            size,
+            modified_at,
+            Some(device),
+            Some(inode),
+        );
+        let legacy = crate::storage::StoredChapterDetectionSource {
+            source_id: "source".to_owned(),
+            item_id: "episode".to_owned(),
+            season_id: "season".to_owned(),
+            fingerprint: Some(legacy_source),
+            relative_path: relative_path.to_owned(),
+            size,
+            modified_at,
+            device: Some(device as i64),
+            inode: Some(inode as i64),
+            duration_ticks: Some(1_800_000_000),
+            provider_ids_json: None,
+            series_provider_ids_json: None,
+            season_number: Some(1),
+            episode_number: Some(1),
+            state: None,
+        };
+        let options = ChapterDetectionOptions::default();
+        let old_input = chapter_input_fingerprint(&legacy, false, options)
+            .expect("legacy chapter input fingerprint");
+        let migrated = crate::storage::StoredChapterDetectionSource {
+            fingerprint: Some(crate::application::scanner::compute_scan_fingerprint_v2(
+                relative_path,
+                size,
+                modified_at,
+                Some(device),
+                Some(inode),
+            )),
+            ..legacy
+        };
+
+        assert!(chapter_source_state_matches(
+            &migrated, false, options, &old_input,
+        ));
+        let changed = crate::storage::StoredChapterDetectionSource {
+            modified_at: modified_at + 1,
+            ..migrated
+        };
+        assert!(!chapter_source_state_matches(
+            &changed, false, options, &old_input,
+        ));
     }
 
     #[test]

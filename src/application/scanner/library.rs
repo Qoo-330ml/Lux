@@ -1001,21 +1001,34 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
         let existing_entry = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?;
         let mut existing_entry = existing_entry;
+        let device = device.and_then(|value| i64::try_from(value).ok());
         let inode = inode.and_then(|value| i64::try_from(value).ok());
         if existing_entry.is_none()
-            && let Some(inode) = inode
+            && let Some(matched_device) = device
+            && let Some(matched_inode) = inode
             && let Some(entry) = self
                 .database
-                .find_filesystem_entry_by_inode(library_id_text, &root.id, inode, &relative_path)
+                .find_filesystem_entry_by_inode(
+                    library_id_text,
+                    &root.id,
+                    matched_device,
+                    matched_inode,
+                    &relative_path,
+                )
                 .await?
         {
+            let fingerprint = compute_scan_fingerprint_v2(
+                &relative_path,
+                size,
+                modified_at,
+                u64::try_from(matched_device).ok(),
+                u64::try_from(matched_inode).ok(),
+            );
             self.database
                 .move_filesystem_entry(FilesystemEntryMove {
                     entry_id: &entry.id,
@@ -1023,13 +1036,36 @@ impl LibraryScanner {
                     relative_path: &relative_path,
                     size,
                     modified_at,
-                    inode: Some(inode),
+                    device: Some(matched_device),
+                    inode: Some(matched_inode),
                     fingerprint: &fingerprint,
                     generation,
                 })
                 .await?;
             existing_entry = Some(entry);
         }
+        let fingerprint = existing_entry
+            .as_ref()
+            .filter(|entry| {
+                scan_fingerprint_matches_observation(
+                    entry,
+                    &relative_path,
+                    size,
+                    modified_at,
+                    device.and_then(|value| u64::try_from(value).ok()),
+                    inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            })
+            .and_then(|entry| entry.fingerprint.clone())
+            .unwrap_or_else(|| {
+                compute_scan_fingerprint_v2(
+                    &relative_path,
+                    size,
+                    modified_at,
+                    device.and_then(|value| u64::try_from(value).ok()),
+                    inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            });
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
@@ -1095,7 +1131,7 @@ impl LibraryScanner {
                     .await?;
             }
             self.database
-                .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
+                .mark_filesystem_entry_seen(&existing_entry.id, generation, device, inode)
                 .await?;
             return Ok(ScanReport {
                 discovered_files: 1,
@@ -1130,7 +1166,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, device, inode)
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
@@ -1146,6 +1182,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    device,
                     inode,
                     generation,
                 )
@@ -1179,6 +1216,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
+                device,
                 inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
@@ -1277,14 +1315,35 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let device = device.and_then(|value| i64::try_from(value).ok());
         let inode = inode.and_then(|value| i64::try_from(value).ok());
-        if let Some(existing_entry) = self
+        let existing_entry = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
-            .await?
-        {
+            .await?;
+        let fingerprint = existing_entry
+            .as_ref()
+            .filter(|entry| {
+                scan_fingerprint_matches_observation(
+                    entry,
+                    &relative_path,
+                    size,
+                    modified_at,
+                    device.and_then(|value| u64::try_from(value).ok()),
+                    inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            })
+            .and_then(|entry| entry.fingerprint.clone())
+            .unwrap_or_else(|| {
+                compute_scan_fingerprint_v2(
+                    &relative_path,
+                    size,
+                    modified_at,
+                    device.and_then(|value| u64::try_from(value).ok()),
+                    inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            });
+        if let Some(existing_entry) = existing_entry {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 let expected_parent_identity =
                     movie_parent_folder_identity(&root.id, &relative_path);
@@ -1311,7 +1370,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, device, inode)
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
@@ -1325,6 +1384,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    device,
                     inode,
                     generation,
                 )
@@ -1401,6 +1461,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
+                device,
                 inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
@@ -1891,9 +1952,14 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
-        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+        if !scan_fingerprint_matches_observation(
+            existing_entry,
+            &relative_path,
+            size,
+            modified_at,
+            device,
+            inode,
+        ) {
             return Ok(MovieQuickScanResult::Rescan);
         }
         let expected_parent_identity =
@@ -1973,8 +2039,8 @@ impl LibraryScanner {
         path: &Path,
         existing_entry: &StoredFilesystemEntry,
     ) -> Result<Option<(String, ScanReport)>, ScannerError> {
-        let (_, fingerprint) = current_file_fingerprint(root_path, path).await?;
-        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+        let observation = current_file_observation(root_path, path).await?;
+        if !observation.matches(existing_entry) {
             return Ok(None);
         }
         Ok(Some((
@@ -2003,18 +2069,12 @@ impl LibraryScanner {
         if is_strm_file(path) {
             return Ok(None);
         }
-        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
-        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+        let observation = current_file_observation(root_path, path).await?;
+        let Some(existing_entry) = existing_entries.get(&observation.relative_path) else {
             return Ok(None);
         };
         let Some((entry_id, report, provider_update)) = self
-            .scan_episode_file_if_unchanged_entry(
-                root,
-                path,
-                &relative_path,
-                &fingerprint,
-                existing_entry,
-            )
+            .scan_episode_file_if_unchanged_entry(root, path, &observation, existing_entry)
             .await?
         else {
             return Ok(None);
@@ -2034,8 +2094,7 @@ impl LibraryScanner {
         &self,
         root: &StoredLibraryRoot,
         path: &Path,
-        relative_path: &str,
-        fingerprint: &[u8],
+        observation: &CurrentFileObservation,
         existing_entry: &StoredFilesystemEntry,
     ) -> Result<EpisodeQuickResult, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -2047,13 +2106,13 @@ impl LibraryScanner {
         if is_strm_file(path) {
             return Ok(None);
         }
-        if existing_entry.fingerprint.as_deref() != Some(fingerprint) {
+        if !observation.matches(existing_entry) {
             return Ok(None);
         }
         if existing_entry.item_id.is_none() {
             return Ok(None);
         }
-        let hierarchy = episode_hierarchy(relative_path, &parsed);
+        let hierarchy = episode_hierarchy(&observation.relative_path, &parsed);
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
         if existing_entry.item_identity_key.as_deref() != Some(episode_identity.as_str()) {
@@ -2113,15 +2172,13 @@ impl LibraryScanner {
             let root = root.clone();
             let root_path = root_path.to_owned();
             let path = path.clone();
-            let relative_path = relative_path.to_owned();
             tasks.spawn(async move {
-                let (_, fingerprint) = current_file_fingerprint(&root_path, &path).await?;
+                let observation = current_file_observation(&root_path, &path).await?;
                 let result = scanner
                     .scan_episode_file_if_unchanged_entry(
                         &root,
                         &path,
-                        &relative_path,
-                        &fingerprint,
+                        &observation,
                         &existing_entry,
                     )
                     .await?;
@@ -2147,10 +2204,11 @@ impl LibraryScanner {
                 path: path.to_owned(),
                 source,
             })?;
-        let Some(inode) = file_identity(&metadata)
-            .1
-            .and_then(|value| i64::try_from(value).ok())
-        else {
+        let (device, inode) = file_identity(&metadata);
+        let (Some(device), Some(inode)) = (
+            device.and_then(|value| i64::try_from(value).ok()),
+            inode.and_then(|value| i64::try_from(value).ok()),
+        ) else {
             return Ok(false);
         };
         let relative_path = path
@@ -2160,7 +2218,7 @@ impl LibraryScanner {
             .ok_or(ScannerError::NonUtf8Path)?;
         Ok(self
             .database
-            .find_filesystem_entry_by_inode(library_id_text, &root.id, inode, relative_path)
+            .find_filesystem_entry_by_inode(library_id_text, &root.id, device, inode, relative_path)
             .await?
             .is_some())
     }
@@ -2212,14 +2270,15 @@ impl LibraryScanner {
         if is_strm_file(path) {
             return Ok(None);
         }
-        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
-        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+        let observation = current_file_observation(root_path, path).await?;
+        let Some(existing_entry) = existing_entries.get(&observation.relative_path) else {
             return Ok(None);
         };
-        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+        if !observation.matches(existing_entry) {
             return Ok(None);
         }
-        let expected_parent_identity = movie_parent_folder_identity(&root.id, &relative_path);
+        let expected_parent_identity =
+            movie_parent_folder_identity(&root.id, &observation.relative_path);
         if existing_entry.item_type.as_deref() == Some("MOVIE")
             && existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref()
         {
@@ -2243,35 +2302,26 @@ impl LibraryScanner {
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
         generation: &str,
     ) -> Result<(String, bool), ScannerError> {
-        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
-        let metadata = fs::metadata(path)
-            .await
-            .map_err(|source| ScannerError::Io {
-                path: path.to_owned(),
-                source,
-            })?;
-        let size = i64::try_from(metadata.len())
-            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
-            .unwrap_or(0);
-        let (_, inode) = file_identity(&metadata);
-        let inode = inode.and_then(|value| i64::try_from(value).ok());
-        if let Some(existing_entry) = existing_entries.get(&relative_path) {
-            if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice())
-                && !existing_entry.is_missing
-            {
+        let observation = current_file_observation(root_path, path).await?;
+        let relative_path = &observation.relative_path;
+        let fingerprint = observation.fingerprint_v2();
+        let device = observation
+            .device
+            .and_then(|value| i64::try_from(value).ok());
+        let inode = observation
+            .inode
+            .and_then(|value| i64::try_from(value).ok());
+        if let Some(existing_entry) = existing_entries.get(relative_path) {
+            if observation.matches(existing_entry) {
                 return Ok((existing_entry.id.clone(), false));
             }
             self.database
                 .update_filesystem_entry(
                     &existing_entry.id,
-                    size,
-                    modified_at,
+                    observation.size,
+                    observation.modified_at,
                     &fingerprint,
+                    device,
                     inode,
                     generation,
                 )
@@ -2285,8 +2335,9 @@ impl LibraryScanner {
                 library_root_id: &root.id,
                 relative_path: &relative_path,
                 entry_kind: "FILE",
-                size,
-                modified_at,
+                size: observation.size,
+                modified_at: observation.modified_at,
+                device,
                 inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,

@@ -56,6 +56,8 @@ mod subtitles;
 mod media;
 #[path = "media_merge.rs"]
 mod media_merge;
+#[path = "scan_fingerprint_migration.rs"]
+mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
 #[path = "metadata.rs"]
 mod metadata;
@@ -562,6 +564,49 @@ impl Database {
                 })?;
         }
         Ok(transaction)
+    }
+
+    pub(crate) async fn lock_scan_fingerprint_migration_state(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO scan_fingerprint_migration_state (library_id)
+             VALUES (?) ON CONFLICT (library_id) DO NOTHING",
+        )
+        .bind(library_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_fingerprint_migration_state SET updated_at = updated_at
+             WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query_scalar(
+            "SELECT CASE WHEN lease_token IS NOT NULL
+                              AND lease_expires_at > unixepoch()
+                         THEN 1 ELSE 0 END
+             FROM scan_fingerprint_migration_state WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map(|value: i64| value == 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn lock_media_items_for_update(
@@ -1410,6 +1455,10 @@ pub(crate) struct NewScanManifestPositiveIndex {
 pub(crate) struct NewScanManifestSeenFilesystemEntry {
     pub(crate) filesystem_entry_id: String,
     pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
 }
 
@@ -1418,6 +1467,7 @@ pub(crate) struct NewScanManifestFilesystemEntry<'a> {
     pub(crate) relative_path: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) last_seen_change_kind: Option<&'a str>,
@@ -1451,6 +1501,7 @@ pub(crate) struct ManifestExistingFileUpdate<'a> {
     pub(crate) expected_missing: bool,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) generation: &'a str,
@@ -1564,6 +1615,10 @@ pub(crate) struct StoredScanManifestDiffCandidate {
 pub(crate) struct StoredScanManifestFilesystemBaseline {
     pub(crate) id: String,
     pub(crate) entry_kind: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) is_missing: bool,
 }
@@ -1602,6 +1657,7 @@ pub(crate) struct NewScanManifestEntry {
     pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
+    pub(crate) fingerprint_pending: bool,
 }
 
 pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
@@ -1859,6 +1915,11 @@ fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
     pub(crate) relative_path: String,
+    pub(crate) entry_kind: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) last_seen_generation: String,
     pub(crate) is_missing: bool,
@@ -1869,6 +1930,25 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) series_provider_ids_json: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanFingerprintMigrationCandidate {
+    pub(crate) entry_id: String,
+    pub(crate) library_id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) root_path: String,
+    pub(crate) root_is_available: bool,
+    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) attempts: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanFingerprintMigrationCursor {
+    pub(crate) root_id: Option<String>,
+    pub(crate) relative_path: Option<String>,
+    pub(crate) completed_at: Option<i64>,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredItemSourceLocator {
     pub(crate) root_path: String,
@@ -1876,6 +1956,8 @@ pub(crate) struct StoredItemSourceLocator {
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) title: String,
     pub(crate) production_year: Option<i32>,
 }
@@ -1892,6 +1974,11 @@ fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
         relative_path: row.get("relative_path"),
+        entry_kind: row.get("entry_kind"),
+        size: row.get("size"),
+        modified_at: row.get("modified_at"),
+        device: row.get("device"),
+        inode: row.get("inode"),
         fingerprint: row.get("fingerprint"),
         last_seen_generation: row.get("last_seen_generation"),
         is_missing: row.get::<i64, _>("is_missing") != 0,
@@ -3389,6 +3476,11 @@ pub(crate) struct StoredChapterDetectionSource {
     pub(crate) item_id: String,
     pub(crate) season_id: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) provider_ids_json: Option<String>,
     pub(crate) series_provider_ids_json: Option<String>,
@@ -3666,6 +3758,7 @@ pub(crate) struct NewFilesystemEntry<'a> {
     pub(crate) entry_kind: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) last_seen_generation: &'a str,
@@ -3677,6 +3770,7 @@ pub(crate) struct FilesystemEntryMove<'a> {
     pub(crate) relative_path: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) generation: &'a str,
@@ -3731,6 +3825,8 @@ pub(crate) struct NewMovieFile {
     pub(crate) relative_path: String,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
     pub(crate) title: String,
     pub(crate) sort_title: String,
@@ -3752,6 +3848,7 @@ pub(crate) struct NewEpisodeFile {
     pub(crate) relative_path: String,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
     pub(crate) series_identity: String,

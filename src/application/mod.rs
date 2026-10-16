@@ -58,6 +58,7 @@ pub mod reidentify;
 pub(crate) mod remote_body;
 pub mod remote_url_policy;
 pub mod restart;
+pub mod scan_fingerprint_migration;
 pub mod scanner;
 pub mod schedule;
 pub mod scheduled_tasks;

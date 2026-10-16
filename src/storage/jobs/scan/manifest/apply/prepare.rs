@@ -147,6 +147,7 @@ impl Database {
                     relative_path: &delta.relative_path,
                     size,
                     modified_at,
+                    device: delta.device,
                     inode: delta.inode,
                     fingerprint,
                     last_seen_change_kind: None,

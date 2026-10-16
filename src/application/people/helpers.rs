@@ -1003,7 +1003,17 @@ pub(super) fn relation_media_snapshot_matches(
             .as_deref()
             .map(|fingerprint| encode_fingerprint(fingerprint) == expected_fingerprint)
             .unwrap_or(false);
-        if !matches {
+        let legacy_path = relation
+            .source_relative_path
+            .as_deref()
+            .unwrap_or(&current.relative_path);
+        if !matches
+            && legacy_scan_fingerprint_for_path(current, legacy_path)
+                .as_deref()
+                .map(encode_fingerprint)
+                .as_deref()
+                != Some(expected_fingerprint)
+        {
             return false;
         }
         if relation.media_title.as_deref().is_some_and(|title| {
@@ -1031,6 +1041,25 @@ pub(super) fn relation_media_snapshot_matches(
     }
     relation.media_production_year.is_none()
         || relation.media_production_year == current.production_year
+}
+
+pub(super) fn legacy_scan_fingerprint_for_path(
+    current: &crate::storage::StoredItemSourceLocator,
+    relative_path: &str,
+) -> Option<Vec<u8>> {
+    let (Some(device), Some(inode)) = (current.device, current.inode) else {
+        return None;
+    };
+    if current.size < 0 || current.modified_at <= 0 {
+        return None;
+    }
+    Some(crate::application::scanner::compute_file_fingerprint(
+        relative_path,
+        current.size,
+        current.modified_at,
+        Some(u64::try_from(device).ok()?),
+        Some(u64::try_from(inode).ok()?),
+    ))
 }
 
 pub(super) fn person_key_for_identities(identities: &[PersonIdentity]) -> Option<String> {

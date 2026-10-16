@@ -712,7 +712,7 @@ async fn full_scan_manifest_persists_discovery_and_reobservations_without_direct
     assert!(manifest_file_observation.0 > 0);
     assert_eq!(manifest_file_observation.1, 3);
     assert!(manifest_file_observation.2 > 0);
-    assert_eq!(manifest_file_observation.3, 32);
+    assert_eq!(manifest_file_observation.3, 25);
 
     sqlx::query(
         "UPDATE scan_manifest_directories SET state = 'PENDING'
@@ -2355,7 +2355,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 177);
+    assert_eq!(database.schema_version().await?, 180);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)

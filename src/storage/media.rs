@@ -446,7 +446,7 @@ impl Database {
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
             "SELECT lr.canonical_path, fe.relative_path,
-                    fe.fingerprint, fe.size, fe.modified_at,
+                    fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
@@ -466,6 +466,8 @@ impl Database {
                 fingerprint: row.get("fingerprint"),
                 size: row.get("size"),
                 modified_at: row.get("modified_at"),
+                device: row.get("device"),
+                inode: row.get("inode"),
                 title: row.get("title"),
                 production_year: row.get("production_year"),
             })
@@ -483,7 +485,7 @@ impl Database {
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
             "SELECT lr.canonical_path, fe.relative_path,
-                    fe.fingerprint, fe.size, fe.modified_at,
+                    fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
@@ -505,6 +507,8 @@ impl Database {
                 fingerprint: row.get("fingerprint"),
                 size: row.get("size"),
                 modified_at: row.get("modified_at"),
+                device: row.get("device"),
+                inode: row.get("inode"),
                 title: row.get("title"),
                 production_year: row.get("production_year"),
             })
@@ -518,20 +522,28 @@ impl Database {
     pub(crate) async fn find_items_by_source_fingerprint(
         &self,
         fingerprint: &[u8],
+        legacy_size: Option<i64>,
+        legacy_modified_at: Option<i64>,
     ) -> Result<Vec<StoredItemSourceLocator>, StorageError> {
         self.query(
             "SELECT lr.canonical_path, fe.relative_path,
-                    fe.fingerprint, fe.size, fe.modified_at,
+                    fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              JOIN media_items mi ON mi.id = ms.item_id
-             WHERE fe.fingerprint = ?
+             WHERE (fe.fingerprint = ? OR (
+                    length(?) = 32 AND length(fe.fingerprint) = 25
+                    AND fe.size = ? AND fe.modified_at = ?
+             ))
                AND mi.removed_at IS NULL AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id",
         )
         .bind(fingerprint)
+        .bind(fingerprint)
+        .bind(legacy_size)
+        .bind(legacy_modified_at)
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -542,6 +554,8 @@ impl Database {
                     fingerprint: row.get("fingerprint"),
                     size: row.get("size"),
                     modified_at: row.get("modified_at"),
+                    device: row.get("device"),
+                    inode: row.get("inode"),
                     title: row.get("title"),
                     production_year: row.get("production_year"),
                 })
@@ -613,8 +627,8 @@ impl Database {
         self.query(
             "INSERT INTO filesystem_entries (
                 id, library_root_id, relative_path, entry_kind, size,
-                modified_at, inode, fingerprint, last_seen_generation, is_missing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                modified_at, device, inode, fingerprint, last_seen_generation, is_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         )
         .bind(entry.id)
         .bind(entry.library_root_id)
@@ -622,6 +636,7 @@ impl Database {
         .bind(entry.entry_kind)
         .bind(entry.size)
         .bind(entry.modified_at)
+        .bind(entry.device)
         .bind(entry.inode)
         .bind(entry.fingerprint)
         .bind(entry.last_seen_generation)
@@ -647,6 +662,7 @@ impl Database {
             expected_missing,
             size,
             modified_at,
+            device,
             inode,
             fingerprint,
             generation,
@@ -661,7 +677,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE filesystem_entries
-                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                 SET size = ?, modified_at = ?, device = ?, inode = ?, fingerprint = ?,
                      last_seen_generation = ?, last_seen_change_kind = ?,
                      is_missing = 0, updated_at = unixepoch()
                  WHERE id = ? AND library_root_id = ? AND relative_path = ?
@@ -670,6 +686,7 @@ impl Database {
             )
             .bind(size)
             .bind(modified_at)
+            .bind(device)
             .bind(inode)
             .bind(fingerprint)
             .bind(generation)
@@ -746,7 +763,7 @@ impl Database {
         let batch_size = super::manifest_existing_file_update_chunk_size(self.backend());
         for chunk in updates.chunks(batch_size) {
             let values = std::iter::repeat_n(
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 chunk.len(),
             )
             .collect::<Vec<_>>()
@@ -754,13 +771,14 @@ impl Database {
             let query = format!(
                 "WITH incoming(
                      filesystem_entry_id, library_root_id, relative_path, base_fingerprint,
-                     expected_missing, size, modified_at, inode, fingerprint, generation,
+                     expected_missing, size, modified_at, device, inode, fingerprint, generation,
                      last_seen_change_kind, source_kind, edition_name, quality_label, container,
                      external_url, strm_target_kind
                  ) AS (VALUES {values})
                  UPDATE filesystem_entries AS entry
                  SET size = incoming.size,
                      modified_at = incoming.modified_at,
+                     device = incoming.device,
                      inode = incoming.inode,
                      fingerprint = incoming.fingerprint,
                      last_seen_generation = incoming.generation,
@@ -787,6 +805,7 @@ impl Database {
                     .bind(database_flag(update.expected_missing))
                     .bind(update.size)
                     .bind(update.modified_at)
+                    .bind(update.device)
                     .bind(update.inode)
                     .bind(update.fingerprint)
                     .bind(update.generation)
@@ -937,13 +956,14 @@ impl Database {
             })?;
         let mut all_chunks_inserted = true;
         for chunk in entries.chunks(batch_size) {
-            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values =
+                std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, ?, 0)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
             let query = format!(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation,
+                    modified_at, device, inode, fingerprint, last_seen_generation,
                     last_seen_change_kind, is_missing
                 ) VALUES {values}
                 ON CONFLICT(library_root_id, relative_path) DO NOTHING"
@@ -956,6 +976,7 @@ impl Database {
                     .bind(entry.relative_path)
                     .bind(entry.size)
                     .bind(entry.modified_at)
+                    .bind(entry.device)
                     .bind(entry.inode)
                     .bind(entry.fingerprint)
                     .bind(generation)
@@ -1022,13 +1043,14 @@ impl Database {
     ) -> Result<HashSet<String>, StorageError> {
         let mut inserted_paths = HashSet::with_capacity(entries.len());
         for chunk in entries.chunks(batch_size) {
-            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values =
+                std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, ?, 0)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
             let query = format!(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation,
+                    modified_at, device, inode, fingerprint, last_seen_generation,
                     last_seen_change_kind, is_missing
                 ) VALUES {values}
                 ON CONFLICT(library_root_id, relative_path) DO NOTHING
@@ -1042,6 +1064,7 @@ impl Database {
                     .bind(entry.relative_path)
                     .bind(entry.size)
                     .bind(entry.modified_at)
+                    .bind(entry.device)
                     .bind(entry.inode)
                     .bind(entry.fingerprint)
                     .bind(generation)
@@ -1080,7 +1103,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE filesystem_entries
-                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                SET size = ?, modified_at = ?, device = ?, inode = ?, fingerprint = ?,
                      last_seen_generation = ?, last_seen_change_kind = 'SIDECAR',
                      is_missing = 0, updated_at = unixepoch()
                  WHERE id = ? AND library_root_id = ? AND relative_path = ?
@@ -1089,6 +1112,7 @@ impl Database {
             )
             .bind(observation.size)
             .bind(observation.modified_at)
+            .bind(observation.device)
             .bind(observation.inode)
             .bind(observation.fingerprint.as_slice())
             .bind(generation)
@@ -2086,13 +2110,13 @@ impl Database {
         if insert_filesystem_entries {
             for chunk in files.chunks(batch_size) {
                 let values =
-                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
                         .collect::<Vec<_>>()
                         .join(", ");
                 let query = format!(
                     "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                    modified_at, device, inode, fingerprint, last_seen_generation, is_missing
                 ) VALUES {values}"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2103,7 +2127,8 @@ impl Database {
                         .bind(&file.relative_path)
                         .bind(file.size)
                         .bind(file.modified_at)
-                        .bind(Option::<i64>::None)
+                        .bind(file.device)
+                        .bind(file.inode)
                         .bind(&file.fingerprint)
                         .bind(generation);
                 }
@@ -2438,13 +2463,13 @@ impl Database {
         if insert_filesystem_entries {
             for chunk in files.chunks(batch_size) {
                 let values =
-                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
                         .collect::<Vec<_>>()
                         .join(", ");
                 let query = format!(
                     "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                    modified_at, device, inode, fingerprint, last_seen_generation, is_missing
                 ) VALUES {values}"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2455,6 +2480,7 @@ impl Database {
                         .bind(&file.relative_path)
                         .bind(file.size)
                         .bind(file.modified_at)
+                        .bind(file.device)
                         .bind(file.inode)
                         .bind(&file.fingerprint)
                         .bind(generation);

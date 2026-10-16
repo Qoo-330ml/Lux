@@ -16,6 +16,14 @@ impl Database {
         }
         let root_count = validate_scan_manifest(manifest)?;
         let mut transaction = self.begin_scan_write_transaction().await?;
+        if !self
+            .lock_scan_fingerprint_migration_state(&mut transaction, manifest.library_id)
+            .await?
+        {
+            return Err(StorageError::Conflict(
+                "scan fingerprint migration lease is active".to_owned(),
+            ));
+        }
         self.query(
             "INSERT INTO scan_jobs (
                 id, library_id, job_type, status, generation, total_count,

@@ -908,6 +908,7 @@ async fn manifest_discovery_chunk_does_not_complete_directory_after_cancel_reque
         device: None,
         inode: None,
         fingerprint: Vec::new(),
+        fingerprint_pending: false,
     }];
     let chunk = NewScanManifestDiscoveryChunk {
         manifest_id: "manifest",
@@ -1005,6 +1006,7 @@ async fn manifest_discovery_does_not_count_a_path_already_seen_in_the_generation
         device: None,
         inode: None,
         fingerprint: vec![1_u8; 32],
+        fingerprint_pending: false,
     }];
     let chunk = NewScanManifestDiscoveryChunk {
         manifest_id: "manifest",
@@ -1073,6 +1075,7 @@ async fn manifest_discovery_finalize_does_not_ignore_cancel_request()
         device: None,
         inode: None,
         fingerprint: Vec::new(),
+        fingerprint_pending: false,
     }];
     let chunk = NewScanManifestDiscoveryChunk {
         manifest_id: "manifest",

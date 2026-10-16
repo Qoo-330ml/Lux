@@ -186,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
+    luxd::application::scan_fingerprint_migration::start(database.clone(), control_rx.clone());
     app_state.start_database_diagnostics().await;
     let shutdown_state = app_state.clone();
     let app = app_with_state(app_state);

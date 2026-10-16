@@ -2466,11 +2466,14 @@ fn manifest_directory_reader_enumerates_from_the_open_directory_handle()
 
     assert!(batch.completed);
     assert_eq!(batch.child_directories, vec!["Nested"]);
+    let observed_file = batch
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == "Example.Movie.2025.mkv")
+        .ok_or("file observation is missing")?;
     assert!(
-        batch
-            .entries
-            .iter()
-            .any(|entry| entry.relative_path == "Example.Movie.2025.mkv")
+        observed_file.fingerprint_pending && observed_file.fingerprint.is_empty(),
+        "directory enumeration must defer file fingerprint computation until after baseline comparison"
     );
     assert!(
         batch
@@ -2700,6 +2703,7 @@ fn manifest_root_without_stable_identity_is_never_authoritative() {
         device: None,
         inode: None,
         fingerprint: Vec::new(),
+        fingerprint_pending: false,
     };
 
     assert!(!manifest_root_identity_matches(None, None, &observed));
