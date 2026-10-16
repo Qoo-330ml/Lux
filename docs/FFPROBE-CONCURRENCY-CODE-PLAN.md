@@ -1,6 +1,6 @@
 # ffprobe 并发优化：代码实施方案
 
-状态：实施中。LUX-561 已登记为实现任务；P1–P6 与 P7a/P7b 已落地，P7 资源接线和关停排空仍待完成，后续按本方案逐个完成并提交。日期：2026-10-16。
+状态：实施中。LUX-561 已登记为实现任务；P1–P7c 已落地，P8–P10 仍待完成，后续按本方案逐个完成并提交。日期：2026-10-16。
 优化方向已由项目所有者认可；本文件将
 [`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md)
 落实为代码职责、内部接口、执行顺序与失败回归。
@@ -224,7 +224,9 @@ with_resource_metrics 只绑定本服务的指标来源，不重建或重置共�
 | P4：子进程回收 | `src/application/probe/runner.rs`、`tests/probe.rs`、`docs/LUX-DEVELOPMENT.md` | 先复现取消 future 未确认回收的问题；超时/输出限制/取消均有真实进程验证 |
 | P5：纯算法 | `src/application/probe.rs`、`src/application/probe/adaptive.rs`、`docs/LUX-DEVELOPMENT.md` | 注入时间和吞吐序列，验证试探/平台/下降/预热/冷却；不接生产执行 |
 | P6：准入与 page 补位 | `src/application/probe.rs`、`src/application/probe/concurrency.rs`、`src/application/probe/adaptive.rs`、`src/application/probe/runner.rs`、`docs/LUX-DEVELOPMENT.md` | 私有模块单测注入 fresh runtime；多库/同库多实例受控，取消回收前不补位，page 内生效 |
-| P7：保护与关停 | `src/observability/resources.rs`、`src/application/probe.rs`、`src/application/probe/concurrency.rs`、`src/api/legacy.rs`、`docs/LUX-DEVELOPMENT.md` | 不读 CPU 使用率；陈旧 p95 失效；关闭及排空幂等；其它 worker 调度不变 |
+| P7a：资源快照 | `src/observability/resources.rs`、`docs/LUX-DEVELOPMENT.md` | probe 专用近期 p95 和 5 秒合并内存快照；原 dashboard 读取语义不变 |
+| P7b：压力控制 | `src/application/probe/adaptive.rs`、`src/application/probe/concurrency.rs`、`docs/LUX-DEVELOPMENT.md`、本方案 | 多会话取最严重档位；过期/恢复重置吞吐基线；仅压力升高时保护性下调 |
+| P7c：页面接线与关停 | `src/application/probe.rs`、`src/application/probe/concurrency.rs`、`src/api/legacy.rs`、`src/main.rs`、`docs/LUX-DEVELOPMENT.md` | 每页刷新压力；关闭新准入并唤醒页面；已有 runtime、页面会话及活动子进程排空后才关闭数据库 |
 | P8：容器默认 | `src/config/mod.rs`、`Dockerfile`、`compose.yaml`、`docs/DEPLOYMENT.md`、`docs/LUX-DEVELOPMENT.md` | 仅补现有 parser 空白值测试；不再固定注入 8，显式数值透传 |
 | P9：集成与兼容 | `tests/probe.rs`、`tests/scanning_jobs.rs`、`tests/shutdown.rs`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md` | scanner/服务调用链、旁车、变化目标及关闭子进程回归通过 |
 | P10：基准与完成 | `tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`、两份 ffprobe 设计文档 | 模拟及真实探测 A/B，校准参数并记录全量门；不使用未测量 CPU 降幅 |
@@ -249,4 +251,4 @@ P6/P7 所需 service 级隔离测试放在同模块 cfg(test) 下，可访问私
   [Notify](https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html) 和
   [oneshot Sender](https://docs.rs/tokio/latest/tokio/sync/oneshot/struct.Sender.html)；在线最新版本与 lockfile 不完全相同，
   实现以锁定版本及其编译/回归结果为准。
-- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；P1 macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。P2 已改新库默认和共享进程预算，CPU 自动预算/环境覆盖单测 1/1、新库持久化单测 1/1、`library` 13/13、`probe` 19/19 通过。P3 已将 runner、错误类型和有界子进程输出读取移动到独立模块，`probe` 19/19 通过。P4 让独立 runner owner 持有子进程，并在取消、timeout 或输出错误后持续持有资源直到 `Child::wait` 确认退出；调用者可先收到原错误，后台 reaper 继续持有 permit。wait gate 单测先按旧逻辑失败，改后通过，取消子进程的真实 PID 检查和 `probe` 20/20 通过。P5 完成纯速率状态机，涵盖预热、饱和资格、两窗升档、p95/timeout 回退、冷却、退化、停滞、失败安全档及反向降档；定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；多库/同库 session、预算下降、停滞降档、Notify 不丢唤醒、真实 permit wait gate 和取消下真实子进程均有回归覆盖。probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P7–P10、性能测量和完整完成门尚未执行。
+- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；P1 macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。P2 已改新库默认和共享进程预算，CPU 自动预算/环境覆盖单测 1/1、新库持久化单测 1/1、`library` 13/13、`probe` 19/19 通过。P3 已将 runner、错误类型和有界子进程输出读取移动到独立模块，`probe` 19/19 通过。P4 让独立 runner owner 持有子进程，并在取消、timeout 或输出错误后持续持有资源直到 `Child::wait` 确认退出；调用者可先收到原错误，后台 reaper 继续持有 permit。wait gate 单测先按旧逻辑失败，改后通过，取消子进程的真实 PID 检查和 `probe` 20/20 通过。P5 完成纯速率状态机，涵盖预热、饱和资格、两窗升档、p95/timeout 回退、冷却、退化、停滞、失败安全档及反向降档；定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；多库/同库 session、预算下降、停滞降档、Notify 不丢唤醒、真实 permit wait gate 和取消下真实子进程均有回归覆盖。probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。P7a 提供近期首页 p95 与 5 秒合并的容器内存压力快照，原 dashboard p95 语义不变。P7b 接通压力分类、多会话最保守聚合及过期/恢复基线重置，不读 CPU 使用率。P7c 在页内接入压力快照，并在 AppState 关停时关闭 registry、拒绝迟到 runtime、唤醒并排空所有页面会话及活动子进程许可；旁车空闲页过早排空回归先失败后修复。P7 控制器单测 11/11、probe 模块单测 32/32、资源模块单测 23/23、`probe` 20/20、`shutdown` 1/1 通过。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P8–P10、性能测量和完整完成门尚未执行。
