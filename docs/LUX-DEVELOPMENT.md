@@ -11836,9 +11836,9 @@ ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 k
 - [x] reader 仍按 8,000 文件读取，事务预算单独设定；release 基准报告明确记录实际事务预算和进程 CPU 时间。
 - [x] SQLite presence 更新单条语句最多分片 10,921 项（每项 3 个 bind + 3 个固定 bind，保持 SQLite 32,766 参数上限内），PostgreSQL 分片保持原值；fingerprint 匹配、旧 fingerprint 与 missing 行回归通过，CAS 与 seen-path ledger 语义不变。
 - [x] 确认 4,000 为默认事务预算：存储批次优化后 4,000/8,000 无锁 A/B 交错五轮中位数分别为首扫 2,275/2,285 ms、unchanged 重扫 1,035/1,117 ms、目录 API p95 602/599 ms、foreground p95 370/377 ms、batch p95 321/328 ms、DML 189/133，4,000 的 WAL/RSS 更低。独立写者完整事务 p95 三轮中位数为 4,000 107.1 ms、5,000 126.4 ms、6,000 150.2 ms、8,000 223.1 ms；4,000 相对 8,000 改善 52.0%，且保持 `<209 DML` 门。7,000 的单轮 unchanged 重扫超过 5% 门；5,000/6,000 未达到 50% 写者 p95 改善目标。100 ms 是期望值，4,000 实测 107.1 ms；本机 ARM64 fixture 不外推 FNOS/NAS 或 x86_64。
-- [ ] 完整 Rust / PostgreSQL gate 未全部通过。最终 `cargo build --locked`、`cargo fmt --all -- --check` 与全 targets / features Clippy 通过。`storage::repository::jobs` 为 16/16（另 2 个 PostgreSQL 用例因缺少数据库被忽略）；`scanning_jobs -- --test-threads=1` 为 89/89。并行 `scanning_jobs` 首次有 1 项报 SQLite `database is locked`，该用例隔离重跑 1/1、串行全目标通过。
+- [ ] 完整 Rust all-targets gate 未通过。最终 `cargo build --locked`、`cargo fmt --all -- --check` 与全 targets / features Clippy 通过；`storage::repository::jobs` 为 16/16，串行 `scanning_jobs` 为 89/89。并行 `scanning_jobs` 首次有 1 项报 SQLite `database is locked`，该用例隔离重跑 1/1、串行全目标通过。
 - [ ] 当前分支 `cargo test --locked --all-targets -- --test-threads=1` 的库测试为 884 passed / 1 failed / 23 ignored；失败为 `application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`，其 actor-credit 并发失败项集合不符合断言，隔离重跑 1/1 通过。此前 all-targets 在 `1e7c2ea8` 上已复现 `scanned_metadata::failed_local_poster_insert_does_not_mark_image_stage_complete`；跳过它后的测试曾因 `web_static::same_origin_web_assets_are_served_by_rust` 固定资产断言停止，使用同一构建产物在基线也复现。当前完整 gate 不能报绿。
-- [ ] PostgreSQL gate 因 `POSTGRES_TEST_DATABASE` 未配置且本机无 `pg_isready` 未运行；不能据此声称完整验收通过。
+- [x] PostgreSQL runtime gate 通过：临时 PostgreSQL 16 Alpine 容器只绑定 localhost，数据库数据位于 tmpfs；`cargo test --locked --test postgres_database -- --include-ignored --test-threads=1` 为 18/18。测试后容器已停止并自动删除。
 
 候选中间值的单轮筛选、逐轮 A/B、独立写者样本、此前基线测试复现及门禁限制见 `docs/PERFORMANCE.md`。
 #### LUX-563：SQLite Manifest 已提交分片的恢复与幂等
