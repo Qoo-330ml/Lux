@@ -150,10 +150,10 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
     let static_sql =
         "SELECT id FROM filesystem_entries WHERE library_root_id = ? AND relative_path = ?";
     let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, static_sql);
-    assert_eq!(&adapted[..], static_sql);
+    assert_eq!(adapted.as_str(), static_sql);
     println!(
         "sqlite_static_adapter_pointer_preserved={}",
-        std::ptr::eq(static_sql.as_ptr(), adapted.as_ptr())
+        std::ptr::eq(static_sql.as_ptr(), adapted.as_str().as_ptr())
     );
     let (elapsed, snapshot) = measure_operation(
         iterations,
