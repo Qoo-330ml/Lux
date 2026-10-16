@@ -1,6 +1,6 @@
 # 动态 SQL 构建与字符串分配优化设计
 
-日期：2026-10-16。状态：分步实施中；LUX-562 基线和 LUX-563 查询入口已完成。LUX-563 的局部 SQL 构造/分配收益已测量，扫描整链路收益仍待后续工作包验证。
+日期：2026-10-17。状态：S0–S7 实施和记录已完成（LUX-562–LUX-571）；最终 Rust 全量测试门未通过，PostgreSQL 运行时验证因本机没有测试实例而未完成。代码改动均在设计分支上分步提交，未推送或合并。
 
 基线：当前 `origin/test` 的 `e7107bfe`（LUX-562 开始时）。
 设计分支：`codex/dynamic-sql-optimization`。
@@ -208,7 +208,7 @@ SQLite CPU 包含在 Lux 进程内；PostgreSQL 还需单独记录数据库服�
 | S6：文件记录借用 | S1；去掉正向索引电影/剧集深复制 | `src/storage/jobs/scan/manifest/indexes.rs`、`src/storage/media.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | claim 胜者与既有媒体归并/剧集层级不变；分配下降 |
 | S7：完成门禁 | 所有保留的增量；记录 A/B 与限制 | `docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md` | 完整 Rust 门禁、实际 PostgreSQL、性能结论可复查 |
 
-进度（2026-10-16）：S0（LUX-562）、S1（LUX-563）、S2（LUX-564）、S3a（LUX-565）和 S3b（LUX-566）已完成并分别记录；S4–S7 尚未实施。S2、S3a、S3b 的 SQL 构造热命中均测到局部收益；扫描整链路收益和 PostgreSQL 运行时验证仍待 S7。S2/S3a 曾遇到 `libraries_api` 并行测试 503，本次完整门禁中该 target 14/14；本次全量测试在 `tests/probe.rs` 的 stderr 限额测试超时，隔离和串行复跑通过但根因未确认。所有全量门禁按实际结果记录，不将未执行的后续 targets 算作通过；详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-565、LUX-566 验收记录。
+进度（2026-10-17）：S0（LUX-562）、S1（LUX-563）、S2（LUX-564）、S3a（LUX-565）、S3b（LUX-566）、S4（LUX-567）、S5a（LUX-568）、S5b（LUX-569）、S6（LUX-570）和 S7（LUX-571）均已实施并有独立记录。最终只运行一次 `cargo test --locked --all-targets`：lib 为 955 passed、0 failed、23 ignored；`tests/scanned_metadata.rs` 为 21 passed、2 failed，之后 targets 未运行。一个失败此前已在基线 `3b4b7325` 重现；另一个 `local_nfo_retry_excludes_non_retryable_conflict_item` 报 `RowNotFound`，本次不重跑。构建、fmt、全 targets/all features Clippy 在 S6 代码后已通过。当前环境没有本地 PostgreSQL 服务或 `POSTGRES_TEST_*` 配置，未执行 ignored PG runtime tests。局部构造/分配 A/B 有收益，但没有扫描整链路、生产 CPU/p95、实际 PostgreSQL 或 NAS/x86_64 收益证据；详见 `docs/PERFORMANCE.md` 和 `docs/LUX-DEVELOPMENT.md` 的 LUX-571。
 
 S3–S6 按已测收益依次处理。`discovery/checkpoint.rs`、scan targets、reconciliation 等作为后续候选，只有基线显示仍是主要构造成本时另登记小任务；不默认把 215 处全部重写。B 也需单独任务，不因本文描述而提前实施。
 
@@ -255,7 +255,7 @@ S6 还应根据实际受影响的媒体/metadata helper 选择相关集成目标
 
 每个增量独立提交且不改变 schema，可按逆序回退。设计不需要新核心依赖、migration 或公共 API 修改；也不处理报告第一至第四、第六至第八点，不推送、合并或部署。
 
-LUX-562 建立了局部 SQL 构造/分配与 SQLite statement-cache 基线。LUX-563 已移除 SQLite adapter 的静态/owned SQL 复制，并减少 PostgreSQL 占位符改写的分配；五轮数据与全量 Rust 门禁结果记录在 `docs/LUX-DEVELOPMENT.md`。尚未测量扫描整链路或 NAS 性能；S2–S7 仍待实施和验收。
+LUX-562–LUX-571 已完成 A+C 方案实现：优先借用/避免多余字符串复制，按有限形状缓存完整 SQL，并仅对安全读取使用分桶；写入保持精确行数。B 临时表方案没有进入首轮。局部 SQL 文本和记录集合微基准显示明显的构造/分配下降，但不是端到端数据库或扫描收益。最终全量 Rust 测试停在 `tests/scanned_metadata.rs` 的 2 个失败，完整门禁为非绿色；本机未配置 PostgreSQL 测试实例，运行时 PG 结果留空。此状态及硬件和测量边界记录在 `docs/PERFORMANCE.md` 与 `docs/LUX-DEVELOPMENT.md`。
 
 ## 8. 依据
 

@@ -47,6 +47,24 @@ SQLx SQLite statement cache 的默认容量为 100。120 种不同形状首次�
 
 上述结果只用于比较后续局部实现。本机 ARM64 合成数据不外推 FNOS/NAS/x86_64，也不构成扫描 CPU、完整查询延迟或生产收益结论。
 
+## LUX-571 动态 SQL 优化完成门禁与综合结论（2026-10-17）
+
+最终选择是 **A+C**：有限的完整 SQL 模板缓存减少重复构造，安全读取按容量桶复用查询形状，写入保留精确行数；同时借用 SQL 和媒体文件记录，消除适配层及索引物化路径中的多余复制。B（临时表 + JOIN）暂缓，因为连接/事务生命周期和清理成本更复杂，当前没有证据表明它能改善已测热点。分项实测完整记录见 `docs/LUX-DEVELOPMENT.md` 的 LUX-565–LUX-570。
+
+| 工作负载 | 动态/复制基线 | 模板/借用结果 | 测量边界 |
+|---|---:|---:|---|
+| Manifest 基线路径，257 条 | 600 ns（592–918） | 18 ns（18–22） | SQL 构造，不含执行/分配 |
+| 目录写入，200 行 INSERT | 844 ns，3 alloc / 7,996 B | 23 ns，0 alloc | SQL 文本构造 |
+| delta verify，100 行 | 1,056 ns，3 alloc / 6,364 B，另 1 realloc / 4,932 B | 57 ns，0 alloc | SQL 文本构造 |
+| Movie 记录集合，256 条 | clone：73,408 ns，3,073 alloc / 150,928 B | 引用：70 ns，1 alloc / 2,048 B | 仅集合构造 |
+| Episode 记录集合，256 条 | clone：97,378 ns，3,841 alloc / 204,660 B | 引用：42 ns，1 alloc / 2,048 B | 仅集合构造 |
+
+这些是本机 macOS arm64 上的局部合成微基准；不同 harness 的耗时不可相加。没有测到完整扫描 CPU/p95、SQLite/PostgreSQL 执行收益或 FNOS/NAS/x86_64 收益。
+
+最终只运行一次 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --all-targets`。lib 为 955 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14，`tests/probe.rs` 为 21/21。该命令在 `tests/scanned_metadata.rs` 停止，结果 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（2 项实际、1 项预期；此前已在基线 `3b4b7325` 重现）和 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；本次未重跑）。后续 targets 未执行，不能称全量 Rust 门禁通过。`cargo build --locked`、fmt 和全 targets/all features Clippy 已在 S6 代码变更后通过，文档收尾未重跑。
+
+PostgreSQL 测试要求本地实例；本次检查没有运行中的 PostgreSQL、5432/55432 监听服务或 `POSTGRES_TEST_*` 设置，因此 ignored PG runtime tests 未运行。PostgreSQL 模板文本和参数序号有单元测试覆盖，但运行时验证仍未完成。
+
 ## 基准目标
 
 规格目标：10,000 部电影、50,000 集剧集；数据库预热、单页 50 条、扫描同时运行。API 目标为首页 p95 < 400 ms、媒体库首屏 p95 < 300 ms、搜索 p95 < 500 ms、详情 p95 < 200 ms、继续观看 p95 < 300 ms、缓存图片 p95 < 150 ms，扫描期间前台 p95 < 1 s 且不超过空闲时 2 倍。

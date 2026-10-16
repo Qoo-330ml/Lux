@@ -12050,6 +12050,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-17）：正向索引直接传入 Movie/Episode 借用记录，原有 owned-slice helper 通过一次 `Vec<&File>` 轻量适配，业务 SQL、排序和事务行为不变。借用 Movie helper 1/1、借用 Episode hierarchy helper 1/1 通过。`tests/scanning_jobs.rs` 目标为 87 passed、1 failed；claim race、重复电影来源/provider ID、streamed positive index 等相关用例通过，唯一失败 `manifest_scan_queues_attachment_removal_only_after_root_confirmation` 报 SQLite `database is locked`。按用户要求未隔离重跑。`cargo build --locked`、fmt、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，256 records、100 次）中 Movie clone 为 73,408 ns、3,073 alloc/150,928 B；引用列表 70 ns、1 alloc/2,048 B。Episode clone 为 97,378 ns、3,841 alloc/204,660 B；引用列表 42 ns、1 alloc/2,048 B。测量只比较记录集合构造，不含 SQLite 或扫描整链路。完整 all-targets 与 PostgreSQL 运行时验证留至 S7。
 
+#### LUX-571：动态 SQL 优化完成门禁与综合记录
+
+范围：完成 S0–S6 后进行一次 Rust 全目标门禁，确认 PostgreSQL 测试环境，汇总 A+C 方案的局部性能证据与未覆盖边界。没有新增代码改动。
+
+预计文件（3 个）：`docs/PERFORMANCE.md`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。
+
+验收：
+
+- [x] 记录 A+C 结论、B 的取舍、已完成的分项 A/B 和本机/微基准测量边界。
+- [x] 只运行一次最终 `cargo test --locked --all-targets`，如实记录失败 target 和未执行的后续 targets。
+- [x] 检查并记录 PostgreSQL runtime 可用性；无本地测试实例时标记未验证，不将 ignored tests 视为通过。
+- [ ] 完整 Rust all-targets 门禁全部通过。
+- [ ] 实际 PostgreSQL runtime 集成测试通过。
+
+结果（2026-10-17）：最终命令使用 `/Volumes/Toshiba/mywork/Lux/target`，运行一次后在 `tests/scanned_metadata.rs` 以 exit 101 结束。lib 为 955 passed、0 failed、23 ignored；该集成 target 为 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1；此前已在基线 `3b4b7325` 重现）与 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；此次不重跑）。此前完成的 `libraries_api` 14/14、`probe` 21/21；其余后续 targets 未执行。S6 代码后的 `cargo build --locked`、`cargo fmt --all -- --check` 和全 targets/all features Clippy 已通过，文档收尾未重复运行。环境检查未发现本地 PostgreSQL 进程、5432/55432 监听服务或 `POSTGRES_TEST_*` 配置，所以没有运行需要数据库的 ignored tests。全量门禁和 PostgreSQL runtime 两项保留未勾选；局部性能数据仅证明 SQL 文本/记录集合构造下降，不代表扫描整链路或生产 CPU 收益。
+
 
 ## 29. 参考资料
 
