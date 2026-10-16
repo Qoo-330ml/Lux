@@ -33,6 +33,7 @@ static GLOBAL_PROBE_SLOTS: OnceLock<GlobalProbeSlots> = OnceLock::new();
 mod runner;
 use runner::read_limited;
 pub use runner::{FfprobeRunner, ProbeError};
+mod adaptive;
 
 fn process_probe_hard_cap() -> Result<Option<usize>, String> {
     match probe_concurrency_override_from_env().map_err(|error| error.to_string())? {
