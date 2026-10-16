@@ -1,10 +1,10 @@
 # SQLite discovery 写事务优化方案
 
-日期：2026-10-16。状态：设计稿，未实施、未测得优化收益。
+日期：2026-10-16。状态：已实施候选优化并将 SQLite 完整写事务默认值选为 4,000；完整 all-targets 与 PostgreSQL 门仍未全部验证通过，详见 LUX-564。
 
 设计基线：`test` 的 `1e7c2ea8`。工作分支：`codex/sqlite-short-write-transactions`。
 范围：用户提供的 `cpu-hotspot-analysis.md` 第四点，仅优化 Manifest discovery 的 SQLite 写事务。
-本文不改变现行产品规格；实施前将选定增量登记到 `LUX-DEVELOPMENT.md`，一次执行一个 LUX 任务。
+本文不改变现行产品规格；实施按 `LUX-DEVELOPMENT.md` 中的 LUX-564 登记范围执行。
 
 ## 1. 结论与三个方案的取舍
 
@@ -31,7 +31,7 @@
 - `SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS=[10,20,40,80,160,250]` 用于扫描优先级和 target materialization barrier 等待，调用 `tokio::time::sleep`。真正的 SQLite 锁冲突重试在 `run_batch_with_failure_handling()`，延迟为 250/750/1500 ms，最多三次。不能把前者直接当作 SQLite BUSY 导致的忙循环；SQLite 自身的 [busy timeout 也通过 sleep 等待](https://sqlite.org/c3ref/busy_timeout.html)。
 - `docs/PERFORMANCE.md` 曾记录 8k→16k 实验：batch p95 308→588 ms、无变化重扫约慢 11.4%，因此恢复 8k。这支持重新评估事务预算，但这是历史 ARM64 fixture 数据，batch p95 也不是写锁时间，不能当成本轮 NAS 诊断或优化结果。
 
-本轮只有源码、规格及历史记录核查，没有现场 SQLite trace、FNOS 采样或新的 A/B 结果。附件中的“事务数百毫秒至数秒”和“间接 CPU 开销”仍须测量。
+本设计最初只基于源码、规格及历史记录提出实验方案；随后完成的 release A/B 与当前选择记录在 `docs/PERFORMANCE.md` 的 LUX-564 章节。附件中的“事务数百毫秒至数秒”和“间接 CPU 开销”不作为已证事实；本机 ARM64 fixture 结果也不外推 FNOS/NAS。
 
 ## 3. 事务边界与执行流程
 
@@ -185,7 +185,8 @@ LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark ./scripts/run-performan
 ## 7. 发布、回退及设计完成条件
 
 - 不需要 schema migration、指纹迁移或公开 DTO 改动；旧 checkpoint、workflow 和 format 保留。首轮也不调整其他热点或在线 metadata 并发。
-- 每个实现增量可独立回退；生产预算的改变作为最后增量。回退恢复原预算及原 application 分片路径，不删除已提交数据或 durable outbox。
-- 本轮交付为设计文档和独立分支；设计已明确原子边界、三案取舍、实验、失败恢复与性能门冲突。业务实现和效果验证均未完成，后续实现按已授权范围及项目阶段门推进。
+- 每个实现增量可独立回退；生产预算的改变作为最后增量。回退恢复原事务预算、application 分片路径及 presence SQL 分片上限，不删除已提交数据或 durable outbox。
+- 方案选择及 SQLite 微批次实现已完成：保留 WAL，A 仅采用完整数据分片提交；不引入临时表。按实测将 SQLite 事务预算固定为 4,000，reader 保持 8,000，PostgreSQL 默认值保持不变；presence fingerprint CAS 语句采用 SQLite 专用安全 bind 上限，减少大批次中的重复 statement。
+- 4,000 的候选结果通过首扫、unchanged 重扫、前台延迟、batch 尾延迟和 DML 门，独立竞争写者 p95 改善 52%。100 ms 是期望值，实测完整更新 p95 为 107.1 ms；ARM64 结果不代表 NAS/x86_64。完整 Rust all-targets 与 PostgreSQL gate 仍受基线失败和缺少本地 PostgreSQL 阻塞，需按 LUX-564 记录完成阶段审查。
 
 依据：现行 `AGENTS.md`、`LUX-DEVELOPMENT.md` 全局完成标准与 LUX-275，以及 ADR-002、ADR-043、ADR-044、ADR-045；源码定位均以设计基线为准。附件作为待核查分析输入，不作为新的执行指令或规格覆盖。
