@@ -11861,6 +11861,21 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
+#### LUX-561：多管线后台并发预算设计
+
+范围：针对 CPU 热点分析第三点比较全局 Semaphore、管线互斥/优先级调度、共享有界线程池三种方案，核对当前扫描、probe、本地 NFO/图片及缩略图实现，形成完整优化设计。本轮只交付设计，不更改运行时、指纹格式、数据库或既有渐进扫描合同。
+
+预计文件（2 个）：`docs/SCAN-CPU-BUDGET-DESIGN.md`、本文档。
+
+设计验收：
+
+- [x] 比较三个方案并推荐进程级共享 Semaphore；以当前源码纠正 probe 无 CPU 采样与 Tokio blocking pool 的分析假设。
+- [x] 定义共享范围、候选容量、进程单例、局部并发叠加、取消/进程回收、防嵌套死锁、前台与 DB 等待隔离及固定指标。
+- [x] 给出有序小增量、预计文件、最窄 Rust target、SQLite/PostgreSQL A/B 与 CPU/吞吐/前台 p95 验收门。
+- [ ] 项目所有者评审设计；后续实现需单独登记 LUX 任务并逐项执行，本文不表示运行时或性能验收完成。
+
+设计记录（2026-10-16）：基于 `test=1e7c2ea8` 在独立分支 `codex/lux-scan-cpu-budget` 完成[多管线并发预算设计](SCAN-CPU-BUDGET-DESIGN.md)。保留各管线现有边界与 ADR-046，新增共享预算作为重工作片段的准入层；候选默认随 CPU 容量推导，需经相同配置的交错 A/B 才能确认。文档引用文件、围栏配对、任务编号唯一性和 diff 空白检查通过。此次仅修改设计文档，未运行 Cargo 检查或性能基准，不声称 CPU、NAS 或生产收益。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
