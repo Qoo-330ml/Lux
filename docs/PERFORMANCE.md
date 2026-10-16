@@ -1993,6 +1993,21 @@ PERSISTED 的三轮方差较大，且耗时包括 delta 核验/写入，并不�
 | 唯一候选在最后一个 id | 37.23 / 26.87 / 30.11；30.11 | 19.36 / 22.90 / 11.51；19.36 |
 | 无候选 | 34.23 / 32.12 / 41.90；34.23 | 32.96 / 40.38 / 34.17；34.17 |
 
-这验证了 EXISTS 可在早期命中时短路；末尾命中收益较小，无候选时两种查询都要检查整个 root。测试直接用 SQLx 执行查询，没有包含 `finish_scan_manifest_diff` 的事务建立、后续计数和状态写入时间，也未覆盖 PostgreSQL。
+这验证了 `(COUNT > 0)` 与 EXISTS 的真值一致。早期命中时 EXISTS 可短路；末尾命中收益较小，无候选时仍要检查整个 root，单轮差异落在样本波动范围内。测试直接用 SQLx 执行查询，没有包含 `finish_scan_manifest_diff` 的事务建立、后续计数和状态写入时间，也未覆盖 PostgreSQL。
+
+#### 固定 root keyset 候选查询
+
+保持相同的两个 root、每 root 60k FILE、page size 500 和旧 generation fixture，先在未改生产查询上保存三轮基线，再在固定 root/path keyset 查询上运行两组各三轮样本。样本为顺序运行而非同一轮交错；机器有其他 Cargo 构建活动，候选结果组间波动明显，因此同时保留原始组，不只报单个改善比例。
+
+| 查询 | 未改实现三轮 / 中位数 | 固定 root 组 1 三轮 / 中位数 | 固定 root 组 2 三轮 / 中位数 |
+|---|---:|---:|---:|
+| LITE 候选枚举 | 7,333 / 5,234 / 6,235；6,235 ms | 275 / 272 / 273；273 ms | 713 / 705 / 767；713 ms |
+| PERSISTED 候选枚举 + delta 写入 | 16,943 / 15,777 / 16,097；16,097 ms | 1,608 / 2,054 / 1,595；1,608 ms | 2,301 / 2,262 / 2,284；2,284 ms |
+
+第二组 PERSISTED 样本把阶段拆开：候选读取为 682 / 671 / 689 ms，delta 核验与写入为 1,514 / 1,485 / 1,490 ms。两版候选页调用数相同（121，含末尾空页）；PERSISTED 总 wrapper query calls 也同为 1,561，因为每个 delta 写批仍要做基线核验、INSERT 和计数更新。性能差异来自页读取访问范围，而不是减少 SQL 语句数。
+
+SQLx SQLite 3.51.3 的原计划按 root 使用 `idx_filesystem_entries_local_metadata_backfill (library_root_id, id)`，对 tuple cursor 临时排序；PERSISTED 目录页还从 root 开头重枚举。新计划改为 `SEARCH fe USING INDEX sqlite_autoindex_filesystem_entries_2 (library_root_id=? AND relative_path>?)`，seen/delta 继续使用完整复合键 covering index，root guard 使用 `idx_scan_manifest_roots_state`，未出现 filesystem 候选排序临时 B-tree。计划中的 manifest/job 小表 SCAN 每个仅一行。
+
+这些是本机合成 SQLx SQLite 数据，不是全量扫描/API 的结论；候选计时有明显组间波动。后续性能门仍须用完整 LUX-270 fixture 在同一 ARM64 环境比较首扫、无变化重扫、目录列表与前台 p95，并单独说明 PostgreSQL/FNOS 证据。
 
 这仅是本机合成 SQLite 结果，没有 PostgreSQL、磁盘冷缓存、真实目录扫描、并发全量/增量流量、API p95、FNOS/NAS 或 x86 数据；不得据此表述生产 CPU 降幅。

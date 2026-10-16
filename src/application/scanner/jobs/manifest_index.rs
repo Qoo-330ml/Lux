@@ -1,7 +1,10 @@
 use super::*;
 
 use crate::storage::StoredScanManifestDelta;
-use crate::storage::{StoredScanManifestDiffCandidate, StoredScanManifestRemovalCandidate};
+use crate::storage::{
+    StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
+    StoredScanManifestRemovalCandidate,
+};
 
 struct ManifestApplyRootPreparation {
     files: ManifestApplyPreparedFiles,
@@ -320,35 +323,15 @@ impl ScanJobService {
         cancellation: &AtomicBool,
         page_size: i64,
     ) -> Result<Option<ScanBatchReport>, ScanJobError> {
-        let mut after_library_root_id: Option<String> = None;
-        let mut after_relative_path: Option<String> = None;
-        loop {
-            if let Some(report) = self
-                .manifest_diff_cancellation_report(&job.id, cancellation)
-                .await?
-            {
-                return Ok(Some(report));
-            }
-            let candidates = self
-                .database
-                .list_scan_manifest_removal_candidates(
-                    manifest_id,
-                    3,
-                    false,
-                    after_library_root_id.as_deref(),
-                    after_relative_path.as_deref(),
-                    page_size,
-                )
-                .await?;
-            let Some(last_candidate) = candidates.last() else {
-                break;
-            };
-            self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
-                .await?;
-            after_library_root_id = Some(last_candidate.library_root_id.clone());
-            after_relative_path = Some(last_candidate.relative_path.clone());
-        }
-        Ok(None)
+        self.persist_scan_manifest_removals_for_root_pages(
+            job,
+            manifest_id,
+            cancellation,
+            3,
+            false,
+            page_size,
+        )
+        .await
     }
 
     async fn persist_directory_scan_manifest_removals(
@@ -359,7 +342,6 @@ impl ScanJobService {
         page_size: i64,
     ) -> Result<Option<ScanBatchReport>, ScanJobError> {
         let mut after_library_root_id: Option<String> = None;
-        let mut after_relative_path: Option<String> = None;
         loop {
             if let Some(report) = self
                 .manifest_diff_cancellation_report(&job.id, cancellation)
@@ -367,41 +349,69 @@ impl ScanJobService {
             {
                 return Ok(Some(report));
             }
-            let directories = self
+            let root_ids = self
                 .database
-                .list_scan_manifest_complete_directories(
+                .list_scan_manifest_complete_roots(
                     manifest_id,
                     after_library_root_id.as_deref(),
-                    after_relative_path.as_deref(),
-                    MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
+                    MANIFEST_REMOVAL_ROOT_BATCH_SIZE,
                 )
                 .await?;
-            let Some(last_directory) = directories.last() else {
+            let Some(last_root_id) = root_ids.last().cloned() else {
                 break;
             };
-            loop {
-                if let Some(report) = self
-                    .manifest_diff_cancellation_report(&job.id, cancellation)
-                    .await?
-                {
-                    return Ok(Some(report));
+            for root_id in &root_ids {
+                let mut after_directory_path: Option<String> = None;
+                loop {
+                    if let Some(report) = self
+                        .manifest_diff_cancellation_report(&job.id, cancellation)
+                        .await?
+                    {
+                        return Ok(Some(report));
+                    }
+                    let directories = self
+                        .database
+                        .list_scan_manifest_complete_directories_for_root(
+                            manifest_id,
+                            root_id,
+                            after_directory_path.as_deref(),
+                            MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
+                        )
+                        .await?;
+                    let Some(last_directory) = directories.last() else {
+                        break;
+                    };
+                    let mut after_relative_path: Option<String> = None;
+                    loop {
+                        if let Some(report) = self
+                            .manifest_diff_cancellation_report(&job.id, cancellation)
+                            .await?
+                        {
+                            return Ok(Some(report));
+                        }
+                        let candidates = self
+                            .database
+                            .list_scan_manifest_removal_candidates_for_root(
+                                manifest_id,
+                                root_id,
+                                3,
+                                false,
+                                Some(&directories),
+                                after_relative_path.as_deref(),
+                                page_size,
+                            )
+                            .await?;
+                        let Some(last_candidate) = candidates.last() else {
+                            break;
+                        };
+                        self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
+                            .await?;
+                        after_relative_path = Some(last_candidate.relative_path.clone());
+                    }
+                    after_directory_path = Some(last_directory.relative_path.clone());
                 }
-                let candidates = self
-                    .database
-                    .list_scan_manifest_removal_candidates_for_directories(
-                        manifest_id,
-                        &directories,
-                        page_size,
-                    )
-                    .await?;
-                if candidates.is_empty() {
-                    break;
-                }
-                self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
-                    .await?;
             }
-            after_library_root_id = Some(last_directory.library_root_id.clone());
-            after_relative_path = Some(last_directory.relative_path.clone());
+            after_library_root_id = Some(last_root_id);
         }
         Ok(None)
     }
@@ -421,35 +431,15 @@ impl ScanJobService {
         {
             return Ok(None);
         }
-        let mut after_library_root_id: Option<String> = None;
-        let mut after_relative_path: Option<String> = None;
-        loop {
-            if let Some(report) = self
-                .manifest_diff_cancellation_report(&job.id, cancellation)
-                .await?
-            {
-                return Ok(Some(report));
-            }
-            let candidates = self
-                .database
-                .list_scan_manifest_removal_candidates(
-                    manifest_id,
-                    discovery_format_version,
-                    true,
-                    after_library_root_id.as_deref(),
-                    after_relative_path.as_deref(),
-                    page_size,
-                )
-                .await?;
-            let Some(last_candidate) = candidates.last() else {
-                break;
-            };
-            self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
-                .await?;
-            after_library_root_id = Some(last_candidate.library_root_id.clone());
-            after_relative_path = Some(last_candidate.relative_path.clone());
-        }
-        Ok(None)
+        self.persist_scan_manifest_removals_for_root_pages(
+            job,
+            manifest_id,
+            cancellation,
+            discovery_format_version,
+            true,
+            page_size,
+        )
+        .await
     }
 
     async fn persist_legacy_scan_manifest_removals(
@@ -460,7 +450,78 @@ impl ScanJobService {
         discovery_format_version: i64,
         page_size: i64,
     ) -> Result<Option<ScanBatchReport>, ScanJobError> {
+        self.persist_scan_manifest_removals_for_root_pages(
+            job,
+            manifest_id,
+            cancellation,
+            discovery_format_version,
+            false,
+            page_size,
+        )
+        .await
+    }
+
+    async fn persist_scan_manifest_removals_for_root_pages(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        discovery_format_version: i64,
+        uncovered_only: bool,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
         let mut after_library_root_id: Option<String> = None;
+        loop {
+            if let Some(report) = self
+                .manifest_diff_cancellation_report(&job.id, cancellation)
+                .await?
+            {
+                return Ok(Some(report));
+            }
+            let root_ids = self
+                .database
+                .list_scan_manifest_complete_roots(
+                    manifest_id,
+                    after_library_root_id.as_deref(),
+                    MANIFEST_REMOVAL_ROOT_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_root_id) = root_ids.last().cloned() else {
+                break;
+            };
+            for root_id in &root_ids {
+                if let Some(report) = self
+                    .persist_scan_manifest_removals_for_root(
+                        job,
+                        manifest_id,
+                        cancellation,
+                        root_id,
+                        discovery_format_version,
+                        uncovered_only,
+                        None,
+                        page_size,
+                    )
+                    .await?
+                {
+                    return Ok(Some(report));
+                }
+            }
+            after_library_root_id = Some(last_root_id);
+        }
+        Ok(None)
+    }
+
+    async fn persist_scan_manifest_removals_for_root(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+        library_root_id: &str,
+        discovery_format_version: i64,
+        uncovered_only: bool,
+        directories: Option<&[StoredScanManifestDirectory]>,
+        page_size: i64,
+    ) -> Result<Option<ScanBatchReport>, ScanJobError> {
         let mut after_relative_path: Option<String> = None;
         loop {
             if let Some(report) = self
@@ -471,11 +532,12 @@ impl ScanJobService {
             }
             let candidates = self
                 .database
-                .list_scan_manifest_removal_candidates(
+                .list_scan_manifest_removal_candidates_for_root(
                     manifest_id,
+                    library_root_id,
                     discovery_format_version,
-                    false,
-                    after_library_root_id.as_deref(),
+                    uncovered_only,
+                    directories,
                     after_relative_path.as_deref(),
                     page_size,
                 )
@@ -485,7 +547,6 @@ impl ScanJobService {
             };
             self.insert_scan_manifest_removal_delta_page(manifest_id, &candidates)
                 .await?;
-            after_library_root_id = Some(last_candidate.library_root_id.clone());
             after_relative_path = Some(last_candidate.relative_path.clone());
         }
         Ok(None)

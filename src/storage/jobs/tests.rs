@@ -996,6 +996,46 @@ async fn insert_manifest_diff_delta(
     Ok(())
 }
 
+async fn collect_manifest_removal_candidate_paths(
+    database: &Database,
+    manifest_id: &str,
+    root_id: &str,
+    discovery_format_version: i64,
+    uncovered_only: bool,
+    directories: Option<&[StoredScanManifestDirectory]>,
+    page_size: i64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::new();
+    let mut after_path: Option<String> = None;
+    loop {
+        let candidates = database
+            .list_scan_manifest_removal_candidates_for_root(
+                manifest_id,
+                root_id,
+                discovery_format_version,
+                uncovered_only,
+                directories,
+                after_path.as_deref(),
+                page_size,
+            )
+            .await?;
+        let Some(last_path) = candidates
+            .last()
+            .map(|candidate| candidate.relative_path.clone())
+        else {
+            break;
+        };
+        assert!(candidates.len() <= usize::try_from(page_size)?);
+        paths.extend(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.relative_path),
+        );
+        after_path = Some(last_path);
+    }
+    Ok(paths)
+}
+
 #[tokio::test]
 async fn manifest_diff_completion_preserves_all_format_candidate_checks()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1172,6 +1212,212 @@ async fn manifest_diff_completion_preserves_all_format_candidate_checks()
             .await?
     );
 
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_removal_candidates_page_within_root_and_preserve_directory_scopes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let (_job_id, manifest_id, root_id) =
+        create_manifest_diff_finish_fixture(&database, "paging", 3, 3, "LITE").await?;
+    let library_id = "manifest-diff-library-paging";
+    let second_root_id = format!("{root_id}-b");
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (?, ?, ?, ?, 1, 0)",
+        )
+        .bind(&second_root_id)
+        .bind(library_id)
+        .bind(format!("/{second_root_id}"))
+        .bind(format!("/{second_root_id}"))
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_roots (manifest_id, library_root_id, state)
+             VALUES (?, ?, 'COMPLETE')",
+        )
+        .bind(&manifest_id)
+        .bind(&second_root_id)
+        .execute(database.pool())
+        .await?;
+
+    let mut candidate_paths = vec![
+        "root.mkv",
+        "A/a.mkv",
+        "A/Nested/deep.mkv",
+        "AB/ab.mkv",
+        "wild%_\\/w.mkv",
+        "中文/电影.mkv",
+        "current.mkv",
+        "seen.mkv",
+        "delta.mkv",
+    ];
+    candidate_paths.sort_unstable();
+    let delta_entry_id = format!(
+        "paging-entry-{}",
+        candidate_paths
+            .iter()
+            .position(|path| *path == "delta.mkv")
+            .ok_or("delta fixture path is missing")?
+    );
+    for (index, path) in candidate_paths.iter().enumerate() {
+        let generation = if *path == "current.mkv" {
+            "generation-paging"
+        } else {
+            "old"
+        };
+        insert_manifest_diff_file(
+            &database,
+            &root_id,
+            &format!("paging-entry-{index}"),
+            path,
+            generation,
+        )
+        .await?;
+    }
+    insert_manifest_diff_file(
+        &database,
+        &second_root_id,
+        "paging-entry-second-root",
+        "A/a.mkv",
+        "old",
+    )
+    .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_seen_paths (manifest_id, library_root_id, relative_path)
+             VALUES (?, ?, 'seen.mkv')",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    insert_manifest_diff_delta(
+        &database,
+        &manifest_id,
+        &root_id,
+        "paging-existing-delta",
+        "delta.mkv",
+        "REMOVE",
+        None,
+        Some(&delta_entry_id),
+    )
+    .await?;
+
+    let roots = database
+        .list_scan_manifest_complete_roots(&manifest_id, None, 1)
+        .await?;
+    assert_eq!(roots, [root_id.clone()]);
+    let next_roots = database
+        .list_scan_manifest_complete_roots(&manifest_id, roots.last().map(String::as_str), 1)
+        .await?;
+    assert_eq!(next_roots, [second_root_id]);
+
+    let lite_candidates = collect_manifest_removal_candidate_paths(
+        &database,
+        &manifest_id,
+        &root_id,
+        3,
+        false,
+        None,
+        2,
+    )
+    .await?;
+    let mut expected_lite = vec![
+        "root.mkv".to_owned(),
+        "A/a.mkv".to_owned(),
+        "A/Nested/deep.mkv".to_owned(),
+        "AB/ab.mkv".to_owned(),
+        "wild%_\\/w.mkv".to_owned(),
+        "中文/电影.mkv".to_owned(),
+    ];
+    expected_lite.sort_unstable();
+    assert_eq!(lite_candidates, expected_lite);
+
+    for directory in ["", "A", "AB", "wild%_\\", "中文"] {
+        if directory.is_empty() {
+            database
+                .query(
+                    "UPDATE scan_manifest_directories SET state = 'COMPLETE'
+                     WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ''",
+                )
+                .bind(&manifest_id)
+                .bind(&root_id)
+                .execute(database.pool())
+                .await?;
+        } else {
+            database
+                .query(
+                    "INSERT INTO scan_manifest_directories (
+                         manifest_id, library_root_id, relative_path, state
+                     ) VALUES (?, ?, ?, 'COMPLETE')",
+                )
+                .bind(&manifest_id)
+                .bind(&root_id)
+                .bind(directory)
+                .execute(database.pool())
+                .await?;
+        }
+    }
+    let mut complete_directories = Vec::new();
+    let mut after_directory: Option<String> = None;
+    loop {
+        let page = database
+            .list_scan_manifest_complete_directories_for_root(
+                &manifest_id,
+                &root_id,
+                after_directory.as_deref(),
+                2,
+            )
+            .await?;
+        let Some(last_directory) = page.last() else {
+            break;
+        };
+        after_directory = Some(last_directory.relative_path.clone());
+        complete_directories.extend(page);
+    }
+    assert_eq!(complete_directories.len(), 5);
+    let persisted_candidates = collect_manifest_removal_candidate_paths(
+        &database,
+        &manifest_id,
+        &root_id,
+        3,
+        false,
+        Some(&complete_directories),
+        2,
+    )
+    .await?;
+    let mut expected_persisted = vec![
+        "root.mkv".to_owned(),
+        "A/a.mkv".to_owned(),
+        "AB/ab.mkv".to_owned(),
+        "wild%_\\/w.mkv".to_owned(),
+        "中文/电影.mkv".to_owned(),
+    ];
+    expected_persisted.sort_unstable();
+    assert_eq!(persisted_candidates, expected_persisted);
+
+    let uncovered_candidates = collect_manifest_removal_candidate_paths(
+        &database,
+        &manifest_id,
+        &root_id,
+        3,
+        true,
+        None,
+        2,
+    )
+    .await?;
+    assert_eq!(uncovered_candidates, ["A/Nested/deep.mkv"]);
     database.close().await;
     Ok(())
 }
@@ -2082,6 +2328,109 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
         Vec::new()
     };
 
+    let fixed_root_lite_plan = if backend == "sqlite" {
+        database
+            .query(
+                "EXPLAIN QUERY PLAN
+                 SELECT fe.library_root_id, fe.relative_path, fe.id, fe.fingerprint
+                 FROM filesystem_entries fe
+                 WHERE fe.library_root_id = ? AND fe.relative_path > ?
+                   AND fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                   AND EXISTS (
+                       SELECT 1 FROM scan_manifest_roots root
+                       WHERE root.manifest_id = ?
+                         AND root.library_root_id = fe.library_root_id
+                         AND root.state = 'COMPLETE'
+                   )
+                   AND COALESCE(fe.last_seen_generation, '') <> (
+                       SELECT job.generation
+                       FROM scan_manifests manifest
+                       JOIN scan_jobs job ON job.id = manifest.job_id
+                       WHERE manifest.id = ?
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_seen_paths seen
+                       WHERE seen.manifest_id = ?
+                         AND seen.library_root_id = fe.library_root_id
+                         AND seen.relative_path = fe.relative_path
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_deltas delta
+                       WHERE delta.manifest_id = ?
+                         AND delta.library_root_id = fe.library_root_id
+                         AND delta.relative_path = fe.relative_path
+                   )
+                 ORDER BY fe.relative_path LIMIT ?",
+            )
+            .bind("root-a")
+            .bind("")
+            .bind("manifest")
+            .bind("manifest")
+            .bind("manifest")
+            .bind("manifest")
+            .bind(PAGE_SIZE)
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let fixed_root_persisted_plan = if backend == "sqlite" {
+        database
+            .query(
+                r"EXPLAIN QUERY PLAN
+                  SELECT fe.library_root_id, fe.relative_path, fe.id, fe.fingerprint
+                  FROM filesystem_entries fe
+                  WHERE fe.library_root_id = ? AND fe.relative_path > ?
+                    AND fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                    AND EXISTS (
+                        SELECT 1 FROM scan_manifest_roots root
+                        WHERE root.manifest_id = ?
+                          AND root.library_root_id = fe.library_root_id
+                          AND root.state = 'COMPLETE'
+                    )
+                    AND COALESCE(fe.last_seen_generation, '') <> (
+                        SELECT job.generation
+                        FROM scan_manifests manifest
+                        JOIN scan_jobs job ON job.id = manifest.job_id
+                        WHERE manifest.id = ?
+                    )
+                    AND fe.relative_path LIKE ? ESCAPE '\'
+                    AND fe.relative_path NOT LIKE ? ESCAPE '\'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM scan_manifest_seen_paths seen
+                        WHERE seen.manifest_id = ?
+                          AND seen.library_root_id = fe.library_root_id
+                          AND seen.relative_path = fe.relative_path
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM scan_manifest_deltas delta
+                        WHERE delta.manifest_id = ?
+                          AND delta.library_root_id = fe.library_root_id
+                          AND delta.relative_path = fe.relative_path
+                    )
+                  ORDER BY fe.relative_path LIMIT ?",
+            )
+            .bind("root-a")
+            .bind("")
+            .bind("manifest")
+            .bind("manifest")
+            .bind("big/%")
+            .bind("big/%/%")
+            .bind("manifest")
+            .bind("manifest")
+            .bind(PAGE_SIZE)
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     let directory = [StoredScanManifestDirectory {
         library_root_id: "root-a".to_owned(),
         relative_path: "big".to_owned(),
@@ -2091,16 +2440,16 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
     for _ in 0..3 {
         database.reset_query_count();
         let started = Instant::now();
-        let mut after_root = None;
-        let mut after_path = None;
+        let mut after_path: Option<String> = None;
         let mut total = 0_usize;
         loop {
             let candidates = database
-                .list_scan_manifest_removal_candidates(
+                .list_scan_manifest_removal_candidates_for_root(
                     "manifest",
+                    "root-a",
                     3,
                     false,
-                    after_root.as_deref(),
+                    None,
                     after_path.as_deref(),
                     PAGE_SIZE,
                 )
@@ -2109,7 +2458,6 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
                 break;
             };
             total += candidates.len();
-            after_root = Some(last.library_root_id.clone());
             after_path = Some(last.relative_path.clone());
         }
         lite_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -2118,6 +2466,8 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
     }
 
     let mut persisted_samples_ms = Vec::with_capacity(3);
+    let mut persisted_candidate_read_ms = Vec::with_capacity(3);
+    let mut persisted_delta_write_ms = Vec::with_capacity(3);
     let mut persisted_query_counts = Vec::with_capacity(3);
     for _ in 0..3 {
         database
@@ -2127,15 +2477,24 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
         database.reset_query_count();
         let started = Instant::now();
         let mut total = 0_usize;
+        let mut after_path: Option<String> = None;
+        let mut candidate_read_elapsed_ms = 0.0;
+        let mut delta_write_elapsed_ms = 0.0;
         loop {
+            let query_started = Instant::now();
             let candidates = database
-                .list_scan_manifest_removal_candidates_for_directories(
-                    "manifest", &directory, PAGE_SIZE,
+                .list_scan_manifest_removal_candidates_for_root(
+                    "manifest",
+                    "root-a",
+                    3,
+                    false,
+                    Some(&directory),
+                    after_path.as_deref(),
+                    PAGE_SIZE,
                 )
                 .await?;
-            if candidates.is_empty() {
-                break;
-            }
+            candidate_read_elapsed_ms += query_started.elapsed().as_secs_f64() * 1_000.0;
+            let Some(last) = candidates.last() else { break };
             total += candidates.len();
             let delta_ids = candidates
                 .iter()
@@ -2154,11 +2513,16 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
                     base_fingerprint: candidate.base_fingerprint.as_deref(),
                 })
                 .collect::<Vec<_>>();
+            let insert_started = Instant::now();
             database
                 .insert_scan_manifest_deltas("manifest", &deltas)
                 .await?;
+            delta_write_elapsed_ms += insert_started.elapsed().as_secs_f64() * 1_000.0;
+            after_path = Some(last.relative_path.clone());
         }
         persisted_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        persisted_candidate_read_ms.push(candidate_read_elapsed_ms);
+        persisted_delta_write_ms.push(delta_write_elapsed_ms);
         persisted_query_counts.push(database.query_count());
         assert_eq!(total, file_count);
     }
@@ -2173,8 +2537,13 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
          completion_no_candidate_count_ms={no_candidate_count_ms:?}, \
          completion_no_candidate_exists_ms={no_candidate_exists_ms:?}, \
          lite_ms={lite_samples_ms:?}, lite_query_calls={lite_query_counts:?}, \
-         lite_query_plan={lite_plan:?}, persisted_ms={persisted_samples_ms:?}, \
-         persisted_query_calls={persisted_query_counts:?}, persisted_query_plan={persisted_plan:?}",
+         tuple_cursor_plan={lite_plan:?}, fixed_root_lite_plan={fixed_root_lite_plan:?}, \
+         persisted_ms={persisted_samples_ms:?}, \
+         persisted_candidate_read_ms={persisted_candidate_read_ms:?}, \
+         persisted_delta_write_ms={persisted_delta_write_ms:?}, \
+         persisted_query_calls={persisted_query_counts:?}, \
+         restarted_directory_plan={persisted_plan:?}, \
+         fixed_root_persisted_plan={fixed_root_persisted_plan:?}",
         postgres_version.unwrap_or_else(|| "not PostgreSQL".to_owned()),
     );
     database.close().await;

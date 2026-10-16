@@ -410,6 +410,12 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 
 验证：0136 完成后 `cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（8/8），包括 PostgreSQL format 3 根目录恢复、checkpoint 重试和升级扫描；SQLite `scanning_jobs` 69/69、`scanner` 16/16、`storage` 28/28。`cargo test --locked --test webhooks --test catalog` 为 8/8。首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1；阶段门 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo test --locked --all-targets` 均通过，机器 `uname -m=arm64`、Rust 1.97.1。两后端 60,000 文件 release 指标见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。PostgreSQL 测试使用本机 ARM64 临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
 
+## LUX-561 Manifest 删除候选兼容
+
+Manifest 删除候选仍只针对 COMPLETE 且身份复核通过的 root；每页保留 generation/最新 observation、seen-path、已存在 delta、目录直接子项/uncovered 判断和原有基线 ID/fingerprint CAS。固定 root 的 path cursor 仅存在于单次执行内；取消、数据库失败或重启仍从头枚举，并依靠已提交的 delta 幂等跳过。完成检查改为存在性判断，报表和应用使用的精确计数没有改变。该优化无 schema migration，不改变 Lux API、Webhook、Emby 或 Manifest 持久格式。
+
+SQLite 语义验证：storage 候选集合回归和 `tests/scanning_jobs.rs` 88/88 通过，覆盖格式分支、目录边界、跨 root 同名路径、特殊路径、uncovered、取消恢复、root 替换与 CAS。SQLx SQLite 3.51.3 计划复用现有 `(library_root_id, relative_path)` 唯一索引范围；性能样本见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。本次没有 PostgreSQL runtime、FNOS/NAS 或 x86 验证；不得将 SQLite 结果外推。
+
 ## LUX-288 渐进扫描与在线补缺兼容边界（规格）
 
 新建扫描 workflow 3 的目标行为是：已提交的正向索引按批次向 Lux Web 目录/首页可见；本地 NFO/图片读取由独立有界 worker 早于全库遍历结束启动；本地检查确认的缺失才进入独立 FILL_MISSING 作业。`ScanCompleted` 与 `JOB_COMPLETED` 仍表示索引完成，不等待在线补缺；Emby 路由、DTO、图片标签与授权合同不变。删除仍要求根路径完整、二次文件状态确认和基线 CAS。

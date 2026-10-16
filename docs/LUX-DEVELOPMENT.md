@@ -11879,11 +11879,13 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 1. 在未修改查询上运行可复现的 SQLx 基线，记录实际后端版本、查询计划与代表性规模数据。
 2. [x] 将四种差异完成检查改为 EXISTS，并补齐各格式语义回归。
-3. 将删除候选调度改为固定 root 的 keyset page；保留各版本目录覆盖和 generation/observation 条件，并以端到端场景验证差异集合和 finish retry。
+3. [x] 将删除候选调度改为固定 root 的 keyset page；保留各版本目录覆盖和 generation/observation 条件，并以端到端场景验证差异集合和 finish retry。
 4. 交错测量基线与实现；只有整 root missing 更新被证明为独立热点时，才评估额外索引。
 5. 执行全量完成门并记录双后端、ARM64、FNOS/x86 的证据边界。
 
 增量 A 进度（2026-10-16）：四种完成检查现以 `CASE WHEN EXISTS` 返回 0/1；workflow 1 的 observed 与 filesystem 两类候选保持独立短路判断，精确 `unchanged_count` 查询未改。LITE、PERSISTED v3、workflow 2 format 2 和 workflow 1 候选/delta 行为回归通过。SQLx SQLite 对照显示首个候选在文件顺序前部时 COUNT/EXISTS 中位数 86.1/0.91 ms，唯一候选在末尾时为 30.1/19.4 ms，无候选时为 34.2/34.2 ms；仅为本机 60k 合成库查询样本，不代表完整扫描收益。完整原始样本见 `docs/PERFORMANCE.md`。
+
+增量 B 进度（2026-10-16）：候选现在先用有界 COMPLETE-root 页分组，再在固定 root 内按 `relative_path` 标量游标读取；PERSISTED v3 每次处理同 root 的最多 128 个 COMPLETE 目录，并为每个目录页单独推进候选游标。storage 回归覆盖两 root 同名路径、多页、seen/delta/current-generation 排除、目录直接子项与根目录、uncovered 路径、`A`/`AB`、`%`/`_`/反斜杠和中文。`cargo test --locked --test scanning_jobs` 88/88 通过。SQLx SQLite 的固定 root 计划使用已有 `(library_root_id, relative_path)` 唯一索引范围并取消临时排序；候选枚举和 delta 写入的 A/B 样本及波动见 `docs/PERFORMANCE.md`。未新增 migration 或 generation 索引。
 
 ## 29. 参考资料
 
