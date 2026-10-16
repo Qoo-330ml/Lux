@@ -3,7 +3,10 @@ use super::{
     NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
     prune_sidecar_directories, sidecar_target_query,
 };
-use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
+use crate::{
+    config::{Config, DatabaseConfiguration, PostgresConnection},
+    storage::StoredScanManifestDirectory,
+};
 use sqlx::Row;
 
 #[tokio::test]
@@ -1417,6 +1420,344 @@ async fn metadata_reidentify_job_reports_items_left_pending()
         !database
             .metadata_reidentify_job_has_pending_items("job")
             .await?
+    );
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "synthetic SQLx baseline; run explicitly before and after LUX-561 changes"]
+async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    const PAGE_SIZE: i64 = 500;
+    let file_count = std::env::var("LUX_ANTIJOIN_FILE_COUNT")
+        .unwrap_or_else(|_| "60000".to_owned())
+        .parse::<usize>()?;
+    if !(1..=240_000).contains(&file_count) {
+        return Err("LUX_ANTIJOIN_FILE_COUNT must be between 1 and 240000".into());
+    }
+    let backend = std::env::var("LUX_ANTIJOIN_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    let database_configuration = match backend.as_str() {
+        "sqlite" => DatabaseConfiguration::Sqlite,
+        "postgres" => {
+            let database = std::env::var("POSTGRES_TEST_DATABASE")?;
+            if database.is_empty()
+                || matches!(database.as_str(), "postgres" | "template0" | "template1")
+            {
+                return Err(
+                    "POSTGRES_TEST_DATABASE must name a disposable non-system database".into(),
+                );
+            }
+            DatabaseConfiguration::Postgres(PostgresConnection {
+                host: std::env::var("POSTGRES_TEST_HOST")
+                    .unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: std::env::var("POSTGRES_TEST_PORT")
+                    .unwrap_or_else(|_| "55432".to_owned())
+                    .parse()?,
+                database,
+                username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+                password: std::env::var("POSTGRES_TEST_PASSWORD")
+                    .unwrap_or_else(|_| "lux-test-password".to_owned()),
+                ssl_mode: "disable".to_owned(),
+            })
+        }
+        unsupported => {
+            return Err(format!(
+                "unsupported LUX_ANTIJOIN_BACKEND {unsupported:?}; expected sqlite or postgres"
+            )
+            .into());
+        }
+    };
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(&config, &database_configuration).await?;
+    let sqlite_version = if backend == "sqlite" {
+        database
+            .query_scalar("SELECT sqlite_version()")
+            .fetch_one(database.pool())
+            .await?
+    } else {
+        "not SQLite".to_owned()
+    };
+    let postgres_version: Option<String> = if backend == "postgres" {
+        database
+            .query_scalar("SELECT version()")
+            .fetch_optional(database.pool())
+            .await?
+    } else {
+        None
+    };
+    database
+        .query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Anti-join fixture', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+    for root_id in ["root-a", "root-b"] {
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES (?, 'lib', ?, ?, 1, 0)",
+            )
+            .bind(root_id)
+            .bind(format!("/{root_id}"))
+            .bind(format!("/{root_id}"))
+            .execute(database.pool())
+            .await?;
+    }
+
+    database
+        .create_scan_job(
+            "job",
+            "lib",
+            "RECONCILE_LIBRARY",
+            "generation-current",
+            0,
+            false,
+        )
+        .await?;
+    database
+        .query("UPDATE scan_jobs SET status = 'RUNNING' WHERE id = 'job'")
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: "root-a",
+    }];
+    database
+        .create_scan_manifest(&crate::storage::NewScanManifest {
+            id: "manifest",
+            job_id: "job",
+            library_id: "lib",
+            roots: &roots,
+        })
+        .await?;
+    database
+        .query(
+            "UPDATE scan_manifests SET state = 'READY_TO_DIFF', workflow_version = 2,
+                 discovery_format_version = 3, discovery_mode = 'LITE' WHERE id = 'manifest'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE scan_manifest_roots SET state = 'COMPLETE'
+             WHERE manifest_id = 'manifest' AND library_root_id = 'root-a'",
+        )
+        .execute(database.pool())
+        .await?;
+
+    for root_id in ["root-a", "root-b"] {
+        let query = if backend == "sqlite" {
+            "WITH RECURSIVE file_numbers(number) AS (
+                 SELECT 0 UNION ALL SELECT number + 1 FROM file_numbers WHERE number + 1 < ?
+             )
+             INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 fingerprint, last_seen_generation
+             )
+             SELECT ? || '-' || printf('%06d', number), ?,
+                    'big/file-' || printf('%06d', number) || '.mkv',
+                    'FILE', 1, 1, NULL, 'generation-old'
+             FROM file_numbers"
+        } else {
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 fingerprint, last_seen_generation
+             )
+             SELECT ? || '-' || LPAD(number::TEXT, 6, '0'), ?,
+                    'big/file-' || LPAD(number::TEXT, 6, '0') || '.mkv',
+                    'FILE', 1, 1, NULL, 'generation-old'
+             FROM generate_series(0, ? - 1) AS numbers(number)"
+        };
+        let mut statement = database.query(query);
+        if backend == "sqlite" {
+            statement = statement.bind(i64::try_from(file_count)?);
+        }
+        statement = statement.bind(root_id).bind(root_id);
+        if backend == "postgres" {
+            statement = statement.bind(i64::try_from(file_count)?);
+        }
+        statement.execute(database.pool()).await?;
+    }
+    database.query("ANALYZE").execute(database.pool()).await?;
+
+    let lite_plan = if backend == "sqlite" {
+        database
+            .query(
+                "EXPLAIN QUERY PLAN
+                 SELECT fe.library_root_id, fe.relative_path, fe.id, fe.fingerprint
+                 FROM filesystem_entries fe
+                 JOIN scan_manifest_roots root
+                   ON root.manifest_id = ? AND root.library_root_id = fe.library_root_id
+                  AND root.state = 'COMPLETE'
+                 JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                   AND (fe.library_root_id, fe.relative_path) > (?, ?)
+                   AND COALESCE(fe.last_seen_generation, '') <> job.generation
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_seen_paths seen
+                       WHERE seen.manifest_id = root.manifest_id
+                         AND seen.library_root_id = fe.library_root_id
+                         AND seen.relative_path = fe.relative_path
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_deltas delta
+                       WHERE delta.manifest_id = root.manifest_id
+                         AND delta.library_root_id = fe.library_root_id
+                         AND delta.relative_path = fe.relative_path
+                   )
+                 ORDER BY fe.library_root_id, fe.relative_path LIMIT ?",
+            )
+            .bind("manifest")
+            .bind("")
+            .bind("")
+            .bind(PAGE_SIZE)
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let persisted_plan = if backend == "sqlite" {
+        database
+            .query(
+                r"EXPLAIN QUERY PLAN
+                  SELECT fe.library_root_id, fe.relative_path, fe.id, fe.fingerprint
+                  FROM filesystem_entries fe
+                  JOIN scan_manifest_roots root
+                    ON root.manifest_id = ? AND root.library_root_id = fe.library_root_id
+                   AND root.state = 'COMPLETE'
+                  JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+                  JOIN scan_jobs job ON job.id = manifest.job_id
+                  WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                    AND fe.library_root_id = ?
+                    AND fe.relative_path LIKE ? ESCAPE '\'
+                    AND fe.relative_path NOT LIKE ? ESCAPE '\'
+                    AND COALESCE(fe.last_seen_generation, '') <> job.generation
+                    AND NOT EXISTS (
+                        SELECT 1 FROM scan_manifest_seen_paths seen
+                        WHERE seen.manifest_id = ? AND seen.library_root_id = fe.library_root_id
+                          AND seen.relative_path = fe.relative_path
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM scan_manifest_deltas delta
+                        WHERE delta.manifest_id = ? AND delta.library_root_id = fe.library_root_id
+                          AND delta.relative_path = fe.relative_path
+                    )
+                  ORDER BY fe.library_root_id, fe.relative_path LIMIT ?",
+            )
+            .bind("manifest")
+            .bind("root-a")
+            .bind("big/%")
+            .bind("big/%/%")
+            .bind("manifest")
+            .bind("manifest")
+            .bind(PAGE_SIZE)
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let directory = [StoredScanManifestDirectory {
+        library_root_id: "root-a".to_owned(),
+        relative_path: "big".to_owned(),
+    }];
+    let mut lite_samples_ms = Vec::with_capacity(3);
+    let mut lite_query_counts = Vec::with_capacity(3);
+    for _ in 0..3 {
+        database.reset_query_count();
+        let started = Instant::now();
+        let mut after_root = None;
+        let mut after_path = None;
+        let mut total = 0_usize;
+        loop {
+            let candidates = database
+                .list_scan_manifest_removal_candidates(
+                    "manifest",
+                    3,
+                    false,
+                    after_root.as_deref(),
+                    after_path.as_deref(),
+                    PAGE_SIZE,
+                )
+                .await?;
+            let Some(last) = candidates.last() else {
+                break;
+            };
+            total += candidates.len();
+            after_root = Some(last.library_root_id.clone());
+            after_path = Some(last.relative_path.clone());
+        }
+        lite_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        lite_query_counts.push(database.query_count());
+        assert_eq!(total, file_count);
+    }
+
+    let mut persisted_samples_ms = Vec::with_capacity(3);
+    let mut persisted_query_counts = Vec::with_capacity(3);
+    for _ in 0..3 {
+        database
+            .query("DELETE FROM scan_manifest_deltas WHERE manifest_id = 'manifest'")
+            .execute(database.pool())
+            .await?;
+        database.reset_query_count();
+        let started = Instant::now();
+        let mut total = 0_usize;
+        loop {
+            let candidates = database
+                .list_scan_manifest_removal_candidates_for_directories(
+                    "manifest", &directory, PAGE_SIZE,
+                )
+                .await?;
+            if candidates.is_empty() {
+                break;
+            }
+            total += candidates.len();
+            let delta_ids = candidates
+                .iter()
+                .map(|_| uuid::Uuid::now_v7().to_string())
+                .collect::<Vec<_>>();
+            let deltas = candidates
+                .iter()
+                .zip(&delta_ids)
+                .map(|(candidate, id)| NewScanManifestDelta {
+                    id,
+                    library_root_id: &candidate.library_root_id,
+                    relative_path: &candidate.relative_path,
+                    observation_sequence: None,
+                    delta_kind: "REMOVE",
+                    base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                    base_fingerprint: candidate.base_fingerprint.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            database
+                .insert_scan_manifest_deltas("manifest", &deltas)
+                .await?;
+        }
+        persisted_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        persisted_query_counts.push(database.query_count());
+        assert_eq!(total, file_count);
+    }
+
+    eprintln!(
+        "LUX-561 baseline: backend={backend}, sqlite_version={sqlite_version}, \
+         postgres_version={}, file_count_per_root={file_count}, page_size={PAGE_SIZE}, \
+         lite_ms={lite_samples_ms:?}, lite_query_calls={lite_query_counts:?}, \
+         lite_query_plan={lite_plan:?}, persisted_ms={persisted_samples_ms:?}, \
+         persisted_query_calls={persisted_query_counts:?}, persisted_query_plan={persisted_plan:?}",
+        postgres_version.unwrap_or_else(|| "not PostgreSQL".to_owned()),
     );
     database.close().await;
     Ok(())

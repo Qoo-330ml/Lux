@@ -11873,7 +11873,7 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 - [ ] 只有实测证明新增 generation 索引净收益后才追加 SQLite/PostgreSQL migration；否则记录不新增索引的结论。
 - [ ] 定向 `storage`/`scanning_jobs` 测试、性能记录、fmt、build、全目标 Clippy 与全量 Rust 完成门结果如实记录。
 
-方案和增量文件计划：[`NOT-EXISTS-OPTIMIZATION-PLAN.md`](NOT-EXISTS-OPTIMIZATION-PLAN.md)。基线 SQLx benchmark 位于 `tests/performance.rs`，语义和分页回归在 `src/storage/jobs/tests.rs`、`tests/scanning_jobs.rs`；查询实现位于 `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs` 和 `src/application/scanner/jobs/manifest_index.rs`。结果更新到本文、`docs/PERFORMANCE.md` 与 `docs/COMPATIBILITY.md`。若索引增量单独证明有必要，再按新增 migration 单独拆分并验证空库与旧库升级。
+方案和增量文件计划：[`NOT-EXISTS-OPTIMIZATION-PLAN.md`](NOT-EXISTS-OPTIMIZATION-PLAN.md)。storage SQLx 基线及语义回归位于 `src/storage/jobs/tests.rs`，端到端分页回归在 `tests/scanning_jobs.rs`；查询实现位于 `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs` 和 `src/application/scanner/jobs/manifest_index.rs`。完整扫描 A/B 复用 `tests/performance.rs`。结果更新到本文、`docs/PERFORMANCE.md` 与 `docs/COMPATIBILITY.md`。若索引增量单独证明有必要，再按新增 migration 单独拆分并验证空库与旧库升级。
 
 ### 增量顺序
 

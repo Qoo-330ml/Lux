@@ -1964,3 +1964,25 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 浏览器还验证了首页进入已加载详情路由后立即返回不新增四区块请求，以及 SSE 失效更新详情、原生重连重新同步后 69 秒零周期请求。首次 SSE 握手不会再次失效已加载的详情缓存，因此初始 item/images/playback 各请求一次；只有断线重连才触发一次全量媒体展示同步。自动化真实 QueryClient/组件时钟回归覆盖在线 60 秒零周期、断线 30 秒刷新和重连后再停轮询；缓存回归覆盖 30 秒内/外回访及库 ID 变化。
 
 计数不包含初次读取、重连同步或真实业务事件引起的请求；事件驱动刷新仍会发起 HTTP。没有测量 Core Web Vitals、滚动帧率、生产库查询耗时或 FNOS/NAS CPU，不将本机 fixture 结果外推为生产收益。
+
+### LUX-561 Manifest 反连接分页 SQLx 基线（2026-10-16）
+
+本地 macOS `arm64`、SQLx 0.9、实际 SQLite 3.51.3。忽略测试使用两个 root，每 root 合成 60,000 个 live FILE；目标 Manifest 只包含 `root-a`，generation 全部旧于本轮，单目录路径按字典序排列，页大小 500。完整 SQLite migrations 执行后运行 `ANALYZE`。测试 target：
+
+```bash
+CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target \
+  cargo test --locked --lib storage::repository::jobs::tests::manifest_diff_antijoin_benchmark -- --ignored --nocapture
+```
+
+三轮 SQLx 查询基线：
+
+| 路径 | 三轮耗时 | 中位数 | query-wrapper 调用数 | 工作内容 |
+|---|---:|---:|---:|---|
+| format 3 LITE generation 候选 | 3965 / 3887 / 3908 ms | 3908 ms | 121 | 120 个 500 项页及末尾空页；按 (root, path) tuple 游标 |
+| PERSISTED 目录候选 | 11279 / 18450 / 16241 ms | 16241 ms | 1561 | 候选页从头重新查询；每页另执行 delta 基线核验和写入 chunk |
+
+SQLx 实际 EXPLAIN QUERY PLAN 中，两条查询的 seen/delta 子查询均通过完整键索引查找；filesystem 外层选择 (library_root_id, id) WHERE entry_kind='FILE' AND is_missing=0 回填索引并按 root 扫描候选，随后用临时 B-tree 排序。tuple cursor 未转为 path 范围。PERSISTED 目录查询同样按 root 扫描并临时排序，且每页从头枚举。Manifest、job 的 SCAN 是本 fixture 各只有一行的小表，不是 filesystem 全表扫描。
+
+PERSISTED 的三轮方差较大，且耗时包括 delta 核验/写入，并不等同单条查询执行时间。wrapper 调用数包括同一批次内的辅助 SQL，不代表网络往返次数；SQLite 测试数据库位于临时目录。目录候选查询与 LITE 查询的 WHERE 子句和覆盖范围不同，不能单独从两个表格耗时推出查询变慢。后续 A/B 会保持同一 fixture 和工作量，并分别统计候选读取与 delta 阶段耗时。
+
+这仅是本机合成 SQLite 结果，没有 PostgreSQL、磁盘冷缓存、真实目录扫描、并发全量/增量流量、API p95、FNOS/NAS 或 x86 数据；不得据此表述生产 CPU 降幅。

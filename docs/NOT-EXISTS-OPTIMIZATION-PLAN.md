@@ -182,6 +182,8 @@ generation 每轮会更新大量行，新增索引必须把更新成本、WAL、
 完成检查实验：60,000 条均属当前 generation 时，COUNT 和 EXISTS 均约 420,000 VM 指令；存在首部未处理项时 EXISTS 能提前结束。
 新增 generation 索引还可能改变行顺序，把该未处理项放到最后，因此“换 EXISTS 就一定很快”也不成立。
 
+SQLx 基线已在 storage::repository::jobs::tests::manifest_diff_antijoin_benchmark 建立：SQLite 3.51.3、两个 60k root、每页 500。三轮 LITE tuple 候选中位数 3.91s / 121 wrapper calls；PERSISTED 目录候选加 delta 核验与写入中位数 16.24s / 1,561 calls。实际查询计划确认 seen/delta 使用完整键索引；filesystem 候选外层使用 root/id 部分索引并做临时排序，tuple cursor 未形成 path 范围。PERSISTED 方差较大，后续需拆候选读取和 delta 写入耗时并在交错 A/B 中复测。完整记录见 docs/PERFORMANCE.md。
+
 ## 7. 实施顺序、文件与验收
 
 开始生产改动前，先用增量 C 的 fixture/harness 在原版本保存 SQLx 基线，后续每个增量沿用同一组数据比较。
@@ -217,9 +219,9 @@ generation 每轮会更新大量行，新增索引必须把更新成本、WAL、
 
 ### 增量 C：性能矩阵与是否增加索引的决策
 
-预计文件：`tests/performance.rs`、`src/storage/jobs/tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/storage/jobs/tests.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
-新增显式 ignored 基准：`manifest_diff_antijoin_benchmark`，复用项目现有双后端配置，测量真实 repository 查询；与旧版本做同 fixture A/B。
+新增显式 ignored 基准：`manifest_diff_antijoin_benchmark`，放在 `src/storage/jobs/tests.rs` 以直接执行真实 storage repository 方法，复用 SQLite/PostgreSQL 配置；完整扫描 A/B 复用 `tests/performance.rs` 的现有 fixture。两类测量都与旧版本使用同 fixture 比较。
 至少 3 轮，交错运行基线/候选；记录中位数、范围和原始样本，固定数据及并发设置。
 
 | 维度 | 必测组合 |
