@@ -11880,14 +11880,16 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 - [x] probe 与 thumbnail 接入共享预算，同时保留原有专用进程上限。
 - [x] blocking closure 与监督中的子进程在调用者取消后继续持有预算；超时路径确认子进程回收后才释放名额。
 - [x] 记录全局/分 stage 活动与等待峰值、p50/p95/max、取消等待、运行中取消和子进程清理中计数；采样有界且日志不带路径或环境变量原值。
-- [ ] 混合负载 SQLite/PostgreSQL A/B 与至少三轮交错测量；性能门通过前不声称 CPU 收益或默认值已由性能数据确认。
+- [x] 项目所有者于 2026-10-16 明确免除本任务的性能 A/B；该测量不执行，CPU 收益和自动默认容量仍不作性能结论。
 - [ ] 完整 Rust 完成门全部通过。
 
 设计记录（2026-10-16）：基于 `test=1e7c2ea8` 在独立分支 `codex/lux-scan-cpu-budget` 完成[多管线并发预算设计](SCAN-CPU-BUDGET-DESIGN.md)。保留各管线现有边界与 ADR-046，新增共享预算作为重工作片段的准入层；候选默认随 CPU 容量推导，需经相同配置的交错 A/B 才能确认。文档引用文件、围栏配对、任务编号唯一性和 diff 空白检查通过。此次仅修改设计文档，未运行 Cargo 检查或性能基准，不声称 CPU、NAS 或生产收益。
 
 初始实施进度（2026-10-16）：预算核心已加入进程级异步单例、CPU/cgroup 容量推导与 `LUX_BACKGROUND_CPU_BUDGET` clamp；克隆预算跨 stage 共用 permit，统计并发峰值、等待和有界 p95 样本。先写的容量回归在旧实现上失败（4 核期望 3、实际 1）；实现后 `cargo test --locked --lib application::background_work::tests` 5/5 通过。该记录反映当时 Discovery、指纹、本地 metadata、外部进程监督、混合基准和完整 gate 尚未完成的状态。
 
-当前实施进度（2026-10-16）：预算核心通过 9/9 定向单测；Discovery/Manifest preparation 与 scanner fingerprint 在 G=1 下通过 `scanner` 18/18、`scanning_jobs` 88/88；probe/thumbnail 在 G=1 下通过 `probe` 20/20、`thumbnails` 18/18，且取消后子进程终止、回收与临时文件清理回归通过；跨服务、跨库 G=1 混合回归 `background_work_budget` 1/1 通过，并确认前台 metadata 在后台预算占用时仍能完成。metadata 目标 `metadata` 21/21、`scanned_series_metadata` 3/3、图片计算等价 lib 用例 1/1 通过；`scanned_metadata` 为 22/23。唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 上同样复现（两边均为实际 2、预期 1），已确认不是本分支新增。性能环境缺少 `LUX_PERF_MEDIA_ROOT`、ffmpeg 和 PostgreSQL 测试库，因此混合负载 SQLite/PostgreSQL A/B 尚不能运行；CPU 收益与自动默认值仍未由实测确认。完整 Rust 完成门尚待执行。
+当前实施进度（2026-10-16）：预算核心通过 9/9 定向单测；Discovery/Manifest preparation 与 scanner fingerprint 在 G=1 下通过 `scanner` 18/18、`scanning_jobs` 88/88；probe/thumbnail 在 G=1 下通过 `probe` 20/20、`thumbnails` 18/18，且取消后子进程终止、回收与临时文件清理回归通过；跨服务、跨库 G=1 混合回归 `background_work_budget` 1/1 通过，并确认前台 metadata 在后台预算占用时仍能完成。metadata 目标 `metadata` 21/21、`scanned_series_metadata` 3/3、图片计算等价 lib 用例 1/1 通过；`scanned_metadata` 为 22/23。唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 上同样复现（两边均为实际 2、预期 1），已确认不是本分支新增。项目所有者明确免除性能 A/B，因此不执行该项；CPU 收益与自动默认值仍未由实测确认。
+
+完成门更新（2026-10-16）：最终代码的 `cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；series enrichment 参数收拢后，`cargo test --locked --test metadata --test scanned_series_metadata` 为 24/24。最终代码的 `cargo test --locked --all-targets` 中 library tests 为 889 passed、23 ignored；后续运行在 `tests/scanned_metadata.rs` 停止，该目标 22 passed、1 failed。唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 也以实际 2、预期 1 复现，因此完整测试门仍不标记通过。性能 A/B 按项目所有者指示免除；CPU 收益和自动容量仍无性能实测结论。
 
 ## 29. 参考资料
 

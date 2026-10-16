@@ -6,7 +6,7 @@
 
 实现新增进程级共享预算，协调扫描准备与指纹、本地 NFO/图片计算、ffprobe 和缩略图 ffmpeg。预算容量按可见 CPU 与 cgroup CPU 限额推导，也可用 `LUX_BACKGROUND_CPU_BUDGET` 显式设置；运行时仍保留各管线原有局部并发上限。功能测试用于证明准入、取消与回收语义，不作为 CPU 性能结果。
 
-本机已核对为 macOS `arm64`，但 `LUX_PERF_MEDIA_ROOT` 未配置，ffmpeg 不可用，`POSTGRES_TEST_DATABASE` 未配置。因此没有运行混合负载 A/B，也没有 CPU p95、吞吐、内存或前台响应对比数据；报告中的 15% CPU p95 降幅只是待验证目标。自动容量目前是候选默认值，仍需在相同 fixture 和配置下完成 SQLite/PostgreSQL 交错测量，并分别验证 NAS/cgroup 环境后才能确认收益或默认值。
+项目所有者于 2026-10-16 明确表示本任务不用完成性能 A/B，因此没有运行混合负载 A/B，也没有 CPU p95、吞吐、内存或前台响应对比数据。执行时环境亦未配置 `LUX_PERF_MEDIA_ROOT`，没有可用 ffmpeg，且未配置 `POSTGRES_TEST_DATABASE`。报告中的 15% CPU p95 降幅仍只是待验证目标；自动容量仍是未经性能验证的候选默认值，不据此声称性能收益。
 
 ## 基准目标
 
