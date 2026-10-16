@@ -13456,10 +13456,49 @@ fn provider_identity_uses_the_selected_scraper_without_falling_back_to_another_i
 fn postgres_placeholder_adapter_preserves_quoted_question_marks() {
     let sql = "SELECT ?, '?' AS literal, \"?\" AS identifier, ?";
     assert_eq!(
-        adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sql).as_str(),
         "SELECT $1, '?' AS literal, \"?\" AS identifier, $2"
     );
-    assert_eq!(adapt_sql_for_backend(DatabaseBackend::Sqlite, sql), sql);
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Sqlite, sql).as_str(),
+        sql
+    );
+}
+
+#[test]
+fn sqlite_sql_adapter_preserves_static_owned_and_arc_storage() {
+    let static_sql = "SELECT 1";
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, static_sql);
+    assert!(std::ptr::eq(static_sql.as_ptr(), adapted.as_str().as_ptr()));
+
+    let owned_sql = String::from("SELECT 2");
+    let owned_pointer = owned_sql.as_ptr();
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(owned_sql));
+    assert!(std::ptr::eq(owned_pointer, adapted.as_str().as_ptr()));
+
+    let shared_sql: std::sync::Arc<str> = std::sync::Arc::from("SELECT 3");
+    let shared_pointer = shared_sql.as_ptr();
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(shared_sql));
+    assert!(std::ptr::eq(shared_pointer, adapted.as_str().as_ptr()));
+}
+
+#[test]
+fn postgres_sql_adapter_preserves_unmodified_text_and_numbers_placeholders() {
+    let no_parameters = "SELECT 'no parameters'";
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Postgres, no_parameters);
+    assert!(std::ptr::eq(
+        no_parameters.as_ptr(),
+        adapted.as_str().as_ptr()
+    ));
+
+    let parameters = std::iter::repeat_n("?", 12).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT ?, '?' AS literal, \"?\" AS identifier, 'it''s ?' AS escaped_literal, {parameters}"
+    );
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sqlx::AssertSqlSafe(sql)).as_str(),
+        "SELECT $1, '?' AS literal, \"?\" AS identifier, 'it''s ?' AS escaped_literal, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13"
+    );
 }
 
 #[tokio::test]
