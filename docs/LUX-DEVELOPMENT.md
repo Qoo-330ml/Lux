@@ -11931,11 +11931,15 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收：
 
-- [ ] SQLite 对静态 `&str`、owned `String` 与 `Arc<str>` 保持原 SQL 缓冲区地址；对应测试先失败再通过。
-- [ ] PostgreSQL 对无占位符 SQL 保留原地址；改写覆盖单/多位编号、单双引号内问号和转义单引号。
-- [ ] repository 三种查询入口及迁移查询使用新的 `SqlStr` 返回值；定向存储测试通过。
-- [ ] 重跑 LUX-562 release 基准，记录静态/owned SQLite adapter 与 120 参数 PostgreSQL adapter 的分配变化；其余基线项目不变。
-- [ ] `cargo fmt --all -- --check`、定向测试和任务完成阶段规定的全量门禁均有明确结果；既有基线失败单独报告，不称全量测试通过。
+- [x] SQLite 对静态 `&str`、owned `String` 与 `Arc<str>` 保持原 SQL 缓冲区地址；对应测试先失败再通过。
+- [x] PostgreSQL 对无占位符 SQL 保留原地址；改写覆盖单双引号内问号、转义单引号和 `$10`–`$13` 多位编号。
+- [x] repository 三种查询入口及迁移查询使用新的 `SqlStr` 返回值；adapter 定向单测与 `server_id_survives_database_reopen` 通过。
+- [x] 重跑 LUX-562 release 基准，记录静态/owned SQLite adapter 与 120 参数 PostgreSQL adapter 的分配变化；其余基线项目不变。
+- [x] `cargo fmt --all -- --check`、定向测试和任务完成阶段规定的全量门禁均有明确结果；既有基线失败单独报告，不称全量测试通过。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮，安静窗口内直接复跑编译后的测试二进制。静态 SQLite adapter 为 0 allocations / 0 B，时间中位数 2 ns（2–6）；owned SQLite adapter 为 0 / 0 B，中位数 10 ns（8–13）；PostgreSQL 120 参数改写为 1 allocation / 887 B / 0 reallocations，中位数 1,304 ns（1,301–1,367）。相对 LUX-562 基线，静态 SQLite 从 1 allocation / 81 B 降为零；PostgreSQL 从 121 allocations / 1,615 B / 1 realloc 降为 1 / 887 B / 0。VALUES CTE、Any 参数绑定及 statement-cache 行为不属于本步优化，五轮结果保持在基线波动范围内。本机合成微基准不外推为 NAS/x86 或扫描整链路收益。
+
+完成门禁记录（2026-10-16）：`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 931 passed、0 failed、23 ignored；随后在 `tests/scanned_metadata.rs` 为 21 passed、2 failed 并停止，后续 targets 未执行。`failed_local_poster_insert_does_not_mark_image_stage_complete` 隔离重跑仍为实际 2、预期 1，且已在干净 `e7107bfe` 基线复现（见 LUX-562）；并行失败的 `manifest_scan_indexes_poster_while_local_nfo_is_blocked` 隔离重跑通过。全量 Rust 测试门禁明确为非绿色。
 
 
 ## 29. 参考资料
