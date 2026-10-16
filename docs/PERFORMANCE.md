@@ -8,6 +8,45 @@
 
 项目所有者于 2026-10-16 明确表示本任务不用完成性能 A/B，因此没有运行混合负载 A/B，也没有 CPU p95、吞吐、内存或前台响应对比数据。执行时环境亦未配置 `LUX_PERF_MEDIA_ROOT`，没有可用 ffmpeg，且未配置 `POSTGRES_TEST_DATABASE`。报告中的 15% CPU p95 降幅仍只是待验证目标；自动容量仍是未经性能验证的候选默认值，不据此声称性能收益。
 
+## LUX-562 动态 SQL 构建与字符串分配基线（2026-10-16）
+
+环境：macOS `arm64`，Rust `1.97.1`；生产源码基线 `e7107bfe`，仅新增测试专用 harness。命令固定为 release、单线程，使用 Toshiba 共享 Cargo target：
+
+```bash
+CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --release --locked --lib storage::repository::sql_query_benchmarks::dynamic_sql_allocation_baseline --features performance-benchmarks -- --ignored --nocapture --test-threads=1
+```
+
+该 harness 单独统计分配与耗时，覆盖 SQLite 静态/owned SQL 适配、PostgreSQL 120 占位符适配、1/100/200/2,900/5,000 行 VALUES CTE 字符串构造、200 条路径绑定（32/128/512 字节）及 SQLite 单连接 120 种 SQL 形状的冷执行、缓存重放和淘汰重放。Any 绑定用例只构造 SQLx Query，不连接后端；SQLite case 使用内存数据库。缓存容量/驻留条数不等同于 prepare 次数或命中率，时间也不是整链路扫描或数据库服务端性能。
+
+先用上述 Cargo 命令编译并通过一次；随后在没有其他 Cargo 构建或高 CPU 测试运行时，直接顺序运行同一测试二进制五轮：
+
+```bash
+for i in 1 2 3 4 5; do
+  /Volumes/Toshiba/mywork/Lux/target/release/deps/luxd-b56c43d60e82dde1 --ignored --exact storage::repository::sql_query_benchmarks::dynamic_sql_allocation_baseline --nocapture --test-threads=1
+done
+```
+
+分配计数与字节在五轮完全相同；表中耗时为五轮中位数及最小–最大值。单次操作的分配数、分配字节和 realloc 数/字节均按 harness 的 iteration 数归一化。
+静态 SQLite SQL 输出的内存地址与输入不同（`sqlite_static_adapter_pointer_preserved=false`），确认当前 adapter 有一次完整文本分配；本条只证明适配层复制，不代表数据库执行成本。
+
+| 工作负载 | 分配 / 次 | 分配字节 / 次 | realloc / 次（字节） | 耗时中位数 [范围] |
+|---|---:|---:|---:|---:|
+| SQLite 静态 SQL adapter | 1 | 81 | 0 (0) | 25 [20–25] ns |
+| SQLite owned SQL adapter | 1 | 81 | 0 (0) | 27 [26–35] ns |
+| PostgreSQL 120 参数 adapter | 121 | 1,615 | 1 (830) | 3,311 [3,057–3,443] ns |
+| VALUES CTE，1 行 | 3 | 135 | 0 (0) | 72 [69–76] ns |
+| VALUES CTE，100 行 | 3 | 2,214 | 2 (1,587) | 383 [381–388] ns |
+| VALUES CTE，200 行 | 3 | 4,314 | 2 (3,087) | 621 [610–622] ns |
+| VALUES CTE，2,900 行 | 3 | 61,014 | 2 (43,587) | 6,873 [6,765–6,967] ns |
+| VALUES CTE，5,000 行 | 3 | 105,114 | 2 (75,087) | 12,919 [12,620–13,430] ns |
+| Any query，200 paths × 32 B | 401 | 14,496 | 6 (12,096) | 9,210 [9,036–9,427] ns |
+| Any query，200 paths × 128 B | 401 | 33,696 | 6 (12,096) | 8,828 [8,494–9,362] ns |
+| Any query，200 paths × 512 B | 401 | 110,496 | 6 (12,096) | 10,365 [10,206–10,977] ns |
+
+SQLx SQLite statement cache 的默认容量为 100。120 种不同形状首次执行后驻留 100 条；重放 100 条最近形状后仍驻留 100 条；再执行最早被淘汰的 20 条后仍驻留 100 条。五轮的 cold 120 条耗时中位数为 10,143 μs（9,726–10,295），缓存内重放 100 条为 1,314 μs（1,244–1,459），淘汰后重放 20 条为 534 μs（501–580）。这是内存 SQLite 的时间观察与驻留数量断言，不是 driver prepare 次数或 hit rate 的测量。
+
+上述结果只用于比较后续局部实现。本机 ARM64 合成数据不外推 FNOS/NAS/x86_64，也不构成扫描 CPU、完整查询延迟或生产收益结论。
+
 ## 基准目标
 
 规格目标：10,000 部电影、50,000 集剧集；数据库预热、单页 50 条、扫描同时运行。API 目标为首页 p95 < 400 ms、媒体库首屏 p95 < 300 ms、搜索 p95 < 500 ms、详情 p95 < 200 ms、继续观看 p95 < 300 ms、缓存图片 p95 < 150 ms，扫描期间前台 p95 < 1 s 且不超过空闲时 2 倍。

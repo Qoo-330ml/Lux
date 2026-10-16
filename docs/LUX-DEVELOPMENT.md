@@ -11905,6 +11905,24 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 ffprobe 分支的验证记录：定向探测器测试通过；cargo build --locked、fmt 和全 targets/all-features Clippy 通过。该分支全量 Cargo 测试在 lib 阶段 914 passed、1 failed、23 ignored 后停止，唯一失败为旧断言期待 1/8 步长下并发 6；更新断言后该定向用例通过。之后的集成 targets 未执行，Linux 交叉构建因缺少 x86_64-linux-gnu-gcc 未启动。ARM64 模拟负载发现忙碌时重置 sleep 导致采样 tick 不推进，修复为固定 tick；后续将上调步长改为 1/4，但真实 ffprobe A/B 尚未测量。具体数据和限制见 docs/PERFORMANCE.md；本机结果不外推为 NAS/x86 性能。
 
+#### LUX-562：动态 SQL 构建与字符串分配基线
+
+范围：为 CPU 热点分析第五点建立可重复的局部基线；只使用合成输入，不访问线上 FNOS 数据库，不改变生产查询行为。后续 SQLite SQL 转交、PostgreSQL 占位符改写、有限 SQL 模板复用和业务字符串借用仍须各自登记为后续任务。
+
+设计记录：[动态 SQL 构建与字符串分配优化设计](DYNAMIC-SQL-OPTIMIZATION-PLAN.md)。基线源码为 `origin/test` 提交 `e7107bfe`。测试专用分配计数器只在 `performance-benchmarks` feature 下编译，测量窗口外关闭；普通生产构建不引入该 allocator。
+
+验收：
+
+- [x] ignored release harness 分别测量 SQLite 静态/owned SQL 适配、PostgreSQL 120 占位符改写、1/100/200/2,900/5,000 行 VALUES CTE 构造、200 条不同长度路径的 Any 参数绑定，以及 SQLite 单连接 statement-cache 冷执行/热重放/淘汰重放。
+- [x] 在 Toshiba 共享 Cargo target 上完成五轮；逐项报告分配数/字节与耗时的中位数和范围，报告 120 种 SQL 形状相对 100 条缓存容量的驻留行为。
+- [x] 记录本机架构、Rust 版本、基线提交和可复跑命令；明确结果仅是本机合成微基准，不外推 NAS/x86 性能，也不声称扫描整链路收益。
+- [x] 定向 release 基准、格式、普通构建和 all-targets/all-features Clippy 通过；普通 `cargo build --locked` 不启用测试 allocator。
+- [x] 执行并记录 `cargo test --locked --all-targets`。该命令在 `scanned_metadata` 停止：`failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净 `e7107bfe` 基线也以实际 2、预期 1 复现；`manifest_scan_indexes_poster_while_local_nfo_is_blocked` 在并行全量运行中失败，但隔离重跑通过。不将全量 Rust 门禁报告为绿。
+
+预计文件（4 个）：`src/storage/sql_query_benchmarks.rs`、`docs/PERFORMANCE.md`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。基准模块挂接已在 LUX-562 工作分支的基线 harness checkpoint 中完成。
+
+实施记录（2026-10-16）：Toshiba 已挂载，本机 `arm64`，Rust `1.97.1`。五轮 release 微基准分配数/字节稳定；静态 SQLite SQL adapter 的指针未保留、每次分配 81 字节；PostgreSQL 120 参数 adapter 为 121 次分配、1,615 字节；5,000 行 VALUES CTE 构造为 105,114 字节。五轮中位数、范围、缓存 100/120 形状驻留结果与复跑命令见 `docs/PERFORMANCE.md`。定向 ignored benchmark 通过；`cargo fmt --all -- --check`、普通 `cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 `cargo test --locked --all-targets` 的 lib target 为 929 passed、0 failed、23 ignored；随后 `scanned_metadata` 为 21 passed、2 failed，后续 targets 未执行。已在干净 `e7107bfe` worktree 复现其中的既有 poster 计数失败，并隔离复跑通过慢 NFO 测试。`tests/performance.rs` 编译时有两条既有 dead-code warning；它们不影响 Clippy，未触及相关测试代码。本任务没有生产查询行为改动，完整 Rust 全量门禁仍非绿色。
+
 
 ## 29. 参考资料
 

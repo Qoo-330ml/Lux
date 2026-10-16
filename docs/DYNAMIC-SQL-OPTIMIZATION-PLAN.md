@@ -1,8 +1,8 @@
 # 动态 SQL 构建与字符串分配优化设计
 
-日期：2026-10-16。状态：设计稿，尚未实施或测量性能收益。
+日期：2026-10-16。状态：分步实施中；LUX-562 仅建立局部基线，尚未实施生产优化或确认性能收益。
 
-基线：`test` 的 `1e7c2ea88d8cec5d2b8083bb4b9193b471d7af4d`。
+基线：当前 `origin/test` 的 `e7107bfe`（LUX-562 开始时）。
 设计分支：`codex/dynamic-sql-optimization`。
 范围：用户提供的 `cpu-hotspot-analysis.md` 第五点。
 
@@ -19,7 +19,7 @@
 | B：临时表 + JOIN | 同一大集合在多个查询中重复绑定、构造和处理 | 装载/清理、连接固定、异常恢复和两种数据库的差异；单次查询未必划算 | 保留实验，首轮不落地 |
 | C：减少字符串复制 | Rust 侧 SQL、路径、ID 和整个文件记录的重复分配 | 无法单独减少 SQL 形状；SQLx Any 绑定字符串仍需拥有数据 | 第一优先级，与 A 配合 |
 
-本轮只交付本文档。后续实施前，把以下每个工作包按当时已占用的编号登记为独立 `LUX-*` 任务，补入 `LUX-DEVELOPMENT.md`；一次只实施一个任务。工作包编号 S0–S7 不是已登记的项目任务。
+设计已获用户授权进入实施。S0 已登记为 LUX-562；其余工作包仍须按实施时可用编号分别登记为独立 `LUX-*` 任务并补入 `LUX-DEVELOPMENT.md`，一次只实施一个任务。工作包编号 S0–S7 不是项目任务编号。
 
 ## 2. 已核实的现状
 
@@ -197,7 +197,7 @@ SQLite CPU 包含在 Lux 进程内；PostgreSQL 还需单独记录数据库服�
 
 | 工作包 | 依赖与结果 | 预计修改文件 | 主要验收 |
 | --- | --- | --- | --- |
-| S0：基线 | 无；建立构造/分配与扫描基线 | `src/storage/sql_query_benchmarks.rs`（新增）、`src/storage/repository.rs`（测试模块挂接）、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md` | 基线可复跑，数据/架构/缓存状态明确 |
+| S0：基线（LUX-562） | 无；建立局部 SQL 构造/分配与单连接 statement-cache 基线 | `src/storage/sql_query_benchmarks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`、本文档 | 五轮 release 结果可复跑，数据/架构/缓存状态明确；本步不声称扫描整链路收益 |
 | S1：查询入口 | S0；SQLite SqlStr 直传，PostgreSQL 编号无临时 String | `src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 地址保持测试先红后绿；编号与集成回归通过 |
 | S2：模板基础 | S1；有限键、满批模板、单缓冲区构造 | `src/storage/sql_templates.rs`（新增，含单测）、`src/storage/repository.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | Arc 重用、绑定预算、并发和文本预算测试通过 |
 | S3：两类读取 | S2；filesystem/diff 的模板与 IN 分桶 A/B | `src/storage/filesystem.rs`、`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；无收益则保留精确模板 |
@@ -211,7 +211,7 @@ S3–S6 按已测收益依次处理。`discovery/checkpoint.rs`、scan targets�
 
 ### 6.1 定向检查与完成检查
 
-所有 Cargo 命令前确认 `/Volumes/Toshiba` 实际挂载，并使用统一 target。以下是实施时的命令计划，本轮没有执行：
+所有 Cargo 命令前确认 `/Volumes/Toshiba` 实际挂载，并使用统一 target。LUX-562 已在该 target 上执行 ignored release 基准、`cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 和全量 Rust 测试。后续实现包按各自的 LUX 任务运行以下窄测与门禁：
 
 ```bash
 mount | rg '/Volumes/Toshiba'
@@ -252,7 +252,7 @@ S6 还应根据实际受影响的媒体/metadata helper 选择相关集成目标
 
 每个增量独立提交且不改变 schema，可按逆序回退。设计不需要新核心依赖、migration 或公共 API 修改；也不处理报告第一至第四、第六至第八点，不推送、合并或部署。
 
-本轮验证仅为读取源码、依赖源码、项目规范和官方资料，以及创建分支并检查本文档。没有运行 Rust 测试、性能基准或生产验证；所有优化验收仍待实施。
+LUX-562 仅建立局部 SQL 构造/分配与 SQLite statement-cache 基线，未更改生产查询。五轮数据、命令、普通构建/格式/Clippy 结果及全量 Rust 门禁的已复现基线失败记录在 `docs/PERFORMANCE.md` 和 `docs/LUX-DEVELOPMENT.md`。尚未测量扫描整链路或 NAS 性能，也未实施 S1 及后续优化。
 
 ## 8. 依据
 

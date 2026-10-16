@@ -3,8 +3,8 @@ use sqlx::{Connection, SqliteConnection, sqlite::SqlitePoolOptions};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     hint::black_box,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Instant,
 };
 
@@ -94,7 +94,12 @@ fn sql_with_question_marks(count: usize) -> String {
     format!("SELECT COUNT(*) FROM input_paths WHERE path IN ({placeholders})")
 }
 
-fn report_allocation_case(name: &str, iterations: usize, elapsed: std::time::Duration, snapshot: AllocationSnapshot) {
+fn report_allocation_case(
+    name: &str,
+    iterations: usize,
+    elapsed: std::time::Duration,
+    snapshot: AllocationSnapshot,
+) {
     println!(
         "allocation_case={name} iterations={iterations} elapsed_ns_per_op={} allocs_per_op={:.2} alloc_bytes_per_op={:.2} reallocs_per_op={:.2} realloc_bytes_per_op={:.2}",
         elapsed.as_nanos() / u128::try_from(iterations).unwrap_or(1),
@@ -139,7 +144,7 @@ async fn execute_count_query(
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "run explicitly to record the LUX-561 SQL construction baseline"]
+#[ignore = "run explicitly to record the LUX-562 SQL construction baseline"]
 async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Error>> {
     let iterations = 2_000;
     let static_sql =
@@ -180,9 +185,7 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
         || {
             adapt_sql_for_backend(
                 DatabaseBackend::Sqlite,
-                sqlx::AssertSqlSafe(
-                    owned_inputs_for_timing.next().expect("prebuilt SQL input"),
-                ),
+                sqlx::AssertSqlSafe(owned_inputs_for_timing.next().expect("prebuilt SQL input")),
             )
         },
     );
@@ -220,7 +223,12 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
             )
         },
     );
-    report_allocation_case("postgres_120_parameter_adapter", iterations, elapsed, snapshot);
+    report_allocation_case(
+        "postgres_120_parameter_adapter",
+        iterations,
+        elapsed,
+        snapshot,
+    );
 
     for row_count in [1, 100, 200, 2_900, 5_000] {
         let case_iterations = if row_count >= 2_900 { 40 } else { 2_000 };
@@ -242,19 +250,23 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
             .map(|index| format!("{}-{index:06}", "p".repeat(path_length.saturating_sub(7))))
             .collect::<Vec<_>>();
         let query: Arc<str> = sql_with_question_marks(paths.len()).into();
-        let (elapsed, snapshot) = measure_operation(100, || {
-            let mut statement = sqlx::query::<sqlx::Any>(sqlx::AssertSqlSafe(query.clone()));
-            for path in &paths {
-                statement = statement.bind(path.as_str());
-            }
-            black_box(statement)
-        }, || {
-            let mut statement = sqlx::query::<sqlx::Any>(sqlx::AssertSqlSafe(query.clone()));
-            for path in &paths {
-                statement = statement.bind(path.as_str());
-            }
-            black_box(statement)
-        });
+        let (elapsed, snapshot) = measure_operation(
+            100,
+            || {
+                let mut statement = sqlx::query::<sqlx::Any>(sqlx::AssertSqlSafe(query.clone()));
+                for path in &paths {
+                    statement = statement.bind(path.as_str());
+                }
+                black_box(statement)
+            },
+            || {
+                let mut statement = sqlx::query::<sqlx::Any>(sqlx::AssertSqlSafe(query.clone()));
+                for path in &paths {
+                    statement = statement.bind(path.as_str());
+                }
+                black_box(statement)
+            },
+        );
         report_allocation_case(
             &format!("any_query_200_paths_{path_length}_bytes"),
             100,
@@ -279,12 +291,8 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
 
     let cold_started = Instant::now();
     for (index, query) in query_shapes.iter().enumerate() {
-        let count = execute_count_query(
-            &mut connection,
-            query.clone(),
-            index.saturating_add(1),
-        )
-        .await?;
+        let count =
+            execute_count_query(&mut connection, query.clone(), index.saturating_add(1)).await?;
         assert_eq!(count, i64::try_from(index + 1)?);
     }
     let cold_elapsed = cold_started.elapsed();
@@ -292,12 +300,8 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
 
     let warm_started = Instant::now();
     for index in (20..120).rev() {
-        let count = execute_count_query(
-            &mut connection,
-            query_shapes[index].clone(),
-            index + 1,
-        )
-        .await?;
+        let count =
+            execute_count_query(&mut connection, query_shapes[index].clone(), index + 1).await?;
         assert_eq!(count, i64::try_from(index + 1)?);
     }
     let warm_elapsed = warm_started.elapsed();
@@ -321,7 +325,10 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
         evicted_elapsed.as_micros(),
     );
     assert_eq!(resident_after_cold, sqlx_default_statement_cache_capacity());
-    assert_eq!(resident_after_reuse, sqlx_default_statement_cache_capacity());
+    assert_eq!(
+        resident_after_reuse,
+        sqlx_default_statement_cache_capacity()
+    );
 
     drop(connection);
     pool.close().await;
