@@ -11890,7 +11890,7 @@ Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 - [ ] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
 - [ ] 通过定向测试、全量项目完成门和记录在 `docs/PERFORMANCE.md` 的可重复 A/B 测量；不把本机 ARM 结果外推为 NAS/x86 性能。
 
-进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
+进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过；P3 已将 ffprobe runner 与输出读取逻辑提取到独立模块，提取后 `probe` 19/19 通过。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
 
 ## 29. 参考资料
 
