@@ -1818,6 +1818,7 @@ async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
             device: None,
             inode: None,
             fingerprint: vec![1_u8; 32],
+            fingerprint_pending: false,
         },
         NewScanManifestEntry {
             relative_path: "Changed.mkv".to_owned(),
@@ -1827,6 +1828,7 @@ async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
             device: None,
             inode: None,
             fingerprint: vec![3_u8; 32],
+            fingerprint_pending: false,
         },
         NewScanManifestEntry {
             relative_path: "Missing.mkv".to_owned(),
@@ -1836,22 +1838,35 @@ async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
             device: None,
             inode: None,
             fingerprint: vec![4_u8; 32],
+            fingerprint_pending: false,
         },
     ];
     let seen_filesystem_entries = [
         NewScanManifestSeenFilesystemEntry {
             filesystem_entry_id: "matched".to_owned(),
             relative_path: "Matched.mkv".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![1_u8; 32],
         },
         NewScanManifestSeenFilesystemEntry {
             filesystem_entry_id: "changed".to_owned(),
             relative_path: "Changed.mkv".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![3_u8; 32],
         },
         NewScanManifestSeenFilesystemEntry {
             filesystem_entry_id: "missing".to_owned(),
             relative_path: "Missing.mkv".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![4_u8; 32],
         },
     ];

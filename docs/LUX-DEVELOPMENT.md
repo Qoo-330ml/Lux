@@ -11956,7 +11956,9 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 通过进程级 singleton semaphore 共用后台工作预算，容量按 CPU/cgroup 推导并支持 `LUX_BACKGROUND_CPU_BUDGET` 覆盖。Discovery 与 Manifest preparation 保留有界 reader/JoinSet；指纹、NFO/图片、probe、thumbnail 的后台 CPU 片段接入同一预算，同时保留已有专用进程上限。调用者取消后，blocking closure 和受监督子进程仍持有预算，子进程确认回收后才释放名额。指标记录全局与分 stage 活跃/等待峰值、p50/p95/max、取消等待、运行中取消及子进程清理中计数；样本有界，日志不含路径或环境变量原值。
 
-分支合并前的记录：预算核心定向单测 9/9；`scanner` 18/18、`scanning_jobs` 88/88、`probe` 20/20、`thumbnails` 18/18、`background_work_budget` 1/1、`metadata` 21/21、`scanned_series_metadata` 3/3。`scanned_metadata` 为 22/23；唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 也以实际 2、预期 1 复现，因此全量 Rust 测试门未通过。分支上的 `cargo build --locked`、fmt 与 clippy 通过；性能 A/B 按项目所有者要求免除，CPU 收益和自动容量仍无实测结论。合并后门禁结果待本次验证更新。
+分支合并前的记录：预算核心定向单测 9/9；`scanner` 18/18、`scanning_jobs` 88/88、`probe` 20/20、`thumbnails` 18/18、`background_work_budget` 1/1、`metadata` 21/21、`scanned_series_metadata` 3/3。`scanned_metadata` 为 22/23；唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 也以实际 2、预期 1 复现，因此全量 Rust 测试门未通过。分支上的 `cargo build --locked`、fmt 与 clippy 通过；性能 A/B 按项目所有者要求免除，CPU 收益和自动容量仍无实测结论。
+
+三分支合并后验证（2026-10-17）：`cargo build --locked`、`cargo fmt --all -- --check`、全 targets/all features Clippy、shell 语法、两组 Python 单测、Web 冻结依赖安装与 production build 通过。`cargo test --locked --all-targets` 在 `tests/scanned_metadata.rs` 以 exit 101 终止：lib 963 passed、24 ignored；该 target 22 passed、1 failed，唯一失败仍为 `failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1，已在干净基线复现），后续 targets 未执行。Web Node 测试为 145/148（3 项失败），单独运行的 Vitest 为 644/650（6 项失败）；失败涉及的 Web 页面和测试文件与合并前 `origin/test` 相同，这三条后端功能分支没有 Web 文件改动。完整 Rust/Web 测试门未全部通过。
 
 后台预算验收：
 

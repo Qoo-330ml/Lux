@@ -238,6 +238,7 @@ mod tests {
             device: Some(1),
             inode: Some(1),
             fingerprint: vec![1],
+            fingerprint_pending: false,
         }
     }
 
