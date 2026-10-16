@@ -11825,6 +11825,23 @@ ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 k
 
 验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
 
+#### LUX-561：记录 Manifest 写事务体耗时与结果
+
+范围：为 Manifest discovery 写事务单独记录事务体时间，排除 `BEGIN IMMEDIATE` 获取写者资格和 `COMMIT` 时间；记录事务体成功/失败计数，不记录错误文本或业务标识。只增加观测，不改变事务边界、批次大小、存储语义或性能门槛。
+
+预计文件（4 个）：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、本文档。
+
+验收：
+
+- [x] release Manifest 基准报告包含 `transaction_body` p50/p95 和事务体 outcome 计数，至少存在成功样本。
+- [x] 事务体错误分支只记录耗时及 `error` 标签；计数器回归覆盖 success/error 事件，日志不记录错误内容或用户数据。
+- [x] 事务计时能与 BEGIN 等待、COMMIT 分开；现有 `<209 DML` 门槛和事务行为不变。
+- [x] 只记录 ARM64 本机观测，不推断 NAS/FNOS 性能收益；更新性能记录并保留干扰因素。
+
+最窄目标：`cargo test --locked --test performance`；release 基准：`LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark ./scripts/run-performance.sh`。
+
+实施结果（2026-10-16）：storage 现在分别记录 `transaction_body`、BEGIN 和 COMMIT，事务体事件只带 success/error 与条目计数。性能报告序列化并 reset outcome 计数；定向单测通过，60k SQLite release 基准 1/1 通过，两轮各观测到 9 个成功 body。两轮首扫 `transaction_body` p95 为 199,544 / 188,235 µs，DML 均为 127，低于原 `<209` 门槛。探针启用时的写锁等待 p95 为 232,899 / 223,689 µs；探针会主动争用写锁，所以数据只用于说明观测已接通和门槛未回归，不作为无探针性能基线。性能测试目标 18 passed、5 ignored；格式检查通过。
+
 #### LUX-560：用户状态修改向其他会话发送失效
 
 范围：Web/Emby 收藏、已看修改在状态持久化及容器状态同步成功后发布无 ID 的 favorites/item 用户事件；Web 两种播放事件路径、账户库顺序和排序策略更新发布合并 home 事件。人物收藏同样发 favorites。HTTP 响应和认证/CSRF/ACL 保持既有合同。

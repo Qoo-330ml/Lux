@@ -331,6 +331,7 @@ struct QueryStatementCounts {
     active_preparation_tasks_peak: AtomicUsize,
     active_directory_readers_peak: AtomicUsize,
     scan_stage_samples: Mutex<std::collections::HashMap<String, Vec<ScanStageSample>>>,
+    transaction_body_outcomes: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl QueryStatementCounts {
@@ -365,6 +366,10 @@ impl QueryStatementCounts {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.scan_stage_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.transaction_body_outcomes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -425,6 +430,11 @@ impl QueryStatementCounts {
 
     fn scan_stage_values(&self) -> serde_json::Value {
         let (preparation_peak, reader_peak) = self.scan_stage_peaks();
+        let transaction_body_outcomes = self
+            .transaction_body_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         serde_json::json!({
             "stages": self.scan_stage_snapshot().into_iter().map(|summary| serde_json::json!({
                 "phase": summary.phase,
@@ -438,8 +448,18 @@ impl QueryStatementCounts {
             })).collect::<Vec<_>>(),
             "activePreparationTasksPeak": preparation_peak,
             "activeDirectoryReadersPeak": reader_peak,
+            "transactionBodyOutcomes": transaction_body_outcomes,
             "durationNote": "Cumulative stage durations are work totals, not wall time; nested and concurrent stages may overlap."
         })
+    }
+
+    fn record_transaction_body_outcome(&self, outcome: &str) {
+        *self
+            .transaction_body_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(outcome.to_owned())
+            .or_default() += 1;
     }
 
     fn take_query_latency_values(
@@ -544,6 +564,7 @@ struct QuerySummaryVisitor {
     application_ms: Option<u64>,
     transaction_ms: Option<u64>,
     phase: Option<String>,
+    outcome: Option<String>,
     duration_us: Option<u64>,
     units: Option<u64>,
     files: Option<u64>,
@@ -582,6 +603,8 @@ impl Visit for QuerySummaryVisitor {
             self.summary = Some(value.to_owned());
         } else if field.name() == "phase" {
             self.phase = Some(value.to_owned());
+        } else if field.name() == "outcome" {
+            self.outcome = Some(value.to_owned());
         }
     }
 
@@ -707,6 +730,37 @@ fn scan_stage_summary_reports_overlapping_microsecond_work_without_calling_it_wa
 #[test]
 fn scan_stage_summary_omits_empty_stages() {
     assert_eq!(scan_stage_summary("known_paths", &[]), None);
+}
+
+#[test]
+fn transaction_body_outcomes_are_reported_and_reset() {
+    let counts = Arc::new(QueryStatementCounts::default());
+    let subscriber = tracing_subscriber::registry().with(QueryStatementLayer(counts.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase = "transaction_body_outcome",
+            outcome = "success",
+            "fixture outcome"
+        );
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase = "transaction_body_outcome",
+            outcome = "error",
+            "fixture outcome"
+        );
+    });
+
+    assert_eq!(
+        counts.scan_stage_values()["transactionBodyOutcomes"],
+        serde_json::json!({"error": 1, "success": 1})
+    );
+
+    counts.reset();
+    assert_eq!(
+        counts.scan_stage_values()["transactionBodyOutcomes"],
+        serde_json::json!({})
+    );
 }
 
 #[test]
@@ -910,6 +964,11 @@ where
         if event.metadata().target() == "lux::scan_performance" {
             let mut visitor = QuerySummaryVisitor::default();
             event.record(&mut visitor);
+            if visitor.phase.as_deref() == Some("transaction_body_outcome")
+                && let Some(outcome) = visitor.outcome.as_deref()
+            {
+                self.0.record_transaction_body_outcome(outcome);
+            }
             if visitor.phase.as_deref() == Some("directory_read_budget") {
                 if let Some(concurrency) = visitor.preparation_concurrency {
                     self.0.manifest_preparation_concurrency.fetch_max(
@@ -2352,6 +2411,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "positive_file_recheck",
         "transaction_input_validation",
         "transaction_begin",
+        "transaction_body",
         "manifest_state_check",
         "directory_frontier_insert",
         "known_path_query",
@@ -2384,6 +2444,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             manifest_stage_timings["writerCancelledObserved"]
         );
     }
+    assert!(
+        manifest_stage_timings["transactionBodyOutcomes"]["success"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "60k scan report is missing a successful transaction body outcome: {manifest_stage_timings}"
+    );
     assert!(
         manifest_stage_timings["activePreparationTasksPeak"]
             .as_u64()

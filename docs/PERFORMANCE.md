@@ -1964,3 +1964,18 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 浏览器还验证了首页进入已加载详情路由后立即返回不新增四区块请求，以及 SSE 失效更新详情、原生重连重新同步后 69 秒零周期请求。首次 SSE 握手不会再次失效已加载的详情缓存，因此初始 item/images/playback 各请求一次；只有断线重连才触发一次全量媒体展示同步。自动化真实 QueryClient/组件时钟回归覆盖在线 60 秒零周期、断线 30 秒刷新和重连后再停轮询；缓存回归覆盖 30 秒内/外回访及库 ID 变化。
 
 计数不包含初次读取、重连同步或真实业务事件引起的请求；事件驱动刷新仍会发起 HTTP。没有测量 Core Web Vitals、滚动帧率、生产库查询耗时或 FNOS/NAS CPU，不将本机 fixture 结果外推为生产收益。
+
+### SQLite Manifest 写事务初始观测（2026-10-16，LUX-561）
+
+源码行为基线为 `test` 提交 `1e7c2ea8`，本机 macOS `arm64`，60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）。第一次启用 SQLite 写锁探针的样本记录到 `transaction_begin` p95 96 µs、`transaction_commit` p95 61,853 µs、`transaction_total` p50/p95 260,617 / 326,562 µs，batch p50/p95 469 / 602 ms，127 条 DML。旧实现尚未记录 `transaction_body`，因此 `transaction_total` 不能区分事务内工作和 BEGIN 等待；`transaction_commit` 是单独的 COMMIT 耗时。锁探针每 100 ms 通过同一连接池执行空 `BEGIN IMMEDIATE`/`COMMIT`，自身会产生写竞争；其等待 p50/p95 为 90 / 253,306 µs。
+
+该轮与另一条共享 Toshiba `target` 的 Rust release 编译并行，样本只用于发现需要新增事务体计时，不作为稳定基线或收益比较。无探针初跑的 `transaction_total` p95 为 47,692 µs，但同样没有隔离编译负载，且探针开关改变了写竞争条件，故两者不可直接作 A/B。尚未取得无并发编译、可重复的无探针基线；没有据此判断事务锁持有时长、CPU 收益或 NAS/FNOS 表现。
+
+增加事务体观测后的同 fixture release 样本如下。两轮均启用会主动争用写锁的探针；首轮编译期间共享 target 有其他 Cargo 竞争。第二轮复用构建产物，60k 扫描 5.40 秒完成。
+
+| 样本 | BEGIN p95 | body p50 / p95 | COMMIT p50 / p95 | total p50 / p95 | DML / SQL | batch p50 / p95 | 探针等待 p95 | body outcome |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 67 µs | 169,479 / 199,544 µs | 39,511 / 56,269 µs | 211,908 / 243,481 µs | 127 / 372 | 393 / 446 ms | 232,899 µs | 9 success |
+| 2 | 46 µs | 156,997 / 188,235 µs | 39,974 / 45,379 µs | 201,188 / 233,658 µs | 127 / 370 | 355 / 400 ms | 223,689 µs | 9 success |
+
+两轮的 DML 均低于旧 `<209` 门槛。样本只证明阶段与结果进入报告、60k release gate 仍通过；由于探针自身制造写竞争，不能视作无探针基线，也不代表事务锁等待的纯粹测量。

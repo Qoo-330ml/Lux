@@ -80,9 +80,27 @@ impl Database {
             transaction_directory_count,
         );
 
+        let transaction_body_started = Instant::now();
         let result = self
             .commit_manifest_discovery_transaction(&mut transaction, input)
-            .await?;
+            .await;
+        record_manifest_storage_stage(
+            "transaction_body",
+            transaction_body_started,
+            transaction_item_count,
+            transaction_file_count,
+            transaction_directory_count,
+        );
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase = "transaction_body_outcome",
+            outcome = if result.is_ok() { "success" } else { "error" },
+            units = u64::try_from(transaction_item_count).unwrap_or(u64::MAX),
+            files = u64::try_from(transaction_file_count).unwrap_or(u64::MAX),
+            directories = u64::try_from(transaction_directory_count).unwrap_or(u64::MAX),
+            "manifest discovery transaction body outcome"
+        );
+        let result = result?;
         let transaction_commit_started = Instant::now();
         transaction
             .commit()
