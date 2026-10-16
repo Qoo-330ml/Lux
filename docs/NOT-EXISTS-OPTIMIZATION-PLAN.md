@@ -1,10 +1,10 @@
 # 第六项：NOT EXISTS 与扫描查询优化方案
 
-日期：2026-10-16。状态：设计稿，尚未实施生产代码。
+日期：2026-10-16。状态：LUX-561 实施中。
 
 分支：`codex/not-exists-antijoin-optimization`，基线：`test@1e7c2ea8`。
 范围来自用户指定的 `cpu-hotspot-analysis.md` 第六项；附件中的建议作为待验证假设。
-本轮只新增本方案。实施前，在 `LUX-DEVELOPMENT.md` 登记一个独立 LUX 任务，以下增量均属于该任务，不提前推进其他阶段。
+方案基于 `LUX-DEVELOPMENT.md` 中的 LUX-561 登记；以下增量均属于该任务，不提前推进其他阶段。
 
 ## 1. 结论与选择
 

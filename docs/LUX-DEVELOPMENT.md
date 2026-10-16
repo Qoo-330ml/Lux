@@ -11861,6 +11861,28 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
+#### LUX-561：优化 Manifest 删除反连接与分页扫描
+
+范围：针对 CPU 热点分析第六项，在不改变 Manifest、文件路径和删除安全合同的前提下，降低删除候选分页重复枚举，并将只用于判断完成与否的差异统计改为存在性检查。format 3/LITE、PERSISTED v3、workflow 2/3 与 legacy 路径均须保留各自语义。seen-path/delta 继续使用完整复合键反连接。先用 SQLx 双后端 fixture 建立可复现基线，再以固定 root、相对路径 keyset 查询复用 `(library_root_id, relative_path)` 现有索引；不默认增加索引。
+
+验收：
+
+- [ ] EXISTS 完成检查与原差异集合一致；精确报告计数保持；root 完整性、取消/job fencing 与事务边界不变。
+- [ ] 各格式删除候选集合与基线逐项相同；跨 root 同名路径、多页、直接子项、通配符路径、父目录缺失、uncovered 路径、并发增量、取消恢复和 CAS 均有覆盖。
+- [ ] 相关查询使用真实 SQLite/PostgreSQL 运行计划和固定 A/B fixture 验证；完整扫描及前台请求无超过 5% 回退。若 PostgreSQL 或 FNOS 无运行时证据，明确记录未验证，不外推。
+- [ ] 只有实测证明新增 generation 索引净收益后才追加 SQLite/PostgreSQL migration；否则记录不新增索引的结论。
+- [ ] 定向 `storage`/`scanning_jobs` 测试、性能记录、fmt、build、全目标 Clippy 与全量 Rust 完成门结果如实记录。
+
+方案和增量文件计划：[`NOT-EXISTS-OPTIMIZATION-PLAN.md`](NOT-EXISTS-OPTIMIZATION-PLAN.md)。基线 SQLx benchmark 位于 `tests/performance.rs`，语义和分页回归在 `src/storage/jobs/tests.rs`、`tests/scanning_jobs.rs`；查询实现位于 `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs` 和 `src/application/scanner/jobs/manifest_index.rs`。结果更新到本文、`docs/PERFORMANCE.md` 与 `docs/COMPATIBILITY.md`。若索引增量单独证明有必要，再按新增 migration 单独拆分并验证空库与旧库升级。
+
+### 增量顺序
+
+1. 在未修改查询上运行可复现的 SQLx 基线，记录实际后端版本、查询计划与代表性规模数据。
+2. 将四种差异完成检查改为 EXISTS，并补齐各格式语义回归。
+3. 将删除候选调度改为固定 root 的 keyset page；保留各版本目录覆盖和 generation/observation 条件，并以端到端场景验证差异集合和 finish retry。
+4. 交错测量基线与实现；只有整 root missing 更新被证明为独立热点时，才评估额外索引。
+5. 执行全量完成门并记录双后端、ARM64、FNOS/x86 的证据边界。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
