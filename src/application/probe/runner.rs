@@ -13,6 +13,7 @@ use tokio::{
     time::timeout,
 };
 
+use super::concurrency::{AttemptOutcome, ProbePermit};
 use super::{MAX_OUTPUT_BYTES, MediaProbeResult, parse_probe_json};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,14 +38,30 @@ impl FfprobeRunner {
     }
 
     pub async fn probe_path(&self, path: &Path) -> Result<MediaProbeResult, ProbeError> {
+        self.probe_path_inner(path, None).await
+    }
+
+    pub(super) async fn probe_path_with_permit(
+        &self,
+        path: &Path,
+        permit: ProbePermit,
+    ) -> Result<MediaProbeResult, ProbeError> {
+        self.probe_path_inner(path, Some(permit)).await
+    }
+
+    async fn probe_path_inner(
+        &self,
+        path: &Path,
+        permit: Option<ProbePermit>,
+    ) -> Result<MediaProbeResult, ProbeError> {
         let runner = self.clone();
         let path = path.to_owned();
         let (sender, receiver) = oneshot::channel();
-        let _ = tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             let mut sender = sender;
-            let result = runner.run_path(&path, &mut sender).await;
+            let result = runner.run_path(&path, &mut sender, permit).await;
             let _ = sender.send(result);
-        });
+        }));
         receiver.await.map_err(|_| {
             ProbeError::Io(std::io::Error::other(
                 "ffprobe process owner stopped before returning a result",
@@ -56,8 +73,9 @@ impl FfprobeRunner {
         &self,
         path: &Path,
         response: &mut oneshot::Sender<Result<MediaProbeResult, ProbeError>>,
+        permit: Option<ProbePermit>,
     ) -> Result<MediaProbeResult, ProbeError> {
-        let mut child = Command::new(&self.binary)
+        let child = Command::new(&self.binary)
             .args([
                 "-v",
                 "error",
@@ -70,36 +88,63 @@ impl FfprobeRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(ProbeError::Io)?;
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(permit) = permit {
+                    permit.complete(AttemptOutcome::Failure);
+                }
+                return Err(ProbeError::Io(error));
+            }
+        };
+        let mut owner = ProcessOwner::new(child, permit);
+        let child = owner.child.as_mut().ok_or_else(|| {
+            ProbeError::Io(std::io::Error::other("ffprobe child ownership was lost"))
+        })?;
         let output = tokio::select! {
             _ = response.closed() => None,
-            output = timeout(self.timeout, collect_process_output(&mut child)) => Some(output),
+            output = timeout(self.timeout, collect_process_output(child)) => Some(output),
         };
         let output = match output {
             None => {
-                terminate_child(child).await;
+                owner.transfer_to_reaper(AttemptOutcome::Cancelled);
                 return Err(ProbeError::Io(std::io::Error::other(
                     "ffprobe process canceled before returning a result",
                 )));
             }
-            Some(Ok(Ok(output))) => output,
+            Some(Ok(Ok(output))) => {
+                owner.mark_reaped();
+                output
+            }
             Some(Ok(Err(error))) => {
-                terminate_child(child).await;
+                let outcome = if matches!(error, ProbeError::Timeout) {
+                    AttemptOutcome::Timeout
+                } else {
+                    AttemptOutcome::Failure
+                };
+                owner.transfer_to_reaper(outcome);
                 return Err(error);
             }
             Some(Err(_)) => {
-                terminate_child(child).await;
+                owner.transfer_to_reaper(AttemptOutcome::Timeout);
                 return Err(ProbeError::Timeout);
             }
         };
         if !output.status.success() {
+            owner.complete(AttemptOutcome::Failure);
             return Err(ProbeError::Exit {
                 code: output.status.code(),
                 stderr: truncate(&output.stderr),
             });
         }
-        parse_probe_json(&output.stdout)
+        let parsed = parse_probe_json(&output.stdout);
+        owner.complete(if parsed.is_ok() {
+            AttemptOutcome::Success
+        } else {
+            AttemptOutcome::Failure
+        });
+        parsed
     }
 }
 
@@ -224,25 +269,82 @@ async fn collect_process_output(child: &mut Child) -> Result<CollectedProcessOut
     })
 }
 
-async fn terminate_child(child: Child) {
-    terminate_child_with_wait(child, |child| async move {
-        let mut child = child;
-        let result = child.wait().await;
-        (child, result)
-    })
-    .await;
+struct ProcessOwner {
+    child: Option<Child>,
+    permit: Option<ProbePermit>,
 }
 
-async fn terminate_child_with_wait<F, Fut>(mut child: Child, mut wait: F)
+impl ProcessOwner {
+    fn new(child: Child, permit: Option<ProbePermit>) -> Self {
+        Self {
+            child: Some(child),
+            permit,
+        }
+    }
+
+    fn mark_reaped(&mut self) {
+        self.child.take();
+    }
+
+    fn complete(&mut self, outcome: AttemptOutcome) {
+        if let Some(permit) = self.permit.take() {
+            permit.complete(outcome);
+        }
+    }
+
+    fn transfer_to_reaper(&mut self, outcome: AttemptOutcome) {
+        let Some(child) = self.child.take() else {
+            self.complete(outcome);
+            return;
+        };
+        let permit = self.permit.take();
+        spawn_reaper(child, permit, outcome, |child| Box::pin(child.wait()));
+    }
+}
+
+impl Drop for ProcessOwner {
+    fn drop(&mut self) {
+        self.transfer_to_reaper(AttemptOutcome::Cancelled);
+    }
+}
+
+type ChildWaitFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = std::io::Result<std::process::ExitStatus>> + Send + 'a>>;
+
+fn spawn_reaper<F>(
+    mut child: Child,
+    permit: Option<ProbePermit>,
+    outcome: AttemptOutcome,
+    mut wait: F,
+) where
+    F: for<'a> FnMut(&'a mut Child) -> ChildWaitFuture<'a> + Send + 'static,
+{
+    let _ = child.start_kill();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                terminate_child_with_wait(&mut child, |child| wait(child)).await;
+                if let Some(permit) = permit {
+                    permit.complete(outcome);
+                }
+            });
+        }
+        Err(error) => {
+            tracing::error!(%error, pid = child.id(), "ffprobe runtime ended before child reaping");
+            drop(child);
+            drop(permit);
+        }
+    }
+}
+
+async fn terminate_child_with_wait<F>(child: &mut Child, mut wait: F)
 where
-    F: FnMut(Child) -> Fut,
-    Fut: Future<Output = (Child, std::io::Result<std::process::ExitStatus>)>,
+    F: for<'a> FnMut(&'a mut Child) -> ChildWaitFuture<'a>,
 {
     let _ = child.start_kill();
     let mut next_warning = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let (next_child, result) = wait(child).await;
-        child = next_child;
+        let result = wait(child).await;
         if result.is_ok() {
             return;
         }
@@ -259,26 +361,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
     use tokio::{
         process::Command,
         sync::oneshot,
-        time::{Duration, sleep},
+        time::{Duration, sleep, timeout},
     };
 
-    use super::terminate_child_with_wait;
+    use crate::{application::probe::concurrency::ProbeRuntime, domain::ids::LibraryId};
 
-    struct TestPermit(Arc<AtomicBool>);
-
-    impl Drop for TestPermit {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
+    use super::{AttemptOutcome, ChildWaitFuture, FfprobeRunner, spawn_reaper};
 
     #[tokio::test]
     async fn process_permit_stays_held_until_wait_confirms_child_exit() {
@@ -287,18 +380,27 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("sleep process should start");
-        let permit_held = Arc::new(AtomicBool::new(true));
-        let owner_permit = Arc::clone(&permit_held);
+        let now = std::time::Instant::now();
+        let runtime = ProbeRuntime::new(1, 1, now);
+        let session = runtime
+            .register(LibraryId::new(), 1, 1, now)
+            .expect("session should register");
+        let permit = session
+            .try_acquire(now)
+            .expect("admission state")
+            .expect("permit should be granted");
         let (wait_started_tx, wait_started_rx) = oneshot::channel();
         let (release_wait_tx, release_wait_rx) = oneshot::channel();
-        let owner = tokio::spawn(async move {
-            let _permit = TestPermit(owner_permit);
-            let mut wait_started_tx = Some(wait_started_tx);
-            let mut release_wait_rx = Some(release_wait_rx);
-            terminate_child_with_wait(child, move |child| {
+        let mut wait_started_tx = Some(wait_started_tx);
+        let mut release_wait_rx = Some(release_wait_rx);
+        spawn_reaper(
+            child,
+            Some(permit),
+            AttemptOutcome::Cancelled,
+            move |child| {
                 let wait_started_tx = wait_started_tx.take();
                 let release_wait_rx = release_wait_rx.take();
-                async move {
+                Box::pin(async move {
                     if let Some(wait_started_tx) = wait_started_tx {
                         let _ = wait_started_tx.send(());
                     }
@@ -309,29 +411,88 @@ mod tests {
                     } else {
                         Ok(())
                     };
-                    let mut child = child;
-                    let result = match gate_result {
+                    match gate_result {
                         Ok(()) => child.wait().await,
                         Err(error) => Err(error),
-                    };
-                    (child, result)
-                }
-            })
-            .await;
-        });
+                    }
+                }) as ChildWaitFuture<'_>
+            },
+        );
 
         wait_started_rx
             .await
             .expect("cleanup should reach child wait");
         sleep(Duration::from_millis(1_100)).await;
-        assert!(
-            !owner.is_finished(),
-            "owner must not finish while child reaping is unconfirmed"
-        );
-        assert!(permit_held.load(Ordering::SeqCst));
+        assert_eq!(runtime.active_count().expect("active count"), 1);
 
         let _ = release_wait_tx.send(());
-        owner.await.expect("child owner should finish after wait");
-        assert!(!permit_held.load(Ordering::SeqCst));
+        timeout(Duration::from_secs(5), async {
+            while runtime.active_count().expect("active count") != 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("permit should release after wait confirms exit");
+    }
+
+    #[tokio::test]
+    async fn cancelling_probe_retains_its_runtime_permit_until_child_is_reaped() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let binary = directory.path().join("fake-ffprobe");
+        let marker = directory.path().join("child.pid");
+        let script = format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+            shell_quote(&marker.to_string_lossy())
+        );
+        fs::write(&binary, script).expect("fake ffprobe should be written");
+        let mut permissions = fs::metadata(&binary)
+            .expect("fake ffprobe metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).expect("fake ffprobe should be executable");
+
+        let now = std::time::Instant::now();
+        let runtime = ProbeRuntime::new(1, 1, now);
+        let session = runtime
+            .register(LibraryId::new(), 1, 1, now)
+            .expect("probe session should register");
+        let permit = session
+            .try_acquire(now)
+            .expect("admission state should be available")
+            .expect("probe should acquire its permit");
+        let runner = FfprobeRunner::new(binary, Duration::from_secs(60));
+        let caller = tokio::spawn(async move {
+            runner
+                .probe_path_with_permit(Path::new("/tmp/fixture.mkv"), permit)
+                .await
+        });
+
+        timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake ffprobe should start");
+        assert_eq!(runtime.active_count().expect("active count"), 1);
+
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller task should be cancelled")
+                .is_cancelled()
+        );
+        timeout(Duration::from_secs(5), async {
+            while runtime.active_count().expect("active count") != 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child cleanup should release the permit after reaping");
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }

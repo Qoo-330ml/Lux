@@ -1,9 +1,9 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     path::{Component, Path, PathBuf},
-    sync::{Arc, OnceLock},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use quick_xml::{events::Event, reader::Reader};
@@ -11,8 +11,9 @@ use serde_json::{Map, Value};
 use tokio::{
     fs,
     io::AsyncWriteExt,
-    sync::{Mutex as AsyncMutex, OnceCell, Semaphore},
+    sync::{Mutex as AsyncMutex, OnceCell},
     task::JoinSet,
+    time::sleep,
 };
 
 use crate::{
@@ -20,20 +21,21 @@ use crate::{
     application::plugin_protocol::{MediaProbeRpcResult, MediaProbeRpcStreamType},
     config::probe_concurrency_override_from_env,
     domain::{ids::LibraryId, time::duration_to_ticks},
-    observability::resources::{ResourceMetrics, automatic_probe_concurrency},
+    observability::resources::{ResourceMetrics, automatic_probe_concurrency, probe_cpu_capacity},
     storage::{Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredMediaSourcePath},
 };
 
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
+const PROBE_ADMISSION_TICK: Duration = Duration::from_secs(1);
 pub(crate) const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 512;
-static GLOBAL_PROBE_SLOTS: OnceLock<GlobalProbeSlots> = OnceLock::new();
 
 mod runner;
 use runner::read_limited;
 pub use runner::{FfprobeRunner, ProbeError};
 mod adaptive;
+mod concurrency;
 
 fn process_probe_hard_cap() -> Result<Option<usize>, String> {
     match probe_concurrency_override_from_env().map_err(|error| error.to_string())? {
@@ -48,21 +50,6 @@ fn resolve_process_probe_budget(override_budget: Option<usize>, automatic_budget
     override_budget
         .unwrap_or(automatic_budget)
         .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
-}
-
-struct GlobalProbeSlots {
-    hard_cap: usize,
-    semaphore: Arc<Semaphore>,
-}
-
-impl GlobalProbeSlots {
-    fn new(hard_cap: usize) -> Self {
-        let hard_cap = hard_cap.clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY);
-        Self {
-            hard_cap,
-            semaphore: Arc::new(Semaphore::new(hard_cap)),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -888,24 +875,24 @@ impl MediaProbeService {
         library_id: LibraryId,
     ) -> Result<ProbeReport, ProbeServiceError> {
         let mut report = ProbeReport::default();
-        let library_id = library_id.to_string();
-        let configured = self.configured_concurrency(&library_id).await?;
+        let library_id_text = library_id.to_string();
+        let configured = self.configured_concurrency(&library_id_text).await?;
         let subtitle_cache = Arc::new(SubtitleDirectoryCache::default());
         let mut offset = 0_i64;
         loop {
             let sources = self
                 .database
                 .list_media_sources_for_library_page(
-                    &library_id,
+                    &library_id_text,
                     LIBRARY_SOURCE_PAGE_SIZE as i64,
                     offset,
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            let concurrency = self.effective_concurrency(configured).await?;
             self.probe_source_page(
                 sources,
-                concurrency,
+                library_id,
+                configured,
                 &mut report,
                 Arc::clone(&subtitle_cache),
             )
@@ -924,6 +911,9 @@ impl MediaProbeService {
         library_id: &str,
     ) -> Result<ProbeReport, ProbeServiceError> {
         let configured = self.configured_concurrency(library_id).await?;
+        let library_id = library_id
+            .parse::<LibraryId>()
+            .map_err(|error| ProbeServiceError::Worker(format!("invalid library id: {error}")))?;
         let subtitle_cache = Arc::new(SubtitleDirectoryCache::default());
         let mut report = ProbeReport::default();
         loop {
@@ -934,11 +924,11 @@ impl MediaProbeService {
             if sources.is_empty() {
                 break;
             }
-            let concurrency = self.effective_concurrency(configured).await?;
             let states = self
                 .probe_source_page(
                     sources,
-                    concurrency,
+                    library_id,
+                    configured,
                     &mut report,
                     Arc::clone(&subtitle_cache),
                 )
@@ -980,39 +970,44 @@ impl MediaProbeService {
             .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY))
     }
 
-    async fn effective_concurrency(&self, configured: usize) -> Result<usize, ProbeServiceError> {
-        // This is the actual stage limit used by JoinSet and the global
-        // semaphore for this process.
-        let hard_cap = self.global_probe_slots().await?.hard_cap;
-        Ok(self
-            .resources
-            .probe_concurrency(configured, hard_cap)
-            .await
-            .clamp(1, hard_cap))
-    }
-
-    async fn global_probe_slots(&self) -> Result<&'static GlobalProbeSlots, ProbeServiceError> {
+    async fn global_probe_runtime(&self) -> Result<concurrency::ProbeRuntime, ProbeServiceError> {
         let override_budget = *self
             .process_hard_cap
             .as_ref()
             .map_err(|error| ProbeServiceError::Worker(error.clone()))?;
+        let capacity = probe_cpu_capacity().await;
         let automatic_budget = match override_budget {
             Some(budget) => budget,
             None => automatic_probe_concurrency().await,
         };
-        let hard_cap = resolve_process_probe_budget(override_budget, automatic_budget);
-        Ok(GLOBAL_PROBE_SLOTS.get_or_init(|| GlobalProbeSlots::new(hard_cap)))
+        let budget = resolve_process_probe_budget(override_budget, automatic_budget);
+        let starting_limit = capacity
+            .effective_cores
+            .ceil()
+            .clamp(1.0, MAX_EFFECTIVE_PROBE_CONCURRENCY as f64)
+            as usize;
+        tracing::debug!(
+            cpu_capacity_cores = capacity.effective_cores,
+            cpu_capacity_source = ?capacity.source,
+            process_budget = budget,
+            starting_limit,
+            "initialized CPU-aware probe admission"
+        );
+        concurrency::global_runtime(budget, starting_limit, Instant::now())
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))
     }
 
     async fn probe_source_page(
         &self,
         sources: Vec<StoredMediaSourcePath>,
-        concurrency: usize,
+        library_id: LibraryId,
+        configured_limit: usize,
         report: &mut ProbeReport,
         subtitle_cache: Arc<SubtitleDirectoryCache>,
     ) -> Result<Vec<(String, ProbeTargetState)>, ProbeServiceError> {
         let mut states = Vec::new();
-        let mut inputs = Vec::with_capacity(sources.len());
+        let mut local_inputs = VecDeque::new();
+        let mut sidecar_inputs = VecDeque::new();
         for source in sources {
             if source.probe_status != "PENDING" {
                 report.skipped += 1;
@@ -1021,43 +1016,132 @@ impl MediaProbeService {
             }
             report.attempted += 1;
             let path = safe_media_path(&source.root_path, &source.relative_path)?;
-            inputs.push((source, path));
+            if is_strm_path(&path) {
+                sidecar_inputs.push_back((source, path));
+            } else {
+                local_inputs.push_back((source, path));
+            }
         }
 
+        let runtime = self.global_probe_runtime().await?;
+        let session = runtime
+            .register(
+                library_id,
+                configured_limit,
+                local_inputs.len(),
+                Instant::now(),
+            )
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+        let page_worker_limit = configured_limit
+            .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+            .min(LIBRARY_SOURCE_PAGE_SIZE);
         let mut pending = JoinSet::<ProbeTaskResult>::new();
-        for (source, path) in inputs {
-            while pending.len() >= concurrency {
-                states.push(
-                    self.collect_probe_task(&mut pending, report, subtitle_cache.as_ref())
-                        .await?,
-                );
+        loop {
+            let mut blocked_version = None;
+            while pending.len() < page_worker_limit {
+                if !local_inputs.is_empty() {
+                    let observed_version = runtime
+                        .version()
+                        .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                    let permit = match session.try_acquire(Instant::now()) {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => {
+                            blocked_version = Some(observed_version);
+                            let Some((source, path)) = sidecar_inputs.pop_front() else {
+                                break;
+                            };
+                            let service = self.clone();
+                            pending.spawn(async move {
+                                let result = service.probe_strm_sidecars(&path).await;
+                                (source, path, result)
+                            });
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(ProbeServiceError::Worker(error.to_string()));
+                        }
+                    };
+                    let Some((source, path)) = local_inputs.pop_front() else {
+                        return Err(ProbeServiceError::Worker(
+                            "local probe input disappeared after admission".to_owned(),
+                        ));
+                    };
+                    let service = self.clone();
+                    pending.spawn(async move {
+                        let result = service.probe_source_with_permit(&path, permit).await;
+                        (source, path, result)
+                    });
+                    blocked_version = None;
+                    continue;
+                }
+                if let Some((source, path)) = sidecar_inputs.pop_front() {
+                    let service = self.clone();
+                    pending.spawn(async move {
+                        let result = service.probe_strm_sidecars(&path).await;
+                        (source, path, result)
+                    });
+                    continue;
+                }
+                break;
             }
-            let service = self.clone();
-            pending.spawn(async move {
-                let result = service.probe_source_with_slot(&path).await;
-                (source, path, result)
-            });
-        }
-        while !pending.is_empty() {
-            states.push(
-                self.collect_probe_task(&mut pending, report, subtitle_cache.as_ref())
-                    .await?,
+
+            if pending.is_empty() && local_inputs.is_empty() && sidecar_inputs.is_empty() {
+                break;
+            }
+
+            let observed_version = blocked_version.unwrap_or(
+                runtime
+                    .version()
+                    .map_err(|error| ProbeServiceError::Worker(error.to_string()))?,
             );
+            if pending.is_empty() {
+                tokio::select! {
+                    changed = runtime.wait_for_change_since(observed_version) => {
+                        changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                    }
+                    _ = sleep(PROBE_ADMISSION_TICK) => {
+                        runtime
+                            .tick(Instant::now())
+                            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                    }
+                }
+                continue;
+            }
+
+            tokio::select! {
+                joined = pending.join_next() => {
+                    let joined = joined.ok_or_else(|| {
+                        ProbeServiceError::Worker("probe task set was empty".to_owned())
+                    })?;
+                    states.push(
+                        self.persist_joined_probe_task(
+                            joined,
+                            report,
+                            subtitle_cache.as_ref(),
+                        )
+                        .await?,
+                    );
+                }
+                changed = runtime.wait_for_change_since(observed_version) => {
+                    changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                }
+                _ = sleep(PROBE_ADMISSION_TICK) => {
+                    runtime
+                        .tick(Instant::now())
+                        .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                }
+            }
         }
         Ok(states)
     }
 
-    async fn collect_probe_task(
+    async fn persist_joined_probe_task(
         &self,
-        pending: &mut JoinSet<ProbeTaskResult>,
+        joined: Result<ProbeTaskResult, tokio::task::JoinError>,
         report: &mut ProbeReport,
         subtitle_cache: &SubtitleDirectoryCache,
     ) -> Result<(String, ProbeTargetState), ProbeServiceError> {
-        let task = pending
-            .join_next()
-            .await
-            .ok_or_else(|| ProbeServiceError::Worker("probe task set was empty".to_owned()))?
-            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+        let task = joined.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
         let state = self
             .persist_probe_attempt(&task.0, &task.1, task.2, report, subtitle_cache)
             .await?;
@@ -1176,32 +1260,12 @@ impl MediaProbeService {
         }
     }
 
-    async fn probe_source_with_slot(
+    async fn probe_source_with_permit(
         &self,
         path: &Path,
+        permit: concurrency::ProbePermit,
     ) -> Result<Option<MediaProbeResult>, ProbeError> {
-        let slots = self
-            .global_probe_slots()
-            .await
-            .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?;
-        let permit = slots
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?;
-        let result = self.probe_source(path).await;
-        drop(permit);
-        result
-    }
-
-    async fn probe_source(&self, path: &Path) -> Result<Option<MediaProbeResult>, ProbeError> {
-        if is_strm_path(path) {
-            return Ok(read_media_info_sidecar(path)
-                .await
-                .or(read_nfo_streamdetails(path).await));
-        }
-        match self.runner.probe_path(path).await {
+        match self.runner.probe_path_with_permit(path, permit).await {
             Ok(result) => Ok(Some(result)),
             Err(error) => read_media_info_sidecar(path)
                 .await
@@ -1209,6 +1273,15 @@ impl MediaProbeService {
                 .map(Some)
                 .ok_or(error),
         }
+    }
+
+    async fn probe_strm_sidecars(
+        &self,
+        path: &Path,
+    ) -> Result<Option<MediaProbeResult>, ProbeError> {
+        Ok(read_media_info_sidecar(path)
+            .await
+            .or(read_nfo_streamdetails(path).await))
     }
 }
 

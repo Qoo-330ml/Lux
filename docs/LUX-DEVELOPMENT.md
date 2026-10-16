@@ -11890,7 +11890,7 @@ Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 - [ ] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
 - [ ] 通过定向测试、全量项目完成门和记录在 `docs/PERFORMANCE.md` 的可重复 A/B 测量；不把本机 ARM 结果外推为 NAS/x86 性能。
 
-进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过；P3 已将 ffprobe runner 与输出读取逻辑提取到独立模块；P4 runner owner 在取消、timeout 或输出错误后持续持有子进程，直到 `Child::wait` 确认退出。wait gate 单测曾复现旧逻辑在 1 秒后提前结束的问题，修改后通过；真实子进程取消检查通过，`probe` 20/20 通过。P5 已完成纯完成速率状态机，使用注入时间覆盖预热、饱和窗口、试探/回退、降档、停滞和冷却，定向单测 13/13 通过。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
+进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过；P3 已将 ffprobe runner 与输出读取逻辑提取到独立模块；P4 runner owner 在取消、timeout 或输出错误后持续持有子进程，直到 `Child::wait` 确认退出。wait gate 单测曾复现旧逻辑在 1 秒后提前结束的问题，修改后通过；真实子进程取消检查通过，`probe` 20/20 通过。P5 已完成纯完成速率状态机，使用注入时间覆盖预热、饱和窗口、试探/回退、降档、停滞和冷却，定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；timeout、输出错误和取消可尽快返回调用方，后台 reaper 持有 Child 与 permit，直到 wait 确认退出，STRM 旁车不占本地 probe permit。fresh runtime 多库/同库及停滞测试、真实 permit wait gate 和真实子进程取消均通过；probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。P7–P10、Linux 交叉构建和性能 A/B 尚未完成；Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
 
 ## 29. 参考资料
 

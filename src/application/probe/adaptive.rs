@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::time::{Duration, Instant};
 
 const MIN_WINDOW: Duration = Duration::from_secs(10);
@@ -39,7 +37,6 @@ pub(super) struct WindowInput {
     pub(super) successes: u32,
     pub(super) failures: u32,
     pub(super) timeouts: u32,
-    pub(super) cancellations: u32,
     pub(super) saturated_for: Duration,
     pub(super) service_time_p95: Duration,
     pub(super) has_backlog: bool,
@@ -109,6 +106,70 @@ impl AdaptiveState {
         self.current_limit
     }
 
+    pub(super) fn record_success(&mut self, now: Instant) {
+        self.last_success_at = now;
+    }
+
+    pub(super) fn update_budget(&mut self, budget: usize) -> Option<(usize, usize)> {
+        let budget = budget.clamp(1, super::MAX_EFFECTIVE_PROBE_CONCURRENCY);
+        if self.budget == budget {
+            return None;
+        }
+        self.budget = budget;
+        self.phase = AdaptivePhase::Warmup;
+        self.upward_hold_until = None;
+        if self.current_limit > budget {
+            let previous_limit = self.current_limit;
+            self.current_limit = budget;
+            Some((previous_limit, budget))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn reset_epoch(&mut self, epoch: u64, now: Instant) {
+        self.epoch = epoch;
+        self.phase = AdaptivePhase::Warmup;
+        self.last_success_at = now;
+        self.last_stall_reduction_at = None;
+        self.upward_hold_until = None;
+    }
+
+    pub(super) fn evaluate_stall(
+        &mut self,
+        now: Instant,
+        has_backlog: bool,
+        active_processes: usize,
+        longest_active_for: Duration,
+    ) -> Option<Adjustment> {
+        if !has_backlog
+            || active_processes == 0
+            || longest_active_for < STALL_AFTER
+            || now.saturating_duration_since(self.last_success_at) < STALL_AFTER
+            || self
+                .last_stall_reduction_at
+                .is_some_and(|last| now.saturating_duration_since(last) < STALL_AFTER)
+        {
+            return None;
+        }
+        let next_limit = (self.current_limit / 2).max(1);
+        if next_limit >= self.current_limit {
+            return None;
+        }
+        let previous_limit = self.current_limit;
+        self.current_limit = next_limit;
+        self.last_stall_reduction_at = Some(now);
+        self.phase = AdaptivePhase::Cooldown {
+            until: now + TRIAL_COOLDOWN,
+            baseline: None,
+        };
+        Some(Adjustment {
+            previous_limit,
+            current_limit: next_limit,
+            reason: AdjustmentReason::Stall,
+        })
+    }
+
     pub(super) fn evaluate(&mut self, now: Instant, input: WindowInput) -> Option<Adjustment> {
         if input.epoch != self.epoch {
             self.epoch = input.epoch;
@@ -121,29 +182,13 @@ impl AdaptiveState {
             self.last_success_at = now;
         }
 
-        if input.has_backlog
-            && input.active_processes > 0
-            && input.longest_active_for >= STALL_AFTER
-            && now.saturating_duration_since(self.last_success_at) >= STALL_AFTER
-            && self
-                .last_stall_reduction_at
-                .is_none_or(|last| now.saturating_duration_since(last) >= STALL_AFTER)
-        {
-            let next_limit = (self.current_limit / 2).max(1);
-            if next_limit < self.current_limit {
-                let previous_limit = self.current_limit;
-                self.current_limit = next_limit;
-                self.last_stall_reduction_at = Some(now);
-                self.phase = AdaptivePhase::Cooldown {
-                    until: now + TRIAL_COOLDOWN,
-                    baseline: None,
-                };
-                return Some(Adjustment {
-                    previous_limit,
-                    current_limit: next_limit,
-                    reason: AdjustmentReason::Stall,
-                });
-            }
+        if let Some(adjustment) = self.evaluate_stall(
+            now,
+            input.has_backlog,
+            input.active_processes,
+            input.longest_active_for,
+        ) {
+            return Some(adjustment);
         }
 
         if input.successes == 0
@@ -164,9 +209,7 @@ impl AdaptiveState {
             });
         }
 
-        let Some(stats) = comparable_window(input) else {
-            return None;
-        };
+        let stats = comparable_window(input)?;
 
         match self.phase {
             AdaptivePhase::Warmup => {
@@ -191,7 +234,7 @@ impl AdaptiveState {
                 };
                 if next_degraded_windows >= 2 {
                     let previous_limit = self.current_limit;
-                    let reduction = (self.current_limit + 3) / 4;
+                    let reduction = self.current_limit.div_ceil(4);
                     let next_limit = self.current_limit.saturating_sub(reduction).max(1);
                     if next_limit == previous_limit {
                         self.phase = AdaptivePhase::Stable {
@@ -224,7 +267,7 @@ impl AdaptiveState {
                     && now.saturating_duration_since(since) >= REVERSE_TRIAL_AFTER
                 {
                     let previous_limit = self.current_limit;
-                    let step = ((self.current_limit + 7) / 8).max(1);
+                    let step = self.current_limit.div_ceil(8).max(1);
                     self.current_limit = self.current_limit.saturating_sub(step).max(1);
                     self.phase = AdaptivePhase::TrialDown {
                         original_limit: previous_limit,
@@ -240,7 +283,7 @@ impl AdaptiveState {
                     && self.upward_hold_until.is_none_or(|until| now >= until)
                 {
                     let previous_limit = self.current_limit;
-                    let step = (self.current_limit + 7) / 8;
+                    let step = self.current_limit.div_ceil(8);
                     self.current_limit = self.current_limit.saturating_add(step).min(self.budget);
                     self.phase = AdaptivePhase::TrialUp {
                         original_limit: previous_limit,
@@ -398,7 +441,6 @@ mod tests {
             successes,
             failures: 0,
             timeouts: 0,
-            cancellations: 0,
             saturated_for: Duration::from_secs(10),
             service_time_p95: Duration::from_millis(p95_ms),
             has_backlog: true,
