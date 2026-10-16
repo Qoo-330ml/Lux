@@ -11993,6 +11993,21 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁记录（2026-10-16）：`cargo test --locked --lib manifest_baseline -- --test-threads=1` 为 2 passed；`cargo test --locked --test scanning_jobs` 为 88 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 release A/B harness 均通过。`cargo test --locked --all-targets` 的 lib target 为 944 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14。随后 `tests/probe.rs` 有 20 passed、1 failed：`probe_runner_terminates_when_stderr_exceeds_the_runtime_limit` 超过测试超时；该用例隔离重跑通过，probe target 串行运行 21/21。其余后续 targets 未执行，因此完整 Rust 门禁仍记为非绿色。失败发生在本任务未修改的 probe 代码，现有证据未能确认其根因或证明基线表现。默认 all-targets 未运行 PostgreSQL 实例；PostgreSQL 模板文本和绑定编号由单测验证，运行时 PG 验证留待 S7。
 
+#### LUX-567：manifest 发现路径与 presence 模板
+
+范围：缓存 manifest 发现的旧格式/V3 known-path 查询，以及 V3 presence 更新、部分成功回读、seen-path ledger 插入的精确行数 SQL 模板。模板按后端原有路径批次上限分块，不改查询次数、语义、绑定顺序或事务。全成功更新时借用输入路径；部分成功时只将回读结果持有为 owned 字符串。支持 PostgreSQL presence update 的 35,002 个绑定，并保留 SQLite 绑定上限。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验收：
+
+- [x] SQL 模板覆盖旧格式和 V3 known-path、V3 update/readback/ledger insert；后端占位符、参数顺序、边界绑定数正确，模板复用且缓存有界。
+- [x] SQLite 行为测试覆盖 known path、更新全成功与部分成功回读、seen-path 写入、格式版本切换及计数结果；原扫描语义和 query counter 保持。
+- [x] `successfully_seen_paths` 在全成功路径借用输入，部分成功回读使用 owned 数据；无生命周期扩大或公共 API 变化。
+- [x] 定向测试、格式、构建、Clippy 与完整门禁按实际结果记录；PostgreSQL 运行时验证留至 S7。
+
+完成门禁记录（2026-10-16）：manifest SQL 模板单测 4/4、presence repository 回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 中 lib target 为 948 passed、0 failed、23 ignored，`libraries_api` 为 14/14，`probe` 为 21/21；随后 `tests/scanned_metadata.rs` 有 22 passed、1 failed，失败为 `failed_local_poster_insert_does_not_mark_image_stage_complete`。在未包含 LUX-567 的基线提交 `3b4b7325` 上串行重跑该 target，同一用例以相同断言失败（22/23），确认该失败先于本任务存在。当前分支串行 target 另有一次 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound`，该用例隔离重跑通过，基线串行 target 也通过。完整 all-targets 门禁仍为非绿色；PostgreSQL 运行时验证留待 S7。
+
 
 ## 29. 参考资料
 

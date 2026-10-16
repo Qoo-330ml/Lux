@@ -19999,3 +19999,245 @@ async fn postgres_media_items_are_normalized_to_one_default_source()
     drop_database?;
     Ok(())
 }
+
+#[tokio::test]
+async fn manifest_discovery_presence_templates_preserve_path_and_generation_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    database
+        .query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('presence-lib', 'Presence', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('presence-root', 'presence-lib', '/presence', '/presence', 1, 0)",
+        )
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: "presence-root",
+    }];
+    let manifest = NewScanManifest {
+        id: "presence-manifest",
+        job_id: "presence-job",
+        library_id: "presence-lib",
+        roots: &roots,
+    };
+    database
+        .create_full_scan_manifest_job(
+            "presence-job",
+            "presence-generation",
+            false,
+            &manifest,
+            None,
+        )
+        .await?;
+    assert!(database.claim_scan_job("presence-job").await?);
+
+    for (id, path, fingerprint, generation) in [
+        (
+            "presence-current",
+            "already-seen.mkv",
+            b"current".as_slice(),
+            "presence-generation",
+        ),
+        (
+            "presence-fast",
+            "fast-update.mkv",
+            b"fast".as_slice(),
+            "old-generation",
+        ),
+        (
+            "presence-partial",
+            "partial-update.mkv",
+            b"partial".as_slice(),
+            "old-generation",
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, is_missing
+                 ) VALUES (?, 'presence-root', ?, 'FILE', 10, 20, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(path)
+            .bind(fingerprint)
+            .bind(generation)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let entry = |relative_path: &str, fingerprint: &[u8]| NewScanManifestEntry {
+        relative_path: relative_path.to_owned(),
+        entry_kind: "FILE".to_owned(),
+        size: 11,
+        modified_at: 21,
+        device: None,
+        inode: None,
+        fingerprint: fingerprint.to_vec(),
+        fingerprint_pending: false,
+    };
+    let seen_entry =
+        |id: &str, relative_path: &str, fingerprint: &[u8]| NewScanManifestSeenFilesystemEntry {
+            filesystem_entry_id: id.to_owned(),
+            relative_path: relative_path.to_owned(),
+            size: 11,
+            modified_at: 21,
+            device: None,
+            inode: None,
+            fingerprint: fingerprint.to_vec(),
+        };
+
+    let current_entries = [entry("already-seen.mkv", b"current")];
+    let current_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &current_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&current_chunk)
+            .await?,
+        0,
+        "format 3 treats a path already seen in this generation as known"
+    );
+
+    let fast_entries = [entry("fast-update.mkv", b"fast")];
+    let fast_seen = [seen_entry("presence-fast", "fast-update.mkv", b"fast")];
+    let fast_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &fast_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &fast_seen,
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&fast_chunk)
+            .await?,
+        1,
+        "a full successful presence update counts the file once"
+    );
+    let fast_generation: String = database
+        .query_scalar(
+            "SELECT last_seen_generation FROM filesystem_entries WHERE id = 'presence-fast'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(fast_generation, "presence-generation");
+    let fast_ledger_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM scan_manifest_seen_paths
+             WHERE manifest_id = 'presence-manifest' AND relative_path = 'fast-update.mkv'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        fast_ledger_count, 0,
+        "successful updates do not duplicate the ledger"
+    );
+
+    let partial_entries = [
+        entry("partial-update.mkv", b"partial"),
+        entry("missing-entry.mkv", b"missing"),
+    ];
+    let partial_seen = [
+        seen_entry("presence-partial", "partial-update.mkv", b"partial"),
+        seen_entry("presence-missing", "missing-entry.mkv", b"missing"),
+    ];
+    let partial_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &partial_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &partial_seen,
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&partial_chunk)
+            .await?,
+        2,
+        "partial updates return the updated path and ledger fallback path once each"
+    );
+    let partial_generation: String = database
+        .query_scalar(
+            "SELECT last_seen_generation FROM filesystem_entries WHERE id = 'presence-partial'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(partial_generation, "presence-generation");
+    let ledger_paths: Vec<String> = database
+        .query_scalar(
+            "SELECT relative_path FROM scan_manifest_seen_paths
+             WHERE manifest_id = 'presence-manifest' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(ledger_paths, ["already-seen.mkv", "missing-entry.mkv"]);
+
+    database
+        .query(
+            "UPDATE scan_manifests SET discovery_format_version = 2 WHERE id = 'presence-manifest'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at
+             ) VALUES ('presence-manifest', 'presence-root', 'legacy-known.mkv', 1, 'FILE', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query("UPDATE scan_manifest_roots SET next_observation_sequence = 1 WHERE manifest_id = 'presence-manifest'")
+        .execute(database.pool())
+        .await?;
+    let legacy_entries = [entry("legacy-known.mkv", b"legacy")];
+    let legacy_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &legacy_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&legacy_chunk)
+            .await?,
+        0,
+        "legacy format queries known paths from prior manifest observations"
+    );
+    database.close().await;
+    Ok(())
+}

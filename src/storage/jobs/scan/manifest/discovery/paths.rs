@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::sql_templates::manifest_discovery_known_paths_template;
 
 pub(super) struct ManifestDiscoveryFilePathCounts<'a> {
     pub(super) file_paths: Vec<&'a str>,
@@ -27,31 +28,42 @@ impl Database {
             if paths.is_empty() {
                 continue;
             }
-            let query = if discovery_format_version == 3 {
-                let values = std::iter::repeat_n("(?)", paths.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "WITH incoming(relative_path) AS (VALUES {values})
-                     SELECT incoming.relative_path FROM incoming
-                     WHERE EXISTS (
-                         SELECT 1 FROM filesystem_entries entry
-                           WHERE entry.library_root_id = ?
-                           AND entry.relative_path = incoming.relative_path
-                           AND entry.last_seen_generation = ?
-                     )"
-                )
-            } else {
-                let placeholders = std::iter::repeat_n("?", paths.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "SELECT DISTINCT relative_path FROM scan_manifest_entries
-                     WHERE manifest_id = ? AND library_root_id = ? AND entry_kind = 'FILE'
-                       AND relative_path IN ({placeholders})"
-                )
+            let template = manifest_discovery_known_paths_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                discovery_format_version,
+                paths.len(),
+            );
+            let mut statement = match template {
+                Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let query = if discovery_format_version == 3 {
+                        let values = std::iter::repeat_n("(?)", paths.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            "WITH incoming(relative_path) AS (VALUES {values})
+                             SELECT incoming.relative_path FROM incoming
+                             WHERE EXISTS (
+                                 SELECT 1 FROM filesystem_entries entry
+                                   WHERE entry.library_root_id = ?
+                                   AND entry.relative_path = incoming.relative_path
+                                   AND entry.last_seen_generation = ?
+                             )"
+                        )
+                    } else {
+                        let placeholders = std::iter::repeat_n("?", paths.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            "SELECT DISTINCT relative_path FROM scan_manifest_entries
+                             WHERE manifest_id = ? AND library_root_id = ? AND entry_kind = 'FILE'
+                               AND relative_path IN ({placeholders})"
+                        )
+                    };
+                    self.query(sqlx::AssertSqlSafe(query))
+                }
             };
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
             if discovery_format_version == 3 {
                 for path in paths {
                     statement = statement.bind(path);

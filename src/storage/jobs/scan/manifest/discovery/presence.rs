@@ -1,4 +1,9 @@
 use super::*;
+use crate::storage::sql_templates::{
+    manifest_presence_readback_template, manifest_presence_update_template,
+    manifest_seen_paths_insert_template,
+};
+use std::borrow::Cow;
 
 pub(super) struct ManifestPresenceLedgerInput<'input, 'data>
 where
@@ -30,7 +35,8 @@ impl Database {
             indexed_paths,
         } = input;
         let mut ledger_paths = Vec::new();
-        let mut successfully_seen_paths = std::collections::HashSet::new();
+        let mut successfully_seen_paths: std::collections::HashSet<Cow<'data, str>> =
+            std::collections::HashSet::new();
         if discovery_format_version == 3 && !seen_filesystem_entries.is_empty() {
             for entries in seen_filesystem_entries
                 .chunks(super::manifest_path_query_chunk_size(self.backend()))
@@ -38,61 +44,71 @@ impl Database {
                 if entries.is_empty() {
                     continue;
                 }
-                let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 let postgres_update_from = self.backend() == DatabaseBackend::Postgres;
-                let query = if postgres_update_from {
-                    format!(
-                        "WITH incoming(
-                             filesystem_entry_id, relative_path, fingerprint, size,
-                             modified_at, device, inode
-                         ) AS (VALUES {values})
-                         UPDATE filesystem_entries AS current
-                         SET size = incoming.size,
-                             modified_at = incoming.modified_at,
-                             device = incoming.device,
-                             inode = incoming.inode,
-                             last_seen_generation = ?,
-                             last_seen_change_kind = NULL
-                         FROM incoming
-                         WHERE current.id = incoming.filesystem_entry_id
-                           AND current.library_root_id = ?
-                           AND current.relative_path = incoming.relative_path
-                           AND current.fingerprint = incoming.fingerprint
-                           AND current.entry_kind = 'FILE'
-                           AND current.is_missing = 0
-                           AND current.entry_kind = 'FILE'
-                           AND current.is_missing = 0"
-                    )
-                } else {
-                    format!(
-                        "WITH incoming(
-                                  filesystem_entry_id, relative_path, fingerprint, size,
-                                  modified_at, device, inode
-                              ) AS (VALUES {values}),
-                              matching(filesystem_entry_id) AS (
-                                  SELECT incoming.filesystem_entry_id
-                                  FROM incoming
-                                  JOIN filesystem_entries current
-                                    ON current.id = incoming.filesystem_entry_id
+                let template = manifest_presence_update_template(
+                    &self.filesystem_path_templates,
+                    self.backend(),
+                    entries.len(),
+                );
+                let mut statement = match template {
+                    Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                    Err(_) => {
+                        let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let query = if postgres_update_from {
+                            format!(
+                                "WITH incoming(
+                                     filesystem_entry_id, relative_path, fingerprint, size,
+                                     modified_at, device, inode
+                                 ) AS (VALUES {values})
+                                 UPDATE filesystem_entries AS current
+                                 SET size = incoming.size,
+                                     modified_at = incoming.modified_at,
+                                     device = incoming.device,
+                                     inode = incoming.inode,
+                                     last_seen_generation = ?,
+                                     last_seen_change_kind = NULL
+                                 FROM incoming
+                                 WHERE current.id = incoming.filesystem_entry_id
+                                   AND current.library_root_id = ?
                                    AND current.relative_path = incoming.relative_path
                                    AND current.fingerprint = incoming.fingerprint
-                                  WHERE current.library_root_id = ?
-                                    AND current.entry_kind = 'FILE'
-                                    AND current.is_missing = 0
-                              )
-                         UPDATE filesystem_entries
-                         SET size = (SELECT size FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                             modified_at = (SELECT modified_at FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                             device = (SELECT device FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                             inode = (SELECT inode FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                             last_seen_generation = ?,
-                             last_seen_change_kind = NULL
-                         WHERE id IN (SELECT filesystem_entry_id FROM matching)"
-                    )
+                                   AND current.entry_kind = 'FILE'
+                                   AND current.is_missing = 0
+                                   AND current.entry_kind = 'FILE'
+                                   AND current.is_missing = 0"
+                            )
+                        } else {
+                            format!(
+                                "WITH incoming(
+                                          filesystem_entry_id, relative_path, fingerprint, size,
+                                          modified_at, device, inode
+                                      ) AS (VALUES {values}),
+                                      matching(filesystem_entry_id) AS (
+                                          SELECT incoming.filesystem_entry_id
+                                          FROM incoming
+                                          JOIN filesystem_entries current
+                                            ON current.id = incoming.filesystem_entry_id
+                                           AND current.relative_path = incoming.relative_path
+                                           AND current.fingerprint = incoming.fingerprint
+                                          WHERE current.library_root_id = ?
+                                            AND current.entry_kind = 'FILE'
+                                            AND current.is_missing = 0
+                                      )
+                                 UPDATE filesystem_entries
+                                 SET size = (SELECT size FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                                     modified_at = (SELECT modified_at FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                                     device = (SELECT device FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                                     inode = (SELECT inode FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
+                                     last_seen_generation = ?,
+                                     last_seen_change_kind = NULL
+                                 WHERE id IN (SELECT filesystem_entry_id FROM matching)"
+                            )
+                        };
+                        self.query(sqlx::AssertSqlSafe(query))
+                    }
                 };
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
                 for entry in entries {
                     statement = statement
                         .bind(&entry.filesystem_entry_id)
@@ -117,28 +133,41 @@ impl Database {
                     })?;
                 let updated_count = usize::try_from(updated.rows_affected()).unwrap_or(usize::MAX);
                 if updated_count == entries.len() {
-                    successfully_seen_paths
-                        .extend(entries.iter().map(|entry| entry.relative_path.clone()));
+                    successfully_seen_paths.extend(
+                        entries
+                            .iter()
+                            .map(|entry| Cow::Borrowed(entry.relative_path.as_str())),
+                    );
                     continue;
                 }
 
-                let values = std::iter::repeat_n("(?, ?, ?)", entries.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES {values})
-                     SELECT incoming.relative_path
-                     FROM incoming
-                     JOIN filesystem_entries entry
-                       ON entry.id = incoming.filesystem_entry_id
-                      AND entry.relative_path = incoming.relative_path
-                     WHERE entry.library_root_id = ?
-                       AND entry.entry_kind = 'FILE'
-                       AND entry.is_missing = 0
-                       AND entry.last_seen_generation = ?
-                       AND entry.fingerprint = incoming.fingerprint"
+                let template = manifest_presence_readback_template(
+                    &self.filesystem_path_templates,
+                    self.backend(),
+                    entries.len(),
                 );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                let mut statement = match template {
+                    Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                    Err(_) => {
+                        let values = std::iter::repeat_n("(?, ?, ?)", entries.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let query = format!(
+                            "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES {values})
+                             SELECT incoming.relative_path
+                             FROM incoming
+                             JOIN filesystem_entries entry
+                               ON entry.id = incoming.filesystem_entry_id
+                              AND entry.relative_path = incoming.relative_path
+                             WHERE entry.library_root_id = ?
+                               AND entry.entry_kind = 'FILE'
+                               AND entry.is_missing = 0
+                               AND entry.last_seen_generation = ?
+                               AND entry.fingerprint = incoming.fingerprint"
+                        );
+                        self.query(sqlx::AssertSqlSafe(query))
+                    }
+                };
                 for entry in entries {
                     statement = statement
                         .bind(&entry.filesystem_entry_id)
@@ -157,7 +186,7 @@ impl Database {
                 successfully_seen_paths.extend(
                     successful_rows
                         .into_iter()
-                        .map(|row| row.get::<String, _>("relative_path")),
+                        .map(|row| Cow::Owned(row.get::<String, _>("relative_path"))),
                 );
             }
         }
@@ -177,19 +206,29 @@ impl Database {
             if paths.is_empty() {
                 continue;
             }
-            let values = std::iter::repeat_n("(?)", paths.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "WITH incoming_seen_paths(relative_path) AS (VALUES {values})
-                 INSERT INTO scan_manifest_seen_paths (
-                     manifest_id, library_root_id, relative_path
-                 )
-                 SELECT ?, ?, incoming_seen_paths.relative_path
-                 FROM incoming_seen_paths WHERE TRUE
-                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+            let template = manifest_seen_paths_insert_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                paths.len(),
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = match template {
+                Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let values = std::iter::repeat_n("(?)", paths.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "WITH incoming_seen_paths(relative_path) AS (VALUES {values})
+                         INSERT INTO scan_manifest_seen_paths (
+                             manifest_id, library_root_id, relative_path
+                         )
+                         SELECT ?, ?, incoming_seen_paths.relative_path
+                         FROM incoming_seen_paths WHERE TRUE
+                         ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+                    );
+                    self.query(sqlx::AssertSqlSafe(query))
+                }
+            };
             for path in paths {
                 statement = statement.bind(path);
             }

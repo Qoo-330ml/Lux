@@ -8,7 +8,7 @@ use std::{
 const MAX_CACHED_TEMPLATE_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CACHED_TEMPLATE_ENTRIES: usize = 256;
 const MAX_CACHED_TAILS_PER_TEMPLATE: usize = 4;
-const MAX_TEMPLATE_BINDINGS: usize = 32_766;
+const MAX_TEMPLATE_BINDINGS: usize = 65_535;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TemplateBackend {
@@ -30,24 +30,37 @@ enum TemplateFamily {
     FilesystemEntries,
     FilesystemEntryRecords,
     ManifestFilesystemBaselines,
+    ManifestDiscoveryKnownPaths,
+    ManifestPresenceUpdate,
+    ManifestPresenceReadback,
+    ManifestSeenPathsInsert,
 }
 
 impl TemplateFamily {
-    fn max_in_capacity(self, backend: TemplateBackend) -> u16 {
+    fn max_in_capacity(self, backend: TemplateBackend) -> Option<u16> {
         match self {
-            Self::FilesystemEntries | Self::FilesystemEntryRecords => 500,
-            Self::ManifestFilesystemBaselines => match backend {
+            Self::FilesystemEntries | Self::FilesystemEntryRecords => Some(500),
+            Self::ManifestFilesystemBaselines => Some(match backend {
                 TemplateBackend::Sqlite => 2_900,
                 TemplateBackend::Postgres => 5_000,
-            },
+            }),
+            Self::ManifestDiscoveryKnownPaths
+            | Self::ManifestPresenceUpdate
+            | Self::ManifestPresenceReadback
+            | Self::ManifestSeenPathsInsert => None,
         }
     }
 
-    fn fixed_bindings(self) -> usize {
+    fn exact_row_shape(self, backend: TemplateBackend) -> Option<(u16, usize, usize)> {
         match self {
+            Self::ManifestDiscoveryKnownPaths | Self::ManifestSeenPathsInsert => {
+                Some((manifest_path_max_rows(backend), 1, 2))
+            }
+            Self::ManifestPresenceReadback => Some((manifest_path_max_rows(backend), 3, 2)),
+            Self::ManifestPresenceUpdate => Some((manifest_path_max_rows(backend), 7, 2)),
             Self::FilesystemEntries
             | Self::FilesystemEntryRecords
-            | Self::ManifestFilesystemBaselines => 1,
+            | Self::ManifestFilesystemBaselines => None,
         }
     }
 }
@@ -55,11 +68,13 @@ impl TemplateFamily {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TemplateVersion {
     V1,
+    V2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TemplateShape {
     InCapacity(u16),
+    ExactRows(u16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -79,16 +94,31 @@ impl TemplateKey {
         shape: TemplateShape,
     ) -> Result<Self, TemplateError> {
         let backend = TemplateBackend::from(backend);
-        let TemplateShape::InCapacity(capacity) = shape;
-        let max_capacity = family.max_in_capacity(backend);
-        if capacity == 0
-            || capacity > max_capacity
-            || (!capacity.is_power_of_two() && capacity != max_capacity)
-        {
-            return Err(TemplateError::InvalidShape);
-        }
-
-        let binding_count = usize::from(capacity) + family.fixed_bindings();
+        let binding_count = match shape {
+            TemplateShape::InCapacity(capacity) => {
+                let max_capacity = family
+                    .max_in_capacity(backend)
+                    .ok_or(TemplateError::InvalidShape)?;
+                if capacity == 0
+                    || capacity > max_capacity
+                    || (!capacity.is_power_of_two() && capacity != max_capacity)
+                {
+                    return Err(TemplateError::InvalidShape);
+                }
+                usize::from(capacity).saturating_add(1)
+            }
+            TemplateShape::ExactRows(rows) => {
+                let (max_rows, bindings_per_row, fixed_bindings) = family
+                    .exact_row_shape(backend)
+                    .ok_or(TemplateError::InvalidShape)?;
+                if rows == 0 || rows > max_rows {
+                    return Err(TemplateError::InvalidShape);
+                }
+                usize::from(rows)
+                    .saturating_mul(bindings_per_row)
+                    .saturating_add(fixed_bindings)
+            }
+        };
         if binding_count > MAX_TEMPLATE_BINDINGS {
             return Err(TemplateError::BindingBudgetExceeded);
         }
@@ -106,19 +136,44 @@ impl TemplateKey {
         self.binding_count
     }
 
-    fn in_capacity(self) -> usize {
-        let TemplateShape::InCapacity(capacity) = self.shape;
-        usize::from(capacity)
+    fn in_capacity(self) -> Option<usize> {
+        match self.shape {
+            TemplateShape::InCapacity(capacity) => Some(usize::from(capacity)),
+            TemplateShape::ExactRows(_) => None,
+        }
+    }
+
+    fn exact_rows(self) -> Option<usize> {
+        match self.shape {
+            TemplateShape::ExactRows(rows) => Some(usize::from(rows)),
+            TemplateShape::InCapacity(_) => None,
+        }
     }
 
     fn is_full_batch(self) -> bool {
-        self.in_capacity() == usize::from(self.family.max_in_capacity(self.backend))
+        match self.shape {
+            TemplateShape::InCapacity(capacity) => self
+                .family
+                .max_in_capacity(self.backend)
+                .is_some_and(|maximum| capacity == maximum),
+            TemplateShape::ExactRows(rows) => self
+                .family
+                .exact_row_shape(self.backend)
+                .is_some_and(|(maximum, _, _)| rows == maximum),
+        }
     }
 
     fn belongs_to_same_template(self, other: Self) -> bool {
         self.family == other.family
             && self.backend == other.backend
             && self.version == other.version
+    }
+}
+
+fn manifest_path_max_rows(backend: TemplateBackend) -> u16 {
+    match backend {
+        TemplateBackend::Sqlite => 2_900,
+        TemplateBackend::Postgres => 5_000,
     }
 }
 
@@ -334,10 +389,11 @@ pub(crate) fn filesystem_entries_by_paths_template(
         TemplateShape::InCapacity(in_capacity),
     )?;
     cache.get_or_build(key, |builder| {
+        let capacity = key.in_capacity().ok_or(TemplateError::InvalidShape)?;
         builder.push_static("SELECT id FROM filesystem_entries WHERE library_root_id = ");
         builder.push_bind()?;
         builder.push_static(" AND relative_path IN (");
-        for index in 0..key.in_capacity() {
+        for index in 0..capacity {
             if index > 0 {
                 builder.push_static(", ");
             }
@@ -360,6 +416,7 @@ pub(crate) fn filesystem_entry_records_by_paths_template(
         TemplateShape::InCapacity(in_capacity),
     )?;
     cache.get_or_build(key, |builder| {
+        let capacity = key.in_capacity().ok_or(TemplateError::InvalidShape)?;
         builder.push_static(
             r#"SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
                     fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
@@ -379,7 +436,7 @@ pub(crate) fn filesystem_entry_records_by_paths_template(
         );
         builder.push_bind()?;
         builder.push_static(" AND fe.relative_path IN (");
-        for index in 0..key.in_capacity() {
+        for index in 0..capacity {
             if index > 0 {
                 builder.push_static(", ");
             }
@@ -402,19 +459,210 @@ pub(crate) fn manifest_filesystem_baselines_by_paths_template(
         TemplateShape::InCapacity(in_capacity),
     )?;
     cache.get_or_build(key, |builder| {
+        let capacity = key.in_capacity().ok_or(TemplateError::InvalidShape)?;
         builder.push_static(
             "SELECT id, relative_path, entry_kind, size, modified_at, device, inode, \
              fingerprint, is_missing FROM filesystem_entries WHERE library_root_id = ",
         );
         builder.push_bind()?;
         builder.push_static(" AND relative_path IN (");
-        for index in 0..key.in_capacity() {
+        for index in 0..capacity {
             if index > 0 {
                 builder.push_static(", ");
             }
             builder.push_bind()?;
         }
         builder.push_static(")");
+        Ok(())
+    })
+}
+
+fn exact_rows_key(
+    family: TemplateFamily,
+    backend: DatabaseBackend,
+    version: TemplateVersion,
+    row_count: usize,
+) -> Result<TemplateKey, TemplateError> {
+    let rows = u16::try_from(row_count).map_err(|_| TemplateError::InvalidShape)?;
+    TemplateKey::new(family, backend, version, TemplateShape::ExactRows(rows))
+}
+
+fn push_value_rows(
+    builder: &mut TemplateBuilder,
+    row_count: usize,
+    binds_per_row: usize,
+) -> Result<(), TemplateError> {
+    for row in 0..row_count {
+        if row > 0 {
+            builder.push_static(", ");
+        }
+        builder.push_static("(");
+        for binding in 0..binds_per_row {
+            if binding > 0 {
+                builder.push_static(", ");
+            }
+            builder.push_bind()?;
+        }
+        builder.push_static(")");
+    }
+    Ok(())
+}
+
+pub(crate) fn manifest_discovery_known_paths_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    discovery_format_version: i64,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let is_v3 = discovery_format_version == 3;
+    let key = exact_rows_key(
+        TemplateFamily::ManifestDiscoveryKnownPaths,
+        backend,
+        if is_v3 {
+            TemplateVersion::V2
+        } else {
+            TemplateVersion::V1
+        },
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        if is_v3 {
+            builder.push_static("WITH incoming(relative_path) AS (VALUES ");
+            push_value_rows(builder, rows, 1)?;
+            builder.push_static(
+                ") SELECT incoming.relative_path FROM incoming WHERE EXISTS (SELECT 1 FROM filesystem_entries entry WHERE entry.library_root_id = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(
+                " AND entry.relative_path = incoming.relative_path AND entry.last_seen_generation = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(")");
+        } else {
+            builder.push_static(
+                "SELECT DISTINCT relative_path FROM scan_manifest_entries WHERE manifest_id = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(" AND library_root_id = ");
+            builder.push_bind()?;
+            builder.push_static(" AND entry_kind = 'FILE' AND relative_path IN (");
+            for row in 0..rows {
+                if row > 0 {
+                    builder.push_static(", ");
+                }
+                builder.push_bind()?;
+            }
+            builder.push_static(")");
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn manifest_presence_update_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestPresenceUpdate,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        if backend == DatabaseBackend::Postgres {
+            builder.push_static(
+                "WITH incoming(filesystem_entry_id, relative_path, fingerprint, size, modified_at, device, inode) AS (VALUES ",
+            );
+            push_value_rows(builder, rows, 7)?;
+            builder.push_static(
+                ") UPDATE filesystem_entries AS current SET size = incoming.size, modified_at = incoming.modified_at, device = incoming.device, inode = incoming.inode, last_seen_generation = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(
+                ", last_seen_change_kind = NULL FROM incoming WHERE current.id = incoming.filesystem_entry_id AND current.library_root_id = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(
+                " AND current.relative_path = incoming.relative_path AND current.fingerprint = incoming.fingerprint AND current.entry_kind = 'FILE' AND current.is_missing = 0 AND current.entry_kind = 'FILE' AND current.is_missing = 0",
+            );
+        } else {
+            builder.push_static(
+                "WITH incoming(filesystem_entry_id, relative_path, fingerprint, size, modified_at, device, inode) AS (VALUES ",
+            );
+            push_value_rows(builder, rows, 7)?;
+            builder.push_static(
+                "), matching(filesystem_entry_id) AS (SELECT incoming.filesystem_entry_id FROM incoming JOIN filesystem_entries current ON current.id = incoming.filesystem_entry_id AND current.relative_path = incoming.relative_path AND current.fingerprint = incoming.fingerprint WHERE current.library_root_id = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(
+                " AND current.entry_kind = 'FILE' AND current.is_missing = 0) UPDATE filesystem_entries SET size = (SELECT size FROM incoming WHERE filesystem_entry_id = filesystem_entries.id), modified_at = (SELECT modified_at FROM incoming WHERE filesystem_entry_id = filesystem_entries.id), device = (SELECT device FROM incoming WHERE filesystem_entry_id = filesystem_entries.id), inode = (SELECT inode FROM incoming WHERE filesystem_entry_id = filesystem_entries.id), last_seen_generation = ",
+            );
+            builder.push_bind()?;
+            builder.push_static(
+                ", last_seen_change_kind = NULL WHERE id IN (SELECT filesystem_entry_id FROM matching)",
+            );
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn manifest_presence_readback_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestPresenceReadback,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static(
+            "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES ",
+        );
+        push_value_rows(builder, rows, 3)?;
+        builder.push_static(
+            ") SELECT incoming.relative_path FROM incoming JOIN filesystem_entries entry ON entry.id = incoming.filesystem_entry_id AND entry.relative_path = incoming.relative_path WHERE entry.library_root_id = ",
+        );
+        builder.push_bind()?;
+        builder.push_static(
+            " AND entry.entry_kind = 'FILE' AND entry.is_missing = 0 AND entry.last_seen_generation = ",
+        );
+        builder.push_bind()?;
+        builder.push_static(" AND entry.fingerprint = incoming.fingerprint");
+        Ok(())
+    })
+}
+
+pub(crate) fn manifest_seen_paths_insert_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestSeenPathsInsert,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static("WITH incoming_seen_paths(relative_path) AS (VALUES ");
+        push_value_rows(builder, rows, 1)?;
+        builder.push_static(
+            ") INSERT INTO scan_manifest_seen_paths (manifest_id, library_root_id, relative_path) SELECT ",
+        );
+        builder.push_bind()?;
+        builder.push_static(", ");
+        builder.push_bind()?;
+        builder.push_static(
+            ", incoming_seen_paths.relative_path FROM incoming_seen_paths WHERE TRUE ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING",
+        );
         Ok(())
     })
 }
@@ -442,7 +690,11 @@ fn in_capacity_for_family(
     backend: DatabaseBackend,
     path_count: usize,
 ) -> Result<u16, TemplateError> {
-    let max_capacity = usize::from(family.max_in_capacity(backend.into()));
+    let max_capacity = usize::from(
+        family
+            .max_in_capacity(backend.into())
+            .ok_or(TemplateError::InvalidShape)?,
+    );
     if path_count == 0 || path_count > max_capacity {
         return Err(TemplateError::InvalidShape);
     }
@@ -483,7 +735,8 @@ mod tests {
                 TemplateBackend::Sqlite => DatabaseBackend::Sqlite,
                 TemplateBackend::Postgres => DatabaseBackend::Postgres,
             },
-            u16::try_from(key.in_capacity()).map_err(|_| TemplateError::InvalidShape)?,
+            u16::try_from(key.in_capacity().ok_or(TemplateError::InvalidShape)?)
+                .map_err(|_| TemplateError::InvalidShape)?,
         )
     }
 
@@ -863,6 +1116,129 @@ mod tests {
                 .contains_key(&key(DatabaseBackend::Postgres, 1))
         );
         assert!(state.cached_text_bytes <= MAX_CACHED_TEMPLATE_TEXT_BYTES);
+    }
+
+    #[test]
+    fn manifest_discovery_templates_keep_versions_and_bind_order() {
+        let cache = SqlTemplateCache::default();
+        let sqlite_v3 =
+            manifest_discovery_known_paths_template(&cache, DatabaseBackend::Sqlite, 3, 2)
+                .expect("SQLite format-3 known paths");
+        assert_eq!(
+            sqlite_v3.as_ref(),
+            "WITH incoming(relative_path) AS (VALUES (?), (?)) SELECT incoming.relative_path FROM incoming WHERE EXISTS (SELECT 1 FROM filesystem_entries entry WHERE entry.library_root_id = ? AND entry.relative_path = incoming.relative_path AND entry.last_seen_generation = ?)"
+        );
+
+        let postgres_legacy =
+            manifest_discovery_known_paths_template(&cache, DatabaseBackend::Postgres, 2, 3)
+                .expect("PostgreSQL legacy known paths");
+        assert_eq!(
+            postgres_legacy.as_ref(),
+            "SELECT DISTINCT relative_path FROM scan_manifest_entries WHERE manifest_id = $1 AND library_root_id = $2 AND entry_kind = 'FILE' AND relative_path IN ($3, $4, $5)"
+        );
+
+        let postgres_v3 =
+            manifest_discovery_known_paths_template(&cache, DatabaseBackend::Postgres, 3, 2)
+                .expect("PostgreSQL format-3 known paths");
+        assert!(postgres_v3.contains("VALUES ($1), ($2)"));
+        assert!(postgres_v3.ends_with(
+            "entry.library_root_id = $3 AND entry.relative_path = incoming.relative_path AND entry.last_seen_generation = $4)"
+        ));
+        assert!(!Arc::ptr_eq(&sqlite_v3, &postgres_v3));
+    }
+
+    #[test]
+    fn manifest_presence_templates_keep_exact_rows_and_postgres_numbering() {
+        let cache = SqlTemplateCache::default();
+        let sqlite_update = manifest_presence_update_template(&cache, DatabaseBackend::Sqlite, 2)
+            .expect("SQLite presence update");
+        assert!(sqlite_update.starts_with(
+            "WITH incoming(filesystem_entry_id, relative_path, fingerprint, size, modified_at, device, inode) AS (VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)), matching(filesystem_entry_id) AS ("
+        ));
+        assert!(sqlite_update.ends_with(
+            "last_seen_generation = ?, last_seen_change_kind = NULL WHERE id IN (SELECT filesystem_entry_id FROM matching)"
+        ));
+
+        let postgres_update =
+            manifest_presence_update_template(&cache, DatabaseBackend::Postgres, 2)
+                .expect("PostgreSQL presence update");
+        assert!(postgres_update.starts_with(
+            "WITH incoming(filesystem_entry_id, relative_path, fingerprint, size, modified_at, device, inode) AS (VALUES ($1, $2, $3, $4, $5, $6, $7), ($8, $9, $10, $11, $12, $13, $14))"
+        ));
+        assert!(postgres_update.ends_with(
+            "last_seen_generation = $15, last_seen_change_kind = NULL FROM incoming WHERE current.id = incoming.filesystem_entry_id AND current.library_root_id = $16 AND current.relative_path = incoming.relative_path AND current.fingerprint = incoming.fingerprint AND current.entry_kind = 'FILE' AND current.is_missing = 0 AND current.entry_kind = 'FILE' AND current.is_missing = 0"
+        ));
+
+        let readback = manifest_presence_readback_template(&cache, DatabaseBackend::Postgres, 2)
+            .expect("PostgreSQL presence readback");
+        assert_eq!(
+            readback.as_ref(),
+            "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES ($1, $2, $3), ($4, $5, $6)) SELECT incoming.relative_path FROM incoming JOIN filesystem_entries entry ON entry.id = incoming.filesystem_entry_id AND entry.relative_path = incoming.relative_path WHERE entry.library_root_id = $7 AND entry.entry_kind = 'FILE' AND entry.is_missing = 0 AND entry.last_seen_generation = $8 AND entry.fingerprint = incoming.fingerprint"
+        );
+
+        let ledger = manifest_seen_paths_insert_template(&cache, DatabaseBackend::Sqlite, 2)
+            .expect("SQLite seen-path insert");
+        assert_eq!(
+            ledger.as_ref(),
+            "WITH incoming_seen_paths(relative_path) AS (VALUES (?), (?)) INSERT INTO scan_manifest_seen_paths (manifest_id, library_root_id, relative_path) SELECT ?, ?, incoming_seen_paths.relative_path FROM incoming_seen_paths WHERE TRUE ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+        );
+        let postgres_ledger =
+            manifest_seen_paths_insert_template(&cache, DatabaseBackend::Postgres, 2)
+                .expect("PostgreSQL seen-path insert");
+        assert!(postgres_ledger.starts_with(
+            "WITH incoming_seen_paths(relative_path) AS (VALUES ($1), ($2)) INSERT INTO scan_manifest_seen_paths"
+        ));
+        assert!(postgres_ledger.contains("SELECT $3, $4, incoming_seen_paths.relative_path"));
+
+        let repeated = manifest_presence_update_template(&cache, DatabaseBackend::Postgres, 2)
+            .expect("reused PostgreSQL presence template");
+        assert!(Arc::ptr_eq(&postgres_update, &repeated));
+    }
+
+    #[test]
+    fn manifest_presence_templates_allow_backend_batch_bind_limits() {
+        let cache = SqlTemplateCache::default();
+        let postgres = manifest_presence_update_template(&cache, DatabaseBackend::Postgres, 5_000)
+            .expect("PostgreSQL maximum presence batch");
+        assert_eq!(postgres.matches('$').count(), 35_002);
+        assert!(postgres.ends_with("current.is_missing = 0"));
+        assert_eq!(
+            manifest_presence_update_template(&cache, DatabaseBackend::Postgres, 5_001),
+            Err(TemplateError::InvalidShape)
+        );
+
+        let sqlite = manifest_presence_update_template(&cache, DatabaseBackend::Sqlite, 2_900)
+            .expect("SQLite maximum presence batch");
+        assert_eq!(sqlite.matches('?').count(), 20_302);
+        assert_eq!(
+            manifest_presence_update_template(&cache, DatabaseBackend::Sqlite, 2_901),
+            Err(TemplateError::InvalidShape)
+        );
+        assert_eq!(cache.entry_count(), 2);
+
+        let tail_cache = SqlTemplateCache::default();
+        for rows in [5_000, 1, 2, 3, 4, 5] {
+            manifest_seen_paths_insert_template(&tail_cache, DatabaseBackend::Postgres, rows)
+                .expect("bounded exact-row insert template");
+        }
+        assert_eq!(tail_cache.entry_count(), 5);
+        let full_key = TemplateKey::new(
+            TemplateFamily::ManifestSeenPathsInsert,
+            DatabaseBackend::Postgres,
+            TemplateVersion::V1,
+            TemplateShape::ExactRows(5_000),
+        )
+        .expect("maximum exact-row key");
+        let evicted_tail_key = TemplateKey::new(
+            TemplateFamily::ManifestSeenPathsInsert,
+            DatabaseBackend::Postgres,
+            TemplateVersion::V1,
+            TemplateShape::ExactRows(1),
+        )
+        .expect("first exact-row tail key");
+        let state = tail_cache.state.lock().expect("exact-row cache state");
+        assert!(state.entries.contains_key(&full_key));
+        assert!(!state.entries.contains_key(&evicted_tail_key));
     }
 
     #[test]
