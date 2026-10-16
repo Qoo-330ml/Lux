@@ -11872,9 +11872,12 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 - [x] 比较三个方案并推荐进程级共享 Semaphore；以当前源码纠正 probe 无 CPU 采样与 Tokio blocking pool 的分析假设。
 - [x] 定义共享范围、候选容量、进程单例、局部并发叠加、取消/进程回收、防嵌套死锁、前台与 DB 等待隔离及固定指标。
 - [x] 给出有序小增量、预计文件、最窄 Rust target、SQLite/PostgreSQL A/B 与 CPU/吞吐/前台 p95 验收门。
-- [ ] 项目所有者评审设计；后续实现需单独登记 LUX 任务并逐项执行，本文不表示运行时或性能验收完成。
+- [x] 项目所有者评审并批准设计（2026-10-16）；实现沿用同一个 LUX-561 逐步推进。
+- [ ] 运行时接入、混合负载基准和完整 Rust 完成门全部通过；性能门未通过前不能据局部 CPU 观测认定优化完成。
 
 设计记录（2026-10-16）：基于 `test=1e7c2ea8` 在独立分支 `codex/lux-scan-cpu-budget` 完成[多管线并发预算设计](SCAN-CPU-BUDGET-DESIGN.md)。保留各管线现有边界与 ADR-046，新增共享预算作为重工作片段的准入层；候选默认随 CPU 容量推导，需经相同配置的交错 A/B 才能确认。文档引用文件、围栏配对、任务编号唯一性和 diff 空白检查通过。此次仅修改设计文档，未运行 Cargo 检查或性能基准，不声称 CPU、NAS 或生产收益。
+
+实施进度（2026-10-16）：预算核心已加入进程级异步单例、CPU/cgroup 容量推导与 `LUX_BACKGROUND_CPU_BUDGET` clamp；克隆预算跨 stage 共用 permit，统计并发峰值、等待和有界 p95 样本。先写的容量回归在旧实现上失败（4 核期望 3、实际 1）；实现后 `cargo test --locked --lib application::background_work::tests` 5/5 通过。Discovery、其它指纹准备、本地 metadata、外部进程监督、混合基准和完整 gate 尚未完成。
 
 ## 29. 参考资料
 
