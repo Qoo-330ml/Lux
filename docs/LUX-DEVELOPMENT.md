@@ -11976,6 +11976,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁记录（2026-10-16）：定向 `filesystem_path_reads_reuse_bucketed_templates_without_extra_queries` 为 1 passed，S2 模板单测为 10 passed；release A/B harness 为 1 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 942 passed、0 failed、23 ignored；到 `tests/libraries_api.rs` 时，13 项通过，`admin_can_create_list_and_add_library_root_with_csrf` 再次在并行运行中收到 503 `DATABASE_UNAVAILABLE`（预期 200），后续 targets 未执行。该 target 串行运行 14/14 通过；同一个失败在 S2 全量门禁中已先出现，故不能归因于 LUX-565。随后在干净基线 `e7107bfe` 按“lib target 完成后立即并行运行 `libraries_api`”复核：lib 为 929 passed、0 failed、23 ignored，`libraries_api` 为 14/14 通过；因此该 503 未能在基线复现，根因仍未查明，完整 Rust 门禁仍为非绿色。PostgreSQL 模板编号有单测覆盖，本步没有独立 PostgreSQL 实例验证实际 NULL 绑定。
 
+#### LUX-566：manifest 基线路径查询复用模板
+
+范围：将 `list_scan_manifest_filesystem_baselines` 从每批动态占位符 `Vec`、`join` 和 `format!` 改为专用有限 SQL 模板。按后端路径数量选择不小于输入数的最小 power-of-two IN 桶，超过最后一个二次幂时使用该后端现有批次上限（SQLite 2,900、PostgreSQL 5,000）；不足桶容量的路径绑定 typed NULL。每批仍按原后端上限分块并执行一次查询，保持 root 过滤、投影、绑定顺序、空输入、HashMap 结果语义和查询计数。不改 manifest 批次、事务或其他查询族。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。
+
+验收：
+
+- [x] 空输入不查询；单批、分桶两侧、SQLite 最大批次与跨批次结果和旧实现一致，缺失/重复路径不产生额外结果。
+- [x] root 隔离、完整 baseline 字段、每个 chunk 一次查询及 query counter 保持；SQLite typed NULL 实际查询通过。
+- [x] SQLite 与 PostgreSQL 模板固定参数、IN 容量、占位符编号和绑定顺序正确；容量不超过原后端批次上限。
+- [x] repository 行为测试先红后绿；SQL 构造 A/B、格式、构建与 Clippy 有明确记录，全量门禁失败按证据报告。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮、每轮每种构造 50,000 次。257 个路径的旧式精确 SQL 构造中位数 600 ns（592–918）；计算桶容量并命中 512 项模板的中位数 18 ns（18–22）。结果只包括 SQL 构造，不包括 SQLite/SQLx 执行、绑定和分配计数；大容量 NULL 绑定对数据库执行的影响留待 S7 整链路复测。A/B 使用 `performance-benchmarks` feature 下默认忽略的 `manifest_baseline_template_construction_benchmark`。
+
+完成门禁记录（2026-10-16）：`cargo test --locked --lib manifest_baseline -- --test-threads=1` 为 2 passed；`cargo test --locked --test scanning_jobs` 为 88 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 release A/B harness 均通过。`cargo test --locked --all-targets` 的 lib target 为 944 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14。随后 `tests/probe.rs` 有 20 passed、1 failed：`probe_runner_terminates_when_stderr_exceeds_the_runtime_limit` 超过测试超时；该用例隔离重跑通过，probe target 串行运行 21/21。其余后续 targets 未执行，因此完整 Rust 门禁仍记为非绿色。失败发生在本任务未修改的 probe 代码，现有证据未能确认其根因或证明基线表现。默认 all-targets 未运行 PostgreSQL 实例；PostgreSQL 模板文本和绑定编号由单测验证，运行时 PG 验证留待 S7。
+
 
 ## 29. 参考资料
 

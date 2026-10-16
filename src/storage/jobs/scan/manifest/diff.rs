@@ -1,5 +1,12 @@
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 
+use crate::storage::sql_templates::{
+    manifest_filesystem_baselines_by_paths_capacity,
+    manifest_filesystem_baselines_by_paths_template,
+};
+#[cfg(all(test, feature = "performance-benchmarks"))]
+use crate::{config::DatabaseBackend, storage::sql_templates::SqlTemplateCache};
+
 use super::*;
 
 #[path = "diff/finish.rs"]
@@ -322,18 +329,42 @@ impl Database {
             if paths.is_empty() {
                 continue;
             }
-            let placeholders = std::iter::repeat_n("?", paths.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "SELECT id, relative_path, entry_kind, size, modified_at, device, inode,
-                        fingerprint, is_missing
-                 FROM filesystem_entries
-                 WHERE library_root_id = ? AND relative_path IN ({placeholders})"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id);
+            let template =
+                manifest_filesystem_baselines_by_paths_capacity(self.backend(), paths.len())
+                    .and_then(|capacity| {
+                        manifest_filesystem_baselines_by_paths_template(
+                            &self.filesystem_path_templates,
+                            self.backend(),
+                            capacity,
+                        )
+                        .map(|sql| (capacity, sql))
+                    });
+            let (mut statement, padding_count) = match template {
+                Ok((capacity, sql)) => (
+                    self.query(sqlx::AssertSqlSafe(sql)).bind(library_root_id),
+                    usize::from(capacity).saturating_sub(paths.len()),
+                ),
+                Err(_) => {
+                    let placeholders = std::iter::repeat_n("?", paths.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "SELECT id, relative_path, entry_kind, size, modified_at, device, inode,
+                                fingerprint, is_missing
+                         FROM filesystem_entries
+                         WHERE library_root_id = ? AND relative_path IN ({placeholders})"
+                    );
+                    (
+                        self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id),
+                        0,
+                    )
+                }
+            };
             for path in paths {
                 statement = statement.bind(path);
+            }
+            for _ in 0..padding_count {
+                statement = statement.bind(None::<String>);
             }
             for row in
                 statement
@@ -715,4 +746,67 @@ impl Database {
         }
         Ok(inserted_count)
     }
+}
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+fn legacy_manifest_baselines_query(path_count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", path_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT id, relative_path, entry_kind, size, modified_at, device, inode,
+                fingerprint, is_missing
+         FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path IN ({placeholders})"
+    )
+}
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+#[test]
+#[ignore = "run explicitly to compare manifest baseline SQL construction with cached buckets"]
+fn manifest_baseline_template_construction_benchmark() {
+    use std::{hint::black_box, time::Instant};
+
+    let cache = SqlTemplateCache::default();
+    let path_count = 257;
+    let iterations = 50_000;
+    let capacity =
+        manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Sqlite, path_count)
+            .expect("valid manifest path count");
+    assert_eq!(capacity, 512);
+    black_box(
+        manifest_filesystem_baselines_by_paths_template(&cache, DatabaseBackend::Sqlite, capacity)
+            .expect("cached manifest baseline template"),
+    );
+
+    let mut exact_rounds = Vec::with_capacity(5);
+    let mut cached_rounds = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(legacy_manifest_baselines_query(path_count));
+        }
+        exact_rounds.push(started.elapsed().as_nanos() / iterations);
+
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let capacity = manifest_filesystem_baselines_by_paths_capacity(
+                DatabaseBackend::Sqlite,
+                path_count,
+            )
+            .expect("valid manifest path count");
+            black_box(
+                manifest_filesystem_baselines_by_paths_template(
+                    &cache,
+                    DatabaseBackend::Sqlite,
+                    capacity,
+                )
+                .expect("cached manifest baseline template"),
+            );
+        }
+        cached_rounds.push(started.elapsed().as_nanos() / iterations);
+    }
+
+    eprintln!("manifest_baseline_exact_sql_ns_per_op={exact_rounds:?}");
+    eprintln!("manifest_baseline_cached_bucket_sql_ns_per_op={cached_rounds:?}");
 }

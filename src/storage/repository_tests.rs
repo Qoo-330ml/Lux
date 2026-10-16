@@ -11864,6 +11864,207 @@ async fn filesystem_path_reads_reuse_bucketed_templates_without_extra_queries() 
 }
 
 #[tokio::test]
+async fn manifest_baseline_reads_reuse_bucketed_templates_without_extra_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Manifest baseline templates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_root_path = temp_dir.path().join("first-media-root");
+    let other_root_path = temp_dir.path().join("other-media-root");
+    tokio::fs::create_dir_all(&first_root_path)
+        .await
+        .expect("first media root");
+    tokio::fs::create_dir_all(&other_root_path)
+        .await
+        .expect("other media root");
+    let library_service = LibraryService::new(database.clone());
+    let first_root = library_service
+        .add_root(
+            library.id,
+            first_root_path.to_str().expect("UTF-8 first media root"),
+        )
+        .await
+        .expect("first library root")
+        .root;
+    let other_root = library_service
+        .add_root(
+            library.id,
+            other_root_path.to_str().expect("UTF-8 other media root"),
+        )
+        .await
+        .expect("other library root")
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let other_root_id = other_root.id.to_string();
+    for (entry_id, root_id, path, size, fingerprint) in [
+        (
+            "manifest-baseline-first-root",
+            first_root_id.as_str(),
+            "same.mkv",
+            17,
+            b"first-fingerprint".as_slice(),
+        ),
+        (
+            "manifest-baseline-last-root",
+            first_root_id.as_str(),
+            "last.mkv",
+            23,
+            b"last-fingerprint".as_slice(),
+        ),
+        (
+            "manifest-baseline-other-root",
+            other_root_id.as_str(),
+            "same.mkv",
+            99,
+            b"other-fingerprint".as_slice(),
+        ),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size,
+                modified_at: size + 100,
+                device: None,
+                inode: None,
+                fingerprint,
+                last_seen_generation: "manifest-baseline-template-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+
+    database.reset_query_count();
+    let empty = database
+        .list_scan_manifest_filesystem_baselines(&first_root_id, &[])
+        .await
+        .expect("empty baseline lookup");
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 0);
+
+    database.reset_query_count();
+    let one_path = database
+        .list_scan_manifest_filesystem_baselines(&first_root_id, &["same.mkv".to_owned()])
+        .await
+        .expect("one path baseline lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 1);
+    assert_eq!(one_path.len(), 1);
+    assert_eq!(one_path["same.mkv"].id, "manifest-baseline-first-root");
+    assert_eq!(one_path["same.mkv"].size, 17);
+    assert_eq!(one_path["same.mkv"].modified_at, 117);
+    assert_eq!(
+        one_path["same.mkv"].fingerprint.as_deref(),
+        Some(b"first-fingerprint".as_slice())
+    );
+
+    database.reset_query_count();
+    let three_paths = database
+        .list_scan_manifest_filesystem_baselines(
+            &first_root_id,
+            &[
+                "same.mkv".to_owned(),
+                "same.mkv".to_owned(),
+                "missing.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("duplicate and missing path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(three_paths.len(), 1);
+    assert_eq!(three_paths["same.mkv"].id, "manifest-baseline-first-root");
+
+    database.reset_query_count();
+    let four_paths = database
+        .list_scan_manifest_filesystem_baselines(
+            &first_root_id,
+            &[
+                "same.mkv".to_owned(),
+                "last.mkv".to_owned(),
+                "missing-one.mkv".to_owned(),
+                "missing-two.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("full four-path bucket lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(four_paths.len(), 2);
+
+    database.reset_query_count();
+    let other_root_entry = database
+        .list_scan_manifest_filesystem_baselines(&other_root_id, &["same.mkv".to_owned()])
+        .await
+        .expect("same relative path in another root");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        other_root_entry["same.mkv"].id,
+        "manifest-baseline-other-root"
+    );
+
+    let paths_with_matches_at = |count: usize, first: usize, last: usize| {
+        let mut paths = (0..count)
+            .map(|index| format!("missing-{index}.mkv"))
+            .collect::<Vec<_>>();
+        paths[first] = "same.mkv".to_owned();
+        paths[last] = "last.mkv".to_owned();
+        paths
+    };
+
+    for (count, first, last, expected_shapes) in
+        [(256, 0, 255, 3), (257, 0, 256, 4), (2_900, 0, 2_899, 5)]
+    {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, first, last);
+        let baselines = database
+            .list_scan_manifest_filesystem_baselines(&first_root_id, &paths)
+            .await
+            .expect("manifest baseline bucket boundary lookup");
+        assert_eq!(database.query_count(), 1, "path_count={count}");
+        assert_eq!(
+            database.filesystem_path_templates.entry_count(),
+            expected_shapes,
+            "path_count={count}"
+        );
+        assert_eq!(baselines.len(), 2, "path_count={count}");
+    }
+
+    for (count, expected_queries) in [(2_901, 2), (5_801, 3)] {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, 0, count - 1);
+        let baselines = database
+            .list_scan_manifest_filesystem_baselines(&first_root_id, &paths)
+            .await
+            .expect("manifest baseline cross-chunk lookup");
+        assert_eq!(
+            database.query_count(),
+            expected_queries,
+            "path_count={count}"
+        );
+        assert_eq!(baselines.len(), 2, "path_count={count}");
+        assert_eq!(
+            baselines["same.mkv"].id, "manifest-baseline-first-root",
+            "path_count={count}"
+        );
+        assert_eq!(
+            baselines["last.mkv"].id, "manifest-baseline-last-root",
+            "path_count={count}"
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
 async fn subtitle_stream_query_is_source_scoped_and_paginated() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

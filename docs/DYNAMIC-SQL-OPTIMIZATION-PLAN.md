@@ -201,14 +201,14 @@ SQLite CPU 包含在 Lux 进程内；PostgreSQL 还需单独记录数据库服�
 | S1：查询入口（LUX-563） | S0；SQLite SqlStr 直传，PostgreSQL 编号无临时 String；同步迁移调用与基准夹具 | `src/storage/repository.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | 静态/owned/Arc 地址保持测试先红后绿；PostgreSQL 引号与多位编号回归通过；记录优化前后局部基准 |
 | S2：模板基础（LUX-564） | S1；有限键、满批模板、单缓冲区构造 | `src/storage/sql_templates.rs`（新增，含单测）、`src/storage/mod.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md`、本文档 | Arc 重用、绑定预算、并发和文本/条目预算测试通过 |
 | S3a：filesystem 路径读取 | S2；模板查询入口与 IN 分桶 A/B | `src/storage/filesystem.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；query counter 保持；无收益则保留精确模板 |
-| S3b：manifest 基线读取 | S2；模板查询入口与 IN 分桶 A/B | `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；query counter 保持；无收益则保留精确模板 |
+| S3b：manifest 基线读取（LUX-566） | S2；完整模板与 IN 分桶 A/B，保留现有 SQLite 2,900 / PostgreSQL 5,000 路径上限 | `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、本文档 | 分桶两侧与跨批次结果一致；query counter 保持；无收益则保留精确模板 |
 | S4：发现路径与 presence | S2；精确 CTE 模板与局部 Cow | `src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | workflow/format 版本、完整成功/回读、重试计数均一致 |
 | S5a：目录 DML | S2；目录模板，不改批次/事务 | `src/storage/jobs/scan/manifest/discovery/frontier.rs`、`src/storage/sql_templates.rs`、`src/storage/jobs/tests.rs`、`docs/LUX-DEVELOPMENT.md` | 重放与完成计数保持一致 |
 | S5b：delta DML | S2；校验/插入/CASE 模板，删除片段 clone | `src/storage/jobs/scan/manifest/diff/insert.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | CAS、RETURNING、attempt_count、重试冲突均一致 |
 | S6：文件记录借用 | S1；去掉正向索引电影/剧集深复制 | `src/storage/jobs/scan/manifest/indexes.rs`、`src/storage/media.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | claim 胜者与既有媒体归并/剧集层级不变；分配下降 |
 | S7：完成门禁 | 所有保留的增量；记录 A/B 与限制 | `docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md` | 完整 Rust 门禁、实际 PostgreSQL、性能结论可复查 |
 
-进度（2026-10-16）：S0（LUX-562）、S1（LUX-563）与 S2（LUX-564）已完成并分别记录；S3a–S7 尚未实施。S2 的热缓存命中构造基准为 16 ns 中位数、零分配；全量 Rust 门禁在 `libraries_api` 并行测试处出现一次未定位的 503，按非绿色记录，详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-564 验收记录。
+进度（2026-10-16）：S0（LUX-562）、S1（LUX-563）、S2（LUX-564）、S3a（LUX-565）和 S3b（LUX-566）已完成并分别记录；S4–S7 尚未实施。S2、S3a、S3b 的 SQL 构造热命中均测到局部收益；扫描整链路收益和 PostgreSQL 运行时验证仍待 S7。S2/S3a 曾遇到 `libraries_api` 并行测试 503，本次完整门禁中该 target 14/14；本次全量测试在 `tests/probe.rs` 的 stderr 限额测试超时，隔离和串行复跑通过但根因未确认。所有全量门禁按实际结果记录，不将未执行的后续 targets 算作通过；详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-565、LUX-566 验收记录。
 
 S3–S6 按已测收益依次处理。`discovery/checkpoint.rs`、scan targets、reconciliation 等作为后续候选，只有基线显示仍是主要构造成本时另登记小任务；不默认把 215 处全部重写。B 也需单独任务，不因本文描述而提前实施。
 

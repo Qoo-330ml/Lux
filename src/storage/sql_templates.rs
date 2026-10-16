@@ -27,20 +27,27 @@ impl From<DatabaseBackend> for TemplateBackend {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TemplateFamily {
-    FilesystemEntriesByPaths,
-    FilesystemEntryRecordsByPaths,
+    FilesystemEntries,
+    FilesystemEntryRecords,
+    ManifestFilesystemBaselines,
 }
 
 impl TemplateFamily {
-    fn max_in_capacity(self, _backend: TemplateBackend) -> u16 {
+    fn max_in_capacity(self, backend: TemplateBackend) -> u16 {
         match self {
-            Self::FilesystemEntriesByPaths | Self::FilesystemEntryRecordsByPaths => 500,
+            Self::FilesystemEntries | Self::FilesystemEntryRecords => 500,
+            Self::ManifestFilesystemBaselines => match backend {
+                TemplateBackend::Sqlite => 2_900,
+                TemplateBackend::Postgres => 5_000,
+            },
         }
     }
 
     fn fixed_bindings(self) -> usize {
         match self {
-            Self::FilesystemEntriesByPaths | Self::FilesystemEntryRecordsByPaths => 1,
+            Self::FilesystemEntries
+            | Self::FilesystemEntryRecords
+            | Self::ManifestFilesystemBaselines => 1,
         }
     }
 }
@@ -321,7 +328,7 @@ pub(crate) fn filesystem_entries_by_paths_template(
     in_capacity: u16,
 ) -> Result<Arc<str>, TemplateError> {
     let key = TemplateKey::new(
-        TemplateFamily::FilesystemEntriesByPaths,
+        TemplateFamily::FilesystemEntries,
         backend,
         TemplateVersion::V1,
         TemplateShape::InCapacity(in_capacity),
@@ -347,7 +354,7 @@ pub(crate) fn filesystem_entry_records_by_paths_template(
     in_capacity: u16,
 ) -> Result<Arc<str>, TemplateError> {
     let key = TemplateKey::new(
-        TemplateFamily::FilesystemEntryRecordsByPaths,
+        TemplateFamily::FilesystemEntryRecords,
         backend,
         TemplateVersion::V1,
         TemplateShape::InCapacity(in_capacity),
@@ -383,12 +390,59 @@ pub(crate) fn filesystem_entry_records_by_paths_template(
     })
 }
 
+pub(crate) fn manifest_filesystem_baselines_by_paths_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    in_capacity: u16,
+) -> Result<Arc<str>, TemplateError> {
+    let key = TemplateKey::new(
+        TemplateFamily::ManifestFilesystemBaselines,
+        backend,
+        TemplateVersion::V1,
+        TemplateShape::InCapacity(in_capacity),
+    )?;
+    cache.get_or_build(key, |builder| {
+        builder.push_static(
+            "SELECT id, relative_path, entry_kind, size, modified_at, device, inode, \
+             fingerprint, is_missing FROM filesystem_entries WHERE library_root_id = ",
+        );
+        builder.push_bind()?;
+        builder.push_static(" AND relative_path IN (");
+        for index in 0..key.in_capacity() {
+            if index > 0 {
+                builder.push_static(", ");
+            }
+            builder.push_bind()?;
+        }
+        builder.push_static(")");
+        Ok(())
+    })
+}
+
 pub(crate) fn filesystem_entries_by_paths_capacity(
     backend: DatabaseBackend,
     path_count: usize,
 ) -> Result<u16, TemplateError> {
-    let max_capacity =
-        usize::from(TemplateFamily::FilesystemEntryRecordsByPaths.max_in_capacity(backend.into()));
+    in_capacity_for_family(TemplateFamily::FilesystemEntryRecords, backend, path_count)
+}
+
+pub(crate) fn manifest_filesystem_baselines_by_paths_capacity(
+    backend: DatabaseBackend,
+    path_count: usize,
+) -> Result<u16, TemplateError> {
+    in_capacity_for_family(
+        TemplateFamily::ManifestFilesystemBaselines,
+        backend,
+        path_count,
+    )
+}
+
+fn in_capacity_for_family(
+    family: TemplateFamily,
+    backend: DatabaseBackend,
+    path_count: usize,
+) -> Result<u16, TemplateError> {
+    let max_capacity = usize::from(family.max_in_capacity(backend.into()));
     if path_count == 0 || path_count > max_capacity {
         return Err(TemplateError::InvalidShape);
     }
@@ -411,7 +465,7 @@ mod tests {
 
     fn key(backend: DatabaseBackend, capacity: u16) -> TemplateKey {
         TemplateKey::new(
-            TemplateFamily::FilesystemEntriesByPaths,
+            TemplateFamily::FilesystemEntries,
             backend,
             TemplateVersion::V1,
             TemplateShape::InCapacity(capacity),
@@ -485,11 +539,68 @@ mod tests {
     }
 
     #[test]
+    fn manifest_baseline_templates_respect_backend_limits_and_bind_order() {
+        let cache = SqlTemplateCache::default();
+        let sqlite =
+            manifest_filesystem_baselines_by_paths_template(&cache, DatabaseBackend::Sqlite, 4)
+                .expect("SQLite manifest baseline template");
+        assert_eq!(
+            sqlite.as_ref(),
+            "SELECT id, relative_path, entry_kind, size, modified_at, device, inode, fingerprint, is_missing FROM filesystem_entries WHERE library_root_id = ? AND relative_path IN (?, ?, ?, ?)"
+        );
+
+        let postgres =
+            manifest_filesystem_baselines_by_paths_template(&cache, DatabaseBackend::Postgres, 4)
+                .expect("PostgreSQL manifest baseline template");
+        assert!(
+            postgres.ends_with("WHERE library_root_id = $1 AND relative_path IN ($2, $3, $4, $5)")
+        );
+
+        let sqlite_max =
+            manifest_filesystem_baselines_by_paths_template(&cache, DatabaseBackend::Sqlite, 2_900)
+                .expect("SQLite maximum manifest baseline template");
+        assert_eq!(sqlite_max.matches('?').count(), 2_901);
+        let postgres_max = manifest_filesystem_baselines_by_paths_template(
+            &cache,
+            DatabaseBackend::Postgres,
+            5_000,
+        )
+        .expect("PostgreSQL maximum manifest baseline template");
+        assert!(postgres_max.ends_with("$5001)"));
+        assert_eq!(postgres_max.matches('$').count(), 5_001);
+
+        assert_eq!(
+            manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Sqlite, 3),
+            Ok(4)
+        );
+        assert_eq!(
+            manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Sqlite, 2_049),
+            Ok(2_900)
+        );
+        assert_eq!(
+            manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Sqlite, 2_901),
+            Err(TemplateError::InvalidShape)
+        );
+        assert_eq!(
+            manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Postgres, 4_097),
+            Ok(5_000)
+        );
+        assert_eq!(
+            manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Postgres, 0),
+            Err(TemplateError::InvalidShape)
+        );
+        assert_eq!(
+            manifest_filesystem_baselines_by_paths_capacity(DatabaseBackend::Postgres, 5_001),
+            Err(TemplateError::InvalidShape)
+        );
+    }
+
+    #[test]
     fn invalid_shapes_and_placeholder_budget_are_rejected_before_publication() {
         let cache = SqlTemplateCache::default();
         assert!(
             TemplateKey::new(
-                TemplateFamily::FilesystemEntriesByPaths,
+                TemplateFamily::FilesystemEntries,
                 DatabaseBackend::Sqlite,
                 TemplateVersion::V1,
                 TemplateShape::InCapacity(0),
@@ -498,7 +609,7 @@ mod tests {
         );
         assert!(
             TemplateKey::new(
-                TemplateFamily::FilesystemEntriesByPaths,
+                TemplateFamily::FilesystemEntries,
                 DatabaseBackend::Sqlite,
                 TemplateVersion::V1,
                 TemplateShape::InCapacity(3),
@@ -507,7 +618,7 @@ mod tests {
         );
         assert!(
             TemplateKey::new(
-                TemplateFamily::FilesystemEntriesByPaths,
+                TemplateFamily::FilesystemEntries,
                 DatabaseBackend::Postgres,
                 TemplateVersion::V1,
                 TemplateShape::InCapacity(1024),
@@ -516,7 +627,7 @@ mod tests {
         );
         assert!(
             TemplateKey::new(
-                TemplateFamily::FilesystemEntriesByPaths,
+                TemplateFamily::FilesystemEntries,
                 DatabaseBackend::Postgres,
                 TemplateVersion::V1,
                 TemplateShape::InCapacity(512),
