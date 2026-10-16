@@ -57,7 +57,10 @@ Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONC
 `LUX_FFMPEG_CONCURRENCY=2`。
 `LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime
 使用的 OS 线程总数；媒体技术信息探测和缩略图生成是独立阶段，分别由
-`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 限制。需要限制硬件占用时，应同时设置这三个变量。
+`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 限制。可分别调节这些局部上限，也可用进程级后台预算限制它们与扫描准备等工作的叠加。
+进程级 `LUX_BACKGROUND_CPU_BUDGET` 会在上述局部上限之上共享限制扫描准备、本地 NFO/图片计算、ffprobe 和缩略图 ffmpeg 的后台重工作片段。
+未设置或留空时，按可见 CPU 与 cgroup CPU 限额推导 `max(1, min(CPU 数) - 1)`，自动值上限为 16；手动整数范围为 1-32，服务启动时读取一次。
+它是后台并发名额，不是 OS CPU 配额；ffprobe/ffmpeg 可在单个进程内使用多个 CPU 线程，实际前台延迟与吞吐应按部署负载测量。
 非容器部署未设置扫描环境变量时，新建媒体库默认 4 路，已有媒体库仍可在管理 API 中用
 `scanConcurrency` 单独覆盖；扫库和刮削的实际并发仍会根据 CPU、内存、前台延迟和存储延迟自动降级，SQLite 入库保持单写者。
 
@@ -77,6 +80,8 @@ services:
       LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-4}
       LUX_PROBE_CONCURRENCY: ${LUX_PROBE_CONCURRENCY:-8}
       LUX_FFMPEG_CONCURRENCY: ${LUX_FFMPEG_CONCURRENCY:-2}
+      # Optional process-wide cap for CPU-heavy background work; blank selects automatic.
+      LUX_BACKGROUND_CPU_BUDGET: ${LUX_BACKGROUND_CPU_BUDGET-}
     ports:
       - "8097:8097"
     volumes:
@@ -91,9 +96,10 @@ services:
 LUX_SCAN_CONCURRENCY=1024
 LUX_PROBE_CONCURRENCY=8
 LUX_FFMPEG_CONCURRENCY=2
+LUX_BACKGROUND_CPU_BUDGET=4
 ```
 
-`LUX_SCAN_CONCURRENCY` 支持范围为 `1-1024`；`LUX_PROBE_CONCURRENCY` 支持范围为 `1-512`；`LUX_FFMPEG_CONCURRENCY` 支持范围为 `1-4`。Compose 未设置时索引、探测和 ffmpeg 分别默认使用 4、8、2 路。在线元数据刮削默认使用 4 路 worker；实际后台 worker 数仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+`LUX_SCAN_CONCURRENCY` 支持范围为 `1-1024`；`LUX_PROBE_CONCURRENCY` 支持范围为 `1-512`；`LUX_FFMPEG_CONCURRENCY` 支持范围为 `1-4`。Compose 未设置时索引、探测和 ffmpeg 分别默认使用 4、8、2 路。`LUX_BACKGROUND_CPU_BUDGET` 留空时自动值按可见 CPU 与 cgroup CPU 限额推导，最低 1、最高 16；显式整数夹到 1-32，非整数回退自动值。在线元数据刮削默认使用 4 路 worker；现有后台 worker 仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
 
 修改 Compose 中的并发值后请执行 `docker compose up -d --force-recreate lux`；单纯重启旧容器不会更新环境变量。
 
