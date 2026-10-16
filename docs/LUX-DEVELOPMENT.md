@@ -11825,6 +11825,22 @@ ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 k
 
 验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
 
+#### LUX-563：SQLite Manifest 已提交分片的恢复与幂等
+
+范围：用实际文件 SQLite 验证 PERSISTED Manifest 在首片提交、后片失败、数据库连接关闭并重新打开后，可从 durable directory frontier 重试。重试必须保留此前完成的目录和正向索引，不重复 observed/processed 计数，也不重复 outbox source IDs 或 batch sequence。仅在发现存储合同缺陷时另拆最小 storage 修复任务。
+
+预计文件（2 个）：`tests/scanning_jobs.rs`、本文档。分别验证 LUX-562 的 256 文件 streamed SQLite 分片重开恢复，以及 PERSISTED discovery 在 8,000 条 observation reader chunk 提交后、下一事务失败时的重开恢复；不改公共模型、schema 或 SQL 行为。
+
+验收：
+
+- [x] 重开 SQLite 后 manifest/job checkpoint 持久；完成目录不重新入队，未完成目录恢复为可处理 frontier。
+- [x] 同一 job 重试完成后，manifest/root observed 与 completed 计数精确，generation 索引文件完整，outbox source IDs 与 batch sequences 全唯一。
+- [x] 256 文件切片和 PERSISTED 8,000 条 observation reader-chunk 后续事务失败，均在关闭并重开 SQLite 后从 durable frontier 恢复；既有 PERSISTED shutdown-resume 与 LITE retry 回归仍通过。
+
+定向验证：`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_discovery_keeps_committed_slices_when_a_later_slice_fails -- --exact --ignored`、`cargo test --locked --test scanning_jobs manifest_discovery_reopens_and_retries_persisted_frontier_idempotently -- --exact`、`cargo test --locked --test scanning_jobs shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier -- --exact`、`cargo test --locked --test scanning_jobs failed_manifest_discovery_retries_its_pending_frontier_safely -- --exact`。
+
+验收结果：两个实际 SQLite 注入故障测试均通过关闭连接、重开数据库和同 job retry 验证；256 文件 LITE 分片最终索引/outbox 各 1,025 条唯一，PERSISTED 在首个 8,000 observation chunk 后保留 7,998 个正向索引并从持久 frontier 完成 8,001 个文件，计数与 outbox source IDs / batch sequences 无重复。既有 shutdown-resume 与失败 retry 各 1/1，`scanning_jobs` 串行完整目标 89/89 通过。首轮完整目标的两个 ffprobe 用例曾分别报 NULL 解码和 TIMEOUT，单独重跑均通过，随后完整串行目标也全绿；最终预算 A/B 与完整 Rust gate 留待 LUX-564。
+
 #### LUX-562：SQLite Manifest discovery 按完整事务分片
 
 范围：在 application 层、基线读取和正向索引准备之前，将 SQLite 的 Pending Manifest directory chunks 按有界文件数、总 observation entries、child frontier 和 completed-directory 数分成有序微批次。每片独立执行完整 storage 事务；DIRECTORY observation 与对应 child frontier 同片，跨片目录的 `completed_directory` 只落在最后一片。每片重新读取数据库基线并执行现有文件/root/目录复核。PostgreSQL 保留现有聚合事务路径。
