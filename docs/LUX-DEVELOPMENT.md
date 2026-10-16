@@ -12062,9 +12062,9 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [x] 只运行一次最终 `cargo test --locked --all-targets`，如实记录失败 target 和未执行的后续 targets。
 - [x] 检查并记录 PostgreSQL runtime 可用性；无本地测试实例时标记未验证，不将 ignored tests 视为通过。
 - [ ] 完整 Rust all-targets 门禁全部通过。
-- [ ] 实际 PostgreSQL runtime 集成测试通过。
+- [x] 实际 PostgreSQL runtime 集成测试通过。
 
-结果（2026-10-17）：最终命令使用 `/Volumes/Toshiba/mywork/Lux/target`，运行一次后在 `tests/scanned_metadata.rs` 以 exit 101 结束。lib 为 955 passed、0 failed、23 ignored；该集成 target 为 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1；此前已在基线 `3b4b7325` 重现）与 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；此次不重跑）。此前完成的 `libraries_api` 14/14、`probe` 21/21；其余后续 targets 未执行。S6 代码后的 `cargo build --locked`、`cargo fmt --all -- --check` 和全 targets/all features Clippy 已通过，文档收尾未重复运行。环境检查未发现本地 PostgreSQL 进程、5432/55432 监听服务或 `POSTGRES_TEST_*` 配置，所以没有运行需要数据库的 ignored tests。全量门禁和 PostgreSQL runtime 两项保留未勾选；局部性能数据仅证明 SQL 文本/记录集合构造下降，不代表扫描整链路或生产 CPU 收益。
+结果（2026-10-17）：最终 Rust 命令使用 `/Volumes/Toshiba/mywork/Lux/target`，运行一次后在 `tests/scanned_metadata.rs` 以 exit 101 结束。lib 为 955 passed、0 failed、23 ignored；该集成 target 为 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1；此前已在基线 `3b4b7325` 重现）与 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；此次不重跑）。此前完成的 `libraries_api` 14/14、`probe` 21/21；其余后续 targets 未执行。S6 代码后的 `cargo build --locked`、`cargo fmt --all -- --check` 和全 targets/all features Clippy 已通过，文档收尾未重复运行。PostgreSQL 使用只绑定 `127.0.0.1:55432` 的临时 16 版容器运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database -- --ignored --test-threads=1`，18/18 通过；随后容器已删除且端口不再监听。完整 Rust 门禁仍未通过；PostgreSQL runtime 项已完成。局部性能数据仅证明 SQL 文本/记录集合构造下降，不代表扫描整链路或生产 CPU 收益。
 
 
 ## 29. 参考资料

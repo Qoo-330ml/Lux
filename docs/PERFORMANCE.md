@@ -63,7 +63,7 @@ SQLx SQLite statement cache 的默认容量为 100。120 种不同形状首次�
 
 最终只运行一次 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --all-targets`。lib 为 955 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14，`tests/probe.rs` 为 21/21。该命令在 `tests/scanned_metadata.rs` 停止，结果 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（2 项实际、1 项预期；此前已在基线 `3b4b7325` 重现）和 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；本次未重跑）。后续 targets 未执行，不能称全量 Rust 门禁通过。`cargo build --locked`、fmt 和全 targets/all features Clippy 已在 S6 代码变更后通过，文档收尾未重跑。
 
-PostgreSQL 测试要求本地实例；本次检查没有运行中的 PostgreSQL、5432/55432 监听服务或 `POSTGRES_TEST_*` 设置，因此 ignored PG runtime tests 未运行。PostgreSQL 模板文本和参数序号有单元测试覆盖，但运行时验证仍未完成。
+PostgreSQL 测试要求本地实例。为完成运行时验证，使用已缓存的 PostgreSQL 16 镜像启动只绑定 `127.0.0.1:55432` 的临时容器，执行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database -- --ignored --test-threads=1`，18/18 通过；随后删除容器并确认 55432 不再监听。PostgreSQL 模板文本和参数序号有单元测试覆盖，`postgres_database` 的真实后端迁移、manifest 和扫描集成也已通过。本次没有运行所有散布在 lib target 中的 ignored PostgreSQL tests。
 
 ## 基准目标
 
