@@ -335,13 +335,7 @@ impl Database {
 
     pub(crate) async fn update_filesystem_entry(
         &self,
-        id: &str,
-        size: i64,
-        modified_at: i64,
-        fingerprint: &[u8],
-        device: Option<i64>,
-        inode: Option<i64>,
-        last_seen_generation: &str,
+        update: FilesystemEntryUpdate<'_>,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -357,20 +351,20 @@ impl Database {
                  is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
-        .bind(size)
-        .bind(modified_at)
-        .bind(fingerprint)
-        .bind(device)
-        .bind(inode)
-        .bind(last_seen_generation)
-        .bind(id)
+        .bind(update.size)
+        .bind(update.modified_at)
+        .bind(update.fingerprint)
+        .bind(update.device)
+        .bind(update.inode)
+        .bind(update.last_seen_generation)
+        .bind(update.id)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        self.restore_media_items_for_filesystem_entries(&mut transaction, &[id.to_owned()])
+        self.restore_media_items_for_filesystem_entries(&mut transaction, &[update.id.to_owned()])
             .await?;
         transaction
             .commit()

@@ -13967,15 +13967,15 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
 
     database.reset_query_count();
     database
-        .update_filesystem_entry(
-            "filesystem-entry-update",
-            40,
-            50,
-            b"new-fingerprint",
-            None,
-            Some(60),
-            "new-generation",
-        )
+        .update_filesystem_entry(FilesystemEntryUpdate {
+            id: "filesystem-entry-update",
+            size: 40,
+            modified_at: 50,
+            fingerprint: b"new-fingerprint",
+            device: None,
+            inode: Some(60),
+            last_seen_generation: "new-generation",
+        })
         .await
         .expect("filesystem entry update");
     assert_eq!(database.query_count(), 2);
@@ -14166,15 +14166,15 @@ async fn scan_fingerprint_migration_replaces_legacy_token_and_persists_cursor()
     );
     assert!(
         database
-            .migrate_scan_fingerprint_candidate(
-                &candidate,
-                &fingerprint_v2,
+            .migrate_scan_fingerprint_candidate(ScanFingerprintMigrationCommit {
+                candidate: &candidate,
+                fingerprint_v2: &fingerprint_v2,
                 size,
                 modified_at,
                 device,
                 inode,
                 lease_token,
-            )
+            },)
             .await?
     );
 

@@ -741,15 +741,15 @@ impl LibraryScanner {
                 return Ok(report);
             }
             self.database
-                .update_filesystem_entry(
-                    &existing_entry.id,
+                .update_filesystem_entry(FilesystemEntryUpdate {
+                    id: &existing_entry.id,
                     size,
                     modified_at,
-                    &fingerprint,
+                    fingerprint: &fingerprint,
                     device,
                     inode,
-                    generation,
-                )
+                    last_seen_generation: generation,
+                })
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -845,15 +845,15 @@ impl LibraryScanner {
                 return Ok(report);
             }
             self.database
-                .update_filesystem_entry(
-                    &existing_entry.id,
+                .update_filesystem_entry(FilesystemEntryUpdate {
+                    id: &existing_entry.id,
                     size,
                     modified_at,
-                    &fingerprint,
+                    fingerprint: &fingerprint,
                     device,
                     inode,
-                    generation,
-                )
+                    last_seen_generation: generation,
+                })
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -881,7 +881,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
-                device: device.and_then(|value| i64::try_from(value).ok()),
+                device,
                 inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,

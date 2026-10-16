@@ -15,6 +15,24 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.9",
+    date: "2026-10-16",
+    sections: [
+      { kind: "added", items: [
+        "扫描准备、指纹、后台 NFO/图片计算、本地媒体探测和缩略图共用进程级 CPU 预算，可按 CPU 与容器配额自动设置，也可通过环境变量调整。",
+        "本地 ffprobe 根据有效 CPU 容量设置自动进程预算，并按近期探测完成速率自适应调整；首页延迟或容器内存压力升高时会保护性降档。",
+        "扫描指纹支持版本化格式和可靠文件状态快照复用，并以低速后台任务迁移旧指纹。",
+      ] },
+      { kind: "changed", items: [
+        "Docker Compose 默认使用 ffprobe 自动并发预算，后台 CPU 名额在扫描、元数据、图片、ffprobe 和缩略图之间共享。",
+        "管理员活动弹窗仅展示正在运行的任务，避免已完成的扫描阶段占据活动列表。",
+      ] },
+      { kind: "fixed", items: [
+        "取消或超时的 ffprobe 子进程在确认退出并回收前继续占用调度和后台预算；关停时等待探测会话及子进程清理。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.8",
     date: "2026-10-16",
     sections: [

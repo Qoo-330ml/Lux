@@ -1184,15 +1184,15 @@ impl LibraryScanner {
                 });
             }
             self.database
-                .update_filesystem_entry(
-                    &existing_entry.id,
+                .update_filesystem_entry(FilesystemEntryUpdate {
+                    id: &existing_entry.id,
                     size,
                     modified_at,
-                    &fingerprint,
+                    fingerprint: &fingerprint,
                     device,
                     inode,
-                    generation,
-                )
+                    last_seen_generation: generation,
+                })
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -1391,15 +1391,15 @@ impl LibraryScanner {
                 });
             }
             self.database
-                .update_filesystem_entry(
-                    &existing_entry.id,
+                .update_filesystem_entry(FilesystemEntryUpdate {
+                    id: &existing_entry.id,
                     size,
                     modified_at,
-                    &fingerprint,
+                    fingerprint: &fingerprint,
                     device,
                     inode,
-                    generation,
-                )
+                    last_seen_generation: generation,
+                })
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -2345,15 +2345,15 @@ impl LibraryScanner {
                 return Ok((existing_entry.id.clone(), false));
             }
             self.database
-                .update_filesystem_entry(
-                    &existing_entry.id,
-                    observation.size,
-                    observation.modified_at,
-                    &fingerprint,
+                .update_filesystem_entry(FilesystemEntryUpdate {
+                    id: &existing_entry.id,
+                    size: observation.size,
+                    modified_at: observation.modified_at,
+                    fingerprint: &fingerprint,
                     device,
                     inode,
-                    generation,
-                )
+                    last_seen_generation: generation,
+                })
                 .await?;
             return Ok((existing_entry.id.clone(), true));
         }
@@ -2362,7 +2362,7 @@ impl LibraryScanner {
             .insert_filesystem_entry(NewFilesystemEntry {
                 id: &entry_id,
                 library_root_id: &root.id,
-                relative_path: &relative_path,
+                relative_path,
                 entry_kind: "FILE",
                 size: observation.size,
                 modified_at: observation.modified_at,

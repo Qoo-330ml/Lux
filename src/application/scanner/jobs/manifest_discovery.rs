@@ -54,7 +54,7 @@ fn complete_pending_manifest_fingerprints_sync(
                             );
                         (baseline.fingerprint.as_deref()
                             == Some(current_legacy_fingerprint.as_slice()))
-                        .then(|| baseline.fingerprint.as_deref())
+                        .then_some(baseline.fingerprint.as_deref())
                         .flatten()
                     })
             })

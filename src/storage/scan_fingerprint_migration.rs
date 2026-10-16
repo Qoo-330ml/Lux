@@ -470,14 +470,17 @@ impl Database {
 
     pub(crate) async fn migrate_scan_fingerprint_candidate(
         &self,
-        candidate: &StoredScanFingerprintMigrationCandidate,
-        fingerprint_v2: &[u8],
-        size: i64,
-        modified_at: i64,
-        device: i64,
-        inode: i64,
-        lease_token: &str,
+        commit: ScanFingerprintMigrationCommit<'_>,
     ) -> Result<bool, StorageError> {
+        let ScanFingerprintMigrationCommit {
+            candidate,
+            fingerprint_v2,
+            size,
+            modified_at,
+            device,
+            inode,
+            lease_token,
+        } = commit;
         let mut transaction = self
             .pool
             .begin()

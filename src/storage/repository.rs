@@ -1942,6 +1942,16 @@ pub(crate) struct StoredScanFingerprintMigrationCandidate {
     pub(crate) attempts: i64,
 }
 
+pub(crate) struct ScanFingerprintMigrationCommit<'a> {
+    pub(crate) candidate: &'a StoredScanFingerprintMigrationCandidate,
+    pub(crate) fingerprint_v2: &'a [u8],
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: i64,
+    pub(crate) inode: i64,
+    pub(crate) lease_token: &'a str,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredScanFingerprintMigrationCursor {
     pub(crate) root_id: Option<String>,
@@ -3761,6 +3771,16 @@ pub(crate) struct NewFilesystemEntry<'a> {
     pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
+    pub(crate) last_seen_generation: &'a str,
+}
+
+pub(crate) struct FilesystemEntryUpdate<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) last_seen_generation: &'a str,
 }
 

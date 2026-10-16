@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{restart::ShutdownReason, scanner},
-    storage::{Database, StoredScanFingerprintMigrationCandidate},
+    storage::{Database, ScanFingerprintMigrationCommit, StoredScanFingerprintMigrationCandidate},
 };
 
 const START_DELAY: Duration = Duration::from_secs(60);
@@ -315,15 +315,15 @@ async fn process_candidate(
         Some(second.inode as u64),
     );
     match database
-        .migrate_scan_fingerprint_candidate(
+        .migrate_scan_fingerprint_candidate(ScanFingerprintMigrationCommit {
             candidate,
-            &fingerprint_v2,
-            second.size,
-            second.modified_at,
-            second.device,
-            second.inode,
-            &lease_token,
-        )
+            fingerprint_v2: &fingerprint_v2,
+            size: second.size,
+            modified_at: second.modified_at,
+            device: second.device,
+            inode: second.inode,
+            lease_token: &lease_token,
+        })
         .await
     {
         Ok(true) => Ok(CandidateResult::Migrated),
