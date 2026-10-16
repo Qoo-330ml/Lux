@@ -1,4 +1,7 @@
 use super::*;
+#[path = "commit_batches.rs"]
+mod commit_batches;
+use commit_batches::{ManifestDiscoveryTransactionBudget, split_pending_manifest_directory_chunks};
 
 impl ScanJobService {
     pub(in crate::application::scanner) async fn discover_scan_manifest_directory_batches(
@@ -654,8 +657,9 @@ impl ScanJobService {
                             && next_file_count > MANIFEST_STREAMED_INDEX_BATCH_SIZE
                         || next_child_count > DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE)
                 {
+                    let chunks = std::mem::take(&mut pending_chunks);
                     let Some(commit_result) = self
-                        .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                        .commit_pending_manifest_directory_chunks(context, chunks)
                         .await?
                     else {
                         return Ok(None);
@@ -666,7 +670,6 @@ impl ScanJobService {
                     result.created_items = result
                         .created_items
                         .saturating_add(commit_result.created_items);
-                    pending_chunks.clear();
                     pending_entry_count = 0;
                     pending_file_count = 0;
                     pending_child_count = 0;
@@ -688,8 +691,9 @@ impl ScanJobService {
                         && pending_file_count >= MANIFEST_STREAMED_INDEX_BATCH_SIZE
                     || pending_child_count >= DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE
                 {
+                    let chunks = std::mem::take(&mut pending_chunks);
                     let Some(commit_result) = self
-                        .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                        .commit_pending_manifest_directory_chunks(context, chunks)
                         .await?
                     else {
                         return Ok(None);
@@ -700,7 +704,6 @@ impl ScanJobService {
                     result.created_items = result
                         .created_items
                         .saturating_add(commit_result.created_items);
-                    pending_chunks.clear();
                     pending_entry_count = 0;
                     pending_file_count = 0;
                     pending_child_count = 0;
@@ -711,8 +714,9 @@ impl ScanJobService {
             }
         }
         if !pending_chunks.is_empty() {
+            let chunks = std::mem::take(&mut pending_chunks);
             let Some(commit_result) = self
-                .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                .commit_pending_manifest_directory_chunks(context, chunks)
                 .await?
             else {
                 return Ok(None);
@@ -730,8 +734,135 @@ impl ScanJobService {
     pub(in crate::application::scanner) async fn commit_pending_manifest_directory_chunks(
         &self,
         context: ManifestRootDiscoveryContext<'_>,
-        chunks: &[PendingManifestDirectoryChunk],
+        chunks: Vec<PendingManifestDirectoryChunk>,
     ) -> Result<Option<ManifestDiscoveryCommitResult>, ScannerError> {
+        let batches = if matches!(
+            self.database.backend(),
+            crate::config::DatabaseBackend::Sqlite
+        ) {
+            let budget = ManifestDiscoveryTransactionBudget::sqlite(
+                self.manifest_discovery_transaction_file_limit(),
+                MANIFEST_STREAMED_ENTRY_BATCH_SIZE
+                    .saturating_sub(MANIFEST_STREAMED_INDEX_BATCH_SIZE),
+                DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE,
+                MANIFEST_DISCOVERY_BATCH_SIZE,
+            );
+            split_pending_manifest_directory_chunks(chunks, budget)
+        } else if chunks.is_empty() {
+            Vec::new()
+        } else {
+            vec![chunks]
+        };
+
+        let mut committed_result = ManifestDiscoveryCommitResult::default();
+        let mut legacy_variant_paths = Vec::new();
+        let mut has_committed_slice = false;
+        for batch in batches {
+            if context.cancellation.load(Ordering::Acquire) {
+                if has_committed_slice {
+                    self.finish_manifest_discovery_commit_group(
+                        context,
+                        &committed_result,
+                        &legacy_variant_paths,
+                    )
+                    .await?;
+                }
+                return Ok(None);
+            }
+
+            match self
+                .commit_pending_manifest_directory_chunk_slice(context, &batch)
+                .await
+            {
+                Ok(Some((slice_result, slice_legacy_variant_paths))) => {
+                    committed_result.observed_file_count = committed_result
+                        .observed_file_count
+                        .saturating_add(slice_result.observed_file_count);
+                    committed_result.created_items = committed_result
+                        .created_items
+                        .saturating_add(slice_result.created_items);
+                    committed_result.metadata_targets_changed |=
+                        slice_result.metadata_targets_changed;
+                    committed_result.local_metadata_batches_changed |=
+                        slice_result.local_metadata_batches_changed;
+                    legacy_variant_paths.extend(slice_legacy_variant_paths);
+                    has_committed_slice = true;
+                }
+                Ok(None) => {
+                    if has_committed_slice {
+                        self.finish_manifest_discovery_commit_group(
+                            context,
+                            &committed_result,
+                            &legacy_variant_paths,
+                        )
+                        .await?;
+                    }
+                    return Ok(None);
+                }
+                Err(error) => {
+                    if has_committed_slice {
+                        self.finish_manifest_discovery_commit_group(
+                            context,
+                            &committed_result,
+                            &legacy_variant_paths,
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        if has_committed_slice {
+            self.finish_manifest_discovery_commit_group(
+                context,
+                &committed_result,
+                &legacy_variant_paths,
+            )
+            .await?;
+        }
+        Ok(Some(committed_result))
+    }
+
+    fn manifest_discovery_transaction_file_limit(&self) -> usize {
+        #[cfg(feature = "performance-benchmarks")]
+        {
+            std::env::var("LUX_PERF_DISCOVERY_TRANSACTION_FILES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|limit| *limit > 0)
+                .unwrap_or(MANIFEST_STREAMED_INDEX_BATCH_SIZE)
+        }
+        #[cfg(not(feature = "performance-benchmarks"))]
+        {
+            MANIFEST_STREAMED_INDEX_BATCH_SIZE
+        }
+    }
+
+    async fn finish_manifest_discovery_commit_group(
+        &self,
+        context: ManifestRootDiscoveryContext<'_>,
+        result: &ManifestDiscoveryCommitResult,
+        legacy_variant_paths: &[String],
+    ) -> Result<(), ScannerError> {
+        let movie_identity_reassigned = self
+            .reconcile_legacy_movie_variant_paths(
+                context.job_id,
+                &context.root.id,
+                Path::new(&context.root.canonical_path),
+                legacy_variant_paths,
+            )
+            .await?;
+        self.publish_home_after_manifest_commit(result, movie_identity_reassigned)
+            .await;
+        Ok(())
+    }
+
+    async fn commit_pending_manifest_directory_chunk_slice(
+        &self,
+        context: ManifestRootDiscoveryContext<'_>,
+        chunks: &[PendingManifestDirectoryChunk],
+    ) -> Result<Option<(ManifestDiscoveryCommitResult, Vec<String>)>, ScannerError> {
         let ManifestRootDiscoveryContext {
             job_id,
             manifest_id,
@@ -878,23 +1009,13 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
-                let movie_identity_reassigned = self
-                    .reconcile_legacy_movie_variant_paths(
-                        job_id,
-                        &root.id,
-                        Path::new(&root.canonical_path),
-                        &legacy_variant_paths,
-                    )
-                    .await?;
-                self.publish_home_after_manifest_commit(&result, movie_identity_reassigned)
-                    .await;
                 if result.local_metadata_batches_changed {
                     self.notify_local_metadata_outbox_worker();
                 }
                 if result.metadata_targets_changed {
                     self.notify_local_metadata_worker(job_id);
                 }
-                Ok(Some(result))
+                Ok(Some((result, legacy_variant_paths)))
             }
             Err(error) => {
                 if cancellation.load(Ordering::Acquire)
