@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     config::{Config, DatabaseConfiguration, PostgresConnection},
-    storage::StoredScanManifestDirectory,
+    storage::{ScanManifestRemovalCandidateQuery, StoredScanManifestDirectory},
 };
 use sqlx::Row;
 
@@ -971,22 +971,9 @@ async fn insert_manifest_diff_file(
 async fn insert_manifest_diff_delta(
     database: &Database,
     manifest_id: &str,
-    root_id: &str,
-    delta_id: &str,
-    relative_path: &str,
-    delta_kind: &str,
-    observation_sequence: Option<i64>,
-    base_entry_id: Option<&str>,
+    delta: NewScanManifestDelta<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let delta = [NewScanManifestDelta {
-        id: delta_id,
-        library_root_id: root_id,
-        relative_path,
-        observation_sequence,
-        delta_kind,
-        base_filesystem_entry_id: base_entry_id,
-        base_fingerprint: None,
-    }];
+    let delta = [delta];
     assert_eq!(
         database
             .insert_scan_manifest_deltas(manifest_id, &delta)
@@ -1009,15 +996,15 @@ async fn collect_manifest_removal_candidate_paths(
     let mut after_path: Option<String> = None;
     loop {
         let candidates = database
-            .list_scan_manifest_removal_candidates_for_root(
+            .list_scan_manifest_removal_candidates_for_root(ScanManifestRemovalCandidateQuery {
                 manifest_id,
-                root_id,
+                library_root_id: root_id,
                 discovery_format_version,
                 uncovered_only,
                 directories,
-                after_path.as_deref(),
-                page_size,
-            )
+                after_relative_path: after_path.as_deref(),
+                limit: page_size,
+            })
             .await?;
         let Some(last_path) = candidates
             .last()
@@ -1058,12 +1045,15 @@ async fn manifest_diff_completion_preserves_all_format_candidate_checks()
     insert_manifest_diff_delta(
         &database,
         &manifest_id,
-        &root_id,
-        "lite-delta",
-        "movie.mkv",
-        "REMOVE",
-        None,
-        Some("lite-entry"),
+        NewScanManifestDelta {
+            id: "lite-delta",
+            library_root_id: &root_id,
+            relative_path: "movie.mkv",
+            observation_sequence: None,
+            delta_kind: "REMOVE",
+            base_filesystem_entry_id: Some("lite-entry"),
+            base_fingerprint: None,
+        },
     )
     .await?;
     assert!(
@@ -1101,12 +1091,15 @@ async fn manifest_diff_completion_preserves_all_format_candidate_checks()
     insert_manifest_diff_delta(
         &database,
         &manifest_id,
-        &root_id,
-        "persisted-delta",
-        "big/movie.mkv",
-        "REMOVE",
-        None,
-        Some("persisted-entry"),
+        NewScanManifestDelta {
+            id: "persisted-delta",
+            library_root_id: &root_id,
+            relative_path: "big/movie.mkv",
+            observation_sequence: None,
+            delta_kind: "REMOVE",
+            base_filesystem_entry_id: Some("persisted-entry"),
+            base_fingerprint: None,
+        },
     )
     .await?;
     assert!(
@@ -1138,12 +1131,15 @@ async fn manifest_diff_completion_preserves_all_format_candidate_checks()
     insert_manifest_diff_delta(
         &database,
         &manifest_id,
-        &root_id,
-        "format2-delta",
-        "legacy.mkv",
-        "REMOVE",
-        None,
-        Some("format2-entry"),
+        NewScanManifestDelta {
+            id: "format2-delta",
+            library_root_id: &root_id,
+            relative_path: "legacy.mkv",
+            observation_sequence: None,
+            delta_kind: "REMOVE",
+            base_filesystem_entry_id: Some("format2-entry"),
+            base_fingerprint: None,
+        },
     )
     .await?;
     assert!(
@@ -1182,12 +1178,15 @@ async fn manifest_diff_completion_preserves_all_format_candidate_checks()
     insert_manifest_diff_delta(
         &database,
         &manifest_id,
-        &root_id,
-        "workflow1-orphan-delta",
-        "orphan.mkv",
-        "ADD",
-        Some(1),
-        None,
+        NewScanManifestDelta {
+            id: "workflow1-orphan-delta",
+            library_root_id: &root_id,
+            relative_path: "orphan.mkv",
+            observation_sequence: Some(1),
+            delta_kind: "ADD",
+            base_filesystem_entry_id: None,
+            base_fingerprint: None,
+        },
     )
     .await?;
     assert!(
@@ -1198,12 +1197,15 @@ async fn manifest_diff_completion_preserves_all_format_candidate_checks()
     insert_manifest_diff_delta(
         &database,
         &manifest_id,
-        &root_id,
-        "workflow1-unobserved-delta",
-        "unobserved.mkv",
-        "REMOVE",
-        None,
-        Some("workflow1-entry"),
+        NewScanManifestDelta {
+            id: "workflow1-unobserved-delta",
+            library_root_id: &root_id,
+            relative_path: "unobserved.mkv",
+            observation_sequence: None,
+            delta_kind: "REMOVE",
+            base_filesystem_entry_id: Some("workflow1-entry"),
+            base_fingerprint: None,
+        },
     )
     .await?;
     assert!(
@@ -1305,19 +1307,22 @@ async fn manifest_removal_candidates_page_within_root_and_preserve_directory_sco
     insert_manifest_diff_delta(
         &database,
         &manifest_id,
-        &root_id,
-        "paging-existing-delta",
-        "delta.mkv",
-        "REMOVE",
-        None,
-        Some(&delta_entry_id),
+        NewScanManifestDelta {
+            id: "paging-existing-delta",
+            library_root_id: &root_id,
+            relative_path: "delta.mkv",
+            observation_sequence: None,
+            delta_kind: "REMOVE",
+            base_filesystem_entry_id: Some(&delta_entry_id),
+            base_fingerprint: None,
+        },
     )
     .await?;
 
     let roots = database
         .list_scan_manifest_complete_roots(&manifest_id, None, 1)
         .await?;
-    assert_eq!(roots, [root_id.clone()]);
+    assert_eq!(roots.as_slice(), std::slice::from_ref(&root_id));
     let next_roots = database
         .list_scan_manifest_complete_roots(&manifest_id, roots.last().map(String::as_str), 1)
         .await?;
@@ -2444,15 +2449,15 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
         let mut total = 0_usize;
         loop {
             let candidates = database
-                .list_scan_manifest_removal_candidates_for_root(
-                    "manifest",
-                    "root-a",
-                    3,
-                    false,
-                    None,
-                    after_path.as_deref(),
-                    PAGE_SIZE,
-                )
+                .list_scan_manifest_removal_candidates_for_root(ScanManifestRemovalCandidateQuery {
+                    manifest_id: "manifest",
+                    library_root_id: "root-a",
+                    discovery_format_version: 3,
+                    uncovered_only: false,
+                    directories: None,
+                    after_relative_path: after_path.as_deref(),
+                    limit: PAGE_SIZE,
+                })
                 .await?;
             let Some(last) = candidates.last() else {
                 break;
@@ -2483,15 +2488,15 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
         loop {
             let query_started = Instant::now();
             let candidates = database
-                .list_scan_manifest_removal_candidates_for_root(
-                    "manifest",
-                    "root-a",
-                    3,
-                    false,
-                    Some(&directory),
-                    after_path.as_deref(),
-                    PAGE_SIZE,
-                )
+                .list_scan_manifest_removal_candidates_for_root(ScanManifestRemovalCandidateQuery {
+                    manifest_id: "manifest",
+                    library_root_id: "root-a",
+                    discovery_format_version: 3,
+                    uncovered_only: false,
+                    directories: Some(&directory),
+                    after_relative_path: after_path.as_deref(),
+                    limit: PAGE_SIZE,
+                })
                 .await?;
             candidate_read_elapsed_ms += query_started.elapsed().as_secs_f64() * 1_000.0;
             let Some(last) = candidates.last() else { break };

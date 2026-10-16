@@ -2,13 +2,20 @@ use super::*;
 
 use crate::storage::StoredScanManifestDelta;
 use crate::storage::{
-    StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
-    StoredScanManifestRemovalCandidate,
+    ScanManifestRemovalCandidateQuery, StoredScanManifestDiffCandidate,
+    StoredScanManifestDirectory, StoredScanManifestRemovalCandidate,
 };
 
 struct ManifestApplyRootPreparation {
     files: ManifestApplyPreparedFiles,
     removal_candidates: Vec<StoredScanManifestDelta>,
+}
+
+#[derive(Clone, Copy)]
+struct ManifestRemovalScope<'a> {
+    discovery_format_version: i64,
+    uncovered_only: bool,
+    directories: Option<&'a [StoredScanManifestDirectory]>,
 }
 
 struct ManifestApplyRootDeltaContext<'a> {
@@ -389,16 +396,24 @@ impl ScanJobService {
                         {
                             return Ok(Some(report));
                         }
+                        let removal_scope = ManifestRemovalScope {
+                            discovery_format_version: 3,
+                            uncovered_only: false,
+                            directories: Some(&directories),
+                        };
                         let candidates = self
                             .database
                             .list_scan_manifest_removal_candidates_for_root(
-                                manifest_id,
-                                root_id,
-                                3,
-                                false,
-                                Some(&directories),
-                                after_relative_path.as_deref(),
-                                page_size,
+                                ScanManifestRemovalCandidateQuery {
+                                    manifest_id,
+                                    library_root_id: root_id,
+                                    discovery_format_version: removal_scope
+                                        .discovery_format_version,
+                                    uncovered_only: removal_scope.uncovered_only,
+                                    directories: removal_scope.directories,
+                                    after_relative_path: after_relative_path.as_deref(),
+                                    limit: page_size,
+                                },
                             )
                             .await?;
                         let Some(last_candidate) = candidates.last() else {
@@ -496,9 +511,11 @@ impl ScanJobService {
                         manifest_id,
                         cancellation,
                         root_id,
-                        discovery_format_version,
-                        uncovered_only,
-                        None,
+                        ManifestRemovalScope {
+                            discovery_format_version,
+                            uncovered_only,
+                            directories: None,
+                        },
                         page_size,
                     )
                     .await?
@@ -517,9 +534,7 @@ impl ScanJobService {
         manifest_id: &str,
         cancellation: &AtomicBool,
         library_root_id: &str,
-        discovery_format_version: i64,
-        uncovered_only: bool,
-        directories: Option<&[StoredScanManifestDirectory]>,
+        scope: ManifestRemovalScope<'_>,
         page_size: i64,
     ) -> Result<Option<ScanBatchReport>, ScanJobError> {
         let mut after_relative_path: Option<String> = None;
@@ -532,15 +547,15 @@ impl ScanJobService {
             }
             let candidates = self
                 .database
-                .list_scan_manifest_removal_candidates_for_root(
+                .list_scan_manifest_removal_candidates_for_root(ScanManifestRemovalCandidateQuery {
                     manifest_id,
                     library_root_id,
-                    discovery_format_version,
-                    uncovered_only,
-                    directories,
-                    after_relative_path.as_deref(),
-                    page_size,
-                )
+                    discovery_format_version: scope.discovery_format_version,
+                    uncovered_only: scope.uncovered_only,
+                    directories: scope.directories,
+                    after_relative_path: after_relative_path.as_deref(),
+                    limit: page_size,
+                })
                 .await?;
             let Some(last_candidate) = candidates.last() else {
                 break;

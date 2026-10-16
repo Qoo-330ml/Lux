@@ -1576,6 +1576,16 @@ pub(crate) struct StoredScanManifestRemovalCandidate {
     pub(crate) base_fingerprint: Option<Vec<u8>>,
 }
 
+pub(crate) struct ScanManifestRemovalCandidateQuery<'a> {
+    pub(crate) manifest_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) discovery_format_version: i64,
+    pub(crate) uncovered_only: bool,
+    pub(crate) directories: Option<&'a [StoredScanManifestDirectory]>,
+    pub(crate) after_relative_path: Option<&'a str>,
+    pub(crate) limit: i64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredScanManifestDelta {
     pub(crate) id: String,

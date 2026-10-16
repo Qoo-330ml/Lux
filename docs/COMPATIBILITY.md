@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-561 Manifest 删除差异查询（2026-10-16）
+
+此项只改变内部 Manifest 查询和候选分页方式，不改变 Lux/Emby API、Manifest 格式、客户端请求/响应或数据库 schema。`format 3/LITE`、`PERSISTED v3`、workflow 1/2/3 与 legacy 的删除候选边界继续由完整复合键 seen/delta 反连接保护；分页固定在 COMPLETE root 内按相对路径 keyset 推进。
+
+本机 macOS `arm64` / SQLite 3.51.3：storage 删除候选分页测试、`scanning_jobs` 88/88、build、fmt 和全目标 Clippy 通过。EXPLAIN 使用已有 `(library_root_id, relative_path)` 唯一索引范围，不再为候选排序建立临时 B-tree；未新增索引或 migration。LUX-270 60k/600 fixture 的 8 轮交错首扫、重扫与前台/catalog/batch p95 中位数变化均在 5% 门内，详细样本见 `PERFORMANCE.md`。这不是生产 CPU 或 NAS 性能结论。
+
+完整 Rust 测试门未通过：未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 在本分支和干净基线 `1e7c2ea8` 都以实际插入 2 张海报、预期 1 张失败；合并参数对象后的全目标串行重跑还遇到一个 `login_background` 15 秒超时，该精确用例单独重跑通过（1/1）。并行期间另一次 `libraries_api` 503 在隔离及串行目标重跑通过。Web 冻结安装与 production build 通过；当前 `pnpm test` 的静态部分为 145/148，独立 Vitest 为 650/655，失败都在未修改的 Web 页面/CSS/组件查询用例，本任务未修改这些行为或断言。未取得 PostgreSQL、FNOS/x86_64 或部署后验证证据。
+
 ## LUX-552 Web 媒体库虚拟化（2026-10-15）
 
 Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在行。列数沿用现有 CSS 网格，行高含待确认徽章与操作提示并动态测量；窗口缩放保留聚焦卡片和未保存的编辑草稿。分页仍由原 `useInfiniteQuery` 和列表底部 sentinel 驱动，选择状态仍由库页持有。文件夹、只读合集、排序、元数据筛选、分页失败重试及批量操作由 19 个库页测试覆盖。

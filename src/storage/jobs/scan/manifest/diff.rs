@@ -184,14 +184,17 @@ impl Database {
 
     pub(crate) async fn list_scan_manifest_removal_candidates_for_root(
         &self,
-        manifest_id: &str,
-        library_root_id: &str,
-        discovery_format_version: i64,
-        uncovered_only: bool,
-        directories: Option<&[StoredScanManifestDirectory]>,
-        after_relative_path: Option<&str>,
-        limit: i64,
+        query: ScanManifestRemovalCandidateQuery<'_>,
     ) -> Result<Vec<StoredScanManifestRemovalCandidate>, StorageError> {
+        let ScanManifestRemovalCandidateQuery {
+            manifest_id,
+            library_root_id,
+            discovery_format_version,
+            uncovered_only,
+            directories,
+            after_relative_path,
+            limit,
+        } = query;
         if let Some(directories) = directories {
             if directories.is_empty() {
                 return Ok(Vec::new());
