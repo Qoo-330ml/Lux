@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 const MIN_WINDOW: Duration = Duration::from_secs(10);
 const MAX_WINDOW: Duration = Duration::from_secs(30);
 const MIN_SUCCESS_SAMPLES: u32 = 16;
-const MIN_SATURATION_PERCENT: u32 = 80;
+// Result persistence and page refill leave short gaps between ffprobe runs,
+// even while the service continues to have pending work.
+const MIN_SATURATION_PERCENT: u32 = 60;
 const TRIAL_GAIN_PERCENT: u32 = 5;
+const TRIAL_UP_STEP_DIVISOR: usize = 4;
 const TRIAL_P95_INCREASE_PERCENT: u32 = 20;
 const TRIAL_TIMEOUT_INCREASE_PERCENT: u32 = 0;
 const DEGRADATION_PERCENT: u32 = 15;
@@ -345,7 +348,7 @@ impl AdaptiveState {
                     && self.upward_hold_until.is_none_or(|until| now >= until)
                 {
                     let previous_limit = self.current_limit;
-                    let step = self.current_limit.div_ceil(8);
+                    let step = self.current_limit.div_ceil(TRIAL_UP_STEP_DIVISOR).max(1);
                     self.current_limit = self.current_limit.saturating_add(step).min(self.budget);
                     self.phase = AdaptivePhase::TrialUp {
                         original_limit: previous_limit,
@@ -531,6 +534,20 @@ mod tests {
     }
 
     #[test]
+    fn uses_quarter_sized_upward_trials_for_cpu_scaled_starting_limits() {
+        let start = Instant::now();
+        let mut state = AdaptiveState::new(10, 40, 1, start);
+        state.evaluate(start + Duration::from_secs(10), valid_window(1, 80, 100));
+
+        let adjustment = state
+            .evaluate(start + Duration::from_secs(20), valid_window(1, 80, 100))
+            .expect("a stable backlogged workload should start an upward trial");
+
+        assert_eq!(adjustment.current_limit, 13);
+        assert_eq!(adjustment.reason, AdjustmentReason::TrialUp);
+    }
+
+    #[test]
     fn keeps_a_higher_limit_only_after_two_good_windows() {
         let start = Instant::now();
         let mut state = AdaptiveState::new(4, 8, 1, start);
@@ -551,7 +568,7 @@ mod tests {
             .evaluate(start + Duration::from_secs(50), valid_window(1, 21, 110))
             .expect("two good trial windows should return the controller to stable mode");
         assert_eq!(next_trial.previous_limit, 5);
-        assert_eq!(next_trial.current_limit, 6);
+        assert_eq!(next_trial.current_limit, 7);
     }
 
     #[test]
@@ -747,7 +764,7 @@ mod tests {
         let start = Instant::now();
         let mut state = AdaptiveState::new(4, 8, 1, start);
         let mut unsaturated = valid_window(1, 20, 100);
-        unsaturated.saturated_for = Duration::from_secs(7);
+        unsaturated.saturated_for = Duration::from_secs(5);
         assert_eq!(
             state.evaluate(start + Duration::from_secs(10), unsaturated),
             None
@@ -757,6 +774,25 @@ mod tests {
             None
         );
         assert_eq!(state.current_limit(), 4);
+    }
+
+    #[test]
+    fn permits_throughput_trials_with_seventy_percent_slot_saturation() {
+        let start = Instant::now();
+        let mut state = AdaptiveState::new(4, 8, 1, start);
+        let mut window = valid_window(1, 20, 100);
+        window.saturated_for = Duration::from_secs(7);
+
+        assert_eq!(
+            state.evaluate(start + Duration::from_secs(10), window),
+            None
+        );
+        let adjustment = state
+            .evaluate(start + Duration::from_secs(20), window)
+            .expect("persistent demand and measured throughput should allow an upward trial");
+
+        assert_eq!(adjustment.current_limit, 5);
+        assert_eq!(adjustment.reason, AdjustmentReason::TrialUp);
     }
 
     #[test]

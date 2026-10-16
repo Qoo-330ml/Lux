@@ -63,6 +63,17 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 这组结果证明 512 路配置可被接受且全局 semaphore 没有超过硬上限；当前开发机观察值受动态背压和进程启动开销影响，
 不能据此声称目标 NAS 的实际吞吐。ffprobe 默认配置为 256；4/8/16 核环境的正常有效目标分别为 128/256/512，压力升高时会降档。本次 512 个源在四档请求下均成功完成。
 
+## LUX-561 ffprobe 完成速率控制诊断
+
+本机 ARM64 模拟对照使用相同 8,192 个 fixture、75 ms fake probe 延迟和 release harness。旧版固定默认并发与修复定时器后的候选结果如下。候选运行时源码是 `2687c484` 加未提交工作树修正，包含 60% 饱和资格线及固定间隔 page tick，但**还使用 1/8 升档步长**；最终工作树已改成 1/4，因此候选行不代表最终代码。
+
+| 日期 | 代码版本 | 架构 / available_parallelism | 模式 / 样本 | items/s | p50 / p95 service | 总耗时 | 峰值进程 | 进程 CPU | 失败/超时 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-10-16 | `1e7c2ea8`（旧版） | macOS ARM64 / 10 | simulation / 8,192 | 134.85 | 80.525 / 81.394 ms | 60,750 ms | 16 | 5,561 ms | 0 / 0 |
+| 2026-10-16 | `2687c484` + 工作树修复（非最终步长） | macOS ARM64 / 10 | simulation / 8,192 | 104.36 | 80.531 / 81.220 ms | 78,497 ms | 14 | 5,563 ms | 0 / 0 |
+
+命令：`LUX_PROBE_BENCH_MODE=simulation LUX_PROBE_BENCH_FILE_COUNT=8192 LUX_PROBE_BENCH_DELAY_MS=75 cargo test --release --locked --test performance lux_561_probe_throughput_benchmark -- --ignored --nocapture --test-threads=1`（Cargo 输出目录为 Toshiba 共享 `target`）。此单轮模拟显示候选比旧版低约 22.6% 吞吐，不能作为性能达标证据，也不能外推真实 ffprobe 或 NAS/x86 性能。固定 tick 已修正候选持续负载中控制器未能评估的问题；随后把升档步长从 1/8 调到 1/4。按项目所有者要求没有重复基准；最终 1/4 版本及真实本地 ffprobe 的 A/B 尚无测量，LUX-561 的性能验收仍未完成。
+
 ## Web 首屏资源记录
 
 | 日期 | 提交 | 硬件/架构 | 数据集 | 命令 | 指标 | 优化前 | 优化后 | 备注 |

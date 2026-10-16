@@ -11864,7 +11864,7 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 #### LUX-561：ffprobe CPU 容量预算与完成速率自适应优化
 
-状态（2026-10-16）：项目所有者已确认优化方向和实施方案；代码实施中，尚未完成性能验收。
+状态（2026-10-16）：代码实施完成；性能验收部分未完成，项目全量测试门未通过旧断言后中止。
 
 范围：为内置本地 ffprobe 增加非 cgroup CPU 容量感知，自动进程预算使用
 `ceil(effective_cpu_cores × 4)` 并限制在 1 至 512；首次活动并发从约 CPU 核数起步，
@@ -11882,14 +11882,14 @@ Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 
 验收：
 
-- [ ] 无 cgroup 时由标准库 CPU 可用并行度得到容量；Linux 可见的 v1/v2 quota 与 cpuset 取保守交集，分数核向上计算预算。
-- [ ] 新库默认预算为 CPU 核数 × 4；已有每库配置继续生效但受进程预算保护；显式环境变量仍覆盖自动预算。
-- [ ] 单个进程内所有本地 probe 服务共享动态准入；只基于成功完成速率试探和回退，不依赖 CPU 使用率。
-- [ ] timeout、取消、输出超限及关停都在确认子进程退出/回收后释放活动配额。
-- [ ] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
+- [x] 无 cgroup 时由标准库 CPU 可用并行度得到容量；Linux 可见的 v1/v2 quota 与 cpuset 取保守交集，分数核向上计算预算。
+- [x] 新库默认预算为 CPU 核数 × 4；已有每库配置继续生效但受进程预算保护；显式环境变量仍覆盖自动预算。
+- [x] 单个进程内所有本地 probe 服务共享动态准入；只基于成功完成速率试探和回退，不依赖 CPU 使用率。
+- [x] timeout、取消、输出超限及关停都在确认子进程退出/回收后释放活动配额。
+- [x] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
 - [ ] 通过定向测试、全量项目完成门和记录在 `docs/PERFORMANCE.md` 的可重复 A/B 测量；不把本机 ARM 结果外推为 NAS/x86 性能。
 
-进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过；P3 已将 ffprobe runner 与输出读取逻辑提取到独立模块；P4 runner owner 在取消、timeout 或输出错误后持续持有子进程，直到 `Child::wait` 确认退出。wait gate 单测曾复现旧逻辑在 1 秒后提前结束的问题，修改后通过；真实子进程取消检查通过，`probe` 20/20 通过。P5 已完成纯完成速率状态机，使用注入时间覆盖预热、饱和窗口、试探/回退、降档、停滞和冷却，定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；timeout、输出错误和取消可尽快返回调用方，后台 reaper 持有 Child 与 permit，直到 wait 确认退出，STRM 旁车不占本地 probe permit。fresh runtime 多库/同库及停滞测试、真实 permit wait gate 和真实子进程取消均通过；probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。P7a 已为首页延迟样本加单调时间戳并提供仅供 probe 使用的 30 秒 p95 与 5 秒合并内存快照；原仪表盘 p95 读取语义不变。P7b 已完成多会话压力分类与最严重档位聚合；高压只保护性下调，恢复/过期重置吞吐基线，不读取 CPU 使用率。P7c 已在每页启动及每秒采样资源压力；关停先封闭 runtime registry 与准入、唤醒页面等待者，并等页面会话（含无本地 permit 的旁车页）和活动子进程许可排空后才允许数据库关闭。旧逻辑下旁车页过早排空回归先失败，修复后通过；probe 控制器单测 11/11、probe 模块单测 32/32、资源模块单测 23/23、`probe` 集成测试 20/20、`shutdown` 集成测试 1/1 通过，格式与 diff 检查通过。P8 已移除 Docker/Compose 注入的固定 8 路默认，Compose 未设置时透传空值；配置空白值回归测试覆盖空字符串和纯空白，部署文档已说明 CPU 自动预算和显式覆盖。P9 已补充 scanner 附件变化不重探测、旁车不运行 ffprobe，以及并行关停时活动子进程回收回归；`scanning_jobs` 定向测试 1/1、`probe` 目标 20/20、`shutdown` 目标 2/2 通过。P10 基准 harness 已加入，模拟和真实 ffprobe A/B 尚未运行；最终性能记录与项目全量门待执行。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
+进度：P1–P9 的实现和定向回归已完成；P10 已加入模拟/真实 ffprobe 共用基准 harness。诊断性 ARM64 模拟对照使用 8,192 项、75 ms 延迟、10 个 available parallelism：旧版为 134.85 items/s，固定 tick 修复后的旧 1/8 升档候选为 104.36 items/s（低约 22.6%）。这次对照发现忙碌时重建 sleep 会持续重置采样 tick，现已改为固定间隔；为缩短爬升又将上调步长改为 1/4，但最终步长和真实 ffprobe A/B 没有测量，因此性能验收保持开放。结果、版本和限制见 `docs/PERFORMANCE.md`。最终检查中 `cargo build --locked`、fmt 和全 targets/all-features Clippy 通过；`cargo test --locked --all-targets` 的 lib 阶段为 914 passed、1 failed、23 ignored，唯一失败是旧断言仍期待 1/8 步长下的并发 6，更新为新规则期望 7 后该用例定向通过。失败令该次 Cargo 测试提前结束，后续集成 targets 未执行；按项目所有者要求没有重跑全量测试。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
 
 ## 29. 参考资料
 

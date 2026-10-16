@@ -13,7 +13,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex as AsyncMutex, OnceCell},
     task::JoinSet,
-    time::sleep,
+    time::{MissedTickBehavior, interval_at},
 };
 
 use crate::{
@@ -1053,6 +1053,9 @@ impl MediaProbeService {
             .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
             .min(LIBRARY_SOURCE_PAGE_SIZE);
         let mut pending = JoinSet::<ProbeTaskResult>::new();
+        let first_tick = tokio::time::Instant::now() + PROBE_ADMISSION_TICK;
+        let mut admission_ticks = interval_at(first_tick, PROBE_ADMISSION_TICK);
+        admission_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             if runtime
                 .is_closing()
@@ -1124,7 +1127,7 @@ impl MediaProbeService {
                     changed = runtime.wait_for_change_since(observed_version) => {
                         changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
                     }
-                    _ = sleep(PROBE_ADMISSION_TICK) => {
+                    _ = admission_ticks.tick() => {
                         self.update_probe_pressure(&session).await?;
                         runtime
                             .tick(Instant::now())
@@ -1151,7 +1154,7 @@ impl MediaProbeService {
                 changed = runtime.wait_for_change_since(observed_version) => {
                     changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
                 }
-                _ = sleep(PROBE_ADMISSION_TICK) => {
+                _ = admission_ticks.tick() => {
                     self.update_probe_pressure(&session).await?;
                     runtime
                         .tick(Instant::now())
