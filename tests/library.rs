@@ -114,7 +114,13 @@ async fn new_libraries_preserve_realtime_watch_setting() -> Result<(), Box<dyn s
 
     assert!(!library.realtime_watch_enabled);
     assert_eq!(library.scan_concurrency, 4);
-    assert_eq!(library.probe_concurrency, 256);
+    let available_cores = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1);
+    assert!(
+        (1..=available_cores.saturating_mul(4).min(512) as i64)
+            .contains(&library.probe_concurrency)
+    );
     let updated = service
         .update_settings(
             library.id,

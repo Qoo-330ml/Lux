@@ -21,9 +21,9 @@ use tokio::{
 use crate::{
     application::nfo::{NfoWriteError, NfoWriteService},
     application::plugin_protocol::{MediaProbeRpcResult, MediaProbeRpcStreamType},
-    config::{MAX_PROBE_CONCURRENCY, probe_concurrency_override_from_env},
+    config::probe_concurrency_override_from_env,
     domain::{ids::LibraryId, time::duration_to_ticks},
-    observability::resources::ResourceMetrics,
+    observability::resources::{ResourceMetrics, automatic_probe_concurrency},
     storage::{Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredMediaSourcePath},
 };
 
@@ -32,15 +32,36 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
-pub(crate) const DEFAULT_PROBE_CONCURRENCY: usize = 256;
 pub(crate) const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 512;
-static GLOBAL_PROBE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static GLOBAL_PROBE_SLOTS: OnceLock<GlobalProbeSlots> = OnceLock::new();
 
-fn process_probe_hard_cap() -> Result<usize, String> {
+fn process_probe_hard_cap() -> Result<Option<usize>, String> {
     match probe_concurrency_override_from_env().map_err(|error| error.to_string())? {
         Some(value) => usize::try_from(value)
+            .map(Some)
             .map_err(|_| format!("LUX_PROBE_CONCURRENCY '{value}' is not supported")),
-        None => Ok(MAX_PROBE_CONCURRENCY as usize),
+        None => Ok(None),
+    }
+}
+
+fn resolve_process_probe_budget(override_budget: Option<usize>, automatic_budget: usize) -> usize {
+    override_budget
+        .unwrap_or(automatic_budget)
+        .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+}
+
+struct GlobalProbeSlots {
+    hard_cap: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl GlobalProbeSlots {
+    fn new(hard_cap: usize) -> Self {
+        let hard_cap = hard_cap.clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY);
+        Self {
+            hard_cap,
+            semaphore: Arc::new(Semaphore::new(hard_cap)),
+        }
     }
 }
 
@@ -907,8 +928,7 @@ pub struct MediaProbeService {
     runner: FfprobeRunner,
     nfo_writer: Option<NfoWriteService>,
     resources: ResourceMetrics,
-    global_slots: Arc<Semaphore>,
-    process_hard_cap: Result<usize, String>,
+    process_hard_cap: Result<Option<usize>, String>,
 }
 
 type ProbeTaskResult = (
@@ -972,18 +992,11 @@ impl ProbeTargetState {
 impl MediaProbeService {
     pub fn new(database: Database, runner: FfprobeRunner) -> Self {
         let process_hard_cap = process_probe_hard_cap();
-        let global_slot_count = process_hard_cap
-            .as_ref()
-            .copied()
-            .unwrap_or(MAX_EFFECTIVE_PROBE_CONCURRENCY);
         Self {
             database,
             runner,
             nfo_writer: None,
             resources: ResourceMetrics::new(),
-            global_slots: Arc::clone(
-                GLOBAL_PROBE_SLOTS.get_or_init(|| Arc::new(Semaphore::new(global_slot_count))),
-            ),
             process_hard_cap,
         }
     }
@@ -1138,27 +1151,38 @@ impl MediaProbeService {
     async fn configured_concurrency(&self, library_id: &str) -> Result<usize, ProbeServiceError> {
         // This is the persisted library/request setting. It intentionally
         // remains separate from the process hard cap and runtime backpressure.
+        let automatic_default = automatic_probe_concurrency().await;
         Ok(self
             .database
             .find_library(library_id)
             .await?
             .and_then(|library| usize::try_from(library.probe_concurrency).ok())
-            .unwrap_or(DEFAULT_PROBE_CONCURRENCY)
+            .unwrap_or(automatic_default)
             .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY))
     }
 
     async fn effective_concurrency(&self, configured: usize) -> Result<usize, ProbeServiceError> {
         // This is the actual stage limit used by JoinSet and the global
         // semaphore for this process.
-        let hard_cap = self
+        let hard_cap = self.global_probe_slots().await?.hard_cap;
+        Ok(self
+            .resources
+            .probe_concurrency(configured, hard_cap)
+            .await
+            .clamp(1, hard_cap))
+    }
+
+    async fn global_probe_slots(&self) -> Result<&'static GlobalProbeSlots, ProbeServiceError> {
+        let override_budget = *self
             .process_hard_cap
             .as_ref()
             .map_err(|error| ProbeServiceError::Worker(error.clone()))?;
-        Ok(self
-            .resources
-            .probe_concurrency(configured, *hard_cap)
-            .await
-            .clamp(1, *hard_cap))
+        let automatic_budget = match override_budget {
+            Some(budget) => budget,
+            None => automatic_probe_concurrency().await,
+        };
+        let hard_cap = resolve_process_probe_budget(override_budget, automatic_budget);
+        Ok(GLOBAL_PROBE_SLOTS.get_or_init(|| GlobalProbeSlots::new(hard_cap)))
     }
 
     async fn probe_source_page(
@@ -1337,8 +1361,12 @@ impl MediaProbeService {
         &self,
         path: &Path,
     ) -> Result<Option<MediaProbeResult>, ProbeError> {
-        let permit = self
-            .global_slots
+        let slots = self
+            .global_probe_slots()
+            .await
+            .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?;
+        let permit = slots
+            .semaphore
             .clone()
             .acquire_owned()
             .await
@@ -1910,9 +1938,17 @@ mod tests {
 
     use super::{
         MediaInfoSidecarContext, MediaProbeResult, MediaStreamResult, ProbeError, StreamType,
-        SubtitleDirectoryCache, serialize_media_info_sidecar_with_context,
-        write_media_info_sidecar_with_context,
+        SubtitleDirectoryCache, resolve_process_probe_budget,
+        serialize_media_info_sidecar_with_context, write_media_info_sidecar_with_context,
     };
+
+    #[test]
+    fn process_probe_budget_uses_auto_capacity_unless_explicitly_overridden() {
+        assert_eq!(resolve_process_probe_budget(None, 40), 40);
+        assert_eq!(resolve_process_probe_budget(Some(8), 40), 8);
+        assert_eq!(resolve_process_probe_budget(Some(900), 40), 512);
+        assert_eq!(resolve_process_probe_budget(Some(0), 40), 1);
+    }
 
     #[tokio::test]
     async fn subtitle_directory_cache_reuses_one_listing_for_an_operation() {

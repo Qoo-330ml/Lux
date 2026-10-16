@@ -8,10 +8,7 @@ use tokio::sync::watch;
 
 use crate::{
     application::{
-        probe::{
-            DEFAULT_PROBE_CONCURRENCY as DEFAULT_PROBE_CONCURRENCY_USIZE,
-            MAX_EFFECTIVE_PROBE_CONCURRENCY,
-        },
+        probe::MAX_EFFECTIVE_PROBE_CONCURRENCY,
         schedule::{DEFAULT_METADATA_SCHEDULE, DEFAULT_RECONCILIATION_SCHEDULE, validate_cron},
     },
     config::{DEFAULT_SCAN_CONCURRENCY, MAX_SCAN_CONCURRENCY, scan_concurrency_from_env},
@@ -20,13 +17,13 @@ use crate::{
         LibraryKind, LibraryRecord, LibraryRootRecord, LibraryScraper, LibraryScraperRole,
         RootOverlap, RootPathError, classify_root_overlap, inspect_root_path,
     },
+    observability::resources::automatic_probe_concurrency,
     storage::{
         Database, LibrarySettingsUpdate, NewLibrary, NewLibraryRoot, StorageError, StoredLibrary,
         StoredLibraryRoot,
     },
 };
 
-const DEFAULT_PROBE_CONCURRENCY: i64 = DEFAULT_PROBE_CONCURRENCY_USIZE as i64;
 const MAX_PROBE_CONCURRENCY: i64 = MAX_EFFECTIVE_PROBE_CONCURRENCY as i64;
 const MAX_SCHEDULE_LENGTH: usize = 128;
 const MAX_LIBRARY_SCRAPERS: usize = 16;
@@ -197,7 +194,7 @@ impl LibraryService {
                 reconciliation_schedule: Some(DEFAULT_RECONCILIATION_SCHEDULE),
                 metadata_schedule: (!scrapers.is_empty()).then_some(DEFAULT_METADATA_SCHEDULE),
                 scan_concurrency: self.default_scan_concurrency,
-                probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
+                probe_concurrency: automatic_probe_concurrency().await as i64,
                 chapter_source_id: chapter_source_id.as_deref(),
             })
             .await?;
@@ -972,9 +969,32 @@ fn stored_library_root(
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryKind, LibraryScraper, LibraryScraperRole, LibraryServiceError,
+        LibraryKind, LibraryScraper, LibraryScraperRole, LibraryService, LibraryServiceError,
         normalize_scraper_settings_for_kind,
     };
+    use crate::{
+        config::Config, observability::resources::automatic_probe_concurrency, storage::Database,
+    };
+
+    #[tokio::test]
+    async fn new_library_persists_the_automatic_probe_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = LibraryService::new(database);
+        let expected = i64::try_from(automatic_probe_concurrency().await)?;
+
+        let library = service
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+
+        assert_eq!(library.probe_concurrency, expected);
+        Ok(())
+    }
 
     #[test]
     fn homevideos_library_settings_clear_old_scrapers_and_reject_new_ones() {

@@ -452,9 +452,11 @@ Lux 的核心价值不是功能数量，而是：
 - 默认扫描时常驻内存目标小于 750 MB。
 - 所有后台队列有界；队列满时合并事件或施加背压，不无限增长。
 - 元数据补全使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 的 worker 默认并发均为 4；`FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
-- ffprobe 默认并发 256，可按媒体库配置 1 至 512；实际运行的单库有效上限为 512、进程全局硬上限为 512，
-  并根据 CPU、内存和前台 p95 动态降档。4 核 NAS 的默认有效并发目标为 128，8 核目标为 256，16 核及以上目标为 512；ffprobe 只处理本轮
-  fingerprint 变化或新增的 source，未变化 source 不得重复探测。
+- ffprobe 自动进程预算为 `ceil(effective_cpu_cores × 4)`，范围 1 至 512；没有 cgroup 限额时使用标准库
+  `available_parallelism`，Linux 可见的 v1/v2 quota 与 cpuset 共同取较小容量。新库将自动预算写入每库设置；
+  已有每库配置保留，但运行时不能超过进程预算。`LUX_PROBE_CONCURRENCY` 数值覆盖自动进程预算。
+  本地 ffprobe 的活动并发从约有效 CPU 核数起步，后续仅依据成功完成速率试探和回退，并结合近期前台延迟及内存保护；
+  CPU 使用率不参与 probe 控制，进程全局硬上限为 512。ffprobe 只处理本轮 fingerprint 变化或新增的 source，未变化 source 不得重复探测。
 - TMDb 请求必须经过 `org.lux.tmdb` 插件；插件统一限制最多 16 个并发请求、每秒最多发起 32 次请求，并实现指数退避和抖动。
 - SQLite 写事务短小，批次默认 100 至 500 项；禁止把整个库放入单个事务。
 
@@ -11888,7 +11890,7 @@ Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 - [ ] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
 - [ ] 通过定向测试、全量项目完成门和记录在 `docs/PERFORMANCE.md` 的可重复 A/B 测量；不把本机 ARM 结果外推为 NAS/x86 性能。
 
-进度：P1 CPU 容量模块已实现，macOS 定向单测 6/6 通过；Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P2–P10 待实施。
+进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
 
 ## 29. 参考资料
 

@@ -249,4 +249,4 @@ P6/P7 所需 service 级隔离测试放在同模块 cfg(test) 下，可访问私
   [Notify](https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html) 和
   [oneshot Sender](https://docs.rs/tokio/latest/tokio/sync/oneshot/struct.Sender.html)；在线最新版本与 lockfile 不完全相同，
   实现以锁定版本及其编译/回归结果为准。
-- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P2–P10 尚未实现，性能测量和完整完成门尚未执行。
+- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；P1 macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。P2 已改新库默认和共享进程预算，CPU 自动预算/环境覆盖单测 1/1、新库持久化单测 1/1、`library` 13/13、`probe` 19/19 通过。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P3–P10 尚未实现，性能测量和完整完成门尚未执行。
