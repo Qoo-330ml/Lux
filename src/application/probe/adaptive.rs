@@ -11,6 +11,10 @@ const DEGRADATION_PERCENT: u32 = 15;
 const TRIAL_COOLDOWN: Duration = Duration::from_secs(30);
 const REVERSE_TRIAL_AFTER: Duration = Duration::from_secs(60);
 const STALL_AFTER: Duration = Duration::from_secs(30);
+const PROBE_HOME_P95_DEGRADED_MS: u64 = 1_000;
+const PROBE_HOME_P95_SEVERE_MS: u64 = 2_000;
+const PROBE_MEMORY_DEGRADED_PERCENT: f64 = 85.0;
+const PROBE_MEMORY_SEVERE_PERCENT: f64 = 95.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AdjustmentReason {
@@ -21,6 +25,32 @@ pub(super) enum AdjustmentReason {
     FailureSafety,
     TrialDown,
     TrialDownRejected,
+    ResourcePressure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum PressureLevel {
+    Normal,
+    Degraded,
+    Severe,
+}
+
+pub(super) fn classify_pressure(
+    home_p95_ms: Option<u64>,
+    container_memory_usage_percent: Option<f64>,
+) -> PressureLevel {
+    if home_p95_ms.is_some_and(|value| value >= PROBE_HOME_P95_SEVERE_MS)
+        || container_memory_usage_percent.is_some_and(|value| value >= PROBE_MEMORY_SEVERE_PERCENT)
+    {
+        PressureLevel::Severe
+    } else if home_p95_ms.is_some_and(|value| value >= PROBE_HOME_P95_DEGRADED_MS)
+        || container_memory_usage_percent
+            .is_some_and(|value| value >= PROBE_MEMORY_DEGRADED_PERCENT)
+    {
+        PressureLevel::Degraded
+    } else {
+        PressureLevel::Normal
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +163,38 @@ impl AdaptiveState {
         self.last_success_at = now;
         self.last_stall_reduction_at = None;
         self.upward_hold_until = None;
+    }
+
+    pub(super) fn apply_pressure_change(
+        &mut self,
+        now: Instant,
+        previous: PressureLevel,
+        current: PressureLevel,
+    ) -> Option<Adjustment> {
+        if current <= previous {
+            return None;
+        }
+        let divisor = match current {
+            PressureLevel::Normal => return None,
+            PressureLevel::Degraded => 2,
+            PressureLevel::Severe => 4,
+        };
+        let next_limit = self.current_limit.div_ceil(divisor).max(1);
+        if next_limit >= self.current_limit {
+            return None;
+        }
+        let previous_limit = self.current_limit;
+        self.current_limit = next_limit;
+        self.last_success_at = now;
+        self.phase = AdaptivePhase::Cooldown {
+            until: now + TRIAL_COOLDOWN,
+            baseline: None,
+        };
+        Some(Adjustment {
+            previous_limit,
+            current_limit: next_limit,
+            reason: AdjustmentReason::ResourcePressure,
+        })
     }
 
     pub(super) fn evaluate_stall(
@@ -432,7 +494,7 @@ fn trial_up_is_good(candidate: WindowStats, baseline: WindowStats) -> bool {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{AdaptiveState, AdjustmentReason, WindowInput};
+    use super::{AdaptiveState, AdjustmentReason, PressureLevel, WindowInput, classify_pressure};
 
     fn valid_window(epoch: u64, successes: u32, p95_ms: u64) -> WindowInput {
         WindowInput {
@@ -711,5 +773,48 @@ mod tests {
             None
         );
         assert_eq!(state.current_limit(), 4);
+    }
+
+    #[test]
+    fn resource_pressure_classifies_and_downshifts_only_on_pressure_increases() {
+        let now = Instant::now();
+        assert_eq!(classify_pressure(None, None), PressureLevel::Normal);
+        assert_eq!(
+            classify_pressure(Some(1_000), None),
+            PressureLevel::Degraded
+        );
+        assert_eq!(classify_pressure(None, Some(95.0)), PressureLevel::Severe);
+
+        let mut state = AdaptiveState::new(8, 16, 1, now);
+        let degraded = state
+            .apply_pressure_change(now, PressureLevel::Normal, PressureLevel::Degraded)
+            .expect("degraded frontend or memory pressure should reduce admission");
+        assert_eq!(degraded.reason, AdjustmentReason::ResourcePressure);
+        assert_eq!(degraded.current_limit, 4);
+        assert_eq!(
+            state.apply_pressure_change(
+                now + Duration::from_secs(1),
+                PressureLevel::Degraded,
+                PressureLevel::Degraded,
+            ),
+            None
+        );
+
+        let severe = state
+            .apply_pressure_change(
+                now + Duration::from_secs(2),
+                PressureLevel::Degraded,
+                PressureLevel::Severe,
+            )
+            .expect("severe pressure should reduce admission further");
+        assert_eq!(severe.current_limit, 1);
+        assert_eq!(
+            state.apply_pressure_change(
+                now + Duration::from_secs(3),
+                PressureLevel::Severe,
+                PressureLevel::Normal,
+            ),
+            None
+        );
     }
 }

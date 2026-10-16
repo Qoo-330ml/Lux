@@ -10,9 +10,10 @@ use std::{
 
 use tokio::sync::Notify;
 
-use crate::domain::ids::LibraryId;
+use crate::{domain::ids::LibraryId, observability::resources::ProbePressure};
 
 use super::{MAX_EFFECTIVE_PROBE_CONCURRENCY, adaptive};
+use adaptive::PressureLevel;
 
 const WINDOW_MIN: Duration = Duration::from_secs(10);
 const WINDOW_MAX: Duration = Duration::from_secs(30);
@@ -61,6 +62,7 @@ struct AdmissionState {
     closing: bool,
     budget: usize,
     adaptive: adaptive::AdaptiveState,
+    pressure_level: PressureLevel,
     sessions: HashMap<u64, SessionEntry>,
     active_by_library: HashMap<LibraryId, usize>,
     active_attempts: HashMap<u64, Instant>,
@@ -84,6 +86,7 @@ struct SessionEntry {
     remaining: usize,
     active: usize,
     closed: bool,
+    pressure: Option<ProbePressure>,
 }
 
 #[derive(Default)]
@@ -103,6 +106,7 @@ impl ProbeRuntime {
                     closing: false,
                     budget,
                     adaptive: adaptive::AdaptiveState::new(starting_limit, budget, 0, now),
+                    pressure_level: PressureLevel::Normal,
                     sessions: HashMap::new(),
                     active_by_library: HashMap::new(),
                     active_attempts: HashMap::new(),
@@ -159,6 +163,7 @@ impl ProbeRuntime {
                     remaining,
                     active: 0,
                     closed: false,
+                    pressure: None,
                 },
             );
             state.refresh_profile(now);
@@ -211,6 +216,43 @@ impl ProbeRuntime {
         Ok(self.lock_state()?.active_total)
     }
 
+    #[cfg(test)]
+    pub(super) fn pressure_level(&self) -> Result<PressureLevel, AdmissionError> {
+        Ok(self.lock_state()?.pressure_level)
+    }
+
+    fn update_pressure(
+        &self,
+        session_id: u64,
+        pressure: ProbePressure,
+        now: Instant,
+    ) -> Result<(), AdmissionError> {
+        let (changed, adjustment) = {
+            let mut state = self.lock_state()?;
+            if state.closing {
+                return Err(AdmissionError::Closed);
+            }
+            let Some(session) = state.sessions.get_mut(&session_id) else {
+                return Err(AdmissionError::Closed);
+            };
+            if session.closed {
+                return Err(AdmissionError::Closed);
+            }
+            session.pressure = Some(pressure);
+            let (changed, adjustment) = state.refresh_pressure(now);
+            if changed {
+                state.refresh_saturation(now);
+                state.version = state.version.wrapping_add(1);
+            }
+            (changed, adjustment)
+        };
+        self.log_adjustment(adjustment);
+        if changed {
+            self.inner.changed.notify_waiters();
+        }
+        Ok(())
+    }
+
     pub(super) fn version(&self) -> Result<u64, AdmissionError> {
         Ok(self.lock_state()?.version)
     }
@@ -233,45 +275,59 @@ impl ProbeRuntime {
         &self,
         now: Instant,
     ) -> Result<Option<adaptive::Adjustment>, AdmissionError> {
-        let adjustment = {
+        let (adjustment, changed) = {
             let mut state = self.lock_state()?;
             state.refresh_saturation(now);
-            if state
+            let (pressure_changed, pressure_adjustment) = state.refresh_pressure(now);
+            let mut adjustment = pressure_adjustment;
+
+            let tick_due = !state
                 .last_adaptive_tick
-                .is_some_and(|last| now.saturating_duration_since(last) < TICK_INTERVAL)
-            {
-                return Ok(None);
-            }
-            state.last_adaptive_tick = Some(now);
+                .is_some_and(|last| now.saturating_duration_since(last) < TICK_INTERVAL);
+            if tick_due {
+                state.last_adaptive_tick = Some(now);
 
-            let has_backlog = state.total_remaining() > 0;
-            let longest_active_for = state.longest_active_for(now);
-            let active_total = state.active_total;
-            let stall_adjustment =
-                state
-                    .adaptive
-                    .evaluate_stall(now, has_backlog, active_total, longest_active_for);
-            let mut adjustment = stall_adjustment;
+                if !pressure_changed {
+                    let has_backlog = state.total_remaining() > 0;
+                    let longest_active_for = state.longest_active_for(now);
+                    let active_total = state.active_total;
+                    adjustment = state.adaptive.evaluate_stall(
+                        now,
+                        has_backlog,
+                        active_total,
+                        longest_active_for,
+                    );
 
-            let elapsed = now.saturating_duration_since(state.window_started_at);
-            let window_ready =
-                elapsed >= WINDOW_MAX || (elapsed >= WINDOW_MIN && state.counters.successes >= 16);
-            if window_ready {
-                state.refresh_saturation(now);
-                let input = state.window_input(now);
-                if let Some(window_adjustment) = state.adaptive.evaluate(now, input) {
-                    adjustment = Some(window_adjustment);
+                    let elapsed = now.saturating_duration_since(state.window_started_at);
+                    let window_ready = elapsed >= WINDOW_MAX
+                        || (elapsed >= WINDOW_MIN && state.counters.successes >= 16);
+                    if window_ready {
+                        state.refresh_saturation(now);
+                        let input = state.window_input(now);
+                        if let Some(window_adjustment) = state.adaptive.evaluate(now, input) {
+                            adjustment = Some(window_adjustment);
+                        }
+                        state.reset_window(now);
+                        state.refresh_saturation(now);
+                    }
                 }
-                state.reset_window(now);
-                state.refresh_saturation(now);
             }
 
-            if adjustment.is_some() {
+            let changed = pressure_changed || adjustment.is_some();
+            if changed {
                 state.refresh_saturation(now);
                 state.version = state.version.wrapping_add(1);
             }
-            adjustment
+            (adjustment, changed)
         };
+        self.log_adjustment(adjustment);
+        if changed {
+            self.inner.changed.notify_waiters();
+        }
+        Ok(adjustment)
+    }
+
+    fn log_adjustment(&self, adjustment: Option<adaptive::Adjustment>) {
         if let Some(adjustment) = adjustment {
             tracing::debug!(
                 previous_limit = adjustment.previous_limit,
@@ -279,9 +335,7 @@ impl ProbeRuntime {
                 reason = ?adjustment.reason,
                 "adaptively adjusted ffprobe concurrency"
             );
-            self.inner.changed.notify_waiters();
         }
-        Ok(adjustment)
     }
 
     fn try_acquire(
@@ -357,6 +411,7 @@ impl ProbeRuntime {
             }
         }
         state.refresh_profile(now);
+        let _ = state.refresh_pressure(now);
         state.refresh_saturation(now);
         state.version = state.version.wrapping_add(1);
         drop(state);
@@ -415,6 +470,7 @@ impl ProbeRuntime {
             AttemptOutcome::Cancelled => {}
         }
         state.refresh_profile(now);
+        let _ = state.refresh_pressure(now);
         state.refresh_saturation(now);
         state.version = state.version.wrapping_add(1);
         drop(state);
@@ -446,6 +502,14 @@ pub(super) struct ProbeSession {
 impl ProbeSession {
     pub(super) fn try_acquire(&self, now: Instant) -> Result<Option<ProbePermit>, AdmissionError> {
         self.runtime.try_acquire(self.session_id, now)
+    }
+
+    pub(super) fn update_pressure(
+        &self,
+        pressure: ProbePressure,
+        now: Instant,
+    ) -> Result<(), AdmissionError> {
+        self.runtime.update_pressure(self.session_id, pressure, now)
     }
 }
 
@@ -494,6 +558,34 @@ impl Drop for ProbePermit {
 }
 
 impl AdmissionState {
+    fn refresh_pressure(&mut self, now: Instant) -> (bool, Option<adaptive::Adjustment>) {
+        let current = self
+            .sessions
+            .values()
+            .filter(|session| session.remaining > 0 || session.active > 0)
+            .filter_map(|session| session.pressure)
+            .filter(|pressure| pressure.is_fresh_at(now))
+            .map(|pressure| {
+                adaptive::classify_pressure(
+                    pressure.home_p95_ms,
+                    pressure.container_memory_usage_percent,
+                )
+            })
+            .max()
+            .unwrap_or(PressureLevel::Normal);
+        if current == self.pressure_level {
+            return (false, None);
+        }
+
+        let previous = self.pressure_level;
+        self.pressure_level = current;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.adaptive.reset_epoch(self.epoch, now);
+        self.reset_window(now);
+        let adjustment = self.adaptive.apply_pressure_change(now, previous, current);
+        (true, adjustment)
+    }
+
     fn total_remaining(&self) -> usize {
         self.sessions.values().fold(0_usize, |total, session| {
             total.saturating_add(session.remaining)
@@ -601,8 +693,9 @@ mod tests {
 
     use crate::domain::ids::LibraryId;
 
-    use super::super::adaptive::AdjustmentReason;
+    use super::super::adaptive::{AdjustmentReason, PressureLevel};
     use super::{AdmissionError, AttemptOutcome, ProbeRuntime};
+    use crate::observability::resources::ProbePressure;
 
     #[test]
     fn applies_one_process_limit_and_each_library_limit_across_sessions() {
@@ -750,5 +843,88 @@ mod tests {
             runtime.register(LibraryId::new(), 1, 1, now).err(),
             Some(AdmissionError::Closed)
         );
+    }
+
+    #[test]
+    fn active_sessions_aggregate_the_most_severe_fresh_pressure_and_expire_stale_samples() {
+        let now = Instant::now();
+        let runtime = ProbeRuntime::new(16, 8, now);
+        let degraded = runtime
+            .register(LibraryId::new(), 8, 1, now)
+            .expect("degraded session");
+        let severe = runtime
+            .register(LibraryId::new(), 8, 1, now)
+            .expect("severe session");
+
+        degraded
+            .update_pressure(
+                ProbePressure {
+                    home_p95_ms: Some(1_000),
+                    container_memory_usage_percent: None,
+                    sampled_at: now,
+                },
+                now,
+            )
+            .expect("update degraded pressure");
+        assert_eq!(
+            runtime.pressure_level().expect("pressure level"),
+            PressureLevel::Degraded
+        );
+        assert_eq!(runtime.current_limit().expect("limit"), 4);
+
+        severe
+            .update_pressure(
+                ProbePressure {
+                    home_p95_ms: None,
+                    container_memory_usage_percent: Some(95.0),
+                    sampled_at: now,
+                },
+                now,
+            )
+            .expect("update severe pressure");
+        assert_eq!(
+            runtime.pressure_level().expect("pressure level"),
+            PressureLevel::Severe
+        );
+        assert_eq!(runtime.current_limit().expect("limit"), 1);
+
+        drop(severe);
+        assert_eq!(
+            runtime.pressure_level().expect("pressure level"),
+            PressureLevel::Degraded
+        );
+        assert_eq!(runtime.current_limit().expect("limit"), 1);
+
+        runtime
+            .tick(now + Duration::from_secs(11))
+            .expect("expire stale pressure");
+        assert_eq!(
+            runtime.pressure_level().expect("pressure level"),
+            PressureLevel::Normal
+        );
+        assert_eq!(runtime.current_limit().expect("limit"), 1);
+    }
+
+    #[test]
+    fn sessions_without_pending_or_active_work_do_not_contribute_pressure() {
+        let now = Instant::now();
+        let runtime = ProbeRuntime::new(8, 4, now);
+        let idle = runtime
+            .register(LibraryId::new(), 4, 0, now)
+            .expect("idle session");
+        idle.update_pressure(
+            ProbePressure {
+                home_p95_ms: Some(2_000),
+                container_memory_usage_percent: None,
+                sampled_at: now,
+            },
+            now,
+        )
+        .expect("update idle session pressure");
+        assert_eq!(
+            runtime.pressure_level().expect("pressure level"),
+            PressureLevel::Normal
+        );
+        assert_eq!(runtime.current_limit().expect("limit"), 4);
     }
 }
