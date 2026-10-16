@@ -1,6 +1,6 @@
 # ffprobe 并发优化：代码实施方案
 
-状态：实施中。LUX-561 已登记为实现任务；P1–P5 已落地，后续按本方案逐个完成并提交。日期：2026-10-16。
+状态：实施中。LUX-561 已登记为实现任务；P1–P6 已落地，后续按本方案逐个完成并提交。日期：2026-10-16。
 优化方向已由项目所有者认可；本文件将
 [`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md)
 落实为代码职责、内部接口、执行顺序与失败回归。
@@ -249,4 +249,4 @@ P6/P7 所需 service 级隔离测试放在同模块 cfg(test) 下，可访问私
   [Notify](https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html) 和
   [oneshot Sender](https://docs.rs/tokio/latest/tokio/sync/oneshot/struct.Sender.html)；在线最新版本与 lockfile 不完全相同，
   实现以锁定版本及其编译/回归结果为准。
-- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；P1 macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。P2 已改新库默认和共享进程预算，CPU 自动预算/环境覆盖单测 1/1、新库持久化单测 1/1、`library` 13/13、`probe` 19/19 通过。P3 已将 runner、错误类型和有界子进程输出读取移动到独立模块，`probe` 19/19 通过。P4 让独立 runner owner 持有子进程，并在取消、timeout 或输出错误后持续等待 `Child::wait` 确认退出；wait gate 单测先按旧逻辑失败，改后通过，取消子进程的真实 PID 检查和 `probe` 20/20 通过。P5 完成纯速率状态机，涵盖预热、饱和资格、两窗升档、p95/timeout 回退、冷却、退化、停滞、失败安全档及反向降档；定向单测 13/13 通过。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P6–P10 尚未实现，性能测量和完整完成门尚未执行。
+- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；P1 macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。P2 已改新库默认和共享进程预算，CPU 自动预算/环境覆盖单测 1/1、新库持久化单测 1/1、`library` 13/13、`probe` 19/19 通过。P3 已将 runner、错误类型和有界子进程输出读取移动到独立模块，`probe` 19/19 通过。P4 让独立 runner owner 持有子进程，并在取消、timeout 或输出错误后持续持有资源直到 `Child::wait` 确认退出；调用者可先收到原错误，后台 reaper 继续持有 permit。wait gate 单测先按旧逻辑失败，改后通过，取消子进程的真实 PID 检查和 `probe` 20/20 通过。P5 完成纯速率状态机，涵盖预热、饱和资格、两窗升档、p95/timeout 回退、冷却、退化、停滞、失败安全档及反向降档；定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；多库/同库 session、预算下降、停滞降档、Notify 不丢唤醒、真实 permit wait gate 和取消下真实子进程均有回归覆盖。probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P7–P10、性能测量和完整完成门尚未执行。
