@@ -11943,17 +11943,21 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 #### LUX-564：有限 SQL 模板缓存基础
 
-范围：建立 storage 内部、仅供受控查询族使用的完整 SQL 模板缓存。模板键固定包含有限查询族、后端、枚举版本与形状；缓存共享最终 SQL 的 `Arc<str>`，模板生成在单个 `String` 中完成并验证绑定预算。缓存有文本与条目双重上限，构造发生在缓存锁外，锁毒化时退回未缓存构造。此任务只实现缓存/构造器基础，不添加尚无调用者的 repository 查询入口，不改扫描查询调用点，不引入任意 SQL 字符串键、数据库 schema 或新依赖。
+范围：建立 storage 内部、仅供受控查询族使用的完整 SQL 模板缓存。模板键固定包含有限查询族、后端、枚举版本与形状；缓存共享最终 SQL 的 `Arc<str>`，模板生成在单个 `String` 中完成并验证绑定预算。每个查询族/后端/版本保留满批模板和最多 4 个尾批模板；总缓存文本不超过 8 MiB，另有 256 条全局应急上限。构造发生在缓存锁外，锁毒化时退回未缓存构造。此任务只实现缓存/构造器基础，不添加尚无调用者的 repository 查询入口，不改扫描查询调用点，不引入任意 SQL 字符串键、数据库 schema 或新依赖。
 
 预计文件（5 个）：`src/storage/sql_templates.rs`（新增并含单测）、`src/storage/mod.rs`、`src/storage/sql_query_benchmarks.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。首个专用 repository 查询入口在后续接入真实 filesystem 读取时一同实现。
 
 验收：
 
-- [ ] 非法/越界模板形状在构造前拒绝；SQLite 与 PostgreSQL 完整 SQL 文本及绑定编号正确；实际绑定数不匹配时拒绝发布。
-- [ ] 相同有限键重复/并发请求最终复用同一 `Arc<str>`；SQL 构造不在缓存锁内，毒化锁退回未缓存构造。
-- [ ] 文本预算不超过 8 MiB，缓存条目数有固定上限；超预算模板可用但不留存在缓存中。
-- [ ] 基准比较缓存命中和 SQL 构造成本；实际查询入口与 query counter 在后续工作包按调用点验收。
-- [ ] 定向单测、模板构造基准、格式、构建与 Clippy 有明确结果；本任务全量门禁按阶段记录既有失败，不称其为绿色。
+- [x] 非法/越界模板形状在构造前拒绝；SQLite 与 PostgreSQL 完整 SQL 文本及绑定编号正确；实际绑定数不匹配时拒绝发布。
+- [x] 相同有限键重复/并发请求最终复用同一 `Arc<str>`；SQL 构造不在缓存锁内，毒化锁退回未缓存构造。
+- [x] 每个模板族仅保留满批与最多 4 个尾批；文本预算不超过 8 MiB、全局条目数不超过 256；超预算模板可用但不留存在缓存中。
+- [x] 基准比较缓存命中和 SQL 构造成本；实际查询入口与 query counter 在后续工作包按调用点验收。
+- [x] 定向单测、模板构造基准、格式、构建与 Clippy 有明确结果；本任务全量门禁按阶段记录失败，不称其为绿色。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮，直接复跑编译后的测试二进制。PostgreSQL 128 个路径参数（另含 root 参数）的 adapter 改写耗时中位数 1,488 ns（1,484–1,613），每次 1 allocation / 981 B / 0 reallocations；缓存命中为 16 ns（16–17）、0 allocations / 0 B；冷构造并发布为 1,192 ns（1,172–1,291）、4 allocations / 2,156 B / 0 reallocations。热命中消除了逐请求 SQL 生成和分配；冷构造仍比 adapter 快，但保留一次性构造成本。该构造微基准不包含数据库执行，不代表查询或扫描整链路收益，也不外推 NAS/x86。
+
+完成门禁记录（2026-10-16）：`cargo test --locked --lib storage::sql_templates::tests -- --test-threads=1` 为 9 passed；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 940 passed、0 failed、23 ignored，之前的若干集成 target 通过；在 `tests/libraries_api.rs` 并行运行时，`admin_can_create_list_and_add_library_root_with_csrf` 一次收到 503 `DATABASE_UNAVAILABLE`（预期 200），测试 target 因此中止。该用例隔离运行及该 target 串行运行均通过；干净 `e7107bfe` 基线的并行 target 三次也通过，候选分支之后的并行复跑通过。当前证据不足以确认这次并行失败的根因，也不足以判定为代码回归；全量门禁仍明确为非绿色，后续完成门禁需继续观察并报告，不能把未运行的后续 target 算作通过。
 
 
 ## 29. 参考资料

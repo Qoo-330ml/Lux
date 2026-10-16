@@ -1,4 +1,5 @@
 use super::{DatabaseBackend, adapt_sql_for_backend};
+use crate::storage::sql_templates::{SqlTemplateCache, filesystem_entries_by_paths_template};
 use sqlx::{Connection, SqliteConnection, sqlite::SqlitePoolOptions};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -143,6 +144,11 @@ async fn execute_count_query(
     statement.fetch_one(connection).await
 }
 
+fn filesystem_path_template(cache: &SqlTemplateCache, capacity: u16) -> Arc<str> {
+    filesystem_entries_by_paths_template(cache, DatabaseBackend::Postgres, capacity)
+        .expect("valid filesystem path template")
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "run explicitly to record the LUX-562 SQL construction baseline"]
 async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Error>> {
@@ -226,6 +232,84 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
     report_allocation_case(
         "postgres_120_parameter_adapter",
         iterations,
+        elapsed,
+        snapshot,
+    );
+
+    let template_cache = SqlTemplateCache::default();
+    let template_capacity = 128_u16;
+    let cached_template = filesystem_path_template(&template_cache, template_capacity);
+    let source_query = format!(
+        "SELECT id FROM filesystem_entries WHERE library_root_id = ? AND relative_path IN ({})",
+        std::iter::repeat_n("?", usize::from(template_capacity))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let expected_template = adapt_sql_for_backend(
+        DatabaseBackend::Postgres,
+        sqlx::AssertSqlSafe(source_query.clone()),
+    );
+    assert_eq!(cached_template.as_ref(), expected_template.as_str());
+
+    let adapter_inputs_for_allocations = (0..iterations)
+        .map(|_| source_query.clone())
+        .collect::<Vec<_>>();
+    let adapter_inputs_for_timing = (0..iterations)
+        .map(|_| source_query.clone())
+        .collect::<Vec<_>>();
+    let mut adapter_inputs_for_allocations = adapter_inputs_for_allocations.into_iter();
+    let mut adapter_inputs_for_timing = adapter_inputs_for_timing.into_iter();
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || {
+            adapt_sql_for_backend(
+                DatabaseBackend::Postgres,
+                sqlx::AssertSqlSafe(
+                    adapter_inputs_for_allocations
+                        .next()
+                        .expect("prebuilt 128-parameter SQL"),
+                ),
+            )
+        },
+        || {
+            adapt_sql_for_backend(
+                DatabaseBackend::Postgres,
+                sqlx::AssertSqlSafe(
+                    adapter_inputs_for_timing
+                        .next()
+                        .expect("prebuilt 128-parameter SQL"),
+                ),
+            )
+        },
+    );
+    report_allocation_case(
+        "postgres_128_parameter_adapter",
+        iterations,
+        elapsed,
+        snapshot,
+    );
+
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || filesystem_path_template(&template_cache, template_capacity),
+        || filesystem_path_template(&template_cache, template_capacity),
+    );
+    report_allocation_case(
+        "postgres_128_parameter_template_cache_hit",
+        iterations,
+        elapsed,
+        snapshot,
+    );
+
+    let miss_iterations = 100;
+    let (elapsed, snapshot) = measure_operation(
+        miss_iterations,
+        || filesystem_path_template(&SqlTemplateCache::default(), template_capacity),
+        || filesystem_path_template(&SqlTemplateCache::default(), template_capacity),
+    );
+    report_allocation_case(
+        "postgres_128_parameter_template_cache_miss",
+        miss_iterations,
         elapsed,
         snapshot,
     );
