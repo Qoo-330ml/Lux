@@ -522,7 +522,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_FFMPEG_CONCURRENCY=2`。ffprobe 默认按有效 CPU 容量自动设置进程预算为 `ceil(CPU 核数 × 4)`，上限 512；Compose 未设置 `LUX_PROBE_CONCURRENCY` 时传空值启用自动预算。活动并发从约 CPU 核数起步，再按本地 ffprobe 成功完成速率自适应调整；首页延迟或 cgroup 内存压力升高时保护性降档，不依赖 CPU 使用率。管理员可通过 `LUX_PROBE_CONCURRENCY` 显式覆盖预算。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立控制 ffprobe 和 ffmpeg 子进程。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -1857,7 +1857,6 @@ services:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
       LUX_SCAN_CONCURRENCY: "2"
-      LUX_PROBE_CONCURRENCY: "8"
       LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
       TZ: "Asia/Shanghai"
@@ -11890,7 +11889,7 @@ Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 - [ ] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
 - [ ] 通过定向测试、全量项目完成门和记录在 `docs/PERFORMANCE.md` 的可重复 A/B 测量；不把本机 ARM 结果外推为 NAS/x86 性能。
 
-进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过；P3 已将 ffprobe runner 与输出读取逻辑提取到独立模块；P4 runner owner 在取消、timeout 或输出错误后持续持有子进程，直到 `Child::wait` 确认退出。wait gate 单测曾复现旧逻辑在 1 秒后提前结束的问题，修改后通过；真实子进程取消检查通过，`probe` 20/20 通过。P5 已完成纯完成速率状态机，使用注入时间覆盖预热、饱和窗口、试探/回退、降档、停滞和冷却，定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；timeout、输出错误和取消可尽快返回调用方，后台 reaper 持有 Child 与 permit，直到 wait 确认退出，STRM 旁车不占本地 probe permit。fresh runtime 多库/同库及停滞测试、真实 permit wait gate 和真实子进程取消均通过；probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。P7a 已为首页延迟样本加单调时间戳并提供仅供 probe 使用的 30 秒 p95 与 5 秒合并内存快照；原仪表盘 p95 读取语义不变。P7b 已完成多会话压力分类与最严重档位聚合；高压只保护性下调，恢复/过期重置吞吐基线，不读取 CPU 使用率。P7c 已在每页启动及每秒采样资源压力；关停先封闭 runtime registry 与准入、唤醒页面等待者，并等页面会话（含无本地 permit 的旁车页）和活动子进程许可排空后才允许数据库关闭。旧逻辑下旁车页过早排空回归先失败，修复后通过；probe 控制器单测 11/11、probe 模块单测 32/32、资源模块单测 23/23、`probe` 集成测试 20/20、`shutdown` 集成测试 1/1 通过，格式与 diff 检查通过。P8–P10、Linux 交叉构建和性能 A/B 尚未完成。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
+进度：P1 CPU 容量模块已实现并通过 macOS 定向单测；P2 新库默认及共享进程预算已接入，`library` 13/13 和 `probe` 19/19 通过；P3 已将 ffprobe runner 与输出读取逻辑提取到独立模块；P4 runner owner 在取消、timeout 或输出错误后持续持有子进程，直到 `Child::wait` 确认退出。wait gate 单测曾复现旧逻辑在 1 秒后提前结束的问题，修改后通过；真实子进程取消检查通过，`probe` 20/20 通过。P5 已完成纯完成速率状态机，使用注入时间覆盖预热、饱和窗口、试探/回退、降档、停滞和冷却，定向单测 13/13 通过。P6 已接入进程级共享准入、同库并发上限与 page 补位；timeout、输出错误和取消可尽快返回调用方，后台 reaper 持有 Child 与 permit，直到 wait 确认退出，STRM 旁车不占本地 probe permit。fresh runtime 多库/同库及停滞测试、真实 permit wait gate 和真实子进程取消均通过；probe 模块单测 26/26、`probe` 集成测试 20/20、格式检查和全 targets/all features Clippy 通过。P7a 已为首页延迟样本加单调时间戳并提供仅供 probe 使用的 30 秒 p95 与 5 秒合并内存快照；原仪表盘 p95 读取语义不变。P7b 已完成多会话压力分类与最严重档位聚合；高压只保护性下调，恢复/过期重置吞吐基线，不读取 CPU 使用率。P7c 已在每页启动及每秒采样资源压力；关停先封闭 runtime registry 与准入、唤醒页面等待者，并等页面会话（含无本地 permit 的旁车页）和活动子进程许可排空后才允许数据库关闭。旧逻辑下旁车页过早排空回归先失败，修复后通过；probe 控制器单测 11/11、probe 模块单测 32/32、资源模块单测 23/23、`probe` 集成测试 20/20、`shutdown` 集成测试 1/1 通过，格式与 diff 检查通过。P8 已移除 Docker/Compose 注入的固定 8 路默认，Compose 未设置时透传空值；配置空白值回归测试覆盖空字符串和纯空白，部署文档已说明 CPU 自动预算和显式覆盖。P9–P10、Linux 交叉构建和性能 A/B 尚未完成。Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。
 
 ## 29. 参考资料
 
