@@ -10217,6 +10217,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -11682,6 +11683,187 @@ async fn media_source_library_page_respects_limit_and_offset() {
 }
 
 #[tokio::test]
+async fn filesystem_path_reads_reuse_bucketed_templates_without_extra_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Filesystem path templates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_root_path = temp_dir.path().join("first-media-root");
+    let other_root_path = temp_dir.path().join("other-media-root");
+    tokio::fs::create_dir_all(&first_root_path)
+        .await
+        .expect("first media root");
+    tokio::fs::create_dir_all(&other_root_path)
+        .await
+        .expect("other media root");
+    let library_service = LibraryService::new(database.clone());
+    let first_root = library_service
+        .add_root(
+            library.id,
+            first_root_path.to_str().expect("UTF-8 first media root"),
+        )
+        .await
+        .expect("first library root")
+        .root;
+    let other_root = library_service
+        .add_root(
+            library.id,
+            other_root_path.to_str().expect("UTF-8 other media root"),
+        )
+        .await
+        .expect("other library root")
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let other_root_id = other_root.id.to_string();
+    for (entry_id, root_id, path) in [
+        (
+            "filesystem-template-first",
+            first_root_id.as_str(),
+            "first.mkv",
+        ),
+        (
+            "filesystem-template-last",
+            first_root_id.as_str(),
+            "last.mkv",
+        ),
+        (
+            "filesystem-template-other-root",
+            other_root_id.as_str(),
+            "first.mkv",
+        ),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                device: None,
+                inode: None,
+                fingerprint: b"fingerprint",
+                last_seen_generation: "filesystem-template-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+
+    database.reset_query_count();
+    let empty = database
+        .list_filesystem_entries_for_paths(&first_root_id, &[])
+        .await
+        .expect("empty path lookup");
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 0);
+
+    database.reset_query_count();
+    let one_path = database
+        .list_filesystem_entries_for_paths(&first_root_id, &["first.mkv".to_owned()])
+        .await
+        .expect("one path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 1);
+    assert_eq!(one_path["first.mkv"].id, "filesystem-template-first");
+
+    database.reset_query_count();
+    let three_paths = database
+        .list_filesystem_entries_for_paths(
+            &first_root_id,
+            &[
+                "first.mkv".to_owned(),
+                "missing-middle.mkv".to_owned(),
+                "last.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("three path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(three_paths.len(), 2);
+    assert_eq!(three_paths["first.mkv"].id, "filesystem-template-first");
+    assert_eq!(three_paths["last.mkv"].id, "filesystem-template-last");
+
+    database.reset_query_count();
+    let four_paths = database
+        .list_filesystem_entries_for_paths(
+            &first_root_id,
+            &[
+                "first.mkv".to_owned(),
+                "missing-one.mkv".to_owned(),
+                "missing-two.mkv".to_owned(),
+                "last.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("four path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(four_paths.len(), 2);
+
+    database.reset_query_count();
+    let other_root_entry = database
+        .list_filesystem_entries_for_paths(&other_root_id, &["first.mkv".to_owned()])
+        .await
+        .expect("same relative path in other root");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        other_root_entry["first.mkv"].id,
+        "filesystem-template-other-root"
+    );
+
+    let paths_with_matches_at = |count: usize, first: usize, last: usize| {
+        let mut paths = (0..count)
+            .map(|index| format!("missing-{index}.mkv"))
+            .collect::<Vec<_>>();
+        paths[first] = "first.mkv".to_owned();
+        paths[last] = "last.mkv".to_owned();
+        paths
+    };
+
+    for (count, first, last, cached_shapes) in
+        [(256, 0, 255, 3), (257, 0, 256, 4), (500, 0, 499, 4)]
+    {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, first, last);
+        let entries = database
+            .list_filesystem_entries_for_paths(&first_root_id, &paths)
+            .await
+            .expect("bucket boundary lookup");
+        assert_eq!(database.query_count(), 1, "path_count={count}");
+        assert_eq!(
+            database.filesystem_path_templates.entry_count(),
+            cached_shapes
+        );
+        assert_eq!(entries.len(), 2, "path_count={count}");
+    }
+
+    database.reset_query_count();
+    let mut paths = (0..501)
+        .map(|index| format!("missing-{index}.mkv"))
+        .collect::<Vec<_>>();
+    paths[499] = "first.mkv".to_owned();
+    paths[500] = "last.mkv".to_owned();
+    let entries = database
+        .list_filesystem_entries_for_paths(&first_root_id, &paths)
+        .await
+        .expect("cross batch lookup");
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 4);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries["first.mkv"].id, "filesystem-template-first");
+    assert_eq!(entries["last.mkv"].id, "filesystem-template-last");
+    database.close().await;
+}
+
+#[tokio::test]
 async fn subtitle_stream_query_is_source_scoped_and_paginated() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -12197,6 +12379,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -12263,6 +12446,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -12391,6 +12575,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -12821,6 +13006,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -12909,6 +13095,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -13409,6 +13596,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 

@@ -10,6 +10,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use super::sql_templates::SqlTemplateCache;
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
@@ -368,6 +369,7 @@ pub struct Database {
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
+    filesystem_path_templates: Arc<SqlTemplateCache>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -512,6 +514,7 @@ impl Database {
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
+            filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })

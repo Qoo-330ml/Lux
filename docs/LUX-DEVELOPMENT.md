@@ -11967,10 +11967,14 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收：
 
-- [ ] 1、3/4、256/257、500/501 路径数边界与缺失路径结果一致；相同相对路径在其他 root 的记录不泄漏。
-- [ ] 输入 0 条路径不执行查询；1–500 条仍一次查询，501 条仍两次查询，`query_count` 与旧实现一致。
-- [ ] 绑定先 root 后 paths，padding 使用 NULL；SQLite 实际查询通过，SQL 模板缓存命中且不再逐次拼 SQL 或分配占位符集合。
-- [ ] 定向 repository 测试先红后绿；格式、构建与 Clippy 结果明确，全量门禁的既有/未定位失败按证据报告。
+- [x] 1、3/4、256/257、500/501 路径数边界与缺失路径结果一致；相同相对路径在其他 root 的记录不泄漏。
+- [x] 输入 0 条路径不执行查询；1–500 条仍一次查询，501 条仍两次查询，`query_count` 与旧实现一致。
+- [x] 绑定先 root 后 paths，padding 使用 typed NULL；SQLite 实际查询通过，SQL 模板缓存命中且热路径不再拼 SQL 或分配占位符集合。
+- [x] 定向 repository 测试先红后绿；格式、构建与 Clippy 结果明确，全量门禁的失败按证据报告。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮、每轮每种构造 50,000 次。对 127 个路径，旧式 exact SQL 构造中位数 327 ns（297–551）；查询 bucket 128 后的缓存命中（含 bucket 选择）为 18 ns（18–26）。这是 SQL 构造时间对照，不包含 SQLite/SQLx 执行，也不测数据库计划或整链路；typed NULL 对执行耗时的影响留待最终阶段验证。A/B 使用 `performance-benchmarks` feature 下默认忽略的 `filesystem_path_template_construction_benchmark`。
+
+完成门禁记录（2026-10-16）：定向 `filesystem_path_reads_reuse_bucketed_templates_without_extra_queries` 为 1 passed，S2 模板单测为 10 passed；release A/B harness 为 1 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 942 passed、0 failed、23 ignored；到 `tests/libraries_api.rs` 时，13 项通过，`admin_can_create_list_and_add_library_root_with_csrf` 再次在并行运行中收到 503 `DATABASE_UNAVAILABLE`（预期 200），后续 targets 未执行。该 target 串行运行 14/14 通过；同一个失败在 S2 全量门禁中已先出现，故不能归因于 LUX-565。随后在干净基线 `e7107bfe` 按“lib target 完成后立即并行运行 `libraries_api`”复核：lib 为 929 passed、0 failed、23 ignored，`libraries_api` 为 14/14 通过；因此该 503 未能在基线复现，根因仍未查明，完整 Rust 门禁仍为非绿色。PostgreSQL 模板编号有单测覆盖，本步没有独立 PostgreSQL 实例验证实际 NULL 绑定。
 
 
 ## 29. 参考资料

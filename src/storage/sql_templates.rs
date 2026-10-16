@@ -28,18 +28,19 @@ impl From<DatabaseBackend> for TemplateBackend {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TemplateFamily {
     FilesystemEntriesByPaths,
+    FilesystemEntryRecordsByPaths,
 }
 
 impl TemplateFamily {
     fn max_in_capacity(self, _backend: TemplateBackend) -> u16 {
         match self {
-            Self::FilesystemEntriesByPaths => 500,
+            Self::FilesystemEntriesByPaths | Self::FilesystemEntryRecordsByPaths => 500,
         }
     }
 
     fn fixed_bindings(self) -> usize {
         match self {
-            Self::FilesystemEntriesByPaths => 1,
+            Self::FilesystemEntriesByPaths | Self::FilesystemEntryRecordsByPaths => 1,
         }
     }
 }
@@ -298,7 +299,7 @@ impl SqlTemplateCache {
     }
 
     #[cfg(test)]
-    fn entry_count(&self) -> usize {
+    pub(crate) fn entry_count(&self) -> usize {
         self.state
             .lock()
             .map(|state| state.entries.len())
@@ -340,12 +341,54 @@ pub(crate) fn filesystem_entries_by_paths_template(
     })
 }
 
+pub(crate) fn filesystem_entry_records_by_paths_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    in_capacity: u16,
+) -> Result<Arc<str>, TemplateError> {
+    let key = TemplateKey::new(
+        TemplateFamily::FilesystemEntryRecordsByPaths,
+        backend,
+        TemplateVersion::V1,
+        TemplateShape::InCapacity(in_capacity),
+    )?;
+    cache.get_or_build(key, |builder| {
+        builder.push_static(
+            r#"SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                    fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
+                    fe.is_missing, ms.item_id,
+                    CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                        AS parent_identity_key,
+                    item.item_type AS item_type,
+                    CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                        AS item_identity_key,
+                    series.provider_ids_json AS series_provider_ids_json
+             FROM filesystem_entries fe
+             LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             LEFT JOIN media_items item ON item.id = ms.item_id
+             LEFT JOIN media_items parent ON parent.id = item.parent_id
+             LEFT JOIN media_items series ON series.id = item.series_id
+             WHERE fe.library_root_id = "#,
+        );
+        builder.push_bind()?;
+        builder.push_static(" AND fe.relative_path IN (");
+        for index in 0..key.in_capacity() {
+            if index > 0 {
+                builder.push_static(", ");
+            }
+            builder.push_bind()?;
+        }
+        builder.push_static(")");
+        Ok(())
+    })
+}
+
 pub(crate) fn filesystem_entries_by_paths_capacity(
     backend: DatabaseBackend,
     path_count: usize,
 ) -> Result<u16, TemplateError> {
     let max_capacity =
-        usize::from(TemplateFamily::FilesystemEntriesByPaths.max_in_capacity(backend.into()));
+        usize::from(TemplateFamily::FilesystemEntryRecordsByPaths.max_in_capacity(backend.into()));
     if path_count == 0 || path_count > max_capacity {
         return Err(TemplateError::InvalidShape);
     }
@@ -406,6 +449,39 @@ mod tests {
             postgres.as_ref(),
             "SELECT id FROM filesystem_entries WHERE library_root_id = $1 AND relative_path IN ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
         );
+    }
+
+    #[test]
+    fn filesystem_entry_record_template_keeps_the_full_projection_and_bind_order() {
+        let cache = SqlTemplateCache::default();
+        let sqlite = filesystem_entry_records_by_paths_template(&cache, DatabaseBackend::Sqlite, 2)
+            .expect("SQLite filesystem row template");
+        assert_eq!(
+            sqlite.as_ref(),
+            r#"SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                    fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
+                    fe.is_missing, ms.item_id,
+                    CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                        AS parent_identity_key,
+                    item.item_type AS item_type,
+                    CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                        AS item_identity_key,
+                    series.provider_ids_json AS series_provider_ids_json
+             FROM filesystem_entries fe
+             LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             LEFT JOIN media_items item ON item.id = ms.item_id
+             LEFT JOIN media_items parent ON parent.id = item.parent_id
+             LEFT JOIN media_items series ON series.id = item.series_id
+             WHERE fe.library_root_id = ? AND fe.relative_path IN (?, ?)"#
+        );
+
+        let postgres =
+            filesystem_entry_records_by_paths_template(&cache, DatabaseBackend::Postgres, 2)
+                .expect("PostgreSQL filesystem row template");
+        assert!(
+            postgres.ends_with("WHERE fe.library_root_id = $1 AND fe.relative_path IN ($2, $3)")
+        );
+        assert!(postgres.contains("series.provider_ids_json AS series_provider_ids_json"));
     }
 
     #[test]
