@@ -1001,8 +1001,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let existing_entry = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
@@ -1277,8 +1284,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let inode = inode.and_then(|value| i64::try_from(value).ok());
         if let Some(existing_entry) = self
             .database
@@ -1891,8 +1905,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(MovieQuickScanResult::Rescan);
         }

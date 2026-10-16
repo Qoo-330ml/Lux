@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         admin_events::{AdminEventHub, UserEventHub},
+        background_work::{BackgroundWorkStage, run_process_background_blocking},
         candidates::MetadataSelectionService,
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
@@ -323,6 +324,25 @@ pub fn compute_file_fingerprint(
     hasher.finalize().to_vec()
 }
 
+pub(super) async fn budgeted_file_fingerprint(
+    path: &Path,
+    relative_path: String,
+    size: i64,
+    modified_at: i64,
+    device: Option<u64>,
+    inode: Option<u64>,
+) -> Result<Vec<u8>, ScannerError> {
+    let display_path = path.to_owned();
+    run_process_background_blocking(BackgroundWorkStage::Fingerprint, move || {
+        compute_file_fingerprint(&relative_path, size, modified_at, device, inode)
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path,
+        source: std::io::Error::other(source.to_string()),
+    })
+}
+
 fn manifest_entry_observation(
     relative_path: String,
     entry_kind: &str,
@@ -403,23 +423,35 @@ async fn current_file_fingerprint(
         .to_str()
         .ok_or(ScannerError::NonUtf8Path)?
         .to_owned();
-    let metadata = fs::metadata(path)
+    let display_path = path.to_owned();
+    let fingerprint_path = path.to_owned();
+    let fingerprint_name = relative_path.clone();
+    let fingerprint_data =
+        run_process_background_blocking(BackgroundWorkStage::Fingerprint, move || {
+            let metadata =
+                std::fs::metadata(&fingerprint_path).map_err(|source| ScannerError::Io {
+                    path: fingerprint_path.clone(),
+                    source,
+                })?;
+            let size = i64::try_from(metadata.len())
+                .map_err(|_| ScannerError::FileSizeOverflow(fingerprint_path.clone()))?;
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+                .unwrap_or(0);
+            let (device, inode) = file_identity(&metadata);
+            let fingerprint =
+                compute_file_fingerprint(&fingerprint_name, size, modified_at, device, inode);
+            Ok::<_, ScannerError>(fingerprint)
+        })
         .await
         .map_err(|source| ScannerError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    let size = i64::try_from(metadata.len())
-        .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
-    let modified_at = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
-        .unwrap_or(0);
-    let (device, inode) = file_identity(&metadata);
-    let fingerprint = compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
-    Ok((relative_path, fingerprint))
+            path: display_path,
+            source: std::io::Error::other(source.to_string()),
+        })??;
+    Ok((relative_path, fingerprint_data))
 }
 
 fn file_identity(metadata: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {

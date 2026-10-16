@@ -161,8 +161,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let container = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -316,8 +323,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let series_identity = format!("series:{root_id}:{}", hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
@@ -652,8 +666,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let inode = inode.and_then(|value| i64::try_from(value).ok());
         let mut report = ScanReport {
             discovered_files: 1,
