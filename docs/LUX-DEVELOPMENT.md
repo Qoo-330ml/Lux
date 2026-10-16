@@ -11861,20 +11861,20 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
-#### LUX-561：扫描 SHA-256 临时指纹表示优化
+#### LUX-561：stat 短路与 XXH3-128 扫描指纹优化
 
-状态：设计提案，尚未实施。仅处理 CPU 热点分析的第二点；完整比较、证据、文件预算与验收见 [SHA-256 指纹优化设计](SHA256-FINGERPRINT-OPTIMIZATION.md)。
+状态：设计提案，尚未实施。仅处理 CPU 热点分析的第二点；2026-10-16 项目所有者选择 A+C，取代先前的 B 主方案。风险与规避见 [A+C 扫描指纹方案](SCAN-FINGERPRINT-A-C-DESIGN.md)；原 B 比较及 SHA 微基准保留在 [原设计记录](SHA256-FINGERPRINT-OPTIMIZATION.md)。
 
-决策：优先采用方案 B，以固定数组保存扫描期间新计算的 32 字节指纹，打通 Manifest observation、seen-entry 和切片 SQL bind 边界；保留公开 Vec 包装、SHA-256、`LUX-FP-1` 字节编码、历史 BLOB/CAS 锚点和现有后处理判等。方案 A 的算法替换和方案 C 的持久 stat 快照暂不引入。ARM64 release 合成微基准中 60k 摘要约 13–57 ms，数组与 Vec 中位数差约 1.0–1.2 ms；该数据不是实际扫描、NAS 或生产 CPU 收益。
+决策：可靠的完整 stat 快照命中时复用原指纹；新文件或确认变化使用 XXH3-128。旧 SHA 行按需验证并预热快照，未变化时不换指纹、不产生后处理目标。新格式显式版本化，旧任务/旧值可读；NFO 等共用 SHA helper 保留。inode 不能单独判等，缓存与规范行的指纹/路径锚定并在既有事务中有界更新，原根身份、二次 stat 和 CAS 防护保留。严格抵抗碰撞/ABA 需要独立 source revision，不能宣称仅靠非加密摘要保证。
 
-本次设计预计文件（2 个）：本文档、`docs/SHA256-FINGERPRINT-OPTIMIZATION.md`。实现按设计中的 S1–S5 顺序拆分，每个增量不超过 5 个文件。
+本次设计修订预计文件（3 个）：本文档、`docs/SHA256-FINGERPRINT-OPTIMIZATION.md`、`docs/SCAN-FINGERPRINT-A-C-DESIGN.md`。实施前按新方案拆分依赖、双读兼容、snapshot 存储和扫描入口；每个实现增量不超过 5 个文件。
 
 验收（以下均指未来实现，尚未完成）：
 
-- [ ] 固定 golden vectors 证明指纹字节与旧版本逐项一致；path/size/纳秒 mtime/device/inode 和 None 语义保持。
-- [ ] 直接扫描与 Manifest observation/seen 路径消除目标临时摘要缓冲分配；借用 SQL bind 不重新分配，必要业务 Vec 所有权保留。
-- [ ] 历史 NULL/异常长度 fingerprint 不补零、不截断、不改写 CAS；并发、取消、根不可用/替换和未变化后处理回归通过。
-- [ ] 完成定向与全量 Rust 检查，记录 release 60k 首扫/重扫的前后对比及分配证据；没有稳定端到端收益时明确记录，不扩展至其他热点。
+- [ ] v1/v2 格式和稳定编码有 golden vectors；所有入口双读兼容后才启用 v2 写入，旧 unchanged 数据不因迁移重处理。
+- [ ] 可靠暖命中不计算摘要；未知字段、不可靠根和损坏快照回退；两种数据库迁移、批量 snapshot 读取与原子提交通过。
+- [ ] 移动/硬链接、并发、取消、根替换、CAS 与旧任务恢复回归通过；NFO/人物/章节合同无意外变化，内容改写检测边界明确。
+- [ ] 完成定向与全量 Rust 检查，分别记录冷升级与暖重扫的 CPU、墙钟、SQL/DML、体积和前台 p95；不得把摘要内核时间当作 NAS 扫描收益。
 
 ## 29. 参考资料
 
