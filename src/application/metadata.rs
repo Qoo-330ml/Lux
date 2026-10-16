@@ -988,6 +988,37 @@ impl SeriesEnrichmentMode {
     }
 }
 
+struct SeriesEnrichmentOptions<'a> {
+    mode: SeriesEnrichmentMode,
+    nfo_snapshot: Option<&'a mut ScanLocalMetadataNfoSnapshot>,
+    deferred_actor_credits: Option<DeferredNfoActorCredits>,
+    background_cpu_budgeted: bool,
+}
+
+impl<'a> SeriesEnrichmentOptions<'a> {
+    fn new(mode: SeriesEnrichmentMode, background_cpu_budgeted: bool) -> Self {
+        Self {
+            mode,
+            nfo_snapshot: None,
+            deferred_actor_credits: None,
+            background_cpu_budgeted,
+        }
+    }
+
+    fn with_nfo_snapshot(mut self, snapshot: &'a mut ScanLocalMetadataNfoSnapshot) -> Self {
+        self.nfo_snapshot = Some(snapshot);
+        self
+    }
+
+    fn with_deferred_actor_credits(
+        mut self,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
+    ) -> Self {
+        self.deferred_actor_credits = deferred_actor_credits;
+        self
+    }
+}
+
 fn local_metadata_source_path(source: &StoredScanLocalMetadataSource) -> StoredMediaSourcePath {
     StoredMediaSourcePath {
         source_id: source.source_id.clone(),
@@ -1528,10 +1559,7 @@ impl MetadataEnricher {
             series_sources,
             &mut report,
             &mut series_context,
-            SeriesEnrichmentMode::ImagesAndNfo,
-            None,
-            None,
-            true,
+            SeriesEnrichmentOptions::new(SeriesEnrichmentMode::ImagesAndNfo, true),
         )
         .await?;
         Ok(report)
@@ -1654,10 +1682,7 @@ impl MetadataEnricher {
                 sources,
                 &mut batch_report,
                 &mut series_context,
-                SeriesEnrichmentMode::ImagesAndNfo,
-                None,
-                None,
-                true,
+                SeriesEnrichmentOptions::new(SeriesEnrichmentMode::ImagesAndNfo, true),
             )
             .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -1743,10 +1768,7 @@ impl MetadataEnricher {
             episodes,
             &mut report,
             &mut series_context,
-            SeriesEnrichmentMode::ImagesOnly,
-            None,
-            None,
-            true,
+            SeriesEnrichmentOptions::new(SeriesEnrichmentMode::ImagesOnly, true),
         )
         .await;
         Ok(ScanLocalMetadataImageBatch { report, sources })
@@ -2193,10 +2215,9 @@ impl MetadataEnricher {
             episodes,
             &mut report,
             &mut series_context,
-            SeriesEnrichmentMode::NfoOnly,
-            Some(&mut nfo_snapshot),
-            deferred_actor_credits.clone(),
-            true,
+            SeriesEnrichmentOptions::new(SeriesEnrichmentMode::NfoOnly, true)
+                .with_nfo_snapshot(&mut nfo_snapshot)
+                .with_deferred_actor_credits(deferred_actor_credits.clone()),
         )
         .await;
         let deferred_metadata_updates = &nfo_snapshot.deferred_metadata_updates;
@@ -2503,10 +2524,7 @@ impl MetadataEnricher {
                     series_sources,
                     &mut batch_report,
                     &mut series_context,
-                    SeriesEnrichmentMode::ImagesAndNfo,
-                    None,
-                    None,
-                    true,
+                    SeriesEnrichmentOptions::new(SeriesEnrichmentMode::ImagesAndNfo, true),
                 )
                 .await;
                 let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -2562,21 +2580,10 @@ impl MetadataEnricher {
         sources: Vec<StoredSeriesMetadataSource>,
         report: &mut MetadataReport,
         context: &mut SeriesEnrichmentContext,
-        mode: SeriesEnrichmentMode,
-        nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
-        deferred_actor_credits: Option<DeferredNfoActorCredits>,
-        background_cpu_budgeted: bool,
+        options: SeriesEnrichmentOptions<'_>,
     ) {
         if let Err(error) = self
-            .enrich_series_sources(
-                sources,
-                report,
-                context,
-                mode,
-                nfo_snapshot,
-                deferred_actor_credits,
-                background_cpu_budgeted,
-            )
+            .enrich_series_sources(sources, report, context, options)
             .await
         {
             tracing::warn!(%error, "local series metadata batch failed");
@@ -2842,10 +2849,7 @@ impl MetadataEnricher {
                 sources,
                 &mut report,
                 &mut series_context,
-                SeriesEnrichmentMode::ImagesAndNfo,
-                None,
-                None,
-                false,
+                SeriesEnrichmentOptions::new(SeriesEnrichmentMode::ImagesAndNfo, false),
             )
             .await?;
             if last_page {
@@ -2861,11 +2865,14 @@ impl MetadataEnricher {
         sources: Vec<StoredSeriesMetadataSource>,
         report: &mut MetadataReport,
         context: &mut SeriesEnrichmentContext,
-        mode: SeriesEnrichmentMode,
-        mut nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
-        deferred_actor_credits: Option<DeferredNfoActorCredits>,
-        background_cpu_budgeted: bool,
+        options: SeriesEnrichmentOptions<'_>,
     ) -> Result<(), MetadataError> {
+        let SeriesEnrichmentOptions {
+            mode,
+            mut nfo_snapshot,
+            deferred_actor_credits,
+            background_cpu_budgeted,
+        } = options;
         let process_images = mode.process_images();
         let process_nfo = mode.process_nfo();
         let mut image_candidates = Vec::new();
