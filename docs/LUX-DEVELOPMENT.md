@@ -11861,6 +11861,21 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
+#### LUX-561：扫描 SHA-256 临时指纹表示优化
+
+状态：设计提案，尚未实施。仅处理 CPU 热点分析的第二点；完整比较、证据、文件预算与验收见 [SHA-256 指纹优化设计](SHA256-FINGERPRINT-OPTIMIZATION.md)。
+
+决策：优先采用方案 B，以固定数组保存扫描期间新计算的 32 字节指纹，打通 Manifest observation、seen-entry 和切片 SQL bind 边界；保留公开 Vec 包装、SHA-256、`LUX-FP-1` 字节编码、历史 BLOB/CAS 锚点和现有后处理判等。方案 A 的算法替换和方案 C 的持久 stat 快照暂不引入。ARM64 release 合成微基准中 60k 摘要约 13–57 ms，数组与 Vec 中位数差约 1.0–1.2 ms；该数据不是实际扫描、NAS 或生产 CPU 收益。
+
+本次设计预计文件（2 个）：本文档、`docs/SHA256-FINGERPRINT-OPTIMIZATION.md`。实现按设计中的 S1–S5 顺序拆分，每个增量不超过 5 个文件。
+
+验收（以下均指未来实现，尚未完成）：
+
+- [ ] 固定 golden vectors 证明指纹字节与旧版本逐项一致；path/size/纳秒 mtime/device/inode 和 None 语义保持。
+- [ ] 直接扫描与 Manifest observation/seen 路径消除目标临时摘要缓冲分配；借用 SQL bind 不重新分配，必要业务 Vec 所有权保留。
+- [ ] 历史 NULL/异常长度 fingerprint 不补零、不截断、不改写 CAS；并发、取消、根不可用/替换和未变化后处理回归通过。
+- [ ] 完成定向与全量 Rust 检查，记录 release 60k 首扫/重扫的前后对比及分配证据；没有稳定端到端收益时明确记录，不扩展至其他热点。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
