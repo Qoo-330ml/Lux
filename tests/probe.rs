@@ -265,6 +265,51 @@ async fn probe_runner_classifies_timeout() -> Result<(), Box<dyn std::error::Err
 
 #[cfg(unix)]
 #[tokio::test]
+async fn canceled_probe_runner_reaps_its_child_process() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let pid_file = temp_dir.path().join("ffprobe.pid");
+    let script = executable_script(
+        temp_dir.path(),
+        "#!/bin/sh\nfor argument do media_path=$argument; done\nprintf '%s' \"$$\" > \"$media_path\"\nexec sleep 30\n",
+    )?;
+    let runner = FfprobeRunner::new(script, Duration::from_secs(30));
+    let probe_path = pid_file.clone();
+    let probe = tokio::spawn(async move { runner.probe_path(&probe_path).await });
+    let pid_text = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake ffprobe should start and record its pid");
+    let pid = pid_text.parse::<u32>()?;
+
+    probe.abort();
+    assert!(
+        probe
+            .await
+            .expect_err("probe task should be canceled")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if child_process_state(pid)?.is_none() {
+                break Ok::<(), Box<dyn std::error::Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("canceled probe should reap its child before the deadline")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn probe_runner_terminates_when_stdout_exceeds_the_runtime_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -762,4 +807,17 @@ fn executable_script(
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions)?;
     Ok(path)
+}
+
+#[cfg(unix)]
+fn child_process_state(pid: u32) -> Result<Option<String>, std::io::Error> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
 }

@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -8,6 +9,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
+    sync::oneshot,
     time::timeout,
 };
 
@@ -35,6 +37,26 @@ impl FfprobeRunner {
     }
 
     pub async fn probe_path(&self, path: &Path) -> Result<MediaProbeResult, ProbeError> {
+        let runner = self.clone();
+        let path = path.to_owned();
+        let (sender, receiver) = oneshot::channel();
+        let _ = tokio::spawn(async move {
+            let mut sender = sender;
+            let result = runner.run_path(&path, &mut sender).await;
+            let _ = sender.send(result);
+        });
+        receiver.await.map_err(|_| {
+            ProbeError::Io(std::io::Error::other(
+                "ffprobe process owner stopped before returning a result",
+            ))
+        })?
+    }
+
+    async fn run_path(
+        &self,
+        path: &Path,
+        response: &mut oneshot::Sender<Result<MediaProbeResult, ProbeError>>,
+    ) -> Result<MediaProbeResult, ProbeError> {
         let mut child = Command::new(&self.binary)
             .args([
                 "-v",
@@ -50,14 +72,24 @@ impl FfprobeRunner {
             .kill_on_drop(true)
             .spawn()
             .map_err(ProbeError::Io)?;
-        let output = match timeout(self.timeout, collect_process_output(&mut child)).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
-                terminate_child(&mut child).await;
+        let output = tokio::select! {
+            _ = response.closed() => None,
+            output = timeout(self.timeout, collect_process_output(&mut child)) => Some(output),
+        };
+        let output = match output {
+            None => {
+                terminate_child(child).await;
+                return Err(ProbeError::Io(std::io::Error::other(
+                    "ffprobe process canceled before returning a result",
+                )));
+            }
+            Some(Ok(Ok(output))) => output,
+            Some(Ok(Err(error))) => {
+                terminate_child(child).await;
                 return Err(error);
             }
-            Err(_) => {
-                terminate_child(&mut child).await;
+            Some(Err(_)) => {
+                terminate_child(child).await;
                 return Err(ProbeError::Timeout);
             }
         };
@@ -192,7 +224,114 @@ async fn collect_process_output(child: &mut Child) -> Result<CollectedProcessOut
     })
 }
 
-async fn terminate_child(child: &mut Child) {
+async fn terminate_child(child: Child) {
+    terminate_child_with_wait(child, |child| async move {
+        let mut child = child;
+        let result = child.wait().await;
+        (child, result)
+    })
+    .await;
+}
+
+async fn terminate_child_with_wait<F, Fut>(mut child: Child, mut wait: F)
+where
+    F: FnMut(Child) -> Fut,
+    Fut: Future<Output = (Child, std::io::Result<std::process::ExitStatus>)>,
+{
     let _ = child.start_kill();
-    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+    let mut next_warning = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (next_child, result) = wait(child).await;
+        child = next_child;
+        if result.is_ok() {
+            return;
+        }
+        if tokio::time::Instant::now() >= next_warning {
+            tracing::warn!(
+                pid = child.id(),
+                "ffprobe child exit could not be confirmed; retaining process ownership"
+            );
+            next_warning = tokio::time::Instant::now() + Duration::from_secs(30);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use tokio::{
+        process::Command,
+        sync::oneshot,
+        time::{Duration, sleep},
+    };
+
+    use super::terminate_child_with_wait;
+
+    struct TestPermit(Arc<AtomicBool>);
+
+    impl Drop for TestPermit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn process_permit_stays_held_until_wait_confirms_child_exit() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep process should start");
+        let permit_held = Arc::new(AtomicBool::new(true));
+        let owner_permit = Arc::clone(&permit_held);
+        let (wait_started_tx, wait_started_rx) = oneshot::channel();
+        let (release_wait_tx, release_wait_rx) = oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let _permit = TestPermit(owner_permit);
+            let mut wait_started_tx = Some(wait_started_tx);
+            let mut release_wait_rx = Some(release_wait_rx);
+            terminate_child_with_wait(child, move |child| {
+                let wait_started_tx = wait_started_tx.take();
+                let release_wait_rx = release_wait_rx.take();
+                async move {
+                    if let Some(wait_started_tx) = wait_started_tx {
+                        let _ = wait_started_tx.send(());
+                    }
+                    let gate_result = if let Some(release_wait_rx) = release_wait_rx {
+                        release_wait_rx.await.map_err(|_| {
+                            std::io::Error::other("test wait gate closed before child reaping")
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    let mut child = child;
+                    let result = match gate_result {
+                        Ok(()) => child.wait().await,
+                        Err(error) => Err(error),
+                    };
+                    (child, result)
+                }
+            })
+            .await;
+        });
+
+        wait_started_rx
+            .await
+            .expect("cleanup should reach child wait");
+        sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            !owner.is_finished(),
+            "owner must not finish while child reaping is unconfirmed"
+        );
+        assert!(permit_held.load(Ordering::SeqCst));
+
+        let _ = release_wait_tx.send(());
+        owner.await.expect("child owner should finish after wait");
+        assert!(!permit_held.load(Ordering::SeqCst));
+    }
 }
