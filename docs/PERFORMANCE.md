@@ -2163,3 +2163,67 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 | 7,000 | 2,202 ms | 315 ms | 1,183 ms | 568 ms | 333 ms | 189 |
 
 因此将 SQLite 完整写事务默认预算固定为 4,000，streamed reader 仍独立保持 8,000，PostgreSQL 默认路径不变。4,000 满足首扫、unchanged 重扫、前台 API、batch 尾延迟与 `<209 DML` 门，并把竞争写者 p95 降低 52.0%；完整竞争写入 p95 为 107.1 ms，略高于 100 ms 的期望目标。当前写者采样器报告 p50/p95；每轮样本量仅约 27–38，不据此声称 p99/max 达标。结果来自本机 ARM64 fixture，不外推 FNOS/NAS 或 x86_64。此前失败的 all-targets 基线用例与 PostgreSQL gate 状态见 `docs/LUX-DEVELOPMENT.md` 的 LUX-564 记录。
+
+### LUX-561 Manifest 反连接分页 SQLx 基线（2026-10-16）
+
+本地 macOS `arm64`、SQLx 0.9、实际 SQLite 3.51.3。忽略测试使用两个 root，每 root 合成 60,000 个 live FILE；目标 Manifest 只包含 `root-a`，generation 全部旧于本轮，单目录路径按字典序排列，页大小 500。完整 SQLite migrations 执行后运行 `ANALYZE`。测试 target：
+
+```bash
+CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target \
+  cargo test --locked --lib storage::repository::jobs::tests::manifest_diff_antijoin_benchmark -- --ignored --nocapture
+```
+
+三轮 SQLx 查询基线：
+
+| 路径 | 三轮耗时 | 中位数 | query-wrapper 调用数 | 工作内容 |
+|---|---:|---:|---:|---|
+| format 3 LITE generation 候选 | 3965 / 3887 / 3908 ms | 3908 ms | 121 | 120 个 500 项页及末尾空页；按 (root, path) tuple 游标 |
+| PERSISTED 目录候选 | 11279 / 18450 / 16241 ms | 16241 ms | 1561 | 候选页从头重新查询；每页另执行 delta 基线核验和写入 chunk |
+
+SQLx 实际 EXPLAIN QUERY PLAN 中，两条查询的 seen/delta 子查询均通过完整键索引查找；filesystem 外层选择 (library_root_id, id) WHERE entry_kind='FILE' AND is_missing=0 回填索引并按 root 扫描候选，随后用临时 B-tree 排序。tuple cursor 未转为 path 范围。PERSISTED 目录查询同样按 root 扫描并临时排序，且每页从头枚举。Manifest、job 的 SCAN 是本 fixture 各只有一行的小表，不是 filesystem 全表扫描。
+
+PERSISTED 的三轮方差较大，且耗时包括 delta 核验/写入，并不等同单条查询执行时间。wrapper 调用数包括同一批次内的辅助 SQL，不代表网络往返次数；SQLite 测试数据库位于临时目录。目录候选查询与 LITE 查询的 WHERE 子句和覆盖范围不同，不能单独从两个表格耗时推出查询变慢。后续 A/B 会保持同一 fixture 和工作量，并分别统计候选读取与 delta 阶段耗时。
+
+同一 SQLx fixture 上另外交错执行旧 COUNT 与新的 `CASE WHEN EXISTS` 完成检查各三轮，验证返回值为候选数/存在标志一致。root-a 有 60k 条 FILE；首部场景全部 60k 条符合候选条件，末尾场景仅最后一个 id 符合，无候选场景则全部标记为当前 generation。原始耗时（ms）与中位数：
+
+| 候选分布 | COUNT 三轮 / 中位数 | EXISTS 三轮 / 中位数 |
+|---|---:|---:|
+| 全部符合，首项已有候选 | 86.09 / 66.61 / 142.84；86.09 | 3.47 / 0.91 / 0.70；0.91 |
+| 唯一候选在最后一个 id | 37.23 / 26.87 / 30.11；30.11 | 19.36 / 22.90 / 11.51；19.36 |
+| 无候选 | 34.23 / 32.12 / 41.90；34.23 | 32.96 / 40.38 / 34.17；34.17 |
+
+这验证了 `(COUNT > 0)` 与 EXISTS 的真值一致。早期命中时 EXISTS 可短路；末尾命中收益较小，无候选时仍要检查整个 root，单轮差异落在样本波动范围内。测试直接用 SQLx 执行查询，没有包含 `finish_scan_manifest_diff` 的事务建立、后续计数和状态写入时间，也未覆盖 PostgreSQL。
+
+#### 固定 root keyset 候选查询
+
+保持相同的两个 root、每 root 60k FILE、page size 500 和旧 generation fixture，先在未改生产查询上保存三轮基线，再在固定 root/path keyset 查询上运行两组各三轮样本。样本为顺序运行而非同一轮交错；机器有其他 Cargo 构建活动，候选结果组间波动明显，因此同时保留原始组，不只报单个改善比例。
+
+| 查询 | 未改实现三轮 / 中位数 | 固定 root 组 1 三轮 / 中位数 | 固定 root 组 2 三轮 / 中位数 |
+|---|---:|---:|---:|
+| LITE 候选枚举 | 7,333 / 5,234 / 6,235；6,235 ms | 275 / 272 / 273；273 ms | 713 / 705 / 767；713 ms |
+| PERSISTED 候选枚举 + delta 写入 | 16,943 / 15,777 / 16,097；16,097 ms | 1,608 / 2,054 / 1,595；1,608 ms | 2,301 / 2,262 / 2,284；2,284 ms |
+
+第二组 PERSISTED 样本把阶段拆开：候选读取为 682 / 671 / 689 ms，delta 核验与写入为 1,514 / 1,485 / 1,490 ms。两版候选页调用数相同（121，含末尾空页）；PERSISTED 总 wrapper query calls 也同为 1,561，因为每个 delta 写批仍要做基线核验、INSERT 和计数更新。性能差异来自页读取访问范围，而不是减少 SQL 语句数。
+
+SQLx SQLite 3.51.3 的原计划按 root 使用 `idx_filesystem_entries_local_metadata_backfill (library_root_id, id)`，对 tuple cursor 临时排序；PERSISTED 目录页还从 root 开头重枚举。新计划改为 `SEARCH fe USING INDEX sqlite_autoindex_filesystem_entries_2 (library_root_id=? AND relative_path>?)`，seen/delta 继续使用完整复合键 covering index，root guard 使用 `idx_scan_manifest_roots_state`，未出现 filesystem 候选排序临时 B-tree。计划中的 manifest/job 小表 SCAN 每个仅一行。
+
+这些是本机合成 SQLx SQLite 数据，不是全量扫描/API 的结论；候选计时有明显组间波动。完整 LUX-270 fixture 的交错 A/B 已完成，结果如下。
+
+#### 完整 LUX-270 fixture 交错 A/B
+
+在同一 macOS ARM64 环境交错运行 8 轮基线与候选，使用固定 60k 文件/600 目录 fixture，比较完整首扫、无变化重扫与前台/catalog 请求。候选二进制编译时 B 实现仍在工作树中、尚未提交；其代码随后成为 `e70a487e`。二进制记录的 `commit` 字段因此仍显示 `a670c192`；本次只有后续参数对象整理，不改变 SQL 或调度语义。
+
+| 指标 | 基线 8 轮中位数 | 候选 8 轮中位数 | 变化 |
+|---|---:|---:|---:|
+| Manifest 首扫 | 2,383.5 ms | 2,406.5 ms | +0.96% |
+| 无变化重扫 | 1,167.5 ms | 1,185.5 ms | +1.54% |
+| 前台请求 p95 | 338 ms | 339 ms | +0.30% |
+| 冷 catalog 列表 p95 | 578 ms | 591.5 ms | +2.34% |
+| 热 catalog 列表 p95 | 431.5 ms | 423.5 ms | -1.85% |
+| batch p95 | 334.5 ms | 346 ms | +3.44% |
+
+每项以八个原始样本计算中位数。首扫/无变化重扫/前台请求/cold catalog/warm catalog/batch 的基线样本依次为：`[2416, 2337, 2351, 2243, 2231, 2449, 2450, 2429]` / `[1175, 1338, 1160, 1094, 1095, 1251, 1095, 1197]` / `[260, 343, 345, 271, 340, 321, 336, 347]` / `[518, 610, 596, 522, 569, 607, 538, 587]` / `[416, 452, 424, 404, 432, 431, 472, 449]` / `[359, 328, 326, 316, 315, 342, 379, 341]` ms；候选对应样本为 `[2478, 2564, 2387, 2227, 2427, 2426, 2295, 2384]` / `[1193, 1171, 1185, 1105, 1232, 1201, 1142, 1186]` / `[357, 312, 357, 278, 387, 294, 345, 333]` / `[602, 532, 611, 539, 671, 530, 593, 590]` / `[421, 424, 440, 366, 461, 408, 423, 480]` / `[399, 439, 351, 314, 337, 341, 358, 341]` ms。
+
+这组完整扫描没有观测到超过 5% 的中位数回退；候选枚举本身的合成 SQLite 查询 A/B 与 EXPLAIN 计划见上文。完整扫描 fixture 不包含删除项，删除候选访问路径的直接收益由固定 root SQLx fixture 单独衡量；因此不能把局部候选查询耗时降幅当作完整扫描加速或 CPU 降幅。
+
+以上仅为本机合成 SQLite 和 ARM64 结果，没有 PostgreSQL runtime、磁盘冷缓存、真实媒体目录、并发全量/增量流量、FNOS/NAS 或 x86 数据；不得据此表述生产 CPU 降幅。

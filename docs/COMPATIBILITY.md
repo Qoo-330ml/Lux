@@ -8,6 +8,14 @@
 
 分支合并前的本机定向 Rust 回归覆盖预算原语 9/9、probe 20/20、thumbnails 18/18、跨服务/跨库混合用例 1/1、metadata 21/21、scanned_series_metadata 3/3，混合用例还验证后台预算占用期间前台 metadata 可继续完成。scanned_metadata 22/23，唯一失败也在干净基线 1e7c2ea8 复现。ffprobe 分支的自动化与探测器定向检查记录在开发文档及性能记录中。按项目所有者要求不执行后台混合负载性能 A/B；本任务未部署到 FNOS，这些功能测试不能证明 NAS CPU 降幅或第三方客户端体验变化。
 
+### Manifest 删除差异查询（2026-10-16）
+
+此项只改变内部 Manifest 查询和候选分页方式，不改变 Lux/Emby API、Manifest 格式、客户端请求/响应或数据库 schema。`format 3/LITE`、`PERSISTED v3`、workflow 1/2/3 与 legacy 的删除候选边界继续由完整复合键 seen/delta 反连接保护；分页固定在 COMPLETE root 内按相对路径 keyset 推进。
+
+本机 macOS `arm64` / SQLite 3.51.3：storage 删除候选分页测试、`scanning_jobs` 88/88、build、fmt 和全目标 Clippy 通过。EXPLAIN 使用已有 `(library_root_id, relative_path)` 唯一索引范围，不再为候选排序建立临时 B-tree；未新增索引或 migration。LUX-270 60k/600 fixture 的 8 轮交错首扫、重扫与前台/catalog/batch p95 中位数变化均在 5% 门内，详细样本见 `PERFORMANCE.md`。这不是生产 CPU 或 NAS 性能结论。
+
+完整 Rust 测试门未通过：未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 在本分支和干净基线 `1e7c2ea8` 都以实际插入 2 张海报、预期 1 张失败；合并参数对象后的全目标串行重跑还遇到一个 `login_background` 15 秒超时，该精确用例单独重跑通过（1/1）。并行期间另一次 `libraries_api` 503 在隔离及串行目标重跑通过。Web 冻结安装与 production build 通过；当前 `pnpm test` 的静态部分为 145/148，独立 Vitest 为 650/655，失败都在未修改的 Web 页面/CSS/组件查询用例，本任务未修改这些行为或断言。未取得 PostgreSQL、FNOS/x86_64 或部署后验证证据。
+
 ## LUX-552 Web 媒体库虚拟化（2026-10-15）
 
 Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在行。列数沿用现有 CSS 网格，行高含待确认徽章与操作提示并动态测量；窗口缩放保留聚焦卡片和未保存的编辑草稿。分页仍由原 `useInfiniteQuery` 和列表底部 sentinel 驱动，选择状态仍由库页持有。文件夹、只读合集、排序、元数据筛选、分页失败重试及批量操作由 19 个库页测试覆盖。
@@ -417,6 +425,12 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 完成时序对两后端相同，且不改变 API、Webhook DTO 或 Emby 合同：扫描期间首页继续读取旧快照；Manifest 索引与缺失确认提交后，任务进入 `status=COMPLETED, scan_phase=POSTPROCESSING`，刷新首页快照并发布一次 `home`，同时按既有时点发出 `ScanCompleted` webhook 和 `JOB_COMPLETED` INFO 运行事件。新 v3 Manifest 随后在后台分批物化 SOURCE/ITEM targets；所有 root cursor 完成的 ready barrier 提交后才启动 NFO、probe、封面和缩略图 worker，全部完成后阶段转为 `IDLE`。format 1/2 活动任务保留原执行器和已创建的 targets。target 物化/处理失败不撤销索引或重发索引完成事件，可从持久游标与未完成 target 状态恢复。INFO 运行事件按现有策略不写入 `scan_job_events` 表；PostgreSQL 根路径/CAS/取消恢复/旧版本升级由 `tests/postgres_database.rs` 覆盖。
 
 验证：0136 完成后 `cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（8/8），包括 PostgreSQL format 3 根目录恢复、checkpoint 重试和升级扫描；SQLite `scanning_jobs` 69/69、`scanner` 16/16、`storage` 28/28。`cargo test --locked --test webhooks --test catalog` 为 8/8。首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1；阶段门 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo test --locked --all-targets` 均通过，机器 `uname -m=arm64`、Rust 1.97.1。两后端 60,000 文件 release 指标见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。PostgreSQL 测试使用本机 ARM64 临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
+
+## LUX-561 Manifest 删除候选兼容
+
+Manifest 删除候选仍只针对 COMPLETE 且身份复核通过的 root；每页保留 generation/最新 observation、seen-path、已存在 delta、目录直接子项/uncovered 判断和原有基线 ID/fingerprint CAS。固定 root 的 path cursor 仅存在于单次执行内；取消、数据库失败或重启仍从头枚举，并依靠已提交的 delta 幂等跳过。完成检查改为存在性判断，报表和应用使用的精确计数没有改变。该优化无 schema migration，不改变 Lux API、Webhook、Emby 或 Manifest 持久格式。
+
+SQLite 语义验证：storage 候选集合回归和 `tests/scanning_jobs.rs` 88/88 通过，覆盖格式分支、目录边界、跨 root 同名路径、特殊路径、uncovered、取消恢复、root 替换与 CAS。SQLx SQLite 3.51.3 计划复用现有 `(library_root_id, relative_path)` 唯一索引范围；性能样本见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。本次没有 PostgreSQL runtime、FNOS/NAS 或 x86 验证；不得将 SQLite 结果外推。
 
 ## LUX-288 渐进扫描与在线补缺兼容边界（规格）
 

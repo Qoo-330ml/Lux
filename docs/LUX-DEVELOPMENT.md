@@ -12134,6 +12134,35 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-17）：最终 Rust 命令使用 `/Volumes/Toshiba/mywork/Lux/target`，运行一次后在 `tests/scanned_metadata.rs` 以 exit 101 结束。lib 为 955 passed、0 failed、23 ignored；该集成 target 为 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1；此前已在基线 `3b4b7325` 重现）与 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；此次不重跑）。此前完成的 `libraries_api` 14/14、`probe` 21/21；其余后续 targets 未执行。S6 代码后的 `cargo build --locked`、`cargo fmt --all -- --check` 和全 targets/all features Clippy 已通过，文档收尾未重复运行。PostgreSQL 使用只绑定 `127.0.0.1:55432` 的临时 16 版容器运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database -- --ignored --test-threads=1`，18/18 通过；随后容器已删除且端口不再监听。完整 Rust 门禁仍未通过；PostgreSQL runtime 项已完成。局部性能数据仅证明 SQL 文本/记录集合构造下降，不代表扫描整链路或生产 CPU 收益。
 
+#### LUX-561：优化 Manifest 删除反连接与分页扫描
+
+范围：针对 CPU 热点分析第六项，在不改变 Manifest、文件路径和删除安全合同的前提下，降低删除候选分页重复枚举，并将只用于判断完成与否的差异统计改为存在性检查。format 3/LITE、PERSISTED v3、workflow 2/3 与 legacy 路径均须保留各自语义。seen-path/delta 继续使用完整复合键反连接。先用 SQLx 双后端 fixture 建立可复现基线，再以固定 root、相对路径 keyset 查询复用 `(library_root_id, relative_path)` 现有索引；不默认增加索引。
+
+验收：
+
+- [x] EXISTS 完成检查与原差异集合一致；精确报告计数保持；root 完整性、取消/job fencing 与事务边界不变。
+- [x] 各格式删除候选集合与基线逐项相同；跨 root 同名路径、多页、直接子项、通配符路径、父目录缺失、uncovered 路径、并发增量、取消恢复和 CAS 均有覆盖。
+- [x] SQLite 实际运行计划与固定 A/B fixture 已验证；完整扫描及前台请求所有观测中位数均在 5% 回退门内。PostgreSQL、FNOS 无本次运行时证据，详见限制，不外推。
+- [x] 实测未证明新增 generation 索引能带来净收益；继续使用现有索引，无 schema/migration 变更。
+- [x] 定向 `storage`/`scanning_jobs` 测试、性能记录、fmt、build、全目标 Clippy 与全量 Rust 完成门结果均已记录；全量门有基线失败，未标为通过。
+
+方案和增量文件计划：[`NOT-EXISTS-OPTIMIZATION-PLAN.md`](NOT-EXISTS-OPTIMIZATION-PLAN.md)。storage SQLx 基线及语义回归位于 `src/storage/jobs/tests.rs`，端到端分页回归在 `tests/scanning_jobs.rs`；查询实现位于 `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs` 和 `src/application/scanner/jobs/manifest_index.rs`。完整扫描 A/B 复用 `tests/performance.rs`。结果更新到本文、`docs/PERFORMANCE.md` 与 `docs/COMPATIBILITY.md`。若索引增量单独证明有必要，再按新增 migration 单独拆分并验证空库与旧库升级。
+
+### 增量顺序
+
+1. 在未修改查询上运行可复现的 SQLx 基线，记录实际后端版本、查询计划与代表性规模数据。
+2. [x] 将四种差异完成检查改为 EXISTS，并补齐各格式语义回归。
+3. [x] 将删除候选调度改为固定 root 的 keyset page；保留各版本目录覆盖和 generation/observation 条件，并以端到端场景验证差异集合和 finish retry。
+4. [x] 交错测量基线与实现；只有整 root missing 更新被证明为独立热点时，才评估额外索引。
+5. [x] 执行全量完成门并记录双后端、ARM64、FNOS/x86 的证据边界。
+
+增量 A 进度（2026-10-16）：四种完成检查现以 `CASE WHEN EXISTS` 返回 0/1；workflow 1 的 observed 与 filesystem 两类候选保持独立短路判断，精确 `unchanged_count` 查询未改。LITE、PERSISTED v3、workflow 2 format 2 和 workflow 1 候选/delta 行为回归通过。SQLx SQLite 对照显示首个候选在文件顺序前部时 COUNT/EXISTS 中位数 86.1/0.91 ms，唯一候选在末尾时为 30.1/19.4 ms，无候选时为 34.2/34.2 ms；仅为本机 60k 合成库查询样本，不代表完整扫描收益。完整原始样本见 `docs/PERFORMANCE.md`。
+
+增量 B 进度（2026-10-16）：候选现在先用有界 COMPLETE-root 页分组，再在固定 root 内按 `relative_path` 标量游标读取；PERSISTED v3 每次处理同 root 的最多 128 个 COMPLETE 目录，并为每个目录页单独推进候选游标。storage 回归覆盖两 root 同名路径、多页、seen/delta/current-generation 排除、目录直接子项与根目录、uncovered 路径、`A`/`AB`、`%`/`_`/反斜杠和中文。`cargo test --locked --test scanning_jobs` 88/88 通过。SQLx SQLite 的固定 root 计划使用已有 `(library_root_id, relative_path)` 唯一索引范围并取消临时排序；候选枚举和 delta 写入的 A/B 样本及波动见 `docs/PERFORMANCE.md`。未新增 migration 或 generation 索引。
+
+验收结果（2026-10-16）：EXISTS 完成检查保留 workflow 1 两种候选来源的独立检查；精确 `unchanged_count` 未改。LITE、PERSISTED v3、workflow 2 format 2 与 workflow 1 的差异集合和 finish/retry 行为由 storage 与 `scanning_jobs` 回归覆盖。固定 root/path keyset 使用现有唯一索引，seen/delta 仍使用完整复合键反连接；无新增索引或迁移。完整 LUX-270 fixture 的 8 轮交错中位数：首扫 2,383.5/2,406.5 ms、无变化重扫 1,167.5/1,185.5 ms、前台 p95 338/339 ms、目录列表 p95 578/591.5 ms、热目录列表 p95 431.5/423.5 ms、batch p95 334.5/346 ms（基线/候选）；最大观测回退 3.44%，在 5% 门内。完整样本见 `docs/PERFORMANCE.md`。
+
+代码验证：`cargo test --locked --lib manifest_removal_candidates_page_within_root_and_preserve_directory_scopes`、`cargo test --locked --test scanning_jobs`（88/88）、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；以上 Cargo 命令均将 target 指向 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。`./scripts/check-all.sh` 的 Rust 全量测试未通过：串行执行到未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 时，插入 2 张海报、断言预期 1 张；在干净基线 `1e7c2ea8` 上的同一精确测试得到相同失败。合并参数对象后的全目标重跑另在 `login_background_plugin_is_refreshed_in_worker_and_served_from_cache` 遇到 15 秒超时，单独精确重跑通过（1/1）。并行执行另曾出现 `libraries_api` 的临时 503，隔离及串行目标重跑通过（14/14）。因此全量 Rust 完成门如实记录为未通过，现有证据不将这些故障归因于 LUX-561。Web 冻结安装和 production build 通过；当前工作树 `pnpm test` 静态阶段为 145/148，Vitest 单独运行是 650/655；这些失败涉及未修改的 Web 页面/CSS/组件查询用例，未在本任务归因或修复。未验证 PostgreSQL runtime、FNOS/x86_64、生产 NAS 或部署行为。
 
 ## 29. 参考资料
 
