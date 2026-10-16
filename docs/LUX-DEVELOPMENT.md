@@ -11861,32 +11861,34 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
-#### LUX-561：ffprobe CPU 容量预算与完成速率自适应设计
+#### LUX-561：ffprobe CPU 容量预算与完成速率自适应优化
 
-状态（2026-10-16）：优化方向已由项目所有者认可；代码方案已细化，尚未实现或进行性能验收。
+状态（2026-10-16）：项目所有者已确认优化方向和实施方案；代码实施中，尚未完成性能验收。
 
-范围：核对内置本地 ffprobe 的默认配置、资源降档和分页执行路径，设计非 cgroup CPU 容量感知、
-默认 `cpu_cores × 4` 进程预算以及基于成功完成速率的动态准入。明确旧库配置、环境变量、
-Docker/Compose 默认、多个本地 probe 服务实例和取消/超时的边界。详细方案见
-[`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md)，代码职责、内部接口、子进程生命周期和
-分步提交见 [`FFPROBE-CONCURRENCY-CODE-PLAN.md`](FFPROBE-CONCURRENCY-CODE-PLAN.md)。
+范围：为内置本地 ffprobe 增加非 cgroup CPU 容量感知，自动进程预算使用
+`ceil(effective_cpu_cores × 4)` 并限制在 1 至 512；首次活动并发从约 CPU 核数起步，
+之后仅按本地 ffprobe 成功完成速率调整。容量交集包含可见 cgroup v1/v2 quota、cpuset 与
+`available_parallelism`，读取失败保守回退且容量结果缓存。保持每库配置上限、环境变量覆盖、
+分页持久化和正常关停边界；官方容器默认转为自动值。CPU 使用率不参与 probe 调节，也不改变
+仪表盘不回退到宿主资源数据的规定。远程 STRM 插件继续走独立调度。
 
-本设计拟替代 §5.4 和 LUX-197 的 256 默认/CPU × 32 目标，但本次不宣称现行策略已切换。
-非 cgroup 感知用于 CPU 容量和预算，不给仪表盘回填宿主使用率；运行时 probe 调节不依赖 CPU 使用率。
-STRM 远程插件仍有独立调度，不将本地预算描述为全部插件子进程的共同限额。
-不涉及 fingerprint、Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
+实现职责、接口、子进程生命周期和 P1–P10 分步提交见
+[`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md) 与
+[`FFPROBE-CONCURRENCY-CODE-PLAN.md`](FFPROBE-CONCURRENCY-CODE-PLAN.md)。不涉及 fingerprint、
+Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 
-预计文件（3 个）：本文档、`docs/FFPROBE-CONCURRENCY-DESIGN.md`、`docs/FFPROBE-CONCURRENCY-CODE-PLAN.md`。
+预计文件与单元验收：按代码方案 P1–P10，每个增量最多 5 个文件并单独验证、提交。
 
-设计验收：
+验收：
 
-- [x] 记录源码事实及与热点报告的差异：无 CPU 样本时启动上限持续生效；官方容器默认显式注入 8。
-- [x] 给出 CPU 容量、自动预算、人工覆盖、完成速率计量、窗口/试探/回退和全局本地准入规则。
-- [x] 列出边界回归、性能测量、后续文件预算和完整完成门；不将推测降幅记为实测。
-- [x] 项目所有者认可优化方向；代码方案细化模块职责、纯状态机、动态准入、进程回收及最多 5 文件的 P1–P10 实施单元。
-- [ ] 代码方案进入后续实施时逐个登记 LUX 编号；本任务不提前实现或宣称代码/性能完成。
+- [ ] 无 cgroup 时由标准库 CPU 可用并行度得到容量；Linux 可见的 v1/v2 quota 与 cpuset 取保守交集，分数核向上计算预算。
+- [ ] 新库默认预算为 CPU 核数 × 4；已有每库配置继续生效但受进程预算保护；显式环境变量仍覆盖自动预算。
+- [ ] 单个进程内所有本地 probe 服务共享动态准入；只基于成功完成速率试探和回退，不依赖 CPU 使用率。
+- [ ] timeout、取消、输出超限及关停都在确认子进程退出/回收后释放活动配额。
+- [ ] 扫描状态、旁车/NFO 回退、存储事务与 HTTP 行为保持原有语义；Docker/Compose 不再注入默认并发 8。
+- [ ] 通过定向测试、全量项目完成门和记录在 `docs/PERFORMANCE.md` 的可重复 A/B 测量；不把本机 ARM 结果外推为 NAS/x86 性能。
 
-验证：本次仅文档，检查 diff、链接与文件范围；未运行 Cargo/Web 测试或生产探测。
+进度：P1 CPU 容量模块已实现，macOS 定向单测 6/6 通过；Linux 交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P2–P10 待实施。
 
 ## 29. 参考资料
 

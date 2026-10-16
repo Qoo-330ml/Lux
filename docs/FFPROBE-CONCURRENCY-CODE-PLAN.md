@@ -1,6 +1,6 @@
 # ffprobe 并发优化：代码实施方案
 
-状态：代码方案已细化，尚未实现。日期：2026-10-16。任务：LUX-561（设计）。
+状态：实施中。LUX-561 已登记为实现任务；P1 CPU 容量探测已落地，后续按本方案逐个完成并提交。日期：2026-10-16。
 优化方向已由项目所有者认可；本文件将
 [`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md)
 落实为代码职责、内部接口、执行顺序与失败回归。
@@ -249,4 +249,4 @@ P6/P7 所需 service 级隔离测试放在同模块 cfg(test) 下，可访问私
   [Notify](https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html) 和
   [oneshot Sender](https://docs.rs/tokio/latest/tokio/sync/oneshot/struct.Sender.html)；在线最新版本与 lockfile 不完全相同，
   实现以锁定版本及其编译/回归结果为准。
-- 当前仅更新设计和任务文档；代码草图未编译，生产实现、性能测量、完整测试和部署均尚未执行。
+- 实现进度：P1 已加入标准库 CPU 容量、Linux cgroup v1/v2 quota/cpuset 交集、30 秒缓存及自动预算计算；macOS 定向单测 6/6 通过，其中包含 cgroup 解析 fixture。Linux 目标交叉构建因缺少 `x86_64-linux-gnu-gcc` 未能启动。P2–P10 尚未实现，性能测量和完整完成门尚未执行。

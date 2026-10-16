@@ -1,6 +1,6 @@
 # ffprobe CPU 容量预算与完成速率自适应设计
 
-状态：优化方向已由项目所有者认可，代码方案已细化，尚未实现。任务：LUX-561（仅设计）。日期：2026-10-16。
+状态：优化方向与代码方案已确认，LUX-561 实施中。日期：2026-10-16。
 
 代码模块、内部接口、进程生命周期和逐步提交方案见
 [`FFPROBE-CONCURRENCY-CODE-PLAN.md`](FFPROBE-CONCURRENCY-CODE-PLAN.md)。

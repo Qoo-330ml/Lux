@@ -8,6 +8,16 @@ use std::{
 use serde::Serialize;
 use tokio::{fs, process::Command};
 
+mod cpu_capacity;
+
+pub(crate) async fn probe_cpu_capacity() -> cpu_capacity::CpuCapacity {
+    cpu_capacity::current_cpu_capacity().await
+}
+
+pub(crate) async fn automatic_probe_concurrency() -> usize {
+    cpu_capacity::automatic_probe_concurrency().await
+}
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEDIA_PATH: &str = "/media";
 const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;
