@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{env, path::Path, time::Duration};
 
 use luxd::{
     application::{
@@ -13,6 +13,7 @@ use luxd::{
     },
     config::Config,
     library::LibraryKind,
+    observability::resources::ResourceMetrics,
     storage::Database,
 };
 
@@ -250,6 +251,49 @@ fn nfo_streamdetails_are_available_when_media_info_sidecar_is_missing() {
 }
 
 #[tokio::test]
+async fn cancelling_probe_caller_keeps_child_supervised_until_exit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let script = executable_script(
+        temp_dir.path(),
+        "#!/bin/sh\ntouch \"$0.started\"\nwhile [ ! -f \"$0.release\" ]; do sleep 0.01; done\ntouch \"$0.finished\"\n",
+    )?;
+    let marker = |suffix: &str| {
+        let mut path = script.as_os_str().to_owned();
+        path.push(format!(".{suffix}"));
+        std::path::PathBuf::from(path)
+    };
+    let runner = FfprobeRunner::new(&script, Duration::from_secs(10));
+    let caller =
+        tokio::spawn(async move { runner.probe_path(Path::new("/tmp/fixture.mkv")).await });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !tokio::fs::try_exists(marker("started"))
+            .await
+            .unwrap_or(false)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fake ffprobe started");
+    caller.abort();
+    let _ = caller.await;
+    tokio::fs::write(marker("release"), b"release").await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !tokio::fs::try_exists(marker("finished"))
+            .await
+            .unwrap_or(false)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervised ffprobe exits after cancellation");
+    Ok(())
+}
+
+#[tokio::test]
 async fn probe_runner_classifies_timeout() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let script = executable_script(temp_dir.path(), "#!/bin/sh\nsleep 1\n")?;
@@ -440,6 +484,7 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"6374","bit_rate":"1
 #[tokio::test]
 async fn probe_service_runs_multiple_ffprobe_processes_at_once()
 -> Result<(), Box<dyn std::error::Error>> {
+    let expected_background_budget = expected_background_cpu_budget().await;
     let temp_dir = tempfile::tempdir()?;
     let config = config_for(&temp_dir);
     let media_root = temp_dir.path().join("Movies");
@@ -500,11 +545,35 @@ printf '%s' '{"format":{"format_name":"matroska"},"streams":[]}'
         .await?
         .trim()
         .parse::<usize>()?;
-    assert!(
-        maximum >= 2,
-        "expected overlapping ffprobe processes, saw {maximum}"
-    );
+    if expected_background_budget == 1 {
+        assert_eq!(maximum, 1, "the global CPU budget serializes ffprobe work");
+    } else {
+        assert!(
+            maximum >= 2 && maximum <= expected_background_budget,
+            "expected 2..={expected_background_budget} overlapping ffprobe processes, saw {maximum}"
+        );
+    }
     Ok(())
+}
+
+async fn expected_background_cpu_budget() -> usize {
+    if let Ok(value) = env::var("LUX_BACKGROUND_CPU_BUDGET")
+        && !value.trim().is_empty()
+        && let Ok(parsed) = value.trim().parse::<usize>()
+    {
+        return parsed.clamp(1, 32);
+    }
+    let visible_parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let cgroup_limit = ResourceMetrics::new()
+        .cpu_limit_cores()
+        .await
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let cpu_capacity = cgroup_limit.map_or(visible_parallelism, |limit| {
+        visible_parallelism.min(limit.floor().max(1.0) as usize)
+    });
+    cpu_capacity.saturating_sub(1).clamp(1, 16)
 }
 
 #[tokio::test]

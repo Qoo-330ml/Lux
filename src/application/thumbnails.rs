@@ -8,11 +8,21 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use tokio::{fs, process::Command, sync::Semaphore, task::JoinSet, time::timeout};
+use tokio::{
+    fs,
+    process::{Child, Command},
+    sync::Semaphore,
+    task::JoinSet,
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::{
     application::{
+        background_work::{
+            BackgroundWorkStage, process_background_child_cleanup_pending,
+            run_process_background_supervised,
+        },
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
             is_fallback_image_source, read_image_dimensions_from_bytes, write_image_atomically,
@@ -532,16 +542,11 @@ impl ThumbnailService {
         plan: &ArtworkPlan,
     ) -> Result<(), ThumbnailFileError> {
         let temporary = temporary_artwork_path(&plan.target_path, plan.image_type);
-        let result = async {
-            self.run_ffmpeg(source_path, &temporary, plan.filter)
-                .await?;
-            let bytes = read_validated_output(&temporary).await?;
-            self.write_and_register(item_id, plan.image_type, &plan.target_path, &bytes)
-                .await
-        }
-        .await;
-        let _ = fs::remove_file(&temporary).await;
-        result
+        let bytes = self
+            .run_ffmpeg(source_path, &temporary, plan.filter)
+            .await?;
+        self.write_and_register(item_id, plan.image_type, &plan.target_path, &bytes)
+            .await
     }
 
     async fn generate_pair(
@@ -554,8 +559,8 @@ impl ThumbnailService {
         let poster_temporary = temporary_artwork_path(&poster.target_path, poster.image_type);
         let thumbnail_temporary =
             temporary_artwork_path(&thumbnail.target_path, thumbnail.image_type);
-        let result = async {
-            self.run_ffmpeg_pair(
+        let (poster_bytes, thumbnail_bytes) = self
+            .run_ffmpeg_pair(
                 source_path,
                 &poster_temporary,
                 &thumbnail_temporary,
@@ -564,33 +569,22 @@ impl ThumbnailService {
             )
             .await
             .map_err(PairGenerationError::Process)?;
-            let poster_bytes = read_validated_output(&poster_temporary)
-                .await
-                .map_err(PairGenerationError::Output)?;
-            let thumbnail_bytes = read_validated_output(&thumbnail_temporary)
-                .await
-                .map_err(PairGenerationError::Output)?;
-            self.write_and_register(
-                item_id,
-                poster.image_type,
-                &poster.target_path,
-                &poster_bytes,
-            )
-            .await
-            .map_err(PairGenerationError::Output)?;
-            self.write_and_register(
-                item_id,
-                thumbnail.image_type,
-                &thumbnail.target_path,
-                &thumbnail_bytes,
-            )
-            .await
-            .map_err(PairGenerationError::Output)
-        }
-        .await;
-        let _ = fs::remove_file(&poster_temporary).await;
-        let _ = fs::remove_file(&thumbnail_temporary).await;
-        result
+        self.write_and_register(
+            item_id,
+            poster.image_type,
+            &poster.target_path,
+            &poster_bytes,
+        )
+        .await
+        .map_err(PairGenerationError::Output)?;
+        self.write_and_register(
+            item_id,
+            thumbnail.image_type,
+            &thumbnail.target_path,
+            &thumbnail_bytes,
+        )
+        .await
+        .map_err(PairGenerationError::Output)
     }
 
     async fn write_and_register(
@@ -612,45 +606,62 @@ impl ThumbnailService {
         source_path: &Path,
         output_path: &Path,
         filter: &str,
-    ) -> Result<(), ThumbnailFileError> {
-        let _permit = self
+    ) -> Result<Vec<u8>, ThumbnailFileError> {
+        let slot = self
             .ffmpeg_permits
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| ThumbnailFileError::FfmpegLimit)?;
-        let mut child = Command::new(&self.ffmpeg_binary)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-ss",
-                DEFAULT_FRAME,
-                "-i",
-            ])
-            .arg(source_path)
-            .args(["-vf", filter, "-frames:v", "1", "-an", "-f", "image2"])
-            .arg(output_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(ThumbnailFileError::ProcessIo)?;
-        let status = match timeout(self.timeout, child.wait()).await {
-            Ok(result) => result.map_err(ThumbnailFileError::ProcessIo)?,
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(ThumbnailFileError::Timeout);
+        let binary = self.ffmpeg_binary.clone();
+        let source_path = source_path.to_owned();
+        let output_path = output_path.to_owned();
+        let filter = filter.to_owned();
+        let child_timeout = self.timeout;
+        run_process_background_supervised(BackgroundWorkStage::Thumbnail, move || async move {
+            let _slot = slot;
+            let result = async {
+                let mut child = Command::new(binary)
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-y",
+                        "-ss",
+                        DEFAULT_FRAME,
+                        "-i",
+                    ])
+                    .arg(source_path)
+                    .args(["-vf", &filter, "-frames:v", "1", "-an", "-f", "image2"])
+                    .arg(&output_path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(ThumbnailFileError::ProcessIo)?;
+                let status = match timeout(child_timeout, child.wait()).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(error)) => {
+                        terminate_thumbnail_child(&mut child).await;
+                        return Err(ThumbnailFileError::ProcessIo(error));
+                    }
+                    Err(_) => {
+                        terminate_thumbnail_child(&mut child).await;
+                        return Err(ThumbnailFileError::Timeout);
+                    }
+                };
+                if !status.success() {
+                    return Err(ThumbnailFileError::Exit(status.code()));
+                }
+                read_validated_output(&output_path).await
             }
-        };
-        if status.success() {
-            Ok(())
-        } else {
-            Err(ThumbnailFileError::Exit(status.code()))
-        }
+            .await;
+            let _ = fs::remove_file(&output_path).await;
+            result
+        })
+        .await
+        .map_err(|error| ThumbnailFileError::ProcessIo(std::io::Error::other(error.to_string())))?
     }
 
     async fn run_ffmpeg_pair(
@@ -660,52 +671,74 @@ impl ThumbnailService {
         thumbnail_output: &Path,
         poster_filter: &str,
         thumbnail_filter: &str,
-    ) -> Result<(), ThumbnailFileError> {
-        let _permit = self
+    ) -> Result<(Vec<u8>, Vec<u8>), ThumbnailFileError> {
+        let slot = self
             .ffmpeg_permits
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| ThumbnailFileError::FfmpegLimit)?;
-        let filter_complex = format!(
-            "[0:v:0]split=2[poster_source][thumbnail_source];[poster_source]{poster_filter}[poster];[thumbnail_source]{thumbnail_filter}[thumbnail]"
-        );
-        let mut child = Command::new(&self.ffmpeg_binary)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-ss",
-                DEFAULT_FRAME,
-                "-i",
-            ])
-            .arg(source_path)
-            .args(["-filter_complex", &filter_complex, "-map", "[poster]"])
-            .args(["-frames:v", "1", "-an", "-f", "image2"])
-            .arg(poster_output)
-            .args(["-map", "[thumbnail]"])
-            .args(["-frames:v", "1", "-an", "-f", "image2"])
-            .arg(thumbnail_output)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(ThumbnailFileError::ProcessIo)?;
-        let status = match timeout(self.timeout, child.wait()).await {
-            Ok(result) => result.map_err(ThumbnailFileError::ProcessIo)?,
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(ThumbnailFileError::Timeout);
+        let binary = self.ffmpeg_binary.clone();
+        let source_path = source_path.to_owned();
+        let poster_output = poster_output.to_owned();
+        let thumbnail_output = thumbnail_output.to_owned();
+        let poster_filter = poster_filter.to_owned();
+        let thumbnail_filter = thumbnail_filter.to_owned();
+        let child_timeout = self.timeout;
+        run_process_background_supervised(BackgroundWorkStage::Thumbnail, move || async move {
+            let _slot = slot;
+            let result = async {
+                let filter_complex = format!(
+                    "[0:v:0]split=2[poster_source][thumbnail_source];[poster_source]{poster_filter}[poster];[thumbnail_source]{thumbnail_filter}[thumbnail]"
+                );
+                let mut child = Command::new(binary)
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-y",
+                        "-ss",
+                        DEFAULT_FRAME,
+                        "-i",
+                    ])
+                    .arg(source_path)
+                    .args(["-filter_complex", &filter_complex, "-map", "[poster]"])
+                    .args(["-frames:v", "1", "-an", "-f", "image2"])
+                    .arg(&poster_output)
+                    .args(["-map", "[thumbnail]"])
+                    .args(["-frames:v", "1", "-an", "-f", "image2"])
+                    .arg(&thumbnail_output)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(ThumbnailFileError::ProcessIo)?;
+                let status = match timeout(child_timeout, child.wait()).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(error)) => {
+                        terminate_thumbnail_child(&mut child).await;
+                        return Err(ThumbnailFileError::ProcessIo(error));
+                    }
+                    Err(_) => {
+                        terminate_thumbnail_child(&mut child).await;
+                        return Err(ThumbnailFileError::Timeout);
+                    }
+                };
+                if !status.success() {
+                    return Err(ThumbnailFileError::Exit(status.code()));
+                }
+                let poster_bytes = read_validated_output(&poster_output).await?;
+                let thumbnail_bytes = read_validated_output(&thumbnail_output).await?;
+                Ok((poster_bytes, thumbnail_bytes))
             }
-        };
-        if status.success() {
-            Ok(())
-        } else {
-            Err(ThumbnailFileError::Exit(status.code()))
-        }
+            .await;
+            let _ = fs::remove_file(&poster_output).await;
+            let _ = fs::remove_file(&thumbnail_output).await;
+            result
+        })
+        .await
+        .map_err(|error| ThumbnailFileError::ProcessIo(std::io::Error::other(error.to_string())))?
     }
 
     async fn register_image(
@@ -761,6 +794,29 @@ struct ArtworkPlan {
 enum PairGenerationError {
     Process(ThumbnailFileError),
     Output(ThumbnailFileError),
+}
+
+async fn terminate_thumbnail_child(child: &mut Child) {
+    let cleanup_pending =
+        process_background_child_cleanup_pending(BackgroundWorkStage::Thumbnail).await;
+    let _ = child.start_kill();
+    let mut retry_delay = Duration::from_millis(10);
+    loop {
+        match child.wait().await {
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(
+                    target: "lux::scan_performance",
+                    phase = "thumbnail_child_cleanup_pending",
+                    child_cleanup_pending = cleanup_pending.count(),
+                    error = %error,
+                    "ffmpeg child has not been reaped after termination"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(1));
+            }
+        }
+    }
 }
 
 fn temporary_artwork_path(target_path: &Path, image_type: &str) -> PathBuf {
