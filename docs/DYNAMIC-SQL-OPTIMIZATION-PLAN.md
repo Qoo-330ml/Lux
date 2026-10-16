@@ -198,7 +198,7 @@ SQLite CPU 包含在 Lux 进程内；PostgreSQL 还需单独记录数据库服�
 | 工作包 | 依赖与结果 | 预计修改文件 | 主要验收 |
 | --- | --- | --- | --- |
 | S0：基线（LUX-562） | 无；建立局部 SQL 构造/分配与单连接 statement-cache 基线 | `src/storage/sql_query_benchmarks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`、本文档 | 五轮 release 结果可复跑，数据/架构/缓存状态明确；本步不声称扫描整链路收益 |
-| S1：查询入口 | S0；SQLite SqlStr 直传，PostgreSQL 编号无临时 String | `src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 地址保持测试先红后绿；编号与集成回归通过 |
+| S1：查询入口（LUX-563） | S0；SQLite SqlStr 直传，PostgreSQL 编号无临时 String；同步迁移调用与基准夹具 | `src/storage/repository.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | 静态/owned/Arc 地址保持测试先红后绿；PostgreSQL 引号与多位编号回归通过；记录优化前后局部基准 |
 | S2：模板基础 | S1；有限键、满批模板、单缓冲区构造 | `src/storage/sql_templates.rs`（新增，含单测）、`src/storage/repository.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | Arc 重用、绑定预算、并发和文本预算测试通过 |
 | S3：两类读取 | S2；filesystem/diff 的模板与 IN 分桶 A/B | `src/storage/filesystem.rs`、`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；无收益则保留精确模板 |
 | S4：发现路径与 presence | S2；精确 CTE 模板与局部 Cow | `src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | workflow/format 版本、完整成功/回读、重试计数均一致 |

@@ -11923,6 +11923,20 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 实施记录（2026-10-16）：Toshiba 已挂载，本机 `arm64`，Rust `1.97.1`。五轮 release 微基准分配数/字节稳定；静态 SQLite SQL adapter 的指针未保留、每次分配 81 字节；PostgreSQL 120 参数 adapter 为 121 次分配、1,615 字节；5,000 行 VALUES CTE 构造为 105,114 字节。五轮中位数、范围、缓存 100/120 形状驻留结果与复跑命令见 `docs/PERFORMANCE.md`。定向 ignored benchmark 通过；`cargo fmt --all -- --check`、普通 `cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 `cargo test --locked --all-targets` 的 lib target 为 929 passed、0 failed、23 ignored；随后 `scanned_metadata` 为 21 passed、2 failed，后续 targets 未执行。已在干净 `e7107bfe` worktree 复现其中的既有 poster 计数失败，并隔离复跑通过慢 NFO 测试。`tests/performance.rs` 编译时有两条既有 dead-code warning；它们不影响 Clippy，未触及相关测试代码。本任务没有生产查询行为改动，完整 Rust 全量门禁仍非绿色。
 
+#### LUX-563：SQLite SQL 直传与 PostgreSQL 占位符改写分配优化
+
+范围：优化查询入口的 SQL 字符串适配；SQLite 直接转交 SQLx `SqlStr`，PostgreSQL 仅在确有未引用 `?` 时构造改写文本，并在同一个 `String` 中写出 `$N`，不为每个编号建立临时 `String`。同步更新迁移查询入口和 LUX-562 合成基准夹具。绑定值、SQL 引号解析规则、查询语义和数据库 schema 保持不变。不在本任务实现模板缓存或 IN 分桶。
+
+预计文件（5 个）：`src/storage/repository.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [ ] SQLite 对静态 `&str`、owned `String` 与 `Arc<str>` 保持原 SQL 缓冲区地址；对应测试先失败再通过。
+- [ ] PostgreSQL 对无占位符 SQL 保留原地址；改写覆盖单/多位编号、单双引号内问号和转义单引号。
+- [ ] repository 三种查询入口及迁移查询使用新的 `SqlStr` 返回值；定向存储测试通过。
+- [ ] 重跑 LUX-562 release 基准，记录静态/owned SQLite adapter 与 120 参数 PostgreSQL adapter 的分配变化；其余基线项目不变。
+- [ ] `cargo fmt --all -- --check`、定向测试和任务完成阶段规定的全量门禁均有明确结果；既有基线失败单独报告，不称全量测试通过。
+
 
 ## 29. 参考资料
 
