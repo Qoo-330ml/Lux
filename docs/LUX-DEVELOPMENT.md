@@ -11959,6 +11959,19 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁记录（2026-10-16）：`cargo test --locked --lib storage::sql_templates::tests -- --test-threads=1` 为 9 passed；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 940 passed、0 failed、23 ignored，之前的若干集成 target 通过；在 `tests/libraries_api.rs` 并行运行时，`admin_can_create_list_and_add_library_root_with_csrf` 一次收到 503 `DATABASE_UNAVAILABLE`（预期 200），测试 target 因此中止。该用例隔离运行及该 target 串行运行均通过；干净 `e7107bfe` 基线的并行 target 三次也通过，候选分支之后的并行复跑通过。当前证据不足以确认这次并行失败的根因，也不足以判定为代码回归；全量门禁仍明确为非绿色，后续完成门禁需继续观察并报告，不能把未运行的后续 target 算作通过。
 
+#### LUX-565：filesystem 路径批量查询复用模板
+
+范围：将 `list_filesystem_entries_for_paths` 从每批动态 `format!`、占位符 `Vec` 和 `join` 改为 S2 的有限 SQL 模板缓存。按路径数量选 power-of-two IN 桶（超过 256 时使用现有 500 项上限），不足桶容量的末尾参数绑定 typed NULL；每批仍最多 500 条、仍发起一次查询，保留 SQL 投影、绑定顺序、root 隔离和返回 map 语义。不修改其他扫描查询族，不调整批次大小、事务或公共接口。
+
+预计文件（5 个）：`src/storage/filesystem.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验收：
+
+- [ ] 1、3/4、256/257、500/501 路径数边界与缺失路径结果一致；相同相对路径在其他 root 的记录不泄漏。
+- [ ] 输入 0 条路径不执行查询；1–500 条仍一次查询，501 条仍两次查询，`query_count` 与旧实现一致。
+- [ ] 绑定先 root 后 paths，padding 使用 NULL；SQLite 实际查询通过，SQL 模板缓存命中且不再逐次拼 SQL 或分配占位符集合。
+- [ ] 定向 repository 测试先红后绿；格式、构建与 Clippy 结果明确，全量门禁的既有/未定位失败按证据报告。
+
 
 ## 29. 参考资料
 
