@@ -1,5 +1,6 @@
 use super::deltas::ManifestDeltaApplyOutcome;
 use super::*;
+use crate::storage::sql_templates::manifest_delta_finalize_template;
 use std::path::Path;
 
 impl Database {
@@ -56,22 +57,31 @@ impl Database {
         .await?;
 
         for chunk in delta_updates.chunks(SCAN_MANIFEST_DELTA_BATCH_SIZE) {
-            let state_cases = std::iter::repeat_n("WHEN ? THEN ?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let error_cases = state_cases.clone();
-            let ids = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "UPDATE scan_manifest_deltas
+            let mut statement = match manifest_delta_finalize_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                chunk.len(),
+            ) {
+                Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let state_cases = std::iter::repeat_n("WHEN ? THEN ?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let error_cases = state_cases.clone();
+                    let ids = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "UPDATE scan_manifest_deltas
                  SET state = CASE id {state_cases} ELSE state END,
                      error = CASE id {error_cases} ELSE error END,
                      attempt_count = attempt_count + 1,
                      updated_at = unixepoch()
                  WHERE manifest_id = ? AND state = 'PENDING' AND id IN ({ids})"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                    );
+                    self.query(sqlx::AssertSqlSafe(query))
+                }
+            };
             for (id, state, _) in chunk {
                 statement = statement.bind(id).bind(state);
             }

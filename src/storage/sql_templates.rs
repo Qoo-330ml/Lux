@@ -36,6 +36,9 @@ enum TemplateFamily {
     ManifestSeenPathsInsert,
     ManifestDirectoryFrontierInsert,
     ManifestDirectoryFrontierComplete,
+    ManifestDeltaVerify,
+    ManifestDeltaInsert,
+    ManifestDeltaFinalize,
 }
 
 impl TemplateFamily {
@@ -51,7 +54,10 @@ impl TemplateFamily {
             | Self::ManifestPresenceReadback
             | Self::ManifestSeenPathsInsert
             | Self::ManifestDirectoryFrontierInsert
-            | Self::ManifestDirectoryFrontierComplete => None,
+            | Self::ManifestDirectoryFrontierComplete
+            | Self::ManifestDeltaVerify
+            | Self::ManifestDeltaInsert
+            | Self::ManifestDeltaFinalize => None,
         }
     }
 
@@ -64,6 +70,9 @@ impl TemplateFamily {
             Self::ManifestPresenceUpdate => Some((manifest_path_max_rows(backend), 7, 2)),
             Self::ManifestDirectoryFrontierInsert => Some((200, 3, 0)),
             Self::ManifestDirectoryFrontierComplete => Some((200, 1, 2)),
+            Self::ManifestDeltaVerify => Some((100, 7, 1)),
+            Self::ManifestDeltaInsert => Some((100, 8, 0)),
+            Self::ManifestDeltaFinalize => Some((100, 5, 1)),
             Self::FilesystemEntries
             | Self::FilesystemEntryRecords
             | Self::ManifestFilesystemBaselines => None,
@@ -741,6 +750,109 @@ pub(crate) fn manifest_directory_frontier_complete_template(
     })
 }
 
+pub(crate) fn manifest_delta_verify_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestDeltaVerify,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static(
+            "WITH incoming (id, library_root_id, relative_path, observation_sequence,\n                     delta_kind, base_filesystem_entry_id, base_fingerprint\n                 ) AS (VALUES ",
+        );
+        push_value_rows(builder, rows, 7)?;
+        builder.push_static(
+            ")\n                 SELECT stored.id\n                 FROM incoming\n                 JOIN scan_manifest_deltas stored\n                   ON stored.manifest_id = ",
+        );
+        builder.push_bind()?;
+        builder.push_static(
+            "\n                  AND stored.library_root_id = incoming.library_root_id\n                  AND stored.relative_path = incoming.relative_path\n                 WHERE stored.id <> incoming.id\n                    OR NOT (\n                        stored.observation_sequence = incoming.observation_sequence\n                        OR (stored.observation_sequence IS NULL\n                            AND incoming.observation_sequence IS NULL)\n                    )\n                    OR stored.delta_kind <> incoming.delta_kind\n                    OR NOT (\n                        stored.base_filesystem_entry_id = incoming.base_filesystem_entry_id\n                        OR (stored.base_filesystem_entry_id IS NULL\n                            AND incoming.base_filesystem_entry_id IS NULL)\n                    )\n                    OR NOT (\n                        stored.base_fingerprint = incoming.base_fingerprint\n                        OR (stored.base_fingerprint IS NULL\n                            AND incoming.base_fingerprint IS NULL)\n                    )\n                 LIMIT 1",
+        );
+        Ok(())
+    })
+}
+
+pub(crate) fn manifest_delta_insert_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestDeltaInsert,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static(
+            "INSERT INTO scan_manifest_deltas (\n                     id, manifest_id, library_root_id, relative_path,\n                     observation_sequence, delta_kind, base_filesystem_entry_id, base_fingerprint\n                 ) VALUES ",
+        );
+        push_value_rows(builder, rows, 8)?;
+        builder.push_static(
+            "\n                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING\n                 RETURNING delta_kind",
+        );
+        Ok(())
+    })
+}
+
+pub(crate) fn manifest_delta_finalize_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestDeltaFinalize,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static(
+            "UPDATE scan_manifest_deltas\n                 SET state = CASE id ",
+        );
+        for row in 0..rows {
+            if row > 0 {
+                builder.push_static(" ");
+            }
+            builder.push_static("WHEN ");
+            builder.push_bind()?;
+            builder.push_static(" THEN ");
+            builder.push_bind()?;
+        }
+        builder.push_static(" ELSE state END,\n                     error = CASE id ");
+        for row in 0..rows {
+            if row > 0 {
+                builder.push_static(" ");
+            }
+            builder.push_static("WHEN ");
+            builder.push_bind()?;
+            builder.push_static(" THEN ");
+            builder.push_bind()?;
+        }
+        builder.push_static(
+            " ELSE error END,\n                     attempt_count = attempt_count + 1,\n                     updated_at = unixepoch()\n                 WHERE manifest_id = ",
+        );
+        builder.push_bind()?;
+        builder.push_static(" AND state = 'PENDING' AND id IN (");
+        for row in 0..rows {
+            if row > 0 {
+                builder.push_static(", ");
+            }
+            builder.push_bind()?;
+        }
+        builder.push_static(")");
+        Ok(())
+    })
+}
+
 pub(crate) fn filesystem_entries_by_paths_capacity(
     backend: DatabaseBackend,
     path_count: usize,
@@ -1399,6 +1511,104 @@ mod tests {
                 Err(TemplateError::InvalidShape)
             );
         }
+    }
+
+    #[test]
+    fn manifest_delta_templates_preserve_sql_and_postgres_bind_order() {
+        let cache = SqlTemplateCache::default();
+        let verify = manifest_delta_verify_template(&cache, DatabaseBackend::Postgres, 2)
+            .expect("PostgreSQL delta baseline verification");
+        assert!(verify.starts_with(
+            "WITH incoming (id, library_root_id, relative_path, observation_sequence,"
+        ));
+        assert!(
+            verify
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7), ($8, $9, $10, $11, $12, $13, $14)")
+        );
+        assert!(verify.contains("stored.manifest_id = $15"));
+        assert!(verify.ends_with("LIMIT 1"));
+        assert_eq!(verify.matches('$').count(), 15);
+
+        let insert = manifest_delta_insert_template(&cache, DatabaseBackend::Sqlite, 1)
+            .expect("SQLite delta insert");
+        assert!(insert.starts_with("INSERT INTO scan_manifest_deltas ("));
+        assert!(insert.contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(insert.ends_with(
+            "ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING\n                 RETURNING delta_kind"
+        ));
+        let postgres_insert = manifest_delta_insert_template(&cache, DatabaseBackend::Postgres, 2)
+            .expect("PostgreSQL delta insert");
+        assert!(postgres_insert.contains(
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8), ($9, $10, $11, $12, $13, $14, $15, $16)"
+        ));
+        assert!(postgres_insert.ends_with("RETURNING delta_kind"));
+        assert_eq!(postgres_insert.matches('$').count(), 16);
+        assert!(Arc::ptr_eq(
+            &postgres_insert,
+            &manifest_delta_insert_template(&cache, DatabaseBackend::Postgres, 2)
+                .expect("reused PostgreSQL delta insert")
+        ));
+
+        let finalize = manifest_delta_finalize_template(&cache, DatabaseBackend::Postgres, 2)
+            .expect("PostgreSQL delta finalizer");
+        let finalize_compact = finalize.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            finalize_compact,
+            "UPDATE scan_manifest_deltas SET state = CASE id WHEN $1 THEN $2 WHEN $3 THEN $4 ELSE state END, error = CASE id WHEN $5 THEN $6 WHEN $7 THEN $8 ELSE error END, attempt_count = attempt_count + 1, updated_at = unixepoch() WHERE manifest_id = $9 AND state = 'PENDING' AND id IN ($10, $11)"
+        );
+    }
+
+    #[test]
+    fn manifest_delta_templates_enforce_exact_batch_and_tail_cache_bounds() {
+        let cache = SqlTemplateCache::default();
+        let verify = manifest_delta_verify_template(&cache, DatabaseBackend::Sqlite, 100)
+            .expect("full SQLite delta verification batch");
+        assert_eq!(verify.matches('?').count(), 701);
+        let insert = manifest_delta_insert_template(&cache, DatabaseBackend::Sqlite, 100)
+            .expect("full SQLite delta insert batch");
+        assert_eq!(insert.matches('?').count(), 800);
+        let finalize = manifest_delta_finalize_template(&cache, DatabaseBackend::Sqlite, 100)
+            .expect("full SQLite delta finalizer batch");
+        assert_eq!(finalize.matches('?').count(), 501);
+
+        for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+            assert_eq!(
+                manifest_delta_verify_template(&cache, backend, 0),
+                Err(TemplateError::InvalidShape)
+            );
+            assert_eq!(
+                manifest_delta_insert_template(&cache, backend, 101),
+                Err(TemplateError::InvalidShape)
+            );
+            assert_eq!(
+                manifest_delta_finalize_template(&cache, backend, 101),
+                Err(TemplateError::InvalidShape)
+            );
+        }
+
+        let tail_cache = SqlTemplateCache::default();
+        for rows in [100, 1, 2, 3, 4, 5] {
+            manifest_delta_insert_template(&tail_cache, DatabaseBackend::Postgres, rows)
+                .expect("bounded PostgreSQL delta insert shape");
+        }
+        assert_eq!(tail_cache.entry_count(), 5);
+        let evicted_tail_key = TemplateKey::new(
+            TemplateFamily::ManifestDeltaInsert,
+            DatabaseBackend::Postgres,
+            TemplateVersion::V1,
+            TemplateShape::ExactRows(1),
+        )
+        .expect("first delta tail key");
+        let full_key = TemplateKey::new(
+            TemplateFamily::ManifestDeltaInsert,
+            DatabaseBackend::Postgres,
+            TemplateVersion::V1,
+            TemplateShape::ExactRows(100),
+        )
+        .expect("full delta key");
+        let state = tail_cache.state.lock().expect("delta cache state");
+        assert!(!state.entries.contains_key(&evicted_tail_key));
+        assert!(state.entries.contains_key(&full_key));
     }
 
     #[test]

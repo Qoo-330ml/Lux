@@ -1,6 +1,7 @@
 use super::{DatabaseBackend, adapt_sql_for_backend};
 use crate::storage::sql_templates::{
-    SqlTemplateCache, filesystem_entries_by_paths_template,
+    SqlTemplateCache, filesystem_entries_by_paths_template, manifest_delta_finalize_template,
+    manifest_delta_insert_template, manifest_delta_verify_template,
     manifest_directory_frontier_complete_template, manifest_directory_frontier_insert_template,
 };
 use sqlx::{Connection, SqliteConnection, sqlite::SqlitePoolOptions};
@@ -446,6 +447,74 @@ fn legacy_manifest_frontier_complete_sql(row_count: usize) -> String {
     )
 }
 
+fn legacy_manifest_delta_verify_sql(row_count: usize) -> String {
+    let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", row_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH incoming (
+             id, library_root_id, relative_path, observation_sequence,
+             delta_kind, base_filesystem_entry_id, base_fingerprint
+         ) AS (VALUES {values})
+         SELECT stored.id
+         FROM incoming
+         JOIN scan_manifest_deltas stored
+           ON stored.manifest_id = ?
+          AND stored.library_root_id = incoming.library_root_id
+          AND stored.relative_path = incoming.relative_path
+         WHERE stored.id <> incoming.id
+            OR NOT (
+                stored.observation_sequence = incoming.observation_sequence
+                OR (stored.observation_sequence IS NULL
+                    AND incoming.observation_sequence IS NULL)
+            )
+            OR stored.delta_kind <> incoming.delta_kind
+            OR NOT (
+                stored.base_filesystem_entry_id = incoming.base_filesystem_entry_id
+                OR (stored.base_filesystem_entry_id IS NULL
+                    AND incoming.base_filesystem_entry_id IS NULL)
+            )
+            OR NOT (
+                stored.base_fingerprint = incoming.base_fingerprint
+                OR (stored.base_fingerprint IS NULL
+                    AND incoming.base_fingerprint IS NULL)
+            )
+         LIMIT 1"
+    )
+}
+
+fn legacy_manifest_delta_insert_sql(row_count: usize) -> String {
+    let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", row_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO scan_manifest_deltas (
+             id, manifest_id, library_root_id, relative_path,
+             observation_sequence, delta_kind, base_filesystem_entry_id, base_fingerprint
+         ) VALUES {values}
+         ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING
+         RETURNING delta_kind"
+    )
+}
+
+fn legacy_manifest_delta_finalize_sql(row_count: usize) -> String {
+    let state_cases = std::iter::repeat_n("WHEN ? THEN ?", row_count)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let error_cases = state_cases.clone();
+    let ids = std::iter::repeat_n("?", row_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "UPDATE scan_manifest_deltas
+         SET state = CASE id {state_cases} ELSE state END,
+             error = CASE id {error_cases} ELSE error END,
+             attempt_count = attempt_count + 1,
+             updated_at = unixepoch()
+         WHERE manifest_id = ? AND state = 'PENDING' AND id IN ({ids})"
+    )
+}
+
 #[test]
 #[ignore = "run explicitly to compare Manifest directory frontier SQL construction"]
 fn manifest_directory_frontier_sql_construction_benchmark() {
@@ -531,5 +600,81 @@ fn manifest_directory_frontier_sql_construction_benchmark() {
             elapsed,
             snapshot,
         );
+    }
+}
+
+#[test]
+#[ignore = "run explicitly to compare Manifest delta SQL construction"]
+fn manifest_delta_sql_construction_benchmark() {
+    let cache = SqlTemplateCache::default();
+    for (batch_name, row_count, iterations) in
+        [("full_batch", 100, 2_000), ("tail_batch", 17, 5_000)]
+    {
+        manifest_delta_verify_template(&cache, DatabaseBackend::Sqlite, row_count)
+            .expect("warm delta verify template");
+        manifest_delta_insert_template(&cache, DatabaseBackend::Sqlite, row_count)
+            .expect("warm delta insert template");
+        manifest_delta_finalize_template(&cache, DatabaseBackend::Sqlite, row_count)
+            .expect("warm delta finalizer template");
+
+        for (operation_name, legacy) in [
+            (
+                "verify",
+                legacy_manifest_delta_verify_sql as fn(usize) -> String,
+            ),
+            ("insert", legacy_manifest_delta_insert_sql),
+            ("finalize", legacy_manifest_delta_finalize_sql),
+        ] {
+            let (elapsed, snapshot) =
+                measure_operation(iterations, || legacy(row_count), || legacy(row_count));
+            report_allocation_case(
+                &format!("manifest_delta_{operation_name}_{batch_name}_dynamic"),
+                iterations,
+                elapsed,
+                snapshot,
+            );
+
+            let (elapsed, snapshot) = match operation_name {
+                "verify" => measure_operation(
+                    iterations,
+                    || {
+                        manifest_delta_verify_template(&cache, DatabaseBackend::Sqlite, row_count)
+                            .expect("cached delta verify template")
+                    },
+                    || {
+                        manifest_delta_verify_template(&cache, DatabaseBackend::Sqlite, row_count)
+                            .expect("cached delta verify template")
+                    },
+                ),
+                "insert" => measure_operation(
+                    iterations,
+                    || {
+                        manifest_delta_insert_template(&cache, DatabaseBackend::Sqlite, row_count)
+                            .expect("cached delta insert template")
+                    },
+                    || {
+                        manifest_delta_insert_template(&cache, DatabaseBackend::Sqlite, row_count)
+                            .expect("cached delta insert template")
+                    },
+                ),
+                _ => measure_operation(
+                    iterations,
+                    || {
+                        manifest_delta_finalize_template(&cache, DatabaseBackend::Sqlite, row_count)
+                            .expect("cached delta finalizer template")
+                    },
+                    || {
+                        manifest_delta_finalize_template(&cache, DatabaseBackend::Sqlite, row_count)
+                            .expect("cached delta finalizer template")
+                    },
+                ),
+            };
+            report_allocation_case(
+                &format!("manifest_delta_{operation_name}_{batch_name}_template_hit"),
+                iterations,
+                elapsed,
+                snapshot,
+            );
+        }
     }
 }

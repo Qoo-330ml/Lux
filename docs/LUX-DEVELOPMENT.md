@@ -12018,9 +12018,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 - [x] SQLite/PostgreSQL 模板覆盖 1/满批/尾批行数，绑定编号和顺序正确，同键复用缓存且缓存保持有界；超过现有 200 行批次上限时拒绝模板形状。
 - [x] SQLite 回归覆盖 201 个目录的跨批插入、冲突重放、完成状态及完成计数；查询次数与旧实现相同，lite mode 仍不写 frontier。
-- [ ] 记录满批与尾批 SQL 构造的动态基线/模板热命中 A/B；定向测试、格式、构建、Clippy 与完整门禁按实际结果记录。PostgreSQL 运行时验证留待 S7。
+- [x] 记录满批与尾批 SQL 构造的动态基线/模板热命中 A/B；定向测试、格式、构建、Clippy 与完整门禁按实际结果记录。PostgreSQL 运行时验证留待 S7。
 
 当前实现记录（2026-10-16）：定向模板测试 3/3、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。满批 200 行构造：INSERT 动态基线中位数 844 ns、3 次分配/7,996 B，模板热命中 23 ns、0 次分配；COMPLETE 更新基线 474 ns、3 次分配/4,234 B，模板 23 ns、0 次分配。尾批 17 行：INSERT 基线 177 ns、3 次分配/1,042 B，模板 24 ns、0 次分配；COMPLETE 基线 109 ns、3 次分配/757 B，模板 24 ns、0 次分配。五轮本机 arm64 release 数据仅代表 SQL 文本构造，不含 SQLx/SQLite 执行、扫描整链路或 NAS 性能。PostgreSQL 运行时和一次完整 all-targets 门禁统一留至 S7；本工作包期间启动的重复 all-targets 测试按用户要求中断，未形成新的全量结果。
+
+#### LUX-569：Manifest delta SQL 模板
+
+范围：缓存 delta 基线冲突校验 CTE、delta INSERT/RETURNING、finalizer state/error CASE 更新三个精确行数模板。沿用 100 行 chunk、同一 transaction、校验与冲突分类、ON CONFLICT DO NOTHING、RETURNING 计数、PENDING CAS、affected-row guard、attempt_count、参数顺序和批次边界；CASE SQL 不再通过克隆整段 `String` 生成第二份。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/diff/insert.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`src/storage/sql_templates.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite/PostgreSQL 模板覆盖首行、满批与尾批，绑定编号和顺序一致，缓存复用且尾部形状有界，超过 100 行拒绝模板。
+- [x] 现有 SQLite 回归覆盖 250 行跨批 delta、同值重放、冲突重试、malformed ADD；apply 覆盖 bounded batch、增量写入 CAS、失败回滚和 cancel/resume，attempt_count 与计数不变。
+- [x] 记录满批/尾批 SQL 构造 A/B 与定向测试、格式、构建、Clippy 的实际结果；完整门禁和 PostgreSQL 运行时验证留至 S7。
+
+结果（2026-10-16）：verify/INSERT/finalize 使用精确行数模板，fallback、bind 顺序和事务边界保持。模板单测 2/2、250 行 delta 幂等/冲突回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，full 100 行 2,000 次、tail 17 行 5,000 次）结果为平均单次构造时间：verify 满批动态 1,056 ns（3 alloc/6,364 B，另 1 realloc/4,932 B），模板命中 57 ns（0 alloc）；INSERT 满批 468 ns（3/4,822 B，另 2 realloc/8,409 B），模板 24 ns（0 alloc）；finalize 满批 878 ns（6/6,838 B，另 3 realloc/10,192 B），模板 24 ns（0 alloc）。尾批 verify 156 ns（3/3,127 B）→25 ns，INSERT 177 ns（3/1,336 B，另 1 realloc/1,248 B）→30 ns，finalize 565 ns（6/1,609 B，另 1 realloc/1,084 B）→45 ns，模板命中均 0 alloc。该 A/B 仅测 SQL 文本构造，不含数据库执行、扫描整链路或 NAS。完整 all-targets 与实际 PostgreSQL 运行时验证留至 S7。
 
 
 ## 29. 参考资料
