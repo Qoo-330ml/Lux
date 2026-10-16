@@ -1,6 +1,6 @@
 # 动态 SQL 构建与字符串分配优化设计
 
-日期：2026-10-16。状态：分步实施中；LUX-562 仅建立局部基线，尚未实施生产优化或确认性能收益。
+日期：2026-10-16。状态：分步实施中；LUX-562 基线和 LUX-563 查询入口已完成。LUX-563 的局部 SQL 构造/分配收益已测量，扫描整链路收益仍待后续工作包验证。
 
 基线：当前 `origin/test` 的 `e7107bfe`（LUX-562 开始时）。
 设计分支：`codex/dynamic-sql-optimization`。
@@ -199,8 +199,9 @@ SQLite CPU 包含在 Lux 进程内；PostgreSQL 还需单独记录数据库服�
 | --- | --- | --- | --- |
 | S0：基线（LUX-562） | 无；建立局部 SQL 构造/分配与单连接 statement-cache 基线 | `src/storage/sql_query_benchmarks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`、本文档 | 五轮 release 结果可复跑，数据/架构/缓存状态明确；本步不声称扫描整链路收益 |
 | S1：查询入口（LUX-563） | S0；SQLite SqlStr 直传，PostgreSQL 编号无临时 String；同步迁移调用与基准夹具 | `src/storage/repository.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | 静态/owned/Arc 地址保持测试先红后绿；PostgreSQL 引号与多位编号回归通过；记录优化前后局部基准 |
-| S2：模板基础 | S1；有限键、满批模板、单缓冲区构造 | `src/storage/sql_templates.rs`（新增，含单测）、`src/storage/repository.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | Arc 重用、绑定预算、并发和文本预算测试通过 |
-| S3：两类读取 | S2；filesystem/diff 的模板与 IN 分桶 A/B | `src/storage/filesystem.rs`、`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；无收益则保留精确模板 |
+| S2：模板基础（LUX-564） | S1；有限键、满批模板、单缓冲区构造 | `src/storage/sql_templates.rs`（新增，含单测）、`src/storage/mod.rs`、`src/storage/sql_query_benchmarks.rs`、`docs/LUX-DEVELOPMENT.md` | Arc 重用、绑定预算、并发和文本/条目预算测试通过 |
+| S3a：filesystem 路径读取 | S2；模板查询入口与 IN 分桶 A/B | `src/storage/filesystem.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；query counter 保持；无收益则保留精确模板 |
+| S3b：manifest 基线读取 | S2；模板查询入口与 IN 分桶 A/B | `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | 分桶两侧与跨批次结果一致；query counter 保持；无收益则保留精确模板 |
 | S4：发现路径与 presence | S2；精确 CTE 模板与局部 Cow | `src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | workflow/format 版本、完整成功/回读、重试计数均一致 |
 | S5a：目录 DML | S2；目录模板，不改批次/事务 | `src/storage/jobs/scan/manifest/discovery/frontier.rs`、`src/storage/sql_templates.rs`、`src/storage/jobs/tests.rs`、`docs/LUX-DEVELOPMENT.md` | 重放与完成计数保持一致 |
 | S5b：delta DML | S2；校验/插入/CASE 模板，删除片段 clone | `src/storage/jobs/scan/manifest/diff/insert.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md` | CAS、RETURNING、attempt_count、重试冲突均一致 |
@@ -252,7 +253,7 @@ S6 还应根据实际受影响的媒体/metadata helper 选择相关集成目标
 
 每个增量独立提交且不改变 schema，可按逆序回退。设计不需要新核心依赖、migration 或公共 API 修改；也不处理报告第一至第四、第六至第八点，不推送、合并或部署。
 
-LUX-562 仅建立局部 SQL 构造/分配与 SQLite statement-cache 基线，未更改生产查询。五轮数据、命令、普通构建/格式/Clippy 结果及全量 Rust 门禁的已复现基线失败记录在 `docs/PERFORMANCE.md` 和 `docs/LUX-DEVELOPMENT.md`。尚未测量扫描整链路或 NAS 性能，也未实施 S1 及后续优化。
+LUX-562 建立了局部 SQL 构造/分配与 SQLite statement-cache 基线。LUX-563 已移除 SQLite adapter 的静态/owned SQL 复制，并减少 PostgreSQL 占位符改写的分配；五轮数据与全量 Rust 门禁结果记录在 `docs/LUX-DEVELOPMENT.md`。尚未测量扫描整链路或 NAS 性能；S2–S7 仍待实施和验收。
 
 ## 8. 依据
 

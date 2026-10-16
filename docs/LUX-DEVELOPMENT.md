@@ -11941,6 +11941,20 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁记录（2026-10-16）：`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 931 passed、0 failed、23 ignored；随后在 `tests/scanned_metadata.rs` 为 21 passed、2 failed 并停止，后续 targets 未执行。`failed_local_poster_insert_does_not_mark_image_stage_complete` 隔离重跑仍为实际 2、预期 1，且已在干净 `e7107bfe` 基线复现（见 LUX-562）；并行失败的 `manifest_scan_indexes_poster_while_local_nfo_is_blocked` 隔离重跑通过。全量 Rust 测试门禁明确为非绿色。
 
+#### LUX-564：有限 SQL 模板缓存基础
+
+范围：建立 storage 内部、仅供受控查询族使用的完整 SQL 模板缓存。模板键固定包含有限查询族、后端、枚举版本与形状；缓存共享最终 SQL 的 `Arc<str>`，模板生成在单个 `String` 中完成并验证绑定预算。缓存有文本与条目双重上限，构造发生在缓存锁外，锁毒化时退回未缓存构造。此任务只实现缓存/构造器基础，不添加尚无调用者的 repository 查询入口，不改扫描查询调用点，不引入任意 SQL 字符串键、数据库 schema 或新依赖。
+
+预计文件（5 个）：`src/storage/sql_templates.rs`（新增并含单测）、`src/storage/mod.rs`、`src/storage/sql_query_benchmarks.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。首个专用 repository 查询入口在后续接入真实 filesystem 读取时一同实现。
+
+验收：
+
+- [ ] 非法/越界模板形状在构造前拒绝；SQLite 与 PostgreSQL 完整 SQL 文本及绑定编号正确；实际绑定数不匹配时拒绝发布。
+- [ ] 相同有限键重复/并发请求最终复用同一 `Arc<str>`；SQL 构造不在缓存锁内，毒化锁退回未缓存构造。
+- [ ] 文本预算不超过 8 MiB，缓存条目数有固定上限；超预算模板可用但不留存在缓存中。
+- [ ] 基准比较缓存命中和 SQL 构造成本；实际查询入口与 query counter 在后续工作包按调用点验收。
+- [ ] 定向单测、模板构造基准、格式、构建与 Clippy 有明确结果；本任务全量门禁按阶段记录既有失败，不称其为绿色。
+
 
 ## 29. 参考资料
 
