@@ -1,7 +1,10 @@
 use super::*;
 #[path = "commit_batches.rs"]
 mod commit_batches;
-use commit_batches::{ManifestDiscoveryTransactionBudget, split_pending_manifest_directory_chunks};
+use commit_batches::{
+    DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET, ManifestDiscoveryTransactionBudget,
+    split_pending_manifest_directory_chunks,
+};
 
 impl ScanJobService {
     pub(in crate::application::scanner) async fn discover_scan_manifest_directory_batches(
@@ -831,11 +834,11 @@ impl ScanJobService {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|limit| *limit > 0)
-                .unwrap_or(MANIFEST_STREAMED_INDEX_BATCH_SIZE)
+                .unwrap_or(DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET)
         }
         #[cfg(not(feature = "performance-benchmarks"))]
         {
-            MANIFEST_STREAMED_INDEX_BATCH_SIZE
+            DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET
         }
     }
 

@@ -1,6 +1,8 @@
 use super::PendingManifestDirectoryChunk;
 use std::collections::HashSet;
 
+pub(super) const DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET: usize = 8_000;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ManifestDiscoveryTransactionBudget {
     pub(super) max_entries: usize,
@@ -213,6 +215,18 @@ fn flush_batch(
 mod tests {
     use super::*;
     use crate::storage::NewScanManifestEntry;
+
+    #[test]
+    fn sqlite_transaction_budget_is_bounded_independently_from_reader() {
+        const {
+            assert!(DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET > 0);
+            assert!(
+                DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET
+                    <= super::super::MANIFEST_STREAMED_INDEX_BATCH_SIZE
+            );
+            assert!(super::super::MANIFEST_STREAMED_INDEX_BATCH_SIZE == 8_000);
+        }
+    }
 
     fn observation(relative_path: &str, entry_kind: &str) -> NewScanManifestEntry {
         NewScanManifestEntry {
