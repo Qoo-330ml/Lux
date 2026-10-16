@@ -11825,6 +11825,25 @@ ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 k
 
 验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
 
+#### LUX-562：SQLite Manifest discovery 按完整事务分片
+
+范围：在 application 层、基线读取和正向索引准备之前，将 SQLite 的 Pending Manifest directory chunks 按有界文件数、总 observation entries、child frontier 和 completed-directory 数分成有序微批次。每片独立执行完整 storage 事务；DIRECTORY observation 与对应 child frontier 同片，跨片目录的 `completed_directory` 只落在最后一片。每片重新读取数据库基线并执行现有文件/root/目录复核。PostgreSQL 保留现有聚合事务路径。
+
+预计文件（5 个）：`src/application/scanner/jobs/manifest_discovery.rs`、新建 `src/application/scanner/jobs/commit_batches.rs`、`src/application/scanner/tests.rs`、`tests/scanning_jobs.rs`、本文档。
+
+初始 SQLite 文件预算保持 8,000，与当前最大 streamed file budget 一致；测试 feature 可注入较小值以验证实际事务边界，不增加用户配置或持久化 schema。此任务不选择最终生产预算，也不修改 `<209 DML` 门槛。
+
+验收：
+
+- [x] 分片器覆盖空/单条/边界/超限/多倍输入，混合文件、子目录和 completion；顺序保留，每个 observation/frontier 恰好一次，且每片所有维度均不越预算。
+- [x] SQLite integration fixture 注入 256 文件预算后证明 1,025 个文件跨多个独立 root checkpoint 事务提交；父目录只在最后一片完成，索引、outbox source IDs 与计数无遗漏/重复。
+- [x] SQLite 默认预算保持 8,000；PostgreSQL 保留单一聚合批次路径；注入第二片错误后后续片停止，首片索引/outbox 保留且 completion 未提前写入。
+- [x] 分片在基线查询、positive preparation 和 identity recheck 之前；storage 的一次调用仍全成或全败。
+
+定向验证：`cargo test --locked --lib commit_batches`、`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks -- --exact`、`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_discovery_keeps_committed_slices_when_a_later_slice_fails -- --exact --ignored`，随后运行 `cargo test --locked --test scanning_jobs`。
+
+验收结果：分片器单测 3/3；256 文件预算的 1,025 文件成功与第二片故障注入测试均通过；默认构建下完整 `scanning_jobs` 目标串行运行 88/88 通过，覆盖 8,000 文件默认预算。结构检查确认 SQLite 每片都重新读取基线并进入原有完整 storage 事务，PostgreSQL 直接保留原批次；格式与 diff 检查通过。最终预算选择和 A/B 性能门留待 LUX-564。
+
 #### LUX-561：记录 Manifest 写事务体耗时与结果
 
 范围：为 Manifest discovery 写事务单独记录事务体时间，排除 `BEGIN IMMEDIATE` 获取写者资格和 `COMMIT` 时间；记录事务体成功/失败计数，不记录错误文本或业务标识。只增加观测，不改变事务边界、批次大小、存储语义或性能门槛。
