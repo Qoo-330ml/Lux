@@ -12036,6 +12036,20 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-16）：verify/INSERT/finalize 使用精确行数模板，fallback、bind 顺序和事务边界保持。模板单测 2/2、250 行 delta 幂等/冲突回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，full 100 行 2,000 次、tail 17 行 5,000 次）结果为平均单次构造时间：verify 满批动态 1,056 ns（3 alloc/6,364 B，另 1 realloc/4,932 B），模板命中 57 ns（0 alloc）；INSERT 满批 468 ns（3/4,822 B，另 2 realloc/8,409 B），模板 24 ns（0 alloc）；finalize 满批 878 ns（6/6,838 B，另 3 realloc/10,192 B），模板 24 ns（0 alloc）。尾批 verify 156 ns（3/3,127 B）→25 ns，INSERT 177 ns（3/1,336 B，另 1 realloc/1,248 B）→30 ns，finalize 565 ns（6/1,609 B，另 1 realloc/1,084 B）→45 ns，模板命中均 0 alloc。该 A/B 仅测 SQL 文本构造，不含数据库执行、扫描整链路或 NAS。完整 all-targets 与实际 PostgreSQL 运行时验证留至 S7。
 
+#### LUX-570：Manifest 正向索引借用媒体文件记录
+
+范围：已成功 claim 的 ADD 电影/剧集文件以 `&NewMovieFile` / `&NewEpisodeFile` 传入媒体物化与预取 helper，移除 `indexes.rs` 中整条文件记录的 `.clone()`。已有 owned-slice 调用方通过一次引用列表适配继续使用；不改变 claim 胜者、item/source 归并、层级关系、事务边界或公共 API。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/indexes.rs`、`src/storage/media.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] 正向索引只收集已 claim 的借用 Movie/Episode 记录；媒体 helper 内部消费引用列表，不复制文件记录中的 String 和 fingerprint Vec。
+- [x] SQLite 回归覆盖 claim 竞态、重复电影来源/文件夹与 provider ID 合并、剧集/季度/分集层级及默认来源选择。
+- [x] release 对比记录 clone 和引用列表的分配次数/字节；定向测试、格式、构建、Clippy 按实际结果记录。完整门禁与 PostgreSQL 运行时验证留至 S7。
+
+结果（2026-10-17）：正向索引直接传入 Movie/Episode 借用记录，原有 owned-slice helper 通过一次 `Vec<&File>` 轻量适配，业务 SQL、排序和事务行为不变。借用 Movie helper 1/1、借用 Episode hierarchy helper 1/1 通过。`tests/scanning_jobs.rs` 目标为 87 passed、1 failed；claim race、重复电影来源/provider ID、streamed positive index 等相关用例通过，唯一失败 `manifest_scan_queues_attachment_removal_only_after_root_confirmation` 报 SQLite `database is locked`。按用户要求未隔离重跑。`cargo build --locked`、fmt、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，256 records、100 次）中 Movie clone 为 73,408 ns、3,073 alloc/150,928 B；引用列表 70 ns、1 alloc/2,048 B。Episode clone 为 97,378 ns、3,841 alloc/204,660 B；引用列表 42 ns、1 alloc/2,048 B。测量只比较记录集合构造，不含 SQLite 或扫描整链路。完整 all-targets 与 PostgreSQL 运行时验证留至 S7。
+
 
 ## 29. 参考资料
 

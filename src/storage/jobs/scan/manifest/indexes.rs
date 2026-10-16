@@ -75,7 +75,7 @@ impl Database {
                 positive.delta_kind == "ADD" && claimed_add_paths.contains(&positive.relative_path)
             })
             .filter_map(|positive| match &positive.file {
-                NewScanManifestIndexedFile::Movie(file) => Some(file.clone()),
+                NewScanManifestIndexedFile::Movie(file) => Some(file),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -85,7 +85,7 @@ impl Database {
                 positive.delta_kind == "ADD" && claimed_add_paths.contains(&positive.relative_path)
             })
             .filter_map(|positive| match &positive.file {
-                NewScanManifestIndexedFile::Episode(file) => Some(file.clone()),
+                NewScanManifestIndexedFile::Episode(file) => Some(file),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -93,7 +93,7 @@ impl Database {
         let mut result = ManifestDiscoveryPositiveIndexResult::default();
         let movie_materialization_started = Instant::now();
         result.created_items = self
-            .insert_movie_files_without_filesystem_entries_in_transaction(
+            .insert_movie_files_without_filesystem_entries_refs_in_transaction(
                 transaction,
                 library_id,
                 library_root_id,
@@ -110,7 +110,7 @@ impl Database {
         );
         let episode_materialization_started = Instant::now();
         result.created_items = result.created_items.saturating_add(
-            self.insert_episode_files_without_filesystem_entries_in_transaction(
+            self.insert_episode_files_without_filesystem_entries_refs_in_transaction(
                 transaction,
                 library_id,
                 library_root_id,

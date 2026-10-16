@@ -1,4 +1,4 @@
-use super::{DatabaseBackend, adapt_sql_for_backend};
+use super::{DatabaseBackend, NewEpisodeFile, NewMovieFile, adapt_sql_for_backend};
 use crate::storage::sql_templates::{
     SqlTemplateCache, filesystem_entries_by_paths_template, manifest_delta_finalize_template,
     manifest_delta_insert_template, manifest_delta_verify_template,
@@ -515,6 +515,64 @@ fn legacy_manifest_delta_finalize_sql(row_count: usize) -> String {
     )
 }
 
+fn benchmark_movie_file(index: usize) -> NewMovieFile {
+    NewMovieFile {
+        filesystem_entry_id: format!("movie-entry-{index}"),
+        source_id: format!("movie-source-{index}"),
+        relative_path: format!("Movies/Title {index}/Title.{index}.mkv"),
+        size: i64::try_from(index).unwrap_or_default(),
+        modified_at: i64::try_from(index).unwrap_or_default(),
+        device: Some(1),
+        inode: Some(i64::try_from(index).unwrap_or_default()),
+        fingerprint: vec![0x5a; 32],
+        title: format!("Movie Title {index}"),
+        sort_title: format!("movie title {index}"),
+        original_title: format!("Original Movie Title {index}"),
+        production_year: Some(2000 + i64::try_from(index % 25).unwrap_or_default()),
+        provider_ids_json: Some(format!(r#"{{"tmdb":"{index}"}}"#)),
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: Some("Director's Cut".to_owned()),
+        quality_label: Some("1080p".to_owned()),
+        container: "mkv".to_owned(),
+        external_url: None,
+    }
+}
+
+fn benchmark_episode_file(index: usize) -> NewEpisodeFile {
+    let series_identity = format!("series:show-{index}");
+    let season_identity = format!("{}:season-1", series_identity);
+    let episode_identity = format!("{}:episode-{index}", season_identity);
+    NewEpisodeFile {
+        filesystem_entry_id: format!("episode-entry-{index}"),
+        source_id: format!("episode-source-{index}"),
+        relative_path: format!("Shows/Show {index}/Season 01/Show.S01E{index:02}.mkv"),
+        size: i64::try_from(index).unwrap_or_default(),
+        modified_at: i64::try_from(index).unwrap_or_default(),
+        device: Some(1),
+        inode: Some(i64::try_from(index).unwrap_or_default()),
+        fingerprint: vec![0x5a; 32],
+        series_identity,
+        series_title: format!("Show Title {index}"),
+        series_sort_title: format!("show title {index}"),
+        series_production_year: Some(2000 + i64::try_from(index % 25).unwrap_or_default()),
+        series_provider_ids_json: Some(format!(r#"{{"tvdb":"{index}"}}"#)),
+        season_identity,
+        season_number: 1,
+        episode_identity,
+        episode_title: format!("Episode Title {index}"),
+        episode_sort_title: format!("episode title {index}"),
+        episode_number: i64::try_from(index).unwrap_or_default(),
+        episode_absolute_number: None,
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: None,
+        quality_label: Some("1080p".to_owned()),
+        container: "mkv".to_owned(),
+        external_url: None,
+    }
+}
+
 #[test]
 #[ignore = "run explicitly to compare Manifest directory frontier SQL construction"]
 fn manifest_directory_frontier_sql_construction_benchmark() {
@@ -677,4 +735,45 @@ fn manifest_delta_sql_construction_benchmark() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "run explicitly to compare Manifest positive-index record ownership costs"]
+fn manifest_positive_file_reference_collection_benchmark() {
+    let iterations = 100;
+    let movies = (0..256).map(benchmark_movie_file).collect::<Vec<_>>();
+    let (elapsed, snapshot) = measure_operation(iterations, || movies.clone(), || movies.clone());
+    report_allocation_case("manifest_movie_record_clone", iterations, elapsed, snapshot);
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || movies.iter().collect::<Vec<_>>(),
+        || movies.iter().collect::<Vec<_>>(),
+    );
+    report_allocation_case(
+        "manifest_movie_record_borrow_refs",
+        iterations,
+        elapsed,
+        snapshot,
+    );
+
+    let episodes = (0..256).map(benchmark_episode_file).collect::<Vec<_>>();
+    let (elapsed, snapshot) =
+        measure_operation(iterations, || episodes.clone(), || episodes.clone());
+    report_allocation_case(
+        "manifest_episode_record_clone",
+        iterations,
+        elapsed,
+        snapshot,
+    );
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || episodes.iter().collect::<Vec<_>>(),
+        || episodes.iter().collect::<Vec<_>>(),
+    );
+    report_allocation_case(
+        "manifest_episode_record_borrow_refs",
+        iterations,
+        elapsed,
+        snapshot,
+    );
 }

@@ -12357,6 +12357,234 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
 }
 
 #[tokio::test]
+async fn manifest_movie_materialization_accepts_borrowed_records_and_reuses_item() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let files = [
+        NewMovieFile {
+            filesystem_entry_id: "borrowed-entry-1".to_owned(),
+            source_id: "borrowed-source-1".to_owned(),
+            relative_path: "Movie/Movie.2024.mkv".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![1],
+            title: "Movie".to_owned(),
+            sort_title: "movie".to_owned(),
+            original_title: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: None,
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: None,
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        },
+        NewMovieFile {
+            filesystem_entry_id: "borrowed-entry-2".to_owned(),
+            source_id: "borrowed-source-2".to_owned(),
+            relative_path: "Movie/Movie.2024.Directors.Cut.mkv".to_owned(),
+            size: 2,
+            modified_at: 2,
+            device: None,
+            inode: None,
+            fingerprint: vec![2],
+            title: "Movie".to_owned(),
+            sort_title: "movie".to_owned(),
+            original_title: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: Some(r#"{"tmdb":"1"}"#.to_owned()),
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: Some("Director's Cut".to_owned()),
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        },
+    ];
+    for file in &files {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+                 ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, 'generation', 'NEW', 0)",
+            )
+            .bind(&file.filesystem_entry_id)
+            .bind(&root_id)
+            .bind(&file.relative_path)
+            .bind(file.size)
+            .bind(file.modified_at)
+            .bind(&file.fingerprint)
+            .execute(database.pool())
+            .await
+            .expect("claimed filesystem entry");
+    }
+    let borrowed_files = files.iter().collect::<Vec<_>>();
+    let mut transaction = database
+        .begin_scan_write_transaction()
+        .await
+        .expect("transaction");
+    let created_items = database
+        .insert_movie_files_without_filesystem_entries_refs_in_transaction(
+            &mut transaction,
+            &library.id.to_string(),
+            &root_id,
+            "generation",
+            &borrowed_files,
+        )
+        .await
+        .expect("borrowed movie materialization");
+    transaction.commit().await.expect("commit");
+
+    assert_eq!(created_items, 1);
+    let counts: (i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT item.id), COUNT(source.id), SUM(source.is_default),
+                MAX(item.provider_ids_json)
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         WHERE item.item_type = 'MOVIE' AND item.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("materialized movie and sources");
+    assert_eq!(counts, (1, 2, 1, Some(r#"{"tmdb":"1"}"#.to_owned())));
+}
+
+#[tokio::test]
+async fn manifest_episode_materialization_accepts_borrowed_records_and_builds_hierarchy() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("shows");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("series root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 series root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let episode = NewEpisodeFile {
+        filesystem_entry_id: "borrowed-episode-entry".to_owned(),
+        source_id: "borrowed-episode-source".to_owned(),
+        relative_path: "Example Show/Season 01/Example.Show.S01E01.mkv".to_owned(),
+        size: 10,
+        modified_at: 1,
+        device: None,
+        inode: None,
+        fingerprint: vec![1, 2, 3],
+        series_identity: format!("series:{root_id}:Example Show"),
+        series_title: "Example Show".to_owned(),
+        series_sort_title: "example show".to_owned(),
+        series_production_year: Some(2024),
+        series_provider_ids_json: Some(r#"{"tvdb":"123"}"#.to_owned()),
+        season_identity: format!("series:{root_id}:Example Show:season:1"),
+        season_number: 1,
+        episode_identity: format!(
+            "episode:{root_id}:Example Show/Season 01/Example.Show.S01E01.mkv"
+        ),
+        episode_title: "Pilot".to_owned(),
+        episode_sort_title: "pilot".to_owned(),
+        episode_number: 1,
+        episode_absolute_number: None,
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: None,
+        quality_label: Some("1080p".to_owned()),
+        container: "mkv".to_owned(),
+        external_url: None,
+    };
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, 'generation', 'NEW', 0)",
+        )
+        .bind(&episode.filesystem_entry_id)
+        .bind(&root_id)
+        .bind(&episode.relative_path)
+        .bind(episode.size)
+        .bind(episode.modified_at)
+        .bind(&episode.fingerprint)
+        .execute(database.pool())
+        .await
+        .expect("claimed filesystem entry");
+
+    let borrowed_episodes = [&episode];
+    let mut transaction = database
+        .begin_scan_write_transaction()
+        .await
+        .expect("transaction");
+    let created_items = database
+        .insert_episode_files_without_filesystem_entries_refs_in_transaction(
+            &mut transaction,
+            &library.id.to_string(),
+            &root_id,
+            "generation",
+            &borrowed_episodes,
+        )
+        .await
+        .expect("borrowed episode materialization");
+    transaction.commit().await.expect("commit");
+
+    assert_eq!(created_items, 3);
+    let hierarchy_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT SUM(CASE WHEN item_type = 'SERIES' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN item_type = 'SEASON' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN item_type = 'EPISODE' THEN 1 ELSE 0 END)
+         FROM media_items WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("series hierarchy");
+    assert_eq!(hierarchy_counts, (1, 1, 1));
+    let default_sources: i64 = sqlx::query_scalar(
+        "SELECT SUM(source.is_default) FROM media_sources source
+         JOIN media_items episode ON episode.id = source.item_id
+         WHERE episode.library_id = ? AND episode.item_type = 'EPISODE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("default episode source");
+    assert_eq!(default_sources, 1);
+}
+
+#[tokio::test]
 async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
