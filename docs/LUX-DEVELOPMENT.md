@@ -11861,11 +11861,11 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
-#### LUX-561：多管线后台并发预算设计
+#### LUX-561：多管线后台并发预算
 
-范围：针对 CPU 热点分析第三点比较全局 Semaphore、管线互斥/优先级调度、共享有界线程池三种方案，核对当前扫描、probe、本地 NFO/图片及缩略图实现，形成完整优化设计。本轮只交付设计，不更改运行时、指纹格式、数据库或既有渐进扫描合同。
+范围：针对 CPU 热点分析第三点比较全局 Semaphore、管线互斥/优先级调度、共享有界线程池三种方案，并实现获批的进程级共享后台 CPU 预算。覆盖扫描准备与指纹、本地 NFO/图片计算、ffprobe 和缩略图 ffmpeg；不更改指纹格式、数据库或既有渐进扫描合同。
 
-预计文件（2 个）：`docs/SCAN-CPU-BUDGET-DESIGN.md`、本文档。
+设计文件（2 个）：`docs/SCAN-CPU-BUDGET-DESIGN.md`、本文档。运行时代码分为预算核心、扫描准备、外部进程、本地 metadata/图片及配置文档增量；精确路径与最窄测试见设计记录第 8 节。
 
 设计验收：
 
@@ -11873,11 +11873,18 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 - [x] 定义共享范围、候选容量、进程单例、局部并发叠加、取消/进程回收、防嵌套死锁、前台与 DB 等待隔离及固定指标。
 - [x] 给出有序小增量、预计文件、最窄 Rust target、SQLite/PostgreSQL A/B 与 CPU/吞吐/前台 p95 验收门。
 - [x] 项目所有者评审并批准设计（2026-10-16）；实现沿用同一个 LUX-561 逐步推进。
-- [ ] 运行时接入、混合负载基准和完整 Rust 完成门全部通过；性能门未通过前不能据局部 CPU 观测认定优化完成。
+- [x] 进程单例共享 semaphore、CPU/cgroup 自动容量及 `LUX_BACKGROUND_CPU_BUDGET` 配置。
+- [ ] Discovery、Manifest preparation、scanner fingerprint、本地 NFO/图片、probe 和 thumbnail 的后台重工作片段接入；前台 metadata 不获取预算。
+- [ ] blocking closure 与监督中的子进程在调用者取消后继续持有预算；超时路径确认子进程回收后才释放名额。
+- [x] 记录全局/分 stage 活动与等待峰值、p50/p95/max、取消等待、运行中取消和子进程清理中计数；采样有界且日志不带路径或环境变量原值。
+- [ ] 混合负载 SQLite/PostgreSQL A/B 与至少三轮交错测量；性能门通过前不声称 CPU 收益或默认值已由性能数据确认。
+- [ ] 完整 Rust 完成门全部通过。
 
 设计记录（2026-10-16）：基于 `test=1e7c2ea8` 在独立分支 `codex/lux-scan-cpu-budget` 完成[多管线并发预算设计](SCAN-CPU-BUDGET-DESIGN.md)。保留各管线现有边界与 ADR-046，新增共享预算作为重工作片段的准入层；候选默认随 CPU 容量推导，需经相同配置的交错 A/B 才能确认。文档引用文件、围栏配对、任务编号唯一性和 diff 空白检查通过。此次仅修改设计文档，未运行 Cargo 检查或性能基准，不声称 CPU、NAS 或生产收益。
 
-实施进度（2026-10-16）：预算核心已加入进程级异步单例、CPU/cgroup 容量推导与 `LUX_BACKGROUND_CPU_BUDGET` clamp；克隆预算跨 stage 共用 permit，统计并发峰值、等待和有界 p95 样本。先写的容量回归在旧实现上失败（4 核期望 3、实际 1）；实现后 `cargo test --locked --lib application::background_work::tests` 5/5 通过。Discovery、其它指纹准备、本地 metadata、外部进程监督、混合基准和完整 gate 尚未完成。
+初始实施进度（2026-10-16）：预算核心已加入进程级异步单例、CPU/cgroup 容量推导与 `LUX_BACKGROUND_CPU_BUDGET` clamp；克隆预算跨 stage 共用 permit，统计并发峰值、等待和有界 p95 样本。先写的容量回归在旧实现上失败（4 核期望 3、实际 1）；实现后 `cargo test --locked --lib application::background_work::tests` 5/5 通过。该记录反映当时 Discovery、指纹、本地 metadata、外部进程监督、混合基准和完整 gate 尚未完成的状态。
+
+当前实施进度（2026-10-16）：预算核心与全局指标已通过 9/9 定向单测；Discovery、Manifest preparation、scanner fingerprint、后台 metadata/图片和外部进程监督仍在集成验证中。混合负载 A/B 与完整 Rust 完成门尚待执行。
 
 ## 29. 参考资料
 
