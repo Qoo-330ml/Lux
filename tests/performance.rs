@@ -3467,6 +3467,390 @@ print('{"format":{"format_name":"matroska"},"streams":[]}', end="")
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with LUX_PROBE_BENCH_MODE and LUX_PROBE_BENCH_FILE_COUNT for the LUX-561 A/B gate"]
+async fn lux_561_probe_throughput_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let mode = env::var("LUX_PROBE_BENCH_MODE").unwrap_or_else(|_| "simulation".to_owned());
+    if !matches!(mode.as_str(), "simulation" | "real") {
+        return Err("LUX_PROBE_BENCH_MODE must be simulation or real".into());
+    }
+    let file_count = env::var("LUX_PROBE_BENCH_FILE_COUNT")
+        .unwrap_or_else(|_| (if mode == "real" { "512" } else { "4096" }).to_owned())
+        .parse::<usize>()?;
+    if !(1..=8192).contains(&file_count) {
+        return Err("LUX_PROBE_BENCH_FILE_COUNT must be between 1 and 8192".into());
+    }
+    let delay_ms = env::var("LUX_PROBE_BENCH_DELAY_MS")
+        .unwrap_or_else(|_| "75".to_owned())
+        .parse::<u64>()?;
+    if delay_ms > 250 {
+        return Err("LUX_PROBE_BENCH_DELAY_MS must be at most 250".into());
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("LUX-561 ffprobe benchmark", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let media_dir = media_root.join("Benchmark Movie (2024)");
+    tokio::fs::create_dir_all(&media_dir).await?;
+    // The scanner accepts .mkv; ffprobe detects this tiny AVI payload from its RIFF header.
+    let avi = avi_benchmark_fixture();
+    for index in 0..file_count {
+        tokio::fs::write(
+            media_dir.join(format!("Benchmark.Movie.{index:05}.2024.mkv")),
+            &avi,
+        )
+        .await?;
+    }
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 fixture path")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let state_dir = temp_dir.path().join("probe-benchmark-state");
+    fs::create_dir_all(&state_dir)?;
+    let runner = if mode == "simulation" {
+        let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+        fs::write(
+            &fake_ffprobe,
+            r##"#!/usr/bin/env python3
+import fcntl
+from pathlib import Path
+import os
+import resource
+import time
+
+state = Path(__file__).resolve().parent / "probe-benchmark-state"
+state.mkdir(parents=True, exist_ok=True)
+lock_path = state / "lock"
+current_path = state / "current"
+maximum_path = state / "maximum"
+duration_path = state / "durations"
+started = time.monotonic()
+
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = int(current_path.read_text()) + 1
+    except (FileNotFoundError, ValueError):
+        current = 1
+    current_path.write_text(str(current))
+    try:
+        maximum = int(maximum_path.read_text())
+    except (FileNotFoundError, ValueError):
+        maximum = 0
+    if current > maximum:
+        maximum_path.write_text(str(current))
+    fcntl.flock(lock, fcntl.LOCK_UN)
+
+time.sleep(int(os.environ.get("LUX_PROBE_BENCH_DELAY_MS", "75")) / 1000)
+print('{"format":{"format_name":"avi"},"streams":[]}', end="")
+
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    current = int(current_path.read_text())
+    current_path.write_text(str(current - 1))
+    with duration_path.open("a") as durations:
+        durations.write(f"{(time.monotonic() - started) * 1000:.3f}\n")
+    fcntl.flock(lock, fcntl.LOCK_UN)
+"##,
+        )?;
+        let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_ffprobe, permissions)?;
+        FfprobeRunner::new(&fake_ffprobe, Duration::from_secs(30))
+    } else {
+        let ffprobe_binary = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("ffprobe"))
+            .find(|path| path.is_file())
+            .ok_or("real mode requires ffprobe on PATH")?;
+        fs::write(
+            state_dir.join("real-ffprobe-path"),
+            ffprobe_binary.to_string_lossy().as_bytes(),
+        )?;
+        let tracked_ffprobe = temp_dir.path().join("tracked-ffprobe");
+        fs::write(
+            &tracked_ffprobe,
+            r##"#!/usr/bin/env python3
+import fcntl
+from pathlib import Path
+import resource
+import subprocess
+import sys
+import time
+
+state = Path(__file__).resolve().parent / "probe-benchmark-state"
+lock_path = state / "lock"
+current_path = state / "current"
+maximum_path = state / "maximum"
+duration_path = state / "durations"
+cpu_path = state / "ffprobe-child-cpu-micros"
+started = time.monotonic()
+
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = int(current_path.read_text()) + 1
+    except (FileNotFoundError, ValueError):
+        current = 1
+    current_path.write_text(str(current))
+    try:
+        maximum = int(maximum_path.read_text())
+    except (FileNotFoundError, ValueError):
+        maximum = 0
+    if current > maximum:
+        maximum_path.write_text(str(current))
+    fcntl.flock(lock, fcntl.LOCK_UN)
+
+before = resource.getrusage(resource.RUSAGE_CHILDREN)
+exit_code = 1
+try:
+    binary = (state / "real-ffprobe-path").read_text().strip()
+    result = subprocess.run([binary, *sys.argv[1:]], capture_output=True, check=False)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    exit_code = result.returncode
+finally:
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_micros = int(
+        ((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)) * 1_000_000
+    )
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = int(current_path.read_text())
+        current_path.write_text(str(current - 1))
+        with duration_path.open("a") as durations:
+            durations.write(f"{(time.monotonic() - started) * 1000:.3f}\n")
+        with cpu_path.open("a") as cpu_samples:
+            cpu_samples.write(f"{cpu_micros}\n")
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+sys.exit(exit_code)
+"##,
+        )?;
+        let mut permissions = fs::metadata(&tracked_ffprobe)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tracked_ffprobe, permissions)?;
+        FfprobeRunner::new(&tracked_ffprobe, Duration::from_secs(30))
+    };
+
+    let process_cpu_before = process_cpu_time_micros();
+    let child_cpu_before = child_cpu_time_micros();
+    let started = Instant::now();
+    let report = MediaProbeService::new(database, runner)
+        .probe_movie_library(library.id)
+        .await?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let child_cpu_after = child_cpu_time_micros();
+    let process_cpu_after = process_cpu_time_micros();
+    assert_eq!(report.ready, file_count);
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.timed_out, 0);
+    let observed_maximum = tokio::fs::read_to_string(state_dir.join("maximum"))
+        .await?
+        .trim()
+        .parse::<usize>()?;
+    let active_after_run = tokio::fs::read_to_string(state_dir.join("current"))
+        .await?
+        .trim()
+        .parse::<i64>()?;
+    let durations = tokio::fs::read_to_string(state_dir.join("durations")).await?;
+    let mut durations = durations
+        .lines()
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()?;
+    durations.sort_by(f64::total_cmp);
+    assert_eq!(durations.len(), file_count);
+    assert_eq!(active_after_run, 0, "all ffprobe processes should exit");
+    assert!(
+        observed_maximum > 0
+            && i64::try_from(observed_maximum)
+                .is_ok_and(|maximum| maximum <= library.probe_concurrency),
+        "observed activity must remain within the library budget"
+    );
+    let ffprobe_child_cpu_ms = if mode == "real" {
+        let values = tokio::fs::read_to_string(state_dir.join("ffprobe-child-cpu-micros"))
+            .await?
+            .lines()
+            .map(str::parse::<u128>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(values.len(), file_count);
+        Some(values.into_iter().sum::<u128>() / 1000)
+    } else {
+        None
+    };
+    let elapsed_seconds = elapsed_ms as f64 / 1000.0;
+    println!(
+        "LUX-561 FFPROBE RESULT {}",
+        serde_json::to_string(&json!({
+            "revision": luxd::COMMIT,
+            "architecture": std::env::consts::ARCH,
+            "mode": mode.as_str(),
+            "fileCount": file_count,
+            "simulatedIoDelayMs": if mode == "simulation" { Some(delay_ms) } else { None },
+            "availableParallelism": std::thread::available_parallelism().ok().map(usize::from),
+            "libraryProbeConcurrency": library.probe_concurrency,
+            "processOverride": env::var("LUX_PROBE_CONCURRENCY").ok(),
+            "observedMaximum": observed_maximum,
+            "activeAfterRun": active_after_run,
+            "elapsedMs": elapsed_ms,
+            "itemsPerSecond": file_count as f64 / elapsed_seconds,
+            "runnerP50Ms": percentile_f64(&durations, 50),
+            "runnerP95Ms": percentile_f64(&durations, 95),
+            "processCpuMs": process_cpu_before.zip(process_cpu_after).and_then(|(before, after)| after.checked_sub(before)).map(|micros| micros / 1000),
+            "childProcessCpuMs": child_cpu_before.zip(child_cpu_after).and_then(|(before, after)| after.checked_sub(before)).map(|micros| micros / 1000),
+            "ffprobeChildCpuMs": ffprobe_child_cpu_ms,
+            "benchmarkHarnessPeakRssBytes": process_peak_rss_bytes(),
+            "ready": report.ready,
+            "failed": report.failed,
+            "timedOut": report.timed_out,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn percentile_f64(values: &[f64], percentile: usize) -> Option<f64> {
+    if values.is_empty() || !(1..=100).contains(&percentile) {
+        return None;
+    }
+    let rank = values.len().saturating_mul(percentile).div_ceil(100);
+    values.get(rank.saturating_sub(1)).copied()
+}
+
+#[cfg(unix)]
+fn avi_benchmark_fixture() -> Vec<u8> {
+    fn chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(8 + data.len() + (data.len() & 1));
+        output.extend_from_slice(tag);
+        output.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        output.extend_from_slice(data);
+        if data.len() & 1 != 0 {
+            output.push(0);
+        }
+        output
+    }
+
+    fn list_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + data.len());
+        payload.extend_from_slice(kind);
+        payload.extend_from_slice(data);
+        chunk(b"LIST", &payload)
+    }
+
+    const WIDTH: i32 = 2;
+    const HEIGHT: i32 = 2;
+    let frame = [0_u8; 16];
+    let mut avih = Vec::with_capacity(56);
+    for value in [
+        40_000_u32,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        frame.len() as u32,
+        WIDTH as u32,
+        HEIGHT as u32,
+        0,
+        0,
+        0,
+        0,
+    ] {
+        avih.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let mut strh = Vec::with_capacity(56);
+    strh.extend_from_slice(b"vidsDIB ");
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    for value in [0_u32, 1, 25, 0, 1, frame.len() as u32, u32::MAX, 0] {
+        strh.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [0_i16, 0, WIDTH as i16, HEIGHT as i16] {
+        strh.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let mut strf = Vec::with_capacity(40);
+    strf.extend_from_slice(&40_u32.to_le_bytes());
+    strf.extend_from_slice(&WIDTH.to_le_bytes());
+    strf.extend_from_slice(&HEIGHT.to_le_bytes());
+    strf.extend_from_slice(&1_u16.to_le_bytes());
+    strf.extend_from_slice(&24_u16.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+    strf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    strf.extend_from_slice(&0_i32.to_le_bytes());
+    strf.extend_from_slice(&0_i32.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+
+    let strl = list_chunk(
+        b"strl",
+        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+    );
+    let hdrl = list_chunk(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
+    let movi = list_chunk(b"movi", &chunk(b"00db", &frame));
+    let body = [b"AVI ".as_slice(), hdrl.as_slice(), movi.as_slice()].concat();
+    let mut avi = Vec::with_capacity(8 + body.len());
+    avi.extend_from_slice(b"RIFF");
+    avi.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    avi.extend_from_slice(&body);
+    avi
+}
+
+#[cfg(unix)]
+fn process_cpu_time_micros() -> Option<u128> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the provided structure on success.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: result == 0 proves getrusage initialized usage.
+    let usage = unsafe { usage.assume_init() };
+    let user = timeval_micros(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec)?;
+    let system = timeval_micros(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec)?;
+    user.checked_add(system)
+}
+
+#[cfg(unix)]
+fn child_cpu_time_micros() -> Option<u128> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the provided structure on success.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: result == 0 proves getrusage initialized usage.
+    let usage = unsafe { usage.assume_init() };
+    let user = timeval_micros(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec)?;
+    let system = timeval_micros(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec)?;
+    user.checked_add(system)
+}
+
+#[cfg(unix)]
+fn timeval_micros(seconds: libc::time_t, microseconds: libc::suseconds_t) -> Option<u128> {
+    u128::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(u128::try_from(microseconds).ok()?)
+}
+
 #[cfg(feature = "performance-benchmarks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "run with scripts/run-metadata-performance.sh for the LUX-531 concurrency sweep"]
