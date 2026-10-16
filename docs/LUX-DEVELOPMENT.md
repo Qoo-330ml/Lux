@@ -12008,6 +12008,20 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁记录（2026-10-16）：manifest SQL 模板单测 4/4、presence repository 回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 中 lib target 为 948 passed、0 failed、23 ignored，`libraries_api` 为 14/14，`probe` 为 21/21；随后 `tests/scanned_metadata.rs` 有 22 passed、1 failed，失败为 `failed_local_poster_insert_does_not_mark_image_stage_complete`。在未包含 LUX-567 的基线提交 `3b4b7325` 上串行重跑该 target，同一用例以相同断言失败（22/23），确认该失败先于本任务存在。当前分支串行 target 另有一次 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound`，该用例隔离重跑通过，基线串行 target 也通过。完整 all-targets 门禁仍为非绿色；PostgreSQL 运行时验证留待 S7。
 
+#### LUX-568：Manifest 目录 frontier SQL 模板
+
+范围：缓存 `insert_manifest_directory_frontier` 的精确行数 `VALUES` 模板，以及 `complete_manifest_directory_frontier` 的精确行数 `IN` 更新模板。沿用 `SCAN_DML_CHUNK_SIZE`、lite mode 早退、冲突忽略、`state <> 'COMPLETE'`、固定参数和绑定顺序、原 transaction 与 rows-affected 计数；不补假行、不增加查询、不调整批次或事务。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/discovery/frontier.rs`、`src/storage/sql_templates.rs`、`src/storage/jobs/tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite/PostgreSQL 模板覆盖 1/满批/尾批行数，绑定编号和顺序正确，同键复用缓存且缓存保持有界；超过现有 200 行批次上限时拒绝模板形状。
+- [x] SQLite 回归覆盖 201 个目录的跨批插入、冲突重放、完成状态及完成计数；查询次数与旧实现相同，lite mode 仍不写 frontier。
+- [ ] 记录满批与尾批 SQL 构造的动态基线/模板热命中 A/B；定向测试、格式、构建、Clippy 与完整门禁按实际结果记录。PostgreSQL 运行时验证留待 S7。
+
+当前实现记录（2026-10-16）：定向模板测试 3/3、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。满批 200 行构造：INSERT 动态基线中位数 844 ns、3 次分配/7,996 B，模板热命中 23 ns、0 次分配；COMPLETE 更新基线 474 ns、3 次分配/4,234 B，模板 23 ns、0 次分配。尾批 17 行：INSERT 基线 177 ns、3 次分配/1,042 B，模板 24 ns、0 次分配；COMPLETE 基线 109 ns、3 次分配/757 B，模板 24 ns、0 次分配。五轮本机 arm64 release 数据仅代表 SQL 文本构造，不含 SQLx/SQLite 执行、扫描整链路或 NAS 性能。PostgreSQL 运行时和一次完整 all-targets 门禁统一留至 S7；本工作包期间启动的重复 all-targets 测试按用户要求中断，未形成新的全量结果。
+
 
 ## 29. 参考资料
 

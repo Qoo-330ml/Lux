@@ -1,5 +1,8 @@
 use super::{DatabaseBackend, adapt_sql_for_backend};
-use crate::storage::sql_templates::{SqlTemplateCache, filesystem_entries_by_paths_template};
+use crate::storage::sql_templates::{
+    SqlTemplateCache, filesystem_entries_by_paths_template,
+    manifest_directory_frontier_complete_template, manifest_directory_frontier_insert_template,
+};
 use sqlx::{Connection, SqliteConnection, sqlite::SqlitePoolOptions};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -417,4 +420,116 @@ async fn dynamic_sql_allocation_baseline() -> Result<(), Box<dyn std::error::Err
     drop(connection);
     pool.close().await;
     Ok(())
+}
+
+fn legacy_manifest_frontier_insert_sql(row_count: usize) -> String {
+    let values = std::iter::repeat_n("(?, ?, ?, 'PENDING')", row_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO scan_manifest_directories (
+             manifest_id, library_root_id, relative_path, state
+         ) VALUES {values}
+         ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+    )
+}
+
+fn legacy_manifest_frontier_complete_sql(row_count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", row_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "UPDATE scan_manifest_directories
+         SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
+         WHERE manifest_id = ? AND library_root_id = ? AND state <> 'COMPLETE'
+           AND relative_path IN ({placeholders})"
+    )
+}
+
+#[test]
+#[ignore = "run explicitly to compare Manifest directory frontier SQL construction"]
+fn manifest_directory_frontier_sql_construction_benchmark() {
+    let cache = SqlTemplateCache::default();
+    for (batch_name, row_count, iterations) in
+        [("full_batch", 200, 2_000), ("tail_batch", 17, 5_000)]
+    {
+        manifest_directory_frontier_insert_template(&cache, DatabaseBackend::Sqlite, row_count)
+            .expect("warm directory insert template");
+        manifest_directory_frontier_complete_template(&cache, DatabaseBackend::Sqlite, row_count)
+            .expect("warm directory completion template");
+
+        let (elapsed, snapshot) = measure_operation(
+            iterations,
+            || legacy_manifest_frontier_insert_sql(row_count),
+            || legacy_manifest_frontier_insert_sql(row_count),
+        );
+        report_allocation_case(
+            &format!("manifest_directory_insert_{batch_name}_dynamic"),
+            iterations,
+            elapsed,
+            snapshot,
+        );
+        let (elapsed, snapshot) = measure_operation(
+            iterations,
+            || {
+                manifest_directory_frontier_insert_template(
+                    &cache,
+                    DatabaseBackend::Sqlite,
+                    row_count,
+                )
+                .expect("cached directory insert template")
+            },
+            || {
+                manifest_directory_frontier_insert_template(
+                    &cache,
+                    DatabaseBackend::Sqlite,
+                    row_count,
+                )
+                .expect("cached directory insert template")
+            },
+        );
+        report_allocation_case(
+            &format!("manifest_directory_insert_{batch_name}_template_hit"),
+            iterations,
+            elapsed,
+            snapshot,
+        );
+
+        let (elapsed, snapshot) = measure_operation(
+            iterations,
+            || legacy_manifest_frontier_complete_sql(row_count),
+            || legacy_manifest_frontier_complete_sql(row_count),
+        );
+        report_allocation_case(
+            &format!("manifest_directory_complete_{batch_name}_dynamic"),
+            iterations,
+            elapsed,
+            snapshot,
+        );
+        let (elapsed, snapshot) = measure_operation(
+            iterations,
+            || {
+                manifest_directory_frontier_complete_template(
+                    &cache,
+                    DatabaseBackend::Sqlite,
+                    row_count,
+                )
+                .expect("cached directory completion template")
+            },
+            || {
+                manifest_directory_frontier_complete_template(
+                    &cache,
+                    DatabaseBackend::Sqlite,
+                    row_count,
+                )
+                .expect("cached directory completion template")
+            },
+        );
+        report_allocation_case(
+            &format!("manifest_directory_complete_{batch_name}_template_hit"),
+            iterations,
+            elapsed,
+            snapshot,
+        );
+    }
 }

@@ -34,6 +34,8 @@ enum TemplateFamily {
     ManifestPresenceUpdate,
     ManifestPresenceReadback,
     ManifestSeenPathsInsert,
+    ManifestDirectoryFrontierInsert,
+    ManifestDirectoryFrontierComplete,
 }
 
 impl TemplateFamily {
@@ -47,7 +49,9 @@ impl TemplateFamily {
             Self::ManifestDiscoveryKnownPaths
             | Self::ManifestPresenceUpdate
             | Self::ManifestPresenceReadback
-            | Self::ManifestSeenPathsInsert => None,
+            | Self::ManifestSeenPathsInsert
+            | Self::ManifestDirectoryFrontierInsert
+            | Self::ManifestDirectoryFrontierComplete => None,
         }
     }
 
@@ -58,6 +62,8 @@ impl TemplateFamily {
             }
             Self::ManifestPresenceReadback => Some((manifest_path_max_rows(backend), 3, 2)),
             Self::ManifestPresenceUpdate => Some((manifest_path_max_rows(backend), 7, 2)),
+            Self::ManifestDirectoryFrontierInsert => Some((200, 3, 0)),
+            Self::ManifestDirectoryFrontierComplete => Some((200, 1, 2)),
             Self::FilesystemEntries
             | Self::FilesystemEntryRecords
             | Self::ManifestFilesystemBaselines => None,
@@ -667,6 +673,74 @@ pub(crate) fn manifest_seen_paths_insert_template(
     })
 }
 
+pub(crate) fn manifest_directory_frontier_insert_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestDirectoryFrontierInsert,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static(
+            "INSERT INTO scan_manifest_directories (manifest_id, library_root_id, relative_path, state) VALUES ",
+        );
+        for row in 0..rows {
+            if row > 0 {
+                builder.push_static(", ");
+            }
+            builder.push_static("(");
+            builder.push_bind()?;
+            builder.push_static(", ");
+            builder.push_bind()?;
+            builder.push_static(", ");
+            builder.push_bind()?;
+            builder.push_static(", 'PENDING')");
+        }
+        builder.push_static(
+            " ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING",
+        );
+        Ok(())
+    })
+}
+
+pub(crate) fn manifest_directory_frontier_complete_template(
+    cache: &SqlTemplateCache,
+    backend: DatabaseBackend,
+    row_count: usize,
+) -> Result<Arc<str>, TemplateError> {
+    let key = exact_rows_key(
+        TemplateFamily::ManifestDirectoryFrontierComplete,
+        backend,
+        TemplateVersion::V1,
+        row_count,
+    )?;
+    cache.get_or_build(key, |builder| {
+        let rows = key.exact_rows().ok_or(TemplateError::InvalidShape)?;
+        builder.push_static(
+            "UPDATE scan_manifest_directories SET state = 'COMPLETE', error = NULL, updated_at = unixepoch() WHERE manifest_id = ",
+        );
+        builder.push_bind()?;
+        builder.push_static(" AND library_root_id = ");
+        builder.push_bind()?;
+        builder.push_static(
+            " AND state <> 'COMPLETE' AND relative_path IN (",
+        );
+        for row in 0..rows {
+            if row > 0 {
+                builder.push_static(", ");
+            }
+            builder.push_bind()?;
+        }
+        builder.push_static(")");
+        Ok(())
+    })
+}
+
 pub(crate) fn filesystem_entries_by_paths_capacity(
     backend: DatabaseBackend,
     path_count: usize,
@@ -1239,6 +1313,92 @@ mod tests {
         let state = tail_cache.state.lock().expect("exact-row cache state");
         assert!(state.entries.contains_key(&full_key));
         assert!(!state.entries.contains_key(&evicted_tail_key));
+    }
+
+    #[test]
+    fn manifest_directory_frontier_templates_preserve_sql_and_bind_order() {
+        let cache = SqlTemplateCache::default();
+        let sqlite_insert =
+            manifest_directory_frontier_insert_template(&cache, DatabaseBackend::Sqlite, 2)
+                .expect("SQLite directory insert template");
+        assert_eq!(
+            sqlite_insert.as_ref(),
+            "INSERT INTO scan_manifest_directories (manifest_id, library_root_id, relative_path, state) VALUES (?, ?, ?, 'PENDING'), (?, ?, ?, 'PENDING') ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+        );
+
+        let postgres_insert =
+            manifest_directory_frontier_insert_template(&cache, DatabaseBackend::Postgres, 2)
+                .expect("PostgreSQL directory insert template");
+        assert!(postgres_insert.ends_with(
+            "VALUES ($1, $2, $3, 'PENDING'), ($4, $5, $6, 'PENDING') ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+        ));
+
+        let sqlite_complete =
+            manifest_directory_frontier_complete_template(&cache, DatabaseBackend::Sqlite, 3)
+                .expect("SQLite directory completion template");
+        assert_eq!(
+            sqlite_complete.as_ref(),
+            "UPDATE scan_manifest_directories SET state = 'COMPLETE', error = NULL, updated_at = unixepoch() WHERE manifest_id = ? AND library_root_id = ? AND state <> 'COMPLETE' AND relative_path IN (?, ?, ?)"
+        );
+
+        let postgres_complete =
+            manifest_directory_frontier_complete_template(&cache, DatabaseBackend::Postgres, 3)
+                .expect("PostgreSQL directory completion template");
+        assert!(postgres_complete.ends_with(
+            "WHERE manifest_id = $1 AND library_root_id = $2 AND state <> 'COMPLETE' AND relative_path IN ($3, $4, $5)"
+        ));
+        assert!(Arc::ptr_eq(
+            &postgres_complete,
+            &manifest_directory_frontier_complete_template(&cache, DatabaseBackend::Postgres, 3,)
+                .expect("reused PostgreSQL directory completion template")
+        ));
+        assert_eq!(cache.entry_count(), 4);
+    }
+
+    #[test]
+    fn manifest_directory_frontier_templates_enforce_exact_batch_bounds() {
+        let cache = SqlTemplateCache::default();
+        assert_eq!(
+            manifest_directory_frontier_insert_template(&cache, DatabaseBackend::Sqlite, 1)
+                .expect("SQLite single-directory insert")
+                .as_ref(),
+            "INSERT INTO scan_manifest_directories (manifest_id, library_root_id, relative_path, state) VALUES (?, ?, ?, 'PENDING') ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+        );
+        assert_eq!(
+            manifest_directory_frontier_complete_template(&cache, DatabaseBackend::Postgres, 1)
+                .expect("PostgreSQL single-directory completion")
+                .as_ref(),
+            "UPDATE scan_manifest_directories SET state = 'COMPLETE', error = NULL, updated_at = unixepoch() WHERE manifest_id = $1 AND library_root_id = $2 AND state <> 'COMPLETE' AND relative_path IN ($3)"
+        );
+        let sqlite_insert =
+            manifest_directory_frontier_insert_template(&cache, DatabaseBackend::Sqlite, 200)
+                .expect("SQLite maximum directory insert batch");
+        assert_eq!(sqlite_insert.matches('?').count(), 600);
+        let postgres_complete =
+            manifest_directory_frontier_complete_template(&cache, DatabaseBackend::Postgres, 200)
+                .expect("PostgreSQL maximum directory completion batch");
+        assert_eq!(postgres_complete.matches('$').count(), 202);
+        assert!(postgres_complete.contains("relative_path IN ($3, $4, $5, $6, $7, $8"));
+        assert!(postgres_complete.contains("$201, $202)"));
+
+        for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+            assert_eq!(
+                manifest_directory_frontier_insert_template(&cache, backend, 0),
+                Err(TemplateError::InvalidShape)
+            );
+            assert_eq!(
+                manifest_directory_frontier_insert_template(&cache, backend, 201),
+                Err(TemplateError::InvalidShape)
+            );
+            assert_eq!(
+                manifest_directory_frontier_complete_template(&cache, backend, 0),
+                Err(TemplateError::InvalidShape)
+            );
+            assert_eq!(
+                manifest_directory_frontier_complete_template(&cache, backend, 201),
+                Err(TemplateError::InvalidShape)
+            );
+        }
     }
 
     #[test]
