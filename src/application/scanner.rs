@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         admin_events::{AdminEventHub, UserEventHub},
+        background_work::{BackgroundWorkStage, run_process_background_blocking},
         candidates::MetadataSelectionService,
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
@@ -361,6 +362,25 @@ pub fn compute_scan_fingerprint_v2(
     fingerprint
 }
 
+pub(super) async fn budgeted_file_fingerprint(
+    path: &Path,
+    relative_path: String,
+    size: i64,
+    modified_at: i64,
+    device: Option<u64>,
+    inode: Option<u64>,
+) -> Result<Vec<u8>, ScannerError> {
+    let display_path = path.to_owned();
+    run_process_background_blocking(BackgroundWorkStage::Fingerprint, move || {
+        compute_scan_fingerprint_v2(&relative_path, size, modified_at, device, inode)
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path,
+        source: std::io::Error::other(source.to_string()),
+    })
+}
+
 pub(crate) fn is_supported_scan_fingerprint(fingerprint: &[u8]) -> bool {
     fingerprint.len() == 32
         || fingerprint.len() == SCAN_FINGERPRINT_V2_PREFIX.len() + 16
@@ -502,16 +522,6 @@ struct CurrentFileObservation {
 }
 
 impl CurrentFileObservation {
-    fn fingerprint_v2(&self) -> Vec<u8> {
-        compute_scan_fingerprint_v2(
-            &self.relative_path,
-            self.size,
-            self.modified_at,
-            self.device,
-            self.inode,
-        )
-    }
-
     fn matches(&self, baseline: &crate::storage::StoredFilesystemEntry) -> bool {
         scan_fingerprint_matches_observation(
             baseline,

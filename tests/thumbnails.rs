@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use luxd::{
     application::{
@@ -11,6 +11,7 @@ use luxd::{
     config::Config,
     library::LibraryKind,
     observability::logs::LogStore,
+    observability::resources::ResourceMetrics,
     storage::Database,
 };
 use uuid::Uuid;
@@ -20,6 +21,26 @@ fn config(root: &Path) -> Config {
         http_addr: "127.0.0.1:8097".parse().expect("test address is valid"),
         config_dir: root.join("config"),
     }
+}
+
+async fn expected_background_cpu_budget() -> usize {
+    if let Ok(value) = env::var("LUX_BACKGROUND_CPU_BUDGET")
+        && !value.trim().is_empty()
+        && let Ok(parsed) = value.trim().parse::<usize>()
+    {
+        return parsed.clamp(1, 32);
+    }
+    let visible_parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let cgroup_limit = ResourceMetrics::new()
+        .cpu_limit_cores()
+        .await
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let cpu_capacity = cgroup_limit.map_or(visible_parallelism, |limit| {
+        visible_parallelism.min(limit.floor().max(1.0) as usize)
+    });
+    cpu_capacity.saturating_sub(1).clamp(1, 16)
 }
 
 fn fake_ffmpeg(
@@ -110,6 +131,89 @@ async fn missing_poster_and_thumbnail_use_one_ffmpeg_invocation()
     assert!(log.contains("-filter_complex"), "ffmpeg log:\n{log}");
     assert!(log.contains("scale=600:900"), "ffmpeg log:\n{log}");
     assert!(log.contains("scale=1280:720"), "ffmpeg log:\n{log}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_thumbnail_caller_kills_ffmpeg_and_cleans_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Cancelled Render (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Cancelled.Render.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan.id, 100, None).await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nfor argument in \"$@\"; do case \"$argument\" in *.jpg) printf 'partial' > \"$argument\";; esac; done\ntouch \"$0.started\"\nwhile [ ! -f \"$0.release\" ]; do :; done\ntouch \"$0.finished\"\n",
+    )?;
+    let mut permissions = fs::metadata(&fake)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions)?;
+    let marker = |suffix: &str| {
+        let mut path = fake.as_os_str().to_owned();
+        path.push(format!(".{suffix}"));
+        std::path::PathBuf::from(path)
+    };
+    let thumbnails = ThumbnailService::with_runner(database, fake.clone(), Duration::from_secs(10));
+    let caller = tokio::spawn(async move { thumbnails.generate_library(library.id).await });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !tokio::fs::try_exists(marker("started"))
+            .await
+            .unwrap_or(false)
+            || !movie_dir
+                .read_dir()
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(".lux-") && name.ends_with(".tmp.jpg")
+                })
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fake ffmpeg started");
+    caller.abort();
+    let _ = caller.await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let has_temporary_output = fs::read_dir(&movie_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(".lux-") && name.ends_with(".tmp.jpg")
+                });
+            if !has_temporary_output {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervised ffmpeg is reaped and its temporary output removed");
+    assert!(!tokio::fs::try_exists(marker("finished")).await?);
     Ok(())
 }
 
@@ -980,6 +1084,7 @@ async fn ffmpeg_failure_does_not_fail_the_completed_scan() -> Result<(), Box<dyn
 #[tokio::test]
 async fn thumbnail_workers_run_ffmpeg_concurrently_with_a_global_bound()
 -> Result<(), Box<dyn std::error::Error>> {
+    let expected_background_budget = expected_background_cpu_budget().await;
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&config(temp_dir.path())).await?;
     let libraries = LibraryService::new(database.clone());
@@ -1037,10 +1142,14 @@ done
     )?
     .trim()
     .parse::<usize>()?;
-    assert!(
-        maximum >= 2,
-        "expected overlapping ffmpeg processes, saw {maximum}"
-    );
+    if expected_background_budget == 1 {
+        assert_eq!(maximum, 1, "the global CPU budget serializes ffmpeg work");
+    } else {
+        assert!(
+            maximum >= 2 && maximum <= expected_background_budget,
+            "expected 2..={expected_background_budget} overlapping ffmpeg processes, saw {maximum}"
+        );
+    }
     assert!(
         maximum <= 4,
         "thumbnail ffmpeg peak exceeded the default bound"

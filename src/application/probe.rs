@@ -13,12 +13,16 @@ use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::{Mutex as AsyncMutex, OnceCell, Semaphore},
+    sync::{Mutex as AsyncMutex, OnceCell, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
 };
 
 use crate::{
+    application::background_work::{
+        BackgroundWorkCancellation, BackgroundWorkStage, process_background_child_cleanup_pending,
+        run_process_background_supervised,
+    },
     application::nfo::{NfoWriteError, NfoWriteService},
     application::plugin_protocol::{MediaProbeRpcResult, MediaProbeRpcStreamType},
     config::{MAX_PROBE_CONCURRENCY, probe_concurrency_override_from_env},
@@ -739,6 +743,40 @@ impl FfprobeRunner {
     }
 
     pub async fn probe_path(&self, path: &Path) -> Result<MediaProbeResult, ProbeError> {
+        self.probe_path_supervised(path.to_owned(), None).await
+    }
+
+    async fn probe_path_with_slot(
+        &self,
+        path: &Path,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<MediaProbeResult, ProbeError> {
+        self.probe_path_supervised(path.to_owned(), Some(slot))
+            .await
+    }
+
+    async fn probe_path_supervised(
+        &self,
+        path: PathBuf,
+        slot: Option<OwnedSemaphorePermit>,
+    ) -> Result<MediaProbeResult, ProbeError> {
+        let runner = self.clone();
+        run_process_background_supervised(
+            BackgroundWorkStage::Probe,
+            move |mut cancellation| async move {
+                let _slot = slot;
+                runner.run_probe_path(&path, &mut cancellation).await
+            },
+        )
+        .await
+        .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?
+    }
+
+    async fn run_probe_path(
+        &self,
+        path: &Path,
+        cancellation: &mut BackgroundWorkCancellation,
+    ) -> Result<MediaProbeResult, ProbeError> {
         let mut child = Command::new(&self.binary)
             .args([
                 "-v",
@@ -754,15 +792,22 @@ impl FfprobeRunner {
             .kill_on_drop(true)
             .spawn()
             .map_err(ProbeError::Io)?;
-        let output = match timeout(self.timeout, collect_process_output(&mut child)).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
+        let output = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
                 terminate_child(&mut child).await;
-                return Err(error);
+                return Err(ProbeError::Cancelled);
             }
-            Err(_) => {
-                terminate_child(&mut child).await;
-                return Err(ProbeError::Timeout);
+            result = timeout(self.timeout, collect_process_output(&mut child)) => match result {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    terminate_child(&mut child).await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    terminate_child(&mut child).await;
+                    return Err(ProbeError::Timeout);
+                }
             }
         };
         if !output.status.success() {
@@ -784,6 +829,7 @@ impl Default for FfprobeRunner {
 #[derive(Debug)]
 pub enum ProbeError {
     Io(std::io::Error),
+    Cancelled,
     Timeout,
     Exit { code: Option<i32>, stderr: String },
     OutputTooLarge,
@@ -793,6 +839,7 @@ pub enum ProbeError {
 impl ProbeError {
     pub fn failure_status(&self) -> &'static str {
         match self {
+            Self::Cancelled => "CANCELLED",
             Self::Timeout => "TIMEOUT",
             Self::Exit { .. } => "FAILED",
             Self::Io(_) => "FAILED",
@@ -805,6 +852,7 @@ impl fmt::Display for ProbeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "ffprobe process failed: {error}"),
+            Self::Cancelled => formatter.write_str("ffprobe cancelled"),
             Self::Timeout => formatter.write_str("ffprobe timed out"),
             Self::Exit { code, stderr } => {
                 write!(formatter, "ffprobe exited with {:?}: {}", code, stderr)
@@ -819,9 +867,11 @@ impl std::error::Error for ProbeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Timeout | Self::Exit { .. } | Self::OutputTooLarge | Self::InvalidOutput(_) => {
-                None
-            }
+            Self::Cancelled
+            | Self::Timeout
+            | Self::Exit { .. }
+            | Self::OutputTooLarge
+            | Self::InvalidOutput(_) => None,
         }
     }
 }
@@ -897,8 +947,26 @@ async fn collect_process_output(child: &mut Child) -> Result<CollectedProcessOut
 }
 
 async fn terminate_child(child: &mut Child) {
+    let cleanup_pending =
+        process_background_child_cleanup_pending(BackgroundWorkStage::Probe).await;
     let _ = child.start_kill();
-    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+    let mut retry_delay = Duration::from_millis(10);
+    loop {
+        match child.wait().await {
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(
+                    target: "lux::scan_performance",
+                    phase = "probe_child_cleanup_pending",
+                    child_cleanup_pending = cleanup_pending.count(),
+                    error = %error,
+                    "ffprobe child has not been reaped after termination"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(1));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1343,18 +1411,13 @@ impl MediaProbeService {
             .acquire_owned()
             .await
             .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?;
-        let result = self.probe_source(path).await;
-        drop(permit);
-        result
-    }
-
-    async fn probe_source(&self, path: &Path) -> Result<Option<MediaProbeResult>, ProbeError> {
         if is_strm_path(path) {
+            drop(permit);
             return Ok(read_media_info_sidecar(path)
                 .await
                 .or(read_nfo_streamdetails(path).await));
         }
-        match self.runner.probe_path(path).await {
+        match self.runner.probe_path_with_slot(path, permit).await {
             Ok(result) => Ok(Some(result)),
             Err(error) => read_media_info_sidecar(path)
                 .await

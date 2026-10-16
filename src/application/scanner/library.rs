@@ -1022,13 +1022,15 @@ impl LibraryScanner {
                 )
                 .await?
         {
-            let fingerprint = compute_scan_fingerprint_v2(
-                &relative_path,
+            let fingerprint = budgeted_file_fingerprint(
+                path,
+                relative_path.clone(),
                 size,
                 modified_at,
                 u64::try_from(matched_device).ok(),
                 u64::try_from(matched_inode).ok(),
-            );
+            )
+            .await?;
             self.database
                 .move_filesystem_entry(FilesystemEntryMove {
                     entry_id: &entry.id,
@@ -1056,16 +1058,21 @@ impl LibraryScanner {
                     inode.and_then(|value| u64::try_from(value).ok()),
                 )
             })
-            .and_then(|entry| entry.fingerprint.clone())
-            .unwrap_or_else(|| {
-                compute_scan_fingerprint_v2(
-                    &relative_path,
+            .and_then(|entry| entry.fingerprint.clone());
+        let fingerprint = match fingerprint {
+            Some(fingerprint) => fingerprint,
+            None => {
+                budgeted_file_fingerprint(
+                    path,
+                    relative_path.clone(),
                     size,
                     modified_at,
                     device.and_then(|value| u64::try_from(value).ok()),
                     inode.and_then(|value| u64::try_from(value).ok()),
                 )
-            });
+                .await?
+            }
+        };
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
@@ -1333,16 +1340,21 @@ impl LibraryScanner {
                     inode.and_then(|value| u64::try_from(value).ok()),
                 )
             })
-            .and_then(|entry| entry.fingerprint.clone())
-            .unwrap_or_else(|| {
-                compute_scan_fingerprint_v2(
-                    &relative_path,
+            .and_then(|entry| entry.fingerprint.clone());
+        let fingerprint = match fingerprint {
+            Some(fingerprint) => fingerprint,
+            None => {
+                budgeted_file_fingerprint(
+                    path,
+                    relative_path.clone(),
                     size,
                     modified_at,
                     device.and_then(|value| u64::try_from(value).ok()),
                     inode.and_then(|value| u64::try_from(value).ok()),
                 )
-            });
+                .await?
+            }
+        };
         if let Some(existing_entry) = existing_entry {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
                 let expected_parent_identity =
@@ -2304,7 +2316,24 @@ impl LibraryScanner {
     ) -> Result<(String, bool), ScannerError> {
         let observation = current_file_observation(root_path, path).await?;
         let relative_path = &observation.relative_path;
-        let fingerprint = observation.fingerprint_v2();
+        let fingerprint = match existing_entries
+            .get(relative_path)
+            .filter(|entry| observation.matches(entry))
+            .and_then(|entry| entry.fingerprint.clone())
+        {
+            Some(fingerprint) => fingerprint,
+            None => {
+                budgeted_file_fingerprint(
+                    path,
+                    relative_path.clone(),
+                    observation.size,
+                    observation.modified_at,
+                    observation.device,
+                    observation.inode,
+                )
+                .await?
+            }
+        };
         let device = observation
             .device
             .and_then(|value| i64::try_from(value).ok());

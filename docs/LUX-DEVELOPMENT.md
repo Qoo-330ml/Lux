@@ -11861,25 +11861,42 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
 
-#### LUX-561：stat 短路与 XXH3-128 扫描指纹优化
+#### LUX-561：扫描指纹与后台 CPU 热点优化
 
-状态：实现中，代码位于 `codex/sha256-fingerprint-optimization`。仅处理 CPU 热点分析的第二点；2026-10-16 项目所有者选择 A+C，取代先前的 B 主方案。风险与规避见 [A+C 扫描指纹方案](SCAN-FINGERPRINT-A-C-DESIGN.md)；原 B 比较及 SHA 微基准保留在 [原设计记录](SHA256-FINGERPRINT-OPTIMIZATION.md)。
+范围：结合 CPU 热点分析的扫描指纹短路和多管线后台并发预算。扫描指纹采用经 stat 快照验证的复用与版本化 XXH3-v2；后台计算、扫描准备、NFO/图片计算、ffprobe 和缩略图共用进程级预算。性能 A/B 按项目所有者 2026-10-16 的要求免除，未据此声称实际 CPU 或 NAS 收益。
 
-决策：可靠的完整 stat 快照命中时复用原指纹；新文件或确认变化使用 XXH3-128。前台扫描对旧 SHA 行按需验证并预热快照，未变化时不因算法不同产生后处理目标。按项目所有者追加要求，服务就绪后以一个全局串行 worker 低速逐库、逐文件迁移旧 SHA；等价性验证、消费者重绑定和二次 stat/CAS 成功后原位替换并清除该条临时旧 SHA，不常驻保存双指纹。迁移不是媒体变化，不能触发整库 probe/NFO/章节重检测；限速、忙库让步、断点续跑、依赖迁移失败延期和旧引用生命周期必须明确。新格式显式版本化，旧任务/旧值可读；NFO 等共用 SHA helper 保留。inode 不能单独判等，缓存与规范行的指纹/路径锚定并在既有事务中有界更新，原根身份、二次 stat 和 CAS 防护保留。严格抵抗碰撞/ABA 需要独立 source revision，不能宣称仅靠非加密摘要保证。
+设计记录： [A+C 扫描指纹方案](SCAN-FINGERPRINT-A-C-DESIGN.md)、[原 SHA 比较记录](SHA256-FINGERPRINT-OPTIMIZATION.md)及[多管线 CPU 预算设计](SCAN-CPU-BUDGET-DESIGN.md)。同一任务的两个实现分支已合并；下列完整门禁结果以本次合并后的验证为准。
 
-当前实现包括版本化的 SHA-v1/XXH3-v2 扫描指纹、Manifest 的惰性计算与 size/mtime/device/inode 基线短路、SQLite/PostgreSQL 迁移、单个后台迁移 worker、持久游标/延期记录和每库短租约。worker 启动延迟 60 秒，全局最多每 50ms 处理一个条目；迁移前后各检查一次 stat，并验证现有 v1 值后通过 CAS 原位替换规范指纹。章节输入与人物媒体关系读取保留经过 stat 验证的旧值兼容路径。
+##### 扫描指纹实现
 
-本轮验证：`cargo fmt --all -- --check` 与 `git diff --check` 通过；在 Toshiba 挂载的共享 target 上，`cargo check --locked --lib --bin luxd` 通过。按项目所有者要求未运行测试。旧 schema 升级测试、SQLite/PostgreSQL 运行时迁移、并发/崩溃回归和 CPU/墙钟/前台 p95 实测仍待验证。迁移 0180 增加 missing fingerprint 的候选索引和数据库触发器：以后被标记为 missing 的 FILE 会立即清空 fingerprint，历史 missing 行由现有 worker 每次清一条，并在清完前阻止该库标记完成。相同的 30 天保留期清理会在媒体项级联清理后，低速分批删除超期、无 `media_sources` 引用的 missing FILE tombstone；有 PENDING/RUNNING 扫描任务的媒体库会暂缓清理，仍被媒体源引用的记录保留以支持文件恢复和改名身份恢复。人物关系快照中的旧引用目前由兼容读取验证，不会随规范 filesystem entry 迁移而主动重写，因此那些 JSON 文件仍可能保留旧摘要。worker 采用固定节流与忙库让步，尚无基于 CPU、IO 或前台 p95 的动态降速反馈。
+可靠的完整 stat 快照命中时复用原指纹；新文件或确认变化时写入显式版本化的 XXH3-v2。旧 SHA-v1 行按需验证并预热快照，不因算法差异触发后处理。服务就绪后由一个全局串行 worker 低速逐库迁移旧扫描 SHA；迁移前后检查 stat、验证 v1 并通过 CAS 替换规范指纹。迁移不是媒体变化。旧任务、NFO、人物和章节引用保留兼容读取；inode 不能单独判等，缓存与规范行均使用路径和指纹锚定。
 
-验收（实现已落地但尚待验证的项目保持未勾选）：
+当前实现包括 SQLite/PostgreSQL 前向迁移、持久游标与延期记录、每库短租约、missing 指纹清理、无引用且过期墓碑的有界清理；迁移 worker 启动延迟 60 秒，全局最多每 50ms 处理一个条目。人物关系快照中的旧引用目前由兼容读取验证，不会随规范 filesystem entry 迁移而主动重写。worker 使用固定节流和忙库让步，尚未实现基于 CPU、IO 或前台 p95 的动态降速。
 
-- [ ] v1/v2 格式和稳定编码有 golden vectors；所有入口双读兼容后才启用 v2 写入，旧 unchanged 数据不因迁移重处理。
-- [ ] 可靠暖命中不计算摘要；未知字段、不可靠根和损坏快照回退；两种数据库迁移、批量 snapshot 读取与原子提交通过。
+待验证的指纹验收：
+
+- [ ] v1/v2 格式和稳定编码具备 golden vectors；所有入口双读兼容后才启用 v2 写入，旧 unchanged 数据不因迁移重处理。
+- [ ] 可靠暖命中不计算摘要；未知字段、不可靠根和损坏快照回退；SQLite/PostgreSQL 迁移、批量 snapshot 读取与原子提交通过。
 - [ ] 移动/硬链接、并发、取消、根替换、CAS 与旧任务恢复回归通过；NFO/人物/章节合同无意外变化，内容改写检测边界明确。
-- [ ] 服务就绪后一个全局串行迁移 worker 低速逐库、逐文件工作；限速/资源暂停、忙库让步、断点恢复和候选索引通过，完成条目清除旧扫描 SHA，延期/失败不伪报完成。
-- [ ] missing FILE 的扫描指纹立即清空；超过媒体保留期后，仅清理没有媒体源引用且所属媒体库没有活跃扫描的文件系统墓碑，按有界批次执行并覆盖 SQLite/PostgreSQL。
-- [ ] 纯算法迁移不产生媒体变化/后处理目标；活跃任务、章节派生 input 和人物关系引用有等价性迁移及崩溃恢复，旧值删除不破坏已有结果，普通扫描不能回写 v1。
-- [ ] 完成定向与全量 Rust 检查，分别记录冷升级与暖重扫的 CPU、墙钟、SQL/DML、体积和前台 p95；不得把摘要内核时间当作 NAS 扫描收益。
+- [ ] 单个全局迁移 worker 低速逐库逐文件工作；限速、资源暂停、忙库让步、断点恢复和候选索引通过，完成条目清除旧扫描 SHA，延期/失败不伪报完成。
+- [ ] missing FILE 指纹立即清空；仅对无媒体源引用且所属媒体库无活跃扫描的超期墓碑分批清理，并覆盖 SQLite/PostgreSQL。
+- [ ] 纯算法迁移不产生媒体变化/后处理目标；章节派生 input 与人物关系引用具备等价性迁移及崩溃恢复；普通扫描不能回写 v1。
+- [ ] 完成定向与全量 Rust 检查；分别记录冷升级与暖重扫的 CPU、墙钟、SQL/DML、体积和前台 p95。
+
+##### 后台共享预算实现
+
+通过进程级 singleton semaphore 共用后台工作预算，容量按 CPU/cgroup 推导并支持 `LUX_BACKGROUND_CPU_BUDGET` 覆盖。Discovery 与 Manifest preparation 保留有界 reader/JoinSet；指纹、NFO/图片、probe、thumbnail 的后台 CPU 片段接入同一预算，同时保留已有专用进程上限。调用者取消后，blocking closure 和受监督子进程仍持有预算，子进程确认回收后才释放名额。指标记录全局与分 stage 活跃/等待峰值、p50/p95/max、取消等待、运行中取消及子进程清理中计数；样本有界，日志不含路径或环境变量原值。
+
+分支合并前的记录：预算核心定向单测 9/9；`scanner` 18/18、`scanning_jobs` 88/88、`probe` 20/20、`thumbnails` 18/18、`background_work_budget` 1/1、`metadata` 21/21、`scanned_series_metadata` 3/3。`scanned_metadata` 为 22/23；唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 也以实际 2、预期 1 复现，因此全量 Rust 测试门未通过。分支上的 `cargo build --locked`、fmt 与 clippy 通过；性能 A/B 按项目所有者要求免除，CPU 收益和自动容量仍无实测结论。合并后门禁结果待本次验证更新。
+
+后台预算验收：
+
+- [x] 比较全局 Semaphore、管线互斥/优先级调度、共享有界线程池，并以当前源码核实 probe CPU 采样及 Tokio blocking pool 的行为。
+- [x] 定义共享范围、容量、进程单例、局部并发叠加、取消/进程回收、防嵌套死锁、前台与 DB 等待隔离及指标。
+- [x] 项目所有者评审并批准设计（2026-10-16）；代码接入 Discovery/Manifest、指纹、NFO/图片、probe 和 thumbnail。
+- [x] 取消后的 blocking 工作和受监督子进程在清理完成前继续占用预算；设置日志与有界指标。
+- [ ] 完整 Rust 完成门全部通过；性能 A/B 按项目所有者明确指示免除，不把 CPU 收益或自动默认容量作为实测结论。
+
 
 ## 29. 参考资料
 

@@ -163,8 +163,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_scan_fingerprint_v2(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let container = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -321,8 +328,15 @@ impl LibraryScanner {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0);
         let (device, inode) = file_identity(&metadata);
-        let fingerprint =
-            compute_scan_fingerprint_v2(&relative_path, size, modified_at, device, inode);
+        let fingerprint = budgeted_file_fingerprint(
+            path,
+            relative_path.clone(),
+            size,
+            modified_at,
+            device,
+            inode,
+        )
+        .await?;
         let hierarchy = episode_hierarchy(&relative_path, &parsed);
         let series_identity = format!("series:{root_id}:{}", hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
@@ -680,16 +694,21 @@ impl LibraryScanner {
                     inode.and_then(|value| u64::try_from(value).ok()),
                 )
             })
-            .and_then(|entry| entry.fingerprint.clone())
-            .unwrap_or_else(|| {
-                compute_scan_fingerprint_v2(
-                    &relative_path,
+            .and_then(|entry| entry.fingerprint.clone());
+        let fingerprint = match fingerprint {
+            Some(fingerprint) => fingerprint,
+            None => {
+                budgeted_file_fingerprint(
+                    path,
+                    relative_path.clone(),
                     size,
                     modified_at,
                     device.and_then(|value| u64::try_from(value).ok()),
                     inode.and_then(|value| u64::try_from(value).ok()),
                 )
-            });
+                .await?
+            }
+        };
         let expected_parent_identity = movie_parent_folder_identity(&root.id, &relative_path);
         if let Some(existing_entry) = existing_entry.as_ref()
             && existing_entry.item_type.as_deref() == Some("MOVIE")

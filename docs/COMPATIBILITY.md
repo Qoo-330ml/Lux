@@ -1,5 +1,11 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-561 后台预算运行时兼容性（2026-10-16）
+
+多管线共享预算只改变 Lux 进程内后台重工作片段的准入；现有 API/Emby DTO、数据库 schema、媒体指纹格式和扫描完成合同不变。ffprobe、ffmpeg 与扫描等既有局部并发上限继续生效。`LUX_BACKGROUND_CPU_BUDGET` 留空或未设置时使用 CPU/cgroup 推导值，显式整数夹到 1–32；该值在进程初始化时读取。
+
+本机定向 Rust 回归覆盖预算原语 9/9、`probe` 20/20、`thumbnails` 18/18、跨服务/跨库混合用例 1/1、`metadata` 21/21、`scanned_series_metadata` 3/3 及图片计算等价性 1/1；混合用例还验证后台预算占用期间前台 metadata 可继续完成。Discovery/fingerprint 目标的 G=1 结果见 `LUX-DEVELOPMENT.md`。`scanned_metadata` 22/23，唯一失败也在干净基线 `1e7c2ea8` 复现。按项目所有者要求不执行混合负载性能 A/B；本任务未部署到 FNOS，这些功能测试不能证明 NAS CPU 降幅或第三方客户端体验变化。
+
 ## LUX-552 Web 媒体库虚拟化（2026-10-15）
 
 Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在行。列数沿用现有 CSS 网格，行高含待确认徽章与操作提示并动态测量；窗口缩放保留聚焦卡片和未保存的编辑草稿。分页仍由原 `useInfiniteQuery` 和列表底部 sentinel 驱动，选择状态仍由库页持有。文件夹、只读合集、排序、元数据筛选、分页失败重试及批量操作由 19 个库页测试覆盖。
