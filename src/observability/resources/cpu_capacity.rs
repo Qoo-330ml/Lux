@@ -159,6 +159,7 @@ fn effective_capacity(available: Option<usize>, quotas: &[f64], cpusets: &[usize
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cpu_quota_v2(input: &str) -> Option<f64> {
     let mut fields = input.split_whitespace();
     let quota = fields.next()?;
@@ -170,6 +171,7 @@ fn parse_cpu_quota_v2(input: &str) -> Option<f64> {
     (quota > 0).then_some(quota as f64 / period as f64)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cpu_quota_v1(quota: &str, period: &str) -> Option<f64> {
     let quota = quota.trim().parse::<i64>().ok()?;
     let period = period.trim().parse::<u64>().ok()?;
@@ -179,6 +181,7 @@ fn parse_cpu_quota_v1(quota: &str, period: &str) -> Option<f64> {
     Some(quota as f64 / period as f64)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cpuset(input: &str) -> Option<usize> {
     let mut ranges = Vec::new();
     for part in input.trim().split(',') {
