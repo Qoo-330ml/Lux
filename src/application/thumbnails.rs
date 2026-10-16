@@ -618,48 +618,58 @@ impl ThumbnailService {
         let output_path = output_path.to_owned();
         let filter = filter.to_owned();
         let child_timeout = self.timeout;
-        run_process_background_supervised(BackgroundWorkStage::Thumbnail, move || async move {
-            let _slot = slot;
-            let result = async {
-                let mut child = Command::new(binary)
-                    .args([
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-y",
-                        "-ss",
-                        DEFAULT_FRAME,
-                        "-i",
-                    ])
-                    .arg(source_path)
-                    .args(["-vf", &filter, "-frames:v", "1", "-an", "-f", "image2"])
-                    .arg(&output_path)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                    .map_err(ThumbnailFileError::ProcessIo)?;
-                let status = match timeout(child_timeout, child.wait()).await {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(error)) => {
-                        terminate_thumbnail_child(&mut child).await;
-                        return Err(ThumbnailFileError::ProcessIo(error));
+        run_process_background_supervised(
+            BackgroundWorkStage::Thumbnail,
+            move |mut cancellation| async move {
+                let _slot = slot;
+                let result = async {
+                    let mut child = Command::new(binary)
+                        .args([
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-nostdin",
+                            "-y",
+                            "-ss",
+                            DEFAULT_FRAME,
+                            "-i",
+                        ])
+                        .arg(source_path)
+                        .args(["-vf", &filter, "-frames:v", "1", "-an", "-f", "image2"])
+                        .arg(&output_path)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true)
+                        .spawn()
+                        .map_err(ThumbnailFileError::ProcessIo)?;
+                    let status = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            terminate_thumbnail_child(&mut child).await;
+                            return Err(ThumbnailFileError::Cancelled);
+                        }
+                        result = timeout(child_timeout, child.wait()) => match result {
+                            Ok(Ok(status)) => status,
+                            Ok(Err(error)) => {
+                                terminate_thumbnail_child(&mut child).await;
+                                return Err(ThumbnailFileError::ProcessIo(error));
+                            }
+                            Err(_) => {
+                                terminate_thumbnail_child(&mut child).await;
+                                return Err(ThumbnailFileError::Timeout);
+                            }
+                        }
+                    };
+                    if !status.success() {
+                        return Err(ThumbnailFileError::Exit(status.code()));
                     }
-                    Err(_) => {
-                        terminate_thumbnail_child(&mut child).await;
-                        return Err(ThumbnailFileError::Timeout);
-                    }
-                };
-                if !status.success() {
-                    return Err(ThumbnailFileError::Exit(status.code()));
+                    read_validated_output(&output_path).await
                 }
-                read_validated_output(&output_path).await
-            }
-            .await;
-            let _ = fs::remove_file(&output_path).await;
-            result
-        })
+                .await;
+                let _ = fs::remove_file(&output_path).await;
+                result
+            },
+        )
         .await
         .map_err(|error| ThumbnailFileError::ProcessIo(std::io::Error::other(error.to_string())))?
     }
@@ -685,7 +695,7 @@ impl ThumbnailService {
         let poster_filter = poster_filter.to_owned();
         let thumbnail_filter = thumbnail_filter.to_owned();
         let child_timeout = self.timeout;
-        run_process_background_supervised(BackgroundWorkStage::Thumbnail, move || async move {
+        run_process_background_supervised(BackgroundWorkStage::Thumbnail, move |mut cancellation| async move {
             let _slot = slot;
             let result = async {
                 let filter_complex = format!(
@@ -714,15 +724,22 @@ impl ThumbnailService {
                     .kill_on_drop(true)
                     .spawn()
                     .map_err(ThumbnailFileError::ProcessIo)?;
-                let status = match timeout(child_timeout, child.wait()).await {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(error)) => {
+                let status = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
                         terminate_thumbnail_child(&mut child).await;
-                        return Err(ThumbnailFileError::ProcessIo(error));
+                        return Err(ThumbnailFileError::Cancelled);
                     }
-                    Err(_) => {
-                        terminate_thumbnail_child(&mut child).await;
-                        return Err(ThumbnailFileError::Timeout);
+                    result = timeout(child_timeout, child.wait()) => match result {
+                        Ok(Ok(status)) => status,
+                        Ok(Err(error)) => {
+                            terminate_thumbnail_child(&mut child).await;
+                            return Err(ThumbnailFileError::ProcessIo(error));
+                        }
+                        Err(_) => {
+                            terminate_thumbnail_child(&mut child).await;
+                            return Err(ThumbnailFileError::Timeout);
+                        }
                     }
                 };
                 if !status.success() {
@@ -1043,6 +1060,7 @@ fn is_strm_path(path: &str) -> bool {
 
 #[derive(Debug)]
 enum ThumbnailFileError {
+    Cancelled,
     Exit(Option<i32>),
     InvalidOutput,
     InvalidRelativePath,
@@ -1075,6 +1093,7 @@ impl ThumbnailFileError {
 impl fmt::Display for ThumbnailFileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("ffmpeg cancelled"),
             Self::Exit(code) => write!(formatter, "ffmpeg exited with code {code:?}"),
             Self::InvalidOutput => formatter.write_str("ffmpeg did not produce a JPEG image"),
             Self::InvalidRelativePath => formatter.write_str("media relative path is invalid"),

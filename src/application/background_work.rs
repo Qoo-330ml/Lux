@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::observability::resources::ResourceMetrics;
 
@@ -191,7 +191,7 @@ impl BackgroundWorkBudget {
     ) -> Result<T, BackgroundWorkTaskError>
     where
         T: Send + 'static,
-        F: FnOnce() -> Fut + Send + 'static,
+        F: FnOnce(BackgroundWorkCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
         let permit = self
@@ -199,12 +199,19 @@ impl BackgroundWorkBudget {
             .await
             .map_err(BackgroundWorkTaskError::Budget)?;
         let state = Arc::new(SupervisedTaskState::new(Arc::clone(self), stage));
-        let caller_guard = SupervisedCallerGuard(Arc::clone(&state));
+        let (cancel_sender, cancel_receiver) = watch::channel(false);
+        let caller_guard = SupervisedCallerGuard {
+            state: Arc::clone(&state),
+            cancel_sender,
+        };
         let task_state = Arc::clone(&state);
         let result = tokio::spawn(async move {
             let _permit = permit;
             let _completion = SupervisedCompletionGuard(task_state);
-            work().await
+            work(BackgroundWorkCancellation {
+                receiver: cancel_receiver,
+            })
+            .await
         })
         .await
         .map_err(BackgroundWorkTaskError::Join);
@@ -463,10 +470,10 @@ impl SupervisedTaskState {
         }
     }
 
-    fn caller_cancelled(&self) {
+    fn caller_cancelled(&self) -> bool {
         let mut state = self.lock_state();
         if state.finished || state.caller_cancelled {
-            return;
+            return false;
         }
         state.caller_cancelled = true;
         let mut metrics = self.budget.lock_metrics();
@@ -482,6 +489,7 @@ impl SupervisedTaskState {
             cancelled_running = metrics.cancelled_running,
             "caller cancelled while supervised background work continues"
         );
+        true
     }
 
     fn finished(&self) {
@@ -507,11 +515,33 @@ impl SupervisedTaskState {
     }
 }
 
-struct SupervisedCallerGuard(Arc<SupervisedTaskState>);
+struct SupervisedCallerGuard {
+    state: Arc<SupervisedTaskState>,
+    cancel_sender: watch::Sender<bool>,
+}
 
 impl Drop for SupervisedCallerGuard {
     fn drop(&mut self) {
-        self.0.caller_cancelled();
+        if self.state.caller_cancelled() {
+            let _ = self.cancel_sender.send(true);
+        }
+    }
+}
+
+pub(crate) struct BackgroundWorkCancellation {
+    receiver: watch::Receiver<bool>,
+}
+
+impl BackgroundWorkCancellation {
+    pub(crate) async fn cancelled(&mut self) {
+        loop {
+            if *self.receiver.borrow_and_update() {
+                return;
+            }
+            if self.receiver.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 }
 
@@ -655,7 +685,7 @@ pub(crate) async fn run_process_background_supervised<T, F, Fut>(
 ) -> Result<T, BackgroundWorkTaskError>
 where
     T: Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(BackgroundWorkCancellation) -> Fut + Send + 'static,
     Fut: Future<Output = T> + Send + 'static,
 {
     process_background_work_budget()
@@ -923,19 +953,28 @@ mod tests {
     async fn cancelled_caller_keeps_budget_until_supervised_task_finishes() {
         let budget = Arc::new(BackgroundWorkBudget::with_capacity(1, "test"));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let supervised_budget = Arc::clone(&budget);
         let caller = tokio::spawn(async move {
             supervised_budget
-                .run_supervised(BackgroundWorkStage::Probe, move || async move {
-                    let _ = entered_tx.send(());
-                    let _ = release_rx.await;
-                })
+                .run_supervised(
+                    BackgroundWorkStage::Probe,
+                    move |mut cancellation| async move {
+                        let _ = entered_tx.send(());
+                        cancellation.cancelled().await;
+                        let _ = cancelled_tx.send(());
+                        let _ = release_rx.await;
+                    },
+                )
                 .await
         });
         entered_rx.await.expect("supervised task started");
         caller.abort();
         let _ = caller.await;
+        cancelled_rx
+            .await
+            .expect("supervised task observed caller cancellation");
 
         let waiting_budget = Arc::clone(&budget);
         let waiting =
@@ -953,7 +992,7 @@ mod tests {
         assert_eq!(budget.snapshot().cancelled_running, 1);
         assert_eq!(budget.snapshot().cancelled_running_by_stage[5].1, 1);
 
-        release_tx.send(()).expect("release supervised task");
+        release_tx.send(()).expect("supervised task is waiting");
         let next_permit = timeout(Duration::from_secs(2), waiting)
             .await
             .expect("waiting task acquires after supervised work exits")

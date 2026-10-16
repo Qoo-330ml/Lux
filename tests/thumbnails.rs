@@ -135,7 +135,7 @@ async fn missing_poster_and_thumbnail_use_one_ffmpeg_invocation()
 }
 
 #[tokio::test]
-async fn cancelling_thumbnail_caller_waits_for_ffmpeg_cleanup()
+async fn cancelling_thumbnail_caller_kills_ffmpeg_and_cleans_output()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&config(temp_dir.path())).await?;
@@ -157,7 +157,7 @@ async fn cancelling_thumbnail_caller_waits_for_ffmpeg_cleanup()
     let fake = temp_dir.path().join("ffmpeg");
     fs::write(
         &fake,
-        "#!/bin/sh\ntouch \"$0.started\"\nwhile [ ! -f \"$0.release\" ]; do sleep 0.01; done\nfor argument in \"$@\"; do case \"$argument\" in *.jpg) printf '\\377\\330lux-thumb\\377\\331' > \"$argument\";; esac; done\ntouch \"$0.finished\"\n",
+        "#!/bin/sh\nfor argument in \"$@\"; do case \"$argument\" in *.jpg) printf 'partial' > \"$argument\";; esac; done\ntouch \"$0.started\"\nwhile [ ! -f \"$0.release\" ]; do :; done\ntouch \"$0.finished\"\n",
     )?;
     let mut permissions = fs::metadata(&fake)?.permissions();
     permissions.set_mode(0o755);
@@ -174,6 +174,17 @@ async fn cancelling_thumbnail_caller_waits_for_ffmpeg_cleanup()
         while !tokio::fs::try_exists(marker("started"))
             .await
             .unwrap_or(false)
+            || !movie_dir
+                .read_dir()
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(".lux-") && name.ends_with(".tmp.jpg")
+                })
         {
             tokio::task::yield_now().await;
         }
@@ -182,17 +193,6 @@ async fn cancelling_thumbnail_caller_waits_for_ffmpeg_cleanup()
     .expect("fake ffmpeg started");
     caller.abort();
     let _ = caller.await;
-    tokio::fs::write(marker("release"), b"release").await?;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !tokio::fs::try_exists(marker("finished"))
-            .await
-            .unwrap_or(false)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("supervised ffmpeg exits after cancellation");
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let has_temporary_output = fs::read_dir(&movie_dir)
@@ -212,7 +212,8 @@ async fn cancelling_thumbnail_caller_waits_for_ffmpeg_cleanup()
         }
     })
     .await
-    .expect("supervised ffmpeg removes temporary output");
+    .expect("supervised ffmpeg is reaped and its temporary output removed");
+    assert!(!tokio::fs::try_exists(marker("finished")).await?);
     Ok(())
 }
 

@@ -11887,7 +11887,7 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 初始实施进度（2026-10-16）：预算核心已加入进程级异步单例、CPU/cgroup 容量推导与 `LUX_BACKGROUND_CPU_BUDGET` clamp；克隆预算跨 stage 共用 permit，统计并发峰值、等待和有界 p95 样本。先写的容量回归在旧实现上失败（4 核期望 3、实际 1）；实现后 `cargo test --locked --lib application::background_work::tests` 5/5 通过。该记录反映当时 Discovery、指纹、本地 metadata、外部进程监督、混合基准和完整 gate 尚未完成的状态。
 
-当前实施进度（2026-10-16）：预算核心通过 9/9 定向单测；Discovery/Manifest preparation 与 scanner fingerprint 在 G=1 下通过 `scanner` 18/18、`scanning_jobs` 88/88；probe/thumbnail 在 G=1 下通过 `probe` 20/20、`thumbnails` 18/18。后台 metadata/图片仍在验证中。混合负载 A/B 与完整 Rust 完成门尚待执行。
+当前实施进度（2026-10-16）：预算核心通过 9/9 定向单测；Discovery/Manifest preparation 与 scanner fingerprint 在 G=1 下通过 `scanner` 18/18、`scanning_jobs` 88/88；probe/thumbnail 在 G=1 下通过 `probe` 20/20、`thumbnails` 18/18，且取消后子进程终止、回收与临时文件清理回归通过。跨服务、跨库 G=1 混合回归通过 `background_work_budget` 1/1。后台 NFO/图片仍在验证中。性能环境缺少 `LUX_PERF_MEDIA_ROOT`、ffmpeg 和 PostgreSQL 测试库，因此混合负载 SQLite/PostgreSQL A/B 尚不能运行；CPU 收益与自动默认值仍未由实测确认。完整 Rust 完成门尚待执行。
 
 ## 29. 参考资料
 
