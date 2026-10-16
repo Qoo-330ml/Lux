@@ -38,9 +38,9 @@ impl Database {
         let mut successfully_seen_paths: std::collections::HashSet<Cow<'data, str>> =
             std::collections::HashSet::new();
         if discovery_format_version == 3 && !seen_filesystem_entries.is_empty() {
-            for entries in seen_filesystem_entries
-                .chunks(super::manifest_path_query_chunk_size(self.backend()))
-            {
+            for entries in seen_filesystem_entries.chunks(
+                super::manifest_seen_filesystem_update_chunk_size(self.backend()),
+            ) {
                 if entries.is_empty() {
                     continue;
                 }

@@ -6690,8 +6690,66 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query(
+        "CREATE TABLE manifest_discovery_commit_audit (
+            next_sequence INTEGER NOT NULL,
+            completed_directory_count INTEGER NOT NULL
+        )",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER record_manifest_discovery_checkpoint
+         AFTER UPDATE OF next_observation_sequence ON scan_manifest_roots
+         WHEN NEW.next_observation_sequence > OLD.next_observation_sequence
+         BEGIN
+            INSERT INTO manifest_discovery_commit_audit
+                (next_sequence, completed_directory_count)
+            VALUES (NEW.next_observation_sequence, NEW.completed_directory_count);
+         END",
+    )
+    .execute(database.pool())
+    .await?;
     let discovery = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(discovery.processed, 1_025);
+    let configured_file_limit = if cfg!(feature = "performance-benchmarks") {
+        std::env::var("LUX_PERF_DISCOVERY_TRANSACTION_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(8_000)
+    } else {
+        8_000
+    };
+    let commit_checkpoints: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT next_sequence, completed_directory_count
+         FROM manifest_discovery_commit_audit ORDER BY rowid",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        commit_checkpoints.len(),
+        1_025_usize.div_ceil(configured_file_limit),
+        "each bounded discovery slice must commit its own root checkpoint"
+    );
+    assert!(
+        commit_checkpoints
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0),
+        "root checkpoint sequence must advance across committed slices"
+    );
+    assert!(
+        commit_checkpoints[..commit_checkpoints.len() - 1]
+            .iter()
+            .all(|(_, completed_count)| *completed_count == 0)
+    );
+    assert_eq!(
+        commit_checkpoints
+            .last()
+            .map(|(_, completed_count)| *completed_count),
+        Some(1),
+        "only the final slice may complete the directory"
+    );
     let pending_paths: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_manifest_seen_paths
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
@@ -6789,6 +6847,432 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
     .await?;
     assert_eq!(unchanged_generation_paths, 1_025);
     jobs.run_to_completion(&unchanged_job.id, 100, None).await?;
+    Ok(())
+}
+
+#[cfg(feature = "performance-benchmarks")]
+#[tokio::test]
+#[ignore = "requires LUX_PERF_DISCOVERY_TRANSACTION_FILES=256"]
+async fn manifest_discovery_keeps_committed_slices_when_a_later_slice_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+
+    assert_eq!(
+        std::env::var("LUX_PERF_DISCOVERY_TRANSACTION_FILES")?.parse::<usize>()?,
+        256,
+        "run this failure-injection test with the documented SQLite slice budget"
+    );
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for index in 0..1_025 {
+        tokio::fs::write(
+            root.join(format!("Movie {index:04}.Movie.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query(
+        "CREATE TABLE manifest_discovery_commit_audit (
+            next_sequence INTEGER NOT NULL
+        )",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER record_manifest_discovery_checkpoint
+         AFTER UPDATE OF next_observation_sequence ON scan_manifest_roots
+         WHEN NEW.next_observation_sequence > OLD.next_observation_sequence
+         BEGIN
+            INSERT INTO manifest_discovery_commit_audit (next_sequence)
+            VALUES (NEW.next_observation_sequence);
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_manifest_discovery_checkpoint_after_first
+         BEFORE UPDATE OF next_observation_sequence ON scan_manifest_roots
+         WHEN NEW.next_observation_sequence > OLD.next_observation_sequence
+          AND (SELECT COUNT(*) FROM manifest_discovery_commit_audit) >= 1
+         BEGIN SELECT RAISE(ABORT, 'injected later manifest slice failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert!(jobs.run_batch(&job.id, 1).await.is_err());
+
+    let committed_checkpoints: Vec<i64> = sqlx::query_scalar(
+        "SELECT next_sequence FROM manifest_discovery_commit_audit ORDER BY rowid",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(committed_checkpoints.len(), 1);
+    let completed_directory_count: i64 = sqlx::query_scalar(
+        "SELECT completed_directory_count FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed_directory_count, 0);
+
+    let committed_generation_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (
+             SELECT root.library_root_id FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             WHERE manifest.job_id = ?
+         ) AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(committed_generation_files, 256);
+
+    let local_batches: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT source_count, source_refs_json FROM scan_local_metadata_batches
+         WHERE job_id = ? ORDER BY batch_sequence",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    let mut committed_source_ids = Vec::new();
+    for (source_count, source_refs_json) in &local_batches {
+        let source_ids: Vec<String> = serde_json::from_str(source_refs_json)?;
+        assert_eq!(i64::try_from(source_ids.len())?, *source_count);
+        committed_source_ids.extend(source_ids);
+    }
+    let unique_source_ids = committed_source_ids.iter().collect::<HashSet<_>>();
+    assert_eq!(committed_source_ids.len(), 256);
+    assert_eq!(unique_source_ids.len(), committed_source_ids.len());
+
+    sqlx::query("DROP TRIGGER reject_manifest_discovery_checkpoint_after_first")
+        .execute(database.pool())
+        .await?;
+    database.pool().close().await;
+    drop(jobs);
+    drop(libraries);
+    drop(database);
+
+    let database = Database::connect(&config).await?;
+    let jobs = ScanJobService::new(database.clone());
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "PENDING");
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let completed_manifest: (String, i64, i64, i64, String, i64, i64) = sqlx::query_as(
+        "SELECT manifest.state, manifest.observed_file_count,
+                root.completed_directory_count, root.observed_file_count, root.state,
+                job.total_count, job.processed_count
+         FROM scan_manifests manifest
+         JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
+         JOIN scan_jobs job ON job.id = manifest.job_id
+         WHERE manifest.job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        completed_manifest,
+        (
+            "COMPLETED".to_owned(),
+            1_025,
+            1,
+            1_025,
+            "COMPLETE".to_owned(),
+            1_025,
+            1_025
+        )
+    );
+
+    let indexed_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (
+             SELECT root.library_root_id FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             WHERE manifest.job_id = ?
+         ) AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_files, 1_025);
+
+    let local_batches: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT batch_sequence, source_count, source_refs_json FROM scan_local_metadata_batches
+         WHERE job_id = ? ORDER BY batch_sequence",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    let mut all_source_ids = Vec::new();
+    for (_, source_count, source_refs_json) in &local_batches {
+        let source_ids: Vec<String> = serde_json::from_str(source_refs_json)?;
+        assert_eq!(i64::try_from(source_ids.len())?, *source_count);
+        all_source_ids.extend(source_ids);
+    }
+    let unique_source_ids = all_source_ids.iter().collect::<HashSet<_>>();
+    assert_eq!(all_source_ids.len(), 1_025);
+    assert_eq!(unique_source_ids.len(), all_source_ids.len());
+    assert_eq!(
+        local_batches
+            .iter()
+            .map(|(sequence, _, _)| sequence)
+            .collect::<HashSet<_>>()
+            .len(),
+        local_batches.len()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_discovery_reopens_and_retries_persisted_frontier_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let directory = root.join("Directory");
+    tokio::fs::create_dir_all(&directory).await?;
+    for file_index in 0..8_001 {
+        tokio::fs::write(
+            directory.join(format!("Movie {file_index:04}.Movie.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_mode(&database, &job.id, "PERSISTED").await?;
+    sqlx::query(
+        "CREATE TABLE manifest_discovery_commit_audit (
+            next_sequence INTEGER NOT NULL,
+            completed_directory_count INTEGER NOT NULL
+        )",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER record_manifest_discovery_checkpoint
+         AFTER UPDATE OF next_observation_sequence ON scan_manifest_roots
+         WHEN NEW.next_observation_sequence > OLD.next_observation_sequence
+         BEGIN
+            INSERT INTO manifest_discovery_commit_audit
+                (next_sequence, completed_directory_count)
+            VALUES (NEW.next_observation_sequence, NEW.completed_directory_count);
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_manifest_discovery_checkpoint_after_two_commits
+         BEFORE UPDATE OF next_observation_sequence ON scan_manifest_roots
+         WHEN NEW.next_observation_sequence > OLD.next_observation_sequence
+          AND (SELECT COUNT(*) FROM manifest_discovery_commit_audit) >= 2
+         BEGIN SELECT RAISE(ABORT, 'injected later persisted manifest transaction failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let mut later_transaction_failed = false;
+    let mut batch_reports = Vec::new();
+    for _ in 0..8 {
+        match jobs.run_batch(&job.id, 100).await {
+            Ok(report) => {
+                batch_reports.push((report.status.clone(), report.processed, report.completed));
+                if report.completed {
+                    break;
+                }
+            }
+            Err(_) => {
+                later_transaction_failed = true;
+                break;
+            }
+        }
+    }
+    let checkpoint_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifest_discovery_commit_audit")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        later_transaction_failed,
+        "the injected later transaction must fail; reports={batch_reports:?}, checkpoints={checkpoint_count}"
+    );
+
+    let committed_checkpoints: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT next_sequence, completed_directory_count
+         FROM manifest_discovery_commit_audit ORDER BY rowid",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(committed_checkpoints.len(), 2);
+    assert_eq!(committed_checkpoints[0].1, 1);
+    assert_eq!(committed_checkpoints[1].1, 1);
+    let completed_directory_count: i64 = sqlx::query_scalar(
+        "SELECT completed_directory_count FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed_directory_count, 1);
+
+    let committed_generation_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (
+             SELECT root.library_root_id FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             WHERE manifest.job_id = ?
+         ) AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(committed_generation_files, 7_998);
+
+    let completed_directories_before_restart: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_directories
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+           AND state = 'COMPLETE'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed_directories_before_restart, 1);
+
+    sqlx::query("DROP TRIGGER reject_manifest_discovery_checkpoint_after_two_commits")
+        .execute(database.pool())
+        .await?;
+    database.pool().close().await;
+    drop(jobs);
+    drop(libraries);
+    drop(database);
+
+    let database = Database::connect(&config).await?;
+    let jobs = ScanJobService::new(database.clone());
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "PENDING");
+
+    let retry_frontier: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM scan_manifest_directories
+              WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                AND state = 'COMPLETE'),
+             (SELECT COUNT(*) FROM scan_manifest_directories
+              WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                AND state = 'PENDING'),
+             (SELECT COUNT(*) FROM scan_manifest_directories
+              WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                AND state = 'SCANNING')",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(retry_frontier, (1, 1, 0));
+
+    jobs.run_to_completion(&job.id, 1_000, None).await?;
+
+    let completed_manifest: (String, i64, i64, i64, i64, String, i64, i64) = sqlx::query_as(
+        "SELECT manifest.state, manifest.observed_file_count,
+                manifest.discovered_directory_count, manifest.completed_directory_count,
+                root.observed_file_count, root.state, job.total_count, job.processed_count
+         FROM scan_manifests manifest
+         JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
+         JOIN scan_jobs job ON job.id = manifest.job_id
+         WHERE manifest.job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        completed_manifest,
+        (
+            "COMPLETED".to_owned(),
+            8_001,
+            2,
+            2,
+            8_001,
+            "COMPLETE".to_owned(),
+            8_001,
+            8_001
+        )
+    );
+
+    let indexed_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (
+             SELECT root.library_root_id FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             WHERE manifest.job_id = ?
+         ) AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_files, 8_001);
+
+    let local_batches: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT batch_sequence, source_count, source_refs_json FROM scan_local_metadata_batches
+         WHERE job_id = ? ORDER BY batch_sequence",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    let mut committed_source_ids = Vec::new();
+    for (_, source_count, source_refs_json) in &local_batches {
+        let source_ids: Vec<String> = serde_json::from_str(source_refs_json)?;
+        assert_eq!(i64::try_from(source_ids.len())?, *source_count);
+        committed_source_ids.extend(source_ids);
+    }
+    let unique_source_ids = committed_source_ids.iter().collect::<HashSet<_>>();
+    assert_eq!(committed_source_ids.len(), 8_001);
+    assert_eq!(unique_source_ids.len(), committed_source_ids.len());
+    assert_eq!(
+        local_batches
+            .iter()
+            .map(|(sequence, _, _)| sequence)
+            .collect::<HashSet<_>>()
+            .len(),
+        local_batches.len()
+    );
     Ok(())
 }
 

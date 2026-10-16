@@ -889,7 +889,7 @@ async fn manifest_single_chunk_commit_rejects_replaced_empty_directory()
                 preparation_concurrency: 1,
                 expected_root_identity: root_observation.device.zip(root_observation.inode),
             },
-            &[incomplete_chunk],
+            vec![incomplete_chunk],
         )
         .await;
     assert!(
@@ -918,7 +918,7 @@ async fn manifest_single_chunk_commit_rejects_replaced_empty_directory()
                 preparation_concurrency: 1,
                 expected_root_identity: root_observation.device.zip(root_observation.inode),
             },
-            &[batched_chunk],
+            vec![batched_chunk],
         )
         .await;
     assert!(

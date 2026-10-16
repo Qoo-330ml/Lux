@@ -11826,6 +11826,74 @@ ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 k
 
 验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
 
+#### LUX-564：选择并固定 SQLite Manifest 写事务预算
+
+范围：保持 streamed reader 8,000 文件上限独立，为 SQLite 完整写事务固定经过 release A/B 验证的默认预算；比较 512、1,024、2,048、4,000、5,000、6,000、7,000、8,000，使用相同 60k/600 fixture、FULL synchronous 和固定池配置。扫描/DML 组关闭锁探针；独立竞争组从第二个 SQLite pool 周期性提交真实 scan-job progress update，分开记录 pool acquire、BEGIN IMMEDIATE admission、完整写入延迟和 outcome。PostgreSQL 默认路径不变。
+
+实施文件：`src/application/scanner/jobs/commit_batches.rs`（SQLite 默认预算与回归）、`src/storage/repository.rs`（SQLite 专用 presence CAS 行批次上限）、`src/storage/jobs/scan/manifest/discovery/presence.rs`（应用上限）、`src/storage/jobs/tests.rs`（fingerprint CAS 回归）。A/B 复用 `tests/performance.rs` 现有报告入口，结果记录于 `docs/PERFORMANCE.md`。
+
+验收：
+
+- [x] reader 仍按 8,000 文件读取，事务预算单独设定；release 基准报告明确记录实际事务预算和进程 CPU 时间。
+- [x] SQLite presence 更新单条语句最多分片 10,921 项（每项 3 个 bind + 3 个固定 bind，保持 SQLite 32,766 参数上限内），PostgreSQL 分片保持原值；fingerprint 匹配、旧 fingerprint 与 missing 行回归通过，CAS 与 seen-path ledger 语义不变。
+- [x] 确认 4,000 为默认事务预算：存储批次优化后 4,000/8,000 无锁 A/B 交错五轮中位数分别为首扫 2,275/2,285 ms、unchanged 重扫 1,035/1,117 ms、目录 API p95 602/599 ms、foreground p95 370/377 ms、batch p95 321/328 ms、DML 189/133，4,000 的 WAL/RSS 更低。独立写者完整事务 p95 三轮中位数为 4,000 107.1 ms、5,000 126.4 ms、6,000 150.2 ms、8,000 223.1 ms；4,000 相对 8,000 改善 52.0%，且保持 `<209 DML` 门。7,000 的单轮 unchanged 重扫超过 5% 门；5,000/6,000 未达到 50% 写者 p95 改善目标。100 ms 是期望值，4,000 实测 107.1 ms；本机 ARM64 fixture 不外推 FNOS/NAS 或 x86_64。
+- [ ] 完整 Rust all-targets gate 未通过。最终 `cargo build --locked`、`cargo fmt --all -- --check` 与全 targets / features Clippy 通过；`storage::repository::jobs` 为 16/16，串行 `scanning_jobs` 为 89/89。并行 `scanning_jobs` 首次有 1 项报 SQLite `database is locked`，该用例隔离重跑 1/1、串行全目标通过。
+- [ ] 当前分支 `cargo test --locked --all-targets -- --test-threads=1` 的库测试为 884 passed / 1 failed / 23 ignored；失败为 `application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`，其 actor-credit 并发失败项集合不符合断言，隔离重跑 1/1 通过。此前 all-targets 在 `1e7c2ea8` 上已复现 `scanned_metadata::failed_local_poster_insert_does_not_mark_image_stage_complete`；跳过它后的测试曾因 `web_static::same_origin_web_assets_are_served_by_rust` 固定资产断言停止，使用同一构建产物在基线也复现。当前完整 gate 不能报绿。
+- [x] PostgreSQL runtime gate 通过：临时 PostgreSQL 16 Alpine 容器只绑定 localhost，数据库数据位于 tmpfs；`cargo test --locked --test postgres_database -- --include-ignored --test-threads=1` 为 18/18。测试后容器已停止并自动删除。
+
+候选中间值的单轮筛选、逐轮 A/B、独立写者样本、此前基线测试复现及门禁限制见 `docs/PERFORMANCE.md`。
+#### LUX-563：SQLite Manifest 已提交分片的恢复与幂等
+
+范围：用实际文件 SQLite 验证 PERSISTED Manifest 在首片提交、后片失败、数据库连接关闭并重新打开后，可从 durable directory frontier 重试。重试必须保留此前完成的目录和正向索引，不重复 observed/processed 计数，也不重复 outbox source IDs 或 batch sequence。仅在发现存储合同缺陷时另拆最小 storage 修复任务。
+
+预计文件（2 个）：`tests/scanning_jobs.rs`、本文档。分别验证 LUX-562 的 256 文件 streamed SQLite 分片重开恢复，以及 PERSISTED discovery 在 8,000 条 observation reader chunk 提交后、下一事务失败时的重开恢复；不改公共模型、schema 或 SQL 行为。
+
+验收：
+
+- [x] 重开 SQLite 后 manifest/job checkpoint 持久；完成目录不重新入队，未完成目录恢复为可处理 frontier。
+- [x] 同一 job 重试完成后，manifest/root observed 与 completed 计数精确，generation 索引文件完整，outbox source IDs 与 batch sequences 全唯一。
+- [x] 256 文件切片和 PERSISTED 8,000 条 observation reader-chunk 后续事务失败，均在关闭并重开 SQLite 后从 durable frontier 恢复；既有 PERSISTED shutdown-resume 与 LITE retry 回归仍通过。
+
+定向验证：`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_discovery_keeps_committed_slices_when_a_later_slice_fails -- --exact --ignored`、`cargo test --locked --test scanning_jobs manifest_discovery_reopens_and_retries_persisted_frontier_idempotently -- --exact`、`cargo test --locked --test scanning_jobs shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier -- --exact`、`cargo test --locked --test scanning_jobs failed_manifest_discovery_retries_its_pending_frontier_safely -- --exact`。
+
+验收结果：两个实际 SQLite 注入故障测试均通过关闭连接、重开数据库和同 job retry 验证；256 文件 LITE 分片最终索引/outbox 各 1,025 条唯一，PERSISTED 在首个 8,000 observation chunk 后保留 7,998 个正向索引并从持久 frontier 完成 8,001 个文件，计数与 outbox source IDs / batch sequences 无重复。既有 shutdown-resume 与失败 retry 各 1/1，`scanning_jobs` 串行完整目标 89/89 通过。首轮完整目标的两个 ffprobe 用例曾分别报 NULL 解码和 TIMEOUT，单独重跑均通过，随后完整串行目标也全绿；最终预算 A/B 与完整 Rust gate 留待 LUX-564。
+
+#### LUX-562：SQLite Manifest discovery 按完整事务分片
+
+范围：在 application 层、基线读取和正向索引准备之前，将 SQLite 的 Pending Manifest directory chunks 按有界文件数、总 observation entries、child frontier 和 completed-directory 数分成有序微批次。每片独立执行完整 storage 事务；DIRECTORY observation 与对应 child frontier 同片，跨片目录的 `completed_directory` 只落在最后一片。每片重新读取数据库基线并执行现有文件/root/目录复核。PostgreSQL 保留现有聚合事务路径。
+
+预计文件（5 个）：`src/application/scanner/jobs/manifest_discovery.rs`、新建 `src/application/scanner/jobs/commit_batches.rs`、`src/application/scanner/tests.rs`、`tests/scanning_jobs.rs`、本文档。
+
+初始 SQLite 文件预算保持 8,000，与当前最大 streamed file budget 一致；测试 feature 可注入较小值以验证实际事务边界，不增加用户配置或持久化 schema。此任务不选择最终生产预算，也不修改 `<209 DML` 门槛。
+
+验收：
+
+- [x] 分片器覆盖空/单条/边界/超限/多倍输入，混合文件、子目录和 completion；顺序保留，每个 observation/frontier 恰好一次，且每片所有维度均不越预算。
+- [x] SQLite integration fixture 注入 256 文件预算后证明 1,025 个文件跨多个独立 root checkpoint 事务提交；父目录只在最后一片完成，索引、outbox source IDs 与计数无遗漏/重复。
+- [x] SQLite 默认预算保持 8,000；PostgreSQL 保留单一聚合批次路径；注入第二片错误后后续片停止，首片索引/outbox 保留且 completion 未提前写入。
+- [x] 分片在基线查询、positive preparation 和 identity recheck 之前；storage 的一次调用仍全成或全败。
+
+定向验证：`cargo test --locked --lib commit_batches`、`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks -- --exact`、`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_discovery_keeps_committed_slices_when_a_later_slice_fails -- --exact --ignored`，随后运行 `cargo test --locked --test scanning_jobs`。
+
+验收结果：分片器单测 3/3；256 文件预算的 1,025 文件成功与第二片故障注入测试均通过；默认构建下完整 `scanning_jobs` 目标串行运行 88/88 通过，覆盖 8,000 文件默认预算。结构检查确认 SQLite 每片都重新读取基线并进入原有完整 storage 事务，PostgreSQL 直接保留原批次；格式与 diff 检查通过。最终预算选择和 A/B 性能门留待 LUX-564。
+
+#### LUX-561：记录 Manifest 写事务体耗时与结果
+
+范围：为 Manifest discovery 写事务单独记录事务体时间，排除 `BEGIN IMMEDIATE` 获取写者资格和 `COMMIT` 时间；记录事务体成功/失败计数，不记录错误文本或业务标识。只增加观测，不改变事务边界、批次大小、存储语义或性能门槛。
+
+预计文件（4 个）：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、本文档。
+
+验收：
+
+- [x] release Manifest 基准报告包含 `transaction_body` p50/p95 和事务体 outcome 计数，至少存在成功样本。
+- [x] 事务体错误分支只记录耗时及 `error` 标签；计数器回归覆盖 success/error 事件，日志不记录错误内容或用户数据。
+- [x] 事务计时能与 BEGIN 等待、COMMIT 分开；现有 `<209 DML` 门槛和事务行为不变。
+- [x] 只记录 ARM64 本机观测，不推断 NAS/FNOS 性能收益；更新性能记录并保留干扰因素。
+
+最窄目标：`cargo test --locked --test performance`；release 基准：`LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark ./scripts/run-performance.sh`。
+
+实施结果（2026-10-16）：storage 现在分别记录 `transaction_body`、BEGIN 和 COMMIT，事务体事件只带 success/error 与条目计数。性能报告序列化并 reset outcome 计数；定向单测通过，60k SQLite release 基准 1/1 通过，两轮各观测到 9 个成功 body。两轮首扫 `transaction_body` p95 为 199,544 / 188,235 µs，DML 均为 127，低于原 `<209` 门槛。探针启用时的写锁等待 p95 为 232,899 / 223,689 µs；探针会主动争用写锁，所以数据只用于说明观测已接通和门槛未回归，不作为无探针性能基线。性能测试目标 18 passed、5 ignored；格式检查通过。
+
 #### LUX-560：用户状态修改向其他会话发送失效
 
 范围：Web/Emby 收藏、已看修改在状态持久化及容器状态同步成功后发布无 ID 的 favorites/item 用户事件；Web 两种播放事件路径、账户库顺序和排序策略更新发布合并 home 事件。人物收藏同样发 favorites。HTTP 响应和认证/CSRF/ACL 保持既有合同。
