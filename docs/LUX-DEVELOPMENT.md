@@ -11863,26 +11863,28 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 #### LUX-561：ffprobe CPU 容量预算与完成速率自适应设计
 
-状态（2026-10-16）：仅设计，等待方案审阅；没有实现或性能验收结果。
+状态（2026-10-16）：优化方向已由项目所有者认可；代码方案已细化，尚未实现或进行性能验收。
 
 范围：核对内置本地 ffprobe 的默认配置、资源降档和分页执行路径，设计非 cgroup CPU 容量感知、
 默认 `cpu_cores × 4` 进程预算以及基于成功完成速率的动态准入。明确旧库配置、环境变量、
 Docker/Compose 默认、多个本地 probe 服务实例和取消/超时的边界。详细方案见
-[`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md)。
+[`FFPROBE-CONCURRENCY-DESIGN.md`](FFPROBE-CONCURRENCY-DESIGN.md)，代码职责、内部接口、子进程生命周期和
+分步提交见 [`FFPROBE-CONCURRENCY-CODE-PLAN.md`](FFPROBE-CONCURRENCY-CODE-PLAN.md)。
 
 本设计拟替代 §5.4 和 LUX-197 的 256 默认/CPU × 32 目标，但本次不宣称现行策略已切换。
 非 cgroup 感知用于 CPU 容量和预算，不给仪表盘回填宿主使用率；运行时 probe 调节不依赖 CPU 使用率。
 STRM 远程插件仍有独立调度，不将本地预算描述为全部插件子进程的共同限额。
 不涉及 fingerprint、Manifest/SQLite 事务、ffmpeg 缩略图或跨管线 CPU 预算。
 
-预计文件（2 个）：本文档、`docs/FFPROBE-CONCURRENCY-DESIGN.md`。
+预计文件（3 个）：本文档、`docs/FFPROBE-CONCURRENCY-DESIGN.md`、`docs/FFPROBE-CONCURRENCY-CODE-PLAN.md`。
 
 设计验收：
 
 - [x] 记录源码事实及与热点报告的差异：无 CPU 样本时启动上限持续生效；官方容器默认显式注入 8。
 - [x] 给出 CPU 容量、自动预算、人工覆盖、完成速率计量、窗口/试探/回退和全局本地准入规则。
 - [x] 列出边界回归、性能测量、后续文件预算和完整完成门；不将推测降幅记为实测。
-- [ ] 项目所有者审阅设计；后续实施单元逐个分配 LUX 编号，不在设计阶段实现。
+- [x] 项目所有者认可优化方向；代码方案细化模块职责、纯状态机、动态准入、进程回收及最多 5 文件的 P1–P10 实施单元。
+- [ ] 代码方案进入后续实施时逐个登记 LUX 编号；本任务不提前实现或宣称代码/性能完成。
 
 验证：本次仅文档，检查 diff、链接与文件范围；未运行 Cargo/Web 测试或生产探测。
 
