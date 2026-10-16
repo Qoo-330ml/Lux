@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -21,7 +21,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const LATENCY_SAMPLE_CAPACITY: usize = 256;
 const IDLE_EPOCH_RESET: Duration = Duration::from_secs(60);
 
-static GLOBAL_PROBE_RUNTIME: OnceLock<ProbeRuntime> = OnceLock::new();
+static GLOBAL_PROBE_RUNTIME: ProbeRuntimeRegistry = ProbeRuntimeRegistry::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AttemptOutcome {
@@ -56,6 +56,58 @@ struct ProbeRuntimeInner {
     changed: Notify,
     next_session_id: AtomicU64,
     next_attempt_id: AtomicU64,
+}
+
+struct ProbeRuntimeRegistry {
+    lifecycle: Mutex<()>,
+    closing: AtomicBool,
+    runtime: OnceLock<ProbeRuntime>,
+}
+
+impl ProbeRuntimeRegistry {
+    const fn new() -> Self {
+        Self {
+            lifecycle: Mutex::new(()),
+            closing: AtomicBool::new(false),
+            runtime: OnceLock::new(),
+        }
+    }
+
+    fn get_or_init(
+        &self,
+        budget: usize,
+        starting_limit: usize,
+        now: Instant,
+    ) -> Result<ProbeRuntime, AdmissionError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| AdmissionError::LockPoisoned)?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(AdmissionError::Closed);
+        }
+        let runtime = self
+            .runtime
+            .get_or_init(|| ProbeRuntime::new(budget, starting_limit, now))
+            .clone();
+        runtime.update_budget(budget, now)?;
+        Ok(runtime)
+    }
+
+    async fn shutdown(&self) -> Result<(), AdmissionError> {
+        let runtime = {
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| AdmissionError::LockPoisoned)?;
+            self.closing.store(true, Ordering::Release);
+            self.runtime.get().cloned()
+        };
+        if let Some(runtime) = runtime {
+            runtime.shutdown_and_drain().await?;
+        }
+        Ok(())
+    }
 }
 
 struct AdmissionState {
@@ -134,11 +186,7 @@ impl ProbeRuntime {
         starting_limit: usize,
         now: Instant,
     ) -> Result<Self, AdmissionError> {
-        let runtime = GLOBAL_PROBE_RUNTIME
-            .get_or_init(|| Self::new(budget, starting_limit, now))
-            .clone();
-        runtime.update_budget(budget, now)?;
-        Ok(runtime)
+        GLOBAL_PROBE_RUNTIME.get_or_init(budget, starting_limit, now)
     }
 
     pub(super) fn register(
@@ -255,6 +303,52 @@ impl ProbeRuntime {
 
     pub(super) fn version(&self) -> Result<u64, AdmissionError> {
         Ok(self.lock_state()?.version)
+    }
+
+    pub(super) fn is_closing(&self) -> Result<bool, AdmissionError> {
+        Ok(self.lock_state()?.closing)
+    }
+
+    pub(super) async fn shutdown_and_drain(&self) -> Result<(), AdmissionError> {
+        self.close_admission()?;
+        loop {
+            let (version, drained) = {
+                let state = self.lock_state()?;
+                (
+                    state.version,
+                    state.active_total == 0 && state.sessions.is_empty(),
+                )
+            };
+            if drained {
+                return Ok(());
+            }
+            self.wait_for_change_since(version).await?;
+        }
+    }
+
+    fn close_admission(&self) -> Result<(), AdmissionError> {
+        let now = Instant::now();
+        let changed = {
+            let mut state = self.lock_state()?;
+            if state.closing {
+                false
+            } else {
+                state.closing = true;
+                for session in state.sessions.values_mut() {
+                    session.closed = true;
+                    session.remaining = 0;
+                }
+                state.refresh_profile(now);
+                let _ = state.refresh_pressure(now);
+                state.refresh_saturation(now);
+                state.version = state.version.wrapping_add(1);
+                true
+            }
+        };
+        if changed {
+            self.inner.changed.notify_waiters();
+        }
+        Ok(())
     }
 
     pub(super) async fn wait_for_change_since(
@@ -494,6 +588,10 @@ pub(super) fn global_runtime(
     ProbeRuntime::global(budget, starting_limit, now)
 }
 
+pub(super) async fn shutdown_global_runtime() -> Result<(), AdmissionError> {
+    GLOBAL_PROBE_RUNTIME.shutdown().await
+}
+
 pub(super) struct ProbeSession {
     runtime: ProbeRuntime,
     session_id: u64,
@@ -694,7 +792,7 @@ mod tests {
     use crate::domain::ids::LibraryId;
 
     use super::super::adaptive::{AdjustmentReason, PressureLevel};
-    use super::{AdmissionError, AttemptOutcome, ProbeRuntime};
+    use super::{AdmissionError, AttemptOutcome, ProbeRuntime, ProbeRuntimeRegistry};
     use crate::observability::resources::ProbePressure;
 
     #[test]
@@ -831,6 +929,69 @@ mod tests {
         assert_eq!(runtime.active_count().expect("active count"), 0);
     }
 
+    #[tokio::test]
+    async fn shutdown_closes_admission_and_waits_for_active_permits_to_finish() {
+        let now = Instant::now();
+        let runtime = ProbeRuntime::new(1, 1, now);
+        let session = runtime
+            .register(LibraryId::new(), 1, 1, now)
+            .expect("session");
+        let permit = session
+            .try_acquire(now)
+            .expect("admission state")
+            .expect("permit");
+        drop(session);
+        let observed_version = runtime.version().expect("version");
+
+        let draining_runtime = runtime.clone();
+        let draining = tokio::spawn(async move { draining_runtime.shutdown_and_drain().await });
+        runtime
+            .wait_for_change_since(observed_version)
+            .await
+            .expect("shutdown should wake waiters");
+
+        assert_eq!(runtime.active_count().expect("active count"), 1);
+        assert_eq!(
+            runtime.register(LibraryId::new(), 1, 1, now).err(),
+            Some(AdmissionError::Closed)
+        );
+        drop(permit);
+        draining
+            .await
+            .expect("drain task")
+            .expect("active permits should drain");
+        assert_eq!(runtime.active_count().expect("active count"), 0);
+        assert!(runtime.is_closing().expect("closing state"));
+        runtime
+            .shutdown_and_drain()
+            .await
+            .expect("shutdown should be idempotent");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_idle_page_sessions_to_drop() {
+        let now = Instant::now();
+        let runtime = ProbeRuntime::new(1, 1, now);
+        let session = runtime
+            .register(LibraryId::new(), 1, 0, now)
+            .expect("sidecar-only page session");
+        let observed_version = runtime.version().expect("version");
+
+        let draining_runtime = runtime.clone();
+        let draining = tokio::spawn(async move { draining_runtime.shutdown_and_drain().await });
+        runtime
+            .wait_for_change_since(observed_version)
+            .await
+            .expect("shutdown should wake waiters");
+
+        assert!(!draining.is_finished());
+        drop(session);
+        draining
+            .await
+            .expect("drain task")
+            .expect("idle sessions should drain after their page exits");
+    }
+
     #[test]
     fn closed_runtime_rejects_new_sessions() {
         let now = Instant::now();
@@ -841,6 +1002,21 @@ mod tests {
         }
         assert_eq!(
             runtime.register(LibraryId::new(), 1, 1, now).err(),
+            Some(AdmissionError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_prevents_late_runtime_initialization() {
+        let registry = ProbeRuntimeRegistry::new();
+        registry
+            .shutdown()
+            .await
+            .expect("shutdown before initialization");
+
+        assert!(registry.runtime.get().is_none());
+        assert_eq!(
+            registry.get_or_init(8, 4, Instant::now()).err(),
             Some(AdmissionError::Closed)
         );
     }

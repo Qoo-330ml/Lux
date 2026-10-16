@@ -206,12 +206,22 @@ pub struct AppState {
 
 impl AppState {
     pub async fn shutdown_background_workers(&self) {
+        if let Err(error) = self.shutdown_background_workers_checked().await {
+            tracing::error!(%error, "background workers could not drain before shutdown");
+        }
+    }
+
+    pub async fn shutdown_background_workers_checked(&self) -> Result<(), String> {
+        crate::application::probe::shutdown_probe_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(metadata_reidentify) = &self.metadata_reidentify {
             metadata_reidentify.shutdown().await;
         }
         if let Some(worker) = &self.global_collection_sync_worker {
             worker.shutdown().await;
         }
+        Ok(())
     }
 
     pub fn ready(

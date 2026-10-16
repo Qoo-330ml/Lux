@@ -37,6 +37,12 @@ pub use runner::{FfprobeRunner, ProbeError};
 mod adaptive;
 mod concurrency;
 
+pub(crate) async fn shutdown_probe_runtime() -> Result<(), ProbeServiceError> {
+    concurrency::shutdown_global_runtime()
+        .await
+        .map_err(|error| ProbeServiceError::Worker(error.to_string()))
+}
+
 fn process_probe_hard_cap() -> Result<Option<usize>, String> {
     match probe_concurrency_override_from_env().map_err(|error| error.to_string())? {
         Some(value) => usize::try_from(value)
@@ -997,6 +1003,16 @@ impl MediaProbeService {
             .map_err(|error| ProbeServiceError::Worker(error.to_string()))
     }
 
+    async fn update_probe_pressure(
+        &self,
+        session: &concurrency::ProbeSession,
+    ) -> Result<(), ProbeServiceError> {
+        let pressure = self.resources.probe_pressure().await;
+        session
+            .update_pressure(pressure, Instant::now())
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))
+    }
+
     async fn probe_source_page(
         &self,
         sources: Vec<StoredMediaSourcePath>,
@@ -1032,11 +1048,20 @@ impl MediaProbeService {
                 Instant::now(),
             )
             .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+        self.update_probe_pressure(&session).await?;
         let page_worker_limit = configured_limit
             .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
             .min(LIBRARY_SOURCE_PAGE_SIZE);
         let mut pending = JoinSet::<ProbeTaskResult>::new();
         loop {
+            if runtime
+                .is_closing()
+                .map_err(|error| ProbeServiceError::Worker(error.to_string()))?
+            {
+                return Err(ProbeServiceError::Worker(
+                    "probe admission is closing".to_owned(),
+                ));
+            }
             let mut blocked_version = None;
             while pending.len() < page_worker_limit {
                 if !local_inputs.is_empty() {
@@ -1100,6 +1125,7 @@ impl MediaProbeService {
                         changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
                     }
                     _ = sleep(PROBE_ADMISSION_TICK) => {
+                        self.update_probe_pressure(&session).await?;
                         runtime
                             .tick(Instant::now())
                             .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
@@ -1126,6 +1152,7 @@ impl MediaProbeService {
                     changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
                 }
                 _ = sleep(PROBE_ADMISSION_TICK) => {
+                    self.update_probe_pressure(&session).await?;
                     runtime
                         .tick(Instant::now())
                         .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
