@@ -1,7 +1,7 @@
 use super::{
     Database, MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE, NewScanManifest, NewScanManifestDelta,
     NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
-    prune_sidecar_directories, sidecar_target_query,
+    NewScanManifestSeenFilesystemEntry, prune_sidecar_directories, sidecar_target_query,
 };
 use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
 use sqlx::Row;
@@ -1027,6 +1027,179 @@ async fn manifest_discovery_does_not_count_a_path_already_seen_in_the_generation
         .fetch_one(database.pool())
         .await?;
     assert_eq!(stored_count, 0);
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
+        )
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: "root",
+    }];
+    let manifest = NewScanManifest {
+        id: "manifest",
+        job_id: "job",
+        library_id: "lib",
+        roots: &roots,
+    };
+    database
+        .create_full_scan_manifest_job("job", "generation", false, &manifest, None)
+        .await?;
+    assert!(database.claim_scan_job("job").await?);
+
+    for (id, path, stored_fingerprint, last_seen_change_kind, is_missing) in [
+        (
+            "matched",
+            "Matched.mkv",
+            vec![1_u8; 32],
+            Some("CHANGED"),
+            0_i64,
+        ),
+        ("changed", "Changed.mkv", vec![2_u8; 32], Some("NEW"), 0_i64),
+        (
+            "missing",
+            "Missing.mkv",
+            vec![4_u8; 32],
+            Some("CHANGED"),
+            1_i64,
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+                 ) VALUES (?, 'root', ?, 'FILE', 1, 1, ?, 'old-generation', ?, ?)",
+            )
+            .bind(id)
+            .bind(path)
+            .bind(stored_fingerprint)
+            .bind(last_seen_change_kind)
+            .bind(is_missing)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let entries = [
+        NewScanManifestEntry {
+            relative_path: "Matched.mkv".to_owned(),
+            entry_kind: "FILE".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![1_u8; 32],
+        },
+        NewScanManifestEntry {
+            relative_path: "Changed.mkv".to_owned(),
+            entry_kind: "FILE".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![3_u8; 32],
+        },
+        NewScanManifestEntry {
+            relative_path: "Missing.mkv".to_owned(),
+            entry_kind: "FILE".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![4_u8; 32],
+        },
+    ];
+    let seen_filesystem_entries = [
+        NewScanManifestSeenFilesystemEntry {
+            filesystem_entry_id: "matched".to_owned(),
+            relative_path: "Matched.mkv".to_owned(),
+            fingerprint: vec![1_u8; 32],
+        },
+        NewScanManifestSeenFilesystemEntry {
+            filesystem_entry_id: "changed".to_owned(),
+            relative_path: "Changed.mkv".to_owned(),
+            fingerprint: vec![3_u8; 32],
+        },
+        NewScanManifestSeenFilesystemEntry {
+            filesystem_entry_id: "missing".to_owned(),
+            relative_path: "Missing.mkv".to_owned(),
+            fingerprint: vec![4_u8; 32],
+        },
+    ];
+    let chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "manifest",
+        job_id: "job",
+        library_root_id: "root",
+        child_directories: &[],
+        entries: &entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &seen_filesystem_entries,
+        completed_directory: Some(""),
+    };
+
+    database
+        .commit_scan_manifest_discovery_chunk(&chunk)
+        .await?;
+
+    let matched: (String, Option<String>, i64) = database
+        .query_as(
+            "SELECT last_seen_generation, last_seen_change_kind, is_missing
+             FROM filesystem_entries WHERE id = 'matched'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(matched, ("generation".to_owned(), None, 0));
+    let changed: (String, Option<String>, i64) = database
+        .query_as(
+            "SELECT last_seen_generation, last_seen_change_kind, is_missing
+             FROM filesystem_entries WHERE id = 'changed'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        changed,
+        ("old-generation".to_owned(), Some("NEW".to_owned()), 0)
+    );
+    let missing: (String, Option<String>, i64) = database
+        .query_as(
+            "SELECT last_seen_generation, last_seen_change_kind, is_missing
+             FROM filesystem_entries WHERE id = 'missing'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        missing,
+        ("old-generation".to_owned(), Some("CHANGED".to_owned()), 1)
+    );
+    let mut ledger_paths: Vec<String> = database
+        .query_scalar(
+            "SELECT relative_path FROM scan_manifest_seen_paths WHERE manifest_id = 'manifest'",
+        )
+        .fetch_all(database.pool())
+        .await?;
+    ledger_paths.sort();
+    assert_eq!(ledger_paths, ["Changed.mkv", "Missing.mkv"]);
+
     database.close().await;
     Ok(())
 }

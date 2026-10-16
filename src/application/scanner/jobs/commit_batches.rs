@@ -1,7 +1,7 @@
 use super::PendingManifestDirectoryChunk;
 use std::collections::HashSet;
 
-pub(super) const DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET: usize = 8_000;
+pub(super) const DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET: usize = 4_000;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ManifestDiscoveryTransactionBudget {
@@ -225,6 +225,7 @@ mod tests {
                     <= super::super::MANIFEST_STREAMED_INDEX_BATCH_SIZE
             );
             assert!(super::super::MANIFEST_STREAMED_INDEX_BATCH_SIZE == 8_000);
+            assert!(DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET == 4_000);
         }
     }
 

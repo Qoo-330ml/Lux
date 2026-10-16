@@ -151,6 +151,13 @@ pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize 
     }
 }
 
+pub(crate) fn manifest_seen_filesystem_update_chunk_size(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS.saturating_sub(3) / 3,
+        DatabaseBackend::Postgres => manifest_path_query_chunk_size(backend),
+    }
+}
+
 pub(crate) fn media_item_hierarchy_insert_chunk_size(backend: DatabaseBackend) -> usize {
     let (chunk_size, max_bind_parameters) = match backend {
         DatabaseBackend::Sqlite => (
@@ -174,7 +181,7 @@ mod manifest_positive_index_batch_tests {
         MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW, POSTGRES_MAX_BIND_PARAMETERS,
         SQLITE_MAX_BIND_PARAMETERS, manifest_existing_file_update_chunk_size,
         manifest_path_query_chunk_size, manifest_positive_index_insert_chunk_size,
-        media_item_hierarchy_insert_chunk_size,
+        manifest_seen_filesystem_update_chunk_size, media_item_hierarchy_insert_chunk_size,
     };
 
     #[test]
@@ -219,6 +226,19 @@ mod manifest_positive_index_batch_tests {
             manifest_path_query_chunk_size(DatabaseBackend::Postgres),
             5_000
         );
+    }
+
+    #[test]
+    fn seen_filesystem_update_batches_use_all_safe_sqlite_parameters() {
+        let sqlite_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Sqlite);
+        let postgres_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Postgres);
+
+        assert_eq!(sqlite_size, 10_921);
+        assert_eq!(
+            postgres_size,
+            manifest_path_query_chunk_size(DatabaseBackend::Postgres)
+        );
+        assert!(sqlite_size * 3 + 3 <= SQLITE_MAX_BIND_PARAMETERS);
     }
 
     #[test]
