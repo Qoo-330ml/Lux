@@ -11905,6 +11905,167 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 ffprobe 分支的验证记录：定向探测器测试通过；cargo build --locked、fmt 和全 targets/all-features Clippy 通过。该分支全量 Cargo 测试在 lib 阶段 914 passed、1 failed、23 ignored 后停止，唯一失败为旧断言期待 1/8 步长下并发 6；更新断言后该定向用例通过。之后的集成 targets 未执行，Linux 交叉构建因缺少 x86_64-linux-gnu-gcc 未启动。ARM64 模拟负载发现忙碌时重置 sleep 导致采样 tick 不推进，修复为固定 tick；后续将上调步长改为 1/4，但真实 ffprobe A/B 尚未测量。具体数据和限制见 docs/PERFORMANCE.md；本机结果不外推为 NAS/x86 性能。
 
+#### LUX-562：动态 SQL 构建与字符串分配基线
+
+范围：为 CPU 热点分析第五点建立可重复的局部基线；只使用合成输入，不访问线上 FNOS 数据库，不改变生产查询行为。后续 SQLite SQL 转交、PostgreSQL 占位符改写、有限 SQL 模板复用和业务字符串借用仍须各自登记为后续任务。
+
+设计记录：[动态 SQL 构建与字符串分配优化设计](DYNAMIC-SQL-OPTIMIZATION-PLAN.md)。基线源码为 `origin/test` 提交 `e7107bfe`。测试专用分配计数器只在 `performance-benchmarks` feature 下编译，测量窗口外关闭；普通生产构建不引入该 allocator。
+
+验收：
+
+- [x] ignored release harness 分别测量 SQLite 静态/owned SQL 适配、PostgreSQL 120 占位符改写、1/100/200/2,900/5,000 行 VALUES CTE 构造、200 条不同长度路径的 Any 参数绑定，以及 SQLite 单连接 statement-cache 冷执行/热重放/淘汰重放。
+- [x] 在 Toshiba 共享 Cargo target 上完成五轮；逐项报告分配数/字节与耗时的中位数和范围，报告 120 种 SQL 形状相对 100 条缓存容量的驻留行为。
+- [x] 记录本机架构、Rust 版本、基线提交和可复跑命令；明确结果仅是本机合成微基准，不外推 NAS/x86 性能，也不声称扫描整链路收益。
+- [x] 定向 release 基准、格式、普通构建和 all-targets/all-features Clippy 通过；普通 `cargo build --locked` 不启用测试 allocator。
+- [x] 执行并记录 `cargo test --locked --all-targets`。该命令在 `scanned_metadata` 停止：`failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净 `e7107bfe` 基线也以实际 2、预期 1 复现；`manifest_scan_indexes_poster_while_local_nfo_is_blocked` 在并行全量运行中失败，但隔离重跑通过。不将全量 Rust 门禁报告为绿。
+
+预计文件（4 个）：`src/storage/sql_query_benchmarks.rs`、`docs/PERFORMANCE.md`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。基准模块挂接已在 LUX-562 工作分支的基线 harness checkpoint 中完成。
+
+实施记录（2026-10-16）：Toshiba 已挂载，本机 `arm64`，Rust `1.97.1`。五轮 release 微基准分配数/字节稳定；静态 SQLite SQL adapter 的指针未保留、每次分配 81 字节；PostgreSQL 120 参数 adapter 为 121 次分配、1,615 字节；5,000 行 VALUES CTE 构造为 105,114 字节。五轮中位数、范围、缓存 100/120 形状驻留结果与复跑命令见 `docs/PERFORMANCE.md`。定向 ignored benchmark 通过；`cargo fmt --all -- --check`、普通 `cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 `cargo test --locked --all-targets` 的 lib target 为 929 passed、0 failed、23 ignored；随后 `scanned_metadata` 为 21 passed、2 failed，后续 targets 未执行。已在干净 `e7107bfe` worktree 复现其中的既有 poster 计数失败，并隔离复跑通过慢 NFO 测试。`tests/performance.rs` 编译时有两条既有 dead-code warning；它们不影响 Clippy，未触及相关测试代码。本任务没有生产查询行为改动，完整 Rust 全量门禁仍非绿色。
+
+#### LUX-563：SQLite SQL 直传与 PostgreSQL 占位符改写分配优化
+
+范围：优化查询入口的 SQL 字符串适配；SQLite 直接转交 SQLx `SqlStr`，PostgreSQL 仅在确有未引用 `?` 时构造改写文本，并在同一个 `String` 中写出 `$N`，不为每个编号建立临时 `String`。同步更新迁移查询入口和 LUX-562 合成基准夹具。绑定值、SQL 引号解析规则、查询语义和数据库 schema 保持不变。不在本任务实现模板缓存或 IN 分桶。
+
+预计文件（5 个）：`src/storage/repository.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite 对静态 `&str`、owned `String` 与 `Arc<str>` 保持原 SQL 缓冲区地址；对应测试先失败再通过。
+- [x] PostgreSQL 对无占位符 SQL 保留原地址；改写覆盖单双引号内问号、转义单引号和 `$10`–`$13` 多位编号。
+- [x] repository 三种查询入口及迁移查询使用新的 `SqlStr` 返回值；adapter 定向单测与 `server_id_survives_database_reopen` 通过。
+- [x] 重跑 LUX-562 release 基准，记录静态/owned SQLite adapter 与 120 参数 PostgreSQL adapter 的分配变化；其余基线项目不变。
+- [x] `cargo fmt --all -- --check`、定向测试和任务完成阶段规定的全量门禁均有明确结果；既有基线失败单独报告，不称全量测试通过。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮，安静窗口内直接复跑编译后的测试二进制。静态 SQLite adapter 为 0 allocations / 0 B，时间中位数 2 ns（2–6）；owned SQLite adapter 为 0 / 0 B，中位数 10 ns（8–13）；PostgreSQL 120 参数改写为 1 allocation / 887 B / 0 reallocations，中位数 1,304 ns（1,301–1,367）。相对 LUX-562 基线，静态 SQLite 从 1 allocation / 81 B 降为零；PostgreSQL 从 121 allocations / 1,615 B / 1 realloc 降为 1 / 887 B / 0。VALUES CTE、Any 参数绑定及 statement-cache 行为不属于本步优化，五轮结果保持在基线波动范围内。本机合成微基准不外推为 NAS/x86 或扫描整链路收益。
+
+完成门禁记录（2026-10-16）：`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 931 passed、0 failed、23 ignored；随后在 `tests/scanned_metadata.rs` 为 21 passed、2 failed 并停止，后续 targets 未执行。`failed_local_poster_insert_does_not_mark_image_stage_complete` 隔离重跑仍为实际 2、预期 1，且已在干净 `e7107bfe` 基线复现（见 LUX-562）；并行失败的 `manifest_scan_indexes_poster_while_local_nfo_is_blocked` 隔离重跑通过。全量 Rust 测试门禁明确为非绿色。
+
+#### LUX-564：有限 SQL 模板缓存基础
+
+范围：建立 storage 内部、仅供受控查询族使用的完整 SQL 模板缓存。模板键固定包含有限查询族、后端、枚举版本与形状；缓存共享最终 SQL 的 `Arc<str>`，模板生成在单个 `String` 中完成并验证绑定预算。每个查询族/后端/版本保留满批模板和最多 4 个尾批模板；总缓存文本不超过 8 MiB，另有 256 条全局应急上限。构造发生在缓存锁外，锁毒化时退回未缓存构造。此任务只实现缓存/构造器基础，不添加尚无调用者的 repository 查询入口，不改扫描查询调用点，不引入任意 SQL 字符串键、数据库 schema 或新依赖。
+
+预计文件（5 个）：`src/storage/sql_templates.rs`（新增并含单测）、`src/storage/mod.rs`、`src/storage/sql_query_benchmarks.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。首个专用 repository 查询入口在后续接入真实 filesystem 读取时一同实现。
+
+验收：
+
+- [x] 非法/越界模板形状在构造前拒绝；SQLite 与 PostgreSQL 完整 SQL 文本及绑定编号正确；实际绑定数不匹配时拒绝发布。
+- [x] 相同有限键重复/并发请求最终复用同一 `Arc<str>`；SQL 构造不在缓存锁内，毒化锁退回未缓存构造。
+- [x] 每个模板族仅保留满批与最多 4 个尾批；文本预算不超过 8 MiB、全局条目数不超过 256；超预算模板可用但不留存在缓存中。
+- [x] 基准比较缓存命中和 SQL 构造成本；实际查询入口与 query counter 在后续工作包按调用点验收。
+- [x] 定向单测、模板构造基准、格式、构建与 Clippy 有明确结果；本任务全量门禁按阶段记录失败，不称其为绿色。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮，直接复跑编译后的测试二进制。PostgreSQL 128 个路径参数（另含 root 参数）的 adapter 改写耗时中位数 1,488 ns（1,484–1,613），每次 1 allocation / 981 B / 0 reallocations；缓存命中为 16 ns（16–17）、0 allocations / 0 B；冷构造并发布为 1,192 ns（1,172–1,291）、4 allocations / 2,156 B / 0 reallocations。热命中消除了逐请求 SQL 生成和分配；冷构造仍比 adapter 快，但保留一次性构造成本。该构造微基准不包含数据库执行，不代表查询或扫描整链路收益，也不外推 NAS/x86。
+
+完成门禁记录（2026-10-16）：`cargo test --locked --lib storage::sql_templates::tests -- --test-threads=1` 为 9 passed；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 940 passed、0 failed、23 ignored，之前的若干集成 target 通过；在 `tests/libraries_api.rs` 并行运行时，`admin_can_create_list_and_add_library_root_with_csrf` 一次收到 503 `DATABASE_UNAVAILABLE`（预期 200），测试 target 因此中止。该用例隔离运行及该 target 串行运行均通过；干净 `e7107bfe` 基线的并行 target 三次也通过，候选分支之后的并行复跑通过。当前证据不足以确认这次并行失败的根因，也不足以判定为代码回归；全量门禁仍明确为非绿色，后续完成门禁需继续观察并报告，不能把未运行的后续 target 算作通过。
+
+#### LUX-565：filesystem 路径批量查询复用模板
+
+范围：将 `list_filesystem_entries_for_paths` 从每批动态 `format!`、占位符 `Vec` 和 `join` 改为 S2 的有限 SQL 模板缓存。按路径数量选 power-of-two IN 桶（超过 256 时使用现有 500 项上限），不足桶容量的末尾参数绑定 typed NULL；每批仍最多 500 条、仍发起一次查询，保留 SQL 投影、绑定顺序、root 隔离和返回 map 语义。不修改其他扫描查询族，不调整批次大小、事务或公共接口。
+
+预计文件（5 个）：`src/storage/filesystem.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验收：
+
+- [x] 1、3/4、256/257、500/501 路径数边界与缺失路径结果一致；相同相对路径在其他 root 的记录不泄漏。
+- [x] 输入 0 条路径不执行查询；1–500 条仍一次查询，501 条仍两次查询，`query_count` 与旧实现一致。
+- [x] 绑定先 root 后 paths，padding 使用 typed NULL；SQLite 实际查询通过，SQL 模板缓存命中且热路径不再拼 SQL 或分配占位符集合。
+- [x] 定向 repository 测试先红后绿；格式、构建与 Clippy 结果明确，全量门禁的失败按证据报告。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮、每轮每种构造 50,000 次。对 127 个路径，旧式 exact SQL 构造中位数 327 ns（297–551）；查询 bucket 128 后的缓存命中（含 bucket 选择）为 18 ns（18–26）。这是 SQL 构造时间对照，不包含 SQLite/SQLx 执行，也不测数据库计划或整链路；typed NULL 对执行耗时的影响留待最终阶段验证。A/B 使用 `performance-benchmarks` feature 下默认忽略的 `filesystem_path_template_construction_benchmark`。
+
+完成门禁记录（2026-10-16）：定向 `filesystem_path_reads_reuse_bucketed_templates_without_extra_queries` 为 1 passed，S2 模板单测为 10 passed；release A/B harness 为 1 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 942 passed、0 failed、23 ignored；到 `tests/libraries_api.rs` 时，13 项通过，`admin_can_create_list_and_add_library_root_with_csrf` 再次在并行运行中收到 503 `DATABASE_UNAVAILABLE`（预期 200），后续 targets 未执行。该 target 串行运行 14/14 通过；同一个失败在 S2 全量门禁中已先出现，故不能归因于 LUX-565。随后在干净基线 `e7107bfe` 按“lib target 完成后立即并行运行 `libraries_api`”复核：lib 为 929 passed、0 failed、23 ignored，`libraries_api` 为 14/14 通过；因此该 503 未能在基线复现，根因仍未查明，完整 Rust 门禁仍为非绿色。PostgreSQL 模板编号有单测覆盖，本步没有独立 PostgreSQL 实例验证实际 NULL 绑定。
+
+#### LUX-566：manifest 基线路径查询复用模板
+
+范围：将 `list_scan_manifest_filesystem_baselines` 从每批动态占位符 `Vec`、`join` 和 `format!` 改为专用有限 SQL 模板。按后端路径数量选择不小于输入数的最小 power-of-two IN 桶，超过最后一个二次幂时使用该后端现有批次上限（SQLite 2,900、PostgreSQL 5,000）；不足桶容量的路径绑定 typed NULL。每批仍按原后端上限分块并执行一次查询，保持 root 过滤、投影、绑定顺序、空输入、HashMap 结果语义和查询计数。不改 manifest 批次、事务或其他查询族。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。
+
+验收：
+
+- [x] 空输入不查询；单批、分桶两侧、SQLite 最大批次与跨批次结果和旧实现一致，缺失/重复路径不产生额外结果。
+- [x] root 隔离、完整 baseline 字段、每个 chunk 一次查询及 query counter 保持；SQLite typed NULL 实际查询通过。
+- [x] SQLite 与 PostgreSQL 模板固定参数、IN 容量、占位符编号和绑定顺序正确；容量不超过原后端批次上限。
+- [x] repository 行为测试先红后绿；SQL 构造 A/B、格式、构建与 Clippy 有明确记录，全量门禁失败按证据报告。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮、每轮每种构造 50,000 次。257 个路径的旧式精确 SQL 构造中位数 600 ns（592–918）；计算桶容量并命中 512 项模板的中位数 18 ns（18–22）。结果只包括 SQL 构造，不包括 SQLite/SQLx 执行、绑定和分配计数；大容量 NULL 绑定对数据库执行的影响留待 S7 整链路复测。A/B 使用 `performance-benchmarks` feature 下默认忽略的 `manifest_baseline_template_construction_benchmark`。
+
+完成门禁记录（2026-10-16）：`cargo test --locked --lib manifest_baseline -- --test-threads=1` 为 2 passed；`cargo test --locked --test scanning_jobs` 为 88 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 release A/B harness 均通过。`cargo test --locked --all-targets` 的 lib target 为 944 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14。随后 `tests/probe.rs` 有 20 passed、1 failed：`probe_runner_terminates_when_stderr_exceeds_the_runtime_limit` 超过测试超时；该用例隔离重跑通过，probe target 串行运行 21/21。其余后续 targets 未执行，因此完整 Rust 门禁仍记为非绿色。失败发生在本任务未修改的 probe 代码，现有证据未能确认其根因或证明基线表现。默认 all-targets 未运行 PostgreSQL 实例；PostgreSQL 模板文本和绑定编号由单测验证，运行时 PG 验证留待 S7。
+
+#### LUX-567：manifest 发现路径与 presence 模板
+
+范围：缓存 manifest 发现的旧格式/V3 known-path 查询，以及 V3 presence 更新、部分成功回读、seen-path ledger 插入的精确行数 SQL 模板。模板按后端原有路径批次上限分块，不改查询次数、语义、绑定顺序或事务。全成功更新时借用输入路径；部分成功时只将回读结果持有为 owned 字符串。支持 PostgreSQL presence update 的 35,002 个绑定，并保留 SQLite 绑定上限。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验收：
+
+- [x] SQL 模板覆盖旧格式和 V3 known-path、V3 update/readback/ledger insert；后端占位符、参数顺序、边界绑定数正确，模板复用且缓存有界。
+- [x] SQLite 行为测试覆盖 known path、更新全成功与部分成功回读、seen-path 写入、格式版本切换及计数结果；原扫描语义和 query counter 保持。
+- [x] `successfully_seen_paths` 在全成功路径借用输入，部分成功回读使用 owned 数据；无生命周期扩大或公共 API 变化。
+- [x] 定向测试、格式、构建、Clippy 与完整门禁按实际结果记录；PostgreSQL 运行时验证留至 S7。
+
+完成门禁记录（2026-10-16）：manifest SQL 模板单测 4/4、presence repository 回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 中 lib target 为 948 passed、0 failed、23 ignored，`libraries_api` 为 14/14，`probe` 为 21/21；随后 `tests/scanned_metadata.rs` 有 22 passed、1 failed，失败为 `failed_local_poster_insert_does_not_mark_image_stage_complete`。在未包含 LUX-567 的基线提交 `3b4b7325` 上串行重跑该 target，同一用例以相同断言失败（22/23），确认该失败先于本任务存在。当前分支串行 target 另有一次 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound`，该用例隔离重跑通过，基线串行 target 也通过。完整 all-targets 门禁仍为非绿色；PostgreSQL 运行时验证留待 S7。
+
+#### LUX-568：Manifest 目录 frontier SQL 模板
+
+范围：缓存 `insert_manifest_directory_frontier` 的精确行数 `VALUES` 模板，以及 `complete_manifest_directory_frontier` 的精确行数 `IN` 更新模板。沿用 `SCAN_DML_CHUNK_SIZE`、lite mode 早退、冲突忽略、`state <> 'COMPLETE'`、固定参数和绑定顺序、原 transaction 与 rows-affected 计数；不补假行、不增加查询、不调整批次或事务。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/discovery/frontier.rs`、`src/storage/sql_templates.rs`、`src/storage/jobs/tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite/PostgreSQL 模板覆盖 1/满批/尾批行数，绑定编号和顺序正确，同键复用缓存且缓存保持有界；超过现有 200 行批次上限时拒绝模板形状。
+- [x] SQLite 回归覆盖 201 个目录的跨批插入、冲突重放、完成状态及完成计数；查询次数与旧实现相同，lite mode 仍不写 frontier。
+- [x] 记录满批与尾批 SQL 构造的动态基线/模板热命中 A/B；定向测试、格式、构建、Clippy 与完整门禁按实际结果记录。PostgreSQL 运行时验证留待 S7。
+
+当前实现记录（2026-10-16）：定向模板测试 3/3、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。满批 200 行构造：INSERT 动态基线中位数 844 ns、3 次分配/7,996 B，模板热命中 23 ns、0 次分配；COMPLETE 更新基线 474 ns、3 次分配/4,234 B，模板 23 ns、0 次分配。尾批 17 行：INSERT 基线 177 ns、3 次分配/1,042 B，模板 24 ns、0 次分配；COMPLETE 基线 109 ns、3 次分配/757 B，模板 24 ns、0 次分配。五轮本机 arm64 release 数据仅代表 SQL 文本构造，不含 SQLx/SQLite 执行、扫描整链路或 NAS 性能。PostgreSQL 运行时和一次完整 all-targets 门禁统一留至 S7；本工作包期间启动的重复 all-targets 测试按用户要求中断，未形成新的全量结果。
+
+#### LUX-569：Manifest delta SQL 模板
+
+范围：缓存 delta 基线冲突校验 CTE、delta INSERT/RETURNING、finalizer state/error CASE 更新三个精确行数模板。沿用 100 行 chunk、同一 transaction、校验与冲突分类、ON CONFLICT DO NOTHING、RETURNING 计数、PENDING CAS、affected-row guard、attempt_count、参数顺序和批次边界；CASE SQL 不再通过克隆整段 `String` 生成第二份。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/diff/insert.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`src/storage/sql_templates.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite/PostgreSQL 模板覆盖首行、满批与尾批，绑定编号和顺序一致，缓存复用且尾部形状有界，超过 100 行拒绝模板。
+- [x] 现有 SQLite 回归覆盖 250 行跨批 delta、同值重放、冲突重试、malformed ADD；apply 覆盖 bounded batch、增量写入 CAS、失败回滚和 cancel/resume，attempt_count 与计数不变。
+- [x] 记录满批/尾批 SQL 构造 A/B 与定向测试、格式、构建、Clippy 的实际结果；完整门禁和 PostgreSQL 运行时验证留至 S7。
+
+结果（2026-10-16）：verify/INSERT/finalize 使用精确行数模板，fallback、bind 顺序和事务边界保持。模板单测 2/2、250 行 delta 幂等/冲突回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，full 100 行 2,000 次、tail 17 行 5,000 次）结果为平均单次构造时间：verify 满批动态 1,056 ns（3 alloc/6,364 B，另 1 realloc/4,932 B），模板命中 57 ns（0 alloc）；INSERT 满批 468 ns（3/4,822 B，另 2 realloc/8,409 B），模板 24 ns（0 alloc）；finalize 满批 878 ns（6/6,838 B，另 3 realloc/10,192 B），模板 24 ns（0 alloc）。尾批 verify 156 ns（3/3,127 B）→25 ns，INSERT 177 ns（3/1,336 B，另 1 realloc/1,248 B）→30 ns，finalize 565 ns（6/1,609 B，另 1 realloc/1,084 B）→45 ns，模板命中均 0 alloc。该 A/B 仅测 SQL 文本构造，不含数据库执行、扫描整链路或 NAS。完整 all-targets 与实际 PostgreSQL 运行时验证留至 S7。
+
+#### LUX-570：Manifest 正向索引借用媒体文件记录
+
+范围：已成功 claim 的 ADD 电影/剧集文件以 `&NewMovieFile` / `&NewEpisodeFile` 传入媒体物化与预取 helper，移除 `indexes.rs` 中整条文件记录的 `.clone()`。已有 owned-slice 调用方通过一次引用列表适配继续使用；不改变 claim 胜者、item/source 归并、层级关系、事务边界或公共 API。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/indexes.rs`、`src/storage/media.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] 正向索引只收集已 claim 的借用 Movie/Episode 记录；媒体 helper 内部消费引用列表，不复制文件记录中的 String 和 fingerprint Vec。
+- [x] SQLite 回归覆盖 claim 竞态、重复电影来源/文件夹与 provider ID 合并、剧集/季度/分集层级及默认来源选择。
+- [x] release 对比记录 clone 和引用列表的分配次数/字节；定向测试、格式、构建、Clippy 按实际结果记录。完整门禁与 PostgreSQL 运行时验证留至 S7。
+
+结果（2026-10-17）：正向索引直接传入 Movie/Episode 借用记录，原有 owned-slice helper 通过一次 `Vec<&File>` 轻量适配，业务 SQL、排序和事务行为不变。借用 Movie helper 1/1、借用 Episode hierarchy helper 1/1 通过。`tests/scanning_jobs.rs` 目标为 87 passed、1 failed；claim race、重复电影来源/provider ID、streamed positive index 等相关用例通过，唯一失败 `manifest_scan_queues_attachment_removal_only_after_root_confirmation` 报 SQLite `database is locked`。按用户要求未隔离重跑。`cargo build --locked`、fmt、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，256 records、100 次）中 Movie clone 为 73,408 ns、3,073 alloc/150,928 B；引用列表 70 ns、1 alloc/2,048 B。Episode clone 为 97,378 ns、3,841 alloc/204,660 B；引用列表 42 ns、1 alloc/2,048 B。测量只比较记录集合构造，不含 SQLite 或扫描整链路。完整 all-targets 与 PostgreSQL 运行时验证留至 S7。
+
+#### LUX-571：动态 SQL 优化完成门禁与综合记录
+
+范围：完成 S0–S6 后进行一次 Rust 全目标门禁，确认 PostgreSQL 测试环境，汇总 A+C 方案的局部性能证据与未覆盖边界。没有新增代码改动。
+
+预计文件（3 个）：`docs/PERFORMANCE.md`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。
+
+验收：
+
+- [x] 记录 A+C 结论、B 的取舍、已完成的分项 A/B 和本机/微基准测量边界。
+- [x] 只运行一次最终 `cargo test --locked --all-targets`，如实记录失败 target 和未执行的后续 targets。
+- [x] 检查并记录 PostgreSQL runtime 可用性；无本地测试实例时标记未验证，不将 ignored tests 视为通过。
+- [ ] 完整 Rust all-targets 门禁全部通过。
+- [x] 实际 PostgreSQL runtime 集成测试通过。
+
+结果（2026-10-17）：最终 Rust 命令使用 `/Volumes/Toshiba/mywork/Lux/target`，运行一次后在 `tests/scanned_metadata.rs` 以 exit 101 结束。lib 为 955 passed、0 failed、23 ignored；该集成 target 为 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1；此前已在基线 `3b4b7325` 重现）与 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；此次不重跑）。此前完成的 `libraries_api` 14/14、`probe` 21/21；其余后续 targets 未执行。S6 代码后的 `cargo build --locked`、`cargo fmt --all -- --check` 和全 targets/all features Clippy 已通过，文档收尾未重复运行。PostgreSQL 使用只绑定 `127.0.0.1:55432` 的临时 16 版容器运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database -- --ignored --test-threads=1`，18/18 通过；随后容器已删除且端口不再监听。完整 Rust 门禁仍未通过；PostgreSQL runtime 项已完成。局部性能数据仅证明 SQL 文本/记录集合构造下降，不代表扫描整链路或生产 CPU 收益。
+
 
 ## 29. 参考资料
 

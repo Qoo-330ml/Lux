@@ -1,4 +1,7 @@
 use super::*;
+use crate::storage::sql_templates::{
+    filesystem_entries_by_paths_capacity, filesystem_entry_records_by_paths_template,
+};
 
 impl Database {
     pub(crate) async fn mark_filesystem_entry_missing_by_path(
@@ -65,29 +68,52 @@ impl Database {
             if chunk.is_empty() {
                 continue;
             }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
-                        fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
-                        fe.is_missing, ms.item_id,
-                        CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
-                            AS parent_identity_key,
-                        item.item_type AS item_type,
-                        CASE WHEN item.removed_at IS NULL THEN item.identity_key END
-                            AS item_identity_key,
-                        series.provider_ids_json AS series_provider_ids_json
-                 FROM filesystem_entries fe
-                 LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
-                 LEFT JOIN media_items item ON item.id = ms.item_id
-                 LEFT JOIN media_items parent ON parent.id = item.parent_id
-                 LEFT JOIN media_items series ON series.id = item.series_id
-                 WHERE fe.library_root_id = ? AND fe.relative_path IN ({placeholders})"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id);
+            let template = filesystem_entries_by_paths_capacity(self.backend, chunk.len())
+                .and_then(|capacity| {
+                    filesystem_entry_records_by_paths_template(
+                        &self.filesystem_path_templates,
+                        self.backend,
+                        capacity,
+                    )
+                    .map(|sql| (capacity, sql))
+                });
+            let (mut statement, padding_count) = match template {
+                Ok((capacity, sql)) => (
+                    self.query(sqlx::AssertSqlSafe(sql)).bind(library_root_id),
+                    usize::from(capacity).saturating_sub(chunk.len()),
+                ),
+                Err(_) => {
+                    let placeholders = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                                fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
+                                fe.is_missing, ms.item_id,
+                                CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                                    AS parent_identity_key,
+                                item.item_type AS item_type,
+                                CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                                    AS item_identity_key,
+                                series.provider_ids_json AS series_provider_ids_json
+                         FROM filesystem_entries fe
+                         LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                         LEFT JOIN media_items item ON item.id = ms.item_id
+                         LEFT JOIN media_items parent ON parent.id = item.parent_id
+                         LEFT JOIN media_items series ON series.id = item.series_id
+                         WHERE fe.library_root_id = ? AND fe.relative_path IN ({placeholders})"
+                    );
+                    (
+                        self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id),
+                        0,
+                    )
+                }
+            };
             for relative_path in chunk {
                 statement = statement.bind(relative_path);
+            }
+            for _ in 0..padding_count {
+                statement = statement.bind(None::<String>);
             }
             let rows =
                 statement
@@ -504,4 +530,75 @@ impl Database {
         }
         Ok(missing_entries)
     }
+}
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+fn legacy_filesystem_entry_records_query(path_count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", path_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT fe.id, fe.relative_path, fe.entry_kind, fe.size, fe.modified_at,
+                fe.device, fe.inode, fe.fingerprint, fe.last_seen_generation,
+                fe.is_missing, ms.item_id,
+                CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                    AS parent_identity_key,
+                item.item_type AS item_type,
+                CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                    AS item_identity_key,
+                series.provider_ids_json AS series_provider_ids_json
+         FROM filesystem_entries fe
+         LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+         LEFT JOIN media_items item ON item.id = ms.item_id
+         LEFT JOIN media_items parent ON parent.id = item.parent_id
+         LEFT JOIN media_items series ON series.id = item.series_id
+         WHERE fe.library_root_id = ? AND fe.relative_path IN ({placeholders})"
+    )
+}
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+#[test]
+#[ignore = "run explicitly to compare exact filesystem SQL construction with cached buckets"]
+fn filesystem_path_template_construction_benchmark() {
+    use std::{hint::black_box, time::Instant};
+
+    let cache = SqlTemplateCache::default();
+    let path_count = 127;
+    let capacity = filesystem_entries_by_paths_capacity(DatabaseBackend::Sqlite, path_count)
+        .expect("valid filesystem path count");
+    assert_eq!(capacity, 128);
+    let cached =
+        filesystem_entry_records_by_paths_template(&cache, DatabaseBackend::Sqlite, capacity)
+            .expect("cached filesystem path template");
+    assert!(cached.contains("WHERE fe.library_root_id = ? AND fe.relative_path IN ("));
+    assert!(legacy_filesystem_entry_records_query(path_count).contains("IN ("));
+
+    let iterations = 50_000;
+    let mut exact_rounds = Vec::with_capacity(5);
+    let mut cached_rounds = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(legacy_filesystem_entry_records_query(path_count));
+        }
+        exact_rounds.push(started.elapsed().as_nanos() / iterations);
+
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let capacity =
+                filesystem_entries_by_paths_capacity(DatabaseBackend::Sqlite, path_count)
+                    .expect("valid filesystem path count");
+            black_box(
+                filesystem_entry_records_by_paths_template(
+                    &cache,
+                    DatabaseBackend::Sqlite,
+                    capacity,
+                )
+                .expect("cached filesystem path template"),
+            );
+        }
+        cached_rounds.push(started.elapsed().as_nanos() / iterations);
+    }
+    println!("filesystem_exact_sql_ns_per_op={exact_rounds:?}");
+    println!("filesystem_cached_bucket_sql_ns_per_op={cached_rounds:?}");
 }

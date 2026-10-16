@@ -863,6 +863,149 @@ async fn scan_manifest_creation_is_atomic_and_idempotent() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn manifest_directory_frontier_templates_preserve_insert_and_completion_counts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
+        )
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: "root",
+    }];
+    let manifest = NewScanManifest {
+        id: "manifest",
+        job_id: "job",
+        library_id: "lib",
+        roots: &roots,
+    };
+    database
+        .create_full_scan_manifest_job("job", "generation", false, &manifest, None)
+        .await?;
+    assert!(database.claim_scan_job("job").await?);
+
+    let child_paths = (0..201)
+        .map(|index| format!("child-{index:03}"))
+        .collect::<Vec<_>>();
+    let lite_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "manifest",
+        job_id: "job",
+        library_root_id: "root",
+        child_directories: &child_paths,
+        entries: &[],
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&lite_chunk)
+            .await?,
+        0
+    );
+    let lite_child_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM scan_manifest_directories
+             WHERE manifest_id = 'manifest' AND relative_path <> ''",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        lite_child_count, 0,
+        "lite mode must not persist frontier rows"
+    );
+    let lite_root_state: String = database
+        .query_scalar(
+            "SELECT state FROM scan_manifest_directories
+             WHERE manifest_id = 'manifest' AND relative_path = ''",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        lite_root_state, "PENDING",
+        "lite mode must skip completion DML"
+    );
+    database
+        .query("UPDATE scan_manifests SET discovery_mode = 'PERSISTED' WHERE id = 'manifest'")
+        .execute(database.pool())
+        .await?;
+
+    let chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "manifest",
+        job_id: "job",
+        library_root_id: "root",
+        child_directories: &child_paths,
+        entries: &[],
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: Some(""),
+    };
+
+    database.reset_query_count();
+    let first_observed_file_count = database
+        .commit_scan_manifest_discovery_chunk(&chunk)
+        .await?;
+    let first_query_count = database.query_count();
+    assert_eq!(first_observed_file_count, 0);
+    assert_eq!(first_query_count, 7);
+
+    let discovered_child_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM scan_manifest_directories
+             WHERE manifest_id = 'manifest' AND relative_path <> ''",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(discovered_child_count, 201);
+    let root_state: String = database
+        .query_scalar(
+            "SELECT state FROM scan_manifest_directories
+             WHERE manifest_id = 'manifest' AND relative_path = ''",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(root_state, "COMPLETE");
+    let stored = database
+        .get_scan_manifest("manifest")
+        .await?
+        .ok_or("manifest disappeared after frontier commit")?;
+    assert_eq!(stored.discovered_directory_count, 202);
+    assert_eq!(stored.completed_directory_count, 1);
+
+    database.reset_query_count();
+    let replay_observed_file_count = database
+        .commit_scan_manifest_discovery_chunk(&chunk)
+        .await?;
+    let replay_query_count = database.query_count();
+    assert_eq!(replay_query_count, first_query_count);
+    assert_eq!(replay_observed_file_count, 0);
+    let replayed = database
+        .get_scan_manifest("manifest")
+        .await?
+        .ok_or("manifest disappeared after frontier replay")?;
+    assert_eq!(replayed.discovered_directory_count, 202);
+    assert_eq!(replayed.completed_directory_count, 1);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn manifest_discovery_chunk_does_not_complete_directory_after_cancel_request()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

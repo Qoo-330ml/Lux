@@ -1,4 +1,7 @@
 mod repository;
+// LUX-564 lands the cache foundation before S3a adds its first production caller.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod sql_templates;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetadataAutoMatchPolicy {

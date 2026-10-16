@@ -10,6 +10,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use super::sql_templates::SqlTemplateCache;
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
@@ -368,6 +369,7 @@ pub struct Database {
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
+    filesystem_path_templates: Arc<SqlTemplateCache>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -512,6 +514,7 @@ impl Database {
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
+            filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -935,10 +938,7 @@ impl Database {
     ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
-        sqlx::query(sqlx::AssertSqlSafe(adapt_sql_for_backend(
-            self.backend,
-            sql,
-        )))
+        sqlx::query(adapt_sql_for_backend(self.backend, sql))
     }
 
     fn query_as<O>(
@@ -950,10 +950,7 @@ impl Database {
     {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
-        sqlx::query_as(sqlx::AssertSqlSafe(adapt_sql_for_backend(
-            self.backend,
-            sql,
-        )))
+        sqlx::query_as(adapt_sql_for_backend(self.backend, sql))
     }
 
     fn query_scalar<O>(
@@ -965,10 +962,7 @@ impl Database {
     {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
-        sqlx::query_scalar(sqlx::AssertSqlSafe(adapt_sql_for_backend(
-            self.backend,
-            sql,
-        )))
+        sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
 }
 
@@ -3980,17 +3974,25 @@ impl std::fmt::Display for StorageError {
     }
 }
 
-fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -> String {
+fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -> sqlx::SqlStr {
     let sql = sql.into_sql_str();
+    let source = sql.as_str();
     if backend == DatabaseBackend::Sqlite {
-        return sql.as_str().to_owned();
+        return sql;
     }
 
-    let mut adapted = String::with_capacity(sql.as_str().len() + 8);
+    let placeholder_count = source.bytes().filter(|byte| *byte == b'?').count();
+    if placeholder_count == 0 {
+        return sql;
+    }
+
+    let placeholder_width = placeholder_count.ilog10() as usize + 1;
+    let estimated_growth = placeholder_count.saturating_mul(placeholder_width + 1);
+    let mut adapted = String::with_capacity(source.len().saturating_add(estimated_growth));
     let mut parameter_index = 1;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
-    let mut characters = sql.as_str().chars().peekable();
+    let mut characters = source.chars().peekable();
     while let Some(character) = characters.next() {
         match character {
             '\'' if !in_double_quote => {
@@ -4009,13 +4011,14 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
             }
             '?' if !in_single_quote && !in_double_quote => {
                 adapted.push('$');
-                adapted.push_str(&parameter_index.to_string());
+                // Formatting into String cannot fail, but the formatting API returns Result.
+                let _ = std::fmt::Write::write_fmt(&mut adapted, format_args!("{parameter_index}"));
                 parameter_index += 1;
             }
             _ => adapted.push(character),
         }
     }
-    adapted
+    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(adapted))
 }
 
 impl std::error::Error for StorageError {
@@ -4033,3 +4036,7 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 #[path = "repository_tests.rs"]
 mod repository_tests;
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+#[path = "sql_query_benchmarks.rs"]
+mod sql_query_benchmarks;

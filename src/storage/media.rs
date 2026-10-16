@@ -51,10 +51,10 @@ struct FileIndexWriteOptions {
     batch_size: usize,
 }
 
-struct MovieParentFolderBatch<'a> {
+struct MovieParentFolderBatch<'a, 'file> {
     library_id: &'a str,
     library_root_id: &'a str,
-    files: &'a [NewMovieFile],
+    files: &'a [&'file NewMovieFile],
     folder_cache: &'a mut HashMap<String, String>,
     touched_folders: &'a mut HashSet<String>,
     batch_size: usize,
@@ -1335,7 +1335,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
-        files: &[NewMovieFile],
+        files: &[&NewMovieFile],
         batch_size: usize,
     ) -> Result<HashMap<(String, Option<i64>), PrefetchedMovieItem>, StorageError> {
         let mut sort_titles = files
@@ -1429,7 +1429,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_root_id: &str,
-        files: &[NewMovieFile],
+        files: &[&NewMovieFile],
         batch_size: usize,
     ) -> Result<HashMap<String, String>, StorageError> {
         let mut identity_keys = HashSet::new();
@@ -1501,7 +1501,7 @@ impl Database {
     async fn insert_missing_movie_parent_folders_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        batch: MovieParentFolderBatch<'_>,
+        batch: MovieParentFolderBatch<'_, '_>,
     ) -> Result<(), StorageError> {
         let MovieParentFolderBatch {
             library_id,
@@ -1679,7 +1679,7 @@ impl Database {
     async fn refresh_existing_movie_parent_folders_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        batch: MovieParentFolderBatch<'_>,
+        batch: MovieParentFolderBatch<'_, '_>,
     ) -> Result<(), StorageError> {
         let MovieParentFolderBatch {
             library_id,
@@ -1985,6 +1985,7 @@ impl Database {
         generation: &str,
         files: &[NewMovieFile],
     ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
         self.insert_movie_files_batch_in_transaction_inner(
             transaction,
             FileIndexScope {
@@ -1992,7 +1993,7 @@ impl Database {
                 library_root_id,
                 generation,
             },
-            files,
+            &files,
             FileIndexWriteOptions {
                 insert_filesystem_entries: true,
                 batch_size: BATCH_INSERT_CHUNK_SIZE,
@@ -2008,6 +2009,31 @@ impl Database {
         library_root_id: &str,
         generation: &str,
         files: &[NewMovieFile],
+    ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
+        self.insert_movie_files_batch_in_transaction_inner(
+            transaction,
+            FileIndexScope {
+                library_id,
+                library_root_id,
+                generation,
+            },
+            &files,
+            FileIndexWriteOptions {
+                insert_filesystem_entries: false,
+                batch_size: super::manifest_positive_index_insert_chunk_size(self.backend()),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_movie_files_without_filesystem_entries_refs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[&NewMovieFile],
     ) -> Result<usize, StorageError> {
         self.insert_movie_files_batch_in_transaction_inner(
             transaction,
@@ -2029,7 +2055,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         scope: FileIndexScope<'_>,
-        files: &[NewMovieFile],
+        files: &[&NewMovieFile],
         options: FileIndexWriteOptions,
     ) -> Result<usize, StorageError> {
         let FileIndexScope {
@@ -2400,6 +2426,7 @@ impl Database {
         generation: &str,
         files: &[NewEpisodeFile],
     ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
         self.insert_episode_files_batch_in_transaction_inner(
             transaction,
             FileIndexScope {
@@ -2407,7 +2434,7 @@ impl Database {
                 library_root_id,
                 generation,
             },
-            files,
+            &files,
             FileIndexWriteOptions {
                 insert_filesystem_entries: true,
                 batch_size: BATCH_INSERT_CHUNK_SIZE,
@@ -2423,6 +2450,31 @@ impl Database {
         library_root_id: &str,
         generation: &str,
         files: &[NewEpisodeFile],
+    ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
+        self.insert_episode_files_batch_in_transaction_inner(
+            transaction,
+            FileIndexScope {
+                library_id,
+                library_root_id,
+                generation,
+            },
+            &files,
+            FileIndexWriteOptions {
+                insert_filesystem_entries: false,
+                batch_size: super::manifest_positive_index_insert_chunk_size(self.backend()),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_episode_files_without_filesystem_entries_refs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[&NewEpisodeFile],
     ) -> Result<usize, StorageError> {
         self.insert_episode_files_batch_in_transaction_inner(
             transaction,
@@ -2444,7 +2496,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         scope: FileIndexScope<'_>,
-        files: &[NewEpisodeFile],
+        files: &[&NewEpisodeFile],
         options: FileIndexWriteOptions,
     ) -> Result<usize, StorageError> {
         let FileIndexScope {

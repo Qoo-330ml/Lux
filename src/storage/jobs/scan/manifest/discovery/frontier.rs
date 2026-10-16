@@ -1,4 +1,7 @@
 use super::*;
+use crate::storage::sql_templates::{
+    manifest_directory_frontier_complete_template, manifest_directory_frontier_insert_template,
+};
 
 impl Database {
     pub(super) async fn insert_manifest_directory_frontier(
@@ -17,16 +20,26 @@ impl Database {
             if paths.is_empty() {
                 continue;
             }
-            let values = std::iter::repeat_n("(?, ?, ?, 'PENDING')", paths.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "INSERT INTO scan_manifest_directories (
-                     manifest_id, library_root_id, relative_path, state
-                 ) VALUES {values}
-                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+            let template = manifest_directory_frontier_insert_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                paths.len(),
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = match template {
+                Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let values = std::iter::repeat_n("(?, ?, ?, 'PENDING')", paths.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "INSERT INTO scan_manifest_directories (
+                             manifest_id, library_root_id, relative_path, state
+                         ) VALUES {values}
+                         ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+                    );
+                    self.query(sqlx::AssertSqlSafe(query))
+                }
+            };
             for path in paths {
                 statement = statement
                     .bind(chunk.manifest_id)
@@ -63,19 +76,28 @@ impl Database {
         }
 
         for directories in completed_directories.chunks(SCAN_DML_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat_n("?", directories.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "UPDATE scan_manifest_directories
-                 SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
-                 WHERE manifest_id = ? AND library_root_id = ? AND state <> 'COMPLETE'
-                   AND relative_path IN ({placeholders})"
+            let template = manifest_directory_frontier_complete_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                directories.len(),
             );
-            let mut statement = self
-                .query(sqlx::AssertSqlSafe(query))
-                .bind(chunk.manifest_id)
-                .bind(chunk.library_root_id);
+            let mut statement = match template {
+                Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let placeholders = std::iter::repeat_n("?", directories.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "UPDATE scan_manifest_directories
+                         SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
+                         WHERE manifest_id = ? AND library_root_id = ? AND state <> 'COMPLETE'
+                           AND relative_path IN ({placeholders})"
+                    );
+                    self.query(sqlx::AssertSqlSafe(query))
+                }
+            }
+            .bind(chunk.manifest_id)
+            .bind(chunk.library_root_id);
             for directory in directories {
                 statement = statement.bind(*directory);
             }

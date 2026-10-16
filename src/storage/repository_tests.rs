@@ -10217,6 +10217,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -11682,6 +11683,388 @@ async fn media_source_library_page_respects_limit_and_offset() {
 }
 
 #[tokio::test]
+async fn filesystem_path_reads_reuse_bucketed_templates_without_extra_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Filesystem path templates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_root_path = temp_dir.path().join("first-media-root");
+    let other_root_path = temp_dir.path().join("other-media-root");
+    tokio::fs::create_dir_all(&first_root_path)
+        .await
+        .expect("first media root");
+    tokio::fs::create_dir_all(&other_root_path)
+        .await
+        .expect("other media root");
+    let library_service = LibraryService::new(database.clone());
+    let first_root = library_service
+        .add_root(
+            library.id,
+            first_root_path.to_str().expect("UTF-8 first media root"),
+        )
+        .await
+        .expect("first library root")
+        .root;
+    let other_root = library_service
+        .add_root(
+            library.id,
+            other_root_path.to_str().expect("UTF-8 other media root"),
+        )
+        .await
+        .expect("other library root")
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let other_root_id = other_root.id.to_string();
+    for (entry_id, root_id, path) in [
+        (
+            "filesystem-template-first",
+            first_root_id.as_str(),
+            "first.mkv",
+        ),
+        (
+            "filesystem-template-last",
+            first_root_id.as_str(),
+            "last.mkv",
+        ),
+        (
+            "filesystem-template-other-root",
+            other_root_id.as_str(),
+            "first.mkv",
+        ),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                device: None,
+                inode: None,
+                fingerprint: b"fingerprint",
+                last_seen_generation: "filesystem-template-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+
+    database.reset_query_count();
+    let empty = database
+        .list_filesystem_entries_for_paths(&first_root_id, &[])
+        .await
+        .expect("empty path lookup");
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 0);
+
+    database.reset_query_count();
+    let one_path = database
+        .list_filesystem_entries_for_paths(&first_root_id, &["first.mkv".to_owned()])
+        .await
+        .expect("one path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 1);
+    assert_eq!(one_path["first.mkv"].id, "filesystem-template-first");
+
+    database.reset_query_count();
+    let three_paths = database
+        .list_filesystem_entries_for_paths(
+            &first_root_id,
+            &[
+                "first.mkv".to_owned(),
+                "missing-middle.mkv".to_owned(),
+                "last.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("three path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(three_paths.len(), 2);
+    assert_eq!(three_paths["first.mkv"].id, "filesystem-template-first");
+    assert_eq!(three_paths["last.mkv"].id, "filesystem-template-last");
+
+    database.reset_query_count();
+    let four_paths = database
+        .list_filesystem_entries_for_paths(
+            &first_root_id,
+            &[
+                "first.mkv".to_owned(),
+                "missing-one.mkv".to_owned(),
+                "missing-two.mkv".to_owned(),
+                "last.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("four path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(four_paths.len(), 2);
+
+    database.reset_query_count();
+    let other_root_entry = database
+        .list_filesystem_entries_for_paths(&other_root_id, &["first.mkv".to_owned()])
+        .await
+        .expect("same relative path in other root");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        other_root_entry["first.mkv"].id,
+        "filesystem-template-other-root"
+    );
+
+    let paths_with_matches_at = |count: usize, first: usize, last: usize| {
+        let mut paths = (0..count)
+            .map(|index| format!("missing-{index}.mkv"))
+            .collect::<Vec<_>>();
+        paths[first] = "first.mkv".to_owned();
+        paths[last] = "last.mkv".to_owned();
+        paths
+    };
+
+    for (count, first, last, cached_shapes) in
+        [(256, 0, 255, 3), (257, 0, 256, 4), (500, 0, 499, 4)]
+    {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, first, last);
+        let entries = database
+            .list_filesystem_entries_for_paths(&first_root_id, &paths)
+            .await
+            .expect("bucket boundary lookup");
+        assert_eq!(database.query_count(), 1, "path_count={count}");
+        assert_eq!(
+            database.filesystem_path_templates.entry_count(),
+            cached_shapes
+        );
+        assert_eq!(entries.len(), 2, "path_count={count}");
+    }
+
+    database.reset_query_count();
+    let mut paths = (0..501)
+        .map(|index| format!("missing-{index}.mkv"))
+        .collect::<Vec<_>>();
+    paths[499] = "first.mkv".to_owned();
+    paths[500] = "last.mkv".to_owned();
+    let entries = database
+        .list_filesystem_entries_for_paths(&first_root_id, &paths)
+        .await
+        .expect("cross batch lookup");
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 4);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries["first.mkv"].id, "filesystem-template-first");
+    assert_eq!(entries["last.mkv"].id, "filesystem-template-last");
+    database.close().await;
+}
+
+#[tokio::test]
+async fn manifest_baseline_reads_reuse_bucketed_templates_without_extra_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Manifest baseline templates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_root_path = temp_dir.path().join("first-media-root");
+    let other_root_path = temp_dir.path().join("other-media-root");
+    tokio::fs::create_dir_all(&first_root_path)
+        .await
+        .expect("first media root");
+    tokio::fs::create_dir_all(&other_root_path)
+        .await
+        .expect("other media root");
+    let library_service = LibraryService::new(database.clone());
+    let first_root = library_service
+        .add_root(
+            library.id,
+            first_root_path.to_str().expect("UTF-8 first media root"),
+        )
+        .await
+        .expect("first library root")
+        .root;
+    let other_root = library_service
+        .add_root(
+            library.id,
+            other_root_path.to_str().expect("UTF-8 other media root"),
+        )
+        .await
+        .expect("other library root")
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let other_root_id = other_root.id.to_string();
+    for (entry_id, root_id, path, size, fingerprint) in [
+        (
+            "manifest-baseline-first-root",
+            first_root_id.as_str(),
+            "same.mkv",
+            17,
+            b"first-fingerprint".as_slice(),
+        ),
+        (
+            "manifest-baseline-last-root",
+            first_root_id.as_str(),
+            "last.mkv",
+            23,
+            b"last-fingerprint".as_slice(),
+        ),
+        (
+            "manifest-baseline-other-root",
+            other_root_id.as_str(),
+            "same.mkv",
+            99,
+            b"other-fingerprint".as_slice(),
+        ),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size,
+                modified_at: size + 100,
+                device: None,
+                inode: None,
+                fingerprint,
+                last_seen_generation: "manifest-baseline-template-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+
+    database.reset_query_count();
+    let empty = database
+        .list_scan_manifest_filesystem_baselines(&first_root_id, &[])
+        .await
+        .expect("empty baseline lookup");
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 0);
+
+    database.reset_query_count();
+    let one_path = database
+        .list_scan_manifest_filesystem_baselines(&first_root_id, &["same.mkv".to_owned()])
+        .await
+        .expect("one path baseline lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 1);
+    assert_eq!(one_path.len(), 1);
+    assert_eq!(one_path["same.mkv"].id, "manifest-baseline-first-root");
+    assert_eq!(one_path["same.mkv"].size, 17);
+    assert_eq!(one_path["same.mkv"].modified_at, 117);
+    assert_eq!(
+        one_path["same.mkv"].fingerprint.as_deref(),
+        Some(b"first-fingerprint".as_slice())
+    );
+
+    database.reset_query_count();
+    let three_paths = database
+        .list_scan_manifest_filesystem_baselines(
+            &first_root_id,
+            &[
+                "same.mkv".to_owned(),
+                "same.mkv".to_owned(),
+                "missing.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("duplicate and missing path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(three_paths.len(), 1);
+    assert_eq!(three_paths["same.mkv"].id, "manifest-baseline-first-root");
+
+    database.reset_query_count();
+    let four_paths = database
+        .list_scan_manifest_filesystem_baselines(
+            &first_root_id,
+            &[
+                "same.mkv".to_owned(),
+                "last.mkv".to_owned(),
+                "missing-one.mkv".to_owned(),
+                "missing-two.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("full four-path bucket lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(four_paths.len(), 2);
+
+    database.reset_query_count();
+    let other_root_entry = database
+        .list_scan_manifest_filesystem_baselines(&other_root_id, &["same.mkv".to_owned()])
+        .await
+        .expect("same relative path in another root");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        other_root_entry["same.mkv"].id,
+        "manifest-baseline-other-root"
+    );
+
+    let paths_with_matches_at = |count: usize, first: usize, last: usize| {
+        let mut paths = (0..count)
+            .map(|index| format!("missing-{index}.mkv"))
+            .collect::<Vec<_>>();
+        paths[first] = "same.mkv".to_owned();
+        paths[last] = "last.mkv".to_owned();
+        paths
+    };
+
+    for (count, first, last, expected_shapes) in
+        [(256, 0, 255, 3), (257, 0, 256, 4), (2_900, 0, 2_899, 5)]
+    {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, first, last);
+        let baselines = database
+            .list_scan_manifest_filesystem_baselines(&first_root_id, &paths)
+            .await
+            .expect("manifest baseline bucket boundary lookup");
+        assert_eq!(database.query_count(), 1, "path_count={count}");
+        assert_eq!(
+            database.filesystem_path_templates.entry_count(),
+            expected_shapes,
+            "path_count={count}"
+        );
+        assert_eq!(baselines.len(), 2, "path_count={count}");
+    }
+
+    for (count, expected_queries) in [(2_901, 2), (5_801, 3)] {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, 0, count - 1);
+        let baselines = database
+            .list_scan_manifest_filesystem_baselines(&first_root_id, &paths)
+            .await
+            .expect("manifest baseline cross-chunk lookup");
+        assert_eq!(
+            database.query_count(),
+            expected_queries,
+            "path_count={count}"
+        );
+        assert_eq!(baselines.len(), 2, "path_count={count}");
+        assert_eq!(
+            baselines["same.mkv"].id, "manifest-baseline-first-root",
+            "path_count={count}"
+        );
+        assert_eq!(
+            baselines["last.mkv"].id, "manifest-baseline-last-root",
+            "path_count={count}"
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
 async fn subtitle_stream_query_is_source_scoped_and_paginated() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -11974,6 +12357,234 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
 }
 
 #[tokio::test]
+async fn manifest_movie_materialization_accepts_borrowed_records_and_reuses_item() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let files = [
+        NewMovieFile {
+            filesystem_entry_id: "borrowed-entry-1".to_owned(),
+            source_id: "borrowed-source-1".to_owned(),
+            relative_path: "Movie/Movie.2024.mkv".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![1],
+            title: "Movie".to_owned(),
+            sort_title: "movie".to_owned(),
+            original_title: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: None,
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: None,
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        },
+        NewMovieFile {
+            filesystem_entry_id: "borrowed-entry-2".to_owned(),
+            source_id: "borrowed-source-2".to_owned(),
+            relative_path: "Movie/Movie.2024.Directors.Cut.mkv".to_owned(),
+            size: 2,
+            modified_at: 2,
+            device: None,
+            inode: None,
+            fingerprint: vec![2],
+            title: "Movie".to_owned(),
+            sort_title: "movie".to_owned(),
+            original_title: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: Some(r#"{"tmdb":"1"}"#.to_owned()),
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: Some("Director's Cut".to_owned()),
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        },
+    ];
+    for file in &files {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+                 ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, 'generation', 'NEW', 0)",
+            )
+            .bind(&file.filesystem_entry_id)
+            .bind(&root_id)
+            .bind(&file.relative_path)
+            .bind(file.size)
+            .bind(file.modified_at)
+            .bind(&file.fingerprint)
+            .execute(database.pool())
+            .await
+            .expect("claimed filesystem entry");
+    }
+    let borrowed_files = files.iter().collect::<Vec<_>>();
+    let mut transaction = database
+        .begin_scan_write_transaction()
+        .await
+        .expect("transaction");
+    let created_items = database
+        .insert_movie_files_without_filesystem_entries_refs_in_transaction(
+            &mut transaction,
+            &library.id.to_string(),
+            &root_id,
+            "generation",
+            &borrowed_files,
+        )
+        .await
+        .expect("borrowed movie materialization");
+    transaction.commit().await.expect("commit");
+
+    assert_eq!(created_items, 1);
+    let counts: (i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT item.id), COUNT(source.id), SUM(source.is_default),
+                MAX(item.provider_ids_json)
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         WHERE item.item_type = 'MOVIE' AND item.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("materialized movie and sources");
+    assert_eq!(counts, (1, 2, 1, Some(r#"{"tmdb":"1"}"#.to_owned())));
+}
+
+#[tokio::test]
+async fn manifest_episode_materialization_accepts_borrowed_records_and_builds_hierarchy() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("shows");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("series root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 series root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let episode = NewEpisodeFile {
+        filesystem_entry_id: "borrowed-episode-entry".to_owned(),
+        source_id: "borrowed-episode-source".to_owned(),
+        relative_path: "Example Show/Season 01/Example.Show.S01E01.mkv".to_owned(),
+        size: 10,
+        modified_at: 1,
+        device: None,
+        inode: None,
+        fingerprint: vec![1, 2, 3],
+        series_identity: format!("series:{root_id}:Example Show"),
+        series_title: "Example Show".to_owned(),
+        series_sort_title: "example show".to_owned(),
+        series_production_year: Some(2024),
+        series_provider_ids_json: Some(r#"{"tvdb":"123"}"#.to_owned()),
+        season_identity: format!("series:{root_id}:Example Show:season:1"),
+        season_number: 1,
+        episode_identity: format!(
+            "episode:{root_id}:Example Show/Season 01/Example.Show.S01E01.mkv"
+        ),
+        episode_title: "Pilot".to_owned(),
+        episode_sort_title: "pilot".to_owned(),
+        episode_number: 1,
+        episode_absolute_number: None,
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: None,
+        quality_label: Some("1080p".to_owned()),
+        container: "mkv".to_owned(),
+        external_url: None,
+    };
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, 'generation', 'NEW', 0)",
+        )
+        .bind(&episode.filesystem_entry_id)
+        .bind(&root_id)
+        .bind(&episode.relative_path)
+        .bind(episode.size)
+        .bind(episode.modified_at)
+        .bind(&episode.fingerprint)
+        .execute(database.pool())
+        .await
+        .expect("claimed filesystem entry");
+
+    let borrowed_episodes = [&episode];
+    let mut transaction = database
+        .begin_scan_write_transaction()
+        .await
+        .expect("transaction");
+    let created_items = database
+        .insert_episode_files_without_filesystem_entries_refs_in_transaction(
+            &mut transaction,
+            &library.id.to_string(),
+            &root_id,
+            "generation",
+            &borrowed_episodes,
+        )
+        .await
+        .expect("borrowed episode materialization");
+    transaction.commit().await.expect("commit");
+
+    assert_eq!(created_items, 3);
+    let hierarchy_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT SUM(CASE WHEN item_type = 'SERIES' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN item_type = 'SEASON' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN item_type = 'EPISODE' THEN 1 ELSE 0 END)
+         FROM media_items WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("series hierarchy");
+    assert_eq!(hierarchy_counts, (1, 1, 1));
+    let default_sources: i64 = sqlx::query_scalar(
+        "SELECT SUM(source.is_default) FROM media_sources source
+         JOIN media_items episode ON episode.id = source.item_id
+         WHERE episode.library_id = ? AND episode.item_type = 'EPISODE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("default episode source");
+    assert_eq!(default_sources, 1);
+}
+
+#[tokio::test]
 async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -12197,6 +12808,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -12263,6 +12875,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -12391,6 +13004,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -12821,6 +13435,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -12909,6 +13524,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -13409,6 +14025,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -13456,10 +14073,49 @@ fn provider_identity_uses_the_selected_scraper_without_falling_back_to_another_i
 fn postgres_placeholder_adapter_preserves_quoted_question_marks() {
     let sql = "SELECT ?, '?' AS literal, \"?\" AS identifier, ?";
     assert_eq!(
-        adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sql).as_str(),
         "SELECT $1, '?' AS literal, \"?\" AS identifier, $2"
     );
-    assert_eq!(adapt_sql_for_backend(DatabaseBackend::Sqlite, sql), sql);
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Sqlite, sql).as_str(),
+        sql
+    );
+}
+
+#[test]
+fn sqlite_sql_adapter_preserves_static_owned_and_arc_storage() {
+    let static_sql = "SELECT 1";
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, static_sql);
+    assert!(std::ptr::eq(static_sql.as_ptr(), adapted.as_str().as_ptr()));
+
+    let owned_sql = String::from("SELECT 2");
+    let owned_pointer = owned_sql.as_ptr();
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(owned_sql));
+    assert!(std::ptr::eq(owned_pointer, adapted.as_str().as_ptr()));
+
+    let shared_sql: std::sync::Arc<str> = std::sync::Arc::from("SELECT 3");
+    let shared_pointer = shared_sql.as_ptr();
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(shared_sql));
+    assert!(std::ptr::eq(shared_pointer, adapted.as_str().as_ptr()));
+}
+
+#[test]
+fn postgres_sql_adapter_preserves_unmodified_text_and_numbers_placeholders() {
+    let no_parameters = "SELECT 'no parameters'";
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Postgres, no_parameters);
+    assert!(std::ptr::eq(
+        no_parameters.as_ptr(),
+        adapted.as_str().as_ptr()
+    ));
+
+    let parameters = std::iter::repeat_n("?", 12).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT ?, '?' AS literal, \"?\" AS identifier, 'it''s ?' AS escaped_literal, {parameters}"
+    );
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sqlx::AssertSqlSafe(sql)).as_str(),
+        "SELECT $1, '?' AS literal, \"?\" AS identifier, 'it''s ?' AS escaped_literal, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13"
+    );
 }
 
 #[tokio::test]
@@ -19569,5 +20225,247 @@ async fn postgres_media_items_are_normalized_to_one_default_source()
     admin_pool.close().await;
     outcome??;
     drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_discovery_presence_templates_preserve_path_and_generation_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    database
+        .query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('presence-lib', 'Presence', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('presence-root', 'presence-lib', '/presence', '/presence', 1, 0)",
+        )
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: "presence-root",
+    }];
+    let manifest = NewScanManifest {
+        id: "presence-manifest",
+        job_id: "presence-job",
+        library_id: "presence-lib",
+        roots: &roots,
+    };
+    database
+        .create_full_scan_manifest_job(
+            "presence-job",
+            "presence-generation",
+            false,
+            &manifest,
+            None,
+        )
+        .await?;
+    assert!(database.claim_scan_job("presence-job").await?);
+
+    for (id, path, fingerprint, generation) in [
+        (
+            "presence-current",
+            "already-seen.mkv",
+            b"current".as_slice(),
+            "presence-generation",
+        ),
+        (
+            "presence-fast",
+            "fast-update.mkv",
+            b"fast".as_slice(),
+            "old-generation",
+        ),
+        (
+            "presence-partial",
+            "partial-update.mkv",
+            b"partial".as_slice(),
+            "old-generation",
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, is_missing
+                 ) VALUES (?, 'presence-root', ?, 'FILE', 10, 20, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(path)
+            .bind(fingerprint)
+            .bind(generation)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let entry = |relative_path: &str, fingerprint: &[u8]| NewScanManifestEntry {
+        relative_path: relative_path.to_owned(),
+        entry_kind: "FILE".to_owned(),
+        size: 11,
+        modified_at: 21,
+        device: None,
+        inode: None,
+        fingerprint: fingerprint.to_vec(),
+        fingerprint_pending: false,
+    };
+    let seen_entry =
+        |id: &str, relative_path: &str, fingerprint: &[u8]| NewScanManifestSeenFilesystemEntry {
+            filesystem_entry_id: id.to_owned(),
+            relative_path: relative_path.to_owned(),
+            size: 11,
+            modified_at: 21,
+            device: None,
+            inode: None,
+            fingerprint: fingerprint.to_vec(),
+        };
+
+    let current_entries = [entry("already-seen.mkv", b"current")];
+    let current_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &current_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&current_chunk)
+            .await?,
+        0,
+        "format 3 treats a path already seen in this generation as known"
+    );
+
+    let fast_entries = [entry("fast-update.mkv", b"fast")];
+    let fast_seen = [seen_entry("presence-fast", "fast-update.mkv", b"fast")];
+    let fast_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &fast_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &fast_seen,
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&fast_chunk)
+            .await?,
+        1,
+        "a full successful presence update counts the file once"
+    );
+    let fast_generation: String = database
+        .query_scalar(
+            "SELECT last_seen_generation FROM filesystem_entries WHERE id = 'presence-fast'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(fast_generation, "presence-generation");
+    let fast_ledger_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM scan_manifest_seen_paths
+             WHERE manifest_id = 'presence-manifest' AND relative_path = 'fast-update.mkv'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        fast_ledger_count, 0,
+        "successful updates do not duplicate the ledger"
+    );
+
+    let partial_entries = [
+        entry("partial-update.mkv", b"partial"),
+        entry("missing-entry.mkv", b"missing"),
+    ];
+    let partial_seen = [
+        seen_entry("presence-partial", "partial-update.mkv", b"partial"),
+        seen_entry("presence-missing", "missing-entry.mkv", b"missing"),
+    ];
+    let partial_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &partial_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &partial_seen,
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&partial_chunk)
+            .await?,
+        2,
+        "partial updates return the updated path and ledger fallback path once each"
+    );
+    let partial_generation: String = database
+        .query_scalar(
+            "SELECT last_seen_generation FROM filesystem_entries WHERE id = 'presence-partial'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(partial_generation, "presence-generation");
+    let ledger_paths: Vec<String> = database
+        .query_scalar(
+            "SELECT relative_path FROM scan_manifest_seen_paths
+             WHERE manifest_id = 'presence-manifest' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(ledger_paths, ["already-seen.mkv", "missing-entry.mkv"]);
+
+    database
+        .query(
+            "UPDATE scan_manifests SET discovery_format_version = 2 WHERE id = 'presence-manifest'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at
+             ) VALUES ('presence-manifest', 'presence-root', 'legacy-known.mkv', 1, 'FILE', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query("UPDATE scan_manifest_roots SET next_observation_sequence = 1 WHERE manifest_id = 'presence-manifest'")
+        .execute(database.pool())
+        .await?;
+    let legacy_entries = [entry("legacy-known.mkv", b"legacy")];
+    let legacy_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &legacy_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&legacy_chunk)
+            .await?,
+        0,
+        "legacy format queries known paths from prior manifest observations"
+    );
+    database.close().await;
     Ok(())
 }
