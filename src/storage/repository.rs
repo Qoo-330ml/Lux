@@ -4033,3 +4033,7 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 #[path = "repository_tests.rs"]
 mod repository_tests;
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+#[path = "sql_query_benchmarks.rs"]
+mod sql_query_benchmarks;
