@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::background_work::{BackgroundWorkStage, acquire_process_background_work};
 
 impl ScanJobService {
     pub(in crate::application::scanner) async fn discover_scan_manifest_directory_batches(
@@ -40,7 +41,17 @@ impl ScanJobService {
         let open_root_path = root_path.clone();
         let open_relative_directory = relative_directory.to_owned();
         let open_started = Instant::now();
+        let open_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: root_path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let mut reader = tokio::task::spawn_blocking(move || {
+            let _permit = open_permit;
             ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
         })
         .await
@@ -72,13 +83,24 @@ impl ScanJobService {
         loop {
             let read_started = Instant::now();
             let reader_to_move = reader;
-            let (next_reader, batch) =
-                tokio::task::spawn_blocking(move || reader_to_move.next_batch(reader_batch_size))
-                    .await
-                    .map_err(|source| ScannerError::Io {
-                        path: root_path.clone(),
-                        source: std::io::Error::other(source.to_string()),
-                    })??;
+            let read_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: root_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let (next_reader, batch) = tokio::task::spawn_blocking(move || {
+                let _permit = read_permit;
+                reader_to_move.next_batch(reader_batch_size)
+            })
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: root_path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })??;
             reader = next_reader;
             let batch_file_count = batch
                 .entries
@@ -575,7 +597,17 @@ impl ScanJobService {
             let open_root_path = root_path.clone();
             let open_relative_directory = relative_directory.clone();
             let open_started = Instant::now();
+            let open_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: root_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             let mut reader = tokio::task::spawn_blocking(move || {
+                let _permit = open_permit;
                 ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
             })
             .await
@@ -593,13 +625,24 @@ impl ScanJobService {
                     return Ok(None);
                 }
                 let read_started = Instant::now();
-                let (next_reader, batch) =
-                    tokio::task::spawn_blocking(move || reader.next_batch(reader_batch_size))
-                        .await
-                        .map_err(|source| ScannerError::Io {
-                            path: root_path.clone(),
-                            source: std::io::Error::other(source.to_string()),
-                        })??;
+                let read_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+                    .await
+                    .map_err(|source| ScannerError::Io {
+                        path: root_path.clone(),
+                        source: std::io::Error::other(source.to_string()),
+                    })?;
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let (next_reader, batch) = tokio::task::spawn_blocking(move || {
+                    let _permit = read_permit;
+                    reader.next_batch(reader_batch_size)
+                })
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: root_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })??;
                 reader = next_reader;
                 let batch_file_count = batch
                     .entries

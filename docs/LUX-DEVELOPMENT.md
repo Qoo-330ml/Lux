@@ -11874,7 +11874,10 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 - [x] 给出有序小增量、预计文件、最窄 Rust target、SQLite/PostgreSQL A/B 与 CPU/吞吐/前台 p95 验收门。
 - [x] 项目所有者评审并批准设计（2026-10-16）；实现沿用同一个 LUX-561 逐步推进。
 - [x] 进程单例共享 semaphore、CPU/cgroup 自动容量及 `LUX_BACKGROUND_CPU_BUDGET` 配置。
-- [ ] Discovery、Manifest preparation、scanner fingerprint、本地 NFO/图片、probe 和 thumbnail 的后台重工作片段接入；前台 metadata 不获取预算。
+- [x] Discovery 与 Manifest preparation 接入预算并保留有界 reader/JoinSet。
+- [ ] scanner fingerprint 准备接入预算且保持原指纹格式。
+- [ ] 本地 NFO/图片只为后台 CPU 片段获取预算，前台 metadata 不限流。
+- [ ] probe 与 thumbnail 接入共享预算，同时保留原有专用进程上限。
 - [ ] blocking closure 与监督中的子进程在调用者取消后继续持有预算；超时路径确认子进程回收后才释放名额。
 - [x] 记录全局/分 stage 活动与等待峰值、p50/p95/max、取消等待、运行中取消和子进程清理中计数；采样有界且日志不带路径或环境变量原值。
 - [ ] 混合负载 SQLite/PostgreSQL A/B 与至少三轮交错测量；性能门通过前不声称 CPU 收益或默认值已由性能数据确认。
@@ -11884,7 +11887,7 @@ Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` �
 
 初始实施进度（2026-10-16）：预算核心已加入进程级异步单例、CPU/cgroup 容量推导与 `LUX_BACKGROUND_CPU_BUDGET` clamp；克隆预算跨 stage 共用 permit，统计并发峰值、等待和有界 p95 样本。先写的容量回归在旧实现上失败（4 核期望 3、实际 1）；实现后 `cargo test --locked --lib application::background_work::tests` 5/5 通过。该记录反映当时 Discovery、指纹、本地 metadata、外部进程监督、混合基准和完整 gate 尚未完成的状态。
 
-当前实施进度（2026-10-16）：预算核心与全局指标已通过 9/9 定向单测；Discovery、Manifest preparation、scanner fingerprint、后台 metadata/图片和外部进程监督仍在集成验证中。混合负载 A/B 与完整 Rust 完成门尚待执行。
+当前实施进度（2026-10-16）：预算核心通过 9/9 定向单测；Discovery/Manifest preparation 在 `LUX_BACKGROUND_CPU_BUDGET=1` 下通过 `scanner` 18/18、`scanning_jobs` 88/88。scanner fingerprint、后台 metadata/图片和外部进程监督仍在验证中。混合负载 A/B 与完整 Rust 完成门尚待执行。
 
 ## 29. 参考资料
 
