@@ -520,8 +520,8 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let remaining_changes = self
-            .count_manifest_diff_remaining_changes(
+        let has_remaining_changes = self
+            .has_manifest_diff_remaining_changes(
                 &mut transaction,
                 manifest_id,
                 workflow_version,
@@ -529,7 +529,7 @@ impl Database {
                 &discovery_mode,
             )
             .await?;
-        if remaining_changes > 0 {
+        if has_remaining_changes {
             return Ok(false);
         }
         let unchanged_count = self

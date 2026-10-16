@@ -865,6 +865,317 @@ async fn scan_manifest_creation_is_atomic_and_idempotent() -> Result<(), Box<dyn
     Ok(())
 }
 
+async fn create_manifest_diff_finish_fixture(
+    database: &Database,
+    suffix: &str,
+    workflow_version: i64,
+    discovery_format_version: i64,
+    discovery_mode: &str,
+) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+    let library_id = format!("manifest-diff-library-{suffix}");
+    let root_id = format!("manifest-diff-root-{suffix}");
+    let job_id = format!("manifest-diff-job-{suffix}");
+    let manifest_id = format!("manifest-diff-manifest-{suffix}");
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+        .bind(&library_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (?, ?, ?, ?, 1, 0)",
+        )
+        .bind(&root_id)
+        .bind(&library_id)
+        .bind(format!("/{root_id}"))
+        .bind(format!("/{root_id}"))
+        .execute(database.pool())
+        .await?;
+    database
+        .create_scan_job(
+            &job_id,
+            &library_id,
+            "RECONCILE_LIBRARY",
+            &format!("generation-{suffix}"),
+            0,
+            false,
+        )
+        .await?;
+    database
+        .query("UPDATE scan_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job_id)
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: &root_id,
+    }];
+    database
+        .create_scan_manifest(&NewScanManifest {
+            id: &manifest_id,
+            job_id: &job_id,
+            library_id: &library_id,
+            roots: &roots,
+        })
+        .await?;
+    database
+        .query(
+            "UPDATE scan_manifests
+             SET state = 'READY_TO_DIFF', workflow_version = ?,
+                 discovery_format_version = ?, discovery_mode = ?
+             WHERE id = ?",
+        )
+        .bind(workflow_version)
+        .bind(discovery_format_version)
+        .bind(discovery_mode)
+        .bind(&manifest_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE scan_manifest_roots SET state = 'COMPLETE'
+             WHERE manifest_id = ? AND library_root_id = ?",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    Ok((job_id, manifest_id, root_id))
+}
+
+async fn insert_manifest_diff_file(
+    database: &Database,
+    root_id: &str,
+    entry_id: &str,
+    relative_path: &str,
+    generation: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 fingerprint, last_seen_generation
+             ) VALUES (?, ?, ?, 'FILE', 1, 1, NULL, ?)",
+        )
+        .bind(entry_id)
+        .bind(root_id)
+        .bind(relative_path)
+        .bind(generation)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
+async fn insert_manifest_diff_delta(
+    database: &Database,
+    manifest_id: &str,
+    root_id: &str,
+    delta_id: &str,
+    relative_path: &str,
+    delta_kind: &str,
+    observation_sequence: Option<i64>,
+    base_entry_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let delta = [NewScanManifestDelta {
+        id: delta_id,
+        library_root_id: root_id,
+        relative_path,
+        observation_sequence,
+        delta_kind,
+        base_filesystem_entry_id: base_entry_id,
+        base_fingerprint: None,
+    }];
+    assert_eq!(
+        database
+            .insert_scan_manifest_deltas(manifest_id, &delta)
+            .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_diff_completion_preserves_all_format_candidate_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    // Format-3 LITE: a live file with an old generation and no seen-path row is pending.
+    let (job_id, manifest_id, root_id) =
+        create_manifest_diff_finish_fixture(&database, "lite", 3, 3, "LITE").await?;
+    insert_manifest_diff_file(&database, &root_id, "lite-entry", "movie.mkv", "old").await?;
+    assert!(
+        !database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+    insert_manifest_diff_delta(
+        &database,
+        &manifest_id,
+        &root_id,
+        "lite-delta",
+        "movie.mkv",
+        "REMOVE",
+        None,
+        Some("lite-entry"),
+    )
+    .await?;
+    assert!(
+        database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+
+    // Format-3 PERSISTED: only a completed directory's direct children are candidates.
+    let (job_id, manifest_id, root_id) =
+        create_manifest_diff_finish_fixture(&database, "persisted", 3, 3, "PERSISTED").await?;
+    insert_manifest_diff_file(
+        &database,
+        &root_id,
+        "persisted-entry",
+        "big/movie.mkv",
+        "old",
+    )
+    .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_directories (
+                 manifest_id, library_root_id, relative_path, state
+             ) VALUES (?, ?, 'big', 'COMPLETE')",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+    insert_manifest_diff_delta(
+        &database,
+        &manifest_id,
+        &root_id,
+        "persisted-delta",
+        "big/movie.mkv",
+        "REMOVE",
+        None,
+        Some("persisted-entry"),
+    )
+    .await?;
+    assert!(
+        database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+
+    // Workflow 2/3 with format 2 treats a latest non-file observation as a removal.
+    let (job_id, manifest_id, root_id) =
+        create_manifest_diff_finish_fixture(&database, "format2", 2, 2, "PERSISTED").await?;
+    insert_manifest_diff_file(&database, &root_id, "format2-entry", "legacy.mkv", "old").await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at
+             ) VALUES (?, ?, 'legacy.mkv', 1, 'DIRECTORY', 0, 1)",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+    insert_manifest_diff_delta(
+        &database,
+        &manifest_id,
+        &root_id,
+        "format2-delta",
+        "legacy.mkv",
+        "REMOVE",
+        None,
+        Some("format2-entry"),
+    )
+    .await?;
+    assert!(
+        database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+
+    // Workflow 1 has two independent candidate sets; each must be cleared before finishing.
+    let (job_id, manifest_id, root_id) =
+        create_manifest_diff_finish_fixture(&database, "workflow1", 1, 2, "PERSISTED").await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at, fingerprint
+             ) VALUES (?, ?, 'orphan.mkv', 1, 'FILE', 1, 1, X'01')",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    insert_manifest_diff_file(
+        &database,
+        &root_id,
+        "workflow1-entry",
+        "unobserved.mkv",
+        "old",
+    )
+    .await?;
+    assert!(
+        !database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+    insert_manifest_diff_delta(
+        &database,
+        &manifest_id,
+        &root_id,
+        "workflow1-orphan-delta",
+        "orphan.mkv",
+        "ADD",
+        Some(1),
+        None,
+    )
+    .await?;
+    assert!(
+        !database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+    insert_manifest_diff_delta(
+        &database,
+        &manifest_id,
+        &root_id,
+        "workflow1-unobserved-delta",
+        "unobserved.mkv",
+        "REMOVE",
+        None,
+        Some("workflow1-entry"),
+    )
+    .await?;
+    assert!(
+        database
+            .finish_scan_manifest_diff(&manifest_id, &job_id)
+            .await?
+    );
+
+    database.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn manifest_discovery_chunk_does_not_complete_directory_after_cancel_request()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1426,7 +1737,7 @@ async fn metadata_reidentify_job_reports_items_left_pending()
 }
 
 #[tokio::test]
-#[ignore = "synthetic SQLx baseline; run explicitly before and after LUX-561 changes"]
+#[ignore = "synthetic SQLx comparison; run explicitly before and after LUX-561 changes"]
 async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
@@ -1585,6 +1896,107 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
         statement.execute(database.pool()).await?;
     }
     database.query("ANALYZE").execute(database.pool()).await?;
+
+    const LITE_COMPLETION_COUNT: &str = "SELECT COUNT(*)
+         FROM filesystem_entries fe
+         JOIN scan_manifest_roots root
+           ON root.manifest_id = ? AND root.library_root_id = fe.library_root_id
+          AND root.state = 'COMPLETE'
+         JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+         JOIN scan_jobs job ON job.id = manifest.job_id
+         WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+           AND COALESCE(fe.last_seen_generation, '') <> job.generation
+           AND NOT EXISTS (
+               SELECT 1 FROM scan_manifest_seen_paths seen
+               WHERE seen.manifest_id = root.manifest_id
+                 AND seen.library_root_id = fe.library_root_id
+                 AND seen.relative_path = fe.relative_path
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM scan_manifest_deltas delta
+               WHERE delta.manifest_id = root.manifest_id
+                 AND delta.library_root_id = fe.library_root_id
+                 AND delta.relative_path = fe.relative_path
+           )";
+    const LITE_COMPLETION_EXISTS: &str = "SELECT CASE WHEN EXISTS (
+             SELECT 1
+             FROM filesystem_entries fe
+             JOIN scan_manifest_roots root
+               ON root.manifest_id = ? AND root.library_root_id = fe.library_root_id
+              AND root.state = 'COMPLETE'
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             JOIN scan_jobs job ON job.id = manifest.job_id
+             WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+               AND COALESCE(fe.last_seen_generation, '') <> job.generation
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_manifest_seen_paths seen
+                   WHERE seen.manifest_id = root.manifest_id
+                     AND seen.library_root_id = fe.library_root_id
+                     AND seen.relative_path = fe.relative_path
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_manifest_deltas delta
+                   WHERE delta.manifest_id = root.manifest_id
+                     AND delta.library_root_id = fe.library_root_id
+                     AND delta.relative_path = fe.relative_path
+               )
+         ) THEN 1 ELSE 0 END";
+    let (first_candidate_count_ms, first_candidate_exists_ms) =
+        measure_manifest_diff_completion_queries(
+            &database,
+            LITE_COMPLETION_COUNT,
+            LITE_COMPLETION_EXISTS,
+            i64::try_from(file_count)?,
+            1,
+        )
+        .await?;
+    database
+        .query(
+            "UPDATE filesystem_entries SET last_seen_generation = 'generation-current'
+             WHERE library_root_id = 'root-a'",
+        )
+        .execute(database.pool())
+        .await?;
+    let last_entry_id = format!("root-a-{:06}", file_count - 1);
+    database
+        .query(
+            "UPDATE filesystem_entries SET last_seen_generation = 'generation-old'
+             WHERE id = ?",
+        )
+        .bind(&last_entry_id)
+        .execute(database.pool())
+        .await?;
+    let (last_candidate_count_ms, last_candidate_exists_ms) =
+        measure_manifest_diff_completion_queries(
+            &database,
+            LITE_COMPLETION_COUNT,
+            LITE_COMPLETION_EXISTS,
+            1,
+            1,
+        )
+        .await?;
+    database
+        .query(
+            "UPDATE filesystem_entries SET last_seen_generation = 'generation-current'
+             WHERE library_root_id = 'root-a'",
+        )
+        .execute(database.pool())
+        .await?;
+    let (no_candidate_count_ms, no_candidate_exists_ms) = measure_manifest_diff_completion_queries(
+        &database,
+        LITE_COMPLETION_COUNT,
+        LITE_COMPLETION_EXISTS,
+        0,
+        0,
+    )
+    .await?;
+    database
+        .query(
+            "UPDATE filesystem_entries SET last_seen_generation = 'generation-old'
+             WHERE library_root_id = 'root-a'",
+        )
+        .execute(database.pool())
+        .await?;
 
     let lite_plan = if backend == "sqlite" {
         database
@@ -1752,8 +2164,14 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
     }
 
     eprintln!(
-        "LUX-561 baseline: backend={backend}, sqlite_version={sqlite_version}, \
+        "LUX-561 SQLx comparison: backend={backend}, sqlite_version={sqlite_version}, \
          postgres_version={}, file_count_per_root={file_count}, page_size={PAGE_SIZE}, \
+         completion_first_candidate_count_ms={first_candidate_count_ms:?}, \
+         completion_first_candidate_exists_ms={first_candidate_exists_ms:?}, \
+         completion_last_candidate_count_ms={last_candidate_count_ms:?}, \
+         completion_last_candidate_exists_ms={last_candidate_exists_ms:?}, \
+         completion_no_candidate_count_ms={no_candidate_count_ms:?}, \
+         completion_no_candidate_exists_ms={no_candidate_exists_ms:?}, \
          lite_ms={lite_samples_ms:?}, lite_query_calls={lite_query_counts:?}, \
          lite_query_plan={lite_plan:?}, persisted_ms={persisted_samples_ms:?}, \
          persisted_query_calls={persisted_query_counts:?}, persisted_query_plan={persisted_plan:?}",
@@ -1761,4 +2179,55 @@ async fn manifest_diff_antijoin_benchmark() -> Result<(), Box<dyn std::error::Er
     );
     database.close().await;
     Ok(())
+}
+
+async fn measure_manifest_diff_completion_queries(
+    database: &Database,
+    count_query: &str,
+    exists_query: &str,
+    expected_count: i64,
+    expected_exists: i64,
+) -> Result<(Vec<f64>, Vec<f64>), Box<dyn std::error::Error>> {
+    let mut count_samples_ms = Vec::with_capacity(3);
+    let mut exists_samples_ms = Vec::with_capacity(3);
+    for round in 0..3 {
+        if round % 2 == 0 {
+            let started = std::time::Instant::now();
+            let count: i64 = database
+                .query_scalar(sqlx::AssertSqlSafe(count_query.to_owned()))
+                .bind("manifest")
+                .fetch_one(database.pool())
+                .await?;
+            count_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(count, expected_count);
+
+            let started = std::time::Instant::now();
+            let exists: i64 = database
+                .query_scalar(sqlx::AssertSqlSafe(exists_query.to_owned()))
+                .bind("manifest")
+                .fetch_one(database.pool())
+                .await?;
+            exists_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(exists, expected_exists);
+        } else {
+            let started = std::time::Instant::now();
+            let exists: i64 = database
+                .query_scalar(sqlx::AssertSqlSafe(exists_query.to_owned()))
+                .bind("manifest")
+                .fetch_one(database.pool())
+                .await?;
+            exists_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(exists, expected_exists);
+
+            let started = std::time::Instant::now();
+            let count: i64 = database
+                .query_scalar(sqlx::AssertSqlSafe(count_query.to_owned()))
+                .bind("manifest")
+                .fetch_one(database.pool())
+                .await?;
+            count_samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(count, expected_count);
+        }
+    }
+    Ok((count_samples_ms, exists_samples_ms))
 }
