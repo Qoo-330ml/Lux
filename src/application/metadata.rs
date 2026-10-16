@@ -15,9 +15,13 @@ use tokio::{
 };
 
 use crate::{
+    application::background_work::{BackgroundWorkStage, run_process_background_blocking},
     application::scanner::compute_file_fingerprint,
     application::{
-        images::image_content_tag_and_dimensions_from_bytes,
+        images::{
+            background_image_content_tag_and_dimensions_from_bytes,
+            image_content_tag_and_dimensions_from_bytes,
+        },
         nfo::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
             parse_local_nfo_projection, parse_local_nfo_projection_with_semantic_fingerprint,
@@ -1262,6 +1266,7 @@ struct SeriesNfoRequest {
     nfo_path: PathBuf,
     metadata: Option<StoredMediaMetadata>,
     on_demand: bool,
+    background_cpu_budgeted: bool,
     deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
 }
 
@@ -1504,13 +1509,14 @@ impl MetadataEnricher {
             .database
             .list_movie_metadata_sources_for_incremental_scan(scan_job_id)
             .await?;
-        self.enrich_movie_sources(movie_sources, &mut report).await;
+        self.enrich_movie_sources(movie_sources, &mut report, true)
+            .await;
 
         let home_video_sources = self
             .database
             .list_home_video_metadata_sources_for_incremental_scan(scan_job_id)
             .await?;
-        self.enrich_home_video_sources(home_video_sources, &mut report)
+        self.enrich_home_video_sources(home_video_sources, &mut report, true)
             .await;
 
         let series_sources = self
@@ -1525,6 +1531,7 @@ impl MetadataEnricher {
             SeriesEnrichmentMode::ImagesAndNfo,
             None,
             None,
+            true,
         )
         .await?;
         Ok(report)
@@ -1552,7 +1559,8 @@ impl MetadataEnricher {
                 .map(|source| source.item_id.clone())
                 .collect::<Vec<_>>();
             let mut batch_report = MetadataReport::default();
-            self.enrich_movie_sources(sources, &mut batch_report).await;
+            self.enrich_movie_sources(sources, &mut batch_report, true)
+                .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
             report.merge(batch_report);
             self.database
@@ -1596,7 +1604,7 @@ impl MetadataEnricher {
                 .map(|source| source.item_id.clone())
                 .collect::<Vec<_>>();
             let mut batch_report = MetadataReport::default();
-            self.enrich_home_video_sources(sources, &mut batch_report)
+            self.enrich_home_video_sources(sources, &mut batch_report, true)
                 .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
             report.merge(batch_report);
@@ -1649,6 +1657,7 @@ impl MetadataEnricher {
                 SeriesEnrichmentMode::ImagesAndNfo,
                 None,
                 None,
+                true,
             )
             .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -1737,6 +1746,7 @@ impl MetadataEnricher {
             SeriesEnrichmentMode::ImagesOnly,
             None,
             None,
+            true,
         )
         .await;
         Ok(ScanLocalMetadataImageBatch { report, sources })
@@ -1898,13 +1908,12 @@ impl MetadataEnricher {
             {
                 continue;
             }
-            let prepared =
-                prepare_local_image(image.clone())
-                    .await
-                    .map_err(|error| MetadataError::Io {
-                        path: error.path,
-                        source: error.error,
-                    })?;
+            let prepared = prepare_local_image(image.clone(), true)
+                .await
+                .map_err(|error| MetadataError::Io {
+                    path: error.path,
+                    source: error.error,
+                })?;
             let local_path = prepared.image.path.to_string_lossy().into_owned();
             let existing = indexed.iter().find(|existing| {
                 existing.source == "LOCAL"
@@ -1968,7 +1977,8 @@ impl MetadataEnricher {
         for source in sources {
             report.items_processed += 1;
             if let Some(item) =
-                prepare_scan_local_movie_image_batch_item(source, directory_cache, report).await
+                prepare_scan_local_movie_image_batch_item(source, directory_cache, report, true)
+                    .await
             {
                 items.push(item);
             }
@@ -2149,6 +2159,7 @@ impl MetadataEnricher {
                                     deferred_metadata_updates: request.deferred_metadata_updates,
                                 },
                                 deferred_actor_credits,
+                                true,
                             )
                             .await;
                         item_report
@@ -2185,6 +2196,7 @@ impl MetadataEnricher {
             SeriesEnrichmentMode::NfoOnly,
             Some(&mut nfo_snapshot),
             deferred_actor_credits.clone(),
+            true,
         )
         .await;
         let deferred_metadata_updates = &nfo_snapshot.deferred_metadata_updates;
@@ -2402,7 +2414,7 @@ impl MetadataEnricher {
                     .map(|source| source.item_id.clone())
                     .collect::<Vec<_>>();
                 let mut batch_report = MetadataReport::default();
-                self.enrich_movie_sources(movie_sources, &mut batch_report)
+                self.enrich_movie_sources(movie_sources, &mut batch_report, true)
                     .await;
                 let failed_item_ids = batch_report.failed_item_ids.clone();
                 report.merge(batch_report);
@@ -2439,7 +2451,7 @@ impl MetadataEnricher {
                     .map(|source| source.item_id.clone())
                     .collect::<Vec<_>>();
                 let mut batch_report = MetadataReport::default();
-                self.enrich_home_video_sources(home_video_sources, &mut batch_report)
+                self.enrich_home_video_sources(home_video_sources, &mut batch_report, true)
                     .await;
                 let failed_item_ids = batch_report.failed_item_ids.clone();
                 report.merge(batch_report);
@@ -2494,6 +2506,7 @@ impl MetadataEnricher {
                     SeriesEnrichmentMode::ImagesAndNfo,
                     None,
                     None,
+                    true,
                 )
                 .await;
                 let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -2552,6 +2565,7 @@ impl MetadataEnricher {
         mode: SeriesEnrichmentMode,
         nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
+        background_cpu_budgeted: bool,
     ) {
         if let Err(error) = self
             .enrich_series_sources(
@@ -2561,6 +2575,7 @@ impl MetadataEnricher {
                 mode,
                 nfo_snapshot,
                 deferred_actor_credits,
+                background_cpu_budgeted,
             )
             .await
         {
@@ -2585,7 +2600,7 @@ impl MetadataEnricher {
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            self.enrich_movie_sources(sources, &mut report).await;
+            self.enrich_movie_sources(sources, &mut report, false).await;
             if last_page {
                 break;
             }
@@ -2598,6 +2613,7 @@ impl MetadataEnricher {
         &self,
         sources: Vec<StoredMediaSourcePath>,
         report: &mut MetadataReport,
+        background_cpu_budgeted: bool,
     ) {
         let mut directory_cache = DirectoryPathCache::default();
         for source_page in sources.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
@@ -2616,7 +2632,11 @@ impl MetadataEnricher {
                     let enricher = self.clone();
                     move |(item_id, media_path)| {
                         let enricher = enricher.clone();
-                        async move { enricher.enrich_movie_nfo(&item_id, &media_path).await }
+                        async move {
+                            enricher
+                                .enrich_movie_nfo(&item_id, &media_path, background_cpu_budgeted)
+                                .await
+                        }
                     }
                 })
                 .await;
@@ -2652,9 +2672,13 @@ impl MetadataEnricher {
 
             let mut image_items = Vec::with_capacity(source_page.len());
             for source in source_page {
-                if let Some(item) =
-                    prepare_scan_local_movie_image_batch_item(source, &mut directory_cache, report)
-                        .await
+                if let Some(item) = prepare_scan_local_movie_image_batch_item(
+                    source,
+                    &mut directory_cache,
+                    report,
+                    background_cpu_budgeted,
+                )
+                .await
                 {
                     image_items.push(item);
                 }
@@ -2701,6 +2725,7 @@ impl MetadataEnricher {
         &self,
         sources: Vec<StoredMediaSourcePath>,
         report: &mut MetadataReport,
+        background_cpu_budgeted: bool,
     ) {
         for source in sources {
             report.items_processed += 1;
@@ -2714,6 +2739,7 @@ impl MetadataEnricher {
                         &nfo_path,
                         NfoMetadataLookup::OnDemand,
                         None,
+                        background_cpu_budgeted,
                     )
                     .await;
                 }
@@ -2765,6 +2791,7 @@ impl MetadataEnricher {
                         deferred_metadata_updates,
                     },
                     deferred_actor_credits.clone(),
+                    true,
                 )
                 .await;
             }
@@ -2784,11 +2811,13 @@ impl MetadataEnricher {
         &self,
         item_id: &str,
         media_path: &Path,
+        background_cpu_budgeted: bool,
     ) -> Result<MetadataReport, MetadataError> {
         let Some(nfo_path) = find_nfo_path(media_path).await else {
             return Ok(MetadataReport::default());
         };
-        self.enrich_nfo_item(item_id, &nfo_path).await
+        self.enrich_nfo_item_with_background_context(item_id, &nfo_path, background_cpu_budgeted)
+            .await
     }
 
     pub async fn enrich_series_library(
@@ -2816,6 +2845,7 @@ impl MetadataEnricher {
                 SeriesEnrichmentMode::ImagesAndNfo,
                 None,
                 None,
+                false,
             )
             .await?;
             if last_page {
@@ -2834,6 +2864,7 @@ impl MetadataEnricher {
         mode: SeriesEnrichmentMode,
         mut nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
+        background_cpu_budgeted: bool,
     ) -> Result<(), MetadataError> {
         let process_images = mode.process_images();
         let process_nfo = mode.process_nfo();
@@ -2903,6 +2934,7 @@ impl MetadataEnricher {
                         nfo_path,
                         metadata,
                         on_demand: nfo_snapshot.is_none(),
+                        background_cpu_budgeted,
                         deferred_metadata_updates,
                     });
                 }
@@ -2979,6 +3011,7 @@ impl MetadataEnricher {
                         nfo_path,
                         metadata,
                         on_demand: nfo_snapshot.is_none(),
+                        background_cpu_budgeted,
                         deferred_metadata_updates,
                     });
                 }
@@ -3021,6 +3054,7 @@ impl MetadataEnricher {
                         nfo_path,
                         metadata,
                         on_demand: nfo_snapshot.is_none(),
+                        background_cpu_budgeted,
                         deferred_metadata_updates,
                     });
                 }
@@ -3054,6 +3088,7 @@ impl MetadataEnricher {
                                     &request.item_id,
                                     &request.nfo_path,
                                     deferred_actor_credits,
+                                    request.background_cpu_budgeted,
                                 )
                                 .await
                         } else {
@@ -3064,6 +3099,7 @@ impl MetadataEnricher {
                                     request.metadata,
                                     deferred_actor_credits,
                                     request.deferred_metadata_updates,
+                                    request.background_cpu_budgeted,
                                 )
                                 .await
                         };
@@ -3093,7 +3129,8 @@ impl MetadataEnricher {
                 }
             }
         }
-        self.index_images_batch(image_candidates, report).await;
+        self.index_images_batch(image_candidates, report, background_cpu_budgeted)
+            .await;
         Ok(())
     }
 
@@ -3104,6 +3141,7 @@ impl MetadataEnricher {
         nfo_path: &Path,
         metadata: NfoMetadataLookup<'_>,
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
+        background_cpu_budgeted: bool,
     ) {
         let enriched = match metadata {
             NfoMetadataLookup::OnDemand => {
@@ -3111,6 +3149,7 @@ impl MetadataEnricher {
                     item_id,
                     nfo_path,
                     deferred_actor_credits,
+                    background_cpu_budgeted,
                 )
                 .await
             }
@@ -3124,6 +3163,7 @@ impl MetadataEnricher {
                     metadata_by_item.remove(item_id),
                     deferred_actor_credits,
                     deferred_metadata_updates,
+                    background_cpu_budgeted,
                 )
                 .await
             }
@@ -3137,6 +3177,7 @@ impl MetadataEnricher {
                     metadata.map(|metadata| *metadata),
                     deferred_actor_credits,
                     Some(deferred_metadata_updates),
+                    background_cpu_budgeted,
                 )
                 .await
             }
@@ -3174,13 +3215,29 @@ impl MetadataEnricher {
         }
     }
 
+    #[cfg(test)]
     async fn enrich_nfo_item(
         &self,
         item_id: &str,
         nfo_path: &Path,
     ) -> Result<MetadataReport, MetadataError> {
-        self.enrich_nfo_item_with_actor_credit_batch(item_id, nfo_path, None)
+        self.enrich_nfo_item_with_background_context(item_id, nfo_path, false)
             .await
+    }
+
+    async fn enrich_nfo_item_with_background_context(
+        &self,
+        item_id: &str,
+        nfo_path: &Path,
+        background_cpu_budgeted: bool,
+    ) -> Result<MetadataReport, MetadataError> {
+        self.enrich_nfo_item_with_actor_credit_batch(
+            item_id,
+            nfo_path,
+            None,
+            background_cpu_budgeted,
+        )
+        .await
     }
 
     async fn enrich_nfo_item_with_actor_credit_batch(
@@ -3188,6 +3245,7 @@ impl MetadataEnricher {
         item_id: &str,
         nfo_path: &Path,
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
+        background_cpu_budgeted: bool,
     ) -> Result<MetadataReport, MetadataError> {
         let metadata = self.database.find_media_item_metadata(item_id).await?;
         self.enrich_nfo_item_with_metadata(
@@ -3196,6 +3254,7 @@ impl MetadataEnricher {
             metadata,
             deferred_actor_credits,
             None,
+            background_cpu_budgeted,
         )
         .await
     }
@@ -3227,6 +3286,7 @@ impl MetadataEnricher {
         metadata: Option<StoredMediaMetadata>,
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
         deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
+        background_cpu_budgeted: bool,
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
@@ -3312,14 +3372,26 @@ impl MetadataEnricher {
             report.nfo_skipped = 1;
             return Ok(report);
         }
-        let bytes = match fs::read(nfo_path).await {
-            Ok(bytes) => bytes,
+        let bytes: Arc<[u8]> = match fs::read(nfo_path).await {
+            Ok(bytes) => Arc::from(bytes),
             Err(_) => {
                 report.nfo_failed = 1;
                 return Ok(report);
             }
         };
-        let source_fingerprint = nfo_content_fingerprint(&bytes);
+        let source_fingerprint = if background_cpu_budgeted {
+            let fingerprint_bytes = Arc::clone(&bytes);
+            run_process_background_blocking(BackgroundWorkStage::LocalNfo, move || {
+                nfo_content_fingerprint(&fingerprint_bytes)
+            })
+            .await
+            .map_err(|error| MetadataError::Io {
+                path: nfo_path.to_owned(),
+                source: std::io::Error::other(error.to_string()),
+            })?
+        } else {
+            nfo_content_fingerprint(&bytes)
+        };
         if !actor_relation_missing
             && let (Some(metadata), Some((details, cached_fingerprint, _, _))) =
                 (metadata.as_ref(), cached_nfo.as_ref())
@@ -3351,7 +3423,23 @@ impl MetadataEnricher {
             report.nfo_skipped = 1;
             return Ok(report);
         }
-        let parsed_projection = if self.local_nfo.is_some() {
+        let needs_semantic_fingerprint = self.local_nfo.is_some();
+        let parsed_projection = if background_cpu_budgeted {
+            let parse_bytes = Arc::clone(&bytes);
+            run_process_background_blocking(BackgroundWorkStage::LocalNfo, move || {
+                if needs_semantic_fingerprint {
+                    parse_local_nfo_projection_with_semantic_fingerprint(&parse_bytes)
+                } else {
+                    parse_local_nfo_projection(&parse_bytes)
+                        .map(|projection| (projection, Vec::new()))
+                }
+            })
+            .await
+            .map_err(|error| MetadataError::Io {
+                path: nfo_path.to_owned(),
+                source: std::io::Error::other(error.to_string()),
+            })?
+        } else if needs_semantic_fingerprint {
             parse_local_nfo_projection_with_semantic_fingerprint(&bytes)
         } else {
             parse_local_nfo_projection(&bytes).map(|projection| (projection, Vec::new()))
@@ -3721,6 +3809,7 @@ impl MetadataEnricher {
         &self,
         candidates: Vec<(String, Vec<LocalImage>)>,
         report: &mut MetadataReport,
+        background_cpu_budgeted: bool,
     ) {
         for page in candidates.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
             let item_ids = page
@@ -3735,7 +3824,8 @@ impl MetadataEnricher {
                         %error,
                         "local series image page could not read existing images; retrying items individually"
                     );
-                    self.index_images_individually(page, report).await;
+                    self.index_images_individually(page, report, background_cpu_budgeted)
+                        .await;
                     continue;
                 }
             };
@@ -3746,7 +3836,14 @@ impl MetadataEnricher {
                     .get(item_id)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                match prepare_local_image_batch_item(item_id, images.clone(), indexed).await {
+                match prepare_local_image_batch_item(
+                    item_id,
+                    images.clone(),
+                    indexed,
+                    background_cpu_budgeted,
+                )
+                .await
+                {
                     Ok(insert) => inserts.push(insert),
                     Err(error) => {
                         tracing::warn!(
@@ -3775,7 +3872,8 @@ impl MetadataEnricher {
                         %batch_error,
                         "local series image page failed; retrying items individually"
                     );
-                    self.index_images_individually(page, report).await;
+                    self.index_images_individually(page, report, background_cpu_budgeted)
+                        .await;
                 }
             }
         }
@@ -3785,9 +3883,13 @@ impl MetadataEnricher {
         &self,
         candidates: &[(String, Vec<LocalImage>)],
         report: &mut MetadataReport,
+        background_cpu_budgeted: bool,
     ) {
         for (item_id, images) in candidates {
-            match self.index_images(item_id, images.clone(), report).await {
+            match self
+                .index_images(item_id, images.clone(), report, background_cpu_budgeted)
+                .await
+            {
                 Ok(images_found) => report.images_found += images_found,
                 Err(error) => {
                     tracing::warn!(
@@ -3806,9 +3908,17 @@ impl MetadataEnricher {
         item_id: &str,
         images: Vec<LocalImage>,
         report: &mut MetadataReport,
+        background_cpu_budgeted: bool,
     ) -> Result<usize, MetadataError> {
         let indexed_images = self.database.list_item_images(item_id).await?;
-        let insert = match prepare_local_image_batch_item(item_id, images, &indexed_images).await {
+        let insert = match prepare_local_image_batch_item(
+            item_id,
+            images,
+            &indexed_images,
+            background_cpu_budgeted,
+        )
+        .await
+        {
             Ok(insert) => insert,
             Err(error) => {
                 report.mark_item_failed(item_id);
@@ -3829,6 +3939,7 @@ async fn prepare_local_image_batch_item(
     item_id: &str,
     images: Vec<LocalImage>,
     indexed_images: &[StoredItemImage],
+    background_cpu_budgeted: bool,
 ) -> Result<ItemImageBatchInsert, LocalImageReadError> {
     let images = images
         .into_iter()
@@ -3843,7 +3954,7 @@ async fn prepare_local_image_batch_item(
     let clear_poster_fallback = images
         .iter()
         .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
-    let prepared = prepare_local_images(images).await;
+    let prepared = prepare_local_images(images, background_cpu_budgeted).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
     let mut first_error = None;
@@ -3888,6 +3999,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     source: &StoredMediaSourcePath,
     directory_cache: &mut DirectoryPathCache,
     report: &mut MetadataReport,
+    background_cpu_budgeted: bool,
 ) -> Option<ItemImageBatchInsert> {
     let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
     let mut image_paths = match directory_cache
@@ -3929,7 +4041,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     let clear_poster_fallback = images
         .iter()
         .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
-    let prepared = prepare_local_images(images).await;
+    let prepared = prepare_local_images(images, background_cpu_budgeted).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
     let mut first_error = None;
@@ -3999,6 +4111,7 @@ struct LocalImageReadError {
 
 async fn prepare_local_images(
     images: Vec<LocalImage>,
+    background_cpu_budgeted: bool,
 ) -> Vec<Result<PreparedLocalImage, LocalImageReadError>> {
     let permits = local_image_read_permits();
     let mut pending = JoinSet::new();
@@ -4022,7 +4135,10 @@ async fn prepare_local_images(
         };
         pending.spawn(async move {
             let _permit = permit;
-            (index, prepare_local_image(image).await)
+            (
+                index,
+                prepare_local_image(image, background_cpu_budgeted).await,
+            )
         });
     }
     while !pending.is_empty() {
@@ -4045,7 +4161,10 @@ async fn collect_local_image_task(
     }
 }
 
-async fn prepare_local_image(image: LocalImage) -> Result<PreparedLocalImage, LocalImageReadError> {
+async fn prepare_local_image(
+    image: LocalImage,
+    background_cpu_budgeted: bool,
+) -> Result<PreparedLocalImage, LocalImageReadError> {
     let bytes = fs::read(&image.path)
         .await
         .map_err(|error| LocalImageReadError {
@@ -4059,12 +4178,15 @@ async fn prepare_local_image(image: LocalImage) -> Result<PreparedLocalImage, Lo
             bytes.len()
         )),
     })?;
-    let (content_tag, dimensions) = image_content_tag_and_dimensions_from_bytes(bytes)
-        .await
-        .map_err(|error| LocalImageReadError {
-            path: image.path.clone(),
-            error,
-        })?;
+    let dimensions_and_tag = if background_cpu_budgeted {
+        background_image_content_tag_and_dimensions_from_bytes(bytes).await
+    } else {
+        image_content_tag_and_dimensions_from_bytes(bytes).await
+    };
+    let (content_tag, dimensions) = dimensions_and_tag.map_err(|error| LocalImageReadError {
+        path: image.path.clone(),
+        error,
+    })?;
     Ok(PreparedLocalImage {
         image,
         file_size,
@@ -5547,6 +5669,7 @@ mod tests {
                         path: poster.clone(),
                     }],
                     &mut report,
+                    false,
                 )
                 .await
                 .is_err()
@@ -5564,6 +5687,7 @@ mod tests {
                         path: poster,
                     }],
                     &mut report,
+                    false,
                 )
                 .await?,
             1
@@ -5771,6 +5895,7 @@ mod tests {
                 Some(metadata),
                 None,
                 Some(deferred.clone()),
+                false,
             )
             .await?;
         assert_eq!(report.nfo_skipped, 1);

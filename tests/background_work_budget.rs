@@ -5,6 +5,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use luxd::{
     application::{
         libraries::LibraryService,
+        metadata::MetadataEnricher,
         probe::{FfprobeRunner, MediaProbeService},
         scanner::LibraryScanner,
         thumbnails::ThumbnailService,
@@ -51,6 +52,10 @@ async fn probe_and_thumbnail_services_share_budget_across_libraries()
     let probe_movie = probe_root.join("Probe Fixture (2024)");
     fs::create_dir_all(&probe_movie)?;
     fs::write(probe_movie.join("Probe.Fixture.2024.mkv"), b"probe fixture")?;
+    fs::write(
+        probe_movie.join("movie.nfo"),
+        "<movie><title>Probe Fixture</title><year>2024</year></movie>",
+    )?;
 
     let thumbnail_root = temp_dir.path().join("Thumbnail Movies");
     let thumbnail_movie = thumbnail_root.join("Thumbnail Fixture (2024)");
@@ -108,10 +113,29 @@ async fn probe_and_thumbnail_services_share_budget_across_libraries()
     wait_for_file(&probe_started).await?;
 
     let thumbnails =
-        ThumbnailService::with_runner(database, ffmpeg_binary, Duration::from_secs(10));
+        ThumbnailService::with_runner(database.clone(), ffmpeg_binary, Duration::from_secs(10));
     let thumbnail_library_id = thumbnail_library.id;
     let thumbnail_task =
         tokio::spawn(async move { thumbnails.generate_library(thumbnail_library_id).await });
+
+    let metadata = MetadataEnricher::new(database);
+    let metadata_library_id = probe_library.id;
+    let mut metadata_task =
+        tokio::spawn(async move { metadata.enrich_movie_library(metadata_library_id).await });
+    let metadata_result = tokio::time::timeout(Duration::from_secs(1), &mut metadata_task).await;
+    let metadata_report = match metadata_result {
+        Ok(Ok(Ok(report))) => report,
+        _ => {
+            fs::write(state_dir.join("probe.release"), b"")?;
+            fs::write(state_dir.join("thumbnail.release"), b"")?;
+            let _ = metadata_task.await;
+            let _ = probe_task.await;
+            let _ = thumbnail_task.await;
+            return Err("foreground metadata waited on the background CPU budget".into());
+        }
+    };
+    assert_eq!(metadata_report.items_processed, 1);
+
     let thumbnail_started = state_dir.join("thumbnail.started");
     let thumbnail_started_while_probe_held = tokio::time::timeout(
         Duration::from_millis(250),

@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::{
+        background_work::{BackgroundWorkStage, run_process_background_blocking},
         metadata::series_directory,
         metadata_paths::{library_item_directory, metadata_root},
         metadata_writeback::item_metadata_writeback_enabled,
@@ -237,13 +238,27 @@ fn image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i32, i32)> {
 pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
     bytes: Vec<u8>,
 ) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
-    tokio::task::spawn_blocking(move || {
-        let content_tag = format!("{:x}", Sha256::digest(&bytes));
-        let dimensions = image_dimensions_from_bytes(&bytes);
-        Ok((content_tag, dimensions))
+    tokio::task::spawn_blocking(move || image_content_tag_and_dimensions_sync(&bytes))
+        .await
+        .map_err(|error| std::io::Error::other(format!("image metadata worker failed: {error}")))?
+}
+
+pub(crate) async fn background_image_content_tag_and_dimensions_from_bytes(
+    bytes: Vec<u8>,
+) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
+    run_process_background_blocking(BackgroundWorkStage::LocalImage, move || {
+        image_content_tag_and_dimensions_sync(&bytes)
     })
     .await
     .map_err(|error| std::io::Error::other(format!("image metadata worker failed: {error}")))?
+}
+
+fn image_content_tag_and_dimensions_sync(
+    bytes: &[u8],
+) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
+    let content_tag = format!("{:x}", Sha256::digest(bytes));
+    let dimensions = image_dimensions_from_bytes(bytes);
+    Ok((content_tag, dimensions))
 }
 
 #[derive(Clone, Debug)]
@@ -2763,11 +2778,12 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImagePermitPool,
-        ImageWriteError, canonical_image_stems, global_image_download_permits,
-        global_image_write_permits, image_attempt_failure,
-        image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
-        image_language_matches, image_lookup_stems, is_allowed_scraper_image_url,
-        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
+        ImageWriteError, background_image_content_tag_and_dimensions_from_bytes,
+        canonical_image_stems, global_image_download_permits, global_image_write_permits,
+        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
+        image_download_retry_delay, image_language_matches, image_lookup_stems,
+        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
+        write_image_atomically,
     };
 
     #[test]
@@ -2847,6 +2863,25 @@ mod tests {
             .expect("metadata worker");
         assert_eq!(content_tag.len(), 64);
         assert_eq!(dimensions, Some((3, 2)));
+    }
+
+    #[tokio::test]
+    async fn background_image_metadata_matches_the_existing_cpu_path() {
+        let image = image::RgbImage::from_pixel(3, 2, image::Rgb([12, 34, 56]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("png encoding");
+        let expected = image_content_tag_and_dimensions_from_bytes(bytes.clone())
+            .await
+            .expect("existing metadata worker");
+        let actual = background_image_content_tag_and_dimensions_from_bytes(bytes)
+            .await
+            .expect("budgeted metadata worker");
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
