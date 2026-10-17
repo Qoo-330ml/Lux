@@ -1312,6 +1312,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 
 每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务。服务重启标记为 `CANCELLED` / `SERVER_SHUTDOWN` 的元数据任务，在下次启动时恢复原任务 ID，只将未完成子项重新排队；已完成子项和管理员主动取消的任务保持原状。`FILL_MISSING` 仅在媒体库仍启用且仍选中刮削器时恢复；没有可用刮削器的库不得创建待运行任务。
 
+自动 `FILL_MISSING` 因刮削器暂不可用而 `DEFERRED` 时，调度服务按持久化的 item 退避截止时间独立轮询并重排到期失败项，不依赖媒体库扫描或用户计划任务；只有自动来源、仍启用且选中刮削器的媒体库、未消费的带快照 `SCRAPER_UNAVAILABLE` 失败项可自动重试。每项仍按既有 5 分钟、30 分钟、最多 6 小时退避，成功后停止，持续不可用则继续延期。
+
 媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条先使用所属媒体库的主刮削器处理全部能力，某项能力为空、无效、不支持或重试失败时再由按顺序启用的备用刮削器接管该项；身份达到高置信度后自动选择最佳候选，再调用补充刮削器合并单值缺失项和去重后的多值项，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
 
 实时增量扫描默认更新索引并为受影响条目提交 `FILL_MISSING` 元数据任务；媒体库关闭 `realtime_metadata_auto_match_enabled` 后才只更新索引，不再自动补全。不论开关状态，任务都只处理本次受影响且仍可用的媒体条目，不对整库重新刮削。NFO、图片和其他旁车文件的写回事件不得直接导致同一条目无限重复提交；已完整补全的条目由元数据任务跳过。
@@ -12189,6 +12191,21 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [x] 更新 ADR-034 与 §13.5 重启语义；无 schema 变化。定向测试、build、fmt 和 Clippy 结果见本任务记录。
 
 验证：`cargo test --locked --test reidentify -- --test-threads=1`（24/24）、`cargo fmt --all -- --check`、`cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；所有 Cargo build/test/clippy 命令将 `CARGO_TARGET_DIR` 设为 `/Volumes/Toshiba/mywork/Lux/target`。本机为 `arm64`；未验证 FNOS/x86_64 与生产部署，完整 `--all-targets` 测试门禁在这组关联修复完成后统一运行。
+
+#### LUX-573：刮削器恢复后自动重试延期的补缺任务
+
+范围：LUX-402 已为带请求快照的自动 `FILL_MISSING` 失败项保存 5 分钟、30 分钟、最多 6 小时的退避，但当前只有后续扫描会重新提交这些项。利用现有 15 秒后台调度轮询到期的自动延期项，从已保存的媒体完整度生成当前指纹与能力集合，复用请求快照去重事务创建自动重试任务，再经每媒体库有界 dispatcher 执行并消费旧失败记录。仅处理 `AUTOMATIC` 来源、未消费且带请求快照的失败；新尝试继承逐项失败次数，并确认媒体库仍启用且仍选中刮削器。不得触发整库扫描或人工/其他错误重试。
+
+预计文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/reidentify.rs`、`src/application/scheduled_tasks.rs`、`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/metadata.rs`、`tests/scheduled_tasks.rs`。
+
+验收：
+
+- [x] 调度轮询独立发现到期自动 provider 失败，即使没有新扫描或用户计划任务也会重新排队；未到期项不会提前重试。
+- [x] 重试沿用当前完整度指纹和快照去重，经原有 dispatcher 创建一次自动尝试；保留 item 失败次数并在持续不可用时进入下一档退避，服务恢复后完成并停止重试。
+- [x] 不重试人工来源、已消费快照、非 provider 错误、未启用/未选刮削器的媒体库；整个过程不发起扫描，查询和每次调度页有界。
+- [x] 不增加 schema/API 变化；自动重试回归、build、fmt 和 Clippy 通过。调度目标存在一项在本任务基线中同样失败的 STRM cron 测试。
+
+验证：`cargo test --locked --test scheduled_tasks due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule -- --exact --nocapture`（1/1）、`cargo test --locked --test reidentify -- --test-threads=1`（24/24）通过。`scheduled_tasks` 目标 8/9 通过；`enabled_strm_task_runs_once_per_matching_cron_minute` 断言得到 0 而非 1，在干净基线 `3c7dd6be` 上精确重跑得到相同失败。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过；Cargo build/test/clippy 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。未部署 FNOS/x86_64；全量 `--all-targets` 门禁在全部三项修复结束后运行。
 
 ## 29. 参考资料
 

@@ -46,6 +46,7 @@ const METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT: usize = 32;
 const METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE: i64 = 100;
 const METADATA_FILL_MISSING_AUTO_DISPATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const METADATA_AUTOMATIC_RETRY_PAGE_SIZE: i64 = 100;
 const METADATA_SHUTDOWN_RECOVERY_PAGE_SIZE: i64 = 100;
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 4;
@@ -2500,6 +2501,81 @@ impl MetadataReidentifyService {
             );
         }
         Ok(dispatched)
+    }
+
+    /// Requeues due automatic provider failures without requiring a library scan.
+    /// The storage flow preserves request-snapshot deduplication and backoff state.
+    pub async fn retry_due_automatic_fill_missing_jobs(
+        &self,
+    ) -> Result<usize, MetadataReidentifyError> {
+        let mut library_cursor: Option<String> = None;
+        let mut dispatched_jobs = 0;
+        loop {
+            let library_ids = self
+                .database
+                .list_due_automatic_fill_missing_library_ids(
+                    library_cursor.as_deref(),
+                    METADATA_AUTOMATIC_RETRY_PAGE_SIZE,
+                )
+                .await?;
+            if library_ids.is_empty() {
+                break;
+            }
+            library_cursor = library_ids.last().cloned();
+            for library_id in &library_ids {
+                let has_scraper =
+                    self.database
+                        .find_library(library_id)
+                        .await?
+                        .is_some_and(|library| {
+                            library.is_enabled
+                                && library
+                                    .scraper_id
+                                    .as_deref()
+                                    .is_some_and(|scraper_id| !scraper_id.trim().is_empty())
+                        });
+                if !has_scraper {
+                    continue;
+                }
+                let job_ids = self
+                    .database
+                    .enqueue_due_automatic_fill_missing_retries(
+                        library_id,
+                        METADATA_AUTOMATIC_RETRY_PAGE_SIZE,
+                    )
+                    .await?;
+                if job_ids.is_empty() {
+                    continue;
+                }
+                dispatched_jobs += job_ids.len();
+                self.admin_events.publish(AdminEventScope::Jobs);
+                let Some(dispatchers) = self.fill_missing_dispatchers.as_ref() else {
+                    tracing::warn!(
+                        library_id,
+                        jobs = job_ids.len(),
+                        "due automatic metadata retries remain queued without a dispatcher"
+                    );
+                    continue;
+                };
+                if let Err(error) = dispatchers.wake_automatic(self.clone(), library_id).await {
+                    tracing::warn!(
+                        library_id,
+                        %error,
+                        "due automatic metadata retries could not be dispatched"
+                    );
+                }
+            }
+            if library_ids.len() < METADATA_AUTOMATIC_RETRY_PAGE_SIZE as usize {
+                break;
+            }
+        }
+        if dispatched_jobs > 0 {
+            tracing::info!(
+                jobs = dispatched_jobs,
+                "retried due automatic metadata provider failures"
+            );
+        }
+        Ok(dispatched_jobs)
     }
 
     async fn has_selected_scraper_for_shutdown_recovery(

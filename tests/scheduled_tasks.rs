@@ -7,13 +7,21 @@ use std::{
     time::Duration,
 };
 
-use axum::{Json, Router, extract::State as AxumState, routing::any};
+use axum::{
+    Json, Router,
+    extract::State as AxumState,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::any,
+};
 
 mod common;
 
 use common::{TestScraper, TestScraperConfig};
 use luxd::application::{
+    candidates::MetadataSelectionService,
     chapter_detector::{ChapterDetectionService, DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID},
+    images::ImageWriteService,
     libraries::{LibraryService, LibrarySettingsPatch},
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
     reidentify::MetadataReidentifyService,
@@ -25,19 +33,33 @@ use luxd::application::{
     thumbnails::ThumbnailService,
 };
 use luxd::{config::Config, library::LibraryKind, storage::Database};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, json};
 use tokio::{net::TcpListener, sync::Semaphore};
 
 #[derive(Clone)]
 struct MetadataScraperGate {
     started: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
+    failures_remaining: Arc<AtomicUsize>,
 }
 
-async fn gated_metadata_search(AxumState(gate): AxumState<MetadataScraperGate>) -> Json<Value> {
+async fn gated_metadata_search(AxumState(gate): AxumState<MetadataScraperGate>) -> Response {
     gate.started.fetch_add(1, Ordering::SeqCst);
     let _permit = gate.release.acquire().await.ok();
-    Json(json!({ "results": [] }))
+    if gate
+        .failures_remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "temporary" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "results": [] })).into_response()
 }
 
 #[tokio::test]
@@ -164,6 +186,360 @@ async fn thumbnail_scraper_retry_keeps_lease_when_metadata_dispatcher_is_closed(
 }
 
 #[tokio::test]
+async fn due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper(
+            "Automatic metadata retry",
+            LibraryKind::Movie,
+            false,
+            Some("org.lux.tmdb"),
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Retry Movie (2024)");
+    let already_complete_dir = root.join("Already Complete Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::create_dir_all(&already_complete_dir).await?;
+    tokio::fs::write(movie_dir.join("Retry.Movie.2024.mkv"), b"fixture").await?;
+    tokio::fs::write(
+        already_complete_dir.join("Already.Complete.Movie.2024.mkv"),
+        b"fixture",
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 2);
+    let item_id = item_ids[0].clone();
+    let already_complete_item_id = item_ids[1].clone();
+
+    let gate = MetadataScraperGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+        failures_remaining: Arc::new(AtomicUsize::new(1)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(gated_metadata_search))
+        .with_state(gate.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let metadata = MetadataReidentifyService::with_selection(
+        database.clone(),
+        TestScraper::new(TestScraperConfig {
+            base_url: format!("http://{tmdb_address}"),
+            read_access_token: Some("stub-token".to_owned()),
+            timeout: Duration::from_secs(5),
+            ..TestScraperConfig::default()
+        })?
+        .provider(),
+        Some(MetadataSelectionService::new(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+        )),
+    );
+    let job = metadata.create_fill_missing_job(item_ids.clone()).await?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    sqlx::query(
+        "INSERT INTO item_metadata_completeness (
+             item_id, capability, local_state, is_missing, input_fingerprint, checked_at
+         ) VALUES (?, 'POSTER', 'READY', 1, X'01', ?)",
+    )
+    .bind(&item_id)
+    .bind(now)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_metadata_completeness (
+             item_id, capability, local_state, is_missing, input_fingerprint, checked_at
+         ) VALUES (?, 'POSTER', 'READY', 0, X'01', ?)",
+    )
+    .bind(&already_complete_item_id)
+    .bind(now)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET dispatch_source = 'AUTOMATIC', status = 'DEFERRED',
+             error = 'DEFERRED_PROVIDER_UNAVAILABLE', updated_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE',
+             automatic_retry_count = 1, automatic_retry_after = ?,
+             automatic_retry_consumed = 0, request_fingerprint = X'01',
+             request_capabilities_json = '[\"POSTER\"]'
+         WHERE job_id = ?",
+    )
+    .bind(now + 300)
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+
+    let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database.clone(), plugins),
+        None,
+    )
+    .with_library_services(
+        ScanJobService::new(database.clone()),
+        Some(metadata.clone()),
+        None,
+        None,
+    );
+
+    scheduler.run_once().await;
+    assert_eq!(
+        gate.started.load(Ordering::SeqCst),
+        0,
+        "retry must respect its deadline"
+    );
+    let deferred_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(deferred_status, "DEFERRED");
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    scheduler.run_once().await;
+    assert_eq!(
+        gate.started.load(Ordering::SeqCst),
+        0,
+        "disabled libraries must not retry"
+    );
+    sqlx::query("UPDATE libraries SET is_enabled = 1, scraper_id = NULL WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    scheduler.run_once().await;
+    assert_eq!(
+        gate.started.load(Ordering::SeqCst),
+        0,
+        "unselected libraries must not retry"
+    );
+    sqlx::query("UPDATE libraries SET scraper_id = 'org.lux.tmdb' WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    scheduler.run_once().await;
+    if tokio::time::timeout(Duration::from_secs(3), async {
+        while gate.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let parent: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM metadata_reidentify_jobs WHERE id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        let item: (String, Option<String>, Option<i64>, i64) = sqlx::query_as(
+            "SELECT status, error, automatic_retry_after, automatic_retry_consumed
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&job.id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        return Err(format!(
+            "scheduler did not retry due metadata job: parent={parent:?}, item={item:?}"
+        )
+        .into());
+    }
+    let scan_job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(scan_job_count, 0, "retry must not create a scan job");
+    let complete_item_retry_consumed: i64 = sqlx::query_scalar(
+        "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&job.id)
+    .bind(&already_complete_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        complete_item_retry_consumed, 1,
+        "complete items must not remain due"
+    );
+
+    let retry_job_id: String = sqlx::query_scalar(
+        "SELECT id FROM metadata_reidentify_jobs
+         WHERE id <> ? AND library_id = ? AND mode = 'FILL_MISSING'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&job.id)
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    gate.release.add_permits(1);
+    if tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(&retry_job_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if status == "DEFERRED" {
+                break Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let parent: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM metadata_reidentify_jobs WHERE id = ?")
+                .bind(&retry_job_id)
+                .fetch_one(database.pool())
+                .await?;
+        return Err(format!(
+            "retried metadata job did not defer after provider outage: parent={parent:?}"
+        )
+        .into());
+    }
+    let (retry_count, retry_after): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT automatic_retry_count, automatic_retry_after
+         FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&retry_job_id)
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(retry_count, 2, "provider failure advances the retry count");
+    assert!(
+        retry_after.is_some_and(|retry_after| retry_after >= now + 1_700),
+        "the second failure should wait about 30 minutes"
+    );
+    scheduler.run_once().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        gate.started.load(Ordering::SeqCst),
+        1,
+        "retry must respect the next backoff"
+    );
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&retry_job_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    scheduler.run_once().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while gate.started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let completed_retry_job_id: String = sqlx::query_scalar(
+        "SELECT id FROM metadata_reidentify_jobs
+         WHERE id <> ? AND id <> ? AND library_id = ? AND mode = 'FILL_MISSING'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&job.id)
+    .bind(&retry_job_id)
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(&completed_retry_job_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if matches!(status.as_str(), "COMPLETED" | "COMPLETED_WITH_ISSUES") {
+                break Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        job_count, 3,
+        "each due snapshot should create one automatic attempt"
+    );
+    scheduler.run_once().await;
+    let jobs_after_another_poll: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        jobs_after_another_poll, 3,
+        "consumed retries must not duplicate"
+    );
+    let retry_source: String =
+        sqlx::query_scalar("SELECT dispatch_source FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&completed_retry_job_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(retry_source, "AUTOMATIC");
+    let retry_count: i64 = sqlx::query_scalar(
+        "SELECT automatic_retry_count FROM metadata_reidentify_job_items
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&completed_retry_job_id)
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        retry_count, 2,
+        "recovered scraper keeps the backoff history"
+    );
+
+    metadata.shutdown().await;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn thumbnail_scraper_retry_waits_for_dispatched_metadata_job()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -213,6 +589,7 @@ async fn thumbnail_scraper_retry_waits_for_dispatched_metadata_job()
     let gate = MetadataScraperGate {
         started: Arc::new(AtomicUsize::new(0)),
         release: Arc::new(Semaphore::new(0)),
+        failures_remaining: Arc::new(AtomicUsize::new(0)),
     };
     let tmdb_app = Router::new()
         .fallback(any(gated_metadata_search))

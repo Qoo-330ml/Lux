@@ -635,7 +635,7 @@ impl Database {
         Ok(commit)
     }
 
-    async fn build_metadata_fill_missing_requests(
+    pub(crate) async fn build_metadata_fill_missing_requests(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,

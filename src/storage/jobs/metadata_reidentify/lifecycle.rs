@@ -459,6 +459,56 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_due_automatic_fill_missing_library_ids(
+        &self,
+        after_library_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let limit = limit.clamp(1, AUTOMATIC_FILL_MISSING_DISPATCH_PAGE_MAX);
+        let query = "SELECT DISTINCT jobs.library_id
+                     FROM metadata_reidentify_jobs jobs
+                     LEFT JOIN server_settings legacy_retry
+                       ON legacy_retry.key = 'metadata_fill_missing_legacy_retry_after'
+                     WHERE jobs.library_id IS NOT NULL
+                       AND jobs.mode = 'FILL_MISSING'
+                       AND jobs.dispatch_source = 'AUTOMATIC'
+                       AND jobs.status = 'DEFERRED'
+                       AND jobs.cancel_requested = 0
+                       AND EXISTS (
+                           SELECT 1
+                           FROM metadata_reidentify_job_items items
+                           WHERE items.job_id = jobs.id
+                             AND items.status = 'FAILED'
+                             AND items.error = 'SCRAPER_UNAVAILABLE'
+                             AND items.automatic_retry_consumed = 0
+                             AND items.request_fingerprint IS NOT NULL
+                             AND COALESCE(
+                                 items.automatic_retry_after,
+                                 CASE WHEN items.automatic_retry_count = 0
+                                      THEN CAST(legacy_retry.value AS BIGINT)
+                                      ELSE NULL END
+                             ) <= unixepoch()
+                       )";
+        let rows = if let Some(after_library_id) = after_library_id {
+            let query = format!("{query} AND jobs.library_id > ? ORDER BY jobs.library_id LIMIT ?");
+            self.query_scalar(sqlx::AssertSqlSafe(query))
+                .bind(after_library_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            let query = format!("{query} ORDER BY jobs.library_id LIMIT ?");
+            self.query_scalar(sqlx::AssertSqlSafe(query))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+        };
+        rows.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn finish_metadata_reidentify_job(
         &self,
         job_id: &str,
