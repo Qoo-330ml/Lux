@@ -204,7 +204,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-eyebrow { display: inline-block; color: var(--lux-muted); font-size: .68rem; font-weight: 650; letter-spacing: .18em; text-transform: uppercase; }
 .lux-hero-title { --lux-hero-title-line-height: .94em; max-width: 700px; min-height: calc(3 * var(--lux-hero-title-line-height)); margin: 17px 0 10px; color: #fff; font-size: clamp(2.75rem, 5.5vw, 5rem); font-weight: 700; letter-spacing: -.075em; line-height: var(--lux-hero-title-line-height); text-shadow: 0 8px 28px rgba(0,0,0,.48); }
 .lux-hero-title.has-logo { min-height: 0; }
-.lux-hero-title-text { display: -webkit-box; max-width: 700px; max-height: calc(3 * var(--lux-hero-title-line-height)); overflow: hidden; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow-wrap: anywhere; text-wrap: balance; }
+.lux-hero-title-text { display: -webkit-box; max-width: 700px; max-height: calc(3 * var(--lux-hero-title-line-height)); overflow: hidden; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow-wrap: anywhere; text-wrap: balance; font-family: "Didot", "Bodoni 72", "Bodoni MT", "Songti SC", "STSong", "Songti TC", "SimSun", serif; letter-spacing: 0; }
 .lux-hero-title--compact { --lux-hero-title-line-height: 1em; font-size: clamp(2.35rem, 4.4vw, 3.9rem); }
 .lux-hero-title--small { --lux-hero-title-line-height: 1.06em; font-size: clamp(2rem, 3.5vw, 3.2rem); }
 .lux-hero-logo { display: block; max-width: min(440px, 100%); max-height: 145px; width: auto; height: auto; object-fit: contain; object-position: left center; filter: drop-shadow(0 8px 24px rgba(0,0,0,.4)); }
@@ -232,6 +232,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-button-glass:hover, .lux-button-secondary:hover { border-color: rgba(255,255,255,.38); background: rgba(255,255,255,.1); }
 
 .lux-home-content { position: relative; z-index: 2; width: 92%; margin: -24px auto 0; padding: 0 0 80px; }
+.lux-home-content .lux-section-heading h2,
+.lux-home-content .lux-continue-copy strong,
+.lux-home-content .lux-media-copy strong { font-family: "Didot", "Bodoni 72", "Bodoni MT", "Songti SC", "STSong", "Songti TC", "SimSun", serif; }
 .lux-section { margin-top: 52px; }
 .lux-section-heading, .lux-page-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
 .lux-section-heading h2 { margin: 0; font-size: 1.18rem; font-weight: 600; letter-spacing: -.025em; }
