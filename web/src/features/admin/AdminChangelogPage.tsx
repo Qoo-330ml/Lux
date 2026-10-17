@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.10",
+    date: "2026-10-18",
+    sections: [
+      { kind: "added", items: [
+        "Lux 媒体目录响应新增 userData.lastPlayedAt 最近播放时间；继续观看卡片展示电影或剧集上下文、剩余时长和最近观看提示。",
+      ] },
+      { kind: "changed", items: [
+        "全量扫描完成索引后释放共享扫描许可，使下一个媒体库可以开始索引，同时前一个媒体库继续执行媒体探测和其他后处理。",
+        "首页标题采用更具编辑感的字体样式。",
+      ] },
+      { kind: "fixed", items: [
+        "看完一集后，继续观看会前进到该剧下一条符合条件的未看单集，避免剧集过早从列表中消失。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.9",
     date: "2026-10-17",
     sections: [
