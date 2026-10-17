@@ -1310,7 +1310,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 
 指定条目的批量重新识别仍使用持久化任务队列：管理员一次提交 1-100 个条目，服务端去重后以 `QUEUED` 创建任务并在后台逐条处理；每条记录 `PENDING/RUNNING/COMPLETED/FAILED`、候选数量和稳定错误代码，任务通过 `GET /api/v1/admin/metadata/reidentify/{jobId}` 查询。条目级失败不会把整批伪装成基础设施失败，父任务以 `COMPLETED_WITH_ISSUES` 完成；只有任务无法收尾等基础设施故障才使用 `FAILED`。刮削器暂不可用的批次可以使用 `DEFERRED` 表示延后。该指定条目接口只负责重新搜索并生成 pending 候选，供管理员处理；失败、有问题或延后的任务可通过 `POST /api/v1/admin/metadata/reidentify/{jobId}` 重新排队未完成条目。
 
-每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务；服务重启时遗留的活动任务标记为 `CANCELLED`，不会自动重新进入 `PENDING`。
+每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务。服务重启标记为 `CANCELLED` / `SERVER_SHUTDOWN` 的元数据任务，在下次启动时恢复原任务 ID，只将未完成子项重新排队；已完成子项和管理员主动取消的任务保持原状。`FILL_MISSING` 仅在媒体库仍启用且仍选中刮削器时恢复；没有可用刮削器的库不得创建待运行任务。
 
 媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条先使用所属媒体库的主刮削器处理全部能力，某项能力为空、无效、不支持或重试失败时再由按顺序启用的备用刮削器接管该项；身份达到高置信度后自动选择最佳候选，再调用补充刮削器合并单值缺失项和去重后的多值项，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
 
@@ -5718,13 +5718,13 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 数据、媒体索引和 Webhook 投递 outbox 不属于被取消的作业实例。
 
 服务启动并完成数据库迁移后，先在一个事务中将上一次异常退出遗留的活动作业，以及扫描中仍处于
-`COMPLETED + POSTPROCESSING` 的作业，标记为 `CANCELLED`，并记录稳定错误码 `SERVER_SHUTDOWN`；之后不再
-调用旧的 `resume_*_jobs` 自动恢复入口。优雅关闭时，在关闭数据库连接前再次执行同一清理，覆盖关闭窗口内的
-活动作业。计划任务在后续调度周期可以创建新的作业实例，但不恢复被取消的旧实例。
+`COMPLETED + POSTPROCESSING` 的作业，标记为 `CANCELLED`，并记录稳定错误码 `SERVER_SHUTDOWN`。优雅关闭时，
+在关闭数据库连接前再次执行同一清理，覆盖关闭窗口内的活动作业。元数据识别任务按 LUX-572 恢复原任务中
+未完成的子项；其他作业仍保留取消记录并等待既有主动重试或后续计划任务。
 
-例外（元数据补全，2026-10-14 修订）：被取消的作业实例仍不恢复，但每次启动后，对「最近一个 `FILL_MISSING`
-作业被 `SERVER_SHUTDOWN` 取消且已选择刮削器」的媒体库，各新建一个库级 `FILL_MISSING` 作业并按库依次
-执行，使中断的在线刮削自动补完；已完整的条目不发起刮削请求。同时，元数据作业不得在仍有 `PENDING`
+元数据识别恢复（LUX-572）：被取消的任务历史保留；启动后将 `SERVER_SHUTDOWN` 元数据任务中仍未完成的子项
+原子地恢复到同一个任务 ID。`FILL_MISSING` 仅在媒体库仍启用且仍选中刮削器时恢复；已完成条目不重复刮削。
+同时，元数据作业不得在仍有 `PENDING`
 条目时记为完成（以 `FAILED` / `QUEUE_INCOMPLETE` 结束），无法派发的作业记为 `FAILED` / `DISPATCH_FAILED`
 而不是长期停留在 `QUEUED`。
 
@@ -12174,6 +12174,21 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 验收结果（2026-10-16）：EXISTS 完成检查保留 workflow 1 两种候选来源的独立检查；精确 `unchanged_count` 未改。LITE、PERSISTED v3、workflow 2 format 2 与 workflow 1 的差异集合和 finish/retry 行为由 storage 与 `scanning_jobs` 回归覆盖。固定 root/path keyset 使用现有唯一索引，seen/delta 仍使用完整复合键反连接；无新增索引或迁移。完整 LUX-270 fixture 的 8 轮交错中位数：首扫 2,383.5/2,406.5 ms、无变化重扫 1,167.5/1,185.5 ms、前台 p95 338/339 ms、目录列表 p95 578/591.5 ms、热目录列表 p95 431.5/423.5 ms、batch p95 334.5/346 ms（基线/候选）；最大观测回退 3.44%，在 5% 门内。完整样本见 `docs/PERFORMANCE.md`。
 
 代码验证：`cargo test --locked --lib manifest_removal_candidates_page_within_root_and_preserve_directory_scopes`、`cargo test --locked --test scanning_jobs`（88/88）、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；以上 Cargo 命令均将 target 指向 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。`./scripts/check-all.sh` 的 Rust 全量测试未通过：串行执行到未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 时，插入 2 张海报、断言预期 1 张；在干净基线 `1e7c2ea8` 上的同一精确测试得到相同失败。合并参数对象后的全目标重跑另在 `login_background_plugin_is_refreshed_in_worker_and_served_from_cache` 遇到 15 秒超时，单独精确重跑通过（1/1）。并行执行另曾出现 `libraries_api` 的临时 503，隔离及串行目标重跑通过（14/14）。因此全量 Rust 完成门如实记录为未通过，现有证据不将这些故障归因于 LUX-561。Web 冻结安装和 production build 通过；当前工作树 `pnpm test` 静态阶段为 145/148，Vitest 单独运行是 650/655；这些失败涉及未修改的 Web 页面/CSS/组件查询用例，未在本任务归因或修复。未验证 PostgreSQL runtime、FNOS/x86_64、生产 NAS 或部署行为。
+
+#### LUX-572：重启后恢复未完成的元数据识别任务
+
+范围：关闭或重启仍统一保留 `SERVER_SHUTDOWN` 任务历史，但下次启动恢复原元数据任务 ID，不为同一批未完成工作重复创建整库任务。原子地把遗留 `RUNNING/PENDING` 子项（以及迁移后标为 `FAILED/SERVER_SHUTDOWN` 的子项）重新排队；已完成子项不重跑，管理员主动取消和其他终态不恢复。`FILL_MISSING` 只有媒体库仍启用且仍配置主刮削器时恢复；指定条目任务沿用当前媒体库/刮削器选择处理，不可用条目在任务处理中完成为明确跳过结果。继续使用有界 dispatcher，不等待识别完成后才启动 HTTP 服务。
+
+预计文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/034-cancel-jobs-on-shutdown.md`、`src/api/legacy.rs`、`src/application/reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`tests/reidentify.rs`。
+
+验收：
+
+- [x] 仅 `CANCELLED/SERVER_SHUTDOWN` 的元数据任务恢复原任务 ID；恢复事务同时更新父任务和未完成子项，重复调用幂等。
+- [x] 已完成子项不重复请求；`PENDING/RUNNING` 和迁移后 `FAILED/SERVER_SHUTDOWN` 子项恢复；管理员主动取消或无可用刮削器时不创建待运行任务。
+- [x] `ITEMS` 与库级 `FILL_MISSING` 按各自范围派发；整库任务仍串行，恢复筛选和状态更新有界、幂等。
+- [x] 更新 ADR-034 与 §13.5 重启语义；无 schema 变化。定向测试、build、fmt 和 Clippy 结果见本任务记录。
+
+验证：`cargo test --locked --test reidentify -- --test-threads=1`（24/24）、`cargo fmt --all -- --check`、`cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；所有 Cargo build/test/clippy 命令将 `CARGO_TARGET_DIR` 设为 `/Volumes/Toshiba/mywork/Lux/target`。本机为 `arm64`；未验证 FNOS/x86_64 与生产部署，完整 `--all-targets` 测试门禁在这组关联修复完成后统一运行。
 
 ## 29. 参考资料
 

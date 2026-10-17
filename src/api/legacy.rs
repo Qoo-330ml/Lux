@@ -624,7 +624,7 @@ impl AppState {
         }
         if let Some(metadata) = self.metadata_reidentify.clone() {
             tokio::spawn(async move {
-                if let Err(error) = metadata.resume_interrupted_fill_missing_jobs().await {
+                if let Err(error) = metadata.resume_interrupted_metadata_jobs().await {
                     tracing::error!(%error, "failed to requeue interrupted metadata scraping");
                 }
             });

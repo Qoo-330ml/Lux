@@ -33,7 +33,7 @@ use crate::{
     },
     config::DatabaseBackend,
     observability::resources::ResourceMetrics,
-    storage::{Database, StorageError, StoredMetadataReidentifyItem},
+    storage::{Database, StorageError, StoredMetadataReidentifyItem, StoredMetadataReidentifyJob},
 };
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
@@ -46,6 +46,7 @@ const METADATA_FILL_MISSING_AUTO_COMPLETION_LIMIT: usize = 32;
 const METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const METADATA_FILL_MISSING_AUTO_DISPATCH_PAGE_SIZE: i64 = 100;
 const METADATA_FILL_MISSING_AUTO_DISPATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const METADATA_SHUTDOWN_RECOVERY_PAGE_SIZE: i64 = 100;
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
@@ -2405,14 +2406,10 @@ impl MetadataReidentifyService {
         self.get_job(job_id).await
     }
 
-    /// Starts one new library-wide FILL_MISSING job for every library whose
-    /// latest fill-missing job was cancelled by a shutdown. The cancelled job
-    /// instance is not resumed (ADR-034); already complete items are skipped
-    /// without a scraper request, so only the unfinished work is repeated.
-    /// Libraries are processed one after another and the call returns once
-    /// the last job finished, so run it in a background task.
-    /// Returns how many library jobs were dispatched.
-    pub async fn resume_interrupted_fill_missing_jobs(&self) -> Result<usize, StorageError> {
+    /// Resumes metadata jobs interrupted by a server shutdown. The method runs
+    /// in a background task because recovered jobs may take a long time to drain.
+    /// Returns how many original jobs were dispatched.
+    pub async fn resume_interrupted_metadata_jobs(&self) -> Result<usize, MetadataReidentifyError> {
         let mut automatic_library_cursor: Option<String> = None;
         loop {
             let library_ids = self
@@ -2443,65 +2440,114 @@ impl MetadataReidentifyService {
             }
         }
 
-        let library_ids = self
-            .database
-            .list_libraries_with_interrupted_fill_missing_job()
-            .await?;
         let mut dispatched = 0;
-        for library_id in library_ids {
-            let has_scraper =
-                self.database
-                    .find_library(&library_id)
-                    .await?
-                    .is_some_and(|library| {
-                        library.is_enabled
-                            && library
-                                .scraper_id
-                                .as_deref()
-                                .is_some_and(|scraper_id| !scraper_id.trim().is_empty())
-                    });
-            if !has_scraper {
-                continue;
+        let mut shutdown_job_cursor: Option<String> = None;
+        loop {
+            let job_ids = self
+                .database
+                .list_shutdown_interrupted_metadata_reidentify_job_ids(
+                    shutdown_job_cursor.as_deref(),
+                    METADATA_SHUTDOWN_RECOVERY_PAGE_SIZE,
+                )
+                .await?;
+            if job_ids.is_empty() {
+                break;
             }
-            let job = match self
-                .create_library_refresh_job(&library_id, MetadataRefreshMode::FillMissing)
-                .await
-            {
-                Ok(job) => job,
-                Err(error) => {
-                    tracing::warn!(
-                        library_id,
-                        %error,
-                        "interrupted metadata scraping could not be requeued"
-                    );
+            shutdown_job_cursor = job_ids.last().cloned();
+            for job_id in job_ids {
+                let Some(job) = self.database.find_metadata_reidentify_job(&job_id).await? else {
+                    continue;
+                };
+                if !self
+                    .has_selected_scraper_for_shutdown_recovery(&job)
+                    .await?
+                {
                     continue;
                 }
-            };
-            // Only one library-wide job may be active at a time, so wait for
-            // this one before creating the next library's job.
-            match self.enqueue_fill_missing_job(&job).await {
-                Ok(completion) => {
-                    dispatched += 1;
-                    if let Some(completion) = completion {
-                        let _ = completion.await;
-                    }
+                if !self
+                    .database
+                    .resume_metadata_reidentify_job_after_shutdown(&job_id)
+                    .await?
+                {
+                    continue;
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        library_id,
-                        %error,
-                        "interrupted metadata scraping could not be dispatched"
-                    );
+                self.admin_events.publish(AdminEventScope::Jobs);
+                let resumed = self.get_job(&job_id).await?;
+                if resumed.mode == MetadataRefreshMode::FillMissing.as_str() {
+                    match self.enqueue_fill_missing_job(&resumed).await {
+                        Ok(completion) => {
+                            dispatched += 1;
+                            if let Some(completion) = completion {
+                                let _ = completion.await;
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            job_id,
+                            %error,
+                            "interrupted metadata job could not be dispatched"
+                        ),
+                    }
+                } else {
+                    dispatched += 1;
+                    self.run(&job_id).await;
                 }
             }
         }
         if dispatched > 0 {
             tracing::info!(
-                libraries = dispatched,
-                "requeued metadata scraping interrupted by the previous shutdown"
+                jobs = dispatched,
+                "resumed metadata identification interrupted by the previous shutdown"
             );
         }
         Ok(dispatched)
+    }
+
+    async fn has_selected_scraper_for_shutdown_recovery(
+        &self,
+        job: &StoredMetadataReidentifyJob,
+    ) -> Result<bool, MetadataReidentifyError> {
+        if !matches!(job.mode.as_str(), "FILL_MISSING" | "FULL_REFRESH") {
+            return Ok(true);
+        }
+        if let Some(library_id) = job.library_id.as_deref() {
+            return Ok(self
+                .database
+                .find_library(library_id)
+                .await?
+                .is_some_and(|library| {
+                    library.is_enabled
+                        && library
+                            .scraper_id
+                            .as_deref()
+                            .is_some_and(|scraper_id| !scraper_id.trim().is_empty())
+                }));
+        }
+
+        let mut offset = 0;
+        while offset < job.total_count {
+            let items = self
+                .database
+                .list_metadata_reidentify_items(
+                    job.id.as_str(),
+                    offset,
+                    METADATA_JOB_ITEM_PAGE_SIZE,
+                )
+                .await?;
+            if items.is_empty() {
+                break;
+            }
+            let item_ids = items
+                .iter()
+                .filter(|item| item.status != "COMPLETED")
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>();
+            let selected = self.has_selected_scrapers_for_items(&item_ids).await?;
+            if selected.values().any(|result| matches!(result, Ok(true))) {
+                return Ok(true);
+            }
+            offset += items.len() as i64;
+        }
+        Ok(false)
     }
 
     pub async fn active_job_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -4553,7 +4599,7 @@ mod tests {
         .execute(database.pool())
         .await?;
 
-        assert_eq!(service.resume_interrupted_fill_missing_jobs().await?, 0);
+        assert_eq!(service.resume_interrupted_metadata_jobs().await?, 0);
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let job = database

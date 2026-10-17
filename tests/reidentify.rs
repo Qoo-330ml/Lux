@@ -1175,7 +1175,7 @@ async fn fill_missing_empty_provider_search_is_low_confidence_not_unavailable()
 }
 
 #[tokio::test]
-async fn interrupted_fill_missing_work_is_requeued_once_after_restart()
+async fn interrupted_fill_missing_work_resumes_the_original_job_after_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let (_temp_dir, database, library_id, _folder_id) =
@@ -1184,19 +1184,60 @@ async fn interrupted_fill_missing_work_is_requeued_once_after_restart()
         .bind(&library_id)
         .execute(database.pool())
         .await?;
-    let item_id: String = sqlx::query_scalar(
-        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    let second_movie_dir = _temp_dir.path().join("Movies/Second Movie (2024)");
+    tokio::fs::create_dir_all(&second_movie_dir).await?;
+    tokio::fs::write(second_movie_dir.join("Second.Movie.2024.mkv"), b"fixture").await?;
+    let third_movie_dir = _temp_dir.path().join("Movies/Third Movie (2024)");
+    tokio::fs::create_dir_all(&third_movie_dir).await?;
+    tokio::fs::write(third_movie_dir.join("Third.Movie.2024.mkv"), b"fixture").await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library_id.parse()?)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL ORDER BY id",
     )
-    .fetch_one(database.pool())
+    .fetch_all(database.pool())
     .await?;
+    assert_eq!(item_ids.len(), 3);
     let (tmdb, _tracker, tmdb_server) = empty_search_tmdb_provider().await?;
     let metadata = MetadataReidentifyService::new(database.clone(), tmdb);
-    let interrupted = metadata.create_fill_missing_job(vec![item_id]).await?;
+    let interrupted = metadata.create_fill_missing_job(item_ids.clone()).await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED', candidate_count = 1, updated_at = 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&interrupted.id)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items SET status = 'RUNNING'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&interrupted.id)
+    .bind(&item_ids[1])
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE metadata_reidentify_jobs SET processed_count = 1 WHERE id = ?")
+        .bind(&interrupted.id)
+        .execute(database.pool())
+        .await?;
     // Simulate the previous process exiting mid-scrape: startup cancels it.
     assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 1);
+    // Existing installations can have these rows reconciled by migration 0161.
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SERVER_SHUTDOWN'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&interrupted.id)
+    .bind(&item_ids[2])
+    .execute(database.pool())
+    .await?;
 
-    assert_eq!(metadata.resume_interrupted_fill_missing_jobs().await?, 1);
-    assert_eq!(metadata.resume_interrupted_fill_missing_jobs().await?, 0);
+    assert_eq!(metadata.resume_interrupted_metadata_jobs().await?, 1);
+    assert_eq!(metadata.resume_interrupted_metadata_jobs().await?, 0);
 
     let jobs: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, status FROM metadata_reidentify_jobs
@@ -1204,12 +1245,105 @@ async fn interrupted_fill_missing_work_is_requeued_once_after_restart()
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(jobs.len(), 2);
-    assert_eq!(jobs[0], (interrupted.id.clone(), "CANCELLED".to_owned()));
-    assert_ne!(jobs[1].0, interrupted.id);
+    assert_eq!(jobs.len(), 1, "restart must not create a duplicate job");
+    assert_eq!(jobs[0].0, interrupted.id, "the original job ID is resumed");
+    assert_eq!(
+        jobs[0].1, "COMPLETED_WITH_ISSUES",
+        "the resumed work should finish with its recorded no-candidate issue"
+    );
+    let completed_item_updated_at: i64 = sqlx::query_scalar(
+        "SELECT updated_at FROM metadata_reidentify_job_items
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&interrupted.id)
+    .bind(&item_ids[0])
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        completed_item_updated_at, 1,
+        "completed work must not rerun"
+    );
 
     metadata.shutdown().await;
     tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_item_reidentify_job_resumes_after_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let (tmdb, _tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), tmdb);
+    let interrupted = metadata.create_job(vec![item_id]).await?;
+
+    assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 1);
+    assert_eq!(metadata.resume_interrupted_metadata_jobs().await?, 1);
+
+    let resumed = metadata.get_job(&interrupted.id).await?;
+    assert_eq!(resumed.id, interrupted.id);
+    assert_eq!(resumed.status, "COMPLETED");
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(job_count, 1, "restart must resume the same item job");
+
+    metadata.shutdown().await;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_does_not_resume_a_manually_cancelled_metadata_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_job(vec![item_id]).await?;
+
+    metadata.cancel(&job.id).await?;
+    metadata.run(&job.id).await;
+
+    assert_eq!(metadata.resume_interrupted_metadata_jobs().await?, 0);
+    let cancelled = metadata.get_job(&job.id).await?;
+    assert_eq!(cancelled.status, "CANCELLED");
+    assert_eq!(cancelled.error, None);
+
+    metadata.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_does_not_resume_fill_missing_without_a_selected_scraper()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_fill_missing_job(vec![item_id]).await?;
+    assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 1);
+
+    assert_eq!(metadata.resume_interrupted_metadata_jobs().await?, 0);
+    let cancelled = metadata.get_job(&job.id).await?;
+    assert_eq!(cancelled.status, "CANCELLED");
+    assert_eq!(cancelled.error.as_deref(), Some("SERVER_SHUTDOWN"));
+
+    metadata.shutdown().await;
     Ok(())
 }
 
