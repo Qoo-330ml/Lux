@@ -571,7 +571,6 @@ impl Database {
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE t.job_id = ? AND t.target_type = 'SOURCE'
                AND t.probe_state = 'PENDING'
-               AND ms.probe_status = 'PENDING'
                AND fe.is_missing = 0
              ORDER BY t.target_id
              LIMIT ? OFFSET ?",
@@ -1202,7 +1201,7 @@ impl Database {
         self.query(
             "UPDATE media_sources
              SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
-             WHERE id IN (
+             WHERE source_kind = 'LOCAL_FILE' AND id IN (
                  SELECT source_id FROM scan_job_targets
                  WHERE job_id = ? AND target_type = 'SOURCE'
                    AND probe_state = 'FAILED' AND source_id IS NOT NULL

@@ -90,14 +90,6 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let report = generic_probe.probe_movie_library(library.id).await?;
     assert_eq!(report.ready, 0);
     assert_eq!(report.skipped, 1);
-    sqlx::query(
-        "UPDATE media_sources
-         SET probe_status = 'READY', container = 'strm', duration_ticks = NULL,
-             bitrate = NULL, probe_error = NULL",
-    )
-    .execute(database.pool())
-    .await?;
-
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
     let service = StrmProbeService::new(database.clone(), plugins);
@@ -118,6 +110,10 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     assert!(jobs[0].media_info_enabled);
     assert!(!jobs[0].thumbnail_enabled);
     assert_eq!(jobs[0].thumbnail_position_percent, 30);
+    let queued_status: String = sqlx::query_scalar("SELECT probe_status FROM media_sources")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(queued_status, "PENDING");
     service.run(&jobs[0].id).await?;
 
     let job = service.get(&jobs[0].id).await?;
@@ -139,6 +135,30 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
             2
         )
     );
+
+    let skip_jobs = service
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 30,
+            },
+        )
+        .await?;
+    let queued_status: String = sqlx::query_scalar("SELECT probe_status FROM media_sources")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(queued_status, "PENDING");
+    service.run(&skip_jobs[0].id).await?;
+    assert_eq!(service.get(&skip_jobs[0].id).await?.status, "COMPLETED");
+    let skipped_status: String = sqlx::query_scalar("SELECT probe_status FROM media_sources")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(skipped_status, "READY");
 
     let sidecar = tokio::fs::read(movie_dir.join("Plugin.Movie.2024-mediainfo.json")).await?;
     let sidecar: serde_json::Value = serde_json::from_slice(&sidecar)?;

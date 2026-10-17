@@ -1,5 +1,12 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-146 STRM 媒体源探测状态
+
+媒体源 API 的 `probeStatus` 现在可能为 `NOT_CONFIGURED`，表示该 STRM 来源当前没有被启用插件的媒体库选择
+覆盖，也没有等待运行的探测作业。此状态不会触发普通本地 `ffprobe`。插件库选择保存或插件重新启用后，
+宿主为所选库创建持久化 STRM 作业，来源只有在作业成功落库后才转为 `PENDING`；作业处理结束后转为
+`READY`、`FAILED` 或 `TIMEOUT`。本变更保留原有 API 字段形状，不改变播放或 PlaybackInfo 的行为。
+
 ## LUX-561 后台预算与本地 ffprobe 调度兼容性（2026-10-16）
 
 扫描指纹的 stat 命中和 v2 编码不改变 API/Emby DTO、数据库对外模型或扫描完成合同。后台预算只控制 Lux 进程内重工作片段的准入；Discovery/Manifest preparation、扫描指纹、本地 NFO/图片计算、ffprobe 与缩略图共享进程级 CPU 名额，原有每管线和子进程上限继续生效。LUX_BACKGROUND_CPU_BUDGET 留空时按 CPU/cgroup 推导，显式整数夹到 1–32，并在进程初始化时读取。ffprobe 自适应调度只调整内置本地 ffprobe；不读取 CPU 使用率，远程 STRM 插件调度独立。

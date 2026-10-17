@@ -2716,7 +2716,8 @@ impl Database {
                 id, item_id, source_kind, filesystem_entry_id,
                 edition_name, quality_label, container, size,
                 external_url, strm_target_kind, is_default, probe_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
         )
         .bind(source.id)
         .bind(source.item_id)
@@ -2729,6 +2730,7 @@ impl Database {
         .bind(source.external_url)
         .bind(source.strm_target_kind)
         .bind(database_flag(source.is_default))
+        .bind(source.source_kind)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -4835,7 +4837,7 @@ impl Database {
             self.query(
                 "UPDATE media_sources
                  SET container = NULL, size = NULL, duration_ticks = NULL, bitrate = NULL,
-                     probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                     probe_status = 'NOT_CONFIGURED', probe_error = NULL, updated_at = unixepoch()
                  WHERE id = ? AND source_kind = 'STRM_URL'",
             )
             .bind(source_id)
@@ -5993,6 +5995,71 @@ impl Database {
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_media_probe_ready(&self, source_id: &str) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_sources
+             SET probe_status = 'READY', probe_error = NULL, updated_at = unixepoch()
+             WHERE id = ? AND source_kind = 'STRM_URL' AND probe_status = 'PENDING'",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_strm_probe_sources_pending_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        library_id: &str,
+        target_scan_job_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let result = if let Some(scan_job_id) = target_scan_job_id {
+            let query = format!(
+                "UPDATE media_sources
+                 SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 WHERE id IN (
+                     SELECT ms.id
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE mi.library_id = ? AND mi.removed_at IS NULL
+                       AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
+                       AND {}
+                 )",
+                incremental_scan_scope_sql(self.backend)
+            );
+            self.query(sqlx::AssertSqlSafe(query))
+                .bind(library_id)
+                .bind(scan_job_id)
+                .execute(&mut **transaction)
+                .await
+        } else {
+            self.query(
+                "UPDATE media_sources
+                 SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 WHERE id IN (
+                     SELECT ms.id
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE mi.library_id = ? AND mi.removed_at IS NULL
+                       AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
+                 )",
+            )
+            .bind(library_id)
+            .execute(&mut **transaction)
+            .await
+        };
+        result.map(|_| ()).map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })

@@ -2,9 +2,10 @@ use std::fs;
 
 use luxd::{
     api::{AppState, app_with_state},
-    application::setup::SetupService,
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
+    domain::ids::LibraryId,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -49,7 +50,13 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -85,6 +92,24 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
         .as_str()
         .ok_or("missing library id")?
         .to_owned();
+    let library_id_typed = library_id.parse::<LibraryId>()?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Api Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(
+        movie_dir.join("Api.Movie.2024.strm"),
+        "https://example.invalid/movie",
+    )
+    .await?;
+    LibraryService::new(database.clone())
+        .add_root(
+            library_id_typed,
+            media_root.to_str().ok_or("non-utf8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library_id_typed)
+        .await?;
 
     let installed = client
         .post(format!(
@@ -123,32 +148,31 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
         .await?;
     assert_eq!(configured.status(), reqwest::StatusCode::OK);
 
-    let started = client
-        .post(format!("{base_url}/api/v1/admin/strm-probe-jobs"))
-        .header(COOKIE, &cookie)
-        .header("x-csrf-token", &csrf)
-        .send()
-        .await?;
-    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
-    let started_body = started.json::<Value>().await?;
-    let job_id = started_body["jobs"][0]["id"]
+    let mut listed_body = Value::Null;
+    for _ in 0..50 {
+        let listed = client
+            .get(format!("{base_url}/api/v1/admin/strm-probe-jobs"))
+            .header(COOKIE, &cookie)
+            .send()
+            .await?;
+        assert_eq!(listed.status(), reqwest::StatusCode::OK);
+        listed_body = listed.json::<Value>().await?;
+        if listed_body["jobs"]
+            .as_array()
+            .is_some_and(|jobs| !jobs.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let jobs = listed_body["jobs"]
+        .as_array()
+        .ok_or("missing STRM probe jobs")?;
+    assert_eq!(jobs.len(), 1);
+    let job_id = jobs[0]["id"]
         .as_str()
         .ok_or("missing STRM probe job id")?
         .to_owned();
-    assert!(started_body["operationId"].is_string());
-
-    let listed = client
-        .get(format!("{base_url}/api/v1/admin/strm-probe-jobs"))
-        .header(COOKIE, &cookie)
-        .send()
-        .await?;
-    assert_eq!(listed.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        listed.json::<Value>().await?["jobs"]
-            .as_array()
-            .map(Vec::len),
-        Some(1)
-    );
 
     let detail = client
         .get(format!("{base_url}/api/v1/admin/strm-probe-jobs/{job_id}"))

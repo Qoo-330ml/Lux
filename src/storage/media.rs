@@ -710,7 +710,8 @@ impl Database {
             "UPDATE media_sources
              SET source_kind = ?, size = ?, container = ?, edition_name = ?,
                  quality_label = ?, external_url = ?, strm_target_kind = ?,
-                 probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 probe_status = CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END,
+                 probe_error = NULL, updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
         )
         .bind(source_kind)
@@ -720,6 +721,7 @@ impl Database {
         .bind(quality_label)
         .bind(external_url)
         .bind(strm_target_kind)
+        .bind(source_kind)
         .bind(filesystem_entry_id)
         .execute(&mut **transaction)
         .await
@@ -848,7 +850,8 @@ impl Database {
                      quality_label = incoming.quality_label,
                      external_url = incoming.external_url,
                      strm_target_kind = incoming.strm_target_kind,
-                     probe_status = 'PENDING',
+                     probe_status = CASE WHEN incoming.source_kind = 'STRM_URL'
+                         THEN 'NOT_CONFIGURED' ELSE 'PENDING' END,
                      probe_error = NULL,
                      updated_at = unixepoch()
                  FROM incoming
@@ -1223,7 +1226,8 @@ impl Database {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
                  CASE WHEN EXISTS (
                      SELECT 1 FROM media_sources WHERE item_id = ? AND is_default = 1
-                 ) THEN 0 ELSE 1 END, 'PENDING')",
+                 ) THEN 0 ELSE 1 END,
+                 CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
         )
         .bind(&file.source_id)
         .bind(&item_id)
@@ -1234,6 +1238,7 @@ impl Database {
         .bind(file.external_url.as_deref())
         .bind(file.strm_target_kind.as_deref())
         .bind(&item_id)
+        .bind(&file.source_kind)
         .execute(&mut **transaction)
         .await
         .map(|_| ())
@@ -2289,9 +2294,12 @@ impl Database {
         let movie_source_insert_started = Instant::now();
         for chunk in source_rows.chunks(batch_size) {
             let values =
-                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')", chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                std::iter::repeat_n(
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
+                    chunk.len(),
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
                 "INSERT INTO media_sources (
                     id, item_id, source_kind, filesystem_entry_id,
@@ -2314,6 +2322,7 @@ impl Database {
                     .bind(file.external_url.as_deref())
                     .bind(file.strm_target_kind.as_deref())
                     .bind(database_flag(*is_new_item));
+                statement = statement.bind(&file.source_kind);
             }
             statement
                 .execute(&mut **transaction)
@@ -2713,9 +2722,12 @@ impl Database {
         let mut defaulted_episode_identities = HashSet::new();
         for chunk in files.chunks(batch_size) {
             let values =
-                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')", chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                std::iter::repeat_n(
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
+                    chunk.len(),
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
                 "INSERT INTO media_sources (
                     id, item_id, source_kind, filesystem_entry_id,
@@ -2742,6 +2754,7 @@ impl Database {
                     .bind(file.external_url.as_deref())
                     .bind(file.strm_target_kind.as_deref())
                     .bind(database_flag(is_default));
+                statement = statement.bind(&file.source_kind);
             }
             statement
                 .execute(&mut **transaction)

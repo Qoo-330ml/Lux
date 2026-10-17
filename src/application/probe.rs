@@ -1025,17 +1025,23 @@ impl MediaProbeService {
         let mut local_inputs = VecDeque::new();
         let mut sidecar_inputs = VecDeque::new();
         for source in sources {
-            if source.probe_status != "PENDING" {
-                report.skipped += 1;
-                states.push((source.source_id, ProbeTargetState::Skipped));
-                continue;
-            }
-            report.attempted += 1;
             let path = safe_media_path(&source.root_path, &source.relative_path)?;
             if is_strm_path(&path) {
+                if source.probe_status != "PENDING"
+                    && !(source.probe_status == "NOT_CONFIGURED" && has_strm_sidecar(&path).await)
+                {
+                    report.skipped += 1;
+                    states.push((source.source_id, ProbeTargetState::Skipped));
+                    continue;
+                }
+                report.attempted += 1;
                 sidecar_inputs.push_back((source, path));
-            } else {
+            } else if source.probe_status == "PENDING" {
+                report.attempted += 1;
                 local_inputs.push_back((source, path));
+            } else {
+                report.skipped += 1;
+                states.push((source.source_id, ProbeTargetState::Skipped));
             }
         }
 
@@ -1267,8 +1273,7 @@ impl MediaProbeService {
                 Ok(ProbeTargetState::Done)
             }
             Ok(None) => {
-                // A STRM without a sidecar is owned by the STRM plugin;
-                // leave it pending instead of making SKIP suppress it.
+                // A selected STRM source remains pending for its persisted plugin job.
                 report.skipped += 1;
                 Ok(ProbeTargetState::Skipped)
             }
@@ -1325,6 +1330,15 @@ async fn read_media_info_sidecar(path: &Path) -> Option<MediaProbeResult> {
     let stem = path.file_stem()?.to_str()?;
     let sidecar = path.with_file_name(format!("{stem}-mediainfo.json"));
     read_media_info_sidecar_file(&sidecar).await.ok()
+}
+
+async fn has_strm_sidecar(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let media_info = path.with_file_name(format!("{stem}-mediainfo.json"));
+    let nfo = path.with_extension("nfo");
+    fs::try_exists(media_info).await.unwrap_or(false) || fs::try_exists(nfo).await.unwrap_or(false)
 }
 
 pub(crate) async fn read_media_info_sidecar_file(

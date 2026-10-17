@@ -281,7 +281,7 @@ use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConf
 use crate::observability::logs::{LogStore, NewAuditLogEvent};
 
 // Keep the embedded migrator source coupled to newly added migration files.
-static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
+static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 // SQLite migration 0126 used this checksum before the ALTER TABLE default was made compatible

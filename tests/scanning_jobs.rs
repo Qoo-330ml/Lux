@@ -2355,7 +2355,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 180);
+    assert_eq!(database.schema_version().await?, 181);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -8251,7 +8251,7 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
         sources,
         vec![
             (changed_path.to_owned(), "READY".to_owned()),
-            (strm_path.to_owned(), "PENDING".to_owned()),
+            (strm_path.to_owned(), "NOT_CONFIGURED".to_owned()),
             (unchanged_path.to_owned(), "PENDING".to_owned()),
         ]
     );
@@ -8480,7 +8480,10 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(removed_source, (None, None, None, "PENDING".to_owned()));
+    assert_eq!(
+        removed_source,
+        (None, None, None, "NOT_CONFIGURED".to_owned())
+    );
     let removed_stream_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_streams
          JOIN media_sources ON media_sources.id = media_streams.media_source_id

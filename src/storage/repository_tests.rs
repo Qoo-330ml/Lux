@@ -409,6 +409,92 @@ async fn scan_job_metadata_target_selection_uses_one_query_without_a_local_sourc
 }
 
 #[tokio::test]
+async fn retrying_failed_scan_probe_keeps_unconfigured_strm_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root).await?;
+    let root = LibraryService::new(database.clone())
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 media root")?,
+        )
+        .await?
+        .root;
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES ('unselected-strm-entry', ?, 'Unselected.strm', 'FILE', 1, 1,
+                       'generation', 0)",
+        )
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('unselected-strm-item', ?, 'MOVIE', 'Unselected', 'unselected',
+                       'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, external_url, probe_status
+             ) VALUES ('unselected-strm-source', 'unselected-strm-item', 'STRM_URL',
+                       'unselected-strm-entry', 'https://example.invalid/movie',
+                       'NOT_CONFIGURED')",
+        )
+        .execute(database.pool())
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, source_id, item_id, change_kind,
+                 probe_state, updated_at
+             ) VALUES (?, 'SOURCE', 'unselected-strm-source', 'unselected-strm-source',
+                       'unselected-strm-item', 'NEW', 'FAILED', 1)",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    database.retry_failed_scan_job_targets(&job.id).await?;
+
+    let probe_status: String = database
+        .query_scalar("SELECT probe_status FROM media_sources WHERE id = 'unselected-strm-source'")
+        .fetch_one(database.pool())
+        .await?;
+    let probe_state: String = database
+        .query_scalar(
+            "SELECT probe_state FROM scan_job_targets
+             WHERE job_id = ? AND target_id = 'unselected-strm-source'",
+        )
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(probe_status, "NOT_CONFIGURED");
+    assert_eq!(probe_state, "PENDING");
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_metadata_completion_wait_state_uses_one_query_and_stops_for_cancelled_jobs()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
