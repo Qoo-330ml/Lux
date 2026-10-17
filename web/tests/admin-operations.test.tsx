@@ -439,7 +439,7 @@ describe("AdminOperationsPage", () => {
         items: [
           { jobId: "metadata-job-failed", itemId: "movie-1", status: "FAILED", candidateCount: 1, error: "METADATA_IMAGE_WRITE_FAILED", updatedAt: 1_700_000_001 },
           { jobId: "metadata-job-failed", itemId: "movie-2", status: "FAILED", candidateCount: 0, error: "TMDB_UNAVAILABLE", updatedAt: 1_700_000_002 },
-          { jobId: "metadata-job-failed", itemId: "movie-no-candidates", status: "COMPLETED", candidateCount: 0, error: "LOW_CONFIDENCE", updatedAt: 1_700_000_002 },
+          { jobId: "metadata-job-failed", itemId: "movie-no-candidates", status: "COMPLETED", candidateCount: 0, error: "NO_CANDIDATE", updatedAt: 1_700_000_002 },
           { jobId: "metadata-job-failed", itemId: "movie-ok", status: "COMPLETED", candidateCount: 1, error: null, updatedAt: 1_700_000_003 },
           { jobId: "metadata-job-failed", itemId: "movie-unsafe", status: "FAILED", candidateCount: 0, error: "/media/secret?token=abc", updatedAt: 1_700_000_004 },
         ],
@@ -464,7 +464,7 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).toContain("问题条目 4 个");
     expect(container.textContent).toContain("图片下载或写回失败");
     expect(container.textContent).toContain("TMDb 服务暂时不可用");
-    expect(container.textContent).toContain("未获得可自动确认的候选");
+    expect(container.textContent).toContain("没有找到匹配候选");
     expect(container.textContent).toContain("movie-1");
     expect(container.textContent).toContain("movie-no-candidates");
     expect(container.textContent).not.toContain("movie-ok");
@@ -515,7 +515,7 @@ describe("AdminOperationsPage", () => {
       await vi.waitFor(() => expect(getJob).toHaveBeenCalledWith("metadata-job-low-confidence"));
     });
     expect(container.textContent).toContain("问题条目 1 个");
-    expect(container.textContent).toContain("找到 2 个候选，但匹配置信度不足");
+    expect(container.textContent).toContain("找到 2 个候选，分数未达到自动匹配标准，已留待人工复核");
     expect(container.textContent).toContain("episode-1");
   });
 
