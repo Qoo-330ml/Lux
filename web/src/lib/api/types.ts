@@ -104,6 +104,7 @@ export type UserData = {
   isFavorite?: boolean;
   playCount?: number;
   positionTicks?: number;
+  lastPlayedAt?: number | null;
   /** @deprecated Older Web clients used this name; prefer positionTicks. */
   playbackPositionTicks?: number;
 };

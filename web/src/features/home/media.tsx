@@ -11,7 +11,7 @@ import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
 import { MediaCardOverlay } from "./media-card-overlay";
 import { usePopoverPosition } from "../media/usePopoverPosition";
 import type { MediaCardEditor } from "./media-card-editors";
-import { EpisodeCount, MediaPlaceholder, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, remainingRuntimeLabel } from "./media-display";
+import { EpisodeCount, MediaPlaceholder, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, remainingRuntimeLabel } from "./media-display";
 export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
 export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (itemId: string, selected: boolean) => void }) {
@@ -100,11 +100,18 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
   const image = imageUrl(item, "fanart") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const remaining = remainingRuntimeLabel(item);
-  const subtitle = item.itemType === "EPISODE" && item.seriesName
+  const title = item.itemType === "EPISODE" && item.seriesName
     ? item.seriesName
-    : mediaTypeLabel(item.itemType);
+    : mediaTitle(item);
+  const subtitle = item.itemType === "EPISODE" && item.seriesName
+    ? episodeTitle(item).replace(" · ", "·")
+    : item.itemType === "MOVIE" && item.productionYear != null
+      ? String(item.productionYear)
+      : mediaTypeLabel(item.itemType);
+  const recency = recentPlaybackLabel(item.userData?.lastPlayedAt);
+  const accessibleLabel = `继续播放 ${title}，${subtitle}${remaining ? `，还剩 ${remaining}` : ""}${recency ? `，${recency}` : ""}`;
   return (
-    <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
+    <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={accessibleLabel}>
       <div className="lux-media-art">
         {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
         <EpisodeCount item={item} />
@@ -112,11 +119,47 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
         {progress > 0 && progress < 100 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
       </div>
       <div className="lux-continue-copy">
-        <div><strong>{mediaTitle(item)}</strong><small>{subtitle}</small></div>
-        {remaining ? <span className="lux-continue-remaining">还剩 {remaining}</span> : null}
+        <div className="lux-continue-primary">
+          <strong>{title}</strong>
+          {remaining ? <span className="lux-continue-remaining">还剩 {remaining}</span> : null}
+        </div>
+        <small className="lux-continue-context">{subtitle}</small>
+        {recency ? <small className="lux-continue-recency">{recency}</small> : null}
       </div>
     </Link>
   );
+}
+
+export function recentPlaybackLabel(lastPlayedAt?: number | null, now = Date.now()) {
+  if (lastPlayedAt == null || !Number.isSafeInteger(lastPlayedAt) || lastPlayedAt <= 0) return undefined;
+  const playedAt = new Date(lastPlayedAt * 1000);
+  const elapsed = now - playedAt.getTime();
+  if (!Number.isFinite(elapsed) || elapsed < 0) return undefined;
+
+  const minute = 60_000;
+  const hour = 60 * minute;
+  if (elapsed < 5 * minute) return "刚才看到这里";
+  if (elapsed < hour) {
+    const minutes = Math.floor(elapsed / minute);
+    return minutes >= 28 && minutes <= 32
+      ? "半小时前看到这里"
+      : `${minutes} 分钟前看到这里`;
+  }
+
+  const today = new Date(now);
+  const playedDay = Math.floor(Date.UTC(playedAt.getFullYear(), playedAt.getMonth(), playedAt.getDate()) / 86_400_000);
+  const todayDay = Math.floor(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) / 86_400_000);
+  const daysAgo = todayDay - playedDay;
+  if (daysAgo === 0) {
+    if (elapsed >= 6 * hour) {
+      const period = playedAt.getHours() < 12 ? "上午" : playedAt.getHours() < 18 ? "下午" : "晚上";
+      return `今天${period}看到这里`;
+    }
+    return `${Math.floor(elapsed / hour)} 小时前看到这里`;
+  }
+  if (daysAgo === 1) return "昨天看到这里，接着来";
+  if (daysAgo > 1 && daysAgo < 7) return `${daysAgo} 天前看到这里`;
+  return "上次看到这里，回来接着看";
 }
 
 export function MediaRail({ title, items, landscape = false, linkTo }: { title: string; items: MediaItem[]; landscape?: boolean; linkTo?: string }) {
