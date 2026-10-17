@@ -117,7 +117,8 @@ const ERROR_LABELS: Record<string, string> = {
   TMDB_UNAVAILABLE: "TMDb 服务暂时不可用",
   SCRAPER_UNAVAILABLE: "元数据刮削器不可用",
   CANDIDATE_ERROR: "候选搜索失败",
-  LOW_CONFIDENCE: "匹配置信度不足，已转为待确认",
+  LOW_CONFIDENCE: "匹配分数不足，待人工复核",
+  NO_CANDIDATE: "没有找到匹配候选",
   METADATA_WRITE_FAILED: "元数据写回失败",
   METADATA_NFO_WRITE_FAILED: "NFO 写回失败",
   METADATA_IMAGE_WRITE_FAILED: "图片下载或写回失败",
@@ -984,9 +985,10 @@ function formatJobError(
 function metadataItemIssueText(error: string | null | undefined, candidateCount: number) {
   if (error === "LOW_CONFIDENCE") {
     return candidateCount > 0
-      ? `找到 ${candidateCount} 个候选，但匹配置信度不足`
-      : "未获得可自动确认的候选";
+      ? `找到 ${candidateCount} 个候选，分数未达到自动匹配标准，已留待人工复核`
+      : "候选分数不足，当前没有可供复核的候选";
   }
+  if (error === "NO_CANDIDATE") return "没有找到匹配候选";
   return formatJobError(error) || "未记录具体原因";
 }
 
