@@ -64,8 +64,8 @@ impl PeopleService {
             PeopleError::Serialization("person manifest path has no parent".to_owned())
         })?;
         create_private_dir(parent).await?;
-        acquire_person_manifest_lock(&manifest_path).await?;
-        let result = async {
+        let _manifest_lock_guard = acquire_person_manifest_lock(&manifest_path).await?;
+        async {
             let existing = read_people_file(&manifest_path).await?;
             let mut manifest = existing
                 .map(|bytes| {
@@ -104,9 +104,7 @@ impl PeopleService {
             write_atomically(&manifest_path, &bytes).await?;
             Ok::<_, PeopleError>(locked_fields.iter().cloned().collect::<Vec<_>>())
         }
-        .await;
-        let _ = fs::remove_file(&manifest_path.with_file_name(".person.json.lock")).await;
-        result
+        .await
     }
 
     pub(super) async fn persist_person_match_candidate_snapshot(
@@ -794,8 +792,8 @@ impl PeopleService {
             PeopleError::Serialization("person manifest path has no parent".to_owned())
         })?;
         create_private_dir(parent).await?;
-        acquire_person_manifest_lock(&manifest_path).await?;
-        let result = async {
+        let _manifest_lock_guard = acquire_person_manifest_lock(&manifest_path).await?;
+        async {
             let existing = read_people_file(&manifest_path).await?;
             let mut manifest = existing
                 .map(|bytes| {
@@ -853,8 +851,6 @@ impl PeopleService {
             self.mark_person_manifest_restore_pending().await?;
             write_atomically(&manifest_path, &bytes).await
         }
-        .await;
-        let _ = fs::remove_file(&manifest_path.with_file_name(".person.json.lock")).await;
-        result
+        .await
     }
 }

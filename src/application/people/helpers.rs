@@ -1249,7 +1249,9 @@ pub(super) async fn write_atomically_if_changed(
     Ok(true)
 }
 
-pub(super) async fn acquire_person_manifest_lock(manifest_path: &Path) -> Result<(), PeopleError> {
+pub(super) async fn acquire_person_manifest_lock(
+    manifest_path: &Path,
+) -> Result<ExclusiveFileLockGuard, PeopleError> {
     acquire_exclusive_file_lock(&manifest_path.with_file_name(".person.json.lock")).await
 }
 
@@ -1261,43 +1263,37 @@ fn person_manifest_lock_backoff(retry_number: usize) -> Duration {
     Duration::from_millis(PERSON_LOCK_WAIT_BACKOFF_MS[delay_index])
 }
 
-pub(super) async fn acquire_exclusive_file_lock(lock_path: &Path) -> Result<(), PeopleError> {
+/// Owns the advisory lock; the persistent inode keeps all processes on one lock.
+#[derive(Debug)]
+pub(super) struct ExclusiveFileLockGuard {
+    _file: std::fs::File,
+}
+
+pub(super) async fn acquire_exclusive_file_lock(
+    lock_path: &Path,
+) -> Result<ExclusiveFileLockGuard, PeopleError> {
     let deadline = Instant::now() + PERSON_LOCK_WAIT_TIMEOUT;
     let mut retry_number = 0_usize;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .await
+        .map_err(|source| PeopleError::Io {
+            path: lock_path.to_owned(),
+            source,
+        })?
+        .into_std()
+        .await;
     loop {
         if Instant::now() >= deadline {
             return Err(person_manifest_lock_timeout(lock_path));
         }
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .await
-        {
-            Ok(mut file) => {
-                file.write_all(Uuid::now_v7().to_string().as_bytes())
-                    .await
-                    .map_err(|source| PeopleError::Io {
-                        path: lock_path.to_owned(),
-                        source,
-                    })?;
-                file.sync_all().await.map_err(|source| PeopleError::Io {
-                    path: lock_path.to_owned(),
-                    source,
-                })?;
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = safe_metadata(lock_path)
-                    .await?
-                    .and_then(|metadata| metadata.modified().ok())
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > Duration::from_secs(300));
-                if stale {
-                    if fs::remove_file(lock_path).await.is_ok() {
-                        continue;
-                    }
-                }
+        match file.try_lock() {
+            Ok(()) => return Ok(ExclusiveFileLockGuard { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(person_manifest_lock_timeout(lock_path));
@@ -1305,7 +1301,7 @@ pub(super) async fn acquire_exclusive_file_lock(lock_path: &Path) -> Result<(), 
                 sleep(person_manifest_lock_backoff(retry_number).min(remaining)).await;
                 retry_number = retry_number.saturating_add(1);
             }
-            Err(source) => {
+            Err(std::fs::TryLockError::Error(source)) => {
                 return Err(PeopleError::Io {
                     path: lock_path.to_owned(),
                     source,
@@ -1384,13 +1380,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exclusive_file_lock_reuses_legacy_marker_when_unheld()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let lock_path = directory.path().join(".person.json.lock");
+        tokio::fs::write(&lock_path, "legacy owner marker").await?;
+
+        let _lock_guard = acquire_exclusive_file_lock(&lock_path).await?;
+
+        assert!(tokio::fs::try_exists(&lock_path).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exclusive_file_lock_is_released_when_holder_task_is_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir()?;
+        let lock_path = directory.path().join(".people.json.lock");
+        let task_lock_path = lock_path.clone();
+        let (locked_sender, locked_receiver) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _lock_guard = acquire_exclusive_file_lock(&task_lock_path).await?;
+            let _ = locked_sender.send(());
+            std::future::pending::<Result<(), crate::application::people::PeopleError>>().await
+        });
+        locked_receiver.await?;
+        holder.abort();
+        let _ = holder.await;
+
+        let reacquired = tokio::time::timeout(
+            Duration::from_millis(250),
+            acquire_exclusive_file_lock(&lock_path),
+        )
+        .await
+        .expect("cancelling the holder should release its operating-system lock");
+        let _lock_guard = reacquired?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exclusive_file_lock_times_out_when_another_process_holds_the_lock()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::time::{Duration, Instant};
 
         let directory = tempfile::tempdir()?;
         let lock_path = directory.path().join(".person.json.lock");
-        tokio::fs::write(&lock_path, "held by another process").await?;
+        let lock_holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)?;
+        lock_holder.try_lock()?;
         let started = Instant::now();
 
         let error = acquire_exclusive_file_lock(&lock_path)
