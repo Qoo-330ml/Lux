@@ -1477,6 +1477,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(lux_page_body["total"], 2);
     assert_eq!(lux_page_body["pageSize"], 1);
     assert_eq!(lux_page_body["items"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        lux_page_body["items"][0]["userData"]["lastPlayedAt"],
+        Value::Null
+    );
 
     let recent_page = client
         .get(format!(
@@ -1584,7 +1588,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     .bind(admin.id.to_string())
     .bind(&beta_item_id)
     .bind(600_000_000_i64)
-    .bind(500_i64)
+    .bind(Option::<i64>::None)
     .execute(database.pool())
     .await?;
     let pending_sidecar_job = ScanJobService::new(database.clone())
@@ -1624,6 +1628,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         home_body["continueWatching"][0]["userData"]["positionTicks"],
         1_700_000_000_i64
     );
+    assert_eq!(
+        home_body["continueWatching"][0]["userData"]["lastPlayedAt"],
+        400_i64
+    );
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
@@ -1631,6 +1639,21 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(
         home_body["recentlyAdded"][0]["userData"]["positionTicks"],
         1_700_000_000_i64
+    );
+    assert_eq!(
+        home_body["recentlyAdded"][1]["userData"]["lastPlayedAt"],
+        Value::Null
+    );
+    let continue_watching = client
+        .get(format!("{base_url}/api/v1/continue-watching?pageSize=10"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(continue_watching.status(), reqwest::StatusCode::OK);
+    let continue_watching_body: Value = continue_watching.json().await?;
+    assert_eq!(
+        continue_watching_body["items"][0]["userData"]["lastPlayedAt"],
+        400_i64
     );
     assert_eq!(home_body["libraries"].as_array().map(Vec::len), Some(2));
     let home_movie_library = home_body["libraries"]
@@ -1689,6 +1712,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(lux_detail.status(), reqwest::StatusCode::OK);
     let lux_detail_body: Value = lux_detail.json().await?;
     assert_eq!(lux_detail_body["id"], item_id);
+    assert_eq!(lux_detail_body["userData"]["lastPlayedAt"], 400_i64);
     let stored_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
         .bind(&item_id)
         .fetch_one(database.pool())

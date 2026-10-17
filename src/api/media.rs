@@ -3717,6 +3717,7 @@ pub(super) fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemSt
         "playCount": state.map(|value| value.play_count).unwrap_or_default(),
         "isFavorite": state.map(|value| value.is_favorite).unwrap_or(false),
         "isPlayed": state.map(|value| value.is_played).unwrap_or(false),
+        "lastPlayedAt": state.and_then(|value| value.last_played_at),
     })
 }
 

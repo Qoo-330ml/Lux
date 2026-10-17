@@ -304,6 +304,7 @@ Lux 的核心价值不是功能数量，而是：
 - 默认不足 2 分钟的进度不进入继续观看。
 - 继续观看的最短进度由管理员在全局设置中调整；自动标记已看的百分比由用户在个人设置中调整。
 - Lux Web 首页和 Emby Resume 按剧集聚合继续观看进度：同一剧有多条符合继续观看条件的单集时，只展示季号优先、集号其次最大的单集进度；并列时使用最近播放时间决胜。电影保持逐条显示。
+- Lux Web 继续观看卡片的电影首行显示片名和剩余时长，第二行显示年份；剧集首行显示剧名和剩余时长，第二行显示季集号与单集标题。第三行以自然的短句显示当前续看条目的最近播放时间；未知时间不显示该行，不把当前单集的播放时间描述成上一集完播时间。
 - 收到播放开始、进度和停止事件时采用幂等更新。
 - 客户端重复、乱序或延迟上报时，不允许进度无理由倒退；显式从头播放除外。
 - 电影和单集达到已看阈值后自动标记为已看；季度在其全部未删除且可播放的单集均已看后标记为已看，剧集在其全部季度的可播放单集均已看后标记为已看。
@@ -2209,6 +2210,8 @@ services:
 | LUX-306 | src/application/metadata.rs、tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；海报 worker 批量写入及复测 |
 | LUX-307 | docs/LUX-DEVELOPMENT.md、docs/API.md、src/api/media.rs、tests/catalog.rs；Lux 媒体条目响应公开入库时间 |
 | LUX-308 | docs/LUX-DEVELOPMENT.md、web/src/lib/api/types.ts、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；资源详情显示添加时间 |
+| LUX-576 | docs/LUX-DEVELOPMENT.md、docs/API.md、src/api/media.rs、tests/catalog.rs；Lux 媒体 userData 公开最近播放时间 |
+| LUX-577 | docs/LUX-DEVELOPMENT.md、web/src/lib/api/types.ts、web/src/features/home/media.tsx、web/src/react.css、web/tests/home-media.test.tsx；继续观看卡片三行信息与最近观看文案 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -12236,6 +12239,37 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [x] TypeScript 构建通过；Web 全套测试结果与干净基线对照并记录。
 
 验证：`pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。`pnpm --dir web test` 有 3 项布局/代码拆分断言失败；在干净基线 `5548259d` 上同样 145 通过、3 失败（详情编辑器懒加载断言、移动媒体卡片宽度断言、触屏媒体卡片操作断言）。
+
+#### LUX-576：Lux 媒体 userData 公开最近播放时间
+
+范围：在 Lux 媒体条目的 `userData` 中增加当前用户最近播放该条目的 Unix 秒时间戳 `lastPlayedAt`，供继续观看卡片生成相对时间文案。未知或从未播放时返回 `null`；不改变 Emby DTO、播放状态写入和数据库 schema。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/media.rs`、`tests/catalog.rs`。
+
+验收：
+
+- [x] Lux 首页、继续观看、媒体目录和详情响应的 `userData.lastPlayedAt` 与已存储的 `last_played_at` 一致，单位为 Unix 秒；无值为 `null`。
+- [x] Emby `LastPlayedDate`、播放时间存储和 ACL 行为保持不变。
+- [x] Catalog API 回归通过；API 文档记录字段含义与空值行为。
+
+依赖：LUX-074。先在现有 Catalog API 集成场景增加有值与空值响应断言，再添加 Lux DTO 字段。
+
+结果：Lux `userData` 现在公开存储的 `lastPlayedAt` 秒级时间戳，未知值序列化为 `null`。Catalog 集成测试在首页、继续观看、目录及详情响应中覆盖有值和空值；Emby 响应保持不变。验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`（3/3）；本机 `arm64`。未改数据库 schema 或播放状态写入。
+
+#### LUX-577：继续观看卡片三行信息与最近观看文案
+
+范围：调整 Lux Web 首页继续观看卡片的标题层级，并根据 `userData.lastPlayedAt` 显示简短、自然的最近观看提示。电影首行显示电影名与剩余时间，第二行显示年份；电视剧首行显示剧名与剩余时间，第二行显示 `SxxExx·单集标题`。第三行按最近播放时间使用“刚才看到这里”“半小时前看到这里”“今天上午看到这里”“昨天看到这里，接着来”等文案。不得仅凭当前集播放时间声称上一集已完播；缺少最近播放时间时隐藏第三行。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/home/media.tsx`、`web/src/react.css`、`web/tests/home-media.test.tsx`。
+
+验收：
+
+- [ ] 电影与电视剧按指定顺序显示标题、剩余时间和上下文；季集格式为 `S01E05·用魔法打败魔法`。
+- [ ] 最近观看文案覆盖刚刚、分钟、小时、今天、昨天和较早记录；无时间值时不渲染第三行。
+- [ ] 保留播放入口、进度条、横版封面和桌面/移动端卡片尺寸规则。
+- [ ] Web 定向测试、布局检查和生产构建通过。
+
+依赖：LUX-576。先补充卡片顺序、年份、季集格式与相对时间回归，再修改组件和样式。
 
 ## 29. 参考资料
 

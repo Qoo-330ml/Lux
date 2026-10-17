@@ -201,6 +201,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，默认只返回电影和整剧，不返回季度或单集；结果执行媒体库 ACL。剧集季度/单集通过条目层级接口读取。
 - `GET /api/v1/home/carousel`：返回当前用户最多 7 条推荐轮播资源（`recommended`），执行媒体库 ACL。服务端只缓存这一组推荐数据，并按用户、权限与可见媒体库范围隔离；`home` 更新事件会使其失效。
 - `GET /api/v1/continue-watching?page=1&pageSize=10`：分页返回当前用户继续观看条目和准确总数，执行媒体库 ACL；`pageSize` 上限为 100。
+- Lux 媒体条目的 `userData.lastPlayedAt` 为当前用户最近播放该条目的 Unix 秒时间戳；未知或从未播放时为 `null`。该字段随首页、继续观看、媒体目录和详情中的 Lux 媒体条目返回，不改变 Emby 响应。
 - `GET /api/v1/home`：保留兼容响应，包含继续观看、推荐、可见媒体库和每库最新资源；所有内容执行媒体库 ACL，`recentlyAdded` 字段继续保留。Lux Web 首页改用轮播、继续观看、媒体库及每库条目的独立查询；此兼容接口只有推荐轮播使用服务端缓存，其余区块每次实时读取。
 - Catalog 聚合接口排队超过 2 秒时返回 503 和 `error.code=CATALOG_BUSY`，并附 `Retry-After: 2`。`/api/v1/home` 与 `/api/v1/home/carousel` 使用独立的有界 worker 池，避免搜索和目录请求占满轮播 worker；两类 Lux 请求超过排队上限时返回相同错误。Emby 兼容路由保留原来的空 503 响应形状并附相同重试提示。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看、收藏状态，以及该条目的活动播放状态（`state`、`isPaused`、`lastEventAt`）。
