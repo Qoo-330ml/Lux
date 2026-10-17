@@ -8927,7 +8927,7 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
         )
         .await?;
 
-    let scan_lock = Arc::new(Semaphore::new(2));
+    let scan_lock = Arc::new(Semaphore::new(1));
     let jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
     let first_job = jobs.create_movie_scan_job(first_library.id).await?;
     let second_job = jobs.create_movie_scan_job(second_library.id).await?;
@@ -8989,7 +8989,7 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
 
 #[cfg(unix)]
 #[tokio::test]
-async fn postprocessing_does_not_hold_the_shared_scan_lock()
+async fn another_library_starts_indexing_while_scan_postprocessing_runs()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -9026,10 +9026,12 @@ async fn postprocessing_does_not_hold_the_shared_scan_lock()
         .await?;
 
     let fake_ffprobe = temp_dir.path().join("slow-ffprobe");
+    let fake_ffprobe_started = fake_ffprobe.with_extension("started");
     fs::write(
         &fake_ffprobe,
         r#"#!/bin/sh
-sleep 1
+touch "$0.started"
+sleep 2
 printf '%s' '{"format":{"format_name":"mp4"},"streams":[]}'
 "#,
     )?;
@@ -9038,11 +9040,11 @@ printf '%s' '{"format":{"format_name":"mp4"},"streams":[]}'
     fs::set_permissions(&fake_ffprobe, permissions)?;
 
     let scan_lock = Arc::new(Semaphore::new(1));
-    let first_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
-    let second_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
-    let first_job = first_jobs.create_movie_scan_job(first_library.id).await?;
-    let second_job = second_jobs.create_movie_scan_job(second_library.id).await?;
+    let jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
+    let first_job = jobs.create_movie_scan_job(first_library.id).await?;
+    let second_job = jobs.create_movie_scan_job(second_library.id).await?;
     let first_job_id = first_job.id.clone();
+    let first_jobs = jobs.clone();
     let first_probe = MediaProbeService::new(
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
@@ -9067,7 +9069,23 @@ printf '%s' '{"format":{"format_name":"mp4"},"streams":[]}'
     })
     .await??;
 
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tokio::fs::try_exists(&fake_ffprobe_started).await? {
+                break Ok::<(), std::io::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        scan_lock.available_permits(),
+        1,
+        "the shared scan lock should be released while ffprobe is still running"
+    );
+
     let second_job_id = second_job.id.clone();
+    let second_jobs = jobs.clone();
     let second_worker = tokio::spawn(async move {
         second_jobs
             .run_to_completion(&second_job_id, 100, None)
@@ -9085,7 +9103,22 @@ printf '%s' '{"format":{"format_name":"mp4"},"streams":[]}'
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await??;
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "another library did not start indexing during scan postprocessing; available scan permits={}",
+                scan_lock.available_permits()
+            ),
+        )
+    })??;
+
+    let first_phase: String = sqlx::query_scalar("SELECT scan_phase FROM scan_jobs WHERE id = ?")
+        .bind(&first_job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(first_phase, "POSTPROCESSING");
 
     second_worker.await??;
     first_worker.await??;

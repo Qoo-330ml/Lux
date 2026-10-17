@@ -9,7 +9,6 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             user_events: UserEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
-            full_scan_queue: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
             people: None,

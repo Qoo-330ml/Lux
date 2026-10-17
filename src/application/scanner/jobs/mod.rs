@@ -15,7 +15,6 @@ pub struct ScanJobService {
     pub(super) admin_events: AdminEventHub,
     pub(super) user_events: UserEventHub,
     pub(super) scan_lock: Arc<Semaphore>,
-    pub(super) full_scan_queue: Arc<Semaphore>,
     pub(super) library_covers: Option<LibraryCoverService>,
     pub(super) strm_probe: Option<StrmProbeService>,
     pub(super) people: Option<PeopleService>,

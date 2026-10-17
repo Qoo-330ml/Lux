@@ -97,16 +97,6 @@ impl ScanJobService {
             self.cancel_running_job(job_id).await?;
             return Ok(());
         };
-        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
-            Some(
-                Arc::clone(&self.full_scan_queue)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ScanJobError::ScanLockClosed)?,
-            )
-        } else {
-            None
-        };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(
                 job_id, batch_size, probe, metadata, thumbnails,
@@ -295,6 +285,7 @@ impl ScanJobService {
             Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
             return Ok(());
         }
+        drop(scan_permit);
         let Some(completed_job) = self.database.find_scan_job(job_id).await? else {
             if self.cancellation_requested_in_memory(job_id) {
                 Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
@@ -318,7 +309,6 @@ impl ScanJobService {
             Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
             return Err(error);
         }
-        drop(scan_permit);
         if self
             .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
             .await?
