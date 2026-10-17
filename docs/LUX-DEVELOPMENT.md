@@ -1314,6 +1314,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 
 自动 `FILL_MISSING` 因刮削器暂不可用而 `DEFERRED` 时，调度服务按持久化的 item 退避截止时间独立轮询并重排到期失败项，不依赖媒体库扫描或用户计划任务；只有自动来源、仍启用且选中刮削器的媒体库、未消费的带快照 `SCRAPER_UNAVAILABLE` 失败项可自动重试。每项仍按既有 5 分钟、30 分钟、最多 6 小时退避，成功后停止，持续不可用则继续延期。
 
+自动识别结果必须区分“没有找到候选”和“找到候选但分数不足”：前者以 `NO_CANDIDATE` 和候选数 0 记录；后者以 `LOW_CONFIDENCE` 记录实际候选数，候选及媒体识别状态保留为 `PENDING` 供管理员复核。两种情况都让父任务显示 `COMPLETED_WITH_ISSUES`，条目本身仍为 `COMPLETED`。达到现有自动匹配门槛的结果仍自动确认；本任务不调整门槛或评分算法。
+
 媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条先使用所属媒体库的主刮削器处理全部能力，某项能力为空、无效、不支持或重试失败时再由按顺序启用的备用刮削器接管该项；身份达到高置信度后自动选择最佳候选，再调用补充刮削器合并单值缺失项和去重后的多值项，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
 
 实时增量扫描默认更新索引并为受影响条目提交 `FILL_MISSING` 元数据任务；媒体库关闭 `realtime_metadata_auto_match_enabled` 后才只更新索引，不再自动补全。不论开关状态，任务都只处理本次受影响且仍可用的媒体条目，不对整库重新刮削。NFO、图片和其他旁车文件的写回事件不得直接导致同一条目无限重复提交；已完整补全的条目由元数据任务跳过。
@@ -12206,6 +12208,31 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [x] 不增加 schema/API 变化；自动重试回归、build、fmt 和 Clippy 通过。调度目标存在一项在本任务基线中同样失败的 STRM cron 测试。
 
 验证：`cargo test --locked --test scheduled_tasks due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule -- --exact --nocapture`（1/1）、`cargo test --locked --test reidentify -- --test-threads=1`（24/24）通过。`scheduled_tasks` 目标 8/9 通过；`enabled_strm_task_runs_once_per_matching_cron_minute` 断言得到 0 而非 1，在干净基线 `3c7dd6be` 上精确重跑得到相同失败。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过；Cargo build/test/clippy 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。未部署 FNOS/x86_64；全量 `--all-targets` 门禁在全部三项修复结束后运行。
+
+#### LUX-574：区分无候选与低分候选的识别结果
+
+范围：自动识别时将零候选记为 `NO_CANDIDATE`，将存在但未达到当前自动确认门槛的候选记为 `LOW_CONFIDENCE` 并保留候选待人工复核。任务条目保持已完成状态并保存候选数；两种结果都汇总为 `COMPLETED_WITH_ISSUES`。不改变自动阈值、评分算法、数据库 schema 或 API 结构。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/reidentify.rs`、`src/api/admin/admin_metadata.rs`、`src/application/scanner/tests.rs`、`tests/reidentify.rs`。
+
+验收：
+
+- [x] 搜索无候选时以 `NO_CANDIDATE`、候选数 0 记录并汇总为 `COMPLETED_WITH_ISSUES`；失败服务仍单独记录为 `SCRAPER_UNAVAILABLE`。
+- [x] 低分候选以 `LOW_CONFIDENCE` 和候选数记录，媒体识别状态与候选保持 `PENDING`，可由管理员复核，父任务显示 `COMPLETED_WITH_ISSUES`。
+- [x] 高分自动确认与指定条目候选搜索语义不变；新增及原有 Rust 回归通过，不部署到 FNOS。
+
+验证：测试先按新断言复现旧行为失败，随后 `cargo test --locked --test reidentify -- --test-threads=1`（24/24）、`cargo test --locked --lib application::reidentify`（42/42）和扫描器空搜索回归（1/1）通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 `cargo test --locked --all-targets` 的库测试 966 通过、24 忽略，集成测试在 `scanned_metadata` 的 `failed_local_poster_insert_does_not_mark_image_stage_complete`（22/23）停止；同一失败已在干净基线 `5548259d` 精确复现。Cargo build/test/clippy 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`；未部署 FNOS/x86_64。
+
+#### LUX-575：在管理任务详情中区分无候选与低分待复核
+
+范围：Web 管理任务列表和详情把 `NO_CANDIDATE` 显示为“没有找到匹配候选”，把 `LOW_CONFIDENCE` 显示为低分候选已保留、等待人工复核；不改变任务 API 或页面布局。
+
+预计文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminOperationsPage.tsx`。
+
+验收：
+
+- [ ] 任务汇总错误标签和逐条问题详情均能区分无候选与低分待复核。
+- [ ] TypeScript 构建通过；Web 全套测试结果与干净基线对照并记录。
 
 ## 29. 参考资料
 

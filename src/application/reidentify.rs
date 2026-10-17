@@ -1575,7 +1575,7 @@ impl MetadataReidentifyService {
                     .metadata_reidentify_job_has_pending_items(job_id)
                     .await
                     .unwrap_or(true));
-        let (has_scraper_unavailable, has_failed_items) =
+        let (has_scraper_unavailable, has_item_issues) =
             if cancel_requested || reconciliation_failed || queue_incomplete {
                 (Ok(false), Ok(false))
             } else {
@@ -1583,9 +1583,7 @@ impl MetadataReidentifyService {
                     self.database
                         .metadata_reidentify_job_has_item_error(job_id, "SCRAPER_UNAVAILABLE")
                         .await,
-                    self.database
-                        .metadata_reidentify_job_has_failed_items(job_id)
-                        .await,
+                    self.metadata_reidentify_job_has_item_issues(job_id).await,
                 )
             };
         let (status, error) = metadata_job_outcome(MetadataJobOutcomeInput {
@@ -1593,7 +1591,7 @@ impl MetadataReidentifyService {
             reconciliation_failed,
             queue_incomplete,
             has_scraper_unavailable: has_scraper_unavailable.ok(),
-            has_failed_items: has_failed_items.ok(),
+            has_item_issues: has_item_issues.ok(),
         });
         let finish_result = self
             .database
@@ -1632,6 +1630,29 @@ impl MetadataReidentifyService {
         self.publish_job_finished(job_id);
     }
 
+    async fn metadata_reidentify_job_has_item_issues(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        if self
+            .database
+            .metadata_reidentify_job_has_failed_items(job_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        for error in ["NO_CANDIDATE", "LOW_CONFIDENCE"] {
+            if self
+                .database
+                .metadata_reidentify_job_has_item_error(job_id, error)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn process_item(
         &self,
         job_id: &str,
@@ -1648,7 +1669,7 @@ impl MetadataReidentifyService {
                     item.item_type.as_str(),
                     "MOVIE" | "SERIES" | "SEASON" | "EPISODE"
                 ) {
-                    Ok(0)
+                    Ok(RefreshItemOutcome::Confirmed(0))
                 } else if item.title.trim().is_empty() {
                     Err(MetadataReidentifyError::InvalidSearch)
                 } else {
@@ -1670,7 +1691,7 @@ impl MetadataReidentifyService {
                             if matches!(mode, MetadataRefreshMode::FillMissing)
                                 && metadata_request_plan_is_complete(plan.requestable) =>
                         {
-                            Ok(0)
+                            Ok(RefreshItemOutcome::Confirmed(0))
                         }
                         Ok(request_plan) => {
                             match self
@@ -1708,9 +1729,9 @@ impl MetadataReidentifyService {
                                         reason_code = "NO_SCRAPER_SELECTED",
                                         "metadata reidentify item was skipped"
                                     );
-                                    Ok(0)
+                                    Ok(RefreshItemOutcome::Confirmed(0))
                                 }
-                                Ok(None) => Ok(0),
+                                Ok(None) => Ok(RefreshItemOutcome::Confirmed(0)),
                                 Err(error) => Err(MetadataReidentifyError::Scraper(error)),
                             }
                         }
@@ -1731,17 +1752,42 @@ impl MetadataReidentifyService {
             samples.push((item_id.to_owned(), item_elapsed.as_nanos()));
         }
         match result {
-            Ok(candidate_count) => {
-                let _ = self
+            Ok(outcome) => {
+                let (candidate_count, issue) = match outcome {
+                    RefreshItemOutcome::Confirmed(candidate_count) => (candidate_count, None),
+                    RefreshItemOutcome::NeedsReview(candidate_count) => (
+                        candidate_count,
+                        Some(MetadataReidentifyError::LowConfidence),
+                    ),
+                };
+                let recorded = self
                     .database
                     .finish_metadata_reidentify_item(
                         job_id,
                         item_id,
                         "COMPLETED",
                         candidate_count,
-                        None,
+                        issue.as_ref().map(MetadataReidentifyError::code),
                     )
                     .await;
+                if let Some(error) = issue.as_ref() {
+                    self.log_metadata_reidentify_item_issue(
+                        job_id,
+                        item_id,
+                        mode,
+                        "COMPLETED",
+                        error,
+                        recorded.is_ok(),
+                    );
+                    if recorded.is_err() {
+                        tracing::error!(
+                            job_id,
+                            item_id,
+                            error_code = error.code(),
+                            "metadata refresh item result could not be recorded"
+                        );
+                    }
+                }
                 self.publish_job_progress(job_id);
                 if !matches!(mode, MetadataRefreshMode::Reidentify) {
                     let (item_title, library_name) = if self.webhooks.is_some() {
@@ -1769,7 +1815,10 @@ impl MetadataReidentifyService {
                     .await;
                 }
             }
-            Err(error @ MetadataReidentifyError::LowConfidence) => {
+            Err(
+                error @ (MetadataReidentifyError::LowConfidence
+                | MetadataReidentifyError::NoCandidate),
+            ) => {
                 let code = error.code();
                 let recorded = self
                     .database
@@ -1994,7 +2043,7 @@ impl MetadataReidentifyService {
         mode: MetadataRefreshMode,
         scrapers: &[ResolvedScraper],
         request_plan: Option<MetadataRequestPlan>,
-    ) -> Result<i64, MetadataReidentifyError> {
+    ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
         let mut candidate_count = 0_i64;
         let already_confirmed = item_identity_is_confirmed(item, mode);
         let mut selected_scraper_id = already_confirmed.then(|| {
@@ -2077,7 +2126,7 @@ impl MetadataReidentifyService {
         }
         if selected_scraper_id.is_none() {
             if saw_needs_review {
-                return Ok(candidate_count);
+                return Ok(RefreshItemOutcome::NeedsReview(candidate_count));
             }
             return Err(last_recoverable_error.unwrap_or(MetadataReidentifyError::LowConfidence));
         }
@@ -2194,7 +2243,7 @@ impl MetadataReidentifyService {
                 }
             }
         }
-        Ok(candidate_count)
+        Ok(RefreshItemOutcome::Confirmed(candidate_count))
     }
 
     async fn refresh_item(
@@ -2251,11 +2300,11 @@ impl MetadataReidentifyService {
                 .await
                 .map_err(MetadataReidentifyError::Candidate)?
         };
+        let candidate_count = candidate_count_for_page(&page);
+        if candidate_count == 0 {
+            return Err(MetadataReidentifyError::NoCandidate);
+        }
         if matches!(mode, MetadataRefreshMode::Reidentify) {
-            let candidate_count = candidate_count_for_page(&page);
-            if candidate_count == 0 {
-                return Err(MetadataReidentifyError::LowConfidence);
-            }
             return Ok(RefreshItemOutcome::Confirmed(candidate_count));
         }
         let Some(selection) = self.selection.as_ref() else {
@@ -2676,6 +2725,7 @@ pub enum MetadataReidentifyError {
     Scraper(ScraperError),
     Selection(MetadataSelectionError),
     SelectionUnavailable,
+    NoCandidate,
     LowConfidence,
     Storage(StorageError),
 }
@@ -2703,6 +2753,7 @@ impl MetadataReidentifyError {
             Self::Selection(MetadataSelectionError::Storage(_)) => "METADATA_STORAGE_FAILED",
             Self::Selection(_) => "METADATA_WRITE_FAILED",
             Self::SelectionUnavailable => "METADATA_WRITE_UNAVAILABLE",
+            Self::NoCandidate => "NO_CANDIDATE",
             Self::LowConfidence => "LOW_CONFIDENCE",
             Self::Storage(_) => "STORAGE_ERROR",
         }
@@ -2737,6 +2788,7 @@ impl fmt::Display for MetadataReidentifyError {
             Self::SelectionUnavailable => {
                 formatter.write_str("metadata selection service is unavailable")
             }
+            Self::NoCandidate => formatter.write_str("metadata search returned no candidates"),
             Self::LowConfidence => formatter.write_str("metadata candidate confidence is too low"),
             Self::Storage(error) => error.fmt(formatter),
         }
@@ -2783,6 +2835,7 @@ fn metadata_reidentify_issue_diagnostic(
 ) -> MetadataReidentifyIssueDiagnostic {
     let diagnostic = match error {
         MetadataReidentifyError::LowConfidence => ("MATCH", "NO_CONFIRMED_CANDIDATE", None),
+        MetadataReidentifyError::NoCandidate => ("MATCH", "NO_CANDIDATE", None),
         MetadataReidentifyError::Scraper(error)
         | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(error)) => {
             ("SCRAPER", scraper_failure_reason(error), None)
@@ -2931,6 +2984,7 @@ fn recoverable_scraper_attempt(error: &MetadataReidentifyError) -> bool {
     matches!(
         error,
         MetadataReidentifyError::LowConfidence
+            | MetadataReidentifyError::NoCandidate
             | MetadataReidentifyError::Scraper(_)
             | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
     )
@@ -2962,7 +3016,7 @@ struct MetadataJobOutcomeInput {
     queue_incomplete: bool,
     /// `None` when the lookup itself failed.
     has_scraper_unavailable: Option<bool>,
-    has_failed_items: Option<bool>,
+    has_item_issues: Option<bool>,
 }
 
 /// Decides the final job status and error code. A job is never reported as
@@ -2977,7 +3031,7 @@ fn metadata_job_outcome(input: MetadataJobOutcomeInput) -> (&'static str, Option
     if input.reconciliation_failed {
         return ("FAILED", Some("ITEM_FAILED"));
     }
-    match (input.has_scraper_unavailable, input.has_failed_items) {
+    match (input.has_scraper_unavailable, input.has_item_issues) {
         (Some(true), _) => ("DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE")),
         (Some(false), Some(true)) => ("COMPLETED_WITH_ISSUES", Some("ITEM_ISSUES")),
         (Some(false), Some(false)) => ("COMPLETED", None),
@@ -3788,7 +3842,10 @@ mod tests {
             )
             .await?;
 
-        assert!(candidate_count > 0);
+        assert!(matches!(
+            candidate_count,
+            super::RefreshItemOutcome::Confirmed(count) if count > 0
+        ));
         let calls = calls
             .lock()
             .expect("role scraper call list should not be poisoned")
@@ -5035,7 +5092,7 @@ mod tests {
             reconciliation_failed: false,
             queue_incomplete,
             has_scraper_unavailable: Some(false),
-            has_failed_items: Some(false),
+            has_item_issues: Some(false),
         };
         assert_eq!(
             super::metadata_job_outcome(input(true, false)),
@@ -5048,6 +5105,16 @@ mod tests {
         assert_eq!(
             super::metadata_job_outcome(input(false, false)),
             ("COMPLETED", None)
+        );
+        assert_eq!(
+            super::metadata_job_outcome(super::MetadataJobOutcomeInput {
+                cancel_requested: false,
+                reconciliation_failed: false,
+                queue_incomplete: false,
+                has_scraper_unavailable: Some(false),
+                has_item_issues: Some(true),
+            }),
+            ("COMPLETED_WITH_ISSUES", Some("ITEM_ISSUES"))
         );
     }
 

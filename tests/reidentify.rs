@@ -578,9 +578,13 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     let low_confidence_job = low_confidence_metadata
         .get_job(&low_confidence_job.id)
         .await?;
-    assert_eq!(low_confidence_job.status, "COMPLETED");
+    assert_eq!(low_confidence_job.status, "COMPLETED_WITH_ISSUES");
     assert_eq!(low_confidence_job.items[0].status, "COMPLETED");
-    assert_eq!(low_confidence_job.items[0].error, None);
+    assert_eq!(low_confidence_job.items[0].candidate_count, 1);
+    assert_eq!(
+        low_confidence_job.items[0].error.as_deref(),
+        Some("LOW_CONFIDENCE")
+    );
     let low_confidence_item: (String, String) =
         sqlx::query_as("SELECT title, identification_status FROM media_items WHERE id = ?")
             .bind(&item_id)
@@ -1122,7 +1126,7 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
 }
 
 #[tokio::test]
-async fn fill_missing_empty_provider_search_is_low_confidence_not_unavailable()
+async fn fill_missing_empty_provider_search_records_no_candidate_separately()
 -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let (_temp_dir, database, _library_id, _folder_id) =
@@ -1151,11 +1155,11 @@ async fn fill_missing_empty_provider_search_is_low_confidence_not_unavailable()
 
     let completed = metadata.get_job(&job.id).await?;
     assert!(tracker.requests.load(Ordering::SeqCst) > 0);
-    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.status, "COMPLETED_WITH_ISSUES");
     assert_eq!(completed.items.len(), 1);
     assert_eq!(completed.items[0].status, "COMPLETED");
     assert_eq!(completed.items[0].candidate_count, 0);
-    assert_eq!(completed.items[0].error.as_deref(), Some("LOW_CONFIDENCE"));
+    assert_eq!(completed.items[0].error.as_deref(), Some("NO_CANDIDATE"));
 
     let candidates: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
@@ -1288,7 +1292,7 @@ async fn interrupted_item_reidentify_job_resumes_after_restart()
 
     let resumed = metadata.get_job(&interrupted.id).await?;
     assert_eq!(resumed.id, interrupted.id);
-    assert_eq!(resumed.status, "COMPLETED");
+    assert_eq!(resumed.status, "COMPLETED_WITH_ISSUES");
     let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
         .fetch_one(database.pool())
         .await?;
@@ -1397,11 +1401,11 @@ async fn fill_missing_episode_without_series_candidates_is_not_unavailable()
 
     let completed = metadata.get_job(&job.id).await?;
     assert!(tracker.requests.load(Ordering::SeqCst) > 0);
-    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.status, "COMPLETED_WITH_ISSUES");
     assert_eq!(completed.items.len(), 1);
     assert_eq!(completed.items[0].status, "COMPLETED");
     assert_eq!(completed.items[0].candidate_count, 0);
-    assert_eq!(completed.items[0].error.as_deref(), Some("LOW_CONFIDENCE"));
+    assert_eq!(completed.items[0].error.as_deref(), Some("NO_CANDIDATE"));
 
     let candidates: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")

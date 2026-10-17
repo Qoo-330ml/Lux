@@ -2090,7 +2090,7 @@ async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
     );
     assert_eq!(
         fill_item.1.as_deref(),
-        Some("LOW_CONFIDENCE"),
+        Some("NO_CANDIDATE"),
         "an empty provider search is a no-candidate result, not provider unavailability"
     );
     assert_eq!(
