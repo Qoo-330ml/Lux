@@ -1709,6 +1709,25 @@ impl Database {
         query: &ResumeItemsQuery<'_>,
         latest_episode_per_series: bool,
     ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        self.list_resume_items_with_next_episode(query, latest_episode_per_series, false)
+            .await
+    }
+
+    pub(crate) async fn list_home_resume_items_with_total(
+        &self,
+        query: &ResumeItemsQuery<'_>,
+        latest_episode_per_series: bool,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        self.list_resume_items_with_next_episode(query, latest_episode_per_series, true)
+            .await
+    }
+
+    async fn list_resume_items_with_next_episode(
+        &self,
+        query: &ResumeItemsQuery<'_>,
+        latest_episode_per_series: bool,
+        include_next_unplayed_episode: bool,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
         if query.library_ids.is_empty() || query.item_types.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -1720,6 +1739,11 @@ impl Database {
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
+        let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
+            include_next_unplayed_episode,
+            &library_placeholders,
+            resume_rank,
+        );
         let statement_sql = format!(
             "WITH candidates AS (
                  SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
@@ -1738,12 +1762,7 @@ impl Database {
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
-             ),
-             ranked AS (
-                 SELECT id, sort_title, last_played_at,
-                        {resume_rank} AS resume_rank
-                 FROM eligible
-             ),
+             ){next_episode_ctes}{ranking_ctes},
              qualified AS (
                  SELECT id, sort_title, last_played_at,
                         COUNT(*) OVER () AS resume_total
@@ -1807,6 +1826,22 @@ impl Database {
                 .map(|value| CatalogBind::Text(value)),
         );
         binds.push(CatalogBind::Integer(query.played_percent));
+        if include_next_unplayed_episode {
+            binds.push(CatalogBind::Text(query.user_id));
+            binds.extend(
+                query
+                    .library_ids
+                    .iter()
+                    .map(|value| CatalogBind::Text(value)),
+            );
+            binds.push(CatalogBind::Text(query.user_id));
+            binds.extend(
+                query
+                    .library_ids
+                    .iter()
+                    .map(|value| CatalogBind::Text(value)),
+            );
+        }
         binds.push(CatalogBind::Integer(query.limit));
         binds.push(CatalogBind::Integer(query.offset));
         let (rows, total) = self
@@ -1815,12 +1850,9 @@ impl Database {
         if rows.is_empty() && (query.offset > 0 || query.limit <= 0) {
             let total = self
                 .count_resume_items(
-                    query.user_id,
-                    query.library_ids,
-                    query.item_types,
-                    query.played_percent,
-                    query.minimum_ticks,
+                    query,
                     latest_episode_per_series,
+                    include_next_unplayed_episode,
                 )
                 .await?;
             return Ok((rows, total));
@@ -1830,24 +1862,26 @@ impl Database {
 
     pub(crate) async fn count_resume_items(
         &self,
-        user_id: &str,
-        library_ids: &[String],
-        item_types: &[&str],
-        played_percent: i64,
-        minimum_ticks: i64,
+        query: &ResumeItemsQuery<'_>,
         latest_episode_per_series: bool,
+        include_next_unplayed_episode: bool,
     ) -> Result<i64, StorageError> {
-        if library_ids.is_empty() || item_types.is_empty() {
+        if query.library_ids.is_empty() || query.item_types.is_empty() {
             return Ok(0);
         }
-        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+        let item_type_placeholders = std::iter::repeat_n("?", query.item_types.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
+        let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
+        let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
+            include_next_unplayed_episode,
+            &library_placeholders,
+            resume_rank,
+        );
         let statement_sql = format!(
             "WITH candidates AS (
                  SELECT mi.id, mi.item_type, mi.series_id,
@@ -1866,31 +1900,138 @@ impl Database {
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
-             ),
-             ranked AS (
-                 SELECT {resume_rank} AS resume_rank
-                 FROM eligible
-             )
+             ){next_episode_ctes}{ranking_ctes}
              SELECT COUNT(*) FROM ranked WHERE resume_rank = 1"
         );
         let mut statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(statement_sql))
-            .bind(user_id);
-        for item_type in item_types {
+            .bind(query.user_id);
+        for item_type in query.item_types {
             statement = statement.bind(*item_type);
         }
-        statement = statement.bind(minimum_ticks);
-        for library_id in library_ids {
+        statement = statement.bind(query.minimum_ticks);
+        for library_id in query.library_ids {
             statement = statement.bind(library_id);
         }
+        statement = statement.bind(query.played_percent);
+        if include_next_unplayed_episode {
+            statement = statement.bind(query.user_id);
+            for library_id in query.library_ids {
+                statement = statement.bind(library_id);
+            }
+            statement = statement.bind(query.user_id);
+            for library_id in query.library_ids {
+                statement = statement.bind(library_id);
+            }
+        }
         statement
-            .bind(played_percent)
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    fn resume_next_episode_query_parts(
+        include_next_unplayed_episode: bool,
+        library_placeholders: &str,
+        resume_rank: &str,
+    ) -> (String, String) {
+        if !include_next_unplayed_episode {
+            return (
+                String::new(),
+                format!(
+                    ", ranked AS (
+                         SELECT id, sort_title, last_played_at,
+                                {resume_rank} AS resume_rank
+                         FROM eligible
+                     )"
+                ),
+            );
+        }
+
+        let next_episode_ctes = format!(
+            ", completed_episodes_ranked AS (
+                 SELECT mi.series_id, mi.season_number, mi.episode_number,
+                        us.last_played_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mi.series_id
+                            ORDER BY us.last_played_at DESC NULLS LAST,
+                                     mi.season_number DESC NULLS LAST,
+                                     mi.episode_number DESC NULLS LAST,
+                                     mi.id DESC
+                        ) AS played_rank
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type = 'EPISODE' AND mi.series_id IS NOT NULL
+                   AND mi.season_number IS NOT NULL AND mi.episode_number IS NOT NULL
+                   AND mi.removed_at IS NULL AND mi.library_id IN ({library_placeholders})
+                   AND us.is_played = 1{CATALOG_VISIBLE_PREDICATE}
+             ),
+             latest_completed_episode AS (
+                 SELECT series_id, season_number, episode_number, last_played_at
+                 FROM completed_episodes_ranked
+                 WHERE played_rank = 1
+             ),
+             next_episodes_ranked AS (
+                 SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
+                        mi.episode_number, mi.sort_title,
+                        COALESCE(us.last_played_at, completed.last_played_at) AS last_played_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mi.series_id
+                            ORDER BY mi.season_number ASC, mi.episode_number ASC,
+                                     mi.sort_title, mi.id
+                        ) AS next_rank
+                 FROM latest_completed_episode completed
+                 JOIN media_items mi
+                   ON mi.series_id = completed.series_id
+                  AND (mi.season_number > completed.season_number
+                    OR (mi.season_number = completed.season_number
+                        AND mi.episode_number > completed.episode_number))
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type = 'EPISODE'
+                   AND mi.season_number IS NOT NULL AND mi.episode_number IS NOT NULL
+                   AND mi.has_available_source = 1 AND mi.removed_at IS NULL
+                   AND mi.library_id IN ({library_placeholders})
+                   AND COALESCE(us.is_played, 0) = 0
+                   AND COALESCE(us.hide_from_resume, 0) = 0{CATALOG_VISIBLE_PREDICATE}
+             ),
+             next_episode AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at
+                 FROM next_episodes_ranked
+                 WHERE next_rank = 1
+             )"
+        );
+        let ranking_ctes = format!(
+            ", combined AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at, 0 AS candidate_priority
+                 FROM eligible
+                 UNION ALL
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at, 1 AS candidate_priority
+                 FROM next_episode
+             ),
+             deduplicated AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY id ORDER BY candidate_priority
+                        ) AS candidate_rank
+                 FROM combined
+             ),
+             ranked AS (
+                 SELECT id, sort_title, last_played_at,
+                        {resume_rank} AS resume_rank
+                 FROM deduplicated
+                 WHERE candidate_rank = 1
+             )"
+        );
+        (next_episode_ctes, ranking_ctes)
     }
 
     fn resume_rank_expression(latest_episode_per_series: bool) -> &'static str {

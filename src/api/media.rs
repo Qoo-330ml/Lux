@@ -422,7 +422,7 @@ pub(super) async fn lux_list_continue_watching(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match catalog
-        .list_continue_watching(
+        .list_home_continue_watching(
             AccessPrincipal::new(user.id, user.is_admin),
             &user.id.to_string(),
             offset,
