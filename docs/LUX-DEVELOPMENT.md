@@ -12545,6 +12545,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 本机为 macOS `arm64`，全部 Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 在库测试阶段得到 973 passed、3 failed、25 ignored，后续集成 targets 未运行；相关集成 targets 已按上述定向命令独立通过。三个失败分别为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`（实际 0、预期 1）、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`（空集合越界）和 `changed_local_fill_request_during_running_item_is_not_lost`（实际 0、预期 1）。三项均在干净基线 `842f9870` 以各自完整测试名和 `--lib -- --exact` 单独复现相同失败，临时 worktree 已清理；完整 Rust 门禁仍未通过。
 
 真实 Lucky、FNOS/x86_64 和第三方播放器尚未验证，本任务未推送或部署。请求头全部缺失时仍无法恢复客户端地址，兼容合同见 `docs/COMPATIBILITY.md`。
+#### LUX-593：用户管理页面结构
+
+范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码、活动记录和外挂字幕入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 管理员可以从用户列表进入全局设置和任意用户详情。
+- [x] 详情页覆盖设计方案中规划的用户模块入口，页面结构适配小屏。
+- [x] 未实现模块清楚显示占位提示，不提供无后端支撑的交互开关。
+- [x] 当前创建、编辑、禁用和删除用户流程不因路由结构调整而改变。
+
+依赖：用户管理设计已由 `docs/USER-MANAGEMENT-DESIGN.md` 登记。账号生命周期与用户查询在后续独立 `LUX-*` 任务实施；播放与转码权限须等待阶段门确认。
+
+结果（2026-10-19）：新增用户列表视图占位、用户详情模块导航和全局用户设置导航。模块一、三、六及其他待实施模块均未新增业务行为。`pnpm --dir web build` 通过；未部署。
+
 
 ## 29. 参考资料
 

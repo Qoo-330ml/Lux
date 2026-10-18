@@ -1,0 +1,26 @@
+.lux-admin-user-management-page { display: grid; gap: 16px; }
+.lux-admin-users-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
+.lux-admin-users-heading h1, .lux-admin-user-page-heading h1 { margin: 7px 0; color: var(--lux-text); font-size: clamp(1.7rem, 3vw, 2.35rem); letter-spacing: -.055em; }
+.lux-admin-users-heading p, .lux-admin-user-page-heading p { margin: 0; color: var(--lux-muted); font-size: .82rem; }
+.lux-admin-users-nav, .lux-admin-user-section-nav { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 18px; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-admin-users-nav button, .lux-admin-user-section-nav button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 42px; padding: 0 13px; border: 0; border-bottom: 2px solid transparent; color: var(--lux-muted); background: transparent; font: inherit; font-size: .77rem; cursor: pointer; }
+.lux-admin-users-nav button:hover, .lux-admin-user-section-nav button:hover { color: var(--lux-text); }
+.lux-admin-users-nav button.is-active, .lux-admin-user-section-nav button.is-active { border-bottom-color: var(--lux-accent); color: var(--lux-text); }
+.lux-admin-user-section-nav button { align-items: flex-start; flex-direction: column; gap: 3px; padding-inline: 11px; }
+.lux-admin-user-section-nav small { color: var(--lux-subtle); font-size: .62rem; }
+.lux-admin-users-placeholder, .lux-admin-user-module-placeholder { display: flex; align-items: flex-start; gap: 16px; padding: clamp(20px, 4vw, 34px); border: 1px solid var(--lux-line-soft); border-radius: 12px; background: color-mix(in srgb, var(--lux-surface) 65%, transparent); }
+.lux-admin-users-placeholder { display: block; min-height: 200px; }
+.lux-admin-users-placeholder h2, .lux-admin-user-module-placeholder h2 { margin: 7px 0; color: var(--lux-text); font-size: 1rem; }
+.lux-admin-users-placeholder p, .lux-admin-user-module-placeholder p { max-width: 65ch; margin: 0; color: var(--lux-muted); font-size: .78rem; line-height: 1.6; }
+.lux-admin-user-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.lux-admin-user-back { display: inline-flex; align-items: center; gap: 7px; width: fit-content; color: var(--lux-muted); font-size: .75rem; }
+.lux-admin-user-back:hover { color: var(--lux-text); }
+.lux-admin-user-module-placeholder { min-height: 220px; }
+.lux-admin-user-module-icon { display: grid; place-items: center; flex: 0 0 42px; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 11px; color: var(--lux-accent); background: color-mix(in srgb, var(--lux-accent) 8%, transparent); }
+.lux-admin-user-module-placeholder .lux-admin-eyebrow { margin-top: 2px; }
+@media (max-width: 640px) {
+  .lux-admin-users-heading { align-items: flex-start; flex-direction: column; }
+  .lux-admin-user-section-nav { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 1px; scrollbar-width: thin; }
+  .lux-admin-user-section-nav button { flex: 0 0 auto; }
+  .lux-admin-user-module-placeholder { min-height: 180px; padding: 18px; }
+}

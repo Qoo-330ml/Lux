@@ -39,6 +39,8 @@ const AdminUsersPage = lazy(loadAdminUsersPage);
 const AdminOperationsPage = lazy(loadAdminOperationsPage);
 const AdminSettingsPage = lazy(loadAdminSettingsPage);
 const AdminChangelogPage = lazy(loadAdminChangelogPage);
+const AdminUserDetailPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserDetailPage }) => ({ default: AdminUserDetailPage })));
+const AdminUserSettingsPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserSettingsPage }) => ({ default: AdminUserSettingsPage })));
 
 export function App() {
   const setup = useQuery({
@@ -105,6 +107,8 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
               <Route path="plugins" element={<AdminPluginsPage />} />
               <Route path="notifications" element={<AdminNotificationsPage />} />
               <Route path="users" element={<AdminUsersPage />} />
+              <Route path="users/settings" element={<AdminUserSettingsPage />} />
+              <Route path="users/:userId" element={<AdminUserDetailPage />} />
               <Route path="jobs" element={<AdminOperationsPage />} />
               <Route path="settings" element={<AdminSettingsPage />} />
               <Route path="changelog" element={<AdminChangelogPage />} />
