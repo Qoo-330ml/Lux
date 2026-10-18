@@ -573,6 +573,12 @@ impl AppState {
     }
 
     pub async fn start_scheduled_tasks(&self) {
+        if let (Some(database), Some(avatars)) = (&self.database, &self.user_avatars) {
+            crate::application::user_cleanup::spawn_user_cleanup_worker(
+                database.clone(),
+                avatars.clone(),
+            );
+        }
         if let Some(plugins) = self.plugins.as_ref()
             && let Err(error) = plugins.sync_media_info_scheduled_task().await
         {

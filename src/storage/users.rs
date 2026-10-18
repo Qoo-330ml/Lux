@@ -983,6 +983,38 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    pub(crate) async fn purge_expired_deleted_users(
+        &self,
+        now: i64,
+        batch_limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows = self
+            .query(
+                "DELETE FROM users
+                 WHERE id IN (
+                     SELECT id FROM users
+                     WHERE deleted_at IS NOT NULL AND deletion_purge_at <= ?
+                     ORDER BY deletion_purge_at ASC, id ASC
+                     LIMIT ?
+                 )
+                   AND deleted_at IS NOT NULL AND deletion_purge_at <= ?
+                 RETURNING id",
+            )
+            .bind(now)
+            .bind(batch_limit.clamp(1, 100))
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect())
+    }
+
     pub(crate) async fn find_user_emby_configuration(
         &self,
         user_id: &str,

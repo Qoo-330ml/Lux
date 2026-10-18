@@ -12711,6 +12711,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：用户列表接入搜索、状态筛选、排序、分页和播放/活动信息；删除后进入回收站，提供恢复与提前彻底删除并明确影响范围。待审批维持占位。`pnpm --dir web build` 通过；未运行测试、未部署。
 
+#### LUX-603：回收站到期自动清理
+
+范围：添加有界后台清理 worker，每分钟至多清理 50 个已超过默认 7 天期限的回收站账号；数据库条件保证只清理仍处于回收站且期限已到的账号，恢复与自动清理并发时由数据库决定唯一成功操作。数据库删除后移除头像文件，单个头像删除失败只记录不含敏感数据的错误并继续下一项。用户详情、权限、偏好、设备、活动和播放数据按现有用户外键级联规则清理，不删除媒体文件。清理期限配置留在全局设置后续任务。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/user_cleanup.rs`、`src/application/mod.rs`、`src/api/legacy.rs`。
+
+验收标准：
+
+- [x] worker 分钟级运行，单次处理数量有界；启动时不立即执行清理。
+- [x] 只清理到期且仍在回收站的账号，恢复与清理竞态不误删已恢复账号。
+- [x] 成功清理账号后移除头像；单项失败不会阻断其余清理。
+- [x] Rust 构建与格式检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 `/Volumes/Toshiba` 已挂载。
+
+依赖：LUX-597、LUX-599。
+
+结果（2026-10-19）：后台 worker 每分钟最多原子清理 50 个已到期账号；恢复后的账号不匹配删除条件，头像清理逐项执行。Cargo build、fmt check 与 diff check 通过。Clippy 检查发现用户创建函数参数数量和排序枚举命名两项 lint，分别在 LUX-604、LUX-605 跟进；未运行测试或部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

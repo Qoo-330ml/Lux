@@ -73,5 +73,6 @@ pub mod strm_target;
 pub(crate) mod thumbnail_policy;
 pub mod thumbnails;
 pub mod user_avatars;
+pub(crate) mod user_cleanup;
 pub mod watch;
 pub mod webhooks;
