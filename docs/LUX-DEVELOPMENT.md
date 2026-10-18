@@ -12389,6 +12389,139 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁（2026-10-18）：Rust 格式、build 和 Clippy 通过；扫描计数与管理员 API 定向测试通过。`cargo test --locked --all-targets` 在既有的 NFO actor-credit 回归失败，且该失败已在任务基线 `62c1d2ac` 上复现。完整 Web Vitest 为 651 通过、4 个无关失败；`pnpm --dir web test` 还在静态布局阶段因 3 条首页/触屏 CSS 断言失败而未启动 Vitest。
 
+### 扫描后处理诊断与重试修复
+
+本组修复保留 `COMPLETED`、`JOB_COMPLETED` 和 `ScanCompleted` 的索引完成语义。管理员任务接口通过附加的后处理问题标记和重试能力呈现未完成工作；旧 workflow 与 workflow 2/3 仍沿用各自的检查点恢复合同。
+
+#### LUX-584：保留扫描后处理失败错误码
+
+范围：后处理失败收尾仍进入 `COMPLETED/IDLE`，在现有 `error` 字段保存稳定的 `POSTPROCESSING_FAILED`。重试开始和后处理成功时清除错误；不变更数据库状态集合或完成通知时序。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`tests/scanning_jobs.rs`、`tests/postgres_database.rs`。
+
+验收：
+
+- [x] 失败目标和 workflow 3 目标物化失败均保留稳定错误码及可恢复状态。
+- [x] 恢复后重试清除错误，已完成目标与游标不被重置。
+- [x] SQLite 扫描回归及 PostgreSQL 对应合同通过。
+
+验证：`cargo test --locked --test scanning_jobs` 中后处理失败/恢复相关用例；PostgreSQL 对应恢复用例。
+
+后续增量依次补存储诊断、管理员 API 和 Web 流程，每个增量完成后再进入下一项。
+
+结果（2026-10-18）：先确认旧实现无法保留错误码，再补最小存储修复。SQLite 后处理回归 8/8、根目录替换恢复 1/1，以及本地 PostgreSQL 16 workflow 3 恢复 1/1 通过；重试开始和最终成功均清除错误码。
+
+#### LUX-585：批量读取后处理问题与恢复条件
+
+范围：存储层按任务批量读取未完成阶段、未物化检查点、旧工作队列和同库同类型活跃任务；管理员问题筛选在分页之前执行。历史任务不依赖错误码或日志，终态目标不算未完成工作。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/jobs/scan/targets.rs`、`src/storage/repository_tests.rs`。
+
+验收：
+
+- [x] 旧任务的 PENDING/FAILED 和 workflow 2/3 未物化目标被识别；DONE/SKIPPED、运行中和增量任务不误报。
+- [x] 检测旧队列及同库同类型冲突，分页查询没有逐任务 SQL。
+- [x] 问题筛选在分页前执行，存储定向测试通过。
+
+依赖：LUX-584。先补诊断矩阵和分页回归，再实现批量查询。
+
+结果（2026-10-18）：未实现筛选时分页断言先失败；补上数据库筛选后，SQLite 与本地 PostgreSQL 16 的同一诊断矩阵均通过（2/2）。十个任务只查一次，超过批次上限按块查询，空集合不查库。
+
+#### LUX-586：统一重试资格并保护后处理重试竞争
+
+范围：读取能力和实际重试共用恢复判断；仅剩终态目标的任务不可重试。后处理重试在事务内复核活跃冲突及未完成工作，重复请求不回退成新建扫描。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/scanner/jobs/lifecycle.rs`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/jobs/scan/targets.rs`、`tests/scanning_jobs.rs`。
+
+验收：
+
+- [x] 正常完成和全部 DONE/SKIPPED 的任务拒绝重试。
+- [x] 保留检查点的后处理重试沿用任务 ID，重复/冲突请求不产生新任务。
+- [x] 旧 workflow 迁移恢复与既有后处理回归通过。
+
+依赖：LUX-585。先补终态目标和并发重试回归。
+
+结果（2026-10-18）：终态目标用例先在旧判断上失败。统一资格判断并补上事务内复核后，后处理回归 9/9、重试及旧 workflow 恢复回归 7/7 通过；待处理旧队列阻止后处理重试，已完成旧队列不阻止；同库冲突和并发重复请求均被拒绝。
+
+#### LUX-587：管理员接口暴露后处理问题和重试能力
+
+范围：管理员扫描列表和详情附加 `hasPostprocessingIssues`、`canRetry`，共享 LUX-586 资格判断；列表支持 `hasPostprocessingIssues=true/false` 筛选，保留原有状态白名单和分页上限；移除被批量诊断替代的旧查询。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_scan_jobs.rs`、`src/api/admin/admin_jobs.rs`、`src/storage/jobs/scan/reconciliation.rs`、`tests/job_events_api.rs`。
+
+验收：
+
+- [x] 历史失败、未物化目标、正常完成和运行中任务返回正确能力。
+- [x] 列表与详情字段一致，问题筛选先于分页，冲突重试返回 409。
+- [x] 事件仍可读取 WARN/ERROR；管理员接口回归通过。
+
+依赖：LUX-586。先补管理员 API 合同测试。
+
+结果（2026-10-18）：新增用例先因缺少能力字段失败；实现后 `job_events_api` 2/2 通过，覆盖历史空错误码、v3 未物化检查点、分页、WARN 原因和 409/202 重试。既有用例的登录失败在干净基线 `8b019cef` 同样复现；本机开启系统代理，测试客户端显式直连回环地址后通过。
+
+#### LUX-588：Web 显示后处理问题并提供重试
+
+范围：扫描问题使用警告状态和“索引已完成，后处理未完成”提示，重试按钮使用 `canRetry`；按需读取 WARN/ERROR 原因并提供缺失日志回退。问题筛选使用扫描专属条件，重试后刷新任务及事件缓存。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`。
+
+验收：
+
+- [x] 历史问题显示警告、原因入口和允许的重试；正常完成、运行中和冲突任务不误显示重试。
+- [x] 根目录 WARN 原因可见，日志缺失或读取失败不阻断重试。
+- [x] 问题筛选包含扫描与元数据任务；重试后清除旧状态与原因缓存。
+- [x] 管理运行记录定向测试、Web 构建及真实浏览器流程验证完成。
+
+依赖：LUX-587。先补交互测试，再实现 UI。
+
+结果（2026-10-18）：新增交互先复现 5 个失败；修复后管理运行记录 27/27、Web 构建通过。另补旧事件缓存断言，先确认只 invalidation 不会清除旧数据，再于重试成功后移除缓存。Playwright 在真实 Chromium、构建产物及受控 API fixture 下验证警告、WARN 原因、扫描/元数据混合问题筛选、重试后转为 POSTPROCESSING 且隐藏旧原因；390px 页面无横向溢出，控制台 0 error/0 warning。此项是浏览器 UI 证明，不代表 FNOS 部署或真实库恢复验证。
+
+#### LUX-589：诊断查询使用既有阶段索引
+
+范围：后处理诊断按阶段分别使用 EXISTS，复用现有 PENDING/FAILED 部分索引，避免列表读取已完成目标的全部行；不增加索引或迁移。
+
+预计文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/targets.rs`（含查询计划回归）。
+
+验收：
+
+- [x] SQLite 查询计划使用三个阶段部分索引，诊断及筛选含义不变。
+- [x] SQLite/PostgreSQL 诊断矩阵通过。
+
+依赖：LUX-588。先用实际数据库 schema 复现查询走目标主键范围扫描，再调整查询形状。
+
+结果（2026-10-18）：查询计划回归先明确显示目标主键范围扫描并失败；按阶段拆开 EXISTS 后使用现有三个部分索引。查询计划、SQLite 诊断矩阵及本地 PostgreSQL 16 诊断矩阵 3/3 通过；未增加 schema 或迁移，不将此查询计划结果外推为 NAS 性能测量。
+
+#### LUX-591：调整查询计划测试的模块位置
+
+范围：将查询计划测试移到生产代码之后，满足 Clippy `items_after_test_module`；不改变查询或运行时行为。
+
+预计修改文件：`src/storage/jobs/scan/targets.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 查询计划和 SQLite/PostgreSQL 诊断矩阵继续通过。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
+依赖：LUX-589。Clippy 已复现测试模块位置错误，先调整位置，再复跑相关检查。
+
+结果（2026-10-18）：只移动测试模块，查询计划和 SQLite/PostgreSQL 诊断矩阵 3/3 通过；完整 Clippy 与格式检查通过。完整测试中超时的 local metadata worker 用例在同一最终代码单独复跑通过，完整门禁仍保留原失败结果。
+
+#### LUX-590：记录后处理重试修复的兼容与完成门禁
+
+范围：记录 LUX-584 至 LUX-589 的 API、历史任务恢复、浏览器验证及完整检查结果；不增加运行时行为。
+
+预计修改文件：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。
+
+验收标准：
+
+- [x] 记录索引完成语义、附加 API 字段、问题筛选和旧 workflow 恢复合同。
+- [x] 记录 SQLite、PostgreSQL、接口、Web 和真实浏览器的证据范围。
+- [x] 完整门禁失败逐项与干净基线对照，不以定向通过代替全量通过。
+
+依赖：LUX-589、LUX-591。先完成最终检查与基线对照，再写入兼容记录。
+
+结果（2026-10-18）：`docs/COMPATIBILITY.md` 记录合同及验证边界。相关后处理、诊断、PostgreSQL、接口、Web 回归与 Chromium 受控接口验证通过，build、fmt、Clippy 和 Shell/Python 工具检查通过。完整 Rust 库测试 972 通过、4 失败、25 ignored；三个存储失败在基线复现，worker 超时用例在最终代码和基线单独通过。完整扫描 target 为 89 通过、2 个基线复现失败；Web 静态 145 通过/3 失败，完整 Vitest 655 通过/4 失败，七项均在基线复现。完整门禁未通过，不扩展修复无关问题；未合并、推送或部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

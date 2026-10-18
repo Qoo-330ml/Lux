@@ -523,7 +523,9 @@ describe("AdminOperationsPage", () => {
     const unsupportedStatusError = (status?: string) => status === "COMPLETED_WITH_ISSUES"
       ? Promise.reject(new Error("任务状态无效"))
       : Promise.resolve({ jobs: [] });
-    vi.spyOn(api, "adminJobs").mockImplementation(unsupportedStatusError);
+    const scanJobs = vi.spyOn(api, "adminJobs").mockImplementation((status, filter) => filter?.hasPostprocessingIssues
+      ? Promise.resolve({ jobs: [{ id: "scan-issues", libraryId: "library-1", jobType: "RECONCILE_LIBRARY", status: "COMPLETED", scanPhase: "IDLE", hasPostprocessingIssues: true, canRetry: true }] })
+      : unsupportedStatusError(status));
     vi.spyOn(api, "adminStrmProbeJobs").mockImplementation(unsupportedStatusError);
     vi.spyOn(api, "adminChapterDetectionJobs").mockImplementation(unsupportedStatusError);
     vi.spyOn(api, "adminDanmakuMatchJobs").mockImplementation(unsupportedStatusError);
@@ -557,6 +559,83 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector("h1")?.textContent).not.toBe("任务数据加载失败");
     expect(container.textContent).toContain("元数据仅补全");
     expect(container.textContent).toContain("部分条目处理失败");
+    expect(container.textContent).toContain("索引已完成，后处理未完成");
+    expect(scanJobs).toHaveBeenCalledWith(undefined, { hasPostprocessingIssues: true });
+  });
+
+  it("shows historical scan issues, loads WARN reasons lazily, and refreshes after retry", async () => {
+    const issue = { id: "scan-history", libraryId: "library-1", jobType: "RECONCILE_LIBRARY", status: "COMPLETED", scanPhase: "IDLE", hasPostprocessingIssues: true, canRetry: true, error: null };
+    const processing = { ...issue, hasPostprocessingIssues: false, canRetry: false, scanPhase: "POSTPROCESSING" };
+    const jobs = vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [issue] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    const events = vi.spyOn(api, "adminJobEvents").mockImplementation(async (_id, level) => ({
+      total: 1, page: 1, pageSize: 20, events: [{ id: "reason", jobId: issue.id, level: level ?? "ERROR",
+        eventCode: level === "WARN" ? "POSTPROCESSING_TARGET_ROOT_UNAVAILABLE" : "POSTPROCESSING_FAILED",
+        message: "private path https://example.invalid/?token=secret", details: { token: "secret" }, createdAt: 1 }],
+    }));
+    const retry = vi.spyOn(api, "retryAdminJob").mockImplementation(async () => {
+      jobs.mockResolvedValue({ jobs: [processing] });
+      return { job: processing };
+    });
+    const queryClient = renderPage();
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    const oldEventsKey = ["admin", "job-events", issue.id, "previous-attempt"];
+    queryClient.setQueryData(oldEventsKey, { events: ["old reason"] });
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("已注册任务")); });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    expect(container.textContent).toContain("索引已完成，后处理未完成");
+    expect(container.querySelector(".lux-job-icon svg.lucide-triangle-alert")).not.toBeNull();
+    expect(events).not.toHaveBeenCalled();
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="查看扫描后处理原因"]')?.click());
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("媒体库路径不可用")); });
+    expect(events).toHaveBeenCalledWith(issue.id, "WARN", { pageSize: 20 });
+    expect(events).toHaveBeenCalledWith(issue.id, "ERROR", { pageSize: 20 });
+    expect(container.textContent).not.toContain("token=secret");
+    expect(container.textContent).not.toContain("private path");
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="重试任务"]')?.click());
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("索引已完成，后处理进行中")); });
+    expect(retry).toHaveBeenCalledWith(issue.id);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["admin", "job-events", issue.id] });
+    expect(queryClient.getQueryData(oldEventsKey)).toBeUndefined();
+    expect(container.querySelector('button[aria-label="重试任务"]')).toBeNull();
+    expect(container.textContent).not.toContain("媒体库路径不可用");
+  });
+
+  it.each(["missing", "unavailable"])("keeps scan retry available when reason logs are %s", async (mode) => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{ id: "scan-issue", libraryId: "library-1", jobType: "RECONCILE_LIBRARY", status: "COMPLETED", scanPhase: "IDLE", hasPostprocessingIssues: true, canRetry: true, error: "POSTPROCESSING_FAILED" }] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    const events = vi.spyOn(api, "adminJobEvents");
+    if (mode === "missing") events.mockResolvedValue({ events: [], total: 0, page: 1, pageSize: 20 });
+    else events.mockRejectedValue(new Error("unavailable"));
+    renderPage();
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("已注册任务")); });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="查看扫描后处理原因"]')?.click());
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain(mode === "missing" ? "未找到详细原因记录" : "原因记录读取失败")); });
+    expect(container.textContent).toContain("未完成目标已保留");
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="重试任务"]')?.disabled).toBe(false);
+  });
+
+  it("honors server retry denial for completed, active, and conflicting scans", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [
+      { id: "normal", libraryId: "library-1", jobType: "RECONCILE_LIBRARY", status: "COMPLETED", scanPhase: "IDLE", hasPostprocessingIssues: false, canRetry: false },
+      { id: "active", libraryId: "library-1", jobType: "RECONCILE_LIBRARY", status: "COMPLETED", scanPhase: "POSTPROCESSING", hasPostprocessingIssues: false, canRetry: false },
+      { id: "conflict", libraryId: "library-1", jobType: "RECONCILE_LIBRARY", status: "COMPLETED", scanPhase: "IDLE", hasPostprocessingIssues: true, canRetry: false },
+      { id: "failed-conflict", libraryId: "library-1", jobType: "INCREMENTAL_SCAN", status: "FAILED", error: "WORKER_FAILED", canRetry: false },
+    ] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("已注册任务")); });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    expect(container.querySelectorAll(".lux-admin-job-row")).toHaveLength(4);
+    expect(container.querySelector('button[aria-label="重试任务"]')).toBeNull();
+    expect(container.querySelectorAll(".lux-job-status.status-completed-with-issues")).toHaveLength(1);
   });
 
   it("puts the newest runtime record first when timestamps are ISO strings", async () => {

@@ -569,7 +569,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'COMPLETED', error = NULL, cursor = NULL,
+                 SET status = 'COMPLETED', error = 'POSTPROCESSING_FAILED', cursor = NULL,
                      current_item = NULL, cancel_requested = 0,
                      scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
                      updated_at = unixepoch()
@@ -656,8 +656,24 @@ impl Database {
                    AND scan_phase = 'IDLE'
                    AND NOT EXISTS (
                        SELECT 1 FROM reconciliation_scan_entries
-                       WHERE job_id = ?
-                   )",
+                       WHERE job_id = ? AND status = 'PENDING'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_jobs active
+                       WHERE active.library_id = scan_jobs.library_id
+                         AND active.job_type = scan_jobs.job_type
+                         AND active.status IN ('PENDING', 'RUNNING')
+                   )
+                   AND (status != 'COMPLETED' OR EXISTS (
+                       SELECT 1 FROM scan_job_targets t WHERE t.job_id = scan_jobs.id
+                         AND (t.probe_state IN ('PENDING', 'FAILED')
+                           OR t.metadata_state IN ('PENDING', 'FAILED')
+                           OR t.thumbnail_state IN ('PENDING', 'FAILED'))
+                   ) OR EXISTS (
+                       SELECT 1 FROM scan_manifests m WHERE m.job_id = scan_jobs.id
+                         AND m.workflow_version IN (2, 3) AND m.discovery_format_version = 3
+                         AND m.postprocessing_targets_ready = 0
+                   ))",
             )
             .bind(id)
             .bind(id)

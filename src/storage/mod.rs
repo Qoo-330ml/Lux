@@ -606,7 +606,7 @@ pub(crate) use repository::{
     StoredReconciliationScanEntry, StoredScanFingerprintMigrationCandidate,
     StoredScanFingerprintMigrationCursor, StoredScanJob, StoredScanJobCounts,
     StoredScanJobMetadataPage, StoredScanJobMetadataSources, StoredScanJobPath,
-    StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
+    StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
     StoredScanLocalMetadataSource, StoredScanManifest, StoredScanManifestDelta,
     StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
     StoredScanManifestFilesystemBaseline, StoredScanManifestPostprocessingRoot,

@@ -1370,6 +1370,15 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct StoredScanJobRetryState {
+    pub(crate) has_postprocessing_issues: bool,
+    pub(crate) has_unfinished_targets: bool,
+    pub(crate) targets_need_materialization: bool,
+    pub(crate) has_legacy_work: bool,
+    pub(crate) has_active_job: bool,
+}
+
 #[allow(dead_code)] // Storage tests exercise the single-batch enqueue contract.
 #[derive(Clone, Copy)]
 pub(crate) struct NewScanLocalMetadataBatch<'a> {

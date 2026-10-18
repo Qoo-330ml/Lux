@@ -1092,3 +1092,51 @@ Lux 在根路径和 `/emby` 前缀下，对已注册 Emby 路由的静态路径�
 `GET/PATCH /api/v1/auth/library-order` 读取和保存顺序。它与普通媒体库共用管理员/个人顺序策略，Web
 `GET /api/v1/libraries`、Emby `Views` 和登录响应中的 `OrderedViews` 按同一有效顺序排列。没有可见合集的用户
 仍不能提交该 ID。合集保持虚拟库身份，不会加入物理媒体库 ACL，也不会改变合集成员的来源库权限过滤。
+
+## LUX-584 至 LUX-591：扫描后处理诊断与重试（2026-10-18）
+
+`scan_jobs.status=COMPLETED`、`JOB_COMPLETED` 和 `ScanCompleted` 继续表示索引完成；本次不增加扫描状态或数据库迁移。后处理失败仍进入 `COMPLETED/IDLE`，但保存稳定错误码 `POSTPROCESSING_FAILED`，重试开始和最终成功时清除。已完成的目标阶段保留，恢复时继续处理未完成阶段。
+
+管理员扫描列表与详情附加布尔字段 `hasPostprocessingIssues`、`canRetry`。历史任务即使 `error=NULL`，仍可由目标阶段的 `PENDING/FAILED`，或 workflow 2/3、format 3 的未就绪目标检查点识别问题；无需重写旧数据。列表支持可选 `hasPostprocessingIssues=true/false`，与既有 `status` 条件组合，并在数据库分页前筛选。现有分页上限、状态白名单及其他消费者的扫描 DTO 保持原合同。
+
+`canRetry` 与重试入口共用资格判断：检查同库同类型活动任务、旧队列待处理工作及未完成目标；只有终态目标的正常完成任务没有重试入口。后处理重试还在事务内复核条件，竞争或重复请求返回 `409`，不会退回新建全库扫描。保留的 Manifest 检查点继续使用原任务 ID；缺少或不能恢复的旧检查点仍沿用既有迁移恢复路径，新建 Manifest 并承接未完成目标。GET 的能力标记是读取时快照，POST 仍负责校验当前状态。
+
+Web 将这些任务显示为“已完成，有问题”，提示“索引已完成，后处理未完成”，使用 `canRetry` 控制重试。全局问题筛选包含扫描及元数据任务。展开原因时按需读取有界的 WARN/ERROR 事件，只显示稳定错误码与已知文案，不显示原始事件详情；日志缺失或读取失败仍保留重试入口。重试成功刷新任务并清除旧原因缓存，进入“后处理进行中”状态。
+
+诊断按页批量读取，目标检查按三个阶段分别使用既有部分索引；查询次数与实际 SQLite 查询计划已有回归覆盖。该证据不等同于 NAS 性能测量。
+
+### 本机验证
+
+环境为 Toshiba 挂载盘、macOS `arm64`；全部 Cargo 命令使用 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。PostgreSQL 为一次性本地 PostgreSQL 16 容器。各增量的失败在实现前复现，详见 LUX-DEVELOPMENT.md 的 LUX-584 至 LUX-589。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 后处理与旧 workflow 定向回归 | 后处理 9/9、重试及旧 workflow 7/7 通过；覆盖保留错误码、清除错误、检查点恢复、已完成阶段保留、重复请求及活动冲突。两组不合并计数。 |
+| 最终诊断回归 | 查询计划、SQLite 诊断矩阵、PostgreSQL 诊断矩阵 3/3 通过；包括历史空错误码、未物化检查点、批量查询次数与分页前筛选。 |
+| PostgreSQL 后处理 | `cargo test --locked --test postgres_database postprocessing -- --ignored --test-threads=1`：2/2 通过。 |
+| 管理员接口 | `job_events_api`：2/2 通过，覆盖列表/详情能力、WARN 原因、筛选分页、409 竞争拒绝和 202 恢复。回环测试客户端显式禁用本机系统代理；原有代理干扰已在基线复现。 |
+| 扫描完整 target | `scanning_jobs`：89 通过、2 失败；两项失败均在干净基线 `8b019cef` 以相同断言复现，见下文。 |
+| Web 定向 | `admin-operations.test.tsx`：27/27 通过；冻结依赖安装、TypeScript/production build 通过。 |
+| 真实浏览器 | Chromium 使用构建产物与受控 API fixture 验证警告、WARN 原因、混合问题筛选、重试后 POSTPROCESSING 和旧原因缓存清除；390px 宽度无横向溢出，控制台 0 error/0 warning。这是 UI 运行时证明，未连接真实媒体库。 |
+| Rust build / fmt / Clippy | 全部通过。Clippy 首次发现新增测试模块位置问题，移动模块后完整 Clippy、fmt 和上述诊断回归重跑通过；移动不改变生产实现。 |
+| Shell / Python 工具 | `bash -n scripts/*.sh` 通过；compatibility-probe 3/3、catalog-fixture 2/2 通过。 |
+
+### 完整门禁仍失败
+
+最终 `cargo test --locked --all-targets` 在库测试阶段得到 **972 passed、4 failed、25 ignored**，因此没有继续运行后面的 integration targets；上述相关 integration targets 已独立运行。全量运行之后只移动查询计划测试模块，随后重跑相关测试、格式与完整 Clippy。四项失败分别为：
+
+- `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`：预期 1，实际 0。
+- `automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`：读取空集合时越界。
+- `changed_local_fill_request_during_running_item_is_not_lost`：预期 1，实际 0。
+- `local_metadata_worker_dispatches_fill_missing_without_blocking_scan`：完整并发运行时超时；在最终代码和干净基线中单独复跑均通过。超时原因未在本任务内修复，仍保留完整门禁失败。
+
+前三项在干净基线 `8b019cef` 均复现。较早一轮全量还出现过 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 的 actor-credit 断言失败，该失败同样在基线复现；它在最终全量中通过。
+
+`scanning_jobs` 的两项失败也在基线逐项复现：`manifest_discovery_reopens_and_retries_persisted_frontier_idempotently` 的提交检查点预期 2、实际 1；`streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_update` 仍断言 schema 181，而当前实际为 183。本次没有修改它们的断言或相关实现。
+
+完整 Web 静态检查为 **145 passed、3 failed**，`pnpm --dir web test` 在这一阶段停止；另行运行完整 Vitest 为 **655 passed、4 failed**。七项均在基线复现：
+
+- 静态：`detail-actions-loading.test.mjs` 的编辑器懒加载、`home-media-layout.test.mjs` 的移动首页横排、`responsive-layout.test.mjs` 的触屏动作样式。
+- Vitest：`home-page.test.tsx` 的媒体库聚焦预取，`library-card.test.tsx` 的 hover/focus 预取及虚拟合集入口，`media-query-polling.test.tsx` 的详情图片轮询计数。
+
+因此不能把本次定向通过或构建通过记为完整项目门禁通过。此次没有合并、推送或部署，不代表 FNOS、NAS/x86 或真实客户端恢复链路已经验证。

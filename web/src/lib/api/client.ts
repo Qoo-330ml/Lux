@@ -1120,14 +1120,17 @@ export class LuxApiClient {
     );
   }
 
-  adminJobs(status?: string) {
+  adminJobs(status?: string, filter?: { hasPostprocessingIssues?: boolean }) {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);
+    if (filter?.hasPostprocessingIssues !== undefined) {
+      params.set("hasPostprocessingIssues", String(filter.hasPostprocessingIssues));
+    }
     return this.request<{ jobs?: AdminJob[] }>(`/api/v1/admin/jobs?${params}`);
   }
 
-  adminJobEvents(jobId: string, level = "ERROR") {
-    const params = new URLSearchParams({ page: "1", pageSize: "1", level });
+  adminJobEvents(jobId: string, level = "ERROR", options?: { pageSize?: number }) {
+    const params = new URLSearchParams({ page: "1", pageSize: String(options?.pageSize ?? 1), level });
     return this.request<AdminJobEventPage>(
       `/api/v1/admin/jobs/${encodeURIComponent(jobId)}/events?${params}`,
     );

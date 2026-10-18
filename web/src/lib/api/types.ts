@@ -795,6 +795,8 @@ export type AdminJob = {
   discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   error?: string | null;
+  hasPostprocessingIssues?: boolean;
+  canRetry?: boolean;
   createdAt?: string | number;
   startedAt?: string | number | null;
   finishedAt?: string | number | null;

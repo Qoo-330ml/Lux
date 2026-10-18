@@ -7796,8 +7796,8 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
             .is_err()
     );
 
-    let postprocessing_failure: (String, String, i64) = sqlx::query_as(
-        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready
+    let postprocessing_failure: (String, String, i64, Option<String>) = sqlx::query_as(
+        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready, job.error
          FROM scan_jobs job
          JOIN scan_manifests manifest ON manifest.job_id = job.id
          WHERE job.id = ?",
@@ -7807,7 +7807,12 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
     .await?;
     assert_eq!(
         postprocessing_failure,
-        ("COMPLETED".to_owned(), "IDLE".to_owned(), 0)
+        (
+            "COMPLETED".to_owned(),
+            "IDLE".to_owned(),
+            0,
+            Some("POSTPROCESSING_FAILED".to_owned())
+        )
     );
     let log_events = scan_job_log_events(&config.config_dir, &reconciliation.id).await?;
     assert!(
@@ -8821,7 +8826,7 @@ async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
             .await?;
     assert_eq!(status.0, "COMPLETED");
     assert_eq!(status.1, "IDLE");
-    assert_eq!(status.2, None);
+    assert_eq!(status.2.as_deref(), Some("POSTPROCESSING_FAILED"));
     let target_state: String = sqlx::query_scalar(
         "SELECT probe_state FROM scan_job_targets WHERE job_id = ? AND target_type = 'SOURCE'",
     )
@@ -8844,18 +8849,22 @@ async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
     assert_eq!(retried.id, job.id);
     assert_eq!(retried.status, "COMPLETED");
     assert_eq!(retried.scan_phase, "POSTPROCESSING");
+    assert_eq!(retried.error, None);
     let succeeding_probe = MediaProbeService::new(
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
     );
     jobs.run_to_completion(&job.id, 100, Some(succeeding_probe))
         .await?;
-    let final_status: (String, String) =
-        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+    let final_status: (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, scan_phase, error FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(final_status, ("COMPLETED".to_owned(), "IDLE".to_owned()));
+    assert_eq!(
+        final_status,
+        ("COMPLETED".to_owned(), "IDLE".to_owned(), None)
+    );
     Ok(())
 }
 
@@ -8919,6 +8928,88 @@ async fn pending_postprocessing_targets_make_scan_retryable()
             .iter()
             .any(|event| { event.event_code == "POSTPROCESSING_FAILED" && event.level == "ERROR" })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn postprocessing_retry_rejects_finished_targets_and_duplicate_requests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Retry", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, root_path.to_str().ok_or("root path")?)
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED', scan_phase = 'IDLE' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE scan_manifests SET state = 'POSTPROCESSING', postprocessing_targets_ready = 1 WHERE job_id = ?")
+        .bind(&job.id).execute(database.pool()).await?;
+    sqlx::query("INSERT INTO scan_job_targets (job_id, target_type, target_id, item_id, change_kind, metadata_state) VALUES (?, 'ITEM', 'item', 'item', 'NEW', 'DONE')")
+        .bind(&job.id).execute(database.pool()).await?;
+    assert!(matches!(
+        jobs.retry(&job.id).await,
+        Err(luxd::application::scanner::ScanJobError::AlreadyActive(_))
+    ));
+
+    sqlx::query("UPDATE scan_job_targets SET metadata_state = 'FAILED' WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("INSERT INTO reconciliation_scan_entries (job_id, library_root_id, relative_path, entry_type) VALUES (?, ?, '', 'DIRECTORY')")
+        .bind(&job.id).bind(root.id.to_string()).execute(database.pool()).await?;
+    assert!(matches!(
+        jobs.retry(&job.id).await,
+        Err(luxd::application::scanner::ScanJobError::AlreadyActive(_))
+    ));
+    sqlx::query("UPDATE reconciliation_scan_entries SET status = 'DONE' WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    let competing = jobs.create_movie_scan_job(library.id).await?;
+    assert!(matches!(
+        jobs.retry(&job.id).await,
+        Err(luxd::application::scanner::ScanJobError::AlreadyActive(_))
+    ));
+    sqlx::query("UPDATE scan_jobs SET status = 'CANCELLED' WHERE id = ?")
+        .bind(&competing.id)
+        .execute(database.pool())
+        .await?;
+    let (first, second) = tokio::join!(jobs.retry(&job.id), jobs.retry(&job.id));
+    let results = [first, second];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    for result in results {
+        match result {
+            Ok(retried) => {
+                assert_eq!(retried.id, job.id);
+                assert_eq!(retried.scan_phase, "POSTPROCESSING");
+            }
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    luxd::application::scanner::ScanJobError::AlreadyActive(_)
+                ),
+                "{error}"
+            ),
+        }
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE library_id = ?")
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(count, 2, "duplicate retry must not start another full scan");
     Ok(())
 }
 

@@ -71,6 +71,7 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
     let log_store = LogStore::new(&config.config_dir);
     let (base_url, server) = start_server(config.clone(), database.clone(), setup).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let login = client
@@ -78,6 +79,7 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         .json(&json!({ "username": "admin", "password": "correct password" }))
         .send()
         .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
     let cookies = format!(
         "lux_session={}; lux_csrf={}",
         cookie_value(login.headers(), "lux_session"),
@@ -210,6 +212,184 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
     assert_eq!(no_matches.status(), reqwest::StatusCode::OK);
     assert_eq!(no_matches.json::<Value>().await?["total"], 0);
 
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_scan_jobs_expose_historical_issues_and_retry_capabilities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Diagnostics", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let cases = [
+        ("normal", "COMPLETED", "IDLE", None, false, false),
+        (
+            "processing",
+            "COMPLETED",
+            "POSTPROCESSING",
+            None,
+            false,
+            false,
+        ),
+        ("history", "COMPLETED", "IDLE", None, true, true),
+        ("unready", "COMPLETED", "IDLE", None, true, true),
+        (
+            "failed",
+            "FAILED",
+            "IDLE",
+            Some("WORKER_FAILED"),
+            false,
+            true,
+        ),
+        (
+            "marker",
+            "COMPLETED",
+            "IDLE",
+            Some("POSTPROCESSING_FAILED"),
+            true,
+            false,
+        ),
+    ];
+    for (index, (id, status, phase, error, _, _)) in cases.iter().enumerate() {
+        sqlx::query("INSERT INTO scan_jobs (id, library_id, job_type, status, scan_phase, error, generation, created_at) VALUES (?, ?, 'RECONCILE_LIBRARY', ?, ?, ?, 'generation', ?)")
+            .bind(id).bind(&library_id).bind(status).bind(phase).bind(error)
+            .bind(100 - index as i64).execute(database.pool()).await?;
+    }
+    for (id, state) in [
+        ("normal", "DONE"),
+        ("processing", "PENDING"),
+        ("history", "FAILED"),
+    ] {
+        sqlx::query("INSERT INTO scan_job_targets (job_id, target_type, target_id, item_id, change_kind, metadata_state) VALUES (?, 'ITEM', 'item', 'item', 'NEW', ?)")
+            .bind(id).bind(state).execute(database.pool()).await?;
+    }
+    for (id, workflow, ready) in [("history", 1_i64, 1_i64), ("unready", 3_i64, 0_i64)] {
+        sqlx::query("INSERT INTO scan_manifests (id, job_id, library_id, state, workflow_version, discovery_format_version, postprocessing_targets_ready) VALUES (?, ?, ?, 'POSTPROCESSING', ?, 3, ?)")
+            .bind(id).bind(id).bind(&library_id).bind(workflow).bind(ready)
+            .execute(database.pool()).await?;
+    }
+    LogStore::new(&config.config_dir)
+        .append_scan_job_event(
+            "root-unavailable",
+            "unready",
+            "WARN",
+            "POSTPROCESSING_TARGET_ROOT_UNAVAILABLE",
+            "root unavailable",
+            "{}",
+        )
+        .await?;
+    let (base_url, server) = start_server(config, database.clone(), setup).await?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "correct password"}))
+        .send()
+        .await?;
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(login.headers(), "lux_session"),
+        cookie_value(login.headers(), "lux_csrf")
+    );
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let jobs: Value = client
+        .get(format!("{base_url}/api/v1/admin/jobs?pageSize=100"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    for (id, _, _, _, issues, retryable) in cases {
+        let listed = jobs["jobs"]
+            .as_array()
+            .ok_or("jobs")?
+            .iter()
+            .find(|job| job["id"] == id)
+            .ok_or("job")?;
+        assert_eq!(listed["hasPostprocessingIssues"], issues, "{id}");
+        assert_eq!(listed["canRetry"], retryable, "{id}");
+        let detail: Value = client
+            .get(format!("{base_url}/api/v1/admin/jobs/{id}"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(detail["job"], *listed, "list and detail agree for {id}");
+    }
+    for (page, expected) in [(1, "history"), (2, "unready"), (3, "marker")] {
+        let filtered: Value = client
+            .get(format!(
+                "{base_url}/api/v1/admin/jobs?hasPostprocessingIssues=true&pageSize=1&page={page}"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(filtered["jobs"][0]["id"], expected);
+    }
+    let warnings: Value = client
+        .get(format!(
+            "{base_url}/api/v1/admin/jobs/unready/events?level=WARN"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        warnings["events"][0]["eventCode"],
+        "POSTPROCESSING_TARGET_ROOT_UNAVAILABLE"
+    );
+    sqlx::query("INSERT INTO scan_jobs (id, library_id, job_type, status, generation) VALUES ('competing', ?, 'RECONCILE_LIBRARY', 'PENDING', 'generation')")
+        .bind(&library_id).execute(database.pool()).await?;
+    let blocked: Value = client
+        .get(format!("{base_url}/api/v1/admin/jobs/history"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(blocked["job"]["hasPostprocessingIssues"], true);
+    assert_eq!(blocked["job"]["canRetry"], false);
+    let conflict = client
+        .post(format!("{base_url}/api/v1/admin/jobs/history/retry"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    sqlx::query("UPDATE scan_jobs SET status = 'CANCELLED' WHERE id = 'competing'")
+        .execute(database.pool())
+        .await?;
+    let retry = client
+        .post(format!("{base_url}/api/v1/admin/jobs/history/retry"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(retry.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(retry.json::<Value>().await?["job"]["id"], "history");
+    let completed_retry = client
+        .post(format!("{base_url}/api/v1/admin/jobs/normal/retry"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(completed_retry.status(), reqwest::StatusCode::CONFLICT);
     server.abort();
     Ok(())
 }

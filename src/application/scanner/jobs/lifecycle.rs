@@ -1202,52 +1202,52 @@ impl ScanJobService {
         Ok(())
     }
 
+    pub(crate) fn can_retry_stored_job(
+        job: &crate::storage::StoredScanJob,
+        recovery: &crate::storage::StoredScanJobRetryState,
+    ) -> bool {
+        !recovery.has_active_job
+            && (matches!(job.status.as_str(), "FAILED" | "CANCELLED")
+                || (job.status == "COMPLETED"
+                    && job.job_type == "RECONCILE_LIBRARY"
+                    && job.scan_phase == "IDLE"
+                    && !recovery.has_legacy_work
+                    && (recovery.has_unfinished_targets || recovery.targets_need_materialization)))
+    }
+
     pub async fn retry(&self, job_id: &str) -> Result<ScanJob, ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
-        let can_retry_completed_postprocessing = if job.status == "COMPLETED"
-            && job.job_type == "RECONCILE_LIBRARY"
-            && job.scan_phase == "IDLE"
-        {
-            let legacy_work_is_cleared = !self
-                .database
-                .has_reconciliation_scan_entries(&job.id)
-                .await?;
-            let has_targets = self.database.has_scan_job_targets(&job.id).await?;
-            let targets_need_materialization = self
-                .database
-                .has_unready_scan_manifest_postprocessing_targets(&job.id)
-                .await?;
-            legacy_work_is_cleared && (has_targets || targets_need_materialization)
-        } else {
-            false
+        let recovery = self
+            .database
+            .scan_job_retry_states(std::slice::from_ref(&job.id))
+            .await?;
+        let Some(recovery) = recovery.get(&job.id) else {
+            return Err(ScanJobError::JobNotFound);
         };
-        if !matches!(job.status.as_str(), "FAILED" | "CANCELLED")
-            && !can_retry_completed_postprocessing
-        {
+        if !Self::can_retry_stored_job(&job, recovery) {
             return Err(ScanJobError::AlreadyActive(job.id));
         }
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
             return Err(ScanJobError::LibraryNotFound);
         };
-        if let Some(active) = self
-            .database
-            .find_active_scan_job(&job.library_id, &job.job_type)
-            .await?
-        {
-            return Err(ScanJobError::AlreadyActive(active.id));
-        }
         if job.job_type == "RECONCILE_LIBRARY" {
             let manifest_stage = self.database.prepare_scan_manifest_retry(&job.id).await?;
             match manifest_stage.as_deref() {
                 Some("POSTPROCESSING" | "INDEXED") => {
+                    if recovery.has_legacy_work {
+                        return self
+                            .create_movie_scan_job_with_metadata(
+                                library_id,
+                                job.auto_metadata_match,
+                            )
+                            .await;
+                    }
                     if self.database.retry_scan_job_postprocessing(&job.id).await? {
                         return self.get_job(&job.id).await;
                     }
-                    return self
-                        .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
-                        .await;
+                    return Err(ScanJobError::AlreadyActive(job.id));
                 }
                 Some("DISCOVERING" | "READY_TO_DIFF" | "APPLYING") => {
                     if !self.database.retry_scan_job(&job.id).await? {
