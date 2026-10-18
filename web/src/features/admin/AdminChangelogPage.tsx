@@ -16,11 +16,12 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.6.11",
-    date: "2026-10-18",
+    date: "2026-10-19",
     sections: [
       { kind: "added", items: [
         "扫描任务、管理任务页和活动面板展示已处理的电影与剧集数量，并通过管理 API 提供进度信息。",
         "管理员可查看扫描后处理问题并重试可恢复项目；系统保留失败原因并拦截重复恢复请求。",
+        "反向代理客户端地址解析支持 X-Real-IP 和 RFC 7239 Forwarded，并在 X-Forwarded-For 缺失或无效时按顺序回退；地址仅用于会话与活动展示，不参与认证、媒体库 ACL、限流或 HTTPS 判断。",
       ] },
       { kind: "changed", items: [
         "新增与变化资源共用一个自动刮削开关；本地元数据回填只记录缺失，不会自动排队在线刮削。",
