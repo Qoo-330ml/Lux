@@ -12441,6 +12441,37 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-18）：终态目标用例先在旧判断上失败。统一资格判断并补上事务内复核后，后处理回归 9/9、重试及旧 workflow 恢复回归 7/7 通过；待处理旧队列阻止后处理重试，已完成旧队列不阻止；同库冲突和并发重复请求均被拒绝。
 
+#### LUX-587：管理员接口暴露后处理问题和重试能力
+
+范围：管理员扫描列表和详情附加 `hasPostprocessingIssues`、`canRetry`，共享 LUX-586 资格判断；列表支持 `hasPostprocessingIssues=true/false` 筛选，保留原有状态白名单和分页上限；移除被批量诊断替代的旧查询。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_scan_jobs.rs`、`src/api/admin/admin_jobs.rs`、`src/storage/jobs/scan/reconciliation.rs`、`tests/job_events_api.rs`。
+
+验收：
+
+- [x] 历史失败、未物化目标、正常完成和运行中任务返回正确能力。
+- [x] 列表与详情字段一致，问题筛选先于分页，冲突重试返回 409。
+- [x] 事件仍可读取 WARN/ERROR；管理员接口回归通过。
+
+依赖：LUX-586。先补管理员 API 合同测试。
+
+结果（2026-10-18）：新增用例先因缺少能力字段失败；实现后 `job_events_api` 2/2 通过，覆盖历史空错误码、v3 未物化检查点、分页、WARN 原因和 409/202 重试。既有用例的登录失败在干净基线 `8b019cef` 同样复现；本机开启系统代理，测试客户端显式直连回环地址后通过。
+
+#### LUX-588：Web 显示后处理问题并提供重试
+
+范围：扫描问题使用警告状态和“索引已完成，后处理未完成”提示，重试按钮使用 `canRetry`；按需读取 WARN/ERROR 原因并提供缺失日志回退。问题筛选使用扫描专属条件，重试后刷新任务及事件缓存。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`。
+
+验收：
+
+- [ ] 历史问题显示警告、原因入口和允许的重试；正常完成、运行中和冲突任务不误显示重试。
+- [ ] 根目录 WARN 原因可见，日志缺失或读取失败不阻断重试。
+- [ ] 问题筛选包含扫描与元数据任务；重试后清除旧状态与原因缓存。
+- [ ] 管理运行记录定向测试、Web 构建及真实浏览器流程验证完成。
+
+依赖：LUX-587。先补交互测试，再实现 UI。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

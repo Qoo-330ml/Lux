@@ -802,24 +802,4 @@ impl Database {
         }
         Ok(confirmed)
     }
-
-    pub(crate) async fn has_reconciliation_scan_entries(
-        &self,
-        job_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM reconciliation_scan_entries
-                 WHERE job_id = ? AND status = 'PENDING'
-             ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
 }

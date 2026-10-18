@@ -9,8 +9,58 @@ use crate::{
     },
     domain::ids::LibraryId,
     observability::logs::{LogStore, ScanJobLogEvent},
-    storage::Database,
+    storage::{Database, StorageError, StoredScanJob},
 };
+
+pub(crate) struct AdminScanJob {
+    pub(crate) job: StoredScanJob,
+    pub(crate) has_postprocessing_issues: bool,
+    pub(crate) can_retry: bool,
+}
+
+pub(crate) async fn list_admin_scan_jobs(
+    database: &Database,
+    status: Option<&str>,
+    has_postprocessing_issues: Option<bool>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<AdminScanJob>, StorageError> {
+    let jobs = database
+        .list_admin_scan_jobs(status, has_postprocessing_issues, offset, limit)
+        .await?;
+    attach_retry_capabilities(database, jobs).await
+}
+
+pub(crate) async fn find_admin_scan_job(
+    database: &Database,
+    job_id: &str,
+) -> Result<Option<AdminScanJob>, StorageError> {
+    let Some(job) = database.find_scan_job(job_id).await? else {
+        return Ok(None);
+    };
+    Ok(attach_retry_capabilities(database, vec![job]).await?.pop())
+}
+
+async fn attach_retry_capabilities(
+    database: &Database,
+    jobs: Vec<StoredScanJob>,
+) -> Result<Vec<AdminScanJob>, StorageError> {
+    let ids = jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+    let states = database.scan_job_retry_states(&ids).await?;
+    Ok(jobs
+        .into_iter()
+        .map(|job| {
+            let recovery = states.get(&job.id);
+            AdminScanJob {
+                has_postprocessing_issues: recovery
+                    .is_some_and(|state| state.has_postprocessing_issues),
+                can_retry: recovery
+                    .is_some_and(|state| ScanJobService::can_retry_stored_job(&job, state)),
+                job,
+            }
+        })
+        .collect())
+}
 
 pub(crate) enum AdminScanJobEventsError {
     NotFound,
