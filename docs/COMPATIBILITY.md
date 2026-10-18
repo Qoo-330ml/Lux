@@ -1168,7 +1168,7 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 | 检查 | 结果与边界 |
 | --- | --- |
 | 环境 | `/Volumes/Toshiba` 已挂载；macOS `arm64`；所有 Cargo 命令设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。 |
-| 定向 Rust | 配置删除宽限期存储测试 1/1；`admin_dashboard` 集成目标 1/1。 |
+| 定向 Rust | 配置删除宽限期存储测试 1/1；`admin_dashboard` 1/1；`user_settings` 1/1；`emby_auth` 9/9；`users` 1/1。`users` 目标同步了已变化的 API 契约：重复账户使用通用冲突文案；软删除返回账号及清理期限；回收站中的用户名在清理前仍受唯一约束。 |
 | 定向 Web | 用户列表、权限路由与生命周期 13/13；删除期限设置 3/3；账户资料设置 23/23。 |
 | Web 依赖与构建 | `pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。 |
 | 完整 Web | `pnpm --dir web test` 的静态阶段 144 通过、4 失败，因此未进入该命令的 Vitest 阶段；独立完整 Vitest 为 662 通过、4 失败（首页预取、媒体库卡片 2 项、详情轮询）。相关用户管理定向回归通过。 |

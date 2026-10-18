@@ -89,7 +89,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(
         duplicate.json::<Value>().await?["error"]["message"],
-        "用户名已存在"
+        "用户名或邮箱已存在"
     );
 
     let library = client
@@ -270,15 +270,12 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .header("x-csrf-token", &manager_csrf)
         .send()
         .await?;
-    let deleted_regular_status = deleted_regular.status();
-    let deleted_regular_body = deleted_regular.text().await?;
-    assert_eq!(
-        deleted_regular_status,
-        reqwest::StatusCode::NO_CONTENT,
-        "{deleted_regular_body}"
-    );
+    assert_eq!(deleted_regular.status(), reqwest::StatusCode::OK);
+    let deleted_regular_user = deleted_regular.json::<Value>().await?["user"].clone();
+    assert!(deleted_regular_user["deletedAt"].as_i64().is_some());
+    assert!(deleted_regular_user["deletionPurgeAt"].as_i64().is_some());
 
-    let recreated_regular = client
+    let reserved_username = client
         .post(format!("{base_url}/api/v1/admin/users"))
         .header(COOKIE, &manager_cookie)
         .header("x-csrf-token", &manager_csrf)
@@ -288,7 +285,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         }))
         .send()
         .await?;
-    assert_eq!(recreated_regular.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(reserved_username.status(), reqwest::StatusCode::CONFLICT);
 
     let audit = client
         .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
