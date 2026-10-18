@@ -156,7 +156,8 @@ impl Database {
                    ON legacy_retry.key = 'metadata_fill_missing_legacy_retry_after'
                  WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
                    AND jobs.dispatch_source = 'AUTOMATIC'
-                   AND jobs.status = 'DEFERRED' AND jobs.cancel_requested = 0
+                   AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
+                   AND jobs.cancel_requested = 0
                    AND items.status = 'FAILED'
                    AND items.error = 'SCRAPER_UNAVAILABLE'
                    AND items.automatic_retry_consumed = 0
@@ -221,7 +222,8 @@ impl Database {
                        SELECT 1 FROM metadata_reidentify_jobs jobs
                        WHERE jobs.id = metadata_reidentify_job_items.job_id
                          AND jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
-                         AND jobs.dispatch_source = 'AUTOMATIC' AND jobs.status = 'DEFERRED'
+                         AND jobs.dispatch_source = 'AUTOMATIC'
+                         AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                    )"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));

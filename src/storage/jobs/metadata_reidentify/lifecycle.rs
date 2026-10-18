@@ -472,7 +472,7 @@ impl Database {
                      WHERE jobs.library_id IS NOT NULL
                        AND jobs.mode = 'FILL_MISSING'
                        AND jobs.dispatch_source = 'AUTOMATIC'
-                       AND jobs.status = 'DEFERRED'
+                       AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                        AND jobs.cancel_requested = 0
                        AND EXISTS (
                            SELECT 1
@@ -796,6 +796,26 @@ impl Database {
             "SELECT CASE WHEN EXISTS(
                  SELECT 1 FROM metadata_reidentify_job_items
                  WHERE job_id = ? AND status = 'FAILED'
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn metadata_reidentify_job_has_completed_items(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND status = 'COMPLETED'
              ) THEN 1 ELSE 0 END",
         )
         .bind(job_id)

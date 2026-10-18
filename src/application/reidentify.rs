@@ -1575,15 +1575,18 @@ impl MetadataReidentifyService {
                     .metadata_reidentify_job_has_pending_items(job_id)
                     .await
                     .unwrap_or(true));
-        let (has_scraper_unavailable, has_item_issues) =
+        let (has_scraper_unavailable, has_item_issues, has_completed_items) =
             if cancel_requested || reconciliation_failed || queue_incomplete {
-                (Ok(false), Ok(false))
+                (Ok(false), Ok(false), Ok(false))
             } else {
                 (
                     self.database
                         .metadata_reidentify_job_has_item_error(job_id, "SCRAPER_UNAVAILABLE")
                         .await,
                     self.metadata_reidentify_job_has_item_issues(job_id).await,
+                    self.database
+                        .metadata_reidentify_job_has_completed_items(job_id)
+                        .await,
                 )
             };
         let (status, error) = metadata_job_outcome(MetadataJobOutcomeInput {
@@ -1592,6 +1595,7 @@ impl MetadataReidentifyService {
             queue_incomplete,
             has_scraper_unavailable: has_scraper_unavailable.ok(),
             has_item_issues: has_item_issues.ok(),
+            has_completed_items: has_completed_items.ok(),
         });
         let finish_result = self
             .database
@@ -3017,6 +3021,9 @@ struct MetadataJobOutcomeInput {
     /// `None` when the lookup itself failed.
     has_scraper_unavailable: Option<bool>,
     has_item_issues: Option<bool>,
+    /// Whether at least one item finished successfully. A partial provider
+    /// failure should not hide completed work behind a whole-job DEFERRED.
+    has_completed_items: Option<bool>,
 }
 
 /// Decides the final job status and error code. A job is never reported as
@@ -3031,10 +3038,18 @@ fn metadata_job_outcome(input: MetadataJobOutcomeInput) -> (&'static str, Option
     if input.reconciliation_failed {
         return ("FAILED", Some("ITEM_FAILED"));
     }
-    match (input.has_scraper_unavailable, input.has_item_issues) {
-        (Some(true), _) => ("DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE")),
-        (Some(false), Some(true)) => ("COMPLETED_WITH_ISSUES", Some("ITEM_ISSUES")),
-        (Some(false), Some(false)) => ("COMPLETED", None),
+    match (
+        input.has_scraper_unavailable,
+        input.has_item_issues,
+        input.has_completed_items,
+    ) {
+        (Some(true), _, Some(true)) => (
+            "COMPLETED_WITH_ISSUES",
+            Some("PARTIAL_PROVIDER_UNAVAILABLE"),
+        ),
+        (Some(true), _, _) => ("DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE")),
+        (Some(false), Some(true), _) => ("COMPLETED_WITH_ISSUES", Some("ITEM_ISSUES")),
+        (Some(false), Some(false), _) => ("COMPLETED", None),
         _ => ("FAILED", Some("ITEM_FAILED")),
     }
 }
@@ -5093,6 +5108,7 @@ mod tests {
             queue_incomplete,
             has_scraper_unavailable: Some(false),
             has_item_issues: Some(false),
+            has_completed_items: Some(false),
         };
         assert_eq!(
             super::metadata_job_outcome(input(true, false)),
@@ -5113,8 +5129,34 @@ mod tests {
                 queue_incomplete: false,
                 has_scraper_unavailable: Some(false),
                 has_item_issues: Some(true),
+                has_completed_items: Some(true),
             }),
             ("COMPLETED_WITH_ISSUES", Some("ITEM_ISSUES"))
+        );
+        assert_eq!(
+            super::metadata_job_outcome(super::MetadataJobOutcomeInput {
+                cancel_requested: false,
+                reconciliation_failed: false,
+                queue_incomplete: false,
+                has_scraper_unavailable: Some(true),
+                has_item_issues: Some(true),
+                has_completed_items: Some(true),
+            }),
+            (
+                "COMPLETED_WITH_ISSUES",
+                Some("PARTIAL_PROVIDER_UNAVAILABLE")
+            )
+        );
+        assert_eq!(
+            super::metadata_job_outcome(super::MetadataJobOutcomeInput {
+                cancel_requested: false,
+                reconciliation_failed: false,
+                queue_incomplete: false,
+                has_scraper_unavailable: Some(true),
+                has_item_issues: Some(true),
+                has_completed_items: Some(false),
+            }),
+            ("DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE"))
         );
     }
 

@@ -68,6 +68,7 @@ pub struct TestScraper {
 impl TestScraper {
     pub fn new(config: TestScraperConfig) -> Result<Self, TestScraperError> {
         let client = Client::builder()
+            .no_proxy()
             .timeout(config.timeout)
             .build()
             .map_err(TestScraperError)?;

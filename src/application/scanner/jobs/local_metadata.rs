@@ -66,6 +66,7 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
     String,
     Vec<StoredScanLocalMetadataSource>,
     Vec<String>,
+    Vec<String>,
 )> {
     let batch_id = batch.id.clone();
     let scan_job_id = batch.job_id.clone();
@@ -107,24 +108,33 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
         database
             .list_scan_local_metadata_sources(&source_ids)
             .await
+            .map(|sources| (sources, Vec::new()))
             .map_err(|error| error.to_string())
     } else {
         match enricher
             .index_scan_local_metadata_batch_images(&source_ids)
             .await
         {
-            Ok(batch) if !batch.report.failed_item_ids.is_empty() => Err(format!(
-                "{} local image item(s) failed",
-                batch.report.failed_item_ids.len()
-            )),
-            Ok(batch) => match database
-                .mark_scan_local_metadata_images_complete(&batch_id)
-                .await
-            {
-                Ok(true) => Ok(batch.sources),
-                Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
-                Err(error) => Err(error.to_string()),
-            },
+            Ok(batch) => {
+                let skipped_item_ids = batch.report.failed_item_ids.clone();
+                if !skipped_item_ids.is_empty() {
+                    tracing::warn!(
+                        batch_id,
+                        skipped_items = skipped_item_ids.len(),
+                        "local image items could not be read; continuing with the rest of the batch"
+                    );
+                }
+                match database
+                    .mark_scan_local_metadata_images_complete(&batch_id)
+                    .await
+                {
+                    Ok(true) => Ok((batch.sources, skipped_item_ids)),
+                    Ok(false) => {
+                        Err("local metadata batch stopped before image completion".to_owned())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
             Err(error) => Err(error.to_string()),
         }
     };
@@ -134,11 +144,12 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
     user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(source_snapshot) => Some((
+        Ok((source_snapshot, image_skipped_item_ids)) => Some((
             batch_id,
             scan_job_id,
             source_snapshot,
             non_retryable_item_ids,
+            image_skipped_item_ids,
         )),
         Err(error) => {
             tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
@@ -155,8 +166,9 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_batch(
     batch_id: &str,
     scan_job_id: &str,
     source_snapshot: Vec<StoredScanLocalMetadataSource>,
-    existing_non_retryable_item_ids: &[String],
+    completion_issues: (&[String], &[String]),
 ) {
+    let (existing_non_retryable_item_ids, image_skipped_item_ids) = completion_issues;
     let mut non_retryable_item_ids = existing_non_retryable_item_ids.to_vec();
     let result = match enricher
         .enrich_scan_local_metadata_batch_nfo(source_snapshot, &non_retryable_item_ids)
@@ -177,12 +189,10 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_batch(
                     "{retryable_failed_item_count} local NFO item(s) failed"
                 ))
             } else {
-                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
-                    format!(
-                        "{} non-retryable local NFO item(s) failed",
-                        non_retryable_item_ids.len()
-                    )
-                });
+                let issue = local_metadata_completion_issue(
+                    image_skipped_item_ids,
+                    &non_retryable_item_ids,
+                );
                 complete_local_metadata_completeness(
                     database,
                     context.metadata_selection,
@@ -280,12 +290,32 @@ async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
     }
 }
 
+fn local_metadata_completion_issue(
+    image_skipped_item_ids: &[String],
+    non_retryable_item_ids: &[String],
+) -> Option<String> {
+    let mut issues = Vec::new();
+    if !image_skipped_item_ids.is_empty() {
+        issues.push(format!(
+            "{} local image item(s) skipped",
+            image_skipped_item_ids.len()
+        ));
+    }
+    if !non_retryable_item_ids.is_empty() {
+        issues.push(format!(
+            "{} non-retryable local NFO item(s) failed",
+            non_retryable_item_ids.len()
+        ));
+    }
+    (!issues.is_empty()).then(|| issues.join("; "))
+}
+
 pub(in crate::application::scanner) async fn process_scan_local_metadata_backfill_images(
     enricher: &MetadataEnricher,
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     page: &StoredScanLocalMetadataBackfillPage,
-) -> Result<Vec<StoredScanLocalMetadataSource>, String> {
+) -> Result<(Vec<StoredScanLocalMetadataSource>, Vec<String>), String> {
     let result = enricher
         .index_scan_local_metadata_batch_images(&page.entry_ids)
         .await;
@@ -295,12 +325,13 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_backfil
     user_events.publish_home_coalesced().await;
     let batch = result.map_err(|error| error.to_string())?;
     if !batch.report.failed_item_ids.is_empty() {
-        return Err(format!(
-            "{} local image item(s) failed",
-            batch.report.failed_item_ids.len()
-        ));
+        tracing::warn!(
+            library_root_id = %page.library_root_id,
+            skipped_items = batch.report.failed_item_ids.len(),
+            "local image backfill items could not be read; continuing with the rest of the page"
+        );
     }
-    Ok(batch.sources)
+    Ok((batch.sources, batch.report.failed_item_ids))
 }
 
 pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill_page(
@@ -309,6 +340,7 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill
     context: LocalMetadataCompletionContext<'_>,
     page: StoredScanLocalMetadataBackfillPage,
     source_snapshot: Vec<StoredScanLocalMetadataSource>,
+    image_skipped_item_ids: &[String],
 ) {
     let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
     let result = match enricher
@@ -330,12 +362,10 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill
                     "{retryable_failed_item_count} local NFO item(s) failed"
                 ))
             } else {
-                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
-                    format!(
-                        "{} non-retryable local NFO item(s) failed",
-                        non_retryable_item_ids.len()
-                    )
-                });
+                let issue = local_metadata_completion_issue(
+                    image_skipped_item_ids,
+                    &non_retryable_item_ids,
+                );
                 complete_local_metadata_completeness(
                     database,
                     context.metadata_selection,
@@ -910,15 +940,20 @@ async fn process_scan_local_metadata_outbox_batch(
     nfo_tasks: &mut JoinSet<String>,
     batch: StoredScanLocalMetadataBatch,
 ) {
-    let Some((batch_id, scan_job_id, source_snapshot, non_retryable_item_ids)) =
-        process_scan_local_metadata_batch(
-            &context.database,
-            enricher,
-            context.home.as_ref(),
-            &context.user_events,
-            batch,
-        )
-        .await
+    let Some((
+        batch_id,
+        scan_job_id,
+        source_snapshot,
+        non_retryable_item_ids,
+        image_skipped_item_ids,
+    )) = process_scan_local_metadata_batch(
+        &context.database,
+        enricher,
+        context.home.as_ref(),
+        &context.user_events,
+        batch,
+    )
+    .await
     else {
         return;
     };
@@ -943,7 +978,7 @@ async fn process_scan_local_metadata_outbox_batch(
             &batch_id,
             &scan_job_id,
             source_snapshot,
-            &non_retryable_item_ids,
+            (&non_retryable_item_ids, &image_skipped_item_ids),
         )
         .await;
         batch_id
@@ -964,7 +999,7 @@ async fn process_scan_local_metadata_backfill_page(
     )
     .await
     {
-        Ok(source_snapshot) => {
+        Ok((source_snapshot, image_skipped_item_ids)) => {
             let database = context.database.clone();
             let enricher = enricher.clone();
             let metadata_selection = context.metadata_selection.clone();
@@ -985,6 +1020,7 @@ async fn process_scan_local_metadata_backfill_page(
                     completion_context,
                     page,
                     source_snapshot,
+                    &image_skipped_item_ids,
                 )
                 .await;
                 library_root_id

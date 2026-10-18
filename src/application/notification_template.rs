@@ -233,6 +233,7 @@ fn error_label(value: &str) -> String {
         "DISPATCH_FAILED" => "任务未能加入执行队列，可重试",
         "QUEUE_INCOMPLETE" => "任务未处理完即中断，可重试",
         "DEFERRED_PROVIDER_UNAVAILABLE" => "元数据服务暂不可用",
+        "PARTIAL_PROVIDER_UNAVAILABLE" => "部分条目元数据服务暂不可用，已保留自动重试",
         "LIBRARY_NOT_FOUND" => "媒体库不存在",
         "JOB_NOT_FOUND" => "任务不存在",
         "SCAN_IO" => "扫描文件时发生读写错误",

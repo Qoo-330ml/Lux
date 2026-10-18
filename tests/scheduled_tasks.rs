@@ -278,8 +278,8 @@ async fn due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule()
     .await?;
     sqlx::query(
         "UPDATE metadata_reidentify_jobs
-         SET dispatch_source = 'AUTOMATIC', status = 'DEFERRED',
-             error = 'DEFERRED_PROVIDER_UNAVAILABLE', updated_at = unixepoch()
+         SET dispatch_source = 'AUTOMATIC', status = 'COMPLETED_WITH_ISSUES',
+             error = 'PARTIAL_PROVIDER_UNAVAILABLE', updated_at = unixepoch()
          WHERE id = ?",
     )
     .bind(&job.id)
@@ -291,10 +291,20 @@ async fn due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule()
              automatic_retry_count = 1, automatic_retry_after = ?,
              automatic_retry_consumed = 0, request_fingerprint = X'01',
              request_capabilities_json = '[\"POSTER\"]'
-         WHERE job_id = ?",
+         WHERE job_id = ? AND item_id = ?",
     )
     .bind(now + 300)
     .bind(&job.id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED', error = NULL
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&job.id)
+    .bind(&already_complete_item_id)
     .execute(database.pool())
     .await?;
 
@@ -318,12 +328,12 @@ async fn due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule()
         0,
         "retry must respect its deadline"
     );
-    let deferred_status: String =
+    let partial_status: String =
         sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(deferred_status, "DEFERRED");
+    assert_eq!(partial_status, "COMPLETED_WITH_ISSUES");
 
     sqlx::query(
         "UPDATE metadata_reidentify_job_items
@@ -379,8 +389,13 @@ async fn due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+        let debug_jobs: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT id, status, error, total_count FROM metadata_reidentify_jobs ORDER BY created_at",
+        )
+        .fetch_all(database.pool())
+        .await?;
         return Err(format!(
-            "scheduler did not retry due metadata job: parent={parent:?}, item={item:?}"
+            "scheduler did not retry due metadata job: parent={parent:?}, item={item:?}, jobs={debug_jobs:?}"
         )
         .into());
     }
@@ -397,8 +412,8 @@ async fn due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(
-        complete_item_retry_consumed, 1,
-        "complete items must not remain due"
+        complete_item_retry_consumed, 0,
+        "completed items are not retry candidates and stay outside the failed-item budget"
     );
 
     let retry_job_id: String = sqlx::query_scalar(

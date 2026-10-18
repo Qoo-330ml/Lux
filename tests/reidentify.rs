@@ -436,7 +436,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -2368,6 +2368,80 @@ async fn scraper_unavailable_metadata_job_is_deferred() -> Result<(), Box<dyn st
     assert_eq!(
         finished.error.as_deref(),
         Some("DEFERRED_PROVIDER_UNAVAILABLE")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn partially_completed_metadata_job_is_not_reported_as_whole_job_deferred()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for (directory, file) in [
+        ("Partial One (2024)", "Partial.One.2024.mkv"),
+        ("Partial Two (2024)", "Partial.Two.2024.mkv"),
+    ] {
+        let movie_dir = root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(file), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id LIMIT 2",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 2);
+
+    let metadata = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = metadata.create_fill_missing_job(item_ids.clone()).await?;
+    sqlx::query("UPDATE metadata_reidentify_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED', error = NULL, candidate_count = 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&job.id)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&job.id)
+    .bind(&item_ids[1])
+    .execute(database.pool())
+    .await?;
+
+    metadata.run(&job.id).await;
+
+    let finished = metadata.get_job(&job.id).await?;
+    assert_eq!(finished.status, "COMPLETED_WITH_ISSUES");
+    assert_eq!(
+        finished.error.as_deref(),
+        Some("PARTIAL_PROVIDER_UNAVAILABLE")
     );
     Ok(())
 }

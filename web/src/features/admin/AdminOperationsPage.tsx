@@ -129,6 +129,7 @@ const ERROR_LABELS: Record<string, string> = {
   DISPATCH_FAILED: "任务未能加入执行队列，可重试",
   QUEUE_INCOMPLETE: "任务未处理完即中断，可重试",
   DEFERRED_PROVIDER_UNAVAILABLE: "刮削器暂不可用，已延后重试",
+  PARTIAL_PROVIDER_UNAVAILABLE: "部分条目刮削器暂不可用，已完成的部分已保留，失败项会自动重试",
   WORKER_FAILED: "任务工作线程异常退出",
   STORAGE_ERROR: "数据库处理失败",
   SQLITE_BUSY: "SQLite 写入繁忙，扫描重试后仍失败",

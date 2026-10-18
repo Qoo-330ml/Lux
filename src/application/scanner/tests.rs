@@ -1789,6 +1789,176 @@ async fn local_metadata_worker_persists_capability_missing()
     Ok(())
 }
 
+#[tokio::test]
+async fn local_metadata_skips_unreadable_images_without_stalling_batches_or_backfill()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        application::{
+            candidates::MetadataSelectionService, images::ImageWriteService,
+            libraries::LibraryService, reidentify::MetadataReidentifyService,
+            scraper::ScraperProvider,
+        },
+        config::Config,
+        library::LibraryKind,
+        storage::Database,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let backfill_dir = media_root.join("Backfill Bad Poster (2024)");
+    tokio::fs::create_dir_all(&backfill_dir).await?;
+    tokio::fs::write(backfill_dir.join("Backfill.Bad.Poster.2024.mkv"), b"movie").await?;
+    // A directory named like a poster is still discovered by the image stage and
+    // fails when the worker tries to read it as a file.
+    tokio::fs::create_dir(backfill_dir.join("poster.jpg")).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let images =
+        ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?;
+    let selection = MetadataSelectionService::with_config_dir(
+        database.clone(),
+        images,
+        config.config_dir.clone(),
+    );
+    let reidentify = MetadataReidentifyService::with_selection(
+        database.clone(),
+        ScraperProvider::unconfigured(),
+        Some(selection.clone()),
+    );
+    let jobs = ScanJobService::new(database.clone())
+        .with_metadata_selection(selection)
+        .with_metadata_reidentify(reidentify);
+    jobs.start_local_metadata_outbox_worker().await?;
+
+    let library_id = library.id.to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_backfills
+                 WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ?)",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let backfill_item_id: String = sqlx::query_scalar(
+        "SELECT item.id FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path LIKE 'Backfill Bad Poster (2024)/%'
+           AND item.library_id = ? AND item.item_type = 'MOVIE'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_metadata_completeness
+             WHERE item_id = ? AND capability = 'METADATA'
+               AND local_state = 'READY' AND is_missing = 1",
+        )
+        .bind(&backfill_item_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "a bad local image must not stop local metadata completeness"
+    );
+    let backfill_error: Option<String> = sqlx::query_scalar(
+        "SELECT error FROM scan_local_metadata_backfills
+         WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ?)",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        backfill_error
+            .as_deref()
+            .is_some_and(|error| error.contains("local image")),
+        "the skipped image should be visible on the completed backfill page: {backfill_error:?}"
+    );
+
+    let outbox_dir = media_root.join("Outbox Bad Poster (2024)");
+    tokio::fs::create_dir_all(&outbox_dir).await?;
+    tokio::fs::write(outbox_dir.join("Outbox.Bad.Poster.2024.mkv"), b"movie").await?;
+    tokio::fs::create_dir(outbox_dir.join("poster.jpg")).await?;
+    let scan_job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan_job.id, 100, None).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&scan_job.id)
+            .fetch_optional(database.pool())
+            .await?;
+            if status.as_deref() == Some("COMPLETED") {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let outbox_item_id: String = sqlx::query_scalar(
+        "SELECT item.id FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path LIKE 'Outbox Bad Poster (2024)/%'
+           AND item.library_id = ? AND item.item_type = 'MOVIE'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_metadata_completeness
+             WHERE item_id = ? AND capability = 'METADATA'
+               AND local_state = 'READY' AND is_missing = 1",
+        )
+        .bind(&outbox_item_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "a bad local image must not stop the new-item outbox batch"
+    );
+    let batch_error: Option<String> = sqlx::query_scalar(
+        "SELECT error FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+    )
+    .bind(&scan_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        batch_error
+            .as_deref()
+            .is_some_and(|error| error.contains("local image")),
+        "the skipped image should be visible on the completed outbox batch: {batch_error:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stage 23 synthetic automatic online queue measurement; requires LUX_PERF_MEDIA_ROOT"]
 async fn stage23_online_fill_missing_benchmark() -> Result<(), Box<dyn std::error::Error>> {
