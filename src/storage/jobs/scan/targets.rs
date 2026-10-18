@@ -1,5 +1,115 @@
 use super::*;
 
+const UNFINISHED_TARGETS: &str = "EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id
+      AND (t.probe_state IN ('PENDING', 'FAILED')
+        OR t.metadata_state IN ('PENDING', 'FAILED')
+        OR t.thumbnail_state IN ('PENDING', 'FAILED'))
+)";
+const UNREADY_TARGETS: &str = "EXISTS (
+    SELECT 1 FROM scan_manifests m WHERE m.job_id = sj.id
+      AND m.workflow_version IN (2, 3) AND m.discovery_format_version = 3
+      AND m.postprocessing_targets_ready = 0
+)";
+
+fn postprocessing_issues_predicate() -> String {
+    format!("sj.status = 'COMPLETED' AND sj.job_type = 'RECONCILE_LIBRARY'
+        AND sj.scan_phase = 'IDLE'
+        AND (COALESCE(sj.error, '') = 'POSTPROCESSING_FAILED' OR {UNFINISHED_TARGETS} OR {UNREADY_TARGETS})")
+}
+
+impl Database {
+    pub(crate) async fn scan_job_retry_states(
+        &self,
+        job_ids: &[String],
+    ) -> Result<HashMap<String, StoredScanJobRetryState>, StorageError> {
+        let mut states = HashMap::with_capacity(job_ids.len());
+        for chunk in job_ids.chunks(SCAN_DML_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT sj.id,
+                CASE WHEN {} THEN 1 ELSE 0 END AS issues,
+                CASE WHEN {UNFINISHED_TARGETS} THEN 1 ELSE 0 END AS unfinished,
+                CASE WHEN {UNREADY_TARGETS} THEN 1 ELSE 0 END AS unready,
+                CASE WHEN EXISTS (SELECT 1 FROM reconciliation_scan_entries r WHERE r.job_id = sj.id)
+                    THEN 1 ELSE 0 END AS legacy_work,
+                CASE WHEN EXISTS (SELECT 1 FROM scan_jobs active
+                    WHERE active.library_id = sj.library_id AND active.job_type = sj.job_type
+                      AND active.status IN ('PENDING', 'RUNNING'))
+                    THEN 1 ELSE 0 END AS active_job
+                FROM scan_jobs sj WHERE sj.id IN ({placeholders})", postprocessing_issues_predicate());
+            // Only fixed predicates and generated placeholders enter SQL; IDs are bound below.
+            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                states.insert(
+                    row.get("id"),
+                    StoredScanJobRetryState {
+                        has_postprocessing_issues: row.get::<i64, _>("issues") != 0,
+                        has_unfinished_targets: row.get::<i64, _>("unfinished") != 0,
+                        targets_need_materialization: row.get::<i64, _>("unready") != 0,
+                        has_legacy_work: row.get::<i64, _>("legacy_work") != 0,
+                        has_active_job: row.get::<i64, _>("active_job") != 0,
+                    },
+                );
+            }
+        }
+        Ok(states)
+    }
+
+    pub(crate) async fn list_admin_scan_jobs(
+        &self,
+        status: Option<&str>,
+        has_postprocessing_issues: Option<bool>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJob>, StorageError> {
+        let Some(has_issues) = has_postprocessing_issues else {
+            return self.list_scan_jobs(status, offset, limit).await;
+        };
+        let predicate = postprocessing_issues_predicate();
+        let predicate = if has_issues {
+            predicate
+        } else {
+            format!("NOT ({predicate})")
+        };
+        let sql = format!(
+            "SELECT sj.* FROM scan_jobs sj WHERE ({predicate})
+            {} ORDER BY sj.created_at DESC, sj.id DESC LIMIT ? OFFSET ?",
+            if status.is_some() {
+                "AND sj.status = ?"
+            } else {
+                ""
+            }
+        );
+        // Predicates contain only static SQL; all external values use bind parameters.
+        let mut query = self.query(sqlx::AssertSqlSafe(sql));
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+}
+
 pub(in crate::storage::repository::jobs) fn prune_sidecar_directories(
     mut directories: Vec<String>,
 ) -> Vec<String> {

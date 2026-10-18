@@ -1,4 +1,124 @@
 use super::*;
+
+#[tokio::test]
+async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    assert_scan_job_retry_diagnostics(&database, temp.path()).await
+}
+
+async fn assert_scan_job_retry_diagnostics(
+    database: &Database,
+    temp: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Diagnostics", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let cases = [
+        ("normal", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("done", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("pending", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("failed", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("unready-v2", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("unready-v3", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        (
+            "marker",
+            "RECONCILE_LIBRARY",
+            "COMPLETED",
+            "IDLE",
+            Some("POSTPROCESSING_FAILED"),
+        ),
+        (
+            "processing",
+            "RECONCILE_LIBRARY",
+            "COMPLETED",
+            "POSTPROCESSING",
+            None,
+        ),
+        ("incremental", "INCREMENTAL_SCAN", "COMPLETED", "IDLE", None),
+        ("active", "RECONCILE_LIBRARY", "RUNNING", "DISCOVERY", None),
+    ];
+    for (index, (id, kind, status, phase, error)) in cases.iter().enumerate() {
+        database.query("INSERT INTO scan_jobs (id, library_id, job_type, status, scan_phase, error, generation, created_at) VALUES (?, ?, ?, ?, ?, ?, 'generation', ?)")
+            .bind(id).bind(&library_id).bind(kind).bind(status).bind(phase).bind(error)
+            .bind(index as i64).execute(database.pool()).await?;
+    }
+    for (id, state) in [
+        ("done", "DONE"),
+        ("pending", "PENDING"),
+        ("failed", "FAILED"),
+        ("processing", "PENDING"),
+        ("incremental", "PENDING"),
+    ] {
+        database.query("INSERT INTO scan_job_targets (job_id, target_type, target_id, item_id, change_kind, metadata_state) VALUES (?, 'ITEM', 'item', 'item', 'NEW', ?)")
+            .bind(id).bind(state).execute(database.pool()).await?;
+    }
+    for (id, workflow) in [("unready-v2", 2_i64), ("unready-v3", 3_i64)] {
+        database.query("INSERT INTO scan_manifests (id, job_id, library_id, state, workflow_version, discovery_format_version, postprocessing_targets_ready) VALUES (?, ?, ?, 'POSTPROCESSING', ?, 3, 0)")
+            .bind(id)
+            .bind(id).bind(&library_id).bind(workflow).execute(database.pool()).await?;
+    }
+    let ids: Vec<String> = cases.iter().map(|case| case.0.to_owned()).collect();
+    database.reset_query_count();
+    let states = database.scan_job_retry_states(&ids).await?;
+    assert_eq!(
+        database.query_count(),
+        1,
+        "one batched query, not one per task"
+    );
+    for id in ["pending", "failed", "unready-v2", "unready-v3", "marker"] {
+        assert!(states[id].has_postprocessing_issues, "{id}");
+    }
+    for id in ["normal", "done", "processing", "incremental", "active"] {
+        assert!(!states[id].has_postprocessing_issues, "{id}");
+    }
+    assert!(states["pending"].has_unfinished_targets);
+    assert!(!states["done"].has_unfinished_targets);
+    assert!(states["unready-v3"].targets_need_materialization);
+    assert!(states["normal"].has_active_job);
+    assert!(!states["incremental"].has_active_job);
+    assert!(!states["pending"].has_legacy_work);
+    let first = database
+        .list_admin_scan_jobs(None, Some(true), 0, 2)
+        .await?;
+    assert_eq!(
+        first.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        ["marker", "unready-v3"]
+    );
+    let second = database
+        .list_admin_scan_jobs(Some("COMPLETED"), Some(true), 2, 2)
+        .await?;
+    assert_eq!(
+        second.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        ["unready-v2", "failed"]
+    );
+    let clean = database
+        .list_admin_scan_jobs(None, Some(false), 0, 20)
+        .await?;
+    assert_eq!(clean.len(), 5);
+    assert!(database.scan_job_retry_states(&[]).await?.is_empty());
+    let root_path = temp.join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = libraries
+        .add_root(library.id, root_path.to_str().ok_or("root path")?)
+        .await?
+        .root;
+    database.query("INSERT INTO reconciliation_scan_entries (job_id, library_root_id, relative_path, entry_type) VALUES ('pending', ?, '', 'DIRECTORY')")
+        .bind(root.id.to_string()).execute(database.pool()).await?;
+    let ids = vec!["pending".to_owned(); SCAN_DML_CHUNK_SIZE + 1];
+    database.reset_query_count();
+    let states = database.scan_job_retry_states(&ids).await?;
+    assert_eq!(database.query_count(), 2);
+    assert!(states["pending"].has_legacy_work);
+    Ok(())
+}
 use crate::{
     application::{
         access::MediaAccessService,
@@ -20941,5 +21061,69 @@ async fn manifest_discovery_presence_templates_preserve_path_and_generation_resu
         "legacy format queries known paths from prior manifest observations"
     );
     database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_scan_job_retry_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_scan_job_retry_diagnostics(&database, temp_dir.path())
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
     Ok(())
 }
