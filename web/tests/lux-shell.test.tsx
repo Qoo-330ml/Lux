@@ -617,6 +617,7 @@ describe("LuxShell user control", () => {
         libraryId: "library-1",
         taskType: "RECONCILE_LIBRARY",
         status: "RUNNING",
+        processedMediaCount: 3,
         processedCount: 12,
         totalCount: 40,
         currentItem: "Safe.Movie.mkv",
@@ -657,8 +658,10 @@ describe("LuxShell user control", () => {
 
     expect(container.textContent).toContain("电影库");
     expect(container.textContent).toContain("全量校验");
-    expect(container.textContent).toContain("12/40");
+    expect(container.textContent).toContain("已处理 3 部电影");
+    expect(container.textContent).not.toContain("12/40");
     expect(container.textContent).toContain("处理文件 · Safe.Movie.mkv");
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBeNull();
     expect(container.textContent).not.toContain("/media/");
     expect(container.textContent).not.toContain("token=");
   });
