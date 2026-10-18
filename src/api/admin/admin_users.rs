@@ -37,9 +37,9 @@ pub(crate) async fn admin_list_users(
         }
     };
     let sort_by = match query.sort_by.as_deref().unwrap_or("lastActivityAt") {
-        "createdAt" => crate::storage::AdminUserSortField::CreatedAt,
-        "lastLoginAt" => crate::storage::AdminUserSortField::LastLoginAt,
-        "lastActivityAt" => crate::storage::AdminUserSortField::LastActivityAt,
+        "createdAt" => crate::storage::AdminUserSortField::Created,
+        "lastLoginAt" => crate::storage::AdminUserSortField::LastLogin,
+        "lastActivityAt" => crate::storage::AdminUserSortField::LastActivity,
         _ => {
             return api_error(
                 &headers,

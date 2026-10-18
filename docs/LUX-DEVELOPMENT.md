@@ -12747,6 +12747,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：`NewStoredUser` 命名输入结构取代七个独立字段参数，SQL 和绑定顺序未变。Cargo build、fmt check 与 diff check 通过；未运行测试。
 
+#### LUX-605：整理用户列表排序字段命名
+
+范围：缩短内部排序字段枚举变体名称，保留 API 的 `createdAt`、`lastLoginAt`、`lastActivityAt` 参数和对应 SQL 排序列不变。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [x] 内部枚举不再重复 `At` 后缀，API 参数与 SQL 映射不变。
+- [x] Rust 构建、格式检查和 Clippy 全目标检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo clippy --locked --all-targets --all-features -- -D warnings`、`git diff --check`。
+
+依赖：LUX-601、LUX-604。
+
+结果（2026-10-19）：内部变体改为 `Created`、`LastLogin`、`LastActivity`，对外查询字段和数据库排序列保持原样。Cargo build、fmt check、全目标/all-features Clippy 与 diff check 通过；未运行测试。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

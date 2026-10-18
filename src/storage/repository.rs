@@ -1074,9 +1074,9 @@ pub(crate) enum AdminUserStatusFilter {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminUserSortField {
-    CreatedAt,
-    LastLoginAt,
-    LastActivityAt,
+    Created,
+    LastLogin,
+    LastActivity,
 }
 
 #[derive(Clone, Debug)]

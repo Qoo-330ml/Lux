@@ -275,9 +275,9 @@ impl Database {
             ), 0)"
         );
         let sort_column = match sort_by {
-            AdminUserSortField::CreatedAt => "created_at",
-            AdminUserSortField::LastLoginAt => "last_login_at",
-            AdminUserSortField::LastActivityAt => "last_activity_at",
+            AdminUserSortField::Created => "created_at",
+            AdminUserSortField::LastLogin => "last_login_at",
+            AdminUserSortField::LastActivity => "last_activity_at",
         };
         let direction = if descending { "DESC" } else { "ASC" };
         let list_query = format!(
