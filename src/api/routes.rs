@@ -209,10 +209,37 @@ fn case_insensitive_emby_router(router: Router, path_templates: Vec<String>) -> 
         let router = router.clone();
         let path_patterns = path_patterns.clone();
         async move {
-            normalize_emby_request_path(request.uri_mut(), &path_patterns);
+            if !is_media_detail_document_navigation(&request) {
+                normalize_emby_request_path(request.uri_mut(), &path_patterns);
+            }
             router.oneshot(request).await
         }
     }))
+}
+
+fn is_media_detail_document_navigation(request: &Request<Body>) -> bool {
+    if request.method() != Method::GET {
+        return false;
+    }
+    let Some(item_id) = request.uri().path().strip_prefix("/items/") else {
+        return false;
+    };
+    if item_id.is_empty() || item_id.contains('/') {
+        return false;
+    }
+    request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|media_range| {
+                media_range
+                    .trim()
+                    .split(';')
+                    .next()
+                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+            })
+        })
 }
 
 fn normalize_emby_request_path(uri: &mut axum::http::Uri, path_patterns: &EmbyRoutePatterns) {

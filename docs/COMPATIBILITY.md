@@ -1100,6 +1100,8 @@ U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不
 
 Lux 在根路径和 `/emby` 前缀下，对已注册 Emby 路由的静态路径片段按 ASCII 大小写不敏感匹配。动态路径参数和 query 保持原值；Lux 原生 `/api/v1` 路由不做此归一化。大小写混合的发现、密码登录和带 query token 的用户接口由 `tests/emby_system.rs` 覆盖；路径归一化单测验证动态片段与 query 保留，以及原生 API 路径不变。
 
+媒体详情页使用的 `GET /items/{itemId}` 与大小写不敏感的 Emby `Items/{itemId}` 路由相同。浏览器以 `Accept: text/html` 打开此地址时保留小写路径并交给 Web SPA fallback；JSON 请求仍归一化到 Emby 接口。回归由 `tests/web_static.rs::media_detail_navigation_is_served_as_html_while_json_uses_emby` 覆盖。
+
 这是本机自动化服务端验证，不代表 MoviePilot 插件或第三方播放器的实机链路已经复测，也不代表 FNOS 已部署此版本。
 
 ## 虚拟“合集”媒体库排序（2026-10-18）

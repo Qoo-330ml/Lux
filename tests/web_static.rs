@@ -94,3 +94,44 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     let _ = app_with_state(AppState::default());
     Ok(())
 }
+
+#[tokio::test]
+async fn media_detail_navigation_is_served_as_html_while_json_uses_emby()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app()).await });
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{address}");
+
+    let media_detail_page = client
+        .get(format!("{base_url}/items/example-item"))
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+        .send()
+        .await?;
+    assert_eq!(media_detail_page.status(), StatusCode::OK);
+    assert!(
+        media_detail_page
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html"))
+    );
+
+    let emby_item_api = client
+        .get(format!("{base_url}/items/example-item"))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await?;
+    assert_ne!(emby_item_api.status(), StatusCode::OK);
+    assert!(
+        !emby_item_api
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html"))
+    );
+
+    server.abort();
+    Ok(())
+}
