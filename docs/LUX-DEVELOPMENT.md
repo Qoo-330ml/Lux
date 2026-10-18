@@ -12572,7 +12572,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 - [ ] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
 - [x] 用户查询统一映射新增字段；邮箱为空允许重复，非空邮箱不区分大小写唯一。
-- [ ] 不改变当前登录、用户删除及公开 API 行为。
+- [x] 不改变当前登录、用户删除及公开 API 行为。
 
 依赖：LUX-593。后续模块一任务逐步接通 API、用户界面和账号生命周期。
 
@@ -12582,7 +12582,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：管理员创建用户时可选填写邮箱；详情接口返回单个用户的资料；独立资料更新接口可修改显示名称和邮箱。邮箱输入做基本格式校验并大小写归一化；修改地址清除原验证时间，不把未验证地址标记为已验证。权限更新仍沿用现有接口。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`。
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`。
 
 验收标准：
 
@@ -12591,6 +12591,8 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [ ] 邮箱格式错误返回 400，不泄漏数据库或账户敏感信息。
 
 依赖：LUX-594。
+
+结果（2026-10-19）：新增管理员单用户详情、创建时设置邮箱和独立资料更新接口；邮箱统一小写、执行基本格式检查、重复地址映射为冲突，地址变更会清除验证时间。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与 `cargo fmt --all -- --check` 通过；未运行测试。
 
 ## 29. 参考资料
 

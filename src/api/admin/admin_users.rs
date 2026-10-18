@@ -29,6 +29,96 @@ pub(crate) async fn admin_list_users(
     }
 }
 
+pub(crate) async fn admin_get_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users.find_admin_profile_by_id(&user_id.to_string()).await {
+        Ok(Some(profile)) => {
+            Json(json!({ "user": admin_user_profile_json(&profile) })).into_response()
+        }
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateUserProfileRequest {
+    pub(crate) display_name: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+pub(crate) async fn admin_update_user_profile(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateUserProfileRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users
+        .update_profile(
+            &user_id,
+            request.display_name.as_deref(),
+            request.email.as_deref().map(|email| {
+                if email.trim().is_empty() {
+                    None
+                } else {
+                    Some(email)
+                }
+            }),
+        )
+        .await
+    {
+        Ok(Some(profile)) => {
+            Json(json!({ "user": admin_user_profile_json(&profile) })).into_response()
+        }
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
 pub(crate) async fn admin_list_user_library_access(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -67,6 +157,8 @@ pub(crate) struct CreateUserRequest {
     pub(crate) display_name: String,
     pub(crate) password: String,
     #[serde(default)]
+    pub(crate) email: Option<String>,
+    #[serde(default)]
     pub(crate) is_admin: bool,
 }
 
@@ -86,11 +178,12 @@ pub(crate) async fn admin_create_user(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users
-        .create_user(
+        .create_user_with_email(
             &request.username,
             &request.display_name,
             &request.password,
             request.is_admin,
+            request.email.as_deref(),
         )
         .await
     {
@@ -113,6 +206,15 @@ pub(crate) async fn admin_create_user(
         }
         Err(error) => user_store_error(&headers, error),
     }
+}
+
+fn admin_user_profile_json(profile: &crate::auth::users::AdminUserProfile) -> Value {
+    let mut user = user_json(&profile.user);
+    user["email"] = json!(profile.email);
+    user["emailVerifiedAt"] = json!(profile.email_verified_at);
+    user["deletedAt"] = json!(profile.deleted_at);
+    user["deletionPurgeAt"] = json!(profile.deletion_purge_at);
+    user
 }
 
 #[derive(Deserialize, Default)]
@@ -227,7 +329,9 @@ pub(crate) async fn admin_delete_user(
 
 pub(crate) fn user_store_error(headers: &HeaderMap, error: UserStoreError) -> Response {
     match error {
-        UserStoreError::InvalidUsername | UserStoreError::Password(_) => api_error(
+        UserStoreError::InvalidUsername
+        | UserStoreError::InvalidEmail
+        | UserStoreError::Password(_) => api_error(
             headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
@@ -252,7 +356,7 @@ pub(crate) fn user_store_error(headers: &HeaderMap, error: UserStoreError) -> Re
             headers,
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
-            "用户名已存在",
+            "用户名或邮箱已存在",
         )
         .into_response(),
         UserStoreError::Storage(_) => api_error(
@@ -392,7 +496,13 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/users/{user_id}",
-            patch(admin_update_user).delete(admin_delete_user),
+            get(admin_get_user)
+                .patch(admin_update_user)
+                .delete(admin_delete_user),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/profile",
+            patch(admin_update_user_profile),
         )
         .route(
             "/api/v1/admin/users/{user_id}/libraries",

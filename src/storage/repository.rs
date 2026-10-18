@@ -1034,7 +1034,7 @@ pub(crate) struct StoredCatalogItemCounts {
     pub(crate) item_count: i64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredUser {
     pub(crate) id: String,
     pub(crate) username_normalized: String,

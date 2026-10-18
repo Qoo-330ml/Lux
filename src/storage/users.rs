@@ -374,21 +374,24 @@ impl Database {
         &self,
         user_id: &str,
         display_name: Option<&str>,
-        email: Option<&str>,
+        email: Option<Option<&str>>,
     ) -> Result<Option<StoredUser>, StorageError> {
+        let email_was_provided = email.is_some();
+        let email = email.flatten();
         self.query(
             "UPDATE users
              SET display_name = COALESCE(?, display_name),
-                 email = COALESCE(?, email),
+                 email = CASE WHEN ? != 0 THEN ? ELSE email END,
                  email_verified_at = CASE
-                    WHEN ? IS NOT NULL AND LOWER(COALESCE(email, '')) != LOWER(?)
+                    WHEN ? != 0 AND LOWER(COALESCE(email, '')) != LOWER(COALESCE(?, ''))
                     THEN NULL ELSE email_verified_at END,
                  updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(display_name)
+        .bind(database_flag(email_was_provided))
         .bind(email)
-        .bind(email)
+        .bind(database_flag(email_was_provided))
         .bind(email)
         .bind(user_id)
         .execute(&self.pool)
