@@ -135,7 +135,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 181);
+    assert_eq!(database.schema_version().await?, 182);
     let reconciliation_index: Option<String> = sqlx::query_scalar(
         "SELECT to_regclass('idx_media_items_nfo_collection_reference_pending')::text",
     )
@@ -703,6 +703,84 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_merged_into_partial_index_preserves_set_null_behavior()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    let index_definition: String = sqlx::query_scalar(
+        "SELECT indexdef
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_media_items_merged_into'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let normalized_index_definition = index_definition
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    let library_id = Uuid::now_v7().to_string();
+    let target_item_id = Uuid::now_v7().to_string();
+    let merged_item_id = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ($1, $2, 'MOVIE')")
+        .bind(&library_id)
+        .bind("Partial merged index test")
+        .execute(database.pool())
+        .await?;
+    for (item_id, title) in [
+        (&target_item_id, "Merge target"),
+        (&merged_item_id, "Merged source"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ($1, $2, 'MOVIE', $3, $4, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(title)
+        .bind(title.to_ascii_lowercase())
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query("UPDATE media_items SET merged_into_item_id = $1 WHERE id = $2")
+        .bind(&target_item_id)
+        .bind(&merged_item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM media_items WHERE id = $1")
+        .bind(&target_item_id)
+        .execute(database.pool())
+        .await?;
+    let remaining_merged_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE id = $1 AND merged_into_item_id IS NULL",
+    )
+    .bind(&merged_item_id)
+    .fetch_one(database.pool())
+    .await?;
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+
+    assert!(
+        normalized_index_definition.contains("where (merged_into_item_id is not null)"),
+        "expected a partial merged-into index, found: {index_definition}"
+    );
+    assert_eq!(remaining_merged_items, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
 -> Result<(), Box<dyn std::error::Error>> {
     for upgrade_from_175 in [true, false] {
@@ -809,7 +887,7 @@ async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
                     ),
                 ]
             );
-            assert_eq!(database.schema_version().await?, 181);
+            assert_eq!(database.schema_version().await?, 182);
             let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
                 "SELECT version, checksum FROM _sqlx_migrations
                  WHERE version <= $1 ORDER BY version",
@@ -938,7 +1016,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 181);
+        assert_eq!(upgraded_database.schema_version().await?, 182);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -1059,7 +1137,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert_eq!(database.schema_version().await?, 182);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2428,7 +2506,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert_eq!(database.schema_version().await?, 182);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
@@ -2797,7 +2875,7 @@ async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 181);
+    assert_eq!(version, 182);
     pool.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
