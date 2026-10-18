@@ -1,4 +1,5 @@
 import type {
+  AccountProfile,
   AuthSession,
   AdminAuditEvent,
   AdminDashboard,
@@ -315,6 +316,17 @@ export class LuxApiClient {
 
   me() {
     return this.request<AuthSession>("/api/v1/auth/me");
+  }
+
+  accountProfile() {
+    return this.request<{ user: AccountProfile }>("/api/v1/auth/profile");
+  }
+
+  updateAccountProfile(input: { displayName: string; email: string }) {
+    return this.request<{ user: AccountProfile }>("/api/v1/auth/profile", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
   }
 
   userSettings() {

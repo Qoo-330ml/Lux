@@ -56,6 +56,11 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
+export type AccountProfile = LuxUser & {
+  email?: string | null;
+  emailVerifiedAt?: number | null;
+};
+
 export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED" | `PLUGIN:${string}`;
 
 export type LoginBackgroundItem = {

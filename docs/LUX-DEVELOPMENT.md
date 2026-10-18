@@ -12660,6 +12660,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：Lux 管理删除改为回收站，新增恢复和提前彻底删除；Emby 管理删除同步软删除。禁用/删除事务返回被停止的服务端 HLS ID，并在提交后终止进程；彻底删除会清理头像文件。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和格式检查通过，未运行测试。
 
+#### LUX-600：用户个人资料编辑
+
+范围：为登录用户提供受 CSRF 保护的资料读取和更新接口，并在账户页保存自己的显示名称和邮箱，展示邮箱验证状态。修改邮箱时沿用存储层清除验证时间的行为；邮件发送和邮箱验证流程留给注册邮件任务。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、`web/src/features/account/AccountPage.tsx`。
+
+验收标准：
+
+- [x] 读取和修改仅作用于当前登录账号；修改接口要求有效会话和 CSRF。
+- [x] 用户可保存显示名称、邮箱，邮箱变更后显示未验证状态；非法或重复邮箱返回明确错误。
+- [x] 页面同步更新当前会话显示名称，不影响头像和密码修改流程。
+- [x] Web 构建通过。
+
+依赖：LUX-594、LUX-595。
+
+结果（2026-10-19）：新增当前登录用户的个人资料读取/更新 API，并在账户页保存显示名称和邮箱；邮箱更新由既有存储逻辑清除验证时间，当前显示未验证状态。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、Rust 格式检查和 `pnpm --dir web build` 通过。邮件验证发送尚未接通，未运行测试。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
