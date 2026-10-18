@@ -1174,6 +1174,6 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 | 完整 Web | `pnpm --dir web test` 的静态阶段 144 通过、4 失败，因此未进入该命令的 Vitest 阶段；独立完整 Vitest 为 662 通过、4 失败（首页预取、媒体库卡片 2 项、详情轮询）。相关用户管理定向回归通过。 |
 | Rust 构建、格式、Clippy | `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。 |
 | 完整 Rust | `cargo test --locked --all-targets` 在库测试结束，972 通过、5 失败、25 忽略；集成 targets 未继续执行。3 个元数据调度失败与先前文档记录的干净基线 `842f9870` 失败相同；另 2 个回环超时项在单独运行时通过，其中 HTTP 回环测试需设置 `NO_PROXY/no_proxy=127.0.0.1,localhost`。完整门禁仍未通过。 |
-| 浏览器与部署 | 本机未配置 Chrome DevTools MCP，未取得真实浏览器 DOM、网络和截图证据；未推送或部署，未验证 FNOS/x86_64。 |
+| 浏览器与部署 | 使用隔离 Chromium/Playwright、临时 SQLite 数据库和独立本地端口实测用户列表搜索、详情、全局保留设置、创建普通账号、移入回收站及恢复；模块六呈现无操作控件的占位。截图：`output/playwright/user-management-list.png`。控制台 0 warning；7 个资源错误仅为初始化前未登录的 `/auth/me` 401 与无头像账户的头像 API 404，通用头像回退可见；未见脚本异常。未完整审计网络面板；未推送或部署，未验证 FNOS/x86_64。 |
 
-因此阶段 1 的定向实现和构建检查已记录，但完整项目门禁及真实浏览器验证未通过/未完成。阶段 2 不自动开始，等待项目所有者确认阶段结果。
+因此阶段 1 的定向实现、构建检查和临时数据库上的真实浏览器交互验证已记录；完整项目门禁仍未通过，网络面板也未完整审阅。阶段 2 不自动开始，等待项目所有者确认阶段结果。
