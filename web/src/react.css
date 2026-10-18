@@ -205,7 +205,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-hero-copy-animated { animation: lux-hero-copy-in .38s ease both; }
 @keyframes lux-hero-copy-in { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: translateY(0); } }
 .lux-eyebrow { display: inline-block; color: var(--lux-muted); font-size: .68rem; font-weight: 650; letter-spacing: .18em; text-transform: uppercase; }
-.lux-hero-title { --lux-hero-title-line-height: .94em; max-width: 700px; min-height: calc(3 * var(--lux-hero-title-line-height)); margin: 17px 0 10px; color: #fff; font-size: clamp(2.75rem, 5.5vw, 5rem); font-weight: 700; letter-spacing: -.075em; line-height: var(--lux-hero-title-line-height); text-shadow: 0 8px 28px rgba(0,0,0,.48); }
+.lux-hero-title { --lux-hero-title-line-height: .94em; max-width: 700px; margin: 17px 0 10px; color: #fff; font-size: clamp(2.75rem, 5.5vw, 5rem); font-weight: 700; letter-spacing: -.075em; line-height: var(--lux-hero-title-line-height); text-shadow: 0 8px 28px rgba(0,0,0,.48); }
 .lux-hero-title.has-logo { min-height: 0; }
 .lux-hero-title-text { display: -webkit-box; max-width: 700px; max-height: calc(3 * var(--lux-hero-title-line-height)); overflow: hidden; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow-wrap: anywhere; text-wrap: balance; font-family: var(--lux-editorial-font-family); letter-spacing: 0; }
 .lux-hero-title--compact { --lux-hero-title-line-height: 1em; font-size: clamp(2.35rem, 4.4vw, 3.9rem); }
@@ -466,7 +466,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-mobile-header { display: none; }
 .lux-detail-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .58; filter: saturate(.78) brightness(.72) blur(1px); transform: scale(1.02); }
 .lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
-.lux-detail-content { width: 92%; min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
+.lux-detail-content { position: relative; width: 92%; min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 .lux-detail-sections { display: flex; flex-direction: column; }
 .lux-detail-page .lux-media-cast-heading h2,
 .lux-detail-page .lux-media-stills-heading h2,
@@ -542,6 +542,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-tagline { margin: 0; display: flex; align-items: baseline; justify-content: flex-start; gap: 10px; text-align: left; font-family: var(--lux-editorial-font-family); font-size: 1.42rem; font-weight: 700; line-height: 1.6; letter-spacing: .02em; color: rgba(255,255,255,.92); }
 .lux-detail-tagline .lux-tagline-quote { font-family: "Lux Libre Bodoni", serif; font-size: 1.85rem; font-weight: 300; color: #fbbf24; opacity: .85; line-height: 1; user-select: none; }
 .lux-detail-tagline .lux-tagline-text { font-family: var(--lux-editorial-font-family); font-style: normal; }
+@media (min-width: 1200px) {
+  .lux-detail-tagline-wrap { position: absolute; z-index: 1; top: calc(var(--lux-page-top) + 16px); right: 0; display: flex; align-items: center; width: min(38%, 700px); min-height: 120px; margin: 0; padding: 12px 0; }
+}
 .lux-section-heading-sub { font-family: var(--lux-editorial-font-family); font-size: .74rem; font-weight: 300; letter-spacing: .14em; text-transform: uppercase; color: rgba(255,255,255,.52); font-style: normal; line-height: 1; }
 .lux-heading-lead { display: inline-flex; align-items: baseline; gap: 10px; }
 .lux-detail-sections .lux-section-heading h2,

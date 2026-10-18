@@ -11365,6 +11365,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 更新实现与验证（2026-10-15）：`MediaNfoPanel.tsx` 移除外围卡片并收紧分区留白；`react.css` 移除对应边框样式、将 tagline 调至 `1rem`，并去掉官方网站上方短线。新增的渲染回归和布局检查分别为 33/33、31/31；冻结锁文件安装和 Web production build 通过，`git diff --check` 通过。Web 全量检查仍有不相关失败：静态 Node 检查 137/139（首页卡片尺寸、触屏操作规则 2 项）；完整 Vitest 596/600（首页继续观看评分、首页媒体库焦点预取、媒体库卡片预取与合集链接 4 项）。
 
+布局更新（2026-10-18）：宽屏媒体详情页将 tagline 放到主视觉右上方的留白区域；窄屏继续沿用详情内容流中的位置。
+
 #### LUX-537：对齐 Emby 鉴权凭据优先级与重复 query 行为
 
 范围：根据官方 Emby 4.10.1.0 原生 ARM64 临时实例实测，在 Emby 路由入口统一选择凭据，避免不同令牌 query 名称映射到同一 Serde 字段而返回 400。标准优先级为 HTTP `X-Emby-Token`、query `X-Emby-Token`、authorization 的 `Token`、HTTP `X-MediaBrowser-Token`、query `api_key`；非空无效高优先级凭据不回退。Lux 已有扩展仅在标准来源均为空时回退。保留现有 principal、管理员权限、媒体库 ACL 和签名播放票据规则；不改变原生 `/api/v1`。
