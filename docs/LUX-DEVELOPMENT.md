@@ -12904,6 +12904,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：头像上传测试独立 mock `/api/v1/auth/profile` 查询返回，不再复用头像 PUT 的 `avatarUrl` 响应；账户设置 Vitest 23/23 通过。
 
+#### LUX-614：为用户播放策略建立持久化字段
+
+范围：为用户增加播放许可、同时播放上限、封装转换、音频转码和视频转码策略字段。已存在账号迁移后保持允许播放与转码、并发不限（`0`）；新账号默认 2 路及管理员读写界面由后续任务实现。本任务不改变播放准入行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0185_user_playback_policy.sql`、`migrations-postgres/0185_user_playback_policy.sql`、`src/storage/repository_tests.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL migration 均增加 `can_play`、`max_simultaneous_playbacks`、`allow_remux`、`allow_audio_transcode`、`allow_video_transcode`，包含布尔值与非负并发上限约束。
+- [x] 从空 SQLite 数据库启动仍可完成全部 migration。
+- [x] 默认值保留既有账号的播放/转码行为，并将并发上限初始化为不限。
+- [x] 新增 SQLite 与 PostgreSQL 引导回归覆盖所有字段默认值。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_playback_policy_migration_defaults`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database --no-run`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-593、LUX-599、LUX-602、阶段门确认。
+
+结果（2026-10-19）：SQLite 与 PostgreSQL 增加五项策略列；旧账号默认允许播放和转码、并发不限。SQLite 回归验证从空库启动及旧账号行经 migration 后的值，定向测试 1/1 通过。PostgreSQL bootstrap 回归已补充，但本机 `127.0.0.1:55432` 未监听，本次未执行该忽略测试；未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -135,7 +135,21 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 182);
+    assert_eq!(database.schema_version().await?, 185);
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    let playback_policy: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode
+         FROM users WHERE id = 'playback-policy-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(playback_policy, (1, 0, 1, 1, 1));
     let reconciliation_index: Option<String> = sqlx::query_scalar(
         "SELECT to_regclass('idx_media_items_nfo_collection_reference_pending')::text",
     )

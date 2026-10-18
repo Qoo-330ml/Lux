@@ -13851,6 +13851,73 @@ async fn configured_user_deletion_grace_period_sets_purge_deadline()
 }
 
 #[tokio::test]
+async fn user_playback_policy_migration_defaults_keep_existing_playback_compatible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    let policy: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode
+         FROM users WHERE id = 'playback-policy-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    assert_eq!(policy, (1, 0, 1, 1, 1));
+
+    let legacy_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE users (id TEXT PRIMARY KEY);
+         INSERT INTO users (id) VALUES ('legacy-playback-policy-user');",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0185_user_playback_policy.sql"
+    ))
+    .execute(&legacy_pool)
+    .await?;
+    let migrated_policy: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode
+         FROM users WHERE id = 'legacy-playback-policy-user'",
+    )
+    .fetch_one(&legacy_pool)
+    .await?;
+    assert_eq!(migrated_policy, (1, 0, 1, 1, 1));
+    assert!(
+        sqlx::query(
+            "UPDATE users SET max_simultaneous_playbacks = -1
+         WHERE id = 'legacy-playback-policy-user'",
+        )
+        .execute(&legacy_pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE users SET can_play = 2 WHERE id = 'legacy-playback-policy-user'",)
+            .execute(&legacy_pool)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn uninstalling_a_plugin_batches_library_scraper_rewrites()
 -> Result<(), Box<dyn std::error::Error>> {
     const REMOVED_PLUGIN: &str = "org.lux.removed-scraper";
