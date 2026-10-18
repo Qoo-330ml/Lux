@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
-const USER_DELETION_GRACE_SECONDS: i64 = 7 * 24 * 60 * 60;
+const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
+const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
+const SECONDS_PER_DAY: i64 = 86_400;
 
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -846,6 +848,21 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let configured_grace_days: Option<String> = self
+            .query_scalar(
+                "SELECT value FROM server_settings
+                 WHERE key = 'user_deletion_grace_days'",
+            )
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let grace_days = configured_grace_days
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|days| (1..=MAX_USER_DELETION_GRACE_DAYS).contains(days))
+            .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS);
         let hls_session_rows = self
             .query(
                 "SELECT id FROM web_playback_sessions
@@ -871,7 +888,7 @@ impl Database {
         )
         .bind(database_flag(was_disabled))
         .bind(now)
-        .bind(now.saturating_add(USER_DELETION_GRACE_SECONDS))
+        .bind(now.saturating_add(grace_days.saturating_mul(SECONDS_PER_DAY)))
         .bind(now)
         .bind(user_id)
         .execute(&mut *transaction)

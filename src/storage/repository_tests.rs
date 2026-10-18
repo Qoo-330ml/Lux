@@ -13776,6 +13776,81 @@ async fn server_settings_are_written_with_one_upsert() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn configured_user_deletion_grace_period_sets_purge_deadline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    for user_id in [
+        "default-retention-user",
+        "custom-retention-user",
+        "invalid-retention-user",
+    ] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash
+             ) VALUES (?, ?, ?, 'test')",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .soft_delete_user("default-retention-user")
+        .await?
+        .expect("default retention user is deleted");
+    let default_deadline: (i64, i64) =
+        sqlx::query_as("SELECT deleted_at, deletion_purge_at FROM users WHERE id = ?")
+            .bind("default-retention-user")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(default_deadline.1 - default_deadline.0, 7 * 86_400);
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('user_deletion_grace_days', '30')",
+    )
+    .execute(database.pool())
+    .await?;
+    database
+        .soft_delete_user("custom-retention-user")
+        .await?
+        .expect("custom retention user is deleted");
+    let custom_deadline: (i64, i64) =
+        sqlx::query_as("SELECT deleted_at, deletion_purge_at FROM users WHERE id = ?")
+            .bind("custom-retention-user")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(custom_deadline.1 - custom_deadline.0, 30 * 86_400);
+
+    sqlx::query(
+        "UPDATE server_settings SET value = '0'
+         WHERE key = 'user_deletion_grace_days'",
+    )
+    .execute(database.pool())
+    .await?;
+    database
+        .soft_delete_user("invalid-retention-user")
+        .await?
+        .expect("invalid retention user is deleted");
+    let invalid_deadline: (i64, i64) =
+        sqlx::query_as("SELECT deleted_at, deletion_purge_at FROM users WHERE id = ?")
+            .bind("invalid-retention-user")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(invalid_deadline.1 - invalid_deadline.0, 7 * 86_400);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn uninstalling_a_plugin_batches_library_scraper_rewrites()
 -> Result<(), Box<dyn std::error::Error>> {
     const REMOVED_PLUGIN: &str = "org.lux.removed-scraper";

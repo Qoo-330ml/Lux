@@ -12836,6 +12836,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：更新软删除断言并为用户列表测试补齐 MemoryRouter；三个相关文件组 13/13 用例通过。完整 Web 门禁在阶段验收执行。
 
+#### LUX-610：读取可配置的用户删除宽限期
+
+范围：软删除用户时从 `server_settings` 读取删除宽限天数，并将清理期限固化到该用户记录。默认值保持 7 天；已有回收站账号不因后续配置修改而改变其清理时间。不新增迁移或修改已经记录的期限。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 未配置时软删除仍保留 7 天。
+- [x] 配置其他有效天数后，新删除账号的计划清理时间按该值计算。
+- [x] 非法或超范围存储值不能导致立即清理。
+- [x] SQLite 存储回归及 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib configured_user_deletion_grace_period`、`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-597、LUX-599。
+
+结果（2026-10-19）：软删除在事务中读取 `user_deletion_grace_days`，仅接受 1–3650 天，缺失或非法值安全回退 7 天；新期限在删除时固化，配置修改不重算回收站记录。新增存储回归覆盖默认 7 天、自定义 30 天和非法 0 值；定向 Cargo 测试 1/1、fmt 和 diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
