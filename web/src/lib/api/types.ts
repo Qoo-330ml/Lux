@@ -1094,6 +1094,7 @@ export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
+  userDeletionGraceDays?: number;
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;

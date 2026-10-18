@@ -263,11 +263,81 @@ export function AdminUserSettingsPage() {
           </button>
         ))}
       </nav>
-      <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-settings-title">
-        <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
-        <div><span className="lux-admin-eyebrow">{section.module}</span><h2 id="lux-admin-user-settings-title">{section.label}</h2><p>全局设置结构已预留，配置和保存能力将在对应任务中实现。</p></div>
-      </section>
+      {section.id === "retention" ? <AdminUserRetentionSettings /> : (
+        <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-settings-title">
+          <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
+          <div><span className="lux-admin-eyebrow">{section.module}</span><h2 id="lux-admin-user-settings-title">{section.label}</h2><p>全局设置结构已预留，配置和保存能力将在对应任务中实现。</p></div>
+        </section>
+      )}
     </div>
+  );
+}
+
+function AdminUserRetentionSettings() {
+  const queryClient = useQueryClient();
+  const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const [graceDays, setGraceDays] = useState("7");
+  const [notice, setNotice] = useState("");
+  const update = useMutation({
+    mutationFn: (days: number) => api.updateAdminSettings({ userDeletionGraceDays: days }),
+    onSuccess: (updated, days) => {
+      const savedDays = updated.userDeletionGraceDays ?? days;
+      queryClient.setQueryData(queryKeys.adminSettings, { ...updated, userDeletionGraceDays: savedDays });
+      setGraceDays(String(savedDays));
+      setNotice("删除宽限期已保存。");
+    },
+    onError: (error) => setNotice(error.message || "保存失败，请重试。"),
+  });
+  useEffect(() => {
+    setGraceDays(String(settings.data?.userDeletionGraceDays ?? 7));
+  }, [settings.data?.userDeletionGraceDays]);
+
+  if (settings.isPending) return <p className="lux-admin-muted" role="status">正在读取删除保留设置…</p>;
+  if (settings.error) return <p className="lux-error-copy" role="alert">读取删除保留设置失败：{settings.error.message}</p>;
+
+  const parsedDays = Number(graceDays);
+  const validDays = Number.isInteger(parsedDays) && parsedDays >= 1 && parsedDays <= 3_650;
+  const hasChanges = parsedDays !== (settings.data.userDeletionGraceDays ?? 7);
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!validDays || !hasChanges || update.isPending) return;
+    setNotice("");
+    update.mutate(parsedDays);
+  }
+
+  return (
+    <>
+      <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-retention-title">
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-retention-title">删除账号保留期限</h2></div></div>
+        <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
+          <label>
+            移入回收站后保留天数
+            <input
+              type="number"
+              min={1}
+              max={3_650}
+              step={1}
+              value={graceDays}
+              aria-label="删除账号保留天数"
+              onChange={(event) => { setGraceDays(event.target.value); setNotice(""); }}
+              disabled={update.isPending}
+            />
+          </label>
+          <p className="lux-admin-muted">范围为 1–3650 天。新值只影响之后移入回收站的账号；已在回收站中的账号仍按原计划清理时间处理。</p>
+          <div className="lux-admin-user-profile-actions">
+            <button className="lux-button lux-button-primary" type="submit" disabled={!validDays || !hasChanges || update.isPending}>
+              {update.isPending ? "保存中…" : "保存保留期限"}
+            </button>
+            {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
+          </div>
+        </form>
+      </section>
+      <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-activity-retention-title">
+        <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
+        <div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-user-activity-retention-title">活动记录保留</h2><p>活动记录保留将在模块七接入。</p></div>
+      </section>
+    </>
   );
 }
 

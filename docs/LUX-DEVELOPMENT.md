@@ -12872,6 +12872,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：管理员设置 GET/PATCH 增加 `userDeletionGraceDays`，默认 7 天，允许 1–3650 天；缺省保持原值，范围外返回明确 400，审计事件记录新值。接口回归覆盖默认、保存 30 天、拒绝 0/3651 且拒绝后值不变；`admin_dashboard` 1/1、fmt 和 diff check 通过。回环测试设置 `NO_PROXY/no_proxy=127.0.0.1,localhost`。
 
+#### LUX-612：在用户全局设置页维护删除宽限期
+
+范围：将“删除与活动保留”设置页中的用户删除宽限期接入既有管理员设置 API。保存后更新界面缓存；清楚说明新值只作用于后续移入回收站的账号，活动记录保留继续显示未实施状态。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/lib/api/types.ts`、`web/tests/admin-user-retention-settings.test.tsx`。
+
+验收标准：
+
+- [x] 默认或缺省值显示 7 天，管理员可配置 1–3650 天。
+- [x] 无效值不能提交；保存成功后更新查询缓存并显示成功状态，失败时保留可重试界面。
+- [x] 已在回收站的用户期限不因修改设置而改变，活动记录保留仍为占位。
+- [x] 用户管理设置回归与 Web 构建通过。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-retention-settings.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+结果（2026-10-19）：用户全局设置“删除与活动保留”页接入删除宽限天数表单，支持 1–3650 天；缺省显示 7 天，失败保留可重试表单并显示错误，成功同步管理员设置缓存。页面说明修改不重算现有账号期限，活动记录保留继续占位。新增 3 项回归通过，Web 构建通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
