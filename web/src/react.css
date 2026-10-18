@@ -255,6 +255,25 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-library-cover, .lux-library-cover-full { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .45s var(--lux-ease), filter .3s ease; }
 .lux-library-card:hover .lux-library-cover { filter: brightness(.78); transform: scale(1.045); }
 .lux-library-icon { display: grid; place-items: center; width: 100%; height: 100%; color: rgba(255,255,255,.78); font-size: 2rem; }
+.lux-global-collection-library-cover { position: absolute; inset: 0; display: block; overflow: hidden; background: linear-gradient(110deg, #252329 0%, #39302d 46%, #17171b 100%); }
+.lux-global-collection-library-cover::before { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(15,15,19,.22) 0%, rgba(15,15,19,.12) 42%, transparent 72%), radial-gradient(circle at 24% 50%, rgba(151,91,59,.34), transparent 52%); content: ""; }
+.lux-global-collection-library-cover-title { position: absolute; z-index: 3; top: 50%; left: 6%; display: grid; gap: 5px; color: #fff; text-shadow: 0 2px 8px rgba(0,0,0,.45); transform: translateY(-50%); }
+.lux-global-collection-library-cover-title strong { font-size: clamp(1.05rem, 1.35vw, 1.55rem); font-weight: 650; letter-spacing: -.055em; line-height: 1; }
+.lux-global-collection-library-cover-title > span { display: inline-flex; align-items: center; gap: 5px; color: rgba(255,255,255,.9); font-family: Georgia, "Times New Roman", serif; font-size: .62rem; font-style: italic; line-height: 1; }
+.lux-global-collection-library-cover-title > span::before { width: 3px; height: 12px; border-radius: 2px; background: #c47748; content: ""; }
+.lux-global-collection-library-cover-posters { position: absolute; inset: 0 -5% 0 31%; }
+.lux-global-collection-library-poster { position: absolute; top: 50%; display: block; width: 35%; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid rgba(255,255,255,.65); border-radius: 3px; box-shadow: 0 6px 16px rgba(0,0,0,.38); object-fit: cover; }
+.lux-global-collection-library-poster.is-0 { z-index: 1; left: 0; transform: translateY(-48%) rotate(-22deg); }
+.lux-global-collection-library-poster.is-1 { z-index: 2; left: 14%; transform: translateY(-54%) rotate(-13deg); }
+.lux-global-collection-library-poster.is-2 { z-index: 3; left: 29%; transform: translateY(-48%) rotate(-3deg); }
+.lux-global-collection-library-poster.is-3 { z-index: 2; left: 45%; transform: translateY(-54%) rotate(9deg); }
+.lux-global-collection-library-poster.is-4 { z-index: 1; left: 60%; transform: translateY(-48%) rotate(19deg); }
+.lux-global-collection-library-poster.is-fallback { border-color: rgba(255,255,255,.46); background: linear-gradient(145deg, #688778 0%, #253b38 50%, #172226 100%); }
+.lux-global-collection-library-poster.is-fallback::after { position: absolute; inset: 8% 8% 8% 12%; border: 1px solid rgba(255,255,255,.42); background: linear-gradient(160deg, rgba(242,198,120,.64), transparent 35%), linear-gradient(28deg, transparent 45%, rgba(255,255,255,.22) 46%, transparent 48%); content: ""; }
+.lux-global-collection-library-poster.is-1.is-fallback { background: linear-gradient(145deg, #9b6047, #482f37 52%, #22242d); }
+.lux-global-collection-library-poster.is-2.is-fallback { background: linear-gradient(145deg, #738b8b, #374353 52%, #201f2c); }
+.lux-global-collection-library-poster.is-3.is-fallback { background: linear-gradient(145deg, #bb8d58, #634447 52%, #282733); }
+.lux-global-collection-library-poster.is-4.is-fallback { background: linear-gradient(145deg, #728c65, #3c554d 52%, #1e2a31); }
 .lux-library-card-copy { display: block; min-width: 0; padding: var(--lux-card-copy-padding); }
 .lux-library-card strong { display: block; overflow: hidden; color: rgba(255,255,255,.9); font-size: .86rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-library-card-menu-trigger { position: absolute; z-index: 2; right: 8px; bottom: 8px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; color: #fff; background: transparent; box-shadow: none; opacity: 0; pointer-events: none; transform: translateY(3px); transition: opacity .2s ease, transform .2s var(--lux-ease); }

@@ -5,6 +5,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
+import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, LuxUser, MediaItem } from "../../lib/api/types";
 import { readAccountSettings } from "../account/account-settings";
 import {
@@ -108,7 +109,12 @@ export function HomePage({ user }: { user: LuxUser }) {
                   </div>
                 ) : null}
                 {librariesQuery.data && libraries.length ? libraries.map((library) => (
-                  <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />
+                  <LibraryCard
+                    key={library.id}
+                    library={library}
+                    coverItems={library.id === GLOBAL_COLLECTION_LIBRARY_ID ? latestItemsByLibraryId.get(library.id) : undefined}
+                    onPrefetch={() => void prefetchLibraryPage(queryClient, library)}
+                  />
                 )) : null}
                 {librariesQuery.data && !libraries.length ? <EmptyLibraries /> : null}
               </div>

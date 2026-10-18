@@ -202,7 +202,7 @@ export function positionLibraryActionMenu(
   return { left, top };
 }
 
-export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefetch?: () => void }) {
+export function LibraryCard({ library, coverItems, onPrefetch }: { library: Library; coverItems?: MediaItem[]; onPrefetch?: () => void }) {
   const isSystemCollection = library.id === GLOBAL_COLLECTION_LIBRARY_ID;
   const cardRef = useRef<HTMLElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
@@ -271,7 +271,7 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
       <div className="lux-library-card-cover-shell">
         <Link className="lux-library-card-cover-link" to={`/libraries/${library.id}`} onMouseEnter={isSystemCollection ? undefined : onPrefetch} onFocus={isSystemCollection ? undefined : onPrefetch}>
           <span className="lux-library-card-cover">
-            {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : <span className="lux-library-icon" aria-hidden="true">{isSystemCollection ? "▤" : library.kind === "SERIES" ? "▣" : "◈"}</span>}
+            {library.coverImageUrl ? <img className="lux-library-cover lux-library-cover-full" src={library.coverImageUrl} alt="" loading="lazy" decoding="async" /> : isSystemCollection ? <GlobalCollectionLibraryCover items={coverItems ?? []} /> : <span className="lux-library-icon" aria-hidden="true">{library.kind === "SERIES" ? "▣" : "◈"}</span>}
           </span>
         </Link>
         {!isSystemCollection ? <button
@@ -317,5 +317,35 @@ export function LibraryCard({ library, onPrefetch }: { library: Library; onPrefe
         document.body,
       ) : null}
     </article>
+  );
+}
+
+function GlobalCollectionLibraryCover({ items }: { items: MediaItem[] }) {
+  const posters = items
+    .map((item) => ({ id: item.id, src: imageUrl(item) }))
+    .filter((poster): poster is { id: string; src: string } => Boolean(poster.src))
+    .slice(0, 5);
+
+  return (
+    <span className="lux-global-collection-library-cover" aria-hidden="true">
+      <span className="lux-global-collection-library-cover-title">
+        <strong>合集</strong>
+        <span>Collections</span>
+      </span>
+      <span className="lux-global-collection-library-cover-posters">
+        {posters.length ? posters.map((poster, index) => (
+          <img
+            key={poster.id}
+            className={`lux-global-collection-library-poster is-${index}`}
+            src={poster.src}
+            alt=""
+            loading="lazy"
+            decoding="async"
+          />
+        )) : Array.from({ length: 5 }, (_, index) => (
+          <span key={index} className={`lux-global-collection-library-poster is-${index} is-fallback`} />
+        ))}
+      </span>
+    </span>
   );
 }
