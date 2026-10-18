@@ -12373,7 +12373,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：全局后台活动浮层对全量扫描显示已处理的电影或整部剧数量，并使用不确定进度条；不显示发现到的文件总数或百分比。其他活动保持原行为。
 
-预计文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/activity/ScanActivityPopover.tsx`、`web/tests/scan-activity.test.tsx`。
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、`web/tests/lux-shell.test.tsx`。
 
 验收：
 
@@ -12383,7 +12383,9 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-581。先补活动浮层回归，再修改计数标签和进度显示。
 
-结果（2026-10-18）：全局活动浮层对全量电影库显示电影数、剧集库显示整部剧数，并使用无百分比的不确定进度；增量扫描和其他后台任务继续按文件进度显示。旧任务没有可靠媒体计数时显示“媒体进度不可用”。`pnpm --dir web exec vitest run tests/scan-activity.test.tsx` 通过（6/6）。
+结果（2026-10-18）：全局活动浮层对全量电影库显示电影数、剧集库显示整部剧数，并使用无百分比的不确定进度；增量扫描和其他后台任务继续按文件进度显示。旧任务没有可靠媒体计数时显示“媒体进度不可用”。活动浮层回归通过（6/6），Shell 集成回归通过（1/1），Web build 通过。
+
+完成门禁（2026-10-18）：Rust 格式、build 和 Clippy 通过；扫描计数与管理员 API 定向测试通过。`cargo test --locked --all-targets` 在既有的 NFO actor-credit 回归失败，且该失败已在任务基线 `62c1d2ac` 上复现。完整 Web Vitest 为 651 通过、4 个无关失败；`pnpm --dir web test` 还在静态布局阶段因 3 条首页/触屏 CSS 断言失败而未启动 Vitest。
 
 ## 29. 参考资料
 
