@@ -28,17 +28,21 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!("SELECT sj.id,
+            let sql = format!(
+                "SELECT sj.id,
                 CASE WHEN {} THEN 1 ELSE 0 END AS issues,
                 CASE WHEN {UNFINISHED_TARGETS} THEN 1 ELSE 0 END AS unfinished,
                 CASE WHEN {UNREADY_TARGETS} THEN 1 ELSE 0 END AS unready,
-                CASE WHEN EXISTS (SELECT 1 FROM reconciliation_scan_entries r WHERE r.job_id = sj.id)
+                CASE WHEN EXISTS (SELECT 1 FROM reconciliation_scan_entries r
+                    WHERE r.job_id = sj.id AND r.status = 'PENDING')
                     THEN 1 ELSE 0 END AS legacy_work,
                 CASE WHEN EXISTS (SELECT 1 FROM scan_jobs active
                     WHERE active.library_id = sj.library_id AND active.job_type = sj.job_type
                       AND active.status IN ('PENDING', 'RUNNING'))
                     THEN 1 ELSE 0 END AS active_job
-                FROM scan_jobs sj WHERE sj.id IN ({placeholders})", postprocessing_issues_predicate());
+                FROM scan_jobs sj WHERE sj.id IN ({placeholders})",
+                postprocessing_issues_predicate()
+            );
             // Only fixed predicates and generated placeholders enter SQL; IDs are bound below.
             let mut query = self.query(sqlx::AssertSqlSafe(sql));
             for id in chunk {
@@ -1339,44 +1343,6 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn has_scan_job_targets(&self, job_id: &str) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM scan_job_targets WHERE job_id = ?
-             ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn has_unready_scan_manifest_postprocessing_targets(
-        &self,
-        job_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM scan_manifests
-                 WHERE job_id = ? AND workflow_version IN (2, 3)
-                   AND discovery_format_version = 3
-                   AND postprocessing_targets_ready = 0
-             ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
