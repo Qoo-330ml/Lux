@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::UserPlaybackPolicy;
 
 #[tokio::test]
 async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
@@ -13913,6 +13914,97 @@ async fn user_playback_policy_migration_defaults_keep_existing_playback_compatib
             .execute(&legacy_pool)
             .await
             .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_playback_policy_defaults_to_two_and_updates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    assert!(
+        database
+            .insert_initial_user(
+                "initial-playback-policy-user",
+                "initial-playback-policy-user",
+                "Initial Playback Policy",
+                "test",
+            )
+            .await?
+    );
+    database
+        .insert_user(
+            "new-playback-policy-user",
+            "new-playback-policy-user",
+            "New Playback Policy",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+
+    let default_policy = UserPlaybackPolicy {
+        can_play: true,
+        max_simultaneous_playbacks: 2,
+        allow_remux: true,
+        allow_audio_transcode: true,
+        allow_video_transcode: true,
+    };
+    for user_id in ["initial-playback-policy-user", "new-playback-policy-user"] {
+        assert_eq!(
+            database.get_user_playback_policy(user_id).await?,
+            Some(default_policy)
+        );
+    }
+
+    let updated_policy = UserPlaybackPolicy {
+        can_play: false,
+        max_simultaneous_playbacks: 1,
+        allow_remux: false,
+        allow_audio_transcode: false,
+        allow_video_transcode: true,
+    };
+    assert!(
+        database
+            .update_user_playback_policy("new-playback-policy-user", updated_policy)
+            .await?
+    );
+    assert_eq!(
+        database
+            .get_user_playback_policy("new-playback-policy-user")
+            .await?,
+        Some(updated_policy)
+    );
+
+    let invalid_policy = UserPlaybackPolicy {
+        max_simultaneous_playbacks: -1,
+        ..updated_policy
+    };
+    assert!(
+        database
+            .update_user_playback_policy("new-playback-policy-user", invalid_policy)
+            .await
+            .is_err()
+    );
+    assert!(
+        !database
+            .update_user_playback_policy("missing-playback-policy-user", updated_policy)
+            .await?
+    );
+    database
+        .soft_delete_user("new-playback-policy-user")
+        .await?
+        .ok_or("user soft delete should succeed")?;
+    assert!(
+        !database
+            .update_user_playback_policy("new-playback-policy-user", updated_policy)
+            .await?
     );
     Ok(())
 }

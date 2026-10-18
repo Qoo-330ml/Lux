@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::UserPlaybackPolicy;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 
 use std::time::{Duration, Instant};
@@ -48,9 +49,9 @@ impl Database {
             .query(
                 "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
-                is_admin, can_manage_server
+                is_admin, can_manage_server, max_simultaneous_playbacks
             )
-            SELECT ?, ?, ?, ?, 1, 1
+            SELECT ?, ?, ?, ?, 1, 1, 2
             WHERE NOT EXISTS (SELECT 1 FROM users)",
             )
             .bind(id)
@@ -102,8 +103,9 @@ impl Database {
         self.query(
             "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
-                is_admin, can_manage_server, has_password, email
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                is_admin, can_manage_server, has_password, email,
+                max_simultaneous_playbacks
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2)",
         )
         .bind(user.id)
         .bind(user.username_normalized)
@@ -116,6 +118,59 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn get_user_playback_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserPlaybackPolicy>, StorageError> {
+        self.query(
+            "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                    allow_audio_transcode, allow_video_transcode
+             FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| UserPlaybackPolicy {
+                can_play: row.get::<i64, _>("can_play") != 0,
+                max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
+                allow_remux: row.get::<i64, _>("allow_remux") != 0,
+                allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
+                allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_user_playback_policy(
+        &self,
+        user_id: &str,
+        policy: UserPlaybackPolicy,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE users
+             SET can_play = ?, max_simultaneous_playbacks = ?, allow_remux = ?,
+                 allow_audio_transcode = ?, allow_video_transcode = ?, updated_at = unixepoch()
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(database_flag(policy.can_play))
+        .bind(policy.max_simultaneous_playbacks)
+        .bind(database_flag(policy.allow_remux))
+        .bind(database_flag(policy.allow_audio_transcode))
+        .bind(database_flag(policy.allow_video_transcode))
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

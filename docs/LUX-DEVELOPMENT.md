@@ -12923,6 +12923,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：SQLite 与 PostgreSQL 增加五项策略列；旧账号默认允许播放和转码、并发不限。SQLite 回归验证从空库启动及旧账号行经 migration 后的值，定向测试 1/1 通过。PostgreSQL bootstrap 回归已补充，但本机 `127.0.0.1:55432` 未监听，本次未执行该忽略测试；未部署。
 
+#### LUX-615：存储层读取与更新播放策略
+
+范围：为存储层增加读取和更新用户播放策略的方法；通过应用创建的普通用户和首个管理员默认设置为 2 路同时播放。迁移已有账号仍为 `0`（不限）。本任务不接管理员接口、不实施播放准入或转码限制。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新建普通账号和首个管理员通过应用存储方法创建时默认 2 路。
+- [x] 可读取和更新播放、并发、封装转换、音频转码、视频转码五项策略。
+- [x] 负并发上限被数据库约束拒绝；已删除或不存在的账号不能被更新。
+- [x] 定向 SQLite 存储回归及 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib new_user_playback_policy_defaults_to_two_and_updates`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-614。
+
+结果（2026-10-19）：普通用户和首个管理员的应用创建路径显式设为 2 路；migration 对已有用户的 0（不限）保持不变。存储层增加五项策略读取/更新，负并发被 CHECK 拒绝，已软删除/不存在账号不接受更新。定向测试 1/1 通过，未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

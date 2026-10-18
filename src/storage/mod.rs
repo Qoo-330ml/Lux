@@ -10,6 +10,15 @@ pub(crate) enum MetadataAutoMatchPolicy {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserPlaybackPolicy {
+    pub(crate) can_play: bool,
+    pub(crate) max_simultaneous_playbacks: i64,
+    pub(crate) allow_remux: bool,
+    pub(crate) allow_audio_transcode: bool,
+    pub(crate) allow_video_transcode: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
