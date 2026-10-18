@@ -248,12 +248,13 @@ async fn admin_scan_job_endpoints_expose_media_progress_without_changing_file_co
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let login = client
         .post(format!("http://{address}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
         .send()
         .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
     let cookies = format!(
         "lux_session={}; lux_csrf={}",
         cookie_value(login.headers(), "lux_session"),
