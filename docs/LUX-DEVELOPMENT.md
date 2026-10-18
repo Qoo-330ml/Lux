@@ -12328,11 +12328,13 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收：
 
-- [ ] 查找、分页列表和活动列表均能读取新计数，旧任务的计数保持空值。
-- [ ] 原有文件计数与扫描生命周期行为不变。
-- [ ] Rust 存储与扫描任务目标检查通过。
+- [x] 查找、分页列表和活动列表均能读取新计数，旧任务的计数保持空值。
+- [x] 原有文件计数与扫描生命周期行为不变。
+- [x] Rust 存储与扫描任务目标检查通过。
 
 依赖：LUX-579。先补存储模型映射，再扩展查询列并读取计数。
+
+结果（2026-10-18）：`StoredScanJob` 的查找、分页和活动查询都读取独立媒体计数；升级前的任务保持 `None`，新任务使用默认 0。干净验证 worktree 中 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib scan_job_media_progress_is_loaded_from_job_queries` 与 `cargo fmt --all -- --check` 通过。共享工作区未提交的 `src/application/metadata.rs` 当前有独立类型错误，因此没有把共享工作区的构建状态算作本任务验证结果。
 
 #### LUX-581：在管理员扫描任务接口公开媒体进度
 

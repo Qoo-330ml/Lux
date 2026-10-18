@@ -2103,7 +2103,8 @@ async fn full_scan_counts_unique_movies_and_whole_series_during_discovery()
     assert_eq!(series_ledger_matches, 1);
 
     let unchanged_series_job = jobs.create_movie_scan_job(series_library.id).await?;
-    jobs.run_to_completion(&unchanged_series_job.id, 1, None).await?;
+    jobs.run_to_completion(&unchanged_series_job.id, 1, None)
+        .await?;
     let unchanged_series_progress: (i64, i64, i64) = sqlx::query_as(
         "SELECT processed_media_count, processed_count, total_count
          FROM scan_jobs WHERE id = ?",

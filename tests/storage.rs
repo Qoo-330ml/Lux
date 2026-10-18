@@ -33,7 +33,10 @@ async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(not_null, 0, "pre-migration jobs have no reliable media count");
+    assert_eq!(
+        not_null, 0,
+        "pre-migration jobs have no reliable media count"
+    );
     assert_eq!(default_value.as_deref(), Some("0"));
 
     let ledger_table: i64 = sqlx::query_scalar(
