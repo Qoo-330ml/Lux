@@ -97,9 +97,24 @@ impl ScanJobService {
             self.cancel_running_job(job_id).await?;
             return Ok(());
         };
+        let full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
+            Some(
+                Arc::clone(&self.full_scan_queue)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ScanJobError::ScanLockClosed)?,
+            )
+        } else {
+            None
+        };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(
-                job_id, batch_size, probe, metadata, thumbnails,
+                job_id,
+                batch_size,
+                probe,
+                metadata,
+                thumbnails,
+                full_scan_permit,
             )
             .await;
         if result.is_err() {
@@ -254,6 +269,7 @@ impl ScanJobService {
         probe: Option<MediaProbeService>,
         metadata: Option<MetadataReidentifyService>,
         thumbnails: Option<ThumbnailService>,
+        full_scan_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<(), ScanJobError> {
         let manifest_workflow_version = self
             .database
@@ -277,10 +293,12 @@ impl ScanJobService {
         {
             Ok(result) => result,
             Err(error) => {
+                drop(full_scan_permit);
                 Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                 return Err(error);
             }
         };
+        drop(full_scan_permit);
         if report.status != "COMPLETED" {
             Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
             return Ok(());

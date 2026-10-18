@@ -8927,7 +8927,7 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
         )
         .await?;
 
-    let scan_lock = Arc::new(Semaphore::new(1));
+    let scan_lock = Arc::new(Semaphore::new(16));
     let jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
     let first_job = jobs.create_movie_scan_job(first_library.id).await?;
     let second_job = jobs.create_movie_scan_job(second_library.id).await?;
