@@ -554,9 +554,9 @@ pub use repository::{
 
 #[allow(unused_imports)]
 pub(crate) use repository::{
-    CatalogFilterQuery, CatalogSort, ChapterDetectionOutcomeUpdate,
-    ChapterDetectionSourceStateUpdate, DEFAULT_PLAYED_PERCENT, DashboardStats,
-    DatabasePoolSnapshot, DevicePairingRedeemResult, EmbyMigrationHandledItemBatch,
+    AdminUserSortField, AdminUserStatusFilter, CatalogFilterQuery, CatalogSort,
+    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate, DEFAULT_PLAYED_PERCENT,
+    DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult, EmbyMigrationHandledItemBatch,
     EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch, EmbyMigrationItemPageBatch,
     EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
@@ -581,8 +581,9 @@ pub(crate) use repository::{
     PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReconciliationBatchCommit,
     ReconciliationBatchCommitResult, ResumeItemsQuery, ScanFingerprintMigrationCommit,
     ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate, StoredAccessTokenDevice,
-    StoredActivityEvent, StoredCanonicalPerson, StoredCanonicalPersonMatch, StoredCatalogDetail,
-    StoredCatalogImageTag, StoredCatalogItemCounts, StoredCatalogRow, StoredChapterDetectionItem,
+    StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
+    StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,
+    StoredCatalogItemCounts, StoredCatalogRow, StoredChapterDetectionItem,
     StoredChapterDetectionJob, StoredChapterDetectionSource, StoredChapterDetectionSourceState,
     StoredCollectionRefresh, StoredDanmakuMatchItem, StoredDanmakuMatchJob, StoredDanmakuSource,
     StoredDownloadSource, StoredEmbyCollection, StoredEmbyMigrationImportRecord,

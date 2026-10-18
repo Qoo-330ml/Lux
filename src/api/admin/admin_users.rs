@@ -8,6 +8,7 @@ pub(crate) struct SetLibraryAccessRequest {
 
 pub(crate) async fn admin_list_users(
     headers: HeaderMap,
+    Query(query): Query<AdminUsersQuery>,
     State(state): State<AppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
@@ -20,13 +21,102 @@ pub(crate) async fn admin_list_users(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match users.list_all_users().await {
-        Ok(users) => Json(json!({
-            "users": users.iter().map(user_json).collect::<Vec<_>>()
+    let status = match query.status.as_deref().unwrap_or("all") {
+        "all" => crate::storage::AdminUserStatusFilter::All,
+        "active" => crate::storage::AdminUserStatusFilter::Active,
+        "disabled" => crate::storage::AdminUserStatusFilter::Disabled,
+        "deleted" => crate::storage::AdminUserStatusFilter::Deleted,
+        _ => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户状态筛选项无效",
+            )
+            .into_response();
+        }
+    };
+    let sort_by = match query.sort_by.as_deref().unwrap_or("lastActivityAt") {
+        "createdAt" => crate::storage::AdminUserSortField::CreatedAt,
+        "lastLoginAt" => crate::storage::AdminUserSortField::LastLoginAt,
+        "lastActivityAt" => crate::storage::AdminUserSortField::LastActivityAt,
+        _ => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户排序项无效",
+            )
+            .into_response();
+        }
+    };
+    let descending = match query.sort_order.as_deref().unwrap_or("desc") {
+        "asc" => false,
+        "desc" => true,
+        _ => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "排序方向无效",
+            )
+            .into_response();
+        }
+    };
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|search| !search.is_empty());
+    if search.is_some_and(|search| search.chars().count() > 200) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "搜索内容不能超过 200 个字符",
+        )
+        .into_response();
+    }
+    let page = i64::from(query.page.unwrap_or(1).max(1));
+    let page_size = i64::from(query.page_size.unwrap_or(20).clamp(1, 100));
+    match users
+        .list_admin_users(status, search, sort_by, descending, page, page_size)
+        .await
+    {
+        Ok(result) => Json(json!({
+            "users": result.entries.iter().map(admin_user_list_entry_json).collect::<Vec<_>>(),
+            "page": result.page,
+            "pageSize": result.page_size,
+            "totalCount": result.total_count,
         }))
         .into_response(),
         Err(error) => user_store_error(&headers, error),
     }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminUsersQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+    search: Option<String>,
+    status: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+}
+
+fn admin_user_list_entry_json(entry: &crate::auth::users::AdminUserListEntry) -> Value {
+    let mut user = user_json(&entry.user);
+    user["email"] = json!(entry.email);
+    user["emailVerifiedAt"] = json!(entry.email_verified_at);
+    user["deletedAt"] = json!(entry.deleted_at);
+    user["deletionPurgeAt"] = json!(entry.deletion_purge_at);
+    user["createdAt"] = json!(entry.created_at);
+    user["lastLoginAt"] = json!(entry.user.last_login_at);
+    user["lastActivityAt"] = json!(entry.user.last_activity_at);
+    user["currentPlaybackCount"] = json!(entry.current_playback_count);
+    user["presetSource"] = Value::Null;
+    user
 }
 
 pub(crate) async fn admin_get_user(

@@ -1,7 +1,10 @@
 use crate::{
     auth::password::{PasswordError, PasswordService},
     domain::ids::UserId,
-    storage::{Database, StorageError, UpdateUser},
+    storage::{
+        AdminUserSortField, AdminUserStatusFilter, Database, StorageError, StoredAdminUserListItem,
+        UpdateUser,
+    },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +30,25 @@ pub struct AdminUserProfile {
     pub email_verified_at: Option<i64>,
     pub deleted_at: Option<i64>,
     pub deletion_purge_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdminUserListEntry {
+    pub user: UserRecord,
+    pub email: Option<String>,
+    pub email_verified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+    pub deletion_purge_at: Option<i64>,
+    pub created_at: i64,
+    pub current_playback_count: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdminUserPage {
+    pub entries: Vec<AdminUserListEntry>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total_count: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,6 +222,34 @@ impl UserStore {
             .into_iter()
             .map(user_record)
             .collect()
+    }
+
+    pub(crate) async fn list_admin_users(
+        &self,
+        status: AdminUserStatusFilter,
+        search: Option<&str>,
+        sort_by: AdminUserSortField,
+        descending: bool,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminUserPage, UserStoreError> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let (stored, total_count) = self
+            .database
+            .query_admin_users(status, search, sort_by, descending, page_size, offset)
+            .await?;
+        let entries = stored
+            .into_iter()
+            .map(admin_user_list_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AdminUserPage {
+            entries,
+            page,
+            page_size,
+            total_count,
+        })
     }
 
     pub async fn find_by_id(&self, user_id: &str) -> Result<Option<UserRecord>, UserStoreError> {
@@ -648,6 +698,36 @@ fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, UserSto
         can_download: stored.can_download,
         last_login_at: stored.last_login_at,
         last_activity_at: stored.last_activity_at,
+    })
+}
+
+fn admin_user_list_entry(
+    stored: StoredAdminUserListItem,
+) -> Result<AdminUserListEntry, UserStoreError> {
+    let id = stored
+        .id
+        .parse()
+        .map_err(|error: uuid::Error| UserStoreError::InvalidUserId(error.to_string()))?;
+    Ok(AdminUserListEntry {
+        user: UserRecord {
+            id,
+            username_normalized: stored.username_normalized,
+            display_name: stored.display_name,
+            has_password: stored.has_password,
+            is_disabled: stored.is_disabled,
+            is_admin: stored.is_admin,
+            can_manage_server: stored.can_manage_server,
+            can_remote_access: stored.can_remote_access,
+            can_download: stored.can_download,
+            last_login_at: stored.last_login_at,
+            last_activity_at: stored.last_activity_at,
+        },
+        email: stored.email,
+        email_verified_at: stored.email_verified_at,
+        deleted_at: stored.deleted_at,
+        deletion_purge_at: stored.deletion_purge_at,
+        created_at: stored.created_at,
+        current_playback_count: stored.current_playback_count,
     })
 }
 

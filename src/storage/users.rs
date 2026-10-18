@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::repository::stored_user;
+use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 
 use std::time::{Duration, Instant};
 
@@ -211,6 +211,125 @@ impl Database {
 
     pub(crate) async fn list_all_users(&self) -> Result<Vec<StoredUser>, StorageError> {
         self.list_users_with_disabled(true).await
+    }
+
+    pub(crate) async fn query_admin_users(
+        &self,
+        status: AdminUserStatusFilter,
+        search: Option<&str>,
+        sort_by: AdminUserSortField,
+        descending: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredAdminUserListItem>, i64), StorageError> {
+        let status_clause = match status {
+            AdminUserStatusFilter::All => "deleted_at IS NULL",
+            AdminUserStatusFilter::Active => "deleted_at IS NULL AND is_disabled = 0",
+            AdminUserStatusFilter::Disabled => "deleted_at IS NULL AND is_disabled = 1",
+            AdminUserStatusFilter::Deleted => "deleted_at IS NOT NULL",
+        };
+        let search_pattern = search.map(|search| {
+            let escaped = search
+                .to_lowercase()
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_");
+            format!("%{escaped}%")
+        });
+        let where_clause = if search_pattern.is_some() {
+            format!(
+                "{status_clause} AND (
+                    LOWER(username_normalized) LIKE ? ESCAPE '!'
+                    OR LOWER(display_name) LIKE ? ESCAPE '!'
+                    OR LOWER(COALESCE(email, '')) LIKE ? ESCAPE '!'
+                )"
+            )
+        } else {
+            status_clause.to_owned()
+        };
+        let count_query = format!("SELECT COUNT(*) FROM users WHERE {where_clause}");
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        if let Some(search_pattern) = search_pattern.as_deref() {
+            count_statement = count_statement
+                .bind(search_pattern)
+                .bind(search_pattern)
+                .bind(search_pattern);
+        }
+        let total_count = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let max_function = match self.backend() {
+            crate::config::DatabaseBackend::Sqlite => "MAX",
+            crate::config::DatabaseBackend::Postgres => "GREATEST",
+        };
+        let activity_expression = format!(
+            "NULLIF({max_function}(
+                COALESCE(users.last_login_at, 0),
+                COALESCE((SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                          FROM access_tokens at WHERE at.user_id = users.id), 0),
+                COALESCE((SELECT MAX(COALESCE(ws.last_seen_at, ws.created_at))
+                          FROM web_sessions ws WHERE ws.user_id = users.id), 0),
+                COALESCE((SELECT MAX(ps.last_event_at)
+                          FROM playback_sessions ps WHERE ps.user_id = users.id), 0),
+                COALESCE((SELECT MAX(wps.last_heartbeat_at)
+                          FROM web_playback_sessions wps WHERE wps.user_id = users.id), 0)
+            ), 0)"
+        );
+        let sort_column = match sort_by {
+            AdminUserSortField::CreatedAt => "created_at",
+            AdminUserSortField::LastLoginAt => "last_login_at",
+            AdminUserSortField::LastActivityAt => "last_activity_at",
+        };
+        let direction = if descending { "DESC" } else { "ASC" };
+        let list_query = format!(
+            "SELECT id, username_normalized, display_name, has_password,
+                    is_disabled, is_admin, can_manage_server, can_remote_access,
+                    can_download, email, email_verified_at, deleted_at,
+                    deletion_purge_at, last_login_at,
+                    {activity_expression} AS last_activity_at,
+                    created_at,
+                    (SELECT COUNT(*) FROM (
+                        SELECT ps.play_session_id
+                        FROM playback_sessions ps
+                        WHERE ps.user_id = users.id
+                          AND ps.state IN ('PLAYING', 'PAUSED')
+                          AND ps.last_event_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+                        UNION
+                        SELECT wps.play_session_id
+                        FROM web_playback_sessions wps
+                        WHERE wps.user_id = users.id AND wps.state = 'ACTIVE'
+                          AND wps.last_heartbeat_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+                          AND wps.expires_at >= unixepoch()
+                    ) active_playback_sessions) AS current_playback_count
+             FROM users
+             WHERE {where_clause}
+             ORDER BY {sort_column} {direction} NULLS LAST,
+                      username_normalized ASC, id ASC
+             LIMIT ? OFFSET ?"
+        );
+        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
+        if let Some(search_pattern) = search_pattern.as_deref() {
+            list_statement = list_statement
+                .bind(search_pattern)
+                .bind(search_pattern)
+                .bind(search_pattern);
+        }
+        let rows = list_statement
+            .bind(limit.clamp(1, 100))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let users = rows.into_iter().map(stored_admin_user_list_item).collect();
+        Ok((users, total_count))
     }
 
     pub(crate) async fn find_user_display_names(

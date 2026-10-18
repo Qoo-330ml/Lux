@@ -1054,6 +1054,42 @@ pub(crate) struct StoredUser {
     pub(crate) last_activity_at: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminUserStatusFilter {
+    All,
+    Active,
+    Disabled,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminUserSortField {
+    CreatedAt,
+    LastLoginAt,
+    LastActivityAt,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredAdminUserListItem {
+    pub(crate) id: String,
+    pub(crate) username_normalized: String,
+    pub(crate) display_name: String,
+    pub(crate) has_password: bool,
+    pub(crate) is_disabled: bool,
+    pub(crate) is_admin: bool,
+    pub(crate) can_manage_server: bool,
+    pub(crate) can_remote_access: bool,
+    pub(crate) can_download: bool,
+    pub(crate) email: Option<String>,
+    pub(crate) email_verified_at: Option<i64>,
+    pub(crate) deleted_at: Option<i64>,
+    pub(crate) deletion_purge_at: Option<i64>,
+    pub(crate) last_login_at: Option<i64>,
+    pub(crate) last_activity_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) current_playback_count: i64,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredAccessTokenDevice {
     pub(crate) device_id: String,
@@ -1080,6 +1116,28 @@ pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
         deletion_purge_at: row.get("deletion_purge_at"),
         last_login_at: row.get("last_login_at"),
         last_activity_at: row.get("last_activity_at"),
+    }
+}
+
+pub(crate) fn stored_admin_user_list_item(row: sqlx::any::AnyRow) -> StoredAdminUserListItem {
+    StoredAdminUserListItem {
+        id: row.get("id"),
+        username_normalized: row.get("username_normalized"),
+        display_name: row.get("display_name"),
+        has_password: row.get::<i64, _>("has_password") != 0,
+        is_disabled: row.get::<i64, _>("is_disabled") != 0,
+        is_admin: row.get::<i64, _>("is_admin") != 0,
+        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
+        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
+        can_download: row.get::<i64, _>("can_download") != 0,
+        email: row.get("email"),
+        email_verified_at: row.get("email_verified_at"),
+        deleted_at: row.get("deleted_at"),
+        deletion_purge_at: row.get("deletion_purge_at"),
+        last_login_at: row.get("last_login_at"),
+        last_activity_at: row.get("last_activity_at"),
+        created_at: row.get("created_at"),
+        current_playback_count: row.get("current_playback_count"),
     }
 }
 

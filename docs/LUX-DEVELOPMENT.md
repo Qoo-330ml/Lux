@@ -12677,6 +12677,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增当前登录用户的个人资料读取/更新 API，并在账户页保存显示名称和邮箱；邮箱更新由既有存储逻辑清除验证时间，当前显示未验证状态。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、Rust 格式检查和 `pnpm --dir web build` 通过。邮件验证发送尚未接通，未运行测试。
 
+#### LUX-601：管理员用户查询与分页 API
+
+范围：管理员用户列表支持用户名/显示名称/邮箱搜索、账号状态筛选、创建时间/最近登录/最近活动排序及服务端分页。默认每页 20 条，上限 100 条；返回匹配总数、邮箱资料、近期活动时间与 Web/Emby 合并去重的当前播放数。默认列表排除回收站账号，`deleted` 状态专供回收站视图。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [x] 服务端先过滤和排序再分页，页大小默认 20 且不超过 100；返回准确匹配总数。
+- [x] 搜索覆盖用户名、显示名称、邮箱；状态与排序仅接受定义选项。
+- [x] 最近活跃合并登录/访问与播放活动；当前播放数覆盖 Web/Emby 且按会话去重、沿用 90 秒活跃窗口。
+- [x] Cargo 构建与格式检查通过。
+
+依赖：LUX-594、LUX-597、LUX-600。
+
+结果（2026-10-19）：用户列表 API 支持分页、状态、搜索、排序及匹配总数；最近活动汇总 Web/Emby 凭证、Web 会话和播放事件，当前播放合并两种播放表并按播放会话去重。页大小默认 20、最大 100，默认排除回收站账号。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和格式检查通过；未运行测试。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
