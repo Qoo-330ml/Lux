@@ -1,8 +1,10 @@
 import { ArrowLeft, CircleDashed, ShieldCheck, SlidersHorizontal, Users } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FormEvent, useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import type { AdminUser } from "../../lib/api/types";
 import "./user-management.css";
 
 const detailSections = [
@@ -31,11 +33,15 @@ export function AdminUserDetailPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const sectionId = searchParams.get("section") ?? "profile";
   const section = detailSections.find((item) => item.id === sectionId) ?? detailSections[0];
-  const users = useQuery({ queryKey: queryKeys.adminUsers, queryFn: () => api.adminUsers() });
-  const user = users.data?.users?.find((item) => item.id === userId);
+  const userQuery = useQuery({
+    queryKey: ["admin", "user", userId],
+    queryFn: () => api.adminUser(userId),
+    enabled: Boolean(userId),
+  });
+  const user = userQuery.data?.user;
 
-  if (users.isPending) return <AdminUserManagementState label="正在读取账户资料…" />;
-  if (users.error) return <AdminUserManagementState label="暂时无法读取账户资料。" error />;
+  if (userQuery.isPending) return <AdminUserManagementState label="正在读取账户资料…" />;
+  if (userQuery.error) return <AdminUserManagementState label={userQuery.error.message || "暂时无法读取账户资料。"} error />;
   if (!user) return <AdminUserManagementState label="找不到此账户，或账户已不存在。" error />;
 
   const displayName = user.displayName || user.usernameNormalized;
@@ -59,15 +65,81 @@ export function AdminUserDetailPage() {
           </button>
         ))}
       </nav>
-      <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-module-title">
-        <span className="lux-admin-user-module-icon"><Icon size={19} /></span>
-        <div>
-          <span className="lux-admin-eyebrow">{section.module}</span>
-          <h2 id="lux-admin-user-module-title">{section.label}</h2>
-          <p>页面结构已预留。此模块将在对应的用户管理任务中接入服务端数据和操作。</p>
-        </div>
-      </section>
+      {section.id === "profile" ? (
+        <AdminUserProfileEditor key={user.id} user={user} />
+      ) : (
+        <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-module-title">
+          <span className="lux-admin-user-module-icon"><Icon size={19} /></span>
+          <div>
+            <span className="lux-admin-eyebrow">{section.module}</span>
+            <h2 id="lux-admin-user-module-title">{section.label}</h2>
+            <p>页面结构已预留。此模块将在对应的用户管理任务中接入服务端数据和操作。</p>
+          </div>
+        </section>
+      )}
     </div>
+  );
+}
+
+function AdminUserProfileEditor({ user }: { user: AdminUser }) {
+  const queryClient = useQueryClient();
+  const [displayName, setDisplayName] = useState(user.displayName ?? "");
+  const [email, setEmail] = useState(user.email ?? "");
+  const [notice, setNotice] = useState("");
+  const update = useMutation({
+    mutationFn: () => api.updateAdminUserProfile(user.id, { displayName, email }),
+    onSuccess: ({ user: updated }) => {
+      setDisplayName(updated.displayName ?? "");
+      setEmail(updated.email ?? "");
+      setNotice("账户资料已保存。");
+      queryClient.setQueryData(["admin", "user", user.id], { user: updated });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
+    },
+    onError: (error) => setNotice(error.message || "资料保存失败，请重试。"),
+  });
+  useEffect(() => {
+    setDisplayName(user.displayName ?? "");
+    setEmail(user.email ?? "");
+    setNotice("");
+  }, [user.displayName, user.email, user.id]);
+
+  const emailStatus = user.email
+    ? user.emailVerifiedAt ? "已验证" : "未验证"
+    : "未填写";
+  const hasChanges = displayName !== (user.displayName ?? "") || email !== (user.email ?? "");
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setNotice("");
+    update.mutate();
+  }
+
+  return (
+    <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-profile-title">
+      <div className="lux-admin-panel-heading">
+        <div><h2 id="lux-admin-user-profile-title">资料与状态</h2></div>
+        <span className={user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.isDisabled ? "已禁用" : "正常"}</span>
+      </div>
+      <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
+        <label>
+          显示名称
+          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={128} />
+        </label>
+        <label>
+          邮箱
+          <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" />
+        </label>
+        <p className="lux-admin-muted">
+          邮箱状态：{emailStatus}。邮箱变更会清除验证状态；验证流程将在邮件功能中接入。
+        </p>
+        <div className="lux-admin-user-profile-actions">
+          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || update.isPending}>
+            {update.isPending ? "保存中…" : "保存资料"}
+          </button>
+          {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
+        </div>
+      </form>
+    </section>
   );
 }
 

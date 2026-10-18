@@ -1074,6 +1074,22 @@ export class LuxApiClient {
     return this.request<{ users?: AdminUser[] }>("/api/v1/admin/users");
   }
 
+  adminUser(userId: string) {
+    return this.request<{ user?: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  updateAdminUserProfile(
+    userId: string,
+    input: { displayName: string; email: string },
+  ) {
+    return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/profile`,
+      { method: "PATCH", body: JSON.stringify(input) },
+    );
+  }
+
   createAdminUser(input: {
     username: string;
     displayName: string;

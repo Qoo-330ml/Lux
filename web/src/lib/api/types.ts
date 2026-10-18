@@ -531,6 +531,10 @@ export type AdminPluginConfigImageUpload = {
 export type AdminUser = LuxUser & {
   isDisabled: boolean;
   isAdmin: boolean;
+  email?: string | null;
+  emailVerifiedAt?: number | null;
+  deletedAt?: number | null;
+  deletionPurgeAt?: number | null;
 };
 
 export type AdminEmbyMigrationConnection = {

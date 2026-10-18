@@ -12594,6 +12594,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增管理员单用户详情、创建时设置邮箱和独立资料更新接口；邮箱统一小写、执行基本格式检查、重复地址映射为冲突，地址变更会清除验证时间。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与 `cargo fmt --all -- --check` 通过；未运行测试。
 
+#### LUX-596：管理员账号资料详情页
+
+范围：详情页直接按用户 ID 读取资料，并实现模块一中的显示名称、邮箱编辑和邮箱验证状态展示。保存成功后同步更新列表/详情缓存；其余模块继续保持占位。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 详情页不依赖加载全量用户列表；不存在用户显示明确状态。
+- [x] 管理员可保存显示名称与邮箱，显示邮箱未验证状态和服务端错误。
+- [x] 模块六仍只有占位文案，不出现可操作的播放/转码开关。
+
+依赖：LUX-595。
+
+结果（2026-10-19）：详情页改为按用户 ID 请求资料；模块一资料表单可更新显示名称、邮箱并呈现验证状态。模块六保持禁用占位。`pnpm --dir web build` 通过；未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
