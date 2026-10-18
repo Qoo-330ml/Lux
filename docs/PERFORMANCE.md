@@ -2227,3 +2227,19 @@ SQLx SQLite 3.51.3 的原计划按 root 使用 `idx_filesystem_entries_local_met
 这组完整扫描没有观测到超过 5% 的中位数回退；候选枚举本身的合成 SQLite 查询 A/B 与 EXPLAIN 计划见上文。完整扫描 fixture 不包含删除项，删除候选访问路径的直接收益由固定 root SQLx fixture 单独衡量；因此不能把局部候选查询耗时降幅当作完整扫描加速或 CPU 降幅。
 
 以上仅为本机合成 SQLite 和 ARM64 结果，没有 PostgreSQL runtime、磁盘冷缓存、真实媒体目录、并发全量/增量流量、FNOS/NAS 或 x86 数据；不得据此表述生产 CPU 降幅。
+
+### PostgreSQL merged-into 部分索引 A/B
+
+2026-09-27 的 PostgreSQL 16.15 / 60,000 文件、600 目录固定 fixture A/B 评估了 `media_items.merged_into_item_id` 部分索引。三轮交错结果：首扫索引中位数由 5,788 ms 降至 5,229 ms（快约 9.7%）；`movie_item_insert` 由 1,817 ms 降至 1,538 ms（快约 15.3%）；无变化重扫、前台请求、目录列表和 batch p95 未观察到回退。fixture 的 60,600 条媒体记录在该列均为空，完整索引占 409,600 bytes，部分索引占 8,192 bytes。WAL 集群级 delta 中位数高约 2.8%，需继续观察。SQLite 不变。该实验的历史候选 migration 编号为 0150；当前 0150 已被 HOMEVIDEOS migration 占用，因此同一索引定义在本版通过 PostgreSQL migration 0182 应用。历史 A/B 数据不表示本次发布重跑了基准。
+
+### 缩略图重试领取与剧集合并层级更新
+
+2026-10-05 的固定 SQLite 回归中，205 条缩略图重试每轮上限仍为 100；领取 SQL 从一次读取加逐行 UPDATE 的 101 次降为一次读取加一个有界 `UPDATE ... RETURNING` 的 2 次。空队列仍只读取一次；返回顺序、重试时间与租约语义保持。
+
+同日的剧集合并 fixture 包含 20 个没有目标季度的源季度，层级更新 SQL 从逐季度处理的 28 次降至两个有界批次后的 9 次；另以 101 个季度和 101 个分集验证 100 ID 批次边界，调用数为 11。匹配季度的状态合并路径保持原样。两项计数仅代表固定 SQLite fixture 的 storage SQL 调用，不代表事务墙钟、PostgreSQL、NAS 或生产吞吐；本次发布未运行测试。
+
+### 扫描物化、来源读取与关机回收的历史 SQL 计数
+
+2026-10-05 的固定 SQLite 回归记录：205 个嵌套剧集目录的本地元数据来源读取从 208 次降至 4 次；205 个 Manifest 未解析文件首次物化为 12 次 SQL，已有父目录时再次物化为 6 次；252 个 Manifest 根目录初始化从逐根写入的 507 次降至有界批次的 9 次；205 个旧版扫描任务关机回收从 214 次降至 9 次。扫描层级行恢复使用每批最多 100 条 identity 映射的 CTE UPDATE。
+
+这些数字来自对应功能分支的固定 SQLite fixture 历史记录；本次把逻辑适配到当前实现后没有重跑测试或计数。它们不表示事务墙钟、PostgreSQL、NAS 或生产吞吐收益。全量扫描专用队列只串行化索引阶段，索引终结后释放队列，允许下一媒体库开始索引。

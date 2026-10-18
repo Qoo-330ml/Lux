@@ -6978,6 +6978,10 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-28 PostgreSQL 扫描写事务启用事务局部 `SET LOCAL synchronous_commit = off`，普通 metadata 写事务与 SQLite 不变。60k fixture 六轮 A/B 的首扫索引汇总中位数从 5.599 降到 5.236 秒；末三轮反序交错子集为 5.390→5.188 秒，约快 3.7%。累计提交等待中位数约从 78.9 降到 2.35 ms；target、重扫和前台 p95 未观察到超过 5% 的回退。PostgreSQL 异常退出可能丢失近期已确认的整笔扫描事务，但不会造成数据库不一致；启动会取消未完成任务而不自动续跑，需要重新发起扫描。完整样本与限制见 `docs/PERFORMANCE.md`；本结果不关闭 LUX-275 双后端阶段门。
 
+2026-10-18 将 PostgreSQL `media_items.merged_into_item_id` 索引改为只覆盖非空合并关系的部分索引。历史 60k/600 fixture A/B 首扫中位数从 5.788 降至 5.229 秒（约快 9.7%），`movie_item_insert` 中位数从 1.817 降至 1.538 秒；候选 WAL 中位数高约 2.8%，需继续观察。SQLite schema 不变。历史候选使用 0150 版本号；当前 PostgreSQL 0150 已用于 HOMEVIDEOS，因此以新 migration `0182_partial_merged_into_index.sql` 承载相同 schema 变更。完整样本见 `docs/PERFORMANCE.md`，LUX-275 双后端阶段门仍开放。
+
+0.6.10 发布集成还适配了扫描和关机路径的有界批处理：嵌套剧集目录来源读取、未解析 Manifest 文件物化、Manifest 根目录初始化、已移除层级行恢复及旧版扫描任务回收。全量扫描用独立容量为 1 的队列约束索引阶段；索引终结后释放队列与共享扫描许可，使下一媒体库可在前一任务继续后处理时开始索引。对应固定 SQLite fixture 的历史 SQL 计数及验证边界见 `docs/PERFORMANCE.md`；本次发布按要求未运行测试、构建或 lint，LUX-275 的完整性能阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`migrations-postgres/0147_drop_media_search_item_fk.sql`、`migrations-postgres/0148_drop_scan_job_targets_job_fk.sql`、`migrations-postgres/0149_statement_timestamp_unixepoch.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
