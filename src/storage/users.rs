@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::repository::stored_user;
 
 use std::time::{Duration, Instant};
 
@@ -72,11 +73,33 @@ impl Database {
         is_admin: bool,
         has_password: bool,
     ) -> Result<(), StorageError> {
+        self.insert_user_with_email(
+            id,
+            username_normalized,
+            display_name,
+            password_hash,
+            is_admin,
+            has_password,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_user_with_email(
+        &self,
+        id: &str,
+        username_normalized: &str,
+        display_name: &str,
+        password_hash: &str,
+        is_admin: bool,
+        has_password: bool,
+        email: Option<&str>,
+    ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
-                is_admin, can_manage_server, has_password
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                is_admin, can_manage_server, has_password, email
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(username_normalized)
@@ -85,6 +108,7 @@ impl Database {
         .bind(database_flag(is_admin))
         .bind(database_flag(is_admin))
         .bind(database_flag(has_password))
+        .bind(email)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -102,7 +126,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -113,22 +138,7 @@ impl Database {
         .bind(username_normalized)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredUser {
-                id: row.get("id"),
-                username_normalized: row.get("username_normalized"),
-                display_name: row.get("display_name"),
-                password_hash: row.get("password_hash"),
-                has_password: row.get::<i64, _>("has_password") != 0,
-                is_disabled: row.get::<i64, _>("is_disabled") != 0,
-                is_admin: row.get::<i64, _>("is_admin") != 0,
-                can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-                can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-                can_download: row.get::<i64, _>("can_download") != 0,
-                last_login_at: row.get("last_login_at"),
-                last_activity_at: row.get("last_activity_at"),
-            })
-        })
+        .map(|row| row.map(stored_user))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -151,7 +161,8 @@ impl Database {
                 "SELECT id, username_normalized, display_name, password_hash,
                         has_password,
                         is_disabled, is_admin, can_manage_server,
-                        can_remote_access, can_download, last_login_at,
+                        can_remote_access, can_download, email, email_verified_at,
+                        deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
                         COALESCE(
                             (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                              FROM access_tokens at WHERE at.user_id = users.id),
@@ -252,7 +263,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -295,7 +307,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -338,7 +351,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -354,6 +368,36 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn update_user_profile(
+        &self,
+        user_id: &str,
+        display_name: Option<&str>,
+        email: Option<&str>,
+    ) -> Result<Option<StoredUser>, StorageError> {
+        self.query(
+            "UPDATE users
+             SET display_name = COALESCE(?, display_name),
+                 email = COALESCE(?, email),
+                 email_verified_at = CASE
+                    WHEN ? IS NOT NULL AND LOWER(COALESCE(email, '')) != LOWER(?)
+                    THEN NULL ELSE email_verified_at END,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(display_name)
+        .bind(email)
+        .bind(email)
+        .bind(email)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.find_user_by_id(user_id).await
     }
 
     pub(crate) async fn update_user(
@@ -810,7 +854,8 @@ impl Database {
         self.query(
             "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
                     u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
-                    u.can_remote_access, u.can_download, u.last_login_at,
+                    u.can_remote_access, u.can_download, u.email, u.email_verified_at,
+                    u.deleted_at, u.deletion_purge_at, u.is_disabled_before_delete, u.last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at2.last_seen_at, at2.created_at))
                          FROM access_tokens at2 WHERE at2.user_id = u.id),
@@ -823,22 +868,7 @@ impl Database {
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredUser {
-                id: row.get("id"),
-                username_normalized: row.get("username_normalized"),
-                display_name: row.get("display_name"),
-                password_hash: row.get("password_hash"),
-                has_password: row.get::<i64, _>("has_password") != 0,
-                is_disabled: row.get::<i64, _>("is_disabled") != 0,
-                is_admin: row.get::<i64, _>("is_admin") != 0,
-                can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-                can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-                can_download: row.get::<i64, _>("can_download") != 0,
-                last_login_at: row.get("last_login_at"),
-                last_activity_at: row.get("last_activity_at"),
-            })
-        })
+        .map(|row| row.map(stored_user))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

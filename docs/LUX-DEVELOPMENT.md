@@ -12562,6 +12562,35 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增用户列表视图占位、用户详情模块导航和全局用户设置导航。模块一、三、六及其他待实施模块均未新增业务行为。`pnpm --dir web build` 通过；未部署。
 
+#### LUX-594：账号资料与回收站数据模型
+
+范围：为用户补充可选邮箱、邮箱验证时间和软删除/清理时间字段；为邮箱建立不区分大小写的唯一索引，并在 SQLite 与 PostgreSQL 中同步迁移。现有用户邮箱为空且维持原有启用状态；本任务只建立持久化基础，不改变 API、登录或删除行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0184_user_account_profile.sql`、`migrations-postgres/0184_user_account_profile.sql`、`src/storage/repository.rs`、`src/storage/users.rs`。
+
+验收标准：
+
+- [ ] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
+- [x] 用户查询统一映射新增字段；邮箱为空允许重复，非空邮箱不区分大小写唯一。
+- [ ] 不改变当前登录、用户删除及公开 API 行为。
+
+依赖：LUX-593。后续模块一任务逐步接通 API、用户界面和账号生命周期。
+
+结果（2026-10-19）：SQLite/PostgreSQL 迁移、邮箱唯一索引和用户存储映射已实现；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过。迁移尚未在数据库实例执行，未运行测试。
+
+#### LUX-595：管理员账号资料 API
+
+范围：管理员创建用户时可选填写邮箱；详情接口返回单个用户的资料；独立资料更新接口可修改显示名称和邮箱。邮箱输入做基本格式校验并大小写归一化；修改地址清除原验证时间，不把未验证地址标记为已验证。权限更新仍沿用现有接口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [ ] 管理员可获取用户详情并创建/更新邮箱；同一邮箱大小写变体被唯一约束拒绝。
+- [ ] 修改邮箱后验证时间为空；旧账号为空邮箱时保持兼容。
+- [ ] 邮箱格式错误返回 400，不泄漏数据库或账户敏感信息。
+
+依赖：LUX-594。
 
 ## 29. 参考资料
 

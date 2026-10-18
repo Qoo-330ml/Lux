@@ -1046,6 +1046,11 @@ pub(crate) struct StoredUser {
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+    pub(crate) email: Option<String>,
+    pub(crate) email_verified_at: Option<i64>,
+    pub(crate) deleted_at: Option<i64>,
+    pub(crate) deletion_purge_at: Option<i64>,
+    pub(crate) is_disabled_before_delete: bool,
     pub(crate) last_login_at: Option<i64>,
     pub(crate) last_activity_at: Option<i64>,
 }
@@ -1058,7 +1063,7 @@ pub(crate) struct StoredAccessTokenDevice {
     pub(crate) client_version: String,
 }
 
-fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
+pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
     StoredUser {
         id: row.get("id"),
         username_normalized: row.get("username_normalized"),
@@ -1070,6 +1075,11 @@ fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
         can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
         can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
         can_download: row.get::<i64, _>("can_download") != 0,
+        email: row.get("email"),
+        email_verified_at: row.get("email_verified_at"),
+        deleted_at: row.get("deleted_at"),
+        deletion_purge_at: row.get("deletion_purge_at"),
+        is_disabled_before_delete: row.get::<i64, _>("is_disabled_before_delete") != 0,
         last_login_at: row.get("last_login_at"),
         last_activity_at: row.get("last_activity_at"),
     }
