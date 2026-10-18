@@ -116,23 +116,30 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
             .await
         {
             Ok(batch) => {
-                let skipped_item_ids = batch.report.failed_item_ids.clone();
-                if !skipped_item_ids.is_empty() {
-                    tracing::warn!(
-                        batch_id,
-                        skipped_items = skipped_item_ids.len(),
-                        "local image items could not be read; continuing with the rest of the batch"
-                    );
-                }
-                match database
-                    .mark_scan_local_metadata_images_complete(&batch_id)
-                    .await
-                {
-                    Ok(true) => Ok((batch.sources, skipped_item_ids)),
-                    Ok(false) => {
-                        Err("local metadata batch stopped before image completion".to_owned())
+                if !batch.report.failed_item_ids.is_empty() {
+                    Err(format!(
+                        "{} local image item(s) failed",
+                        batch.report.failed_item_ids.len()
+                    ))
+                } else {
+                    let skipped_item_ids = batch.report.skipped_image_item_ids.clone();
+                    if !skipped_item_ids.is_empty() {
+                        tracing::warn!(
+                            batch_id,
+                            skipped_items = skipped_item_ids.len(),
+                            "local image files could not be read; continuing with the rest of the batch"
+                        );
                     }
-                    Err(error) => Err(error.to_string()),
+                    match database
+                        .mark_scan_local_metadata_images_complete(&batch_id)
+                        .await
+                    {
+                        Ok(true) => Ok((batch.sources, skipped_item_ids)),
+                        Ok(false) => {
+                            Err("local metadata batch stopped before image completion".to_owned())
+                        }
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
             }
             Err(error) => Err(error.to_string()),
@@ -325,13 +332,19 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_backfil
     user_events.publish_home_coalesced().await;
     let batch = result.map_err(|error| error.to_string())?;
     if !batch.report.failed_item_ids.is_empty() {
+        return Err(format!(
+            "{} local image item(s) failed",
+            batch.report.failed_item_ids.len()
+        ));
+    }
+    if !batch.report.skipped_image_item_ids.is_empty() {
         tracing::warn!(
             library_root_id = %page.library_root_id,
-            skipped_items = batch.report.failed_item_ids.len(),
-            "local image backfill items could not be read; continuing with the rest of the page"
+            skipped_items = batch.report.skipped_image_item_ids.len(),
+            "local image backfill files could not be read; continuing with the rest of the page"
         );
     }
-    Ok((batch.sources, batch.report.failed_item_ids))
+    Ok((batch.sources, batch.report.skipped_image_item_ids))
 }
 
 pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill_page(
@@ -370,7 +383,7 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill
                     database,
                     context.metadata_selection,
                     context.metadata_reidentify,
-                    LocalMetadataCompletenessTrigger::LibrarySetting,
+                    LocalMetadataCompletenessTrigger::LocalOnly,
                     &source_identities,
                     &non_retryable_item_ids,
                     context.user_events,
@@ -462,7 +475,8 @@ pub(in crate::application::scanner) async fn fail_scan_local_metadata_backfill_p
 pub(in crate::application::scanner) enum LocalMetadataCompletenessTrigger<'a> {
     ScanJob(&'a str),
     ScanJobPolicy(MetadataAutoMatchPolicy),
-    LibrarySetting,
+    /// Local NFO/image refresh. It records completeness but never queues online work.
+    LocalOnly,
 }
 
 pub(in crate::application::scanner) fn metadata_auto_match_policy_for_scan_job(
@@ -496,9 +510,7 @@ pub(in crate::application::scanner) async fn resolve_local_metadata_auto_match_p
     trigger: LocalMetadataCompletenessTrigger<'_>,
 ) -> Result<MetadataAutoMatchPolicy, String> {
     match trigger {
-        LocalMetadataCompletenessTrigger::LibrarySetting => {
-            Ok(MetadataAutoMatchPolicy::UseLibrarySetting)
-        }
+        LocalMetadataCompletenessTrigger::LocalOnly => Ok(MetadataAutoMatchPolicy::Disabled),
         LocalMetadataCompletenessTrigger::ScanJobPolicy(policy) => Ok(policy),
         LocalMetadataCompletenessTrigger::ScanJob(scan_job_id) => {
             let job = database
@@ -1302,7 +1314,7 @@ impl ScanJobService {
                         &self.database,
                         self.metadata_selection.as_ref(),
                         self.metadata_reidentify.as_ref(),
-                        LocalMetadataCompletenessTrigger::LibrarySetting,
+                        LocalMetadataCompletenessTrigger::LocalOnly,
                         &source_identities,
                         &report.non_retryable_failed_item_ids,
                         &self.user_events,

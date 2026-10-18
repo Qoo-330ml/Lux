@@ -1998,10 +1998,13 @@ impl MetadataEnricher {
         let mut items = Vec::with_capacity(sources.len());
         for source in sources {
             report.items_processed += 1;
-            if let Some(item) =
+            if let Some((item, skipped_image_count)) =
                 prepare_scan_local_movie_image_batch_item(source, directory_cache, report, true)
                     .await
             {
+                if skipped_image_count > 0 {
+                    report.mark_item_image_skipped(&source.item_id);
+                }
                 items.push(item);
             }
         }
@@ -2679,14 +2682,18 @@ impl MetadataEnricher {
 
             let mut image_items = Vec::with_capacity(source_page.len());
             for source in source_page {
-                if let Some(item) = prepare_scan_local_movie_image_batch_item(
-                    source,
-                    &mut directory_cache,
-                    report,
-                    background_cpu_budgeted,
-                )
-                .await
+                if let Some((item, skipped_image_count)) =
+                    prepare_scan_local_movie_image_batch_item(
+                        source,
+                        &mut directory_cache,
+                        report,
+                        background_cpu_budgeted,
+                    )
+                    .await
                 {
+                    if skipped_image_count > 0 {
+                        report.mark_item_image_skipped(&source.item_id);
+                    }
                     image_items.push(item);
                 }
             }
@@ -3843,25 +3850,17 @@ impl MetadataEnricher {
                     .get(item_id)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                match prepare_local_image_batch_item(
+                let prepared = prepare_local_image_batch_item(
                     item_id,
                     images.clone(),
                     indexed,
                     background_cpu_budgeted,
                 )
-                .await
-                {
-                    Ok(insert) => inserts.push(insert),
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id,
-                            path = %error.path.display(),
-                            error = %error.error,
-                            "local series image could not be read"
-                        );
-                        report.mark_item_failed(item_id);
-                    }
+                .await;
+                if prepared.skipped_image_count > 0 {
+                    report.mark_item_image_skipped(item_id);
                 }
+                inserts.push(prepared.insert);
             }
 
             if inserts.is_empty() {
@@ -3918,28 +3917,26 @@ impl MetadataEnricher {
         background_cpu_budgeted: bool,
     ) -> Result<usize, MetadataError> {
         let indexed_images = self.database.list_item_images(item_id).await?;
-        let insert = match prepare_local_image_batch_item(
+        let prepared = prepare_local_image_batch_item(
             item_id,
             images,
             &indexed_images,
             background_cpu_budgeted,
         )
-        .await
-        {
-            Ok(insert) => insert,
-            Err(error) => {
-                report.mark_item_failed(item_id);
-                return Err(MetadataError::Io {
-                    path: error.path,
-                    source: error.error,
-                });
-            }
-        };
+        .await;
+        if prepared.skipped_image_count > 0 {
+            report.mark_item_image_skipped(item_id);
+        }
         self.database
-            .insert_item_images_batch_at_indices(&[insert])
+            .insert_item_images_batch_at_indices(&[prepared.insert])
             .await
             .map_err(MetadataError::Storage)
     }
+}
+
+struct PreparedItemImageBatch {
+    insert: ItemImageBatchInsert,
+    skipped_image_count: usize,
 }
 
 async fn prepare_local_image_batch_item(
@@ -3947,7 +3944,7 @@ async fn prepare_local_image_batch_item(
     images: Vec<LocalImage>,
     indexed_images: &[StoredItemImage],
     background_cpu_budgeted: bool,
-) -> Result<ItemImageBatchInsert, LocalImageReadError> {
+) -> PreparedItemImageBatch {
     let images = images
         .into_iter()
         .filter(|image| {
@@ -3958,13 +3955,10 @@ async fn prepare_local_image_batch_item(
                 }))
         })
         .collect::<Vec<_>>();
-    let clear_poster_fallback = images
-        .iter()
-        .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
     let prepared = prepare_local_images(images, background_cpu_budgeted).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
-    let mut first_error = None;
+    let mut skipped_image_count = 0;
     for result in prepared {
         let prepared = match result {
             Ok(prepared) => prepared,
@@ -3973,9 +3967,9 @@ async fn prepare_local_image_batch_item(
                     item_id,
                     path = %error.path.display(),
                     error = %error.error,
-                    "local series image could not be read; failing item"
+                    "local series image could not be read; skipping image"
                 );
-                first_error.get_or_insert(error);
+                skipped_image_count += 1;
                 continue;
             }
         };
@@ -3992,14 +3986,17 @@ async fn prepare_local_image_batch_item(
             source_url: None,
         });
     }
-    if let Some(error) = first_error {
-        return Err(error);
+    let clear_poster_fallback = records
+        .iter()
+        .any(|image| image.image_type == "POSTER" || image.image_type == "THUMB");
+    PreparedItemImageBatch {
+        insert: ItemImageBatchInsert {
+            item_id: item_id.to_owned(),
+            images: records,
+            clear_poster_fallback,
+        },
+        skipped_image_count,
     }
-    Ok(ItemImageBatchInsert {
-        item_id: item_id.to_owned(),
-        images: records,
-        clear_poster_fallback,
-    })
 }
 
 async fn prepare_scan_local_movie_image_batch_item(
@@ -4007,7 +4004,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     directory_cache: &mut DirectoryPathCache,
     report: &mut MetadataReport,
     background_cpu_budgeted: bool,
-) -> Option<ItemImageBatchInsert> {
+) -> Option<(ItemImageBatchInsert, usize)> {
     let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
     let mut image_paths = match directory_cache
         .get(media_path.parent().unwrap_or(Path::new(".")))
@@ -4045,13 +4042,10 @@ async fn prepare_scan_local_movie_image_batch_item(
         };
     images.extend(extrafanart_local_images(&image_paths, resource_directory));
     images.sort_by(|left, right| left.path.cmp(&right.path));
-    let clear_poster_fallback = images
-        .iter()
-        .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
     let prepared = prepare_local_images(images, background_cpu_budgeted).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
-    let mut first_error = None;
+    let mut skipped_image_count = 0;
     for result in prepared {
         let prepared = match result {
             Ok(prepared) => prepared,
@@ -4060,9 +4054,9 @@ async fn prepare_scan_local_movie_image_batch_item(
                     item_id = %source.item_id,
                     path = %error.path.display(),
                     error = %error.error,
-                    "local movie image could not be read; failing item"
+                    "local movie image could not be read; skipping image"
                 );
-                first_error.get_or_insert(error);
+                skipped_image_count += 1;
                 continue;
             }
         };
@@ -4079,16 +4073,17 @@ async fn prepare_scan_local_movie_image_batch_item(
             source_url: None,
         });
     }
-    if let Some(error) = first_error {
-        tracing::warn!(item_id = %source.item_id, %error.error, "local movie image batch item failed");
-        report.mark_item_failed(&source.item_id);
-        return None;
-    }
-    Some(ItemImageBatchInsert {
-        item_id: source.item_id.clone(),
-        images: records,
-        clear_poster_fallback,
-    })
+    let clear_poster_fallback = records
+        .iter()
+        .any(|image| image.image_type == "POSTER" || image.image_type == "THUMB");
+    Some((
+        ItemImageBatchInsert {
+            item_id: source.item_id.clone(),
+            images: records,
+            clear_poster_fallback,
+        },
+        skipped_image_count,
+    ))
 }
 
 fn next_local_image_index(indexes: &mut BTreeMap<&'static str, i64>, image_type: ImageType) -> i64 {
@@ -4240,6 +4235,9 @@ pub struct MetadataReport {
     pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
     pub(crate) non_retryable_failed_item_ids: Vec<String>,
+    /// Items whose image metadata was skipped because one or more image files
+    /// could not be read. These are not batch failures.
+    pub(crate) skipped_image_item_ids: Vec<String>,
 }
 
 pub(crate) struct ScanLocalMetadataNfoBatch {
@@ -4268,6 +4266,19 @@ impl MetadataReport {
         }
         for item_id in other.non_retryable_failed_item_ids {
             self.mark_item_non_retryable_failed(&item_id);
+        }
+        for item_id in other.skipped_image_item_ids {
+            self.mark_item_image_skipped(&item_id);
+        }
+    }
+
+    fn mark_item_image_skipped(&mut self, item_id: &str) {
+        if !self
+            .skipped_image_item_ids
+            .iter()
+            .any(|skipped| skipped == item_id)
+        {
+            self.skipped_image_item_ids.push(item_id.to_owned());
         }
     }
 

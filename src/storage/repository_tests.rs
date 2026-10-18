@@ -5689,7 +5689,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(item_ids.len(), 4);
     let library_id = library.id.to_string();
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5738,7 +5738,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         assert_eq!(completeness.is_missing, Some(true));
     }
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5784,7 +5784,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(incremental_disabled.updated_count, 1);
     assert!(incremental_disabled.scheduled_job_ids.is_empty());
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5920,7 +5920,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .expect("deduplicate replay against the deferred fill-missing job");
     assert!(replayed_deferred_job.scheduled_job_ids.is_empty());
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -6383,7 +6383,7 @@ async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
         .create_library("Deferred snapshot", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -6603,7 +6603,7 @@ async fn postgres_changed_fill_request_consumes_obsolete_provider_failure()
             .await?;
         let library_id = library.id.to_string();
         database
-            .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+            .query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
             .bind(&library_id)
             .execute(database.pool())
             .await?;
@@ -6769,7 +6769,7 @@ async fn automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_sc
         .create_library("Fill backoff", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -7004,7 +7004,7 @@ async fn automatic_fill_missing_retry_backoff_is_consumed_after_a_successful_ret
         .create_library("Retry consumption", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -7701,7 +7701,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
 
     let library_id = library.id.to_string();
     database
-        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -7790,7 +7790,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .finish_metadata_reidentify_job(existing_fill_missing_job_id, "COMPLETED", None)
         .await?;
     database
-        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;

@@ -184,7 +184,7 @@ fn metadata_completeness_policy_is_explicit_for_scan_triggers() {
 }
 
 #[tokio::test]
-async fn library_setting_trigger_preserves_library_completeness_policy()
+async fn local_only_trigger_never_schedules_online_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::{config::Config, storage::Database};
 
@@ -197,11 +197,11 @@ async fn library_setting_trigger_preserves_library_completeness_policy()
 
     let policy = resolve_local_metadata_auto_match_policy(
         &database,
-        LocalMetadataCompletenessTrigger::LibrarySetting,
+        LocalMetadataCompletenessTrigger::LocalOnly,
     )
     .await?;
 
-    assert_eq!(policy, MetadataAutoMatchPolicy::UseLibrarySetting);
+    assert_eq!(policy, MetadataAutoMatchPolicy::Disabled);
     Ok(())
 }
 
@@ -1791,6 +1791,116 @@ async fn local_metadata_worker_persists_capability_missing()
 }
 
 #[tokio::test]
+async fn local_metadata_backfill_is_local_only_with_unified_scraping_switch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        application::{
+            candidates::MetadataSelectionService, images::ImageWriteService,
+            libraries::LibraryService, reidentify::MetadataReidentifyService,
+            scraper::ScraperProvider,
+        },
+        config::Config,
+        library::LibraryKind,
+        storage::Database,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Backfill Local Only (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Backfill.Local.Only.2024.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("Backfill.Local.Only.2024.nfo"),
+        "<movie><title>Backfill Local Only</title></movie>",
+    )
+    .await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    let images =
+        ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?;
+    let selection = MetadataSelectionService::with_config_dir(
+        database.clone(),
+        images,
+        config.config_dir.clone(),
+    );
+    let provider = GateSearchScraper {
+        search_started: Arc::new(Notify::new()),
+        release_search: Arc::new(Semaphore::new(0)),
+    };
+    let reidentify = MetadataReidentifyService::with_selection(
+        database.clone(),
+        ScraperProvider::from_adapter(provider),
+        Some(selection.clone()),
+    );
+    let jobs = ScanJobService::new(database.clone())
+        .with_metadata_selection(selection)
+        .with_metadata_reidentify(reidentify);
+    jobs.start_local_metadata_outbox_worker().await?;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_backfills
+                 WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ?)",
+            )
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            let completeness: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM item_metadata_completeness
+                 WHERE item_id = ? AND capability = 'METADATA'
+                   AND local_state = 'READY'",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" && completeness == 1 {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+            .fetch_one(database.pool())
+            .await?,
+        0,
+        "local backfill must record completeness without queueing online metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_metadata_skips_unreadable_images_without_stalling_batches_or_backfill()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::{
@@ -2008,6 +2118,10 @@ async fn stage23_online_fill_missing_benchmark() -> Result<(), Box<dyn std::erro
     libraries
         .add_root(library.id, root.to_str().ok_or("non-UTF8 fixture")?)
         .await?;
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
     let provider = GateSearchScraper {
         search_started: Arc::new(Notify::new()),
         release_search: Arc::new(Semaphore::new(0)),
@@ -2168,6 +2282,10 @@ async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
             library.id,
             media_root.to_str().ok_or("non-UTF8 media root")?,
         )
+        .await?;
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
         .await?;
 
     let gate_scraper = GateSearchScraper {
