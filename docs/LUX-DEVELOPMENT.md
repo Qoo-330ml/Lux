@@ -12474,6 +12474,21 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-18）：新增交互先复现 5 个失败；修复后管理运行记录 27/27、Web 构建通过。另补旧事件缓存断言，先确认只 invalidation 不会清除旧数据，再于重试成功后移除缓存。Playwright 在真实 Chromium、构建产物及受控 API fixture 下验证警告、WARN 原因、扫描/元数据混合问题筛选、重试后转为 POSTPROCESSING 且隐藏旧原因；390px 页面无横向溢出，控制台 0 error/0 warning。此项是浏览器 UI 证明，不代表 FNOS 部署或真实库恢复验证。
 
+#### LUX-589：诊断查询使用既有阶段索引
+
+范围：后处理诊断按阶段分别使用 EXISTS，复用现有 PENDING/FAILED 部分索引，避免列表读取已完成目标的全部行；不增加索引或迁移。
+
+预计文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/targets.rs`（含查询计划回归）。
+
+验收：
+
+- [x] SQLite 查询计划使用三个阶段部分索引，诊断及筛选含义不变。
+- [x] SQLite/PostgreSQL 诊断矩阵通过。
+
+依赖：LUX-588。先用实际数据库 schema 复现查询走目标主键范围扫描，再调整查询形状。
+
+结果（2026-10-18）：查询计划回归先明确显示目标主键范围扫描并失败；按阶段拆开 EXISTS 后使用现有三个部分索引。查询计划、SQLite 诊断矩阵及本地 PostgreSQL 16 诊断矩阵 3/3 通过；未增加 schema 或迁移，不将此查询计划结果外推为 NAS 性能测量。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

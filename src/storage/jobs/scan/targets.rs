@@ -1,16 +1,53 @@
 use super::*;
 
-const UNFINISHED_TARGETS: &str = "EXISTS (
-    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id
-      AND (t.probe_state IN ('PENDING', 'FAILED')
-        OR t.metadata_state IN ('PENDING', 'FAILED')
-        OR t.thumbnail_state IN ('PENDING', 'FAILED'))
-)";
+// Separate EXISTS predicates let SQLite use each stage's partial index even when
+// the job retains a large number of completed targets.
+const UNFINISHED_TARGETS: &str = "(EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id AND t.probe_state IN ('PENDING', 'FAILED')
+) OR EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id AND t.metadata_state IN ('PENDING', 'FAILED')
+) OR EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id AND t.thumbnail_state IN ('PENDING', 'FAILED')
+))";
 const UNREADY_TARGETS: &str = "EXISTS (
     SELECT 1 FROM scan_manifests m WHERE m.job_id = sj.id
       AND m.workflow_version IN (2, 3) AND m.discovery_format_version = 3
       AND m.postprocessing_targets_ready = 0
 )";
+
+#[cfg(test)]
+mod retry_diagnostic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scan_retry_diagnostics_use_unfinished_stage_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        })
+        .await?;
+        let sql =
+            format!("EXPLAIN QUERY PLAN SELECT sj.id FROM scan_jobs sj WHERE {UNFINISHED_TARGETS}");
+        let rows = database
+            .query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(database.pool())
+            .await?;
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for stage in ["probe", "metadata", "thumbnail"] {
+            assert!(
+                plan.contains(&format!("idx_scan_job_targets_{stage}")),
+                "{plan}"
+            );
+        }
+        Ok(())
+    }
+}
 
 fn postprocessing_issues_predicate() -> String {
     format!("sj.status = 'COMPLETED' AND sj.job_type = 'RECONCILE_LIBRARY'
