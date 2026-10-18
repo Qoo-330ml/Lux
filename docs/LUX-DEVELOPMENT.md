@@ -12764,6 +12764,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：内部变体改为 `Created`、`LastLogin`、`LastActivity`，对外查询字段和数据库排序列保持原样。Cargo build、fmt check、全目标/all-features Clippy 与 diff check 通过；未运行测试。
 
+#### LUX-606：管理员用户头像 API
+
+范围：新增管理员读取与更新指定用户头像的 API，复用现有私有头像存储、内容校验和 5 MiB 上限。读取不要求 CSRF；更新要求管理员会话和 CSRF，或通过现有共享管理员 API key 鉴权。缺失头像返回 404；不返回用户凭证或文件系统路径。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [x] 头像读取和更新只允许管理员访问；上传复用现有格式、大小和路径校验。
+- [x] 无头像返回 404，响应为正确图片 MIME 类型且私有缓存需重新验证。
+- [x] Rust 构建与格式检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-594、LUX-595。
+
+结果（2026-10-19）：新增受管理员鉴权的目标用户头像 GET/PUT；写入要求 CSRF 并复用已有 5 MiB、格式和私有目录校验，GET 返回实际 MIME、私有重验证缓存，缺失返回 404。Cargo build、fmt 和 diff check 通过；未运行测试。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

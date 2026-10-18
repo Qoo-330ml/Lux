@@ -697,6 +697,70 @@ pub(crate) async fn admin_set_library_access(
     }
 }
 
+pub(crate) async fn admin_get_user_avatar(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(avatars) = state.user_avatars.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match avatars.load(user_id).await {
+        Ok(Some(avatar)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, avatar.content_type)
+            .header(CACHE_CONTROL, "private, no-cache")
+            .body(Body::from(avatar.bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => user_avatar_error(&headers, error),
+    }
+}
+
+pub(crate) async fn admin_update_user_avatar(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(avatars) = state.user_avatars.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match avatars.store(user_id, content_type, &body).await {
+        Ok(()) => Json(json!({ "avatarUrl": format!("/api/v1/admin/users/{user_id}/avatar") }))
+            .into_response(),
+        Err(error) => user_avatar_error(&headers, error),
+    }
+}
+
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -712,6 +776,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/profile",
             patch(admin_update_user_profile),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/avatar",
+            get(admin_get_user_avatar).put(admin_update_user_avatar),
         )
         .route(
             "/api/v1/admin/users/{user_id}/restore",
