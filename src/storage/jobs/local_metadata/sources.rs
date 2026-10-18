@@ -200,61 +200,95 @@ impl Database {
         // A series-level poster may be the only changed file in its directory. If that
         // directory contains season subdirectories, associate it with one source per season
         // so the existing series image indexer can find the poster and season artwork.
-        for (library_root_id, directory_path) in &referenced_directories {
-            if directory_path.is_empty()
-                || directories_with_direct_sources
-                    .contains(&(library_root_id.clone(), directory_path.clone()))
-            {
-                continue;
-            }
-            let escaped = escape_sql_like_pattern(directory_path);
-            let query = "SELECT DISTINCT preferred.id AS source_id, mi.id AS item_id, mi.item_type,
-                        preferred.probe_status, series.id AS series_id,
-                        season.id AS season_id, season.season_number,
-                        lr.canonical_path AS root_path, preferred_entry.relative_path
-                 FROM media_sources queued
-                 JOIN filesystem_entries source_entry
-                   ON source_entry.id = queued.filesystem_entry_id
-                 JOIN media_items mi ON mi.id = queued.item_id
-                 JOIN media_sources preferred ON preferred.id = (
-                     SELECT candidate.id FROM media_sources candidate
-                     JOIN filesystem_entries candidate_entry
-                       ON candidate_entry.id = candidate.filesystem_entry_id
-                     WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
-                     ORDER BY candidate.is_default DESC, candidate.id
-                     LIMIT 1
+        let fallback_directories = referenced_directories
+            .iter()
+            .filter(|(library_root_id, directory_path)| {
+                !directory_path.is_empty()
+                    && !directories_with_direct_sources
+                        .contains(&(library_root_id.clone(), directory_path.clone()))
+            })
+            .collect::<Vec<_>>();
+        for directories in fallback_directories.chunks(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES) {
+            let values = std::iter::repeat_n("(?, ?, ?)", directories.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(library_root_id, directory_path, path_pattern) AS (
+                     VALUES {values}
+                 ), ranked AS (
+                     SELECT preferred.id AS source_id, mi.id AS item_id, mi.item_type,
+                            preferred.probe_status, series.id AS series_id,
+                            season.id AS season_id, season.season_number,
+                            lr.canonical_path AS root_path, preferred_entry.relative_path,
+                            requested.library_root_id, requested.directory_path,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY requested.library_root_id,
+                                             requested.directory_path, season.id
+                                ORDER BY mi.id
+                            ) AS season_rank
+                     FROM requested
+                     JOIN filesystem_entries source_entry
+                       ON source_entry.library_root_id = requested.library_root_id
+                      AND source_entry.relative_path LIKE requested.path_pattern ESCAPE '\\'
+                     JOIN media_sources queued
+                       ON queued.filesystem_entry_id = source_entry.id
+                     JOIN media_items mi ON mi.id = queued.item_id
+                     JOIN media_sources preferred ON preferred.id = (
+                         SELECT candidate.id FROM media_sources candidate
+                         JOIN filesystem_entries candidate_entry
+                           ON candidate_entry.id = candidate.filesystem_entry_id
+                         WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
+                         ORDER BY candidate.is_default DESC, candidate.id
+                         LIMIT 1
+                     )
+                     JOIN filesystem_entries preferred_entry
+                       ON preferred_entry.id = preferred.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
+                     LEFT JOIN media_items season
+                       ON season.id = mi.parent_id AND season.item_type = 'SEASON'
+                     LEFT JOIN media_items series
+                       ON series.id = mi.series_id AND series.item_type = 'SERIES'
+                     WHERE source_entry.entry_kind = 'FILE' AND source_entry.is_missing = 0
+                       AND mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
+                       AND preferred_entry.is_missing = 0
+                 ), season_sources AS (
+                     SELECT source_id, item_id, item_type, probe_status, series_id,
+                            season_id, season_number, root_path, relative_path,
+                            library_root_id, directory_path
+                     FROM ranked WHERE season_rank = 1
+                 ), directory_sources AS (
+                     SELECT source_id, item_id, item_type, probe_status, series_id,
+                            season_id, season_number, root_path, relative_path,
+                            library_root_id, directory_path,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY library_root_id, directory_path
+                                ORDER BY item_id
+                            ) AS directory_rank
+                     FROM season_sources
                  )
-                 JOIN filesystem_entries preferred_entry
-                   ON preferred_entry.id = preferred.filesystem_entry_id
-                 JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
-                 LEFT JOIN media_items season
-                   ON season.id = mi.parent_id AND season.item_type = 'SEASON'
-                 LEFT JOIN media_items series
-                   ON series.id = mi.series_id AND series.item_type = 'SERIES'
-                 WHERE source_entry.library_root_id = ?
-                   AND source_entry.relative_path LIKE ? ESCAPE '\\'
-                   AND source_entry.entry_kind = 'FILE' AND source_entry.is_missing = 0
-                   AND mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
-                   AND preferred_entry.is_missing = 0
-                 ORDER BY mi.id
-                 LIMIT ?";
-            let rows = self
-                .query(query)
-                .bind(library_root_id)
-                .bind(format!("{escaped}/%"))
-                .bind(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES as i64)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            let mut seen_seasons = std::collections::HashSet::new();
+                 SELECT source_id, item_id, item_type, probe_status, series_id,
+                        season_id, season_number, root_path, relative_path
+                 FROM directory_sources
+                 WHERE directory_rank <= {MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES}
+                 ORDER BY library_root_id, directory_path, item_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (library_root_id, directory_path) in directories {
+                let escaped = escape_sql_like_pattern(directory_path);
+                statement = statement
+                    .bind(library_root_id)
+                    .bind(directory_path)
+                    .bind(format!("{escaped}/%"));
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             for row in rows {
-                let season_id: String = row.get("season_id");
-                if !seen_seasons.insert(season_id) {
-                    continue;
-                }
                 sources.push(StoredScanLocalMetadataSource {
                     source_id: row.get("source_id"),
                     item_id: row.get("item_id"),

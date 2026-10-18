@@ -51,10 +51,26 @@ struct FileIndexWriteOptions {
     batch_size: usize,
 }
 
-struct MovieParentFolderBatch<'a, 'file> {
+trait ParentFolderFile {
+    fn relative_path(&self) -> &str;
+}
+
+impl ParentFolderFile for &NewMovieFile {
+    fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl ParentFolderFile for NewScanManifestUnresolvedFile {
+    fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+struct MovieParentFolderBatch<'a, T> {
     library_id: &'a str,
     library_root_id: &'a str,
-    files: &'a [&'file NewMovieFile],
+    files: &'a [T],
     folder_cache: &'a mut HashMap<String, String>,
     touched_folders: &'a mut HashSet<String>,
     batch_size: usize,
@@ -1134,118 +1150,181 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
+    pub(crate) async fn materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
         library_root_id: &str,
-        file: &NewScanManifestUnresolvedFile,
+        files: &[NewScanManifestUnresolvedFile],
     ) -> Result<(), StorageError> {
-        let item_type = if file.home_video {
-            "VIDEO"
-        } else {
-            "UNRESOLVED"
-        };
-        let identification_status = if file.home_video {
-            "LOCAL_CONFIRMED"
-        } else {
-            "PENDING"
-        };
-        let parent_id = self
-            .ensure_movie_parent_folder_in_transaction(
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut folder_cache = self
+            .prefetch_movie_folders_in_transaction(
                 &mut *transaction,
-                library_id,
                 library_root_id,
-                &file.relative_path,
+                files,
+                BATCH_INSERT_CHUNK_SIZE,
             )
             .await?;
-        let existing_item_id = self
-            .query_scalar::<String>(
-                "SELECT id FROM media_items
-                 WHERE library_id = ? AND identity_key = ? LIMIT 1",
-            )
-            .bind(library_id)
-            .bind(&file.identity_key)
-            .fetch_optional(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let item_id = if let Some(item_id) = existing_item_id {
-            self.query(
-                "UPDATE media_items
-                 SET item_type = ?, parent_id = ?, title = ?, sort_title = ?,
-                     original_title = ?, identification_status = ?, removed_at = NULL,
-                     updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(item_type)
-            .bind(parent_id.as_deref())
-            .bind(&file.title)
-            .bind(file.title.to_lowercase())
-            .bind(&file.title)
-            .bind(identification_status)
-            .bind(&item_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            item_id
+        let mut touched_folders = HashSet::new();
+        self.insert_missing_movie_parent_folders_in_transaction(
+            &mut *transaction,
+            MovieParentFolderBatch {
+                library_id,
+                library_root_id,
+                files,
+                folder_cache: &mut folder_cache,
+                touched_folders: &mut touched_folders,
+                batch_size: BATCH_INSERT_CHUNK_SIZE,
+            },
+        )
+        .await?;
+        self.refresh_existing_movie_parent_folders_in_transaction(
+            &mut *transaction,
+            MovieParentFolderBatch {
+                library_id,
+                library_root_id,
+                files,
+                folder_cache: &mut folder_cache,
+                touched_folders: &mut touched_folders,
+                batch_size: BATCH_INSERT_CHUNK_SIZE,
+            },
+        )
+        .await?;
+
+        let parent_ids = files
+            .iter()
+            .map(|file| {
+                movie_parent_folder_id_from_cache(
+                    library_root_id,
+                    &file.relative_path,
+                    &folder_cache,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let unique_identities = files
+            .iter()
+            .map(|file| &file.identity_key)
+            .collect::<HashSet<_>>();
+        // PostgreSQL rejects an UPSERT that affects the same conflict target twice.
+        // Keep input-order updates for duplicate identities, matching the old per-file path.
+        let item_batch_size = if unique_identities.len() == files.len() {
+            BATCH_INSERT_CHUNK_SIZE
         } else {
-            self.query(
+            1
+        };
+        for (chunk, parent_chunk) in files
+            .chunks(item_batch_size)
+            .zip(parent_ids.chunks(item_batch_size))
+        {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, 1)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut item_write = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO media_items (
                      id, library_id, item_type, parent_id, title, sort_title,
-                     original_title, identification_status, identity_key,
-                     has_available_source
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
-            )
-            .bind(&file.item_id)
-            .bind(library_id)
-            .bind(item_type)
-            .bind(parent_id.as_deref())
-            .bind(&file.title)
-            .bind(file.title.to_lowercase())
-            .bind(&file.title)
-            .bind(identification_status)
-            .bind(&file.identity_key)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            file.item_id.clone()
-        };
-        self.query(
-            "INSERT INTO media_sources (
-                 id, item_id, source_kind, filesystem_entry_id, container, size,
-                 external_url, strm_target_kind, is_default, probe_status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                 CASE WHEN EXISTS (
-                     SELECT 1 FROM media_sources WHERE item_id = ? AND is_default = 1
-                 ) THEN 0 ELSE 1 END,
-                 CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
-        )
-        .bind(&file.source_id)
-        .bind(&item_id)
-        .bind(&file.source_kind)
-        .bind(&file.filesystem_entry_id)
-        .bind(&file.container)
-        .bind(file.size)
-        .bind(file.external_url.as_deref())
-        .bind(file.strm_target_kind.as_deref())
-        .bind(&item_id)
-        .bind(&file.source_kind)
-        .execute(&mut **transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+                     original_title, identification_status, identity_key, has_available_source
+                 ) VALUES {values}
+                 ON CONFLICT(identity_key) WHERE identity_key IS NOT NULL DO UPDATE SET
+                     item_type = excluded.item_type, parent_id = excluded.parent_id,
+                     title = excluded.title, sort_title = excluded.sort_title,
+                     original_title = excluded.original_title,
+                     identification_status = excluded.identification_status,
+                     removed_at = NULL, updated_at = unixepoch()
+                 WHERE media_items.library_id = excluded.library_id
+                 RETURNING id, identity_key"
+            )));
+            for (file, parent_id) in chunk.iter().zip(parent_chunk) {
+                item_write = item_write
+                    .bind(&file.item_id)
+                    .bind(library_id)
+                    .bind(if file.home_video {
+                        "VIDEO"
+                    } else {
+                        "UNRESOLVED"
+                    })
+                    .bind(parent_id.as_deref())
+                    .bind(&file.title)
+                    .bind(file.title.to_lowercase())
+                    .bind(&file.title)
+                    .bind(if file.home_video {
+                        "LOCAL_CONFIRMED"
+                    } else {
+                        "PENDING"
+                    })
+                    .bind(&file.identity_key);
+            }
+            let item_ids = item_write
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>("identity_key")?,
+                        row.try_get::<String, _>("id")?,
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>, sqlx::Error>>()
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let source_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut source_insert = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH incoming(
+                     id, item_id, source_kind, filesystem_entry_id, container,
+                     size, external_url, strm_target_kind
+                 ) AS (VALUES {source_values})
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, container,
+                     size, external_url, strm_target_kind, is_default, probe_status
+                 )
+                 SELECT incoming.id, incoming.item_id, incoming.source_kind,
+                        incoming.filesystem_entry_id, incoming.container, incoming.size,
+                        incoming.external_url, incoming.strm_target_kind,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM media_sources existing
+                            WHERE existing.item_id = incoming.item_id AND existing.is_default = 1
+                        ) THEN 0 ELSE 1 END,
+                        CASE WHEN incoming.source_kind = 'STRM_URL'
+                             THEN 'NOT_CONFIGURED' ELSE 'PENDING' END
+                 FROM incoming"
+            )));
+            for file in chunk {
+                let item_id = item_ids.get(&file.identity_key).ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest unresolved item was not materialized".to_owned(),
+                    )
+                })?;
+                source_insert = source_insert
+                    .bind(&file.source_id)
+                    .bind(item_id)
+                    .bind(&file.source_kind)
+                    .bind(&file.filesystem_entry_id)
+                    .bind(&file.container)
+                    .bind(file.size)
+                    .bind(file.external_url.as_deref())
+                    .bind(file.strm_target_kind.as_deref());
+            }
+            source_insert
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
     }
 
     async fn ensure_movie_parent_folder_in_transaction(
@@ -1430,22 +1509,22 @@ impl Database {
         Ok(movie_items)
     }
 
-    async fn prefetch_movie_folders_in_transaction(
+    async fn prefetch_movie_folders_in_transaction<T: ParentFolderFile>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_root_id: &str,
-        files: &[&NewMovieFile],
+        files: &[T],
         batch_size: usize,
     ) -> Result<HashMap<String, String>, StorageError> {
         let mut identity_keys = HashSet::new();
         for file in files {
             let mut directory_key = String::new();
             let directory = file
-                .relative_path
+                .relative_path()
                 .rsplit_once('/')
                 .map(|(directory, _)| directory)
                 .or_else(|| {
-                    file.relative_path
+                    file.relative_path()
                         .rsplit_once('\\')
                         .map(|(directory, _)| directory)
                 })
@@ -1503,10 +1582,10 @@ impl Database {
         Ok(folders)
     }
 
-    async fn insert_missing_movie_parent_folders_in_transaction(
+    async fn insert_missing_movie_parent_folders_in_transaction<T: ParentFolderFile>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        batch: MovieParentFolderBatch<'_, '_>,
+        batch: MovieParentFolderBatch<'_, T>,
     ) -> Result<(), StorageError> {
         let MovieParentFolderBatch {
             library_id,
@@ -1519,11 +1598,11 @@ impl Database {
         let mut missing = HashMap::<String, MovieParentFolderToInsert>::new();
         for file in files {
             let directory = file
-                .relative_path
+                .relative_path()
                 .rsplit_once('/')
                 .map(|(directory, _)| directory)
                 .or_else(|| {
-                    file.relative_path
+                    file.relative_path()
                         .rsplit_once('\\')
                         .map(|(directory, _)| directory)
                 })
@@ -1681,10 +1760,10 @@ impl Database {
         Ok(())
     }
 
-    async fn refresh_existing_movie_parent_folders_in_transaction(
+    async fn refresh_existing_movie_parent_folders_in_transaction<T: ParentFolderFile>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        batch: MovieParentFolderBatch<'_, '_>,
+        batch: MovieParentFolderBatch<'_, T>,
     ) -> Result<(), StorageError> {
         let MovieParentFolderBatch {
             library_id,
@@ -1697,11 +1776,11 @@ impl Database {
         let mut updates = HashMap::<String, MovieParentFolderUpdate>::new();
         for file in files {
             let directory = file
-                .relative_path
+                .relative_path()
                 .rsplit_once('/')
                 .map(|(directory, _)| directory)
                 .or_else(|| {
-                    file.relative_path
+                    file.relative_path()
                         .rsplit_once('\\')
                         .map(|(directory, _)| directory)
                 })
@@ -2931,6 +3010,7 @@ impl Database {
     where
         I: IntoIterator<Item = &'a BatchHierarchyRow>,
     {
+        let mut updates = Vec::new();
         for row in rows {
             if !removed_identities.contains(&row.identity_key) {
                 continue;
@@ -2938,27 +3018,52 @@ impl Database {
             let Some(item_id) = ids.get(&row.identity_key) else {
                 continue;
             };
-            self.query(
-                "UPDATE media_items
-                 SET library_id = ?, item_type = ?, parent_id = ?, series_id = ?,
-                     season_number = ?, episode_number = ?, absolute_number = ?,
+            updates.push((item_id.as_str(), row));
+        }
+        for chunk in updates.chunks(100) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH revive(id, library_id, item_type, parent_id, series_id,
+                              season_number, episode_number, absolute_number) AS (
+                    VALUES {values}
+                 )
+                 UPDATE media_items
+                 SET library_id = (SELECT library_id FROM revive WHERE revive.id = media_items.id),
+                     item_type = (SELECT item_type FROM revive WHERE revive.id = media_items.id),
+                     parent_id = (SELECT parent_id FROM revive WHERE revive.id = media_items.id),
+                     series_id = (SELECT series_id FROM revive WHERE revive.id = media_items.id),
+                     season_number = (SELECT season_number FROM revive WHERE revive.id = media_items.id),
+                     episode_number = (SELECT episode_number FROM revive WHERE revive.id = media_items.id),
+                     absolute_number = (SELECT absolute_number FROM revive WHERE revive.id = media_items.id),
                      removed_at = NULL, updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(&row.library_id)
-            .bind(row.item_type)
-            .bind(row.parent_id.as_deref())
-            .bind(row.series_id.as_deref())
-            .bind(row.season_number)
-            .bind(row.episode_number)
-            .bind(row.absolute_number)
-            .bind(item_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 WHERE id IN ({placeholders})"
+            )));
+            for (item_id, row) in chunk {
+                query = query
+                    .bind(item_id)
+                    .bind(&row.library_id)
+                    .bind(row.item_type)
+                    .bind(row.parent_id.as_deref())
+                    .bind(row.series_id.as_deref())
+                    .bind(row.season_number)
+                    .bind(row.episode_number)
+                    .bind(row.absolute_number);
+            }
+            for (item_id, _) in chunk {
+                query = query.bind(item_id);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }

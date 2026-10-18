@@ -1,5 +1,7 @@
 use super::*;
 
+const SCAN_MANIFEST_ROOT_BATCH_SIZE: usize = 100;
+
 impl Database {
     pub(crate) async fn create_full_scan_manifest_job(
         &self,
@@ -86,19 +88,26 @@ impl Database {
         manifest: &NewScanManifest<'_>,
         root_count: i64,
     ) -> Result<(), StorageError> {
-        for root in manifest.roots {
-            let created_root = self
-                .query(
-                    "INSERT INTO scan_manifest_roots (
-                         manifest_id, library_root_id, state, directory_count,
-                         postprocessing_target_stage
-                     )
-                     SELECT ?, lr.id, 'PENDING', 1, 'NEW'
-                     FROM library_roots lr
-                     WHERE lr.id = ? AND lr.library_id = ?",
-                )
+        for chunk in manifest.roots.chunks(SCAN_MANIFEST_ROOT_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut insert = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH requested(library_root_id) AS (VALUES {values})
+                 INSERT INTO scan_manifest_roots (
+                     manifest_id, library_root_id, state, directory_count,
+                     postprocessing_target_stage
+                 )
+                 SELECT ?, requested.library_root_id, 'PENDING', 1, 'NEW'
+                 FROM requested
+                 JOIN library_roots lr ON lr.id = requested.library_root_id
+                 WHERE lr.library_id = ?"
+            )));
+            for root in chunk {
+                insert = insert.bind(root.library_root_id);
+            }
+            let inserted = insert
                 .bind(manifest.id)
-                .bind(root.library_root_id)
                 .bind(manifest.library_id)
                 .execute(&mut **transaction)
                 .await
@@ -106,25 +115,57 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            if created_root.rows_affected() != 1 {
+            if usize::try_from(inserted.rows_affected()).unwrap_or(usize::MAX) != chunk.len() {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut valid_query = self.query(sqlx::AssertSqlSafe(format!(
+                    "SELECT id FROM library_roots
+                     WHERE library_id = ? AND id IN ({placeholders})"
+                )));
+                valid_query = valid_query.bind(manifest.library_id);
+                for root in chunk {
+                    valid_query = valid_query.bind(root.library_root_id);
+                }
+                let valid = valid_query
+                    .fetch_all(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("id"))
+                    .collect::<HashSet<_>>();
+                let missing = chunk
+                    .iter()
+                    .find(|root| !valid.contains(root.library_root_id))
+                    .map(|root| root.library_root_id)
+                    .unwrap_or("unknown");
                 return Err(StorageError::Conflict(format!(
-                    "library root {} does not belong to the manifest library",
-                    root.library_root_id
+                    "library root {missing} does not belong to the manifest library"
                 )));
             }
-            self.query(
+        }
+        for chunk in manifest.roots.chunks(SCAN_MANIFEST_ROOT_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, '', 'PENDING')", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut insert = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO scan_manifest_directories (
                      manifest_id, library_root_id, relative_path, state
-                 ) VALUES (?, ?, '', 'PENDING')",
-            )
-            .bind(manifest.id)
-            .bind(root.library_root_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {values}"
+            )));
+            for root in chunk {
+                insert = insert.bind(manifest.id).bind(root.library_root_id);
+            }
+            insert
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         self.query(
             "UPDATE scan_manifests

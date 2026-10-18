@@ -129,6 +129,7 @@ impl Database {
 
         let mut changed_sidecar_paths = Vec::new();
         let mut existing_updates = Vec::new();
+        let mut unresolved_files_to_materialize = Vec::new();
         let positive_change_application_started = Instant::now();
 
         for positive in positives {
@@ -141,13 +142,7 @@ impl Database {
                         NewScanManifestIndexedFile::Movie(_)
                         | NewScanManifestIndexedFile::Episode(_) => {}
                         NewScanManifestIndexedFile::Unresolved(file) => {
-                            self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
-                                transaction,
-                                library_id,
-                                library_root_id,
-                                file,
-                            )
-                            .await?;
+                            unresolved_files_to_materialize.push(file.clone());
                             result.created_items = result.created_items.saturating_add(1);
                         }
                         NewScanManifestIndexedFile::Sidecar(_) => {
@@ -271,6 +266,14 @@ impl Database {
                 }
             }
         }
+
+        self.materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
+            transaction,
+            library_id,
+            library_root_id,
+            &unresolved_files_to_materialize,
+        )
+        .await?;
 
         let applied_existing_ids = self
             .apply_manifest_existing_files_batch_in_transaction(transaction, &existing_updates)

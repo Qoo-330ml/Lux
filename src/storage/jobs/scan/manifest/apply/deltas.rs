@@ -39,6 +39,29 @@ impl Database {
         let mut removed_sidecar_paths = Vec::new();
         let mut removed_media_entry_ids = Vec::new();
         let mut delta_updates = Vec::with_capacity(batch.deltas.len());
+        let unresolved_files_to_materialize = batch
+            .deltas
+            .iter()
+            .filter(|delta| {
+                delta.delta_kind == "ADD"
+                    && !unstable_ids.contains(delta.id.as_str())
+                    && claimed_add_paths.contains(&delta.relative_path)
+                    && root_state.as_deref() == Some("COMPLETE")
+            })
+            .filter_map(|delta| unresolved_files.get(delta.relative_path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
+            transaction,
+            batch.library_id,
+            batch.library_root_id,
+            &unresolved_files_to_materialize,
+        )
+        .await?;
+        result.created_items = result
+            .created_items
+            .saturating_add(unresolved_files_to_materialize.len());
+
         for delta in batch.deltas {
             let mut state = "APPLIED";
             let mut error = None;
@@ -105,20 +128,8 @@ impl Database {
                             false
                         } else if movie_files.contains_key(delta.relative_path.as_str())
                             || episode_files.contains_key(delta.relative_path.as_str())
+                            || unresolved_files.contains_key(delta.relative_path.as_str())
                         {
-                            new_paths.push(delta.relative_path.clone());
-                            true
-                        } else if let Some(file) =
-                            unresolved_files.get(delta.relative_path.as_str())
-                        {
-                            self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
-                                transaction,
-                                batch.library_id,
-                                batch.library_root_id,
-                                file,
-                            )
-                            .await?;
-                            result.created_items = result.created_items.saturating_add(1);
                             new_paths.push(delta.relative_path.clone());
                             true
                         } else if sidecar_entries.contains_key(delta.relative_path.as_str()) {

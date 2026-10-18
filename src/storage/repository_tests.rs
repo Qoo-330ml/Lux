@@ -762,6 +762,229 @@ async fn local_nfo_state_batch_rolls_back_metadata_and_fills_only_missing_defaul
 }
 
 #[tokio::test]
+async fn scan_local_metadata_sources_batch_nested_series_directories() {
+    const DIRECTORY_COUNT: usize = 205;
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Local metadata sources", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, root_path.to_str().expect("media root"))
+        .await
+        .expect("root");
+    let root_id = root.root.id.to_string();
+    let library_id = library.id.to_string();
+    let mut poster_entry_ids = Vec::with_capacity(DIRECTORY_COUNT);
+    for index in 0..DIRECTORY_COUNT {
+        let series_id = format!("local-source-series-{index:03}");
+        let season_id = format!("local-source-season-{index:03}");
+        let episode_id = format!("local-source-episode-{index:03}");
+        let poster_entry_id = format!("local-source-poster-entry-{index:03}");
+        let episode_entry_id = format!("local-source-episode-entry-{index:03}");
+        let directory = format!("Series {index:03}");
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status)
+             VALUES (?, ?, 'SERIES', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&series_id)
+        .bind(&library_id)
+        .bind(&series_id)
+        .bind(&series_id)
+        .execute(database.pool())
+        .await
+        .expect("series");
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, parent_id, series_id, season_number,
+                  title, sort_title, identification_status)
+             VALUES (?, ?, 'SEASON', ?, ?, 1, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&season_id)
+        .bind(&library_id)
+        .bind(&series_id)
+        .bind(&series_id)
+        .bind(&season_id)
+        .bind(&season_id)
+        .execute(database.pool())
+        .await
+        .expect("season");
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, parent_id, series_id, season_number,
+                  episode_number, title, sort_title, identification_status)
+             VALUES (?, ?, 'EPISODE', ?, ?, 1, 1, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&episode_id)
+        .bind(&library_id)
+        .bind(&season_id)
+        .bind(&series_id)
+        .bind(&episode_id)
+        .bind(&episode_id)
+        .execute(database.pool())
+        .await
+        .expect("episode");
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &poster_entry_id,
+                library_root_id: &root_id,
+                relative_path: &format!("{directory}/poster.jpg"),
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                inode: None,
+                fingerprint: b"poster",
+                last_seen_generation: "generation",
+            })
+            .await
+            .expect("poster entry");
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &episode_entry_id,
+                library_root_id: &root_id,
+                relative_path: &format!("{directory}/Season 1/Episode.mkv"),
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                inode: None,
+                fingerprint: b"episode",
+                last_seen_generation: "generation",
+            })
+            .await
+            .expect("episode entry");
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default)
+             VALUES (?, ?, 'LOCAL_FILE', ?, 1)",
+        )
+        .bind(format!("local-source-media-source-{index:03}"))
+        .bind(&episode_id)
+        .bind(&episode_entry_id)
+        .execute(database.pool())
+        .await
+        .expect("episode source");
+        poster_entry_ids.push(poster_entry_id);
+    }
+
+    database.reset_query_count();
+    let sources = database
+        .list_scan_local_metadata_sources(&poster_entry_ids)
+        .await
+        .expect("local metadata sources");
+    assert_eq!(sources.len(), DIRECTORY_COUNT);
+    assert_eq!(database.query_count(), 4);
+}
+
+#[tokio::test]
+async fn manifest_unresolved_files_use_bounded_batch_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    const FILE_COUNT: usize = 205;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Manifest unresolved", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = LibraryService::new(database.clone())
+        .add_root(
+            library.id,
+            root_path.to_str().ok_or("non-UTF-8 media root")?,
+        )
+        .await?;
+    let root_id = root.root.id.to_string();
+    let mut files = Vec::with_capacity(FILE_COUNT);
+    for index in 0..FILE_COUNT {
+        let relative_path = format!("folder-{index}/video-{index}.mkv");
+        let filesystem_entry_id = format!("unresolved-entry-{index}");
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &filesystem_entry_id,
+                library_root_id: &root_id,
+                relative_path: &relative_path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                inode: None,
+                fingerprint: b"fixture",
+                last_seen_generation: "generation",
+            })
+            .await?;
+        files.push(NewScanManifestUnresolvedFile {
+            item_id: format!("unresolved-item-{index}"),
+            filesystem_entry_id,
+            source_id: format!("unresolved-source-{index}"),
+            relative_path,
+            size: 1,
+            modified_at: 1,
+            inode: None,
+            fingerprint: b"fixture".to_vec(),
+            title: format!("Video {index}"),
+            identity_key: format!("unresolved:{root_id}:video-{index}"),
+            source_kind: "LOCAL_FILE".to_owned(),
+            container: "mkv".to_owned(),
+            external_url: None,
+            strm_target_kind: None,
+            home_video: false,
+        });
+    }
+
+    let mut transaction = database.pool().begin().await?;
+    database.reset_query_count();
+    database
+        .materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
+            &mut transaction,
+            &library_id,
+            &root_id,
+            &files,
+        )
+        .await?;
+    assert_eq!(database.query_count(), 12);
+    transaction.commit().await?;
+
+    let item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = 'UNRESOLVED'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources WHERE source_kind = 'LOCAL_FILE'
+         AND item_id IN (SELECT id FROM media_items WHERE library_id = ?)",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    let parent_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items item
+         JOIN media_items parent ON item.parent_id = parent.id
+         WHERE item.library_id = ? AND item.item_type = 'UNRESOLVED'
+           AND parent.item_type = 'FOLDER'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_count, FILE_COUNT as i64);
+    assert_eq!(source_count, FILE_COUNT as i64);
+    assert_eq!(parent_count, FILE_COUNT as i64);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -1845,6 +2068,105 @@ async fn thumbnail_scraper_retries_are_persisted_and_claimed_at_due_times() {
     assert_eq!(completed.attempt_count, 3);
     assert_eq!(completed.first_attempt_at, first_attempt_at);
     assert_eq!(completed.next_retry_at, None);
+}
+
+#[tokio::test]
+async fn thumbnail_scraper_retry_claims_use_one_bounded_update() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('retry-lib', 'Retries', 'MOVIE')")
+        .execute(database.pool())
+        .await
+        .expect("retry library");
+    sqlx::query(
+        "WITH RECURSIVE numbers(n) AS (
+             SELECT 0 UNION ALL SELECT n + 1 FROM numbers WHERE n < 204
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         )
+         SELECT 'retry-item-' || printf('%03d', n), 'retry-lib', 'MOVIE',
+                'Retry ' || n, 'retry ' || n, 'LOCAL_CONFIRMED'
+         FROM numbers",
+    )
+    .execute(database.pool())
+    .await
+    .expect("retry items");
+    for index in 0..205 {
+        assert!(
+            database
+                .ensure_thumbnail_scraper_retry(&format!("retry-item-{index:03}"), 1, 10)
+                .await
+                .expect("seed retry")
+        );
+    }
+
+    database.reset_query_count();
+    let claimed = database
+        .claim_due_thumbnail_scraper_retries(10, 20, 128)
+        .await
+        .expect("claim retries");
+    assert_eq!(claimed.len(), 100);
+    assert_eq!(database.query_count(), 2);
+    assert!(
+        claimed
+            .windows(2)
+            .all(|pair| pair[0].item_id < pair[1].item_id)
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thumbnail_scraper_retries WHERE status = 'PENDING'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("pending retries");
+    assert_eq!(pending, 105);
+    let claimed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thumbnail_scraper_retries
+         WHERE status = 'RUNNING' AND claimed_until = 20 AND updated_at = 10",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("claim lease");
+    assert_eq!(claimed_count, 100);
+    let remaining = database
+        .claim_due_thumbnail_scraper_retries(19, 30, 100)
+        .await
+        .expect("claim other pending retries");
+    assert_eq!(remaining.len(), 100);
+    assert_eq!(remaining[0].item_id, "retry-item-100");
+    assert_eq!(
+        database
+            .claim_due_thumbnail_scraper_retries(19, 30, 100)
+            .await
+            .expect("claim tail")
+            .len(),
+        5
+    );
+    database.reset_query_count();
+    assert!(
+        database
+            .claim_due_thumbnail_scraper_retries(19, 30, 100)
+            .await
+            .expect("no early reclaim")
+            .is_empty()
+    );
+    assert_eq!(database.query_count(), 1);
+    database.reset_query_count();
+    let reclaimed = database
+        .claim_due_thumbnail_scraper_retries(20, 40, 100)
+        .await
+        .expect("reclaim expired lease");
+    assert_eq!(reclaimed.len(), 100);
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(reclaimed[0].item_id, "retry-item-000");
+    assert!(reclaimed.iter().all(|retry| retry.status == "RUNNING"
+        && retry.attempt_count == 1
+        && retry.first_attempt_at == 1
+        && retry.next_retry_at == Some(10)));
 }
 
 #[tokio::test]
