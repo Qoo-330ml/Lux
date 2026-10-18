@@ -12730,6 +12730,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：后台 worker 每分钟最多原子清理 50 个已到期账号；恢复后的账号不匹配删除条件，头像清理逐项执行。Cargo build、fmt check 与 diff check 通过。Clippy 检查发现用户创建函数参数数量和排序枚举命名两项 lint，分别在 LUX-604、LUX-605 跟进；未运行测试或部署。
 
+#### LUX-604：整理用户创建存储输入
+
+范围：将用户创建存储方法的身份、凭证、初始权限和邮箱字段收敛为命名输入结构，保持 SQL、绑定顺序和账户创建行为不变，以消除参数数量 lint。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/auth/users.rs`。
+
+验收标准：
+
+- [x] 新结构涵盖原调用的所有字段；SQLite/PostgreSQL 插入 SQL 和绑定顺序不变。
+- [x] Rust 构建、格式检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-595。
+
+结果（2026-10-19）：`NewStoredUser` 命名输入结构取代七个独立字段参数，SQL 和绑定顺序未变。Cargo build、fmt check 与 diff check 通过；未运行测试。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

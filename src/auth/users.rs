@@ -2,8 +2,8 @@ use crate::{
     auth::password::{PasswordError, PasswordService},
     domain::ids::UserId,
     storage::{
-        AdminUserSortField, AdminUserStatusFilter, Database, StorageError, StoredAdminUserListItem,
-        UpdateUser,
+        AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser, StorageError,
+        StoredAdminUserListItem, UpdateUser,
     },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -138,15 +138,15 @@ impl UserStore {
         let id = UserId::new();
 
         self.database
-            .insert_user_with_email(
-                &id.to_string(),
-                &username_normalized,
-                &display_name,
-                &password_hash,
+            .insert_user_with_email(NewStoredUser {
+                id: &id.to_string(),
+                username_normalized: &username_normalized,
+                display_name: &display_name,
+                password_hash: &password_hash,
                 is_admin,
-                true,
-                email.as_deref(),
-            )
+                has_password: true,
+                email: email.as_deref(),
+            })
             .await?;
 
         Ok(UserRecord {

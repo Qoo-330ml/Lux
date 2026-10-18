@@ -577,7 +577,7 @@ pub(crate) use repository::{
     NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestFilesystemEntry,
     NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
     NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile,
-    NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
+    NewStoredUser, NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
     PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReconciliationBatchCommit,
     ReconciliationBatchCommitResult, ResumeItemsQuery, ScanFingerprintMigrationCommit,
     ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate, StoredAccessTokenDevice,

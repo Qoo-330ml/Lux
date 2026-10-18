@@ -74,27 +74,21 @@ impl Database {
         is_admin: bool,
         has_password: bool,
     ) -> Result<(), StorageError> {
-        self.insert_user_with_email(
+        self.insert_user_with_email(NewStoredUser {
             id,
             username_normalized,
             display_name,
             password_hash,
             is_admin,
             has_password,
-            None,
-        )
+            email: None,
+        })
         .await
     }
 
     pub(crate) async fn insert_user_with_email(
         &self,
-        id: &str,
-        username_normalized: &str,
-        display_name: &str,
-        password_hash: &str,
-        is_admin: bool,
-        has_password: bool,
-        email: Option<&str>,
+        user: NewStoredUser<'_>,
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO users (
@@ -102,14 +96,14 @@ impl Database {
                 is_admin, can_manage_server, has_password, email
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(id)
-        .bind(username_normalized)
-        .bind(display_name)
-        .bind(password_hash)
-        .bind(database_flag(is_admin))
-        .bind(database_flag(is_admin))
-        .bind(database_flag(has_password))
-        .bind(email)
+        .bind(user.id)
+        .bind(user.username_normalized)
+        .bind(user.display_name)
+        .bind(user.password_hash)
+        .bind(database_flag(user.is_admin))
+        .bind(database_flag(user.is_admin))
+        .bind(database_flag(user.has_password))
+        .bind(user.email)
         .execute(&self.pool)
         .await
         .map(|_| ())

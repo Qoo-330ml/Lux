@@ -1054,6 +1054,16 @@ pub(crate) struct StoredUser {
     pub(crate) last_activity_at: Option<i64>,
 }
 
+pub(crate) struct NewStoredUser<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) username_normalized: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password_hash: &'a str,
+    pub(crate) is_admin: bool,
+    pub(crate) has_password: bool,
+    pub(crate) email: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminUserStatusFilter {
     All,
