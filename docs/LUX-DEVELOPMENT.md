@@ -12387,6 +12387,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完成门禁（2026-10-18）：Rust 格式、build 和 Clippy 通过；扫描计数与管理员 API 定向测试通过。`cargo test --locked --all-targets` 在既有的 NFO actor-credit 回归失败，且该失败已在任务基线 `62c1d2ac` 上复现。完整 Web Vitest 为 651 通过、4 个无关失败；`pnpm --dir web test` 还在静态布局阶段因 3 条首页/触屏 CSS 断言失败而未启动 Vitest。
 
+### 扫描后处理诊断与重试修复
+
+本组修复保留 `COMPLETED`、`JOB_COMPLETED` 和 `ScanCompleted` 的索引完成语义。管理员任务接口通过附加的后处理问题标记和重试能力呈现未完成工作；旧 workflow 与 workflow 2/3 仍沿用各自的检查点恢复合同。
+
+#### LUX-584：保留扫描后处理失败错误码
+
+范围：后处理失败收尾仍进入 `COMPLETED/IDLE`，在现有 `error` 字段保存稳定的 `POSTPROCESSING_FAILED`。重试开始和后处理成功时清除错误；不变更数据库状态集合或完成通知时序。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`tests/scanning_jobs.rs`、`tests/postgres_database.rs`。
+
+验收：
+
+- [x] 失败目标和 workflow 3 目标物化失败均保留稳定错误码及可恢复状态。
+- [x] 恢复后重试清除错误，已完成目标与游标不被重置。
+- [x] SQLite 扫描回归及 PostgreSQL 对应合同通过。
+
+验证：`cargo test --locked --test scanning_jobs` 中后处理失败/恢复相关用例；PostgreSQL 对应恢复用例。
+
+后续增量依次补存储诊断、管理员 API 和 Web 流程，每个增量完成后再进入下一项。
+
+结果（2026-10-18）：先确认旧实现无法保留错误码，再补最小存储修复。SQLite 后处理回归 8/8、根目录替换恢复 1/1，以及本地 PostgreSQL 16 workflow 3 恢复 1/1 通过；重试开始和最终成功均清除错误码。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

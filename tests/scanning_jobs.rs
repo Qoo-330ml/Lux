@@ -7796,8 +7796,8 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
             .is_err()
     );
 
-    let postprocessing_failure: (String, String, i64) = sqlx::query_as(
-        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready
+    let postprocessing_failure: (String, String, i64, Option<String>) = sqlx::query_as(
+        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready, job.error
          FROM scan_jobs job
          JOIN scan_manifests manifest ON manifest.job_id = job.id
          WHERE job.id = ?",
@@ -7807,7 +7807,12 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
     .await?;
     assert_eq!(
         postprocessing_failure,
-        ("COMPLETED".to_owned(), "IDLE".to_owned(), 0)
+        (
+            "COMPLETED".to_owned(),
+            "IDLE".to_owned(),
+            0,
+            Some("POSTPROCESSING_FAILED".to_owned())
+        )
     );
     let log_events = scan_job_log_events(&config.config_dir, &reconciliation.id).await?;
     assert!(
@@ -8821,7 +8826,7 @@ async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
             .await?;
     assert_eq!(status.0, "COMPLETED");
     assert_eq!(status.1, "IDLE");
-    assert_eq!(status.2, None);
+    assert_eq!(status.2.as_deref(), Some("POSTPROCESSING_FAILED"));
     let target_state: String = sqlx::query_scalar(
         "SELECT probe_state FROM scan_job_targets WHERE job_id = ? AND target_type = 'SOURCE'",
     )
@@ -8844,18 +8849,22 @@ async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
     assert_eq!(retried.id, job.id);
     assert_eq!(retried.status, "COMPLETED");
     assert_eq!(retried.scan_phase, "POSTPROCESSING");
+    assert_eq!(retried.error, None);
     let succeeding_probe = MediaProbeService::new(
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
     );
     jobs.run_to_completion(&job.id, 100, Some(succeeding_probe))
         .await?;
-    let final_status: (String, String) =
-        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+    let final_status: (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, scan_phase, error FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(final_status, ("COMPLETED".to_owned(), "IDLE".to_owned()));
+    assert_eq!(
+        final_status,
+        ("COMPLETED".to_owned(), "IDLE".to_owned(), None)
+    );
     Ok(())
 }
 

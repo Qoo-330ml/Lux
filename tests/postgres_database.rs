@@ -1631,6 +1631,11 @@ async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
             "NEW".to_owned(),
         )
     );
+    let error: Option<String> = sqlx::query_scalar("SELECT error FROM scan_jobs WHERE id = $1")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(error.as_deref(), Some("POSTPROCESSING_FAILED"));
     let (_, events) = LogStore::new(&config.config_dir)
         .list_scan_job_events(&job.id, None, None, 0, 100)
         .await?;
@@ -1644,6 +1649,7 @@ async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
     fs::rename(&backup, &root)?;
     let retried = jobs.retry(&job.id).await?;
     assert_eq!(retried.id, job.id);
+    assert_eq!(retried.error, None);
     jobs.run_to_completion(&job.id, 100, None).await?;
 
     let resumed_checkpoint: (String, String, i64, i64, i64, i64) = sqlx::query_as(

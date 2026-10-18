@@ -569,7 +569,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'COMPLETED', error = NULL, cursor = NULL,
+                 SET status = 'COMPLETED', error = 'POSTPROCESSING_FAILED', cursor = NULL,
                      current_item = NULL, cancel_requested = 0,
                      scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
                      updated_at = unixepoch()
