@@ -2057,15 +2057,17 @@ pub(super) async fn emby_delete_user_avatar(
 }
 
 pub(super) async fn emby_ordered_views(state: &AppState, user: &UserRecord) -> Vec<String> {
-    let (Some(libraries), Some(access)) = (state.libraries.as_ref(), state.access.as_ref()) else {
+    let Some(libraries) = state.libraries.as_ref() else {
         return Vec::new();
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let Ok(accessible_library_ids) = access.accessible_library_ids(principal).await else {
+    let Ok((order_scope, _)) =
+        super::emby_catalog::emby_library_order_scope(state, principal).await
+    else {
         return Vec::new();
     };
     libraries
-        .saved_library_order_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
+        .saved_library_order_for_user(&user.id.to_string(), user.is_admin, &order_scope)
         .await
         .unwrap_or_default()
         .into_iter()

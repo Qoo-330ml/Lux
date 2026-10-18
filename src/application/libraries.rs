@@ -338,6 +338,11 @@ impl LibraryService {
                 ordered.push(library_id);
             }
         }
+        let global_collections_id = crate::storage::GLOBAL_COLLECTION_LIBRARY_ID.to_owned();
+        if accessible.contains(&global_collections_id) && seen.insert(global_collections_id.clone())
+        {
+            ordered.push(global_collections_id);
+        }
         self.database
             .replace_user_library_order(user_id, &ordered)
             .await?;

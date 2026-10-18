@@ -133,7 +133,7 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
 
     let admin_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -478,7 +478,7 @@ async fn emby_global_collection_views_children_counts_and_mutations_are_scoped()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let admin_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -760,7 +760,7 @@ async fn emby_manual_collections_and_library_cover_follow_qmby_contract()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -948,13 +948,14 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
 
     let admin_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
         .send()
         .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
     let admin_cookie = cookie_pair(admin_login.headers());
     let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
     for (user_id, library_id) in [
@@ -970,9 +971,15 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
             .json(&json!({ "canView": true }))
             .send()
             .await?;
-        assert_eq!(grant.status(), reqwest::StatusCode::OK);
+        let grant_status = grant.status();
+        let grant_headers = format!("{:?}", grant.headers());
+        let grant_body = grant.text().await?;
+        assert_eq!(
+            grant_status,
+            reqwest::StatusCode::OK,
+            "status headers {grant_headers}; body {grant_body}"
+        );
     }
-
     let admin_libraries = client
         .get(format!("{base_url}/api/v1/libraries"))
         .header(COOKIE, &admin_cookie)
@@ -994,13 +1001,122 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
             .is_some_and(|items| items.iter().any(|item| item["name"] == "Hidden Movies"))
     );
 
+    let admin_library_order = client
+        .patch(format!("{base_url}/api/v1/auth/library-order"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "libraryOrder": [
+                collection_library_id.clone(),
+                hidden_library.id.to_string(),
+                visible_library.id.to_string(),
+                empty_library.id.to_string(),
+            ]
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        admin_library_order.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        admin_library_order.text().await?
+    );
+    let admin_library_order: Value = admin_library_order.json().await?;
+    assert_eq!(
+        admin_library_order["libraryOrder"],
+        json!([
+            GLOBAL_COLLECTION_LIBRARY_ID,
+            hidden_library.id.to_string(),
+            visible_library.id.to_string(),
+            empty_library.id.to_string(),
+        ])
+    );
+
+    let admin_reordered_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(admin_reordered_libraries.status(), reqwest::StatusCode::OK);
+    let admin_reordered_libraries: Value = admin_reordered_libraries.json().await?;
+    assert_eq!(
+        admin_reordered_libraries["libraries"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item["id"].as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            }),
+        Some(vec![
+            GLOBAL_COLLECTION_LIBRARY_ID.to_owned(),
+            hidden_library.id.to_string(),
+            visible_library.id.to_string(),
+            empty_library.id.to_string(),
+        ])
+    );
+
     let viewer_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "viewer", "password": "viewer password" }))
         .send()
         .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
     let viewer_cookie = cookie_pair(viewer_login.headers());
     let viewer_csrf = cookie_value(viewer_login.headers(), "lux_csrf");
+
+    let viewer_inherited_order = client
+        .get(format!("{base_url}/api/v1/auth/library-order"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(
+        viewer_inherited_order["libraryOrder"],
+        json!([GLOBAL_COLLECTION_LIBRARY_ID, visible_library.id.to_string()])
+    );
+
+    let viewer_settings = client
+        .patch(format!("{base_url}/api/v1/auth/settings"))
+        .header(COOKIE, &viewer_cookie)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({ "useAdminLibraryOrder": false }))
+        .send()
+        .await?;
+    assert_eq!(viewer_settings.status(), reqwest::StatusCode::OK);
+
+    let viewer_library_order = client
+        .patch(format!("{base_url}/api/v1/auth/library-order"))
+        .header(COOKIE, &viewer_cookie)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({
+            "libraryOrder": [
+                visible_library.id.to_string(),
+                collection_library_id.clone(),
+            ]
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        viewer_library_order.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        viewer_library_order.text().await?
+    );
+
+    let viewer_saved_order = client
+        .get(format!("{base_url}/api/v1/auth/library-order"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(
+        viewer_saved_order["libraryOrder"],
+        json!([visible_library.id.to_string(), GLOBAL_COLLECTION_LIBRARY_ID])
+    );
+
     let viewer_libraries = client
         .get(format!("{base_url}/api/v1/libraries"))
         .header(COOKIE, &viewer_cookie)
@@ -1017,6 +1133,59 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
     assert!(viewer_library_names.contains(&"Visible Movies"));
     assert!(viewer_library_names.contains(&"合集"));
     assert!(!viewer_library_names.contains(&"Hidden Movies"));
+    assert_eq!(
+        viewer_libraries["libraries"].as_array().and_then(|items| {
+            items
+                .iter()
+                .map(|item| item["id"].as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        }),
+        Some(vec![
+            visible_library.id.to_string(),
+            GLOBAL_COLLECTION_LIBRARY_ID.to_owned(),
+        ])
+    );
+
+    let viewer_emby_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="CollectionOrderTest", Device="Mac", DeviceId="collection-order-viewer", Version="1""#,
+        )
+        .json(&json!({ "Username": "viewer", "Pw": "viewer password" }))
+        .send()
+        .await?;
+    assert_eq!(viewer_emby_login.status(), reqwest::StatusCode::OK);
+    let viewer_emby_login: Value = viewer_emby_login.json().await?;
+    let viewer_emby_token = viewer_emby_login["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer Emby token")?;
+    assert_eq!(
+        viewer_emby_login["User"]["Configuration"]["OrderedViews"],
+        json!([
+            emby_public_id(&visible_library.id.to_string()),
+            emby_public_id(GLOBAL_COLLECTION_LIBRARY_ID),
+        ])
+    );
+    let viewer_emby_views = client
+        .get(format!("{base_url}/Users/{}/Views", viewer.id))
+        .header("X-Emby-Token", viewer_emby_token)
+        .send()
+        .await?;
+    assert_eq!(viewer_emby_views.status(), reqwest::StatusCode::OK);
+    let viewer_emby_views: Value = viewer_emby_views.json().await?;
+    assert_eq!(
+        viewer_emby_views["Items"].as_array().and_then(|items| {
+            items
+                .iter()
+                .map(|item| item["Id"].as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        }),
+        Some(vec![
+            emby_public_id(&visible_library.id.to_string()),
+            emby_public_id(GLOBAL_COLLECTION_LIBRARY_ID),
+        ])
+    );
 
     let global_page = client
         .get(format!(
@@ -1203,6 +1372,31 @@ async fn global_collections_are_visible_only_through_accessible_source_libraries
         !isolated_libraries["libraries"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["name"] == "合集"))
+    );
+    let isolated_csrf = cookie_value(isolated_login.headers(), "lux_csrf");
+    let isolated_settings = client
+        .patch(format!("{base_url}/api/v1/auth/settings"))
+        .header(COOKIE, &isolated_cookie)
+        .header("x-csrf-token", &isolated_csrf)
+        .json(&json!({ "useAdminLibraryOrder": false }))
+        .send()
+        .await?;
+    assert_eq!(isolated_settings.status(), reqwest::StatusCode::OK);
+    let inaccessible_collection_order = client
+        .patch(format!("{base_url}/api/v1/auth/library-order"))
+        .header(COOKIE, &isolated_cookie)
+        .header("x-csrf-token", &isolated_csrf)
+        .json(&json!({
+            "libraryOrder": [
+                GLOBAL_COLLECTION_LIBRARY_ID,
+                empty_library.id.to_string(),
+            ]
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        inaccessible_collection_order.status(),
+        reqwest::StatusCode::BAD_REQUEST
     );
 
     server.abort();

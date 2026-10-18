@@ -637,16 +637,39 @@ pub(super) async fn lux_list_libraries(
             let Some(catalog) = state.catalog.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
-            match catalog.list_global_collection_cards(principal, 0, 1).await {
-                Ok(collections) if collections.total > 0 => visible.push(json!({
+            let collections = match catalog.list_global_collection_cards(principal, 0, 1).await {
+                Ok(collections) => collections,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let mut order_scope = accessible_library_ids;
+            if collections.total > 0 {
+                order_scope.push(crate::storage::GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
+                visible.push(json!({
                     "id": crate::storage::GLOBAL_COLLECTION_LIBRARY_ID,
                     "name": "合集",
                     "kind": "MIXED",
                     "coverImageUrl": null,
-                })),
-                Ok(_) => {}
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }));
             }
+            let order = match libraries
+                .saved_library_order_for_user(&user.id.to_string(), user.is_admin, &order_scope)
+                .await
+            {
+                Ok(order) => order,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let order_index = order
+                .into_iter()
+                .enumerate()
+                .map(|(index, library_id)| (library_id, index))
+                .collect::<HashMap<_, _>>();
+            visible.sort_by_key(|library| {
+                library["id"]
+                    .as_str()
+                    .and_then(|library_id| order_index.get(library_id))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
             Json(json!({
                 "libraries": visible,
                 "showMetadataPending": show_metadata_pending,

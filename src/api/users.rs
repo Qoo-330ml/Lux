@@ -1451,6 +1451,32 @@ async fn effective_library_order(
         .await
 }
 
+async fn library_order_access_scope(
+    state: &AppState,
+    principal: AccessPrincipal,
+) -> Result<Vec<String>, StatusCode> {
+    let access = state
+        .access
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut library_ids = access
+        .accessible_library_ids(principal)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let collections = catalog
+        .list_global_collection_cards(principal, 0, 1)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if collections.total > 0 {
+        library_ids.push(crate::storage::GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
+    }
+    Ok(library_ids)
+}
+
 pub(super) async fn auth_library_order(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1462,13 +1488,10 @@ pub(super) async fn auth_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+    let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(status) => return status.into_response(),
     };
     match effective_library_order(
         libraries,
@@ -1513,13 +1536,10 @@ pub(super) async fn auth_update_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+    let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(status) => return status.into_response(),
     };
     let (use_admin_library_order, _) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)

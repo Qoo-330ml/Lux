@@ -506,6 +506,43 @@ describe("account settings", () => {
     expect(container.querySelector(".lux-account-library-row")?.textContent).toContain("剧集");
   });
 
+  it("includes the virtual collections library in the saved order", async () => {
+    const collectionsLibraryId = "00000000-0000-7000-8000-000000000538";
+    vi.mocked(api.libraries).mockResolvedValueOnce({
+      libraries: [
+        { id: "movies", name: "电影", kind: "MOVIE" },
+        { id: "series", name: "剧集", kind: "SERIES" },
+        { id: collectionsLibraryId, name: "合集", kind: "MIXED" },
+      ],
+    });
+    vi.mocked(api.userSettings).mockResolvedValueOnce({ playedPercent: 95, useAdminLibraryOrder: false, libraryOrderForced: false });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent).toContain("合集");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="上移媒体库 合集"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(api.updateLibraryOrder).toHaveBeenCalledWith({
+      libraryOrder: ["movies", collectionsLibraryId, "series"],
+    });
+    expect(container.textContent).toContain("媒体库顺序已保存");
+  });
+
   it("supports dragging one library row before another", async () => {
     vi.mocked(api.userSettings).mockResolvedValueOnce({ playedPercent: 95, useAdminLibraryOrder: false, libraryOrderForced: false });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
