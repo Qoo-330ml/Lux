@@ -10,6 +10,93 @@ use luxd::{
 };
 
 #[tokio::test]
+async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 183);
+
+    let processed_media_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_jobs')
+         WHERE name = 'processed_media_count'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(processed_media_column, 1);
+    let (not_null, default_value): (i64, Option<String>) = sqlx::query_as(
+        "SELECT \"notnull\", dflt_value FROM pragma_table_info('scan_jobs')
+         WHERE name = 'processed_media_count'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(not_null, 0, "pre-migration jobs have no reliable media count");
+    assert_eq!(default_value.as_deref(), Some("0"));
+
+    let ledger_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'scan_job_processed_media_items'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(ledger_table, 1);
+
+    let job_foreign_key: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('scan_job_processed_media_items')
+         WHERE \"table\" = 'scan_jobs' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(job_foreign_key, 1);
+
+    let postgres_migration =
+        include_str!("../migrations-postgres/0183_scan_job_processed_media.sql");
+    assert!(postgres_migration.contains("processed_media_count BIGINT"));
+    assert!(postgres_migration.contains("scan_job_processed_media_items"));
+    assert!(postgres_migration.contains("ON DELETE CASCADE"));
+    assert!(postgres_migration.contains("UPDATE scan_jobs SET processed_media_count = NULL"));
+
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Progress migration", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('progress-migration-job', ?, 'RECONCILE_LIBRARY', 'COMPLETED', 'g')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_job_processed_media_items (job_id, media_item_id)
+         VALUES ('progress-migration-job', 'movie-1')",
+    )
+    .execute(database.pool())
+    .await?;
+    let duplicate_insert = sqlx::query(
+        "INSERT INTO scan_job_processed_media_items (job_id, media_item_id)
+         VALUES ('progress-migration-job', 'movie-1') ON CONFLICT DO NOTHING",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(duplicate_insert.rows_affected(), 0);
+    sqlx::query("DELETE FROM scan_jobs WHERE id = 'progress-migration-job'")
+        .execute(database.pool())
+        .await?;
+    let remaining_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_processed_media_items
+         WHERE job_id = 'progress-migration-job'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_items, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_movie_collection_storage_is_migrated_from_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

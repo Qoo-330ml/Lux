@@ -2108,6 +2108,11 @@ services:
 | LUX-207 | web/src/features/player/、web/tests/；实现来源可追溯的手势、自动隐藏和时间轴交互 |
 | LUX-208 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；Media Session、移动端安全区和兼容性收尾 |
 | LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
+| LUX-578 | migrations/、migrations-postgres/、tests/storage.rs、docs/LUX-DEVELOPMENT.md；增加逐任务唯一媒体进度台账 |
+| LUX-579 | src/storage/jobs/scan/manifest/discovery/presence.rs、src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-580 | src/application/admin_task_activity.rs、src/api/admin/admin_jobs.rs、src/api/admin/admin_scheduled_tasks.rs、tests/、docs/LUX-DEVELOPMENT.md |
+| LUX-581 | web/src/lib/api/types.ts、web/src/features/admin/AdminOperationsPage.tsx、web/tests/admin-operations.test.tsx、docs/LUX-DEVELOPMENT.md |
+| LUX-582 | web/src/features/activity/ScanActivityPopover.tsx、web/tests/scan-activity.test.tsx、docs/LUX-DEVELOPMENT.md |
 | LUX-210 | docs/LUX-DEVELOPMENT.md；关闭 LuxPlayer 核心阶段并定义字幕、弹幕后续边界 |
 | LUX-211 | src/api/mod.rs、tests/、web/src/features/player/、web/tests/、docs/；将字幕轨绑定到当前媒体源并实现原生 WebVTT 生命周期 |
 | LUX-212 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有的安全文本字幕解析与渲染 |
@@ -12282,6 +12287,77 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 依赖：LUX-576。先补充卡片顺序、年份、季集格式与相对时间回归，再修改组件和样式。
 
 结果（2026-10-17）：卡片定向测试 13/13 通过，生产构建通过。全量 Vitest 为 648/652，另 4 项首页预取、媒体库卡片预取/合集链接和详情轮询用例失败；Node 布局检查为 5/6，失败断言仍要求媒体库封面宽度 `min(170px,52vw)`，当前样式为 `min(180px,56vw)`。`pnpm test` 在 Node 静态检查阶段失败于 3 项详情懒加载、首页卡片宽度和触屏卡片操作断言，因此未执行该脚本内的 Vitest 阶段。Web 生产构建通过；上述全量检查尚未全绿。
+
+#### LUX-578：为全量扫描增加唯一媒体进度台账
+
+范围：为全量扫描任务保存已处理媒体条目的去重集合和累计数量，供后续扫描进度接口使用。SQLite 与 PostgreSQL 均须支持；不预扫媒体库总数，不改变现有文件发现和文件计数语义。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0183_scan_job_processed_media.sql`、`migrations-postgres/0183_scan_job_processed_media.sql`、`tests/storage.rs`。
+
+验收：
+
+- [x] 空数据库迁移创建 `processed_media_count` 和逐任务唯一媒体台账；删除扫描任务时台账级联删除。
+- [x] SQLite 与 PostgreSQL migration 一致，不需要预填充历史扫描数据。
+- [x] 空库迁移回归通过。
+
+结果（2026-10-18）：SQLite 空库迁移创建计数列和去重台账；回归验证唯一约束与扫描任务删除级联通过。PostgreSQL migration 已加入并由同一回归检查关键结构；尚未连接 PostgreSQL 实例执行 migration。
+
+#### LUX-579：扫描期间累计已处理的唯一影片和整部剧
+
+范围：全量扫描每个目录块完成文件登记后，在同一事务中按媒体 ID 去重累计进度。电影按电影条目计数；剧集库按 `series_id` 计整部剧，同一剧的多季、多集只计一次。附属文件、未识别文件不计入。原有文件数保留给内部诊断，不读取目录总量、不增加第二次文件遍历。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`。
+
+验收：
+
+- [ ] 同一电影的多个版本只计一部；同一剧的多集、多季只计一部剧；附属文件不计数。
+- [ ] 未变更的已索引媒体也能在全量扫描过程中计数；任务重启后不重复计数。
+- [ ] 计数随扫描块提交并可从扫描任务读取；不改变旧文件计数。
+- [ ] 扫描任务目标测试通过。
+
+依赖：LUX-578。先添加影片、剧集和附属文件混合场景的回归，再在已有 presence 事务中写入去重台账。
+
+#### LUX-580：在管理员扫描任务接口公开媒体进度
+
+范围：管理员任务列表、任务详情和全局活动接口公开独立的 `processedMediaCount`。保留兼容的文件 `processedCount`/`totalCount` 字段；新字段只用于全量扫描媒体进度。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_task_activity.rs`、`src/api/admin/admin_jobs.rs`、`src/api/admin/admin_scheduled_tasks.rs`、一个相关 Rust API 集成测试文件。
+
+验收：
+
+- [ ] 管理任务列表、详情、活动接口均返回 `processedMediaCount`，且与存储计数一致。
+- [ ] 既有文件计数字段及其他任务的 JSON 行为不变。
+- [ ] Rust API 定向回归通过。
+
+依赖：LUX-579。先补接口响应断言，再映射已存储计数。
+
+#### LUX-581：管理运行记录显示媒体处理数量
+
+范围：全量扫描的管理运行记录将右侧进度改为已处理电影/剧集数量，不显示文件数、总数或百分比。电影库显示“已处理 N 部电影”，剧集库按整部剧显示“已处理 N 部剧”；百分比进度改为不确定进度条。其他任务和增量扫描保持原展示。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`。
+
+验收：
+
+- [ ] 全量电影库显示已处理电影数，全量剧集库显示去重后的整部剧数。
+- [ ] 全量扫描不显示文件分母或百分比；其他任务沿用现有行为。
+- [ ] 管理运行记录 Web 定向回归通过。
+
+依赖：LUX-580。先补电影库、剧集库和非全量任务的渲染断言，再修改运行记录文案。
+
+#### LUX-582：全局活动浮层显示媒体处理数量
+
+范围：全局后台活动浮层对全量扫描显示已处理的电影或整部剧数量，并使用不确定进度条；不显示发现到的文件总数或百分比。其他活动保持原行为。
+
+预计文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/activity/ScanActivityPopover.tsx`、`web/tests/scan-activity.test.tsx`。
+
+验收：
+
+- [ ] 浮层在电影库显示电影数，在剧集库按整部剧显示；全量扫描进度条无百分比。
+- [ ] 增量扫描及其他后台任务进度不变。
+- [ ] 活动浮层 Web 定向回归通过。
+
+依赖：LUX-580。先补活动浮层回归，再修改计数标签和进度显示。
 
 ## 29. 参考资料
 
