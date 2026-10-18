@@ -10,6 +10,74 @@ use crate::{
 use sqlx::Row;
 
 #[tokio::test]
+async fn shutdown_cancels_legacy_scan_jobs_in_one_bounded_update()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .query(
+            "WITH RECURSIVE numbers(n) AS (
+                 SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 205
+             )
+             INSERT INTO libraries (id, name, kind)
+             SELECT 'shutdown-lib-' || n, 'Library ' || n, 'MOVIE' FROM numbers",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "WITH RECURSIVE numbers(n) AS (
+                 SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 205
+             )
+             INSERT INTO scan_jobs (
+                 id, library_id, job_type, status, generation, scan_phase
+             )
+             SELECT 'legacy-' || n, 'shutdown-lib-' || n, 'RECONCILE_LIBRARY', 'RUNNING',
+                    'generation', 'DISCOVERY'
+             FROM numbers",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO libraries (id, name, kind)
+             VALUES ('shutdown-failed-lib', 'Failed library', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_jobs (
+                 id, library_id, job_type, status, generation, scan_phase, cancel_requested
+             ) VALUES (
+                 'legacy-failed-with-stale-cancel', 'shutdown-failed-lib',
+                 'RECONCILE_LIBRARY', 'FAILED', 'generation', 'IDLE', 1
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 205);
+    assert_eq!(database.query_count(), 9);
+    let cancelled: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE status = 'CANCELLED'")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cancelled, 205);
+    let failed_status: String = database
+        .query_scalar("SELECT status FROM scan_jobs WHERE id = 'legacy-failed-with-stale-cancel'")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(failed_status, "FAILED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn manifest_local_metadata_outbox_inserts_three_batches_with_one_query()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

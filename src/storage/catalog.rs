@@ -334,37 +334,48 @@ impl Database {
                 source,
             })?;
         let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let item_id: String = row.get("item_id");
-            let updated = self
-                .query(
-                    "UPDATE thumbnail_scraper_retries
-                     SET status = 'RUNNING', claimed_until = ?, updated_at = ?
-                     WHERE item_id = ? AND (
-                         (status = 'PENDING' AND next_retry_at <= ?)
-                         OR (status = 'RUNNING' AND claimed_until <= ?)
-                     )",
-                )
-                .bind(claimed_until)
+        if !rows.is_empty() {
+            let placeholders = std::iter::repeat_n("?", rows.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut update = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE thumbnail_scraper_retries
+                 SET status = 'RUNNING', claimed_until = ?, updated_at = ?
+                 WHERE item_id IN ({placeholders}) AND (
+                     (status = 'PENDING' AND next_retry_at <= ?)
+                     OR (status = 'RUNNING' AND claimed_until <= ?)
+                 )
+                 RETURNING item_id"
+            )));
+            update = update.bind(claimed_until).bind(now);
+            for row in &rows {
+                update = update.bind(row.get::<String, _>("item_id"));
+            }
+            let claimed_ids = update
                 .bind(now)
-                .bind(&item_id)
                 .bind(now)
-                .bind(now)
-                .execute(&mut *transaction)
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
-                })?;
-            if updated.rows_affected() == 1 {
-                claimed.push(StoredThumbnailScraperRetry {
-                    item_id,
-                    status: "RUNNING".to_owned(),
-                    attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
-                        .unwrap_or(u32::MAX),
-                    first_attempt_at: row.get("first_attempt_at"),
-                    next_retry_at: row.get("next_retry_at"),
-                });
+                })?
+                .into_iter()
+                .map(|row| row.get::<String, _>("item_id"))
+                .collect::<std::collections::HashSet<_>>();
+            // RETURNING has no ordering guarantee; retain the original due-time order.
+            for row in rows {
+                let item_id: String = row.get("item_id");
+                if claimed_ids.contains(&item_id) {
+                    claimed.push(StoredThumbnailScraperRetry {
+                        item_id,
+                        status: "RUNNING".to_owned(),
+                        attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
+                            .unwrap_or(u32::MAX),
+                        first_attempt_at: row.get("first_attempt_at"),
+                        next_retry_at: row.get("next_retry_at"),
+                    });
+                }
             }
         }
         transaction
