@@ -107,7 +107,8 @@ impl Database {
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -132,7 +133,8 @@ impl Database {
         let rows = if let Some(status) = status {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
-                        processed_count, total_count, cancel_requested, error,
+                        processed_count, total_count, processed_media_count,
+                        cancel_requested, error,
                         created_at, started_at, finished_at,
                         discovery_completed, auto_metadata_match,
                         current_item, scan_phase
@@ -147,7 +149,8 @@ impl Database {
         } else {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
-                        processed_count, total_count, cancel_requested, error,
+                        processed_count, total_count, processed_media_count,
+                        cancel_requested, error,
                         created_at, started_at, finished_at,
                         discovery_completed, auto_metadata_match,
                         current_item, scan_phase
@@ -172,7 +175,8 @@ impl Database {
     ) -> Result<Vec<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -219,7 +223,8 @@ impl Database {
     ) -> Result<Vec<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -261,7 +266,8 @@ impl Database {
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -286,7 +292,8 @@ impl Database {
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase

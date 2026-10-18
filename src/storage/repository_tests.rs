@@ -14989,6 +14989,69 @@ async fn scan_job_status_counts_are_aggregated_in_storage() {
 }
 
 #[tokio::test]
+async fn scan_job_media_progress_is_loaded_from_job_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Scan media progress", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO scan_jobs (
+             id, library_id, job_type, status, generation, processed_media_count
+         ) VALUES
+             ('scan-media-progress-running', ?, 'RECONCILE_LIBRARY', 'RUNNING', 'g1', 7),
+             ('scan-media-progress-legacy', ?, 'RECONCILE_LIBRARY', 'COMPLETED', 'g2', NULL)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("scan jobs");
+
+    let found = database
+        .find_scan_job("scan-media-progress-running")
+        .await
+        .expect("find scan job")
+        .expect("running scan job");
+    assert_eq!(found.processed_media_count, Some(7));
+    let legacy = database
+        .find_scan_job("scan-media-progress-legacy")
+        .await
+        .expect("find legacy scan job")
+        .expect("legacy scan job");
+    assert_eq!(legacy.processed_media_count, None);
+
+    let listed = database
+        .list_scan_jobs(None, 0, 10)
+        .await
+        .expect("list scan jobs");
+    assert_eq!(
+        listed
+            .iter()
+            .find(|job| job.id == "scan-media-progress-running")
+            .and_then(|job| job.processed_media_count),
+        Some(7)
+    );
+    let active = database
+        .list_scan_jobs_for_activity(10)
+        .await
+        .expect("list active scan jobs");
+    assert_eq!(
+        active
+            .iter()
+            .find(|job| job.id == "scan-media-progress-running")
+            .and_then(|job| job.processed_media_count),
+        Some(7)
+    );
+}
+
+#[tokio::test]
 async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -2110,7 +2110,7 @@ services:
 | LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
 | LUX-578 | migrations/、migrations-postgres/、tests/storage.rs、docs/LUX-DEVELOPMENT.md；增加逐任务唯一媒体进度台账 |
 | LUX-579 | src/storage/jobs/scan/manifest/discovery/presence.rs、src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
-| LUX-580 | src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、src/application/scanner/tests.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-580 | src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、src/application/scanner/tests.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md |
 | LUX-581 | src/application/admin_task_activity.rs、src/api/admin/admin_jobs.rs、src/api/admin/admin_scheduled_tasks.rs、tests/、docs/LUX-DEVELOPMENT.md |
 | LUX-582 | web/src/lib/api/types.ts、web/src/features/admin/AdminOperationsPage.tsx、web/tests/admin-operations.test.tsx、docs/LUX-DEVELOPMENT.md |
 | LUX-583 | web/src/features/activity/ScanActivityPopover.tsx、web/tests/scan-activity.test.tsx、docs/LUX-DEVELOPMENT.md |
@@ -12324,7 +12324,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：`StoredScanJob` 暴露独立的可空 `processed_media_count`。新任务从 0 开始；升级前创建的任务保持空值，因为无法可靠地回溯其扫描进度。原有文件计数字段不变。
 
-预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/repository.rs`、`src/application/scanner/tests.rs`。
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/repository.rs`、`src/application/scanner/tests.rs`、`src/storage/repository_tests.rs`。
 
 验收：
 

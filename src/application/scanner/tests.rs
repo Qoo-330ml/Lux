@@ -143,6 +143,7 @@ fn stored_scan_job(job_type: &str, auto_metadata_match: bool) -> StoredScanJob {
         cursor: None,
         processed_count: 0,
         total_count: 0,
+        processed_media_count: None,
         cancel_requested: false,
         error: None,
         created_at: 0,
