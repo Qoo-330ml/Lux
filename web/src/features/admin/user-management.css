@@ -24,8 +24,35 @@
 .lux-admin-user-profile-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .lux-admin-user-profile-actions [role="status"] { color: var(--lux-muted); font-size: .75rem; }
 .lux-admin-user-profile-actions [role="alert"] { color: var(--lux-danger, #d86d6d); font-size: .75rem; }
+.lux-admin-user-query-controls { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(140px, 1fr) minmax(150px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 16px; }
+.lux-admin-user-query-controls > label { display: grid; gap: 6px; min-width: 0; color: var(--lux-muted); font-size: .7rem; }
+.lux-admin-user-query-controls input, .lux-admin-user-query-controls select { width: 100%; min-width: 0; min-height: 38px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: color-mix(in srgb, var(--lux-surface) 78%, transparent); font: inherit; font-size: .74rem; }
+.lux-admin-user-query-controls input:focus, .lux-admin-user-query-controls select:focus { border-color: color-mix(in srgb, var(--lux-accent) 65%, var(--lux-line)); }
+.lux-admin-user-search > div { display: flex; align-items: center; gap: 8px; min-width: 0; padding-left: 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-subtle); background: color-mix(in srgb, var(--lux-surface) 78%, transparent); }
+.lux-admin-user-search > div:focus-within { border-color: color-mix(in srgb, var(--lux-accent) 65%, var(--lux-line)); }
+.lux-admin-user-search input { border: 0; background: transparent; }
+.lux-admin-user-sort-order { min-height: 38px; white-space: nowrap; }
+.lux-admin-deleted-hint { display: grid; gap: 5px; min-height: 38px; align-content: center; color: var(--lux-text); font-size: .72rem; }
+.lux-admin-deleted-hint small { color: var(--lux-subtle); font-size: .66rem; }
+.lux-admin-users-list-panel { min-width: 0; }
+.lux-admin-user-row { grid-template-columns: minmax(240px, 1fr) minmax(120px, auto) auto; }
+.lux-admin-user-summary > div { min-width: 0; }
+.lux-admin-user-summary small + small { margin-top: 3px; }
+.lux-admin-users-empty { margin: 10px 0 22px; }
+.lux-admin-user-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-admin-user-pagination > div { display: flex; align-items: center; gap: 9px; }
+.lux-admin-user-pagination > div > span { min-width: 78px; text-align: center; }
+.lux-admin-deleted-user-row { grid-template-columns: minmax(240px, 1fr) minmax(90px, auto) auto; }
+.lux-admin-purge-user { color: var(--lux-danger, #d86d6d); }
+.lux-admin-purge-user:hover { border-color: color-mix(in srgb, var(--lux-danger, #d86d6d) 55%, transparent); }
 @media (max-width: 640px) {
   .lux-admin-users-heading { align-items: flex-start; flex-direction: column; }
+  .lux-admin-user-query-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lux-admin-user-search { grid-column: 1 / -1; }
+  .lux-admin-user-sort-order { width: fit-content; }
+  .lux-admin-user-pagination { align-items: flex-start; flex-direction: column; }
+  .lux-admin-user-pagination > div { width: 100%; justify-content: space-between; }
+  .lux-admin-user-row, .lux-admin-deleted-user-row { grid-template-columns: 1fr; }
   .lux-admin-user-section-nav { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 1px; scrollbar-width: thin; }
   .lux-admin-user-section-nav button { flex: 0 0 auto; }
   .lux-admin-user-module-placeholder { min-height: 180px; padding: 18px; }

@@ -44,6 +44,10 @@ export const queryKeys = {
   adminWebhookDestinations: ["admin", "webhook-destinations"] as const,
   adminWebhookDeliveries: ["admin", "webhook-deliveries"] as const,
   adminUsers: ["admin", "users"] as const,
+  adminUsersPage: (page: number, pageSize: number, search: string, status: string, sortBy: string, sortOrder: string) =>
+    page === 1 && pageSize === 20 && !search && status === "all" && sortBy === "lastActivityAt" && sortOrder === "desc"
+      ? ["admin", "users"] as const
+      : ["admin", "users", page, pageSize, search, status, sortBy, sortOrder] as const,
   adminJobs: (status?: string) => ["admin", "jobs", status ?? "all"] as const,
   adminTaskActivity: ["admin", "task-activity"] as const,
   adminScheduledTasks: (page = 1) => ["admin", "scheduled-tasks", page] as const,

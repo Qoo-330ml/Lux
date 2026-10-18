@@ -12694,6 +12694,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：用户列表 API 支持分页、状态、搜索、排序及匹配总数；最近活动汇总 Web/Emby 凭证、Web 会话和播放事件，当前播放合并两种播放表并按播放会话去重。页大小默认 20、最大 100，默认排除回收站账号。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和格式检查通过；未运行测试。
 
+#### LUX-602：用户列表与回收站界面
+
+范围：用户管理页接入模块三分页查询，提供搜索、状态、排序和翻页控件；列表展示邮箱、最近登录/活动和当前播放数。回收站视图展示删除时间与到期清理时间，并接通恢复、提前彻底删除；普通列表删除提示改为进入 7 天回收站。待审批仍保持模块二占位。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 列表控件驱动服务端搜索、筛选、排序与分页，显示匹配总数和当前播放数。
+- [x] 回收站显示清理时间，可恢复或经确认提前彻底删除；成功后刷新列表。
+- [x] 普通列表删除明确告知进入回收站并保留期为 7 天；待审批仍不提供虚假操作。
+- [x] Web 构建通过。
+
+依赖：LUX-593、LUX-599、LUX-601。
+
+结果（2026-10-19）：用户列表接入搜索、状态筛选、排序、分页和播放/活动信息；删除后进入回收站，提供恢复与提前彻底删除并明确影响范围。待审批维持占位。`pnpm --dir web build` 通过；未运行测试、未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -34,6 +34,8 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
+  AdminUserListQuery,
+  AdminUserListResponse,
   AdminMetadataCandidate,
   AdminMetadataBatchConfirmation,
   AdminItemMergeResult,
@@ -1082,8 +1084,16 @@ export class LuxApiClient {
     );
   }
 
-  adminUsers() {
-    return this.request<{ users?: AdminUser[] }>("/api/v1/admin/users");
+  adminUsers(options: Partial<AdminUserListQuery> = {}) {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      pageSize: String(options.pageSize ?? 20),
+      status: options.status ?? "all",
+      sortBy: options.sortBy ?? "lastActivityAt",
+      sortOrder: options.sortOrder ?? "desc",
+    });
+    if (options.search?.trim()) params.set("search", options.search.trim());
+    return this.request<AdminUserListResponse>(`/api/v1/admin/users?${params}`);
   }
 
   adminUser(userId: string) {
@@ -1129,8 +1139,22 @@ export class LuxApiClient {
   }
 
   deleteAdminUser(userId: string) {
-    return this.request<void>(
+    return this.request<{ user: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  restoreAdminUser(userId: string) {
+    return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/restore`,
+      { method: "POST" },
+    );
+  }
+
+  purgeAdminUser(userId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/purge`,
       { method: "DELETE" },
     );
   }

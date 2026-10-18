@@ -540,6 +540,31 @@ export type AdminUser = LuxUser & {
   emailVerifiedAt?: number | null;
   deletedAt?: number | null;
   deletionPurgeAt?: number | null;
+  createdAt?: number;
+  lastLoginAt?: number | null;
+  lastActivityAt?: number | null;
+  currentPlaybackCount?: number;
+  presetSource?: string | null;
+};
+
+export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
+export type AdminUserSortBy = "createdAt" | "lastLoginAt" | "lastActivityAt";
+export type AdminUserSortOrder = "asc" | "desc";
+
+export type AdminUserListQuery = {
+  page: number;
+  pageSize: number;
+  search?: string;
+  status: AdminUserListStatus;
+  sortBy: AdminUserSortBy;
+  sortOrder: AdminUserSortOrder;
+};
+
+export type AdminUserListResponse = {
+  users: AdminUser[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
 };
 
 export type AdminEmbyMigrationConnection = {
