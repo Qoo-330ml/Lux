@@ -1,6 +1,8 @@
 @import "tailwindcss";
+@import "./lux-fonts.css";
 
 :root {
+  --lux-editorial-font-family: "Lux Libre Bodoni", "Lux Noto Serif SC", serif;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: #f5f5f5;
   background: #050506;
@@ -204,7 +206,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-eyebrow { display: inline-block; color: var(--lux-muted); font-size: .68rem; font-weight: 650; letter-spacing: .18em; text-transform: uppercase; }
 .lux-hero-title { --lux-hero-title-line-height: .94em; max-width: 700px; min-height: calc(3 * var(--lux-hero-title-line-height)); margin: 17px 0 10px; color: #fff; font-size: clamp(2.75rem, 5.5vw, 5rem); font-weight: 700; letter-spacing: -.075em; line-height: var(--lux-hero-title-line-height); text-shadow: 0 8px 28px rgba(0,0,0,.48); }
 .lux-hero-title.has-logo { min-height: 0; }
-.lux-hero-title-text { display: -webkit-box; max-width: 700px; max-height: calc(3 * var(--lux-hero-title-line-height)); overflow: hidden; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow-wrap: anywhere; text-wrap: balance; font-family: "Didot", "Bodoni 72", "Bodoni MT", "Songti SC", "STSong", "Songti TC", "SimSun", serif; letter-spacing: 0; }
+.lux-hero-title-text { display: -webkit-box; max-width: 700px; max-height: calc(3 * var(--lux-hero-title-line-height)); overflow: hidden; text-overflow: ellipsis; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow-wrap: anywhere; text-wrap: balance; font-family: var(--lux-editorial-font-family); letter-spacing: 0; }
 .lux-hero-title--compact { --lux-hero-title-line-height: 1em; font-size: clamp(2.35rem, 4.4vw, 3.9rem); }
 .lux-hero-title--small { --lux-hero-title-line-height: 1.06em; font-size: clamp(2rem, 3.5vw, 3.2rem); }
 .lux-hero-logo { display: block; max-width: min(440px, 100%); max-height: 145px; width: auto; height: auto; object-fit: contain; object-position: left center; filter: drop-shadow(0 8px 24px rgba(0,0,0,.4)); }
@@ -234,7 +236,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-home-content { position: relative; z-index: 2; width: 92%; margin: -24px auto 0; padding: 0 0 80px; }
 .lux-home-content .lux-section-heading h2,
 .lux-home-content .lux-continue-copy strong,
-.lux-home-content .lux-media-copy strong { font-family: "Didot", "Bodoni 72", "Bodoni MT", "Songti SC", "STSong", "Songti TC", "SimSun", serif; }
+.lux-home-content .lux-media-copy strong { font-family: var(--lux-editorial-font-family); }
 .lux-section { margin-top: 52px; }
 .lux-section-heading, .lux-page-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
 .lux-section-heading h2 { margin: 0; font-size: 1.18rem; font-weight: 600; letter-spacing: -.025em; }
@@ -473,8 +475,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-title-row { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 14px; }
 .lux-detail-logo { display: block; flex: 0 0 auto; max-width: min(360px, 100%); max-height: 96px; width: auto; height: auto; object-fit: contain; filter: drop-shadow(0 4px 12px rgba(0,0,0,.28)); margin-bottom: 4px; }
 .lux-detail-title-names { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; width: fit-content; max-width: 100%; min-width: 0; }
-.lux-detail-title-row h1 { min-width: 0; margin: 0; color: #fff; font-size: 26px; font-family: "Songti SC", "STSong", "Songti TC", "SimSun", serif; font-weight: 700; letter-spacing: 0.01em; line-height: 1.15; }
-.lux-detail-original-title { margin: 0; color: rgba(255,255,255,.72); font-family: "Didot", "Bodoni 72", "Bodoni MT", serif; font-size: 1.18rem; font-weight: 300; letter-spacing: .06em; line-height: 1.2; }
+.lux-detail-title-row h1 { min-width: 0; margin: 0; color: #fff; font-size: 26px; font-family: var(--lux-editorial-font-family); font-weight: 700; letter-spacing: 0.01em; line-height: 1.15; }
+.lux-detail-original-title { margin: 0; color: rgba(255,255,255,.72); font-family: var(--lux-editorial-font-family); font-size: 1.18rem; font-weight: 300; letter-spacing: .06em; line-height: 1.2; }
 .lux-detail-subtitle { width: 100%; margin: -3px 0 0; color: rgba(255,255,255,.72); font-size: .9rem; line-height: 1.4; }
 .lux-detail-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--lux-muted); }
 .lux-detail-meta > span + span::before { margin-right: 10px; color: var(--lux-subtle); content: "·"; }
@@ -517,16 +519,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-watched-status:disabled { cursor: wait; opacity: .62; }
 .lux-detail-watched-status.is-played { border-color: rgba(155,226,183,.58); color: #a4e4ba; background: rgba(96,194,132,.16); box-shadow: inset 0 0 0 1px rgba(155,226,183,.12), 0 8px 22px rgba(96,194,132,.16); }
 .lux-detail-tagline-wrap { margin-top: 64px; margin-bottom: 8px; padding: 12px 0; }
-.lux-detail-tagline { margin: 0; display: flex; align-items: baseline; justify-content: flex-start; gap: 10px; text-align: left; font-family: "Didot", "Bodoni 72", "Songti SC", "STSong", "Songti TC", "SimSun", serif; font-size: 1.42rem; font-weight: 700; line-height: 1.6; letter-spacing: .02em; color: rgba(255,255,255,.92); }
-.lux-detail-tagline .lux-tagline-quote { font-family: "Didot", "Bodoni 72", "Georgia", serif; font-size: 1.85rem; font-weight: 300; color: #fbbf24; opacity: .85; line-height: 1; user-select: none; }
-.lux-detail-tagline .lux-tagline-text { font-family: "Didot", "Bodoni 72", "Songti SC", "STSong", "Songti TC", "SimSun", serif; font-style: normal; }
-.lux-section-heading-sub { font-family: "Didot", "Bodoni 72", "Bodoni MT", serif; font-size: .74rem; font-weight: 300; letter-spacing: .14em; text-transform: uppercase; color: rgba(255,255,255,.52); font-style: normal; line-height: 1; }
+.lux-detail-tagline { margin: 0; display: flex; align-items: baseline; justify-content: flex-start; gap: 10px; text-align: left; font-family: var(--lux-editorial-font-family); font-size: 1.42rem; font-weight: 700; line-height: 1.6; letter-spacing: .02em; color: rgba(255,255,255,.92); }
+.lux-detail-tagline .lux-tagline-quote { font-family: "Lux Libre Bodoni", serif; font-size: 1.85rem; font-weight: 300; color: #fbbf24; opacity: .85; line-height: 1; user-select: none; }
+.lux-detail-tagline .lux-tagline-text { font-family: var(--lux-editorial-font-family); font-style: normal; }
+.lux-section-heading-sub { font-family: var(--lux-editorial-font-family); font-size: .74rem; font-weight: 300; letter-spacing: .14em; text-transform: uppercase; color: rgba(255,255,255,.52); font-style: normal; line-height: 1; }
 .lux-heading-lead { display: inline-flex; align-items: baseline; gap: 10px; }
 .lux-detail-sections .lux-section-heading h2,
 .lux-media-cast-heading h2,
 .lux-media-stills-heading h2,
 .lux-media-nfo-heading h2,
-.lux-media-nfo-media-heading h3 { font-family: "Songti SC", "STSong", "Songti TC", "SimSun", serif; font-weight: 700; letter-spacing: .02em; }
+.lux-media-nfo-media-heading h3 { font-family: var(--lux-editorial-font-family); font-weight: 700; letter-spacing: .02em; }
 .lux-media-cast { max-width: none; margin-top: 64px; padding-top: 24px; }
 .lux-media-cast-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
 .lux-media-cast-heading h2 { margin: 0; color: #fff; }
