@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
+const USER_DELETION_GRACE_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -127,7 +128,7 @@ impl Database {
                     has_password,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download, email, email_verified_at,
-                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -162,7 +163,7 @@ impl Database {
                         has_password,
                         is_disabled, is_admin, can_manage_server,
                         can_remote_access, can_download, email, email_verified_at,
-                        deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
+                        deleted_at, deletion_purge_at, last_login_at,
                         COALESCE(
                             (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                              FROM access_tokens at WHERE at.user_id = users.id),
@@ -264,7 +265,7 @@ impl Database {
                     has_password,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download, email, email_verified_at,
-                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -308,7 +309,7 @@ impl Database {
                     has_password,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download, email, email_verified_at,
-                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -352,7 +353,7 @@ impl Database {
                     has_password,
                     is_disabled, is_admin, can_manage_server,
                     can_remote_access, can_download, email, email_verified_at,
-                    deleted_at, deletion_purge_at, is_disabled_before_delete, last_login_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -438,7 +439,7 @@ impl Database {
             })?;
         let Some(current) = self
             .query(
-                "SELECT is_disabled, can_manage_server
+                "SELECT is_disabled, can_manage_server, deleted_at
              FROM users WHERE id = ?",
             )
             .bind(user_id)
@@ -451,6 +452,9 @@ impl Database {
         else {
             return Ok(None);
         };
+        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+            return Ok(None);
+        }
         let current_disabled = current.get::<i64, _>("is_disabled") != 0;
         let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
         let next_disabled = update.is_disabled.unwrap_or(current_disabled);
@@ -464,7 +468,8 @@ impl Database {
             let remaining: i64 = self
                 .query_scalar(
                     "SELECT COUNT(*) FROM users
-                 WHERE can_manage_server = 1 AND is_disabled = 0 AND id != ?",
+                 WHERE can_manage_server = 1 AND is_disabled = 0
+                   AND deleted_at IS NULL AND id != ?",
                 )
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
@@ -505,6 +510,70 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        if !current_disabled && next_disabled {
+            let now: i64 = self
+                .query_scalar("SELECT unixepoch()")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "UPDATE web_sessions
+                 SET revoked_at = ?, updated_at = ?
+                 WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE access_tokens
+                 SET revoked_at = ?, updated_at = ?
+                 WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE playback_sessions
+                 SET state = 'STOPPED', is_paused = 0, last_event_at = ?
+                 WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED')",
+            )
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE web_playback_sessions
+                 SET state = 'STOPPED', updated_at = ?
+                 WHERE user_id = ? AND state = 'ACTIVE'",
+            )
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -574,6 +643,195 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+
+    pub(crate) async fn soft_delete_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(current) = self
+            .query(
+                "SELECT is_disabled, can_manage_server, deleted_at
+                 FROM users WHERE id = ?",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+            return Ok(None);
+        }
+        let was_disabled = current.get::<i64, _>("is_disabled") != 0;
+        let can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        if can_manage_server && !was_disabled {
+            let remaining: i64 = self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM users
+                     WHERE can_manage_server = 1 AND is_disabled = 0
+                       AND deleted_at IS NULL AND id != ?",
+                )
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if remaining == 0 {
+                return Err(StorageError::LastManager);
+            }
+        }
+        let now: i64 = self
+            .query_scalar("SELECT unixepoch()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let hls_session_rows = self
+            .query(
+                "SELECT id FROM web_playback_sessions
+                 WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'",
+            )
+            .bind(user_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let hls_session_ids = hls_session_rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect::<Vec<_>>();
+
+        self.query(
+            "UPDATE users
+             SET is_disabled_before_delete = ?, is_disabled = 1,
+                 deleted_at = ?, deletion_purge_at = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(database_flag(was_disabled))
+        .bind(now)
+        .bind(now.saturating_add(USER_DELETION_GRACE_SECONDS))
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE web_sessions
+             SET revoked_at = ?, updated_at = ?
+             WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE access_tokens
+             SET revoked_at = ?, updated_at = ?
+             WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE playback_sessions
+             SET state = 'STOPPED', is_paused = 0, last_event_at = ?
+             WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED')",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE web_playback_sessions
+             SET state = 'STOPPED', updated_at = ?
+             WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(hls_session_ids))
+    }
+
+    pub(crate) async fn restore_deleted_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE users
+                 SET is_disabled = is_disabled_before_delete,
+                     is_disabled_before_delete = 0,
+                     deleted_at = NULL, deletion_purge_at = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND deleted_at IS NOT NULL",
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn purge_deleted_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        let result = self
+            .query("DELETE FROM users WHERE id = ? AND deleted_at IS NOT NULL")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn find_user_emby_configuration(
@@ -858,7 +1116,7 @@ impl Database {
             "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
                     u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
                     u.can_remote_access, u.can_download, u.email, u.email_verified_at,
-                    u.deleted_at, u.deletion_purge_at, u.is_disabled_before_delete, u.last_login_at,
+                    u.deleted_at, u.deletion_purge_at, u.last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at2.last_seen_at, at2.created_at))
                          FROM access_tokens at2 WHERE at2.user_id = u.id),

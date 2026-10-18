@@ -356,6 +356,34 @@ impl UserStore {
         }
     }
 
+    pub async fn soft_delete_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        match self.database.soft_delete_user(user_id).await {
+            Ok(deleted) => Ok(deleted),
+            Err(StorageError::LastManager) => Err(UserStoreError::LastManager),
+            Err(error) => Err(UserStoreError::Storage(error)),
+        }
+    }
+
+    pub async fn restore_deleted_user(&self, user_id: &str) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        Ok(self.database.restore_deleted_user(user_id).await?)
+    }
+
+    pub async fn purge_deleted_user(&self, user_id: &str) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        Ok(self.database.purge_deleted_user(user_id).await?)
+    }
+
     pub async fn create_initial_admin(
         &self,
         username: &str,
