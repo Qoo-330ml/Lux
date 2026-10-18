@@ -12489,6 +12489,21 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-18）：查询计划回归先明确显示目标主键范围扫描并失败；按阶段拆开 EXISTS 后使用现有三个部分索引。查询计划、SQLite 诊断矩阵及本地 PostgreSQL 16 诊断矩阵 3/3 通过；未增加 schema 或迁移，不将此查询计划结果外推为 NAS 性能测量。
 
+#### LUX-591：调整查询计划测试的模块位置
+
+范围：将查询计划测试移到生产代码之后，满足 Clippy `items_after_test_module`；不改变查询或运行时行为。
+
+预计修改文件：`src/storage/jobs/scan/targets.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 查询计划和 SQLite/PostgreSQL 诊断矩阵继续通过。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
+依赖：LUX-589。Clippy 已复现测试模块位置错误，先调整位置，再复跑相关检查。
+
+结果（2026-10-18）：只移动测试模块，查询计划和 SQLite/PostgreSQL 诊断矩阵 3/3 通过；完整 Clippy 与格式检查通过。完整测试中超时的 local metadata worker 用例在同一最终代码单独复跑通过，完整门禁仍保留原失败结果。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
