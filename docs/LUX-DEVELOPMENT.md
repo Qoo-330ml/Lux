@@ -12345,11 +12345,13 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收：
 
-- [ ] 管理任务列表、详情、活动接口均返回 `processedMediaCount`，且与存储计数一致。
-- [ ] 既有文件计数字段及其他任务的 JSON 行为不变。
-- [ ] Rust API 定向回归通过。
+- [x] 管理任务列表、详情、活动接口均返回 `processedMediaCount`，且与存储计数一致。
+- [x] 既有文件计数字段及其他任务的 JSON 行为不变。
+- [x] Rust API 定向回归通过。
 
 依赖：LUX-580。先补接口响应断言，再映射已存储计数。
+
+结果（2026-10-18）：管理员扫描任务列表、详情、活动接口公开可空的 `processedMediaCount`；创建/重试响应从 0 开始。接口回归验证新字段与存储一致，且文件计数字段不变。干净验证 worktree 中 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test admin_events admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts -- --exact` 通过。
 
 #### LUX-582：管理运行记录显示媒体处理数量
 
