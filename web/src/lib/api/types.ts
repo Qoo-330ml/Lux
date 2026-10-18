@@ -827,6 +827,7 @@ export type AdminTaskActivity = {
   status: "PENDING" | "QUEUED" | "RUNNING" | string;
   processedCount?: number;
   totalCount?: number | null;
+  processedMediaCount?: number | null;
   discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   currentItem?: string | null;

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminTaskActivity } from "../../lib/api/types";
+import type { AdminLibrary, AdminTaskActivity } from "../../lib/api/types";
 
 const JOB_TYPE_LABELS: Record<string, string> = {
   RECONCILE_LIBRARY: "全量校验",
@@ -97,7 +97,7 @@ export function ScanActivityPopover() {
               <article key={job.id} className="lux-scan-activity-row">
                 <div className="lux-scan-activity-row-heading">
                   <strong>{libraryLabel(job, libraries.data?.libraries)}</strong>
-                  <span>{activityLabel(job)} · {progressLabel(job)}</span>
+                  <span>{activityLabel(job)} · {progressLabel(job, libraries.data?.libraries)}</span>
                 </div>
                 <p>{phaseLabel(job)}{job.currentItem ? ` · ${job.currentItem}` : ""}</p>
                 <div className="lux-scan-activity-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progressValue(job) ?? undefined}>
@@ -134,17 +134,35 @@ function phaseLabel(job: AdminTaskActivity) {
 }
 
 function progressValue(job: AdminTaskActivity) {
+  if (isFullLibraryScan(job)) return null;
   if (isPostprocessingActivityJob(job)) return null;
   if (job.kind === "scan" && job.discoveryCompleted === false) return null;
   if (!job.totalCount || job.totalCount <= 0) return null;
   return Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100));
 }
 
-function progressLabel(job: AdminTaskActivity) {
+function progressLabel(job: AdminTaskActivity, libraries?: Array<{ id: string; kind?: AdminLibrary["kind"] }>) {
+  if (isFullLibraryScan(job)) {
+    const kind = libraries?.find((library) => library.id === job.libraryId)?.kind;
+    return formatProcessedMediaCount(job.processedMediaCount, kind);
+  }
   if (isPostprocessingActivityJob(job)) return "索引完成，后处理进行中";
   if (job.kind === "scan" && job.discoveryCompleted === false) return "发现中";
   const total = job.totalCount ?? 0;
   return total > 0 ? `${job.processedCount ?? 0}/${total}` : "发现中";
+}
+
+function isFullLibraryScan(job: AdminTaskActivity) {
+  return job.kind === "scan"
+    && (job.taskType === "RECONCILE_LIBRARY" || job.taskType === "RECONCILIATION_SCAN");
+}
+
+function formatProcessedMediaCount(count: number | null | undefined, kind?: AdminLibrary["kind"]) {
+  if (count == null) return "媒体进度不可用";
+  const formattedCount = count.toLocaleString("zh-CN");
+  if (kind === "MOVIE") return `已处理 ${formattedCount} 部电影`;
+  if (kind === "SERIES") return `已处理 ${formattedCount} 部剧`;
+  return `已处理 ${formattedCount} 项媒体`;
 }
 
 function compareJobs(left: AdminTaskActivity, right: AdminTaskActivity) {

@@ -125,7 +125,7 @@ describe("ScanActivityPopover", () => {
     expect(container.textContent).not.toContain("等待调度");
   });
 
-  it("keeps a queued scan waiting and hides discovery's provisional total", async () => {
+  it("keeps a queued scan waiting and shows processed media without a provisional total", async () => {
     vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
       activities: [{
         id: "scan-job-discovery",
@@ -133,6 +133,7 @@ describe("ScanActivityPopover", () => {
         taskType: "RECONCILE_LIBRARY",
         libraryId: "library-1",
         status: "PENDING",
+        processedMediaCount: 0,
         processedCount: 10,
         totalCount: 10,
         discoveryCompleted: false,
@@ -140,7 +141,7 @@ describe("ScanActivityPopover", () => {
       }],
     });
     vi.spyOn(api, "adminLibraries").mockResolvedValue({
-      libraries: [{ id: "library-1", name: "电影库" }],
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
     });
     container = document.createElement("div");
     document.body.append(container);
@@ -162,8 +163,54 @@ describe("ScanActivityPopover", () => {
     act(() => container.querySelector<HTMLButtonElement>("button[aria-label*='后台任务活动']")?.click());
 
     expect(container.textContent).toContain("等待调度");
-    expect(container.textContent).toContain("发现中");
+    expect(container.textContent).toContain("已处理 0 部电影");
     expect(container.textContent).not.toContain("10/10");
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBeNull();
+  });
+
+  it("counts full scans by series while incremental scans keep file totals", async () => {
+    vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [
+        {
+          id: "series-scan",
+          kind: "scan",
+          taskType: "RECONCILE_LIBRARY",
+          libraryId: "series-library",
+          status: "RUNNING",
+          processedMediaCount: 4,
+          processedCount: 140,
+          totalCount: 140,
+          discoveryCompleted: true,
+        },
+        {
+          id: "incremental-scan",
+          kind: "scan",
+          taskType: "INCREMENTAL_SCAN",
+          libraryId: "series-library",
+          status: "RUNNING",
+          processedCount: 2,
+          totalCount: 5,
+          discoveryCompleted: true,
+        },
+      ],
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "series-library", name: "剧集库", kind: "SERIES" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = mountPopover(container);
+
+    await openPopover(container);
+
+    const rows = [...container.querySelectorAll<HTMLElement>(".lux-scan-activity-row")];
+    const fullScanRow = rows.find((row) => row.textContent?.includes("已处理 4 部剧"));
+    const incrementalRow = rows.find((row) => row.textContent?.includes("2/5"));
+    expect(fullScanRow?.textContent).toContain("已处理 4 部剧");
+    expect(fullScanRow?.textContent).not.toContain("140");
+    expect(fullScanRow?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBeNull();
+    expect(incrementalRow?.textContent).toContain("2/5");
+    expect(incrementalRow?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("40");
   });
 
   it("closes when clicking outside the activity popover", async () => {
