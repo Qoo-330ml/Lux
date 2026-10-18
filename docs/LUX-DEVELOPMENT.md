@@ -12627,6 +12627,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：存储层新增 7 天软删除、恢复、仅回收站账号彻底删除；禁用/删除事务会撤销 Web 会话和 Emby 令牌并将两类播放记录标为停止。`cargo fmt --all -- --check` 与 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过；HTTP 操作尚未接通，未运行测试。
 
+#### LUX-598：禁用和删除时停止服务端 HLS 进程
+
+范围：为账号生命周期路径提供按用户读取活跃服务端 HLS 会话 ID，并提供应用服务停止指定 HLS 进程的方法。停止失败写入不含凭证的会话级日志并继续清理其他会话；不改变 Web 端播放协议。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/sessions.rs`、`src/application/playback/session.rs`。
+
+验收标准：
+
+- [x] 查询只返回目标用户当前活跃的服务端 HLS 会话。
+- [x] 停止方法逐个释放 HLS 进程与临时目录，单项失败不阻断后续会话清理。
+- [x] Cargo 构建与格式检查通过。
+
+依赖：LUX-597。
+
+结果（2026-10-19）：新增活跃服务端 HLS 会话 ID 查询和逐项进程停止入口。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与格式检查通过；入口将在 LUX-599 管理员生命周期 API 中接通。未运行测试。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

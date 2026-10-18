@@ -718,6 +718,24 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_active_server_hls_session_ids_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id FROM web_playback_sessions
+             WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn take_expired_web_playback_sessions(
         &self,
         now: i64,
