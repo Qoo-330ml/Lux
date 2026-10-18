@@ -189,6 +189,8 @@ function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [error, setError] = useState("");
+  const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const graceDays = settings.data?.userDeletionGraceDays;
   const refresh = (updated: AdminUser) => {
     queryClient.setQueryData(["admin", "user", user.id], { user: updated });
     void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
@@ -214,7 +216,8 @@ function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
   }
 
   function confirmDelete() {
-    if (pending || !window.confirm(`将“${displayName}”移入回收站会撤销凭证并停止播放，账号默认保留 7 天，可在期限内恢复。确定继续吗？`)) return;
+    const retention = graceDays === undefined ? "按服务器当前配置的期限保留" : `保留 ${graceDays} 天`;
+    if (pending || !window.confirm(`将“${displayName}”移入回收站会撤销凭证并停止播放，账号会${retention}，可在期限内恢复。确定继续吗？`)) return;
     setError("");
     remove.mutate();
   }

@@ -30,6 +30,8 @@ export function AdminUsersPage() {
     queryFn: () => api.adminUsers({ page, pageSize, search, status: queryStatus, sortBy, sortOrder }),
     enabled: view !== "pending",
   });
+  const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const deletionGraceDays = settings.data?.userDeletionGraceDays;
   const libraries = useQuery({ queryKey: queryKeys.adminLibraries, queryFn: () => api.adminLibraries(), enabled: view === "users" });
   const [form, setForm] = useState({ username: "", displayName: "", password: "", isAdmin: false });
   const [formError, setFormError] = useState("");
@@ -78,7 +80,7 @@ export function AdminUsersPage() {
         {users.error ? <p className="lux-error-copy" role="alert">列表更新失败：{users.error.message}</p> : null}
         {items.length ? <div className="lux-admin-user-list">{items.map((user) => view === "deleted"
           ? <DeletedUserRow key={user.id} user={user} />
-          : <UserAdminRow key={user.id} user={user} libraryIds={availableLibraries.map((library) => library.id)} libraryNames={new Map(availableLibraries.map((library) => [library.id, library.name]))} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
+          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} libraryIds={availableLibraries.map((library) => library.id)} libraryNames={new Map(availableLibraries.map((library) => [library.id, library.name]))} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
         <div className="lux-admin-user-pagination" aria-label="用户列表分页"><span>{totalCount ? `显示 ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalCount)} 条，共 ${totalCount} 条` : "共 0 条"}</span><div><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button><span>第 {page} / {totalPages} 页</span><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button></div></div>
       </section>
       </>}
@@ -86,7 +88,7 @@ export function AdminUsersPage() {
   );
 }
 
-function UserAdminRow({ user, libraryIds, libraryNames }: { user: AdminUser; libraryIds: string[]; libraryNames: Map<string, string> }) {
+function UserAdminRow({ user, graceDays, libraryIds, libraryNames }: { user: AdminUser; graceDays?: number; libraryIds: string[]; libraryNames: Map<string, string> }) {
   const queryClient = useQueryClient();
   const [expanded, setExpanded] = useState(false);
   const [newPassword, setNewPassword] = useState("");
@@ -111,7 +113,8 @@ function UserAdminRow({ user, libraryIds, libraryNames }: { user: AdminUser; lib
   }
 
   function confirmDelete() {
-    if (actionPending || !window.confirm(`确定将账户“${displayName}”移入回收站吗？账号会保留 7 天，你可以在期限内恢复。`)) return;
+    const retention = graceDays === undefined ? "按服务器当前配置的期限保留" : `保留 ${graceDays} 天`;
+    if (actionPending || !window.confirm(`确定将账户“${displayName}”移入回收站吗？账号会${retention}，你可以在期限内恢复。`)) return;
     remove.mutate();
   }
 
@@ -174,7 +177,7 @@ function UserAdminRow({ user, libraryIds, libraryNames }: { user: AdminUser; lib
           className="lux-icon-button lux-icon-button-small lux-danger-icon lux-admin-delete-user"
           type="button"
           aria-label={`删除${displayName}账户`}
-          title="移入回收站，保留 7 天"
+          title={graceDays === undefined ? "按当前服务端设置移入回收站" : `移入回收站，保留 ${graceDays} 天`}
           onClick={confirmDelete}
           disabled={actionPending}
         >

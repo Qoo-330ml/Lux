@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
+import type { AdminSettings } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -120,12 +121,13 @@ describe("AdminUsersPage user actions", () => {
       isAdmin: false, deletedAt: 1_800_000_000, deletionPurgeAt: 1_800_604_800,
     } });
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    renderPage();
+    renderPage(14);
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
     const button = container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]');
+    await act(async () => { await vi.waitFor(() => expect(button?.title).toBe("移入回收站，保留 14 天")); });
     act(() => button?.click());
-    expect(confirm).toHaveBeenCalledWith("确定将账户“观众”移入回收站吗？账号会保留 7 天，你可以在期限内恢复。");
+    expect(confirm).toHaveBeenCalledWith("确定将账户“观众”移入回收站吗？账号会保留 14 天，你可以在期限内恢复。");
     expect(remove).not.toHaveBeenCalled();
 
     confirm.mockReturnValue(true);
@@ -153,7 +155,8 @@ describe("AdminUsersPage user actions", () => {
     });
   });
 
-  function renderPage() {
+  function renderPage(userDeletionGraceDays = 7) {
+    vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays } as AdminSettings);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);

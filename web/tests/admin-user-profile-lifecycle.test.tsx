@@ -7,7 +7,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUserDetailPage } from "../src/features/admin/AdminUserManagementPage";
 import { api } from "../src/lib/api/client";
-import type { AdminUser } from "../src/lib/api/types";
+import type { AdminSettings, AdminUser } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -56,6 +56,22 @@ describe("AdminUserDetailPage account lifecycle", () => {
     });
   });
 
+  it("uses the configured retention period when confirming account deletion", async () => {
+    const queryClient = renderDetail(makeUser(), 14);
+    const remove = vi.spyOn(api, "deleteAdminUser").mockResolvedValue({
+      user: makeUser({ isDisabled: true, deletedAt: 1_800_000_000, deletionPurgeAt: 1_801_209_600 }),
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await waitForUser();
+    await act(async () => {
+      await vi.waitFor(() => expect(queryClient.getQueryData<AdminSettings>(["admin", "settings"])?.userDeletionGraceDays).toBe(14));
+    });
+
+    act(() => findButton("移入回收站").click());
+    expect(confirm).toHaveBeenCalledWith("将“观众”移入回收站会撤销凭证并停止播放，账号会保留 14 天，可在期限内恢复。确定继续吗？");
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   it("makes deleted account details read-only and restores back to the user list", async () => {
     const deletedUser = makeUser({ isDisabled: true, deletedAt: 1_800_000_000, deletionPurgeAt: 1_800_604_800 });
     const queryClient = renderDetail(deletedUser);
@@ -90,8 +106,9 @@ describe("AdminUserDetailPage account lifecycle", () => {
     expect(purge).not.toHaveBeenCalled();
   });
 
-  function renderDetail(user: AdminUser) {
+  function renderDetail(user: AdminUser, userDeletionGraceDays = 7) {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user });
+    vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays } as AdminSettings);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
