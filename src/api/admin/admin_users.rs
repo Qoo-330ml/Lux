@@ -246,7 +246,7 @@ pub(crate) async fn admin_update_user(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users
-        .update_user(
+        .update_user_with_hls_session_ids(
             &user_id,
             UserUpdate {
                 display_name: request.display_name.as_deref(),
@@ -260,7 +260,12 @@ pub(crate) async fn admin_update_user(
         )
         .await
     {
-        Ok(Some(user)) => {
+        Ok(Some((user, hls_session_ids))) => {
+            if let Some(web_playback) = state.web_playback.as_ref() {
+                web_playback
+                    .stop_server_hls_sessions(&hls_session_ids)
+                    .await;
+            }
             let event_type = if request.is_disabled == Some(true) {
                 "USER_DISABLED"
             } else {
@@ -303,12 +308,126 @@ pub(crate) async fn admin_delete_user(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match users.delete_user(&user_id).await {
-        Ok(true) => {
+    match users.soft_delete_user(&user_id).await {
+        Ok(Some(hls_session_ids)) => {
+            if let Some(web_playback) = state.web_playback.as_ref() {
+                web_playback
+                    .stop_server_hls_sessions(&hls_session_ids)
+                    .await;
+            }
+            let profile = match users.find_admin_profile_by_id(&user_id).await {
+                Ok(Some(profile)) => profile,
+                Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             record_audit_event(
                 &state,
                 &headers,
                 "USER_DELETED",
+                Some("user"),
+                Some(&user_id),
+                &json!({ "deletionPurgeAt": profile.deletion_purge_at }).to_string(),
+            )
+            .await;
+            Json(json!({ "user": admin_user_profile_json(&profile) })).into_response()
+        }
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+pub(crate) async fn admin_restore_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users.restore_deleted_user(&user_id).await {
+        Ok(true) => {
+            let profile = match users.find_admin_profile_by_id(&user_id).await {
+                Ok(Some(profile)) => profile,
+                Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_RESTORED",
+                Some("user"),
+                Some(&user_id),
+                "{}",
+            )
+            .await;
+            Json(json!({ "user": admin_user_profile_json(&profile) })).into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "已删除用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+pub(crate) async fn admin_purge_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let profile = match users.find_admin_profile_by_id(&user_id).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return user_store_error(&headers, error),
+    };
+    if profile.deleted_at.is_none() {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "只能彻底删除回收站中的用户",
+        )
+        .into_response();
+    }
+    match users.purge_deleted_user(&user_id).await {
+        Ok(true) => {
+            if let (Some(avatars), Ok(user_id)) = (
+                state.user_avatars.as_ref(),
+                user_id.parse::<crate::domain::ids::UserId>(),
+            ) && let Err(error) = avatars.remove(user_id).await
+            {
+                tracing::warn!(%error, "failed to remove purged user avatar");
+            }
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_PURGED",
                 Some("user"),
                 Some(&user_id),
                 "{}",
@@ -320,7 +439,7 @@ pub(crate) async fn admin_delete_user(
             &headers,
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
-            "用户不存在",
+            "已删除用户不存在",
         )
         .into_response(),
         Err(error) => user_store_error(&headers, error),
@@ -503,6 +622,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/profile",
             patch(admin_update_user_profile),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/restore",
+            post(admin_restore_user),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/purge",
+            delete(admin_purge_user),
         )
         .route(
             "/api/v1/admin/users/{user_id}/libraries",

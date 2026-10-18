@@ -409,6 +409,17 @@ impl Database {
         user_id: &str,
         update: UpdateUser<'_>,
     ) -> Result<Option<StoredUser>, StorageError> {
+        Ok(self
+            .update_user_with_hls_session_ids(user_id, update)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    pub(crate) async fn update_user_with_hls_session_ids(
+        &self,
+        user_id: &str,
+        update: UpdateUser<'_>,
+    ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
         let retry_deadline = Instant::now() + SQLITE_USER_UPDATE_RETRY_WINDOW;
         loop {
             match self.update_user_once(user_id, &update).await {
@@ -428,7 +439,7 @@ impl Database {
         &self,
         user_id: &str,
         update: &UpdateUser<'_>,
-    ) -> Result<Option<StoredUser>, StorageError> {
+    ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
         let mut transaction = self
             .pool
             .begin()
@@ -482,6 +493,22 @@ impl Database {
                 return Err(StorageError::LastManager);
             }
         }
+        let hls_session_ids = if !current_disabled && next_disabled {
+            self.query_scalar(
+                "SELECT id FROM web_playback_sessions
+                 WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .bind(user_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        } else {
+            Vec::new()
+        };
         self.query(
             "UPDATE users
              SET display_name = COALESCE(?, display_name),
@@ -581,7 +608,10 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.find_user_by_id(user_id).await
+        Ok(self
+            .find_user_by_id(user_id)
+            .await?
+            .map(|user| (user, hls_session_ids)))
     }
 
     pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {

@@ -1363,17 +1363,16 @@ pub(super) async fn emby_delete_user(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if let Some(avatars) = state.user_avatars.as_ref() {
-        let Ok(target_user_id) = user_id.parse::<UserId>() else {
-            return StatusCode::BAD_REQUEST.into_response();
-        };
-        if avatars.remove(target_user_id).await.is_err() {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    match users.soft_delete_user(&user_id).await {
+        Ok(Some(hls_session_ids)) => {
+            if let Some(web_playback) = state.web_playback.as_ref() {
+                web_playback
+                    .stop_server_hls_sessions(&hls_session_ids)
+                    .await;
+            }
+            StatusCode::OK.into_response()
         }
-    }
-    match users.delete_user(&user_id).await {
-        Ok(true) => StatusCode::OK.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(UserStoreError::LastManager) => StatusCode::CONFLICT.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -1672,7 +1671,7 @@ pub(super) async fn emby_update_user(
     }
     let policy = request.policy.as_ref();
     match users
-        .update_user(
+        .update_user_with_hls_session_ids(
             &user_id,
             UserUpdate {
                 display_name: request.name.as_deref(),
@@ -1686,7 +1685,12 @@ pub(super) async fn emby_update_user(
         )
         .await
     {
-        Ok(Some(user)) => {
+        Ok(Some((user, hls_session_ids))) => {
+            if let Some(web_playback) = state.web_playback.as_ref() {
+                web_playback
+                    .stop_server_hls_sessions(&hls_session_ids)
+                    .await;
+            }
             if let Some(incoming) = request.configuration {
                 let ordered_views = emby_ordered_views(&state, &user).await;
                 let mut configuration =
@@ -1741,7 +1745,7 @@ pub(super) async fn emby_update_user_policy(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users
-        .update_user(
+        .update_user_with_hls_session_ids(
             &user_id,
             UserUpdate {
                 is_admin: request.is_administrator,
@@ -1754,7 +1758,14 @@ pub(super) async fn emby_update_user_policy(
         )
         .await
     {
-        Ok(Some(_)) => StatusCode::OK.into_response(),
+        Ok(Some((_, hls_session_ids))) => {
+            if let Some(web_playback) = state.web_playback.as_ref() {
+                web_playback
+                    .stop_server_hls_sessions(&hls_session_ids)
+                    .await;
+            }
+            StatusCode::OK.into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(UserStoreError::LastManager) => StatusCode::CONFLICT.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),

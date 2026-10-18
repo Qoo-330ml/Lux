@@ -593,16 +593,6 @@ impl WebPlaybackSessionService {
         Ok(expires_at)
     }
 
-    pub(crate) async fn active_server_hls_session_ids_for_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<String>, WebPlaybackSessionError> {
-        Ok(self
-            .database
-            .list_active_server_hls_session_ids_for_user(user_id)
-            .await?)
-    }
-
     pub(crate) async fn stop_server_hls_sessions(&self, session_ids: &[String]) {
         for session_id in session_ids {
             if let Err(error) = self.hls.stop(session_id).await {

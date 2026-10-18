@@ -253,6 +253,17 @@ impl UserStore {
         user_id: &str,
         update: UserUpdate<'_>,
     ) -> Result<Option<UserRecord>, UserStoreError> {
+        Ok(self
+            .update_user_with_hls_session_ids(user_id, update)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    pub(crate) async fn update_user_with_hls_session_ids(
+        &self,
+        user_id: &str,
+        update: UserUpdate<'_>,
+    ) -> Result<Option<(UserRecord, Vec<String>)>, UserStoreError> {
         let password_hash = update
             .password
             .filter(|password| !password.is_empty())
@@ -260,7 +271,7 @@ impl UserStore {
             .transpose()?;
         let updated = match self
             .database
-            .update_user(
+            .update_user_with_hls_session_ids(
                 user_id,
                 UpdateUser {
                     display_name: update.display_name,
@@ -279,7 +290,9 @@ impl UserStore {
             Err(StorageError::LastManager) => return Err(UserStoreError::LastManager),
             Err(error) => return Err(UserStoreError::Storage(error)),
         };
-        updated.map(user_record).transpose()
+        updated
+            .map(|(user, session_ids)| user_record(user).map(|user| (user, session_ids)))
+            .transpose()
     }
 
     pub async fn update_profile(

@@ -12629,19 +12629,36 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 #### LUX-598：禁用和删除时停止服务端 HLS 进程
 
-范围：为账号生命周期路径提供按用户读取活跃服务端 HLS 会话 ID，并提供应用服务停止指定 HLS 进程的方法。停止失败写入不含凭证的会话级日志并继续清理其他会话；不改变 Web 端播放协议。
+范围：提供应用服务停止指定服务端 HLS 会话进程的方法。生命周期存储事务负责捕获目标用户的活跃 HLS 会话 ID，API 在事务提交后调用该方法；停止失败写入不含凭证的会话级日志并继续清理其他会话，不改变 Web 端播放协议。
 
-预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/sessions.rs`、`src/application/playback/session.rs`。
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`。
 
 验收标准：
 
-- [x] 查询只返回目标用户当前活跃的服务端 HLS 会话。
+- [x] 禁用和软删除的数据库事务捕获目标用户当前活跃的服务端 HLS 会话。
 - [x] 停止方法逐个释放 HLS 进程与临时目录，单项失败不阻断后续会话清理。
 - [x] Cargo 构建与格式检查通过。
 
 依赖：LUX-597。
 
-结果（2026-10-19）：新增活跃服务端 HLS 会话 ID 查询和逐项进程停止入口。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与格式检查通过；入口将在 LUX-599 管理员生命周期 API 中接通。未运行测试。
+结果（2026-10-19）：新增逐项停止指定 HLS 进程入口，活跃会话 ID 由 LUX-597/599 的生命周期事务捕获。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与格式检查通过；入口在 LUX-599 管理员生命周期 API 中接通。未运行测试。
+
+#### LUX-599：管理员账号生命周期 API
+
+范围：管理员删除用户改为软删除并返回回收站期限；新增恢复和彻底删除端点。禁用、软删除事务性撤销凭证、停止数据库播放会话并返回同时捕获的服务端 HLS 会话 ID，提交后交给播放服务终止。Emby 管理接口的禁用和删除沿用相同语义；移除不再需要的独立会话查询；彻底删除账号时清理头像文件。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`src/api/emby_handlers.rs`、`src/storage/sessions.rs`、`src/application/playback/session.rs`。
+
+验收标准：
+
+- [x] 管理员删除将账号放入 7 天回收站；恢复还原禁用状态；彻底删除只接受回收站账号。
+- [x] Lux 与 Emby 管理入口禁用或删除后撤销 Web/Emby 凭证、停止数据库会话并终止捕获的服务端 HLS 进程。
+- [x] 最后一名有效管理员保护和错误状态码保持正确；API 不返回原始凭证。
+- [x] Cargo 构建与格式检查通过。
+
+依赖：LUX-597、LUX-598。
+
+结果（2026-10-19）：Lux 管理删除改为回收站，新增恢复和提前彻底删除；Emby 管理删除同步软删除。禁用/删除事务返回被停止的服务端 HLS ID，并在提交后终止进程；彻底删除会清理头像文件。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和格式检查通过，未运行测试。
 
 ## 29. 参考资料
 
