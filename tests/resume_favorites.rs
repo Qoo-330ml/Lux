@@ -1084,14 +1084,28 @@ async fn home_continue_watching_advances_to_next_unplayed_episode_after_completi
         .as_str()
         .ok_or("missing Emby token")?
         .to_owned();
-    let emby_resume = client
-        .get(format!("{base_url}/Users/{admin_id}/Items/Resume"))
-        .query(&[("api_key", emby_token.as_str()), ("Limit", "10")])
-        .send()
-        .await?;
-    assert_eq!(emby_resume.status(), reqwest::StatusCode::OK);
-    let emby_resume_body = emby_resume.json::<Value>().await?;
-    assert_eq!(emby_resume_body["TotalRecordCount"], 0);
+    for path in [
+        format!("/Users/{admin_id}/Items/Resume"),
+        format!("/emby/Users/{admin_id}/Items/Resume"),
+    ] {
+        let emby_resume = client
+            .get(format!("{base_url}{path}"))
+            .query(&[("api_key", emby_token.as_str()), ("Limit", "10")])
+            .send()
+            .await?;
+        assert_eq!(emby_resume.status(), reqwest::StatusCode::OK);
+        let emby_resume_body = emby_resume.json::<Value>().await?;
+        assert_eq!(emby_resume_body["TotalRecordCount"], 1);
+        assert_eq!(
+            emby_resume_body["Items"][0]["Id"],
+            emby_public_id(&episode_ids[1])
+        );
+        assert_eq!(
+            emby_resume_body["Items"][0]["UserData"]["PlaybackPositionTicks"],
+            0
+        );
+        assert_eq!(emby_resume_body["Items"][0]["UserData"]["Played"], false);
+    }
 
     server.abort();
     database.close().await;

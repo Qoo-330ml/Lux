@@ -230,9 +230,9 @@ VidHub、SenPlayer、Infuse 或其他第三方客户端已经完成真实客户�
 
 ## Emby Resume 同剧单集聚合
 
-`GET /Users/{userId}/Items/Resume`（包括 `/emby` 前缀）对同一剧只返回一条符合继续观看条件的单集：先按季号、再按集号取最大值；季集号相同时按最近播放时间决胜。电影仍逐条返回。`TotalRecordCount` 和分页都在同剧单集收敛后计算，因此不同 Emby 客户端用该接口生成“继续观看”时不会同时展示同剧的多集。
+`GET /Users/{userId}/Items/Resume`（包括 `/emby` 前缀）对同一剧只返回一条符合继续观看条件的单集：先按季号、再按集号取最大值；季集号相同时按最近播放时间决胜。电影仍逐条返回。若最近播放的单集已看，且没有更靠后的合格未完成进度，Resume 会返回其后的第一集未看且可播放单集，`UserData.PlaybackPositionTicks` 为 `0`、`Played` 为 `false`。`TotalRecordCount` 和分页都在同剧单集收敛后计算。
 
-`tests/resume_favorites.rs` 覆盖根路径和 `/emby` 路径的协议响应；自动化结果证明服务端合同，不替代 SenPlayer、VidHub、Infuse 或其他客户端部署环境的 UI 实测。
+`tests/resume_favorites.rs` 覆盖根路径和 `/emby` 路径的协议响应，包括零进度下一集；自动化结果证明服务端合同，不替代 SenPlayer、VidHub、Infuse 或其他客户端部署环境的 UI 实测。
 
 ## LUX-234 URL 型 `.strm` 容器名兼容（2026-09-22）
 
