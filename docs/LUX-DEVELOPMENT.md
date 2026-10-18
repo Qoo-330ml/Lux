@@ -320,7 +320,7 @@ Lux 的核心价值不是功能数量，而是：
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求。URL 型 `.strm` 的解析请求由 Lux 直连目标并绕过全局出站代理，但不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
-- Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
+- Lux 展示的客户端 IP 按有效的 X-Forwarded-For、X-Real-IP、Forwarded 顺序读取；Forwarded 只采用首个代理元素的 for 参数，支持 IPv4、带方括号的 IPv6 和可选端口。转发 IP 缺失或无效时不把反代对端地址当作真实客户端 IP。HTTPS 判断仍读取 X-Forwarded-Proto；远程访问权限不再依据来源 IP 判断。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
 ### 3.14 管理与可观测性
@@ -12521,6 +12521,30 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 依赖：LUX-589、LUX-591。先完成最终检查与基线对照，再写入兼容记录。
 
 结果（2026-10-18）：`docs/COMPATIBILITY.md` 记录合同及验证边界。相关后处理、诊断、PostgreSQL、接口、Web 回归与 Chromium 受控接口验证通过，build、fmt、Clippy 和 Shell/Python 工具检查通过。完整 Rust 库测试 972 通过、4 失败、25 ignored；三个存储失败在基线复现，worker 超时用例在最终代码和基线单独通过。完整扫描 target 为 89 通过、2 个基线复现失败；Web 静态 145 通过/3 失败，完整 Vitest 655 通过/4 失败，七项均在基线复现。完整门禁未通过，不扩展修复无关问题；未合并、推送或部署。
+
+#### LUX-592：兼容 X-Real-IP 和 Forwarded 客户端 IP
+
+范围：扩展播放会话和活动记录共用的客户端 IP 读取逻辑，按 X-Forwarded-For、X-Real-IP、Forwarded 的有效值顺序回退；保留现有账号认证、ACL、限流和 HTTPS 判断行为。
+
+预计修改文件：`src/network.rs`、`src/api/legacy.rs`、`tests/remote.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。
+
+验收标准：
+
+- [x] 无需代理 CIDR 配置，支持 X-Real-IP 的单个 IPv4/IPv6 地址。
+- [x] 支持 RFC 7239 Forwarded 首个元素中的 for，包含大小写不敏感参数名、引号、IPv6 和可选端口；unknown、混淆标识及异常值不作为 IP。
+- [x] 有效 X-Forwarded-For 优先；无效高优先级头允许回退；不从后续代理元素猜测原始客户端 IP。
+- [x] 真实 HTTP 集成测试覆盖根路径和 /emby 播放回调，验证保存的 IP 与 GET /Sessions 的 RemoteEndPoint。
+- [x] 记录定向测试、Rust 完成门禁和本机架构；真实 Lucky/FNOS 部署验证单独说明。
+
+验证：`cargo test --locked --test remote --test sessions --test playback --test admin_dashboard`；Rust build、all-targets test、fmt 和 Clippy 完成门禁。
+
+依赖：LUX-092。
+
+结果（2026-10-19）：新增回环 HTTP 测试先在旧逻辑上复现：只携带 `X-Real-IP` 的播放事件落库 IP 为 `None`。接入共用入口后，`remote` 8/8、`sessions` 2/2、`playback` 3/3、`admin_dashboard` 1/1 通过；其中新增播放回归覆盖根路径和 `/emby`、X-Real-IP/Forwarded 的 IPv4/IPv6，以及数据库与会话接口输出。解析回归覆盖优先级、无效值回退、引号/转义/端口和拒绝后续代理地址。原有 remote HTTP 用例首次受本机代理影响返回 502；为测试进程设置 `NO_PROXY`/`no_proxy=127.0.0.1,localhost` 后通过，生产出站代理配置未改动。
+
+本机为 macOS `arm64`，全部 Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 在库测试阶段得到 973 passed、3 failed、25 ignored，后续集成 targets 未运行；相关集成 targets 已按上述定向命令独立通过。三个失败分别为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`（实际 0、预期 1）、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`（空集合越界）和 `changed_local_fill_request_during_running_item_is_not_lost`（实际 0、预期 1）。三项均在干净基线 `842f9870` 以各自完整测试名和 `--lib -- --exact` 单独复现相同失败，临时 worktree 已清理；完整 Rust 门禁仍未通过。
+
+真实 Lucky、FNOS/x86_64 和第三方播放器尚未验证，本任务未推送或部署。请求头全部缺失时仍无法恢复客户端地址，兼容合同见 `docs/COMPATIBILITY.md`。
 
 ## 29. 参考资料
 

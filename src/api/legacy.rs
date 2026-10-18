@@ -1031,6 +1031,8 @@ fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option
         .reported_client_ip(
             header_str(headers, "x-lux-peer-ip"),
             header_str(headers, "x-forwarded-for"),
+            header_str(headers, "x-real-ip"),
+            header_str(headers, "forwarded"),
         )
         .map(|address| address.to_string())
 }
