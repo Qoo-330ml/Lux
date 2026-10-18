@@ -49,7 +49,7 @@ impl Database {
                     && root_state.as_deref() == Some("COMPLETE")
             })
             .filter_map(|delta| unresolved_files.get(delta.relative_path.as_str()))
-            .cloned()
+            .map(|file| (**file).clone())
             .collect::<Vec<_>>();
         self.materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
             transaction,
