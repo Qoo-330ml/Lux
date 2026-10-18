@@ -12782,6 +12782,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增受管理员鉴权的目标用户头像 GET/PUT；写入要求 CSRF 并复用已有 5 MiB、格式和私有目录校验，GET 返回实际 MIME、私有重验证缓存，缺失返回 404。Cargo build、fmt 和 diff check 通过；未运行测试。
 
+#### LUX-607：管理用户头像页面
+
+范围：列表和回收站显示用户头像，详情资料页显示并允许管理员更新头像；图片通过 LUX-606 管理员 API 获取和保存，上传后立即刷新图片缓存。列表展示预设来源；当前尚无预设模型的账号明确显示“未设置”。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 普通列表与回收站显示头像；头像缺失或读取失败时显示通用图标。
+- [x] 管理员可从详情页更新头像，上传成功后显示新图片并报告失败。
+- [x] 列表显示当前预设来源状态，不虚构未配置的预设。
+- [x] Web 构建通过；未运行测试。
+
+验证：`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-593、LUX-601、LUX-606。
+
+结果（2026-10-19）：列表和回收站改为懒加载管理员头像，缺失或失败时显示默认图标；详情资料页可更新头像并刷新缓存，失败会显示接口错误。用户列表明确显示预设来源（当前无预设时为“未设置”）。`pnpm --dir web build` 与 diff check 通过；未运行测试或部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

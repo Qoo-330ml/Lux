@@ -118,10 +118,11 @@ function UserAdminRow({ user, libraryIds, libraryNames }: { user: AdminUser; lib
   return (
     <article className={user.isDisabled ? "lux-admin-user-row is-disabled" : "lux-admin-user-row"}>
       <div className="lux-admin-user-summary">
-        <span className="lux-admin-user-avatar"><UserRound size={18} /></span>
+        <AdminUserAvatar userId={user.id} />
         <div>
           <strong>{displayName}</strong>
           <small>{user.usernameNormalized}{user.canManageServer ? " · 管理员" : ""}{user.email ? ` · ${user.email}` : ""}</small>
+          <small>预设来源：{user.presetSource || "未设置"}</small>
           <small>最近活动：{formatUserTimestamp(user.lastActivityAt)} · 最近登录：{formatUserTimestamp(user.lastLoginAt)}</small>
         </div>
       </div>
@@ -259,7 +260,7 @@ function DeletedUserRow({ user }: { user: AdminUser }) {
   return (
     <article className="lux-admin-user-row lux-admin-deleted-user-row">
       <div className="lux-admin-user-summary">
-        <span className="lux-admin-user-avatar"><UserRound size={18} /></span>
+        <AdminUserAvatar userId={user.id} />
         <div>
           <strong>{displayName}</strong>
           <small>{user.usernameNormalized}{user.email ? ` · ${user.email}` : ""}</small>
@@ -282,4 +283,13 @@ function AdminUserState({ label, error = false }: { label: string; error?: boole
 
 function formatUserTimestamp(timestamp?: number | null): string {
   return timestamp ? new Date(timestamp * 1000).toLocaleString() : "暂无";
+}
+
+function AdminUserAvatar({ userId }: { userId: string }) {
+  const [failed, setFailed] = useState(false);
+  return (
+    <span className="lux-admin-user-avatar">
+      {failed ? <UserRound size={18} /> : <img src={api.adminUserAvatarUrl(userId)} alt="" loading="lazy" onError={() => setFailed(true)} />}
+    </span>
+  );
 }

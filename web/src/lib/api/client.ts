@@ -1102,6 +1102,18 @@ export class LuxApiClient {
     );
   }
 
+  adminUserAvatarUrl(userId: string, cacheKey?: string) {
+    const path = `/api/v1/admin/users/${encodeURIComponent(userId)}/avatar`;
+    return cacheKey ? `${path}?v=${encodeURIComponent(cacheKey)}` : path;
+  }
+
+  uploadAdminUserAvatar(userId: string, file: File) {
+    return this.request<{ avatarUrl: string }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/avatar`,
+      { method: "PUT", headers: { "Content-Type": file.type }, body: file },
+    );
+  }
+
   updateAdminUserProfile(
     userId: string,
     input: { displayName: string; email: string },

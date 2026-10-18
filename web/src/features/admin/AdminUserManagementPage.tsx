@@ -1,4 +1,4 @@
-import { ArrowLeft, CircleDashed, ShieldCheck, SlidersHorizontal, Users } from "lucide-react";
+import { ArrowLeft, CircleDashed, ShieldCheck, SlidersHorizontal, UserRound, Users } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
@@ -86,6 +86,9 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
   const [displayName, setDisplayName] = useState(user.displayName ?? "");
   const [email, setEmail] = useState(user.email ?? "");
   const [notice, setNotice] = useState("");
+  const [avatarNotice, setAvatarNotice] = useState("");
+  const [avatarVersion, setAvatarVersion] = useState(() => String(Date.now()));
+  const [avatarFailed, setAvatarFailed] = useState(false);
   const update = useMutation({
     mutationFn: () => api.updateAdminUserProfile(user.id, { displayName, email }),
     onSuccess: ({ user: updated }) => {
@@ -96,6 +99,15 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
     },
     onError: (error) => setNotice(error.message || "资料保存失败，请重试。"),
+  });
+  const updateAvatar = useMutation({
+    mutationFn: (file: File) => api.uploadAdminUserAvatar(user.id, file),
+    onSuccess: () => {
+      setAvatarVersion(String(Date.now()));
+      setAvatarFailed(false);
+      setAvatarNotice("头像已更新。");
+    },
+    onError: (error) => setAvatarNotice(error.message || "头像更新失败，请重试。"),
   });
   useEffect(() => {
     setDisplayName(user.displayName ?? "");
@@ -121,6 +133,32 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
         <span className={user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.isDisabled ? "已禁用" : "正常"}</span>
       </div>
       <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
+        <div className="lux-admin-user-avatar-row">
+          <span className="lux-admin-user-avatar is-profile">
+            {avatarFailed ? <UserRound size={27} /> : <img src={api.adminUserAvatarUrl(user.id, avatarVersion)} alt="" onError={() => setAvatarFailed(true)} />}
+          </span>
+          <div className="lux-admin-user-avatar-actions">
+            <strong>头像</strong>
+            <label className="lux-button lux-button-secondary lux-admin-user-avatar-upload">
+              <span>{updateAvatar.isPending ? "上传中…" : "更换头像"}</span>
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                aria-label="更换用户头像"
+                disabled={updateAvatar.isPending}
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = "";
+                  if (file) {
+                    setAvatarNotice("");
+                    updateAvatar.mutate(file);
+                  }
+                }}
+              />
+            </label>
+            {avatarNotice ? <span role={updateAvatar.isError ? "alert" : "status"}>{avatarNotice}</span> : null}
+          </div>
+        </div>
         <label>
           显示名称
           <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={128} />
