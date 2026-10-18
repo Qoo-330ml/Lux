@@ -12504,6 +12504,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-18）：只移动测试模块，查询计划和 SQLite/PostgreSQL 诊断矩阵 3/3 通过；完整 Clippy 与格式检查通过。完整测试中超时的 local metadata worker 用例在同一最终代码单独复跑通过，完整门禁仍保留原失败结果。
 
+#### LUX-590：记录后处理重试修复的兼容与完成门禁
+
+范围：记录 LUX-584 至 LUX-589 的 API、历史任务恢复、浏览器验证及完整检查结果；不增加运行时行为。
+
+预计修改文件：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。
+
+验收标准：
+
+- [x] 记录索引完成语义、附加 API 字段、问题筛选和旧 workflow 恢复合同。
+- [x] 记录 SQLite、PostgreSQL、接口、Web 和真实浏览器的证据范围。
+- [x] 完整门禁失败逐项与干净基线对照，不以定向通过代替全量通过。
+
+依赖：LUX-589、LUX-591。先完成最终检查与基线对照，再写入兼容记录。
+
+结果（2026-10-18）：`docs/COMPATIBILITY.md` 记录合同及验证边界。相关后处理、诊断、PostgreSQL、接口、Web 回归与 Chromium 受控接口验证通过，build、fmt、Clippy 和 Shell/Python 工具检查通过。完整 Rust 库测试 972 通过、4 失败、25 ignored；三个存储失败在基线复现，worker 超时用例在最终代码和基线单独通过。完整扫描 target 为 89 通过、2 个基线复现失败；Web 静态 145 通过/3 失败，完整 Vitest 655 通过/4 失败，七项均在基线复现。完整门禁未通过，不扩展修复无关问题；未合并、推送或部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
