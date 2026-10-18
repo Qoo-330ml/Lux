@@ -2110,9 +2110,10 @@ services:
 | LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
 | LUX-578 | migrations/、migrations-postgres/、tests/storage.rs、docs/LUX-DEVELOPMENT.md；增加逐任务唯一媒体进度台账 |
 | LUX-579 | src/storage/jobs/scan/manifest/discovery/presence.rs、src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
-| LUX-580 | src/application/admin_task_activity.rs、src/api/admin/admin_jobs.rs、src/api/admin/admin_scheduled_tasks.rs、tests/、docs/LUX-DEVELOPMENT.md |
-| LUX-581 | web/src/lib/api/types.ts、web/src/features/admin/AdminOperationsPage.tsx、web/tests/admin-operations.test.tsx、docs/LUX-DEVELOPMENT.md |
-| LUX-582 | web/src/features/activity/ScanActivityPopover.tsx、web/tests/scan-activity.test.tsx、docs/LUX-DEVELOPMENT.md |
+| LUX-580 | src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、src/application/scanner/tests.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-581 | src/application/admin_task_activity.rs、src/api/admin/admin_jobs.rs、src/api/admin/admin_scheduled_tasks.rs、tests/、docs/LUX-DEVELOPMENT.md |
+| LUX-582 | web/src/lib/api/types.ts、web/src/features/admin/AdminOperationsPage.tsx、web/tests/admin-operations.test.tsx、docs/LUX-DEVELOPMENT.md |
+| LUX-583 | web/src/features/activity/ScanActivityPopover.tsx、web/tests/scan-activity.test.tsx、docs/LUX-DEVELOPMENT.md |
 | LUX-210 | docs/LUX-DEVELOPMENT.md；关闭 LuxPlayer 核心阶段并定义字幕、弹幕后续边界 |
 | LUX-211 | src/api/mod.rs、tests/、web/src/features/player/、web/tests/、docs/；将字幕轨绑定到当前媒体源并实现原生 WebVTT 生命周期 |
 | LUX-212 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有的安全文本字幕解析与渲染 |
@@ -12306,18 +12307,34 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：全量扫描每个目录块完成文件登记后，在同一事务中按媒体 ID 去重累计进度。电影按电影条目计数；剧集库按 `series_id` 计整部剧，同一剧的多季、多集只计一次。附属文件、未识别文件不计入。原有文件数保留给内部诊断，不读取目录总量、不增加第二次文件遍历。
 
-预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`。
+预计文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`tests/scanning_jobs.rs`。
 
 验收：
 
-- [ ] 同一电影的多个版本只计一部；同一剧的多集、多季只计一部剧；附属文件不计数。
-- [ ] 未变更的已索引媒体也能在全量扫描过程中计数；任务重启后不重复计数。
-- [ ] 计数随扫描块提交并可从扫描任务读取；不改变旧文件计数。
-- [ ] 扫描任务目标测试通过。
+- [x] 同一电影的多个版本只计一部；同一剧的多集、多季只计一部剧；附属文件不计数。
+- [x] 未变更的已索引媒体也能在全量扫描过程中计数；worker 重建后继续任务不重复计数。
+- [x] 计数随扫描块提交到新字段；不改变旧文件计数。
+- [x] 扫描任务目标测试通过。
 
 依赖：LUX-578。先添加影片、剧集和附属文件混合场景的回归，再在已有 presence 事务中写入去重台账。
 
-#### LUX-580：在管理员扫描任务接口公开媒体进度
+结果（2026-10-18）：Manifest presence 事务会从本批已登记的文件中聚合电影条目 ID，剧集文件映射到 `series_id`，并通过任务级唯一键累计；旧版任务的空计数不回填。集成回归覆盖同片多版本、跨季多集、附属文件、未变更文件、运行中计数以及重建 worker 后继续处理。`cargo test --locked --test scanning_jobs full_scan_counts_unique_movies_and_whole_series_during_discovery -- --exact` 通过。
+
+#### LUX-580：从扫描任务存储模型读取媒体进度
+
+范围：`StoredScanJob` 暴露独立的可空 `processed_media_count`。新任务从 0 开始；升级前创建的任务保持空值，因为无法可靠地回溯其扫描进度。原有文件计数字段不变。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/repository.rs`、`src/application/scanner/tests.rs`。
+
+验收：
+
+- [ ] 查找、分页列表和活动列表均能读取新计数，旧任务的计数保持空值。
+- [ ] 原有文件计数与扫描生命周期行为不变。
+- [ ] Rust 存储与扫描任务目标检查通过。
+
+依赖：LUX-579。先补存储模型映射，再扩展查询列并读取计数。
+
+#### LUX-581：在管理员扫描任务接口公开媒体进度
 
 范围：管理员任务列表、任务详情和全局活动接口公开独立的 `processedMediaCount`。保留兼容的文件 `processedCount`/`totalCount` 字段；新字段只用于全量扫描媒体进度。
 
@@ -12329,9 +12346,9 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [ ] 既有文件计数字段及其他任务的 JSON 行为不变。
 - [ ] Rust API 定向回归通过。
 
-依赖：LUX-579。先补接口响应断言，再映射已存储计数。
+依赖：LUX-580。先补接口响应断言，再映射已存储计数。
 
-#### LUX-581：管理运行记录显示媒体处理数量
+#### LUX-582：管理运行记录显示媒体处理数量
 
 范围：全量扫描的管理运行记录将右侧进度改为已处理电影/剧集数量，不显示文件数、总数或百分比。电影库显示“已处理 N 部电影”，剧集库按整部剧显示“已处理 N 部剧”；百分比进度改为不确定进度条。其他任务和增量扫描保持原展示。
 
@@ -12343,9 +12360,9 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [ ] 全量扫描不显示文件分母或百分比；其他任务沿用现有行为。
 - [ ] 管理运行记录 Web 定向回归通过。
 
-依赖：LUX-580。先补电影库、剧集库和非全量任务的渲染断言，再修改运行记录文案。
+依赖：LUX-581。先补电影库、剧集库和非全量任务的渲染断言，再修改运行记录文案。
 
-#### LUX-582：全局活动浮层显示媒体处理数量
+#### LUX-583：全局活动浮层显示媒体处理数量
 
 范围：全局后台活动浮层对全量扫描显示已处理的电影或整部剧数量，并使用不确定进度条；不显示发现到的文件总数或百分比。其他活动保持原行为。
 
@@ -12357,7 +12374,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [ ] 增量扫描及其他后台任务进度不变。
 - [ ] 活动浮层 Web 定向回归通过。
 
-依赖：LUX-580。先补活动浮层回归，再修改计数标签和进度显示。
+依赖：LUX-581。先补活动浮层回归，再修改计数标签和进度显示。
 
 ## 29. 参考资料
 

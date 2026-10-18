@@ -244,8 +244,110 @@ impl Database {
                 })?;
         }
 
+        self.record_scan_job_processed_media_items_in_transaction(
+            transaction,
+            chunk,
+            generation,
+            file_paths,
+        )
+        .await?;
+
         Ok(successfully_seen_paths
             .len()
             .saturating_add(ledger_paths.len()))
+    }
+
+    async fn record_scan_job_processed_media_items_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        chunk: &NewScanManifestDiscoveryChunk<'_>,
+        generation: &str,
+        file_paths: &[&str],
+    ) -> Result<(), StorageError> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+
+        let chunk_size = (super::manifest_path_query_chunk_size(self.backend()) / 4).max(1);
+        let mut processed_media_count = 0_u64;
+        for paths in file_paths.chunks(chunk_size) {
+            let values = std::iter::repeat_n("(?)", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested_paths(relative_path) AS (VALUES {values})
+                 INSERT INTO scan_job_processed_media_items (job_id, media_item_id)
+                 SELECT job.id,
+                        CASE WHEN item.item_type = 'MOVIE' THEN item.id
+                             ELSE item.series_id END
+                 FROM requested_paths
+                 JOIN scan_jobs job
+                   ON job.id = ? AND job.job_type = 'RECONCILE_LIBRARY'
+                  AND job.status = 'RUNNING' AND job.cancel_requested = 0
+                  AND job.processed_media_count IS NOT NULL
+                 JOIN filesystem_entries entry
+                   ON entry.library_root_id = ?
+                  AND entry.relative_path = requested_paths.relative_path
+                  AND entry.last_seen_generation = ? AND entry.is_missing = 0
+                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
+                 JOIN media_items item ON item.id = source.item_id
+                 WHERE item.removed_at IS NULL
+                   AND item.item_type IN ('MOVIE', 'EPISODE')
+                   AND (item.item_type = 'MOVIE' OR item.series_id IS NOT NULL)
+                   AND 1 = 1
+                 GROUP BY job.id,
+                          CASE WHEN item.item_type = 'MOVIE' THEN item.id
+                               ELSE item.series_id END
+                 ON CONFLICT(job_id, media_item_id) DO NOTHING"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for path in paths {
+                statement = statement.bind(path);
+            }
+            let inserted = statement
+                .bind(&chunk.job_id)
+                .bind(chunk.library_root_id)
+                .bind(generation)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            processed_media_count = processed_media_count
+                .checked_add(inserted.rows_affected())
+                .ok_or_else(|| {
+                    StorageError::Conflict("processed media count overflow".to_owned())
+                })?;
+        }
+
+        if processed_media_count == 0 {
+            return Ok(());
+        }
+        let processed_media_count = i64::try_from(processed_media_count)
+            .map_err(|_| StorageError::Conflict("processed media count overflow".to_owned()))?;
+        let updated = self
+            .query(
+                "UPDATE scan_jobs
+                 SET processed_media_count = processed_media_count + ?,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND job_type = 'RECONCILE_LIBRARY'
+                   AND status = 'RUNNING' AND cancel_requested = 0
+                   AND processed_media_count IS NOT NULL",
+            )
+            .bind(processed_media_count)
+            .bind(&chunk.job_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "scan job stopped accepting processed media progress".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

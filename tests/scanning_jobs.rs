@@ -1949,6 +1949,175 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
 }
 
 #[tokio::test]
+async fn full_scan_counts_unique_movies_and_whole_series_during_discovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let movie_library = libraries
+        .create_library("Progress movies", LibraryKind::Movie, false)
+        .await?;
+    let movie_root = temp_dir.path().join("Progress movies");
+    for directory in ["A", "B", "C"] {
+        tokio::fs::create_dir_all(movie_root.join(directory)).await?;
+    }
+    tokio::fs::write(
+        movie_root.join("A/Duplicate.Movie.2020.1080p.mkv"),
+        b"first version",
+    )
+    .await?;
+    tokio::fs::write(movie_root.join("A/poster.jpg"), b"poster").await?;
+    tokio::fs::write(
+        movie_root.join("B/Duplicate.Movie.2020.2160p.mkv"),
+        b"second version",
+    )
+    .await?;
+    tokio::fs::write(
+        movie_root.join("C/Another.Movie.2021.mkv"),
+        b"another movie",
+    )
+    .await?;
+    tokio::fs::write(movie_root.join("C/movie.nfo"), b"sidecar").await?;
+    libraries
+        .add_root(
+            movie_library.id,
+            movie_root.to_str().ok_or("non-UTF-8 path")?,
+        )
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let movie_job = jobs.create_movie_scan_job(movie_library.id).await?;
+    let mut movie_count_observed_while_running = false;
+    for _ in 0..100 {
+        jobs.run_batch(&movie_job.id, 1).await?;
+        let (status, count): (String, i64) =
+            sqlx::query_as("SELECT status, processed_media_count FROM scan_jobs WHERE id = ?")
+                .bind(&movie_job.id)
+                .fetch_one(database.pool())
+                .await?;
+        if count > 0 {
+            assert_eq!(status, "RUNNING");
+            movie_count_observed_while_running = true;
+            break;
+        }
+        if status != "RUNNING" {
+            break;
+        }
+    }
+    assert!(movie_count_observed_while_running);
+    jobs.run_to_completion(&movie_job.id, 1, None).await?;
+
+    let movie_progress: (i64, i64, i64) = sqlx::query_as(
+        "SELECT processed_media_count, processed_count, total_count
+         FROM scan_jobs WHERE id = ?",
+    )
+    .bind(&movie_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(movie_progress.0, 2, "versions of one movie count once");
+    assert!(movie_progress.1 > movie_progress.0);
+    assert_eq!(movie_progress.1, movie_progress.2);
+    let movie_ledger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_processed_media_items WHERE job_id = ?")
+            .bind(&movie_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(movie_ledger_count, 2);
+
+    let series_library = libraries
+        .create_library("Progress series", LibraryKind::Series, false)
+        .await?;
+    let series_root = temp_dir.path().join("Progress series");
+    let season_one = series_root.join("Example Show (2024)/Season 01");
+    let season_two = series_root.join("Example Show (2024)/Season 02");
+    tokio::fs::create_dir_all(&season_one).await?;
+    tokio::fs::create_dir_all(&season_two).await?;
+    for (directory, name) in [
+        (&season_one, "Example.Show.S01E01.1080p.mkv"),
+        (&season_one, "Example.Show.S01E01.2160p.mkv"),
+        (&season_one, "Example.Show.S01E02.mkv"),
+        (&season_two, "Example.Show.S02E01.mkv"),
+    ] {
+        tokio::fs::write(directory.join(name), b"episode").await?;
+    }
+    tokio::fs::write(season_one.join("poster.jpg"), b"poster").await?;
+    tokio::fs::write(season_one.join("Example.Show.nfo"), b"sidecar").await?;
+    libraries
+        .add_root(
+            series_library.id,
+            series_root.to_str().ok_or("non-UTF-8 path")?,
+        )
+        .await?;
+
+    let series_job = jobs.create_movie_scan_job(series_library.id).await?;
+    let mut series_count_observed_while_running = false;
+    for _ in 0..100 {
+        jobs.run_batch(&series_job.id, 1).await?;
+        let (status, count): (String, i64) =
+            sqlx::query_as("SELECT status, processed_media_count FROM scan_jobs WHERE id = ?")
+                .bind(&series_job.id)
+                .fetch_one(database.pool())
+                .await?;
+        if count > 0 {
+            assert_eq!(status, "RUNNING");
+            series_count_observed_while_running = true;
+            break;
+        }
+        if status != "RUNNING" {
+            break;
+        }
+    }
+    assert!(series_count_observed_while_running);
+    let resumed_jobs = ScanJobService::new(database.clone());
+    resumed_jobs
+        .run_to_completion(&series_job.id, 1, None)
+        .await?;
+
+    let series_progress: (i64, i64, i64) = sqlx::query_as(
+        "SELECT processed_media_count, processed_count, total_count
+         FROM scan_jobs WHERE id = ?",
+    )
+    .bind(&series_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        series_progress.0, 1,
+        "all episodes and seasons count as one series"
+    );
+    assert!(series_progress.1 > series_progress.0);
+    assert_eq!(series_progress.1, series_progress.2);
+    let series_ledger_matches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_processed_media_items progress
+         JOIN media_items series ON series.id = progress.media_item_id
+         WHERE progress.job_id = ? AND series.library_id = ?
+           AND series.item_type = 'SERIES'",
+    )
+    .bind(&series_job.id)
+    .bind(series_library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(series_ledger_matches, 1);
+
+    let unchanged_series_job = jobs.create_movie_scan_job(series_library.id).await?;
+    jobs.run_to_completion(&unchanged_series_job.id, 1, None).await?;
+    let unchanged_series_progress: (i64, i64, i64) = sqlx::query_as(
+        "SELECT processed_media_count, processed_count, total_count
+         FROM scan_jobs WHERE id = ?",
+    )
+    .bind(&unchanged_series_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged_series_progress.0, 1);
+    assert!(unchanged_series_progress.1 > unchanged_series_progress.0);
+    assert_eq!(unchanged_series_progress.1, unchanged_series_progress.2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
