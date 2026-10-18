@@ -10,6 +10,13 @@ const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 
+fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
+    value
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| (1..=MAX_USER_DELETION_GRACE_DAYS).contains(days))
+        .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS)
+}
+
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
         self.query_scalar("SELECT CASE WHEN EXISTS(SELECT 1 FROM users LIMIT 1) THEN 1 ELSE 0 END")
@@ -859,10 +866,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let grace_days = configured_grace_days
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|days| (1..=MAX_USER_DELETION_GRACE_DAYS).contains(days))
-            .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS);
+        let grace_days = normalize_user_deletion_grace_days(configured_grace_days);
         let hls_session_rows = self
             .query(
                 "SELECT id FROM web_playback_sessions
@@ -1850,6 +1854,43 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn user_deletion_grace_days(&self) -> Result<i64, StorageError> {
+        let value: Option<String> = self
+            .query_scalar(
+                "SELECT value FROM server_settings
+                 WHERE key = 'user_deletion_grace_days'",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(normalize_user_deletion_grace_days(value))
+    }
+
+    pub(crate) async fn set_user_deletion_grace_days(&self, days: i64) -> Result<(), StorageError> {
+        if !(1..=MAX_USER_DELETION_GRACE_DAYS).contains(&days) {
+            return Err(StorageError::Serialization(
+                "user deletion grace period is outside the allowed range".to_owned(),
+            ));
+        }
+        self.query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('user_deletion_grace_days', ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(days.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
     }
 
     pub(crate) async fn user_uses_admin_library_order(

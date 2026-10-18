@@ -115,6 +115,7 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) resume_played_percent: i64,
     pub(crate) resume_min_ticks: i64,
     pub(crate) force_admin_library_order: bool,
+    pub(crate) user_deletion_grace_days: i64,
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
     pub(crate) media_strategy: MediaStrategySettings,
@@ -132,6 +133,7 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) resume_played_percent: Option<i64>,
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
+    pub(crate) user_deletion_grace_days: Option<i64>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     pub(crate) network_proxy: NetworkProxyChange,
@@ -144,6 +146,7 @@ pub(crate) enum AdminSettingsError {
     LoginBackgroundPluginUnavailable,
     InvalidServerName,
     InvalidGlobalSettings,
+    InvalidUserDeletionGraceDays,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
     Plugin(PluginServiceError),
@@ -154,6 +157,7 @@ struct StoredAdminSettings {
     resume_played_percent: i64,
     resume_min_ticks: i64,
     force_admin_library_order: bool,
+    user_deletion_grace_days: i64,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
 }
@@ -167,6 +171,7 @@ pub(crate) async fn read_admin_settings(
         database.resume_settings().await.map_err(|_| ())?;
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
+    let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
         _ => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -183,6 +188,7 @@ pub(crate) async fn read_admin_settings(
         resume_played_percent,
         resume_min_ticks,
         force_admin_library_order,
+        user_deletion_grace_days,
         login_background_source,
         login_background_source_status,
         media_strategy,
@@ -236,6 +242,12 @@ pub(crate) async fn update_admin_settings(
     let force_admin_library_order = update
         .force_admin_library_order
         .unwrap_or(current.force_admin_library_order);
+    let user_deletion_grace_days = update
+        .user_deletion_grace_days
+        .unwrap_or(current.user_deletion_grace_days);
+    if !(1..=3_650).contains(&user_deletion_grace_days) {
+        return Err(AdminSettingsError::InvalidUserDeletionGraceDays);
+    }
     if !(1..=100).contains(&resume_played_percent)
         || resume_min_ticks < 0
         || !validate_media_strategy(&media_strategy)
@@ -294,6 +306,7 @@ pub(crate) async fn update_admin_settings(
             resume_min_ticks,
             media_strategy_json: &media_strategy_json,
             force_admin_library_order,
+            user_deletion_grace_days,
             login_background_source: &login_background_source,
             server_name: &server_name,
             refresh_login_background: login_background_source_changed
@@ -310,6 +323,7 @@ pub(crate) async fn update_admin_settings(
         resume_played_percent,
         resume_min_ticks,
         force_admin_library_order,
+        user_deletion_grace_days,
         login_background_source,
         login_background_source_status,
         media_strategy,
@@ -322,6 +336,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         database.resume_settings().await.map_err(|_| ())?;
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
+    let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
         _ => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -335,6 +350,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         resume_played_percent,
         resume_min_ticks,
         force_admin_library_order,
+        user_deletion_grace_days,
         login_background_source,
         media_strategy,
     })
@@ -545,6 +561,7 @@ pub(crate) struct AdminSettingsWrite<'a> {
     pub(crate) resume_min_ticks: i64,
     pub(crate) media_strategy_json: &'a str,
     pub(crate) force_admin_library_order: bool,
+    pub(crate) user_deletion_grace_days: i64,
     pub(crate) login_background_source: &'a str,
     pub(crate) server_name: &'a str,
     pub(crate) refresh_login_background: bool,
@@ -564,6 +581,10 @@ pub(crate) async fn write_admin_settings(
             settings.force_admin_library_order,
             settings.login_background_source,
         )
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_user_deletion_grace_days(settings.user_deletion_grace_days)
         .await
         .map_err(|_| ())?;
     if settings.refresh_login_background

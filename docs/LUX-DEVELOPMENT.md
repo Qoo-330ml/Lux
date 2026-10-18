@@ -12855,6 +12855,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：软删除在事务中读取 `user_deletion_grace_days`，仅接受 1–3650 天，缺失或非法值安全回退 7 天；新期限在删除时固化，配置修改不重算回收站记录。新增存储回归覆盖默认 7 天、自定义 30 天和非法 0 值；定向 Cargo 测试 1/1、fmt 和 diff check 通过。
 
+#### LUX-611：开放用户删除宽限期管理员设置接口
+
+范围：在现有管理员设置 API 中读取和更新用户删除宽限天数，沿用管理员会话和 CSRF 边界。只接受 1–3650 天，默认 7 天；非法设置整体拒绝，不修改已进入回收站账号的期限。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] 管理员 GET 返回当前删除宽限期，缺省为 7 天。
+- [x] PATCH 保存有效范围并返回新值；范围外数值返回 400。
+- [x] 设置只影响之后移入回收站的账号，已有到期时间保持不变。
+- [x] `admin_dashboard` 集成目标和 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test admin_dashboard`、`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+结果（2026-10-19）：管理员设置 GET/PATCH 增加 `userDeletionGraceDays`，默认 7 天，允许 1–3650 天；缺省保持原值，范围外返回明确 400，审计事件记录新值。接口回归覆盖默认、保存 30 天、拒绝 0/3651 且拒绝后值不变；`admin_dashboard` 1/1、fmt 和 diff check 通过。回环测试设置 `NO_PROXY/no_proxy=127.0.0.1,localhost`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

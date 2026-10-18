@@ -39,6 +39,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "resumePlayedPercent": settings.resume_played_percent,
         "resumeMinTicks": settings.resume_min_ticks,
         "forceAdminLibraryOrder": settings.force_admin_library_order,
+        "userDeletionGraceDays": settings.user_deletion_grace_days,
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
@@ -141,6 +142,7 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) resume_played_percent: Option<i64>,
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
+    pub(crate) user_deletion_grace_days: Option<i64>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     #[serde(flatten)]
@@ -254,6 +256,7 @@ pub(crate) async fn admin_update_settings(
             resume_played_percent: request.resume_played_percent,
             resume_min_ticks: request.resume_min_ticks,
             force_admin_library_order: request.force_admin_library_order,
+            user_deletion_grace_days: request.user_deletion_grace_days,
             login_background_source: request.login_background_source,
             media_strategy: request.media_strategy,
             network_proxy,
@@ -295,6 +298,15 @@ pub(crate) async fn admin_update_settings(
             )
             .into_response();
         }
+        Err(crate::application::settings::AdminSettingsError::InvalidUserDeletionGraceDays) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户删除保留期限必须在 1 到 3650 天之间",
+            )
+            .into_response();
+        }
         Err(crate::application::settings::AdminSettingsError::InvalidNetworkProxy) => {
             return api_error(
                 &headers,
@@ -323,7 +335,7 @@ pub(crate) async fn admin_update_settings(
         "SETTINGS_UPDATED",
         Some("settings"),
         None,
-        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"loginBackgroundSource":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.login_background_source),
+        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"loginBackgroundSource":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.login_background_source),
     )
     .await;
     Json(json!({
@@ -331,6 +343,7 @@ pub(crate) async fn admin_update_settings(
         "resumePlayedPercent": settings.resume_played_percent,
         "resumeMinTicks": settings.resume_min_ticks,
         "forceAdminLibraryOrder": settings.force_admin_library_order,
+        "userDeletionGraceDays": settings.user_deletion_grace_days,
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
