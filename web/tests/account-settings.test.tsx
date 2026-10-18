@@ -365,6 +365,7 @@ describe("account settings", () => {
   it("uploads an avatar to the server only after the user explicitly saves it", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const { drawImage, arc, context } = mockAvatarImageProcessing();
+    vi.spyOn(api, "accountProfile").mockResolvedValue({ user: { ...user, email: null, emailVerifiedAt: null } });
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ avatarUrl: "/api/v1/auth/avatar" }), { status: 200 }),
     );
