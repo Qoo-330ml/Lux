@@ -3,6 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
@@ -76,7 +77,7 @@ describe("AdminUsersPage library access scope", () => {
     document.body.append(container);
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    act(() => root.render(<QueryClientProvider client={queryClient}><AdminUsersPage /></QueryClientProvider>));
+    act(() => root.render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={["/admin/users"]}><AdminUsersPage /></MemoryRouter></QueryClientProvider>));
   }
 
   async function expandPermissions() {

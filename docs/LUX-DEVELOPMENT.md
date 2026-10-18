@@ -12801,6 +12801,41 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：列表和回收站改为懒加载管理员头像，缺失或失败时显示默认图标；详情资料页可更新头像并刷新缓存，失败会显示接口错误。用户列表明确显示预设来源（当前无预设时为“未设置”）。`pnpm --dir web build` 与 diff check 通过；未运行测试或部署。
 
+#### LUX-608：用户详情账号状态操作
+
+范围：在用户详情资料页显示并维护账号状态，支持启用、禁用、软删除、恢复和确认后彻底删除；已删除账号资料只读。回收站行提供进入详情的入口。复用既有管理员 API 与最后管理员保护。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-profile-lifecycle.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情显示正常、禁用或回收站状态，并展示对应可用操作。
+- [x] 生命周期操作明确确认破坏性影响，成功后同步详情/列表缓存并导航到正确视图。
+- [x] 已删除用户资料只读，仍可恢复或经确认彻底删除。
+- [x] Web 构建通过；新增行为回归按用户管理测试目标执行。
+
+验证：`pnpm --dir web build`、`pnpm --dir web exec vitest run tests/admin-user-profile-lifecycle.test.tsx`、`git diff --check`。完整 Web 门禁在阶段验收执行。
+
+依赖：LUX-596、LUX-599、LUX-602。
+
+结果（2026-10-19）：详情资料卡和页面标题统一呈现正常、禁用或回收站状态；生命周期面板支持启用、禁用、移入回收站、恢复和确认后彻底删除。成功后刷新详情/列表缓存并返回对应列表视图，回收站账号的资料与头像输入为只读。新增 4 项回归覆盖状态、确认、只读和恢复导航；定向 Vitest 4/4 通过，Web 构建在阶段门复跑。
+
+#### LUX-609：对齐用户列表回收站回归和路由测试环境
+
+范围：更新用户列表删除回归，使其验证移入回收站而非旧的永久删除行为；为使用 URL 状态和 React Router 链接的用户列表测试补充内存路由容器。不改变生产运行时行为。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/tests/admin-users-delete.test.tsx`、`web/tests/admin-users-access.test.tsx`。
+
+验收标准：
+
+- [x] 列表删除回归断言 7 天软删除确认文案、API 结果和列表刷新。
+- [x] 用户列表查询和权限回归在 MemoryRouter 中渲染。
+- [x] 用户列表、权限和详情生命周期定向 Vitest 目标通过。
+
+验证：`pnpm --dir web exec vitest run tests/admin-users-delete.test.tsx tests/admin-users-access.test.tsx tests/admin-user-profile-lifecycle.test.tsx`、`git diff --check`。
+
+结果（2026-10-19）：更新软删除断言并为用户列表测试补齐 MemoryRouter；三个相关文件组 13/13 用例通过。完整 Web 门禁在阶段验收执行。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -3,6 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
@@ -108,20 +109,23 @@ describe("AdminUsersPage user actions", () => {
     expect(button?.textContent).toContain("禁用");
   });
 
-  it("confirms before permanently deleting and refreshes the list", async () => {
+  it("confirms before moving a user into the recycle bin and refreshes the list", async () => {
     const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
       id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,
       isAdmin: false, canManageServer: false, canRemoteAccess: false, canDownload: false,
     }] });
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
-    const remove = vi.spyOn(api, "deleteAdminUser").mockResolvedValue();
+    const remove = vi.spyOn(api, "deleteAdminUser").mockResolvedValue({ user: {
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: true,
+      isAdmin: false, deletedAt: 1_800_000_000, deletionPurgeAt: 1_800_604_800,
+    } });
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     renderPage();
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
     const button = container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]');
     act(() => button?.click());
-    expect(confirm).toHaveBeenCalledWith("确定要永久删除账户“观众”吗？用户数据和迁移绑定将被删除，且无法恢复。");
+    expect(confirm).toHaveBeenCalledWith("确定将账户“观众”移入回收站吗？账号会保留 7 天，你可以在期限内恢复。");
     expect(remove).not.toHaveBeenCalled();
 
     confirm.mockReturnValue(true);
@@ -154,6 +158,6 @@ describe("AdminUsersPage user actions", () => {
     document.body.append(container);
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    act(() => root.render(<QueryClientProvider client={queryClient}><AdminUsersPage /></QueryClientProvider>));
+    act(() => root.render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={["/admin/users"]}><AdminUsersPage /></MemoryRouter></QueryClientProvider>));
   }
 });

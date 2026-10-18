@@ -1,7 +1,7 @@
 import { ArrowLeft, CircleDashed, ShieldCheck, SlidersHorizontal, UserRound, Users } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminUser } from "../../lib/api/types";
@@ -45,6 +45,7 @@ export function AdminUserDetailPage() {
   if (!user) return <AdminUserManagementState label="找不到此账户，或账户已不存在。" error />;
 
   const displayName = user.displayName || user.usernameNormalized;
+  const statusLabel = user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常";
   const Icon = section.icon;
 
   return (
@@ -56,7 +57,7 @@ export function AdminUserDetailPage() {
           <h1>{displayName}</h1>
           <p>用户详情与访问管理</p>
         </div>
-        <span className={user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.isDisabled ? "已禁用" : "正常"}</span>
+        <span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{statusLabel}</span>
       </header>
       <nav className="lux-admin-user-section-nav" aria-label="用户详情模块">
         {detailSections.map((item) => (
@@ -66,7 +67,10 @@ export function AdminUserDetailPage() {
         ))}
       </nav>
       {section.id === "profile" ? (
-        <AdminUserProfileEditor key={user.id} user={user} />
+        <>
+          <AdminUserProfileEditor key={user.id} user={user} />
+          <AdminUserLifecycleActions user={user} />
+        </>
       ) : (
         <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-module-title">
           <span className="lux-admin-user-module-icon"><Icon size={19} /></span>
@@ -130,7 +134,9 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
     <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-profile-title">
       <div className="lux-admin-panel-heading">
         <div><h2 id="lux-admin-user-profile-title">资料与状态</h2></div>
-        <span className={user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.isDisabled ? "已禁用" : "正常"}</span>
+        <span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>
+          {user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常"}
+        </span>
       </div>
       <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
         <div className="lux-admin-user-avatar-row">
@@ -145,7 +151,7 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
                 type="file"
                 accept="image/jpeg,image/png,image/webp"
                 aria-label="更换用户头像"
-                disabled={updateAvatar.isPending}
+                disabled={user.deletedAt != null || updateAvatar.isPending}
                 onChange={(event) => {
                   const file = event.currentTarget.files?.[0];
                   event.currentTarget.value = "";
@@ -161,22 +167,80 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
         </div>
         <label>
           显示名称
-          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={128} />
+          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={128} disabled={user.deletedAt != null} />
         </label>
         <label>
           邮箱
-          <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" />
+          <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" disabled={user.deletedAt != null} />
         </label>
-        <p className="lux-admin-muted">
-          邮箱状态：{emailStatus}。邮箱变更会清除验证状态；验证流程将在邮件功能中接入。
-        </p>
+        <p className="lux-admin-muted">{user.deletedAt != null ? "回收站中的账号资料为只读。" : `邮箱状态：${emailStatus}。邮箱变更会清除验证状态；验证流程将在邮件功能中接入。`}</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || update.isPending}>
+          <button className="lux-button lux-button-primary" type="submit" disabled={user.deletedAt != null || !hasChanges || update.isPending}>
             {update.isPending ? "保存中…" : "保存资料"}
           </button>
           {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
         </div>
       </form>
+    </section>
+  );
+}
+
+function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [error, setError] = useState("");
+  const refresh = (updated: AdminUser) => {
+    queryClient.setQueryData(["admin", "user", user.id], { user: updated });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
+  };
+  const disable = useMutation({ mutationFn: () => api.disableAdminUser(user.id), onSuccess: ({ user: updated }) => refresh(updated), onError: (cause) => setError(cause.message) });
+  const enable = useMutation({ mutationFn: () => api.updateAdminUser(user.id, { isDisabled: false }), onSuccess: ({ user: updated }) => refresh(updated), onError: (cause) => setError(cause.message) });
+  const remove = useMutation({ mutationFn: () => api.deleteAdminUser(user.id), onSuccess: ({ user: updated }) => { refresh(updated); navigate("/admin/users?view=deleted"); }, onError: (cause) => setError(cause.message) });
+  const restore = useMutation({ mutationFn: () => api.restoreAdminUser(user.id), onSuccess: ({ user: updated }) => { refresh(updated); navigate("/admin/users"); }, onError: (cause) => setError(cause.message) });
+  const purge = useMutation({ mutationFn: () => api.purgeAdminUser(user.id), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); navigate("/admin/users?view=deleted"); }, onError: (cause) => setError(cause.message) });
+  const pending = disable.isPending || enable.isPending || remove.isPending || restore.isPending || purge.isPending;
+  const displayName = user.displayName || user.usernameNormalized;
+
+  function confirmDisable() {
+    if (pending || !window.confirm(`禁用“${displayName}”后会撤销登录凭证并停止播放，账号资料仍会保留。确定继续吗？`)) return;
+    setError("");
+    disable.mutate();
+  }
+
+  function confirmEnable() {
+    if (pending || !window.confirm(`启用“${displayName}”后，用户可以重新登录。确定继续吗？`)) return;
+    setError("");
+    enable.mutate();
+  }
+
+  function confirmDelete() {
+    if (pending || !window.confirm(`将“${displayName}”移入回收站会撤销凭证并停止播放，账号默认保留 7 天，可在期限内恢复。确定继续吗？`)) return;
+    setError("");
+    remove.mutate();
+  }
+
+  function confirmPurge() {
+    if (pending || !window.confirm(`彻底删除“${displayName}”将永久删除账号、头像、权限设置、偏好、播放记录和设备关联，媒体文件不受影响，且无法恢复。确定继续吗？`)) return;
+    setError("");
+    purge.mutate();
+  }
+
+  return (
+    <section className="lux-admin-panel lux-admin-user-lifecycle-panel" aria-labelledby="lux-admin-user-lifecycle-title">
+      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-lifecycle-title">账号状态</h2></div><span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常"}</span></div>
+      {user.deletedAt != null ? <p className="lux-admin-muted">删除于 {user.deletedAt ? new Date(user.deletedAt * 1000).toLocaleString() : "未知"} · 计划清理 {user.deletionPurgeAt ? new Date(user.deletionPurgeAt * 1000).toLocaleString() : "未知"}</p> : null}
+      <div className="lux-admin-user-profile-actions">
+        {user.deletedAt != null ? <>
+          <button className="lux-button lux-button-secondary" type="button" onClick={() => restore.mutate()} disabled={pending}>{restore.isPending ? "恢复中…" : "恢复账号"}</button>
+          <button className="lux-button lux-button-secondary lux-admin-purge-user" type="button" onClick={confirmPurge} disabled={pending}>{purge.isPending ? "删除中…" : "彻底删除"}</button>
+        </> : <>
+          {user.isDisabled
+            ? <button className="lux-button lux-button-secondary" type="button" onClick={confirmEnable} disabled={pending}>{enable.isPending ? "启用中…" : "启用账号"}</button>
+            : <button className="lux-button lux-button-secondary" type="button" onClick={confirmDisable} disabled={pending}>{disable.isPending ? "禁用中…" : "禁用账号"}</button>}
+          <button className="lux-button lux-button-secondary lux-admin-purge-user" type="button" onClick={confirmDelete} disabled={pending}>{remove.isPending ? "移入回收站…" : "移入回收站"}</button>
+        </>}
+        {error ? <span role="alert">操作失败：{error}</span> : null}
+      </div>
     </section>
   );
 }

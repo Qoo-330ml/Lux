@@ -269,6 +269,7 @@ function DeletedUserRow({ user }: { user: AdminUser }) {
       </div>
       <div className="lux-admin-user-badges"><span className="lux-user-badge is-warn">回收站</span></div>
       <div className="lux-admin-user-actions">
+        <Link className="lux-button lux-button-compact lux-button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}`}>详情</Link>
         <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => restore.mutate()} disabled={actionPending}><RotateCcw size={15} />{restore.isPending ? "恢复中…" : "恢复"}</button>
         <button className="lux-button lux-button-compact lux-button-secondary lux-admin-purge-user" type="button" onClick={confirmPurge} disabled={actionPending}><Trash2 size={15} />{purge.isPending ? "删除中…" : "彻底删除"}</button>
       </div>
