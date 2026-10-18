@@ -321,7 +321,11 @@ export function LibraryCard({ library, coverItems, onPrefetch }: { library: Libr
 }
 
 function GlobalCollectionLibraryCover({ items }: { items: MediaItem[] }) {
-  const posters = items
+  const posterItems = [
+    ...items.filter((item) => item.posterItemId === item.id),
+    ...items.filter((item) => item.posterItemId !== item.id),
+  ];
+  const posters = posterItems
     .map((item) => ({ id: item.id, src: imageUrl(item) }))
     .filter((poster): poster is { id: string; src: string } => Boolean(poster.src))
     .slice(0, 5);
