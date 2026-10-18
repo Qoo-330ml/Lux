@@ -305,7 +305,7 @@ impl Database {
                 statement = statement.bind(path);
             }
             let inserted = statement
-                .bind(&chunk.job_id)
+                .bind(chunk.job_id)
                 .bind(chunk.library_root_id)
                 .bind(generation)
                 .execute(&mut **transaction)
@@ -336,7 +336,7 @@ impl Database {
                    AND processed_media_count IS NOT NULL",
             )
             .bind(processed_media_count)
-            .bind(&chunk.job_id)
+            .bind(chunk.job_id)
             .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
