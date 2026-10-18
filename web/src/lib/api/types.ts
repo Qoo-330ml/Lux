@@ -791,6 +791,7 @@ export type AdminJob = {
   cursor?: string | null;
   processedCount?: number;
   totalCount?: number | null;
+  processedMediaCount?: number | null;
   discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   error?: string | null;

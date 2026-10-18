@@ -669,6 +669,83 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector<HTMLElement>(".lux-job-progress.is-indeterminate")).not.toBeNull();
   });
 
+  it("uses processed media counts for full scans and preserves file progress for incremental scans", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [
+      {
+        id: "movie-scan",
+        libraryId: "movie-library",
+        jobType: "RECONCILE_LIBRARY",
+        status: "RUNNING",
+        processedMediaCount: 6,
+        processedCount: 140,
+        totalCount: 140,
+        discoveryCompleted: true,
+        createdAt: 1_700_000_004,
+      },
+      {
+        id: "series-scan",
+        libraryId: "series-library",
+        jobType: "RECONCILE_LIBRARY",
+        status: "RUNNING",
+        processedMediaCount: 3,
+        processedCount: 140,
+        totalCount: 140,
+        discoveryCompleted: true,
+        createdAt: 1_700_000_003,
+      },
+      {
+        id: "legacy-scan",
+        libraryId: "legacy-library",
+        jobType: "RECONCILE_LIBRARY",
+        status: "RUNNING",
+        processedCount: 140,
+        totalCount: 140,
+        discoveryCompleted: true,
+        createdAt: 1_700_000_002,
+      },
+      {
+        id: "incremental-scan",
+        libraryId: "movie-library",
+        jobType: "INCREMENTAL_SCAN",
+        status: "RUNNING",
+        processedCount: 2,
+        totalCount: 10,
+        discoveryCompleted: true,
+        createdAt: 1_700_000_001,
+      },
+    ] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [
+      { id: "movie-library", name: "电影库", kind: "MOVIE" },
+      { id: "series-library", name: "剧集库", kind: "SERIES" },
+      { id: "legacy-library", name: "旧版电影库", kind: "MOVIE" },
+    ] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    const rows = [...container.querySelectorAll<HTMLElement>(".lux-admin-job-row")];
+    const movieRow = rows.find((row) => row.textContent?.includes("电影库"));
+    const seriesRow = rows.find((row) => row.textContent?.includes("剧集库"));
+    const legacyRow = rows.find((row) => row.textContent?.includes("旧版电影库"));
+    const incrementalRow = rows.find((row) => row.textContent?.includes("实时增量扫描"));
+    expect(movieRow?.textContent).toContain("已处理 6 部电影");
+    expect(movieRow?.textContent).not.toContain("140");
+    expect(movieRow?.querySelector(".lux-job-progress.is-indeterminate")).not.toBeNull();
+    expect(seriesRow?.textContent).toContain("已处理 3 部剧");
+    expect(seriesRow?.textContent).not.toContain("140");
+    expect(seriesRow?.querySelector(".lux-job-progress.is-indeterminate")).not.toBeNull();
+    expect(legacyRow?.textContent).toContain("媒体进度不可用");
+    expect(legacyRow?.textContent).not.toContain("140");
+    expect(incrementalRow?.textContent).toContain("2 / 10");
+    expect(incrementalRow?.querySelector(".lux-job-progress.is-indeterminate")).toBeNull();
+  });
+
   it("does not present scan postprocessing as finally completed", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-postprocessing",

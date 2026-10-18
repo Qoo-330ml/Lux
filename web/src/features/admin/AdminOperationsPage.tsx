@@ -293,6 +293,7 @@ export function AdminOperationsPage() {
     ? registeredPlans.filter((plan) => plan.isEnabled && Boolean(plan.schedule)).length
     : registeredTasks.filter((task) => task.isEnabled && Boolean(task.schedule)).length;
   const libraryNames = new Map((libraries.data?.libraries ?? []).map((library) => [library.id, library.name]));
+  const libraryKinds = new Map((libraries.data?.libraries ?? []).map((library) => [library.id, library.kind]));
   const runtimeLoading = jobs.isLoading || metadataJobs.isLoading || strmJobs.isLoading || chapterJobs.isLoading || danmakuJobs.isLoading || libraryCoverJobs.isLoading;
   const runtimeError = jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error;
   const logsLoading = logs.isLoading;
@@ -372,6 +373,7 @@ export function AdminOperationsPage() {
         runtimeLoading ? <AdminOperationsState label="正在读取运行记录…" /> : <RunsSection
           jobs={jobItems}
           libraryNames={libraryNames}
+          libraryKinds={libraryKinds}
           status={status}
           onStatusChange={setStatus}
           onCancel={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : job.kind === "chapter" ? cancelChapter.mutate(job.id) : job.kind === "danmaku" ? cancelDanmaku.mutate(job.id) : cancel.mutate(job.id)}
@@ -742,6 +744,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
 function RunsSection({
   jobs,
   libraryNames,
+  libraryKinds,
   status,
   onStatusChange,
   onCancel,
@@ -750,13 +753,14 @@ function RunsSection({
 }: {
   jobs: OperationsJob[];
   libraryNames: ReadonlyMap<string, string>;
+  libraryKinds: ReadonlyMap<string, AdminLibrary["kind"]>;
   status: string;
   onStatusChange: (status: string) => void;
   onCancel: (job: OperationsJob) => void;
   onRetry: (job: OperationsJob) => void;
   busy: boolean;
 }) {
-  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">执行历史</span><h2 id="runs-title">运行记录</h2><p>查看后台任务进度；有问题、失败或取消的任务可以从这里重试。</p></div><LuxSelect className="lux-admin-filter-select" value={status} options={[{ value: "", label: "全部状态" }, { value: "PENDING", label: "等待中" }, { value: "RUNNING", label: "运行中" }, { value: "COMPLETED_WITH_ISSUES", label: "已完成，有问题" }, { value: "DEFERRED", label: "已延后" }, { value: "FAILED", label: "失败" }, { value: "COMPLETED", label: "已完成" }, { value: "CANCELLED", label: "已取消" }]} onChange={onStatusChange} aria-label="运行记录状态" /></div><p className="lux-admin-muted">整库元数据操作会调用所属媒体库的注册刮削任务，低匹配项可从对应媒体库的“待确认”筛选处理。</p><div className="lux-admin-job-list">{jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无运行记录</strong><p>手动或计划任务开始执行后，状态会显示在这里。</p></div></div> : jobs.map((job) => <JobRow key={`${job.kind}-${job.id}`} job={job} libraryNames={libraryNames} onCancel={() => onCancel(job)} onRetry={() => onRetry(job)} busy={busy} />)}</div></section>;
+  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">执行历史</span><h2 id="runs-title">运行记录</h2><p>查看后台任务进度；有问题、失败或取消的任务可以从这里重试。</p></div><LuxSelect className="lux-admin-filter-select" value={status} options={[{ value: "", label: "全部状态" }, { value: "PENDING", label: "等待中" }, { value: "RUNNING", label: "运行中" }, { value: "COMPLETED_WITH_ISSUES", label: "已完成，有问题" }, { value: "DEFERRED", label: "已延后" }, { value: "FAILED", label: "失败" }, { value: "COMPLETED", label: "已完成" }, { value: "CANCELLED", label: "已取消" }]} onChange={onStatusChange} aria-label="运行记录状态" /></div><p className="lux-admin-muted">整库元数据操作会调用所属媒体库的注册刮削任务，低匹配项可从对应媒体库的“待确认”筛选处理。</p><div className="lux-admin-job-list">{jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无运行记录</strong><p>手动或计划任务开始执行后，状态会显示在这里。</p></div></div> : jobs.map((job) => <JobRow key={`${job.kind}-${job.id}`} job={job} libraryNames={libraryNames} libraryKinds={libraryKinds} onCancel={() => onCancel(job)} onRetry={() => onRetry(job)} busy={busy} />)}</div></section>;
 }
 
 function LogsSection({
@@ -836,14 +840,15 @@ function Pagination({ page, pageSize, total, onPageChange }: { page: number; pag
   return <div className="lux-admin-pagination"><span>第 {page} / {totalPages} 页，共 {total} 项</span><div><button className="lux-button lux-button-secondary" type="button" onClick={() => onPageChange(Math.max(1, page - 1))} disabled={page === 1}>上一页</button><button className="lux-button lux-button-secondary" type="button" onClick={() => onPageChange(Math.min(totalPages, page + 1))} disabled={page === totalPages}>下一页</button></div></div>;
 }
 
-function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: OperationsJob; libraryNames: ReadonlyMap<string, string>; onCancel: () => void; onRetry: () => void; busy: boolean }) {
+function JobRow({ job, libraryNames, libraryKinds, onCancel, onRetry, busy }: { job: OperationsJob; libraryNames: ReadonlyMap<string, string>; libraryKinds: ReadonlyMap<string, AdminLibrary["kind"]>; onCancel: () => void; onRetry: () => void; busy: boolean }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const active = isActiveJob(job);
   const postprocessing = isPostprocessingJob(job);
   const cancellable = isActiveStatus(job.status);
   const cancelling = cancellable && job.kind !== "cover" && Boolean(job.cancelRequested);
   const discovering = active && job.kind === "scan" && job.discoveryCompleted === false;
-  const progress = discovering
+  const fullLibraryScan = isFullLibraryScan(job);
+  const progress = fullLibraryScan || discovering
     ? null
     : job.totalCount && job.totalCount > 0
       ? Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100))
@@ -882,6 +887,9 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
         job.kind === "scan" ? "扫描任务失败，具体原因请查看任务错误事件。" : undefined,
       );
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
+  const countLabel = fullLibraryScan
+    ? formatProcessedMediaCount(job.processedMediaCount, job.libraryId ? libraryKinds.get(job.libraryId) : undefined)
+    : `${job.processedCount ?? 0}${job.totalCount && !discovering ? ` / ${job.totalCount}` : ""}`;
   const pendingCount = job.kind === "metadata" ? job.pendingCount ?? 0 : 0;
   const pendingHref = job.libraryId ? `/libraries/${encodeURIComponent(job.libraryId)}?metadataStatus=pending` : undefined;
   const currentItem = job.kind === "scan" ? job.currentItem : null;
@@ -897,7 +905,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
     <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" && !postprocessing ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
       <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status ${postprocessing ? "status-postprocessing" : `status-${job.status.toLowerCase().replaceAll("_", "-")}`}`}>{postprocessing ? "后处理进行中" : formatJobStatus(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : postprocessing ? "索引已完成，后处理进行中" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount && !discovering ? ` / ${job.totalCount}` : ""}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : postprocessing ? "索引已完成，后处理进行中" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{countLabel}</span></div>
       {currentItem ? <span className="lux-admin-job-current-item">当前：{currentItem}</span> : null}
       {error ? <div className="lux-admin-job-error" role="alert"><strong>失败原因</strong><span>{error}</span></div> : null}
       {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">
@@ -907,7 +915,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
       </div> : null}
       <time className="lux-admin-job-finished-at">完成时间：{active || job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
       {duration ? <span className="lux-admin-job-duration">{duration}</span> : null}
-      {active && (postprocessing || progress !== null || discovering) ? <div className={`lux-job-progress${postprocessing || (discovering && progress === null) ? " is-indeterminate" : ""}`}><span style={postprocessing || progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
+      {active && (fullLibraryScan || postprocessing || progress !== null || discovering) ? <div className={`lux-job-progress${fullLibraryScan || postprocessing || (discovering && progress === null) ? " is-indeterminate" : ""}`}><span style={fullLibraryScan || postprocessing || progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
       {pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}
     </div>
     <div className="lux-admin-job-actions">
@@ -916,6 +924,19 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
       {retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}
     </div>
   </article>;
+}
+
+function isFullLibraryScan(job: OperationsJob): job is Extract<OperationsJob, { kind: "scan" }> {
+  return job.kind === "scan"
+    && (job.jobType === "RECONCILE_LIBRARY" || job.jobType === "RECONCILIATION_SCAN");
+}
+
+function formatProcessedMediaCount(count: number | null | undefined, kind?: AdminLibrary["kind"]) {
+  if (count == null) return "媒体进度不可用";
+  const formattedCount = count.toLocaleString("zh-CN");
+  if (kind === "MOVIE") return `已处理 ${formattedCount} 部电影`;
+  if (kind === "SERIES") return `已处理 ${formattedCount} 部剧`;
+  return `已处理 ${formattedCount} 项媒体`;
 }
 
 function metadataStatusFilter(status: string) {
