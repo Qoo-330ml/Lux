@@ -43,6 +43,12 @@ struct DeleteUserPermissionPresetQuery {
     version: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyUserPermissionPresetRequest {
+    preset_id: String,
+}
+
 async fn admin_list_user_permission_presets(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -162,6 +168,45 @@ async fn admin_delete_user_permission_preset(
     }
 }
 
+async fn admin_apply_user_permission_preset(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ApplyUserPermissionPresetRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return invalid_user_permission_preset_request(&headers);
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_presets::apply_user_permission_preset(
+        database,
+        &user_id,
+        &request.preset_id,
+    )
+    .await
+    {
+        Ok(preset) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_PERMISSION_PRESET_APPLIED",
+                Some("user"),
+                Some(&user_id),
+                &json!({ "presetId": preset.id, "version": preset.version }).to_string(),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => user_permission_preset_application_error(&headers, error),
+    }
+}
+
 fn invalid_user_permission_preset_request(headers: &HeaderMap) -> Response {
     api_error(
         headers,
@@ -202,6 +247,40 @@ fn user_permission_preset_error(
         )
         .into_response(),
         PresetError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "权限预设暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+fn user_permission_preset_application_error(
+    headers: &HeaderMap,
+    error: crate::application::user_presets::UserPermissionPresetApplicationError,
+) -> Response {
+    use crate::application::user_presets::UserPermissionPresetApplicationError as ApplyError;
+
+    match error {
+        ApplyError::InvalidUserId | ApplyError::InvalidSnapshot => {
+            invalid_user_permission_preset_request(headers)
+        }
+        ApplyError::NotFound | ApplyError::PresetNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户或权限预设不存在",
+        )
+        .into_response(),
+        ApplyError::LastManager => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "不能移除最后一个服务器管理账户",
+        )
+        .into_response(),
+        ApplyError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
@@ -1236,6 +1315,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/profile",
             patch(admin_update_user_profile),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/permission-preset",
+            post(admin_apply_user_permission_preset),
         )
         .route(
             "/api/v1/admin/users/{user_id}/playback-policy",

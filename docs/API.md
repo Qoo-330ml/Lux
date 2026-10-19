@@ -222,6 +222,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `POST /api/v1/admin/user-permission-presets`：管理员创建自定义预设，接收 `{ "name", "description", "isAdmin", "canManageServer", "permissions" }` 并返回 `{ "preset": ... }`、状态 201。名称不区分大小写且最多 100 项；空 `SELECTED` 归一化为 `NONE`。需要管理员 Web session 和 CSRF。
 - `PUT /api/v1/admin/user-permission-presets/{presetId}`：管理员完整替换自定义预设，接收创建字段及 `version`，成功返回新版本的 `{ "preset": ... }`。版本不匹配、内置预设或名称冲突返回 409；无效权限、管理角色组合或版本号返回 400；不存在返回 404。需要 CSRF。
 - `DELETE /api/v1/admin/user-permission-presets/{presetId}?version={version}`：管理员按当前版本删除自定义预设，成功返回 204；版本不匹配或内置预设返回 409，缺少/无效版本返回 400，不存在返回 404。需要 CSRF。
+- `POST /api/v1/admin/users/{userId}/permission-preset`：管理员以 `{ "presetId": "..." }` 将内置或自定义权限快照原子应用到指定用户，成功返回 204，需要管理员 Web session 和 CSRF。无效用户 ID/快照返回 400，用户或预设不存在返回 404，降权会移除最后一个有效服务器管理员时返回 409；成功后写入以目标用户为对象、详情包含预设 ID 和版本的审计事件。应用结果与预设后续修改/删除无继承关系。
 - `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计与近期登录/播放活动。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；LUX-316 启动迁移旧审计后，接口只读活动文件与保留归档。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。

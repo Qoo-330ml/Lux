@@ -13545,6 +13545,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：application 服务可应用内置或自定义预设快照，校验用户 UUID、预设存在性和当前启用媒体库，并映射最后管理员与存储冲突错误。删除已应用的自定义预设不会改变用户权限或来源记录。`user_presets` 定向回归 7/7、Rust build、fmt check 和 diff check 通过；PostgreSQL 行锁仍未运行时验证。
 
+#### LUX-646：开放管理员应用用户权限预设接口
+
+范围：新增管理员将内置或自定义权限预设应用到指定用户的 API。操作要求管理员 Web session 与 CSRF，复用 application 服务和原子存储事务，并记录审计事件；用户/预设不存在、最后管理员保护和无效快照映射为稳定 HTTP 错误。本任务不接入预设来源查询或 Web 界面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`src/application/user_presets.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可应用内置或自定义预设，用户权限快照原子更新；自定义预设随后删除不回滚已应用权限。
+- [x] 非管理员和缺少 CSRF 的请求拒绝；用户 ID、用户、预设及最后管理员错误映射稳定。
+- [x] 应用操作记录目标用户、预设 ID 与版本，不记录敏感内容。
+- [x] `users` 集成 target、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加端到端 API 回归并确认新路由失败；再接入 application 服务、错误映射、CSRF 和审计；最后同步公开 API 文档。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-640、LUX-645。
+
+结果（2026-10-19）：新增管理员权限预设应用端点，复用事务存储与 application 校验，成功后写入以目标用户为对象、详情只含预设 ID 和版本的审计事件，并规范化 UUID 大小写。`users` target 3/3、Rust build、fmt check 与 diff check 通过；回归覆盖管理员/CSRF、权限快照、应用后删除预设、无效/不存在用户、未知预设和最后管理员保护。全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

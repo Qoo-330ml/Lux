@@ -990,3 +990,238 @@ async fn admin_user_creation_applies_configured_permission_snapshot()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_apply_permission_preset_to_user_with_audit_and_guards()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin_user = setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+    let created_user = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "username": "preset-target", "password": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(created_user.status(), reqwest::StatusCode::CREATED);
+    let target_id = created_user.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing target user ID")?
+        .to_owned();
+
+    let created_preset = client
+        .post(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "name": "Applied snapshot",
+            "isAdmin": false,
+            "canManageServer": false,
+            "permissions": {
+                "libraryAccessMode": "NONE",
+                "libraryIds": [],
+                "canDownload": true,
+                "canPlay": true,
+                "maxSimultaneousPlaybacks": 3,
+                "allowRemux": false,
+                "allowAudioTranscode": true,
+                "allowVideoTranscode": false
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(created_preset.status(), reqwest::StatusCode::CREATED);
+    let preset = created_preset.json::<Value>().await?["preset"].clone();
+    let preset_id = preset["id"].as_str().ok_or("missing preset ID")?;
+    let apply_url = format!(
+        "{base_url}/api/v1/admin/users/{}/permission-preset",
+        target_id.to_uppercase()
+    );
+    let request = json!({ "presetId": preset_id });
+
+    let missing_csrf = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let applied = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(applied.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let playback = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/playback-policy"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(playback.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        playback.json::<Value>().await?["policy"],
+        json!({
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 3,
+            "allowRemux": false,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": false
+        })
+    );
+    let library_access = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/libraries"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(library_access.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        library_access.json::<Value>().await?["libraryAccessMode"],
+        "NONE"
+    );
+    let applied_source: (String, String, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version
+         FROM user_permission_preset_sources WHERE user_id = ?",
+    )
+    .bind(&target_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        applied_source,
+        (preset_id.to_owned(), "Applied snapshot".to_owned(), 1)
+    );
+
+    let deleted_preset = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/{preset_id}?version=1"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted_preset.status(), reqwest::StatusCode::NO_CONTENT);
+    let preserved_policy = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/playback-policy"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(preserved_policy.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        preserved_policy.json::<Value>().await?["policy"]["canPlay"],
+        true
+    );
+
+    let target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "preset-target", "password": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(target_login.status(), reqwest::StatusCode::OK);
+    let forbidden = client
+        .post(&apply_url)
+        .header(COOKIE, cookie_pair(target_login.headers()))
+        .header(
+            "x-csrf-token",
+            cookie_value(target_login.headers(), "lux_csrf"),
+        )
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let invalid_user = client
+        .post(format!(
+            "{base_url}/api/v1/admin/users/not-a-user-id/permission-preset"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(invalid_user.status(), reqwest::StatusCode::BAD_REQUEST);
+    let missing_user = client
+        .post(format!(
+            "{base_url}/api/v1/admin/users/00000000-0000-4000-8000-000000000000/permission-preset"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing_preset = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "presetId": "missing-preset" }))
+        .send()
+        .await?;
+    assert_eq!(missing_preset.status(), reqwest::StatusCode::NOT_FOUND);
+    let last_manager = client
+        .post(format!(
+            "{base_url}/api/v1/admin/users/{}/permission-preset",
+            admin_user.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "presetId": "builtin-user" }))
+        .send()
+        .await?;
+    assert_eq!(last_manager.status(), reqwest::StatusCode::CONFLICT);
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let events = audit.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing audit events")?;
+    assert!(events.iter().any(|event| {
+        event["eventType"] == "USER_PERMISSION_PRESET_APPLIED"
+            && event["targetId"] == target_id
+            && event["metadata"]["presetId"] == preset_id
+            && event["metadata"]["version"] == 1
+    }));
+
+    server.abort();
+    Ok(())
+}

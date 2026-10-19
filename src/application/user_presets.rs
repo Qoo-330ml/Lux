@@ -76,8 +76,6 @@ impl From<StorageError> for UserPermissionPresetError {
     }
 }
 
-// LUX-646 exposes this result through the administrator API.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum UserPermissionPresetApplicationError {
     InvalidUserId,
@@ -201,8 +199,6 @@ pub(crate) async fn delete_user_permission_preset(
     write_custom_presets(database, expected.as_deref(), &presets).await
 }
 
-// LUX-646 connects the preset application service to the administrator route.
-#[allow(dead_code)]
 pub(crate) async fn apply_user_permission_preset(
     database: &Database,
     user_id: &str,
