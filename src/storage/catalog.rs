@@ -82,7 +82,10 @@ struct CatalogSearchPageBindings<'a> {
     limit: i64,
 }
 
-fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String {
+fn postgres_recent_catalog_rows_by_library_query(
+    library_count: usize,
+    content_restriction_predicate: &str,
+) -> String {
     let values = std::iter::repeat_n("(?)", library_count)
         .collect::<Vec<_>>()
         .join(", ");
@@ -109,7 +112,7 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
              JOIN requested_libraries requested ON requested.library_id = mi.library_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              LEFT JOIN episode_latest_by_root ON episode_latest_by_root.root_id = mi.id
-             WHERE mi.removed_at IS NULL
+             WHERE mi.removed_at IS NULL{content_restriction_predicate}
                AND (
                    (mi.item_type IN ('MOVIE', 'SERIES') AND mi.has_available_source = 1)
                    OR (
@@ -149,12 +152,16 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
     )
 }
 
-fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
+fn sqlite_recent_catalog_rows_by_library_query(
+    library_count: usize,
+    content_restriction_predicate: &str,
+) -> String {
     // The explicit `item_type <> 'FOLDER'` predicate lets SQLite match the
     // existing partial index; the IN predicate alone is not inferred.
     let libraries = (0..library_count)
         .map(|_| {
-             "SELECT recent.id, recent.library_id, recent.latest_added_at
+            format!(
+                "SELECT recent.id, recent.library_id, recent.latest_added_at
              FROM (
                  SELECT candidates.id, candidates.library_id, candidates.latest_added_at
                  FROM (
@@ -178,7 +185,7 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                            AND mi.item_type <> 'FOLDER'
                            AND mi.item_type IN ('MOVIE', 'SERIES')
                            AND mi.removed_at IS NULL
-                           AND mi.has_available_source = 1
+                           AND mi.has_available_source = 1{content_restriction_predicate}
                          ORDER BY latest_added_at DESC, mi.sort_title, mi.id
                          LIMIT ?
                      ) AS available
@@ -202,7 +209,7 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                          WHERE mi.library_id = ?
                            AND mi.item_type = 'SERIES'
                            AND mi.removed_at IS NULL
-                           AND mi.has_available_source = 0
+                           AND mi.has_available_source = 0{content_restriction_predicate}
                            AND (
                                EXISTS (
                                    SELECT 1
@@ -232,6 +239,7 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                           candidates.sort_title, candidates.id
                  LIMIT ?
              ) AS recent"
+            )
         })
         .collect::<Vec<_>>()
         .join("\n             UNION ALL\n             ");
@@ -1336,31 +1344,61 @@ impl Database {
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_recent_catalog_rows_by_library(
         &self,
         library_ids: &[String],
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        self.list_recent_catalog_rows_by_library_with_restrictions(library_ids, limit, None)
+            .await
+    }
+
+    pub(crate) async fn list_recent_catalog_rows_by_library_with_restrictions(
+        &self,
+        library_ids: &[String],
+        limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let mut rows = Vec::new();
         for library_ids in library_ids.chunks(500) {
             let (selection_query, binds) = if self.backend == DatabaseBackend::Postgres {
-                let mut binds = Vec::with_capacity(library_ids.len() + 1);
+                let mut binds =
+                    Vec::with_capacity(library_ids.len() + content_restriction_binds.len() + 1);
                 binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
+                binds.extend(content_restriction_binds.iter().copied());
                 binds.push(CatalogBind::Integer(limit));
                 (
-                    postgres_recent_catalog_rows_by_library_query(library_ids.len()),
+                    postgres_recent_catalog_rows_by_library_query(
+                        library_ids.len(),
+                        &content_restriction_predicate,
+                    ),
                     binds,
                 )
             } else {
-                let query = sqlite_recent_catalog_rows_by_library_query(library_ids.len());
-                let mut binds = Vec::with_capacity(library_ids.len() * 5);
+                let query = sqlite_recent_catalog_rows_by_library_query(
+                    library_ids.len(),
+                    &content_restriction_predicate,
+                );
+                let mut binds = Vec::with_capacity(
+                    library_ids.len() * (5 + content_restriction_binds.len() * 2),
+                );
                 for library_id in library_ids {
                     binds.push(CatalogBind::Text(library_id));
+                    binds.extend(content_restriction_binds.iter().copied());
                     binds.push(CatalogBind::Integer(limit));
                     binds.push(CatalogBind::Text(library_id));
+                    binds.extend(content_restriction_binds.iter().copied());
                     binds.push(CatalogBind::Integer(limit));
                     binds.push(CatalogBind::Integer(limit));
                 }
@@ -9534,7 +9572,7 @@ mod tests {
 
     #[test]
     fn postgres_recent_catalog_limits_each_library_before_loading_details() {
-        let query = postgres_recent_catalog_rows_by_library_query(2);
+        let query = postgres_recent_catalog_rows_by_library_query(2, "");
 
         assert!(query.contains("CROSS JOIN LATERAL"));
         assert!(query.contains("VALUES (?), (?)"));
@@ -9545,7 +9583,7 @@ mod tests {
 
     #[test]
     fn postgres_recent_catalog_aggregates_episode_dates_once() {
-        let query = postgres_recent_catalog_rows_by_library_query(2);
+        let query = postgres_recent_catalog_rows_by_library_query(2, "");
 
         assert!(query.contains("episode_latest_by_root AS MATERIALIZED"));
         assert_eq!(query.matches("MAX(episode.added_at)").count(), 1);
@@ -9556,7 +9594,7 @@ mod tests {
 
     #[test]
     fn sqlite_recent_catalog_limits_each_library_before_loading_details() {
-        let query = sqlite_recent_catalog_rows_by_library_query(2);
+        let query = sqlite_recent_catalog_rows_by_library_query(2, "");
 
         assert!(!query.contains("LATERAL"));
         assert!(!query.contains("ROW_NUMBER()"));

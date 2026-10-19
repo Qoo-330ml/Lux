@@ -14647,6 +14647,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1，覆盖管理员旁路、无策略和全允许策略仍返回原总数；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅因未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
 
+#### LUX-700：在按库最新条目候选限制前应用用户内容策略
+
+范围：对 `/api/v1/home` 的每库最新分组，以及按库读取最近条目的两个 Lux API 入口，在候选排序和每库 Top-N 前执行当前用户内容策略。被拒条目和因自身、系列/季度或索引未就绪而拒绝的候选不能占据每库配额。全局合集卡片和合集成员列表留给后续任务。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/media.rs`、`src/application/catalog.rs`、`src/application/home.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] HomeService 与两个按库 API 入口都使用请求用户的当前策略；管理员不受用户策略限制。
+- [x] SQLite 与 PostgreSQL 的每库候选 SQL 都在 Top-N 之前过滤自身及父级限制，缺索引 fail closed。
+- [x] SQL 标签绑定在重复的每库候选分支中保持正确顺序；隐藏候选不消耗可见条目的每库配额。
+- [x] 无策略和无收紧策略保持既有结果；定向目录与主页回归、build、fmt 和 diff check 通过。
+
+短计划：先扩展主页策略回归，确认当前每库最新分组会将最新受限条目放入配额；再让同一策略贯穿 HomeService、CatalogService 与 API 路由，并加入 SQLite/PostgreSQL 每库候选查询；最后运行内容策略、catalog、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib home_recently_added_applies_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-699。
+
+结果（2026-10-19）：HomeService 和两个按库 API 路由都读取当前 principal 的内容策略；管理员旁路由策略服务返回 `None`。SQLite 与 PostgreSQL 在每库 Top-N 候选 SQL 中先应用共享限制谓词，覆盖条目自身及 series/season/episode 父级关系；无索引条目 fail closed。SQLite 两个候选分支按 WHERE、LIMIT 的顺序重复绑定标签参数。
+
+验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1；`cargo test --locked --lib recent_catalog_rows` 3/3；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

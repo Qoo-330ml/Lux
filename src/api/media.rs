@@ -302,11 +302,19 @@ pub(super) async fn lux_list_home_library_latest(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let content_restrictions = match catalog.content_restrictions_for_principal(principal).await {
+        Ok(restrictions) => restrictions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
 
     let mut latest_items = Vec::new();
     if !regular_library_ids.is_empty() {
         let latest_groups = match catalog
-            .list_recently_added_by_library_ids(&regular_library_ids, HOME_LATEST_ITEMS_PER_LIBRARY)
+            .list_recently_added_by_library_ids(
+                &regular_library_ids,
+                content_restrictions.as_ref(),
+                HOME_LATEST_ITEMS_PER_LIBRARY,
+            )
             .await
         {
             Ok(groups) => groups,
@@ -481,8 +489,16 @@ pub(super) async fn lux_list_library_latest(
     if !accessible_library_ids.iter().any(|id| id == &library_id) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let content_restrictions = match catalog.content_restrictions_for_principal(principal).await {
+        Ok(restrictions) => restrictions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     match catalog
-        .list_recently_added_by_library_ids(std::slice::from_ref(&library_id), 12)
+        .list_recently_added_by_library_ids(
+            std::slice::from_ref(&library_id),
+            content_restrictions.as_ref(),
+            12,
+        )
         .await
     {
         Ok(groups) => {

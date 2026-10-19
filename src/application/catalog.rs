@@ -1506,18 +1506,24 @@ impl CatalogService {
         limit: i64,
     ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        self.list_recently_added_by_library_ids(&library_ids, limit)
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        self.list_recently_added_by_library_ids(&library_ids, content_restrictions.as_ref(), limit)
             .await
     }
 
     pub(crate) async fn list_recently_added_by_library_ids(
         &self,
         library_ids: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
         limit: i64,
     ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
         let rows = self
             .database
-            .list_recent_catalog_rows_by_library(library_ids, limit)
+            .list_recent_catalog_rows_by_library_with_restrictions(
+                library_ids,
+                limit,
+                content_restrictions,
+            )
             .await?;
         let mut items = assemble_items(rows);
         self.populate_episode_counts(&mut items).await?;
@@ -3985,6 +3991,9 @@ mod tests {
         assert_eq!(snapshot.recently_added.total, 1);
         assert_eq!(snapshot.recently_added.items.len(), 1);
         assert_eq!(snapshot.recently_added.items[0].id, "recent-policy-visible");
+        assert_eq!(snapshot.latest_groups.len(), 1);
+        assert_eq!(snapshot.latest_groups[0].1.len(), 1);
+        assert_eq!(snapshot.latest_groups[0].1[0].id, "recent-policy-visible");
 
         let admin_page = catalog
             .list_recently_added(AccessPrincipal::new(user.id, true), 0, 1)

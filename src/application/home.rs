@@ -196,7 +196,11 @@ impl HomeService {
             async {
                 self.inner
                     .catalog
-                    .list_recently_added_by_library_ids(&library_ids, 12)
+                    .list_recently_added_by_library_ids(
+                        &library_ids,
+                        content_restrictions.as_ref(),
+                        12,
+                    )
                     .await
                     .map_err(HomeError::Catalog)
             },
