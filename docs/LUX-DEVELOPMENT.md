@@ -16119,6 +16119,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 时启用全站客户端规则后，已签发 Emby HLS URL 仍返回 200；修复后 `NO_PROXY=127.0.0.1,localhost cargo test --locked --test playback --test web_playback` 中 `playback` 4/4、`web_playback` 1/1 通过。回归同时确认 HLS 会话绑定 token 中的 `transcode-test`/`PlaybackTest`，请求头伪报值不能替换已绑定值，命中后返回 410 并停止会话。`cargo build --locked`、fmt 与 `git diff --check` 通过。严格 Clippy 仍有 13 项既存诊断，没有来自本任务新增代码的诊断；完整 Rust all-targets 失败记录见 LUX-771。Cargo 使用 Toshiba target 目录。
 
+#### LUX-773：建立 Emby 直放播放票据会话表
+
+范围：为 Emby 无状态直放签名票据增加可撤销的会话上下文 schema，按用户和播放会话 ID 保存授权设备/客户端、过期时间及可空撤销时间。此任务只新增 SQLite/PostgreSQL migration 和空库 schema 回归，不改变现有 Emby 直放 URL 或授权行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0198_emby_direct_playback_tickets.sql`、`migrations-postgres/0198_emby_direct_playback_tickets.sql`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 新建 `emby_direct_playback_tickets` 表，复合主键按用户/播放会话隔离，并保存可空设备/客户端与撤销时间、必需过期/创建时间。
+- [x] 时间和字符串约束拒绝空播放会话 ID、负/倒置时间；用户删除级联清除票据上下文。
+- [x] 从空库应用完整迁移集并验证列、主键、索引、约束和外键；不改变现有播放授权行为。
+
+短计划：先添加空库 schema/约束回归并确认目标表缺失；再按现有 migration 序列添加 SQLite 和 PostgreSQL 表与索引；最后运行指定 Storage 测试、build、fmt 与 diff check。
+
+验证：TDD RED 因表不存在而在 schema 断言失败；增加双后端 migration 后，`emby_direct_playback_ticket_migration_creates_revocable_context_table` 1/1 通过，覆盖列、有效索引、空/负/倒置值拒绝、复合主键冲突和用户删除级联。空 SQLite 数据库成功应用完整 migration 集；`cargo build --locked`、fmt 与 `git diff --check` 通过。PostgreSQL migration 已编写但未运行 PostgreSQL runtime 验证；未改变直放授权行为。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

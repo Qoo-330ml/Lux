@@ -20923,6 +20923,121 @@ async fn web_playback_access_context_is_scoped_to_active_session()
 }
 
 #[tokio::test]
+async fn emby_direct_playback_ticket_migration_creates_revocable_context_table()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'emby_direct_playback_tickets'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+
+    let columns = sqlx::query("PRAGMA table_info(emby_direct_playback_tickets)")
+        .fetch_all(database.pool())
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    for expected in [
+        "user_id",
+        "play_session_id",
+        "authorization_device_id",
+        "authorization_client_name",
+        "expires_at",
+        "revoked_at",
+        "created_at",
+    ] {
+        assert!(columns.iter().any(|column| column == expected));
+    }
+
+    let user = SetupService::new(database.clone())?
+        .complete("Direct Ticket", "Direct Ticket", "ticket password")
+        .await?;
+    let user_id = user.id.to_string();
+    sqlx::query(
+        "INSERT INTO emby_direct_playback_tickets (
+             user_id, play_session_id, authorization_device_id,
+             authorization_client_name, expires_at, created_at
+         ) VALUES (?, 'ticket-session', 'device-1', 'client-1', 500, 100)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, '', 500, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, 'negative-time', -1, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, 'reversed-time', 99, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, 'ticket-session', 500, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    let expiry_index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_emby_direct_playback_tickets_expiry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(expiry_index_count, 1);
+
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM emby_direct_playback_tickets WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
