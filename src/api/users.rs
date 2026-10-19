@@ -758,16 +758,20 @@ fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
     (device_id.get_version_num() == 4).then_some(device_id.to_string())
 }
 
-async fn record_web_device_observation(headers: &HeaderMap, state: &AppState, user_id: &str) {
-    let (Some(device_id), Some(database)) = (web_login_device_id(headers), state.database.as_ref())
-    else {
+async fn record_web_device_observation(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: &str,
+    device_id: Option<&str>,
+) {
+    let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
         return;
     };
     let remote_ip = request_client_ip(headers, &state.remote_access);
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
-            device_id: &device_id,
+            device_id,
             device_name: None,
             device_type: Some("WEB"),
             client_name: "Lux Web",
@@ -797,6 +801,7 @@ pub(super) async fn auth_login(
     };
 
     let login_key = login_attempt_key(&headers, &request.username);
+    let login_device_id = web_login_device_id(&headers);
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return api_error(
             &headers,
@@ -806,7 +811,14 @@ pub(super) async fn auth_login(
         )
         .into_response();
     }
-    let mut session = match auth.login(&request.username, &request.password).await {
+    let mut session = match auth
+        .login_with_device(
+            &request.username,
+            &request.password,
+            login_device_id.as_deref(),
+        )
+        .await
+    {
         Ok(session) => session,
         Err(_) => {
             return api_error(
@@ -826,7 +838,14 @@ pub(super) async fn auth_login(
             .authenticate_pending_user(&request.username, &request.password)
             .await
         {
-            Ok(true) => match auth.login(&request.username, &request.password).await {
+            Ok(true) => match auth
+                .login_with_device(
+                    &request.username,
+                    &request.password,
+                    login_device_id.as_deref(),
+                )
+                .await
+            {
                 Ok(reauthenticated) => session = reauthenticated,
                 Err(_) => {
                     return api_error(
@@ -881,7 +900,7 @@ pub(super) async fn auth_login(
     }
 
     let user_id = session.user.id.to_string();
-    record_web_device_observation(&headers, &state, &user_id).await;
+    record_web_device_observation(&headers, &state, &user_id, login_device_id.as_deref()).await;
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -1331,7 +1350,11 @@ async fn require_web_session_csrf(
         .into_response());
     }
     let user_id = session.user.id.to_string();
-    record_web_device_observation(headers, state, &user_id).await;
+    let device_id = session
+        .device_id
+        .clone()
+        .or_else(|| web_login_device_id(headers));
+    record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
     Ok(session)
 }
 
@@ -2296,7 +2319,11 @@ pub(super) async fn require_web_principal(
                 .into_response());
             }
             let user_id = session.user.id.to_string();
-            record_web_device_observation(headers, state, &user_id).await;
+            let device_id = session
+                .device_id
+                .clone()
+                .or_else(|| web_login_device_id(headers));
+            record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
             Ok(crate::auth::users::AuthenticationPrincipal::User(
                 session.user,
             ))

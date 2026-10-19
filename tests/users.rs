@@ -53,6 +53,13 @@ async fn successful_login_is_written_to_the_user_activity_index()
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     let user_id = user.id.to_string();
+    let stored_session_device_id: Option<String> = sqlx::query_scalar(
+        "SELECT device_id FROM web_sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_session_device_id.as_deref(), Some(device_id));
     let (event_count, actor_user_id, metadata_json): (i64, Option<String>, Option<String>) =
         sqlx::query_as(
             "SELECT COUNT(*), MAX(actor_user_id), MAX(metadata_json)
@@ -91,9 +98,33 @@ async fn successful_login_is_written_to_the_user_activity_index()
         .bind(device_id)
         .execute(database.pool())
         .await?;
+    let bound_session_without_device_header = client
+        .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
+        .header(COOKIE, &authenticated_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        bound_session_without_device_header.status(),
+        reqwest::StatusCode::OK
+    );
+    let last_seen_without_header: i64 = sqlx::query_scalar(
+        "SELECT last_seen_at FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(&user_id)
+    .bind(device_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(last_seen_without_header > 1);
+
+    sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
+        .bind(&user_id)
+        .bind(device_id)
+        .execute(database.pool())
+        .await?;
+    let alternate_device_id = "00000000-0000-4000-8000-000000000002";
     let authenticated_access = client
         .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
-        .header("X-Lux-Device-Id", device_id)
+        .header("X-Lux-Device-Id", alternate_device_id)
         .header(COOKIE, &authenticated_cookie)
         .send()
         .await?;
@@ -107,6 +138,12 @@ async fn successful_login_is_written_to_the_user_activity_index()
     .await?;
     assert_eq!(refreshed_first_seen_at, first_seen_at);
     assert!(refreshed_last_seen_at > 1);
+    let inventory_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(inventory_count, 1);
 
     sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
         .bind(&user_id)
@@ -120,13 +157,13 @@ async fn successful_login_is_written_to_the_user_activity_index()
         .send()
         .await?;
     assert_eq!(invalid_device_access.status(), reqwest::StatusCode::OK);
-    let (invalid_device_count, unchanged_last_seen_at): (i64, i64) =
+    let (invalid_device_count, refreshed_last_seen_at): (i64, i64) =
         sqlx::query_as("SELECT COUNT(*), MAX(last_seen_at) FROM user_devices WHERE user_id = ?")
             .bind(&user_id)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(invalid_device_count, 1);
-    assert_eq!(unchanged_last_seen_at, 1);
+    assert!(refreshed_last_seen_at > 1);
 
     let invalid_device_login = client
         .post(format!("http://{address}/api/v1/auth/login"))
@@ -138,12 +175,51 @@ async fn successful_login_is_written_to_the_user_activity_index()
         .send()
         .await?;
     assert_eq!(invalid_device_login.status(), reqwest::StatusCode::OK);
+    let null_device_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_sessions WHERE user_id = ? AND device_id IS NULL",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(null_device_sessions, 1);
     let device_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = ?")
             .bind(&user_id)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(device_count, 1);
+
+    let missing_device_login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "activity-user",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing_device_login.status(), reqwest::StatusCode::OK);
+    let null_device_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_sessions WHERE user_id = ? AND device_id IS NULL",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(null_device_sessions, 2);
+    let historical_session_cookie = cookie_pair(missing_device_login.headers());
+    let legacy_device_id = "00000000-0000-4000-8000-000000000003";
+    let historical_session_access = client
+        .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
+        .header("X-Lux-Device-Id", legacy_device_id)
+        .header(COOKIE, historical_session_cookie)
+        .send()
+        .await?;
+    assert_eq!(historical_session_access.status(), reqwest::StatusCode::OK);
+    let historical_device_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(historical_device_count, 2);
 
     sqlx::query(
         "CREATE TRIGGER fail_user_device_insert
@@ -154,7 +230,7 @@ async fn successful_login_is_written_to_the_user_activity_index()
     .await?;
     let storage_failure_login = client
         .post(format!("http://{address}/api/v1/auth/login"))
-        .header("X-Lux-Device-Id", "00000000-0000-4000-8000-000000000002")
+        .header("X-Lux-Device-Id", alternate_device_id)
         .json(&json!({
             "username": "activity-user",
             "password": "correct password"

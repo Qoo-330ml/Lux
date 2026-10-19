@@ -33,21 +33,50 @@ impl WebAuthService {
         username: &str,
         password: &str,
     ) -> Result<Option<LoginSession>, WebAuthError> {
+        self.login_with_device(username, password, None).await
+    }
+
+    pub async fn login_with_device(
+        &self,
+        username: &str,
+        password: &str,
+        device_id: Option<&str>,
+    ) -> Result<Option<LoginSession>, WebAuthError> {
         let Some(user) = self.users.authenticate(username, password).await? else {
             return Ok(None);
         };
         let session_token = generate_token()?;
         let csrf_token = generate_token()?;
         let session_id = UserId::new();
-        self.database
-            .create_web_session(
-                &session_id.to_string(),
-                &user.id.to_string(),
-                &hash_token(&session_token),
-                &hash_token(&csrf_token),
-                SESSION_LIFETIME_SECONDS,
-            )
-            .await?;
+        let session_id = session_id.to_string();
+        let user_id = user.id.to_string();
+        let session_token_hash = hash_token(&session_token);
+        let csrf_token_hash = hash_token(&csrf_token);
+        match device_id {
+            Some(device_id) => {
+                self.database
+                    .create_web_session_with_device(
+                        &session_id,
+                        &user_id,
+                        &session_token_hash,
+                        &csrf_token_hash,
+                        Some(device_id),
+                        SESSION_LIFETIME_SECONDS,
+                    )
+                    .await?;
+            }
+            None => {
+                self.database
+                    .create_web_session(
+                        &session_id,
+                        &user_id,
+                        &session_token_hash,
+                        &csrf_token_hash,
+                        SESSION_LIFETIME_SECONDS,
+                    )
+                    .await?;
+            }
+        }
 
         Ok(Some(LoginSession {
             session_token,
@@ -112,6 +141,7 @@ impl WebAuthService {
                 last_activity_at: stored.last_activity_at,
             },
             csrf_token_hash: stored.csrf_token_hash,
+            device_id: stored.device_id,
         }))
     }
 
@@ -223,6 +253,7 @@ pub struct WebSessionSummary {
 pub struct AuthenticatedSession {
     pub user: UserRecord,
     csrf_token_hash: Vec<u8>,
+    pub(crate) device_id: Option<String>,
 }
 
 fn generate_token() -> Result<String, WebAuthError> {

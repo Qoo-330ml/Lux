@@ -15742,6 +15742,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 先因创建方法和返回字段不存在而编译失败；实现后 `storage::repository::repository_tests::web_session_device_association_is_optional_and_only_read_from_active_sessions` 1/1 通过，覆盖有关联、旧入口空值、过期、撤销和未知 token。`cargo build --locked`、`cargo fmt --all -- --check`、定向 Clippy 放行 7 类既有诊断后及 `git diff --check` 通过。设备字段将在下一增量接入 Web 登录与活动检查。
 
+#### LUX-752：登录时绑定 Web 会话设备 ID
+
+范围：Web 登录时将有效 UUID v4 `X-Lux-Device-Id` 写入该次会话，后续有效会话访问以存储值刷新设备活动，不允许请求中变化的设备头替换已绑定身份。无效/缺失 ID 不阻断登录；历史 `device_id=NULL` 会话继续兼容现有请求头设备观察。不把设备 ID 用作身份认证或权限判定。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`src/auth/sessions.rs`、`src/storage/repository.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 登录成功后，规范化的有效设备 ID 与新 Web 会话关联；无效/缺失 ID 保持 NULL 且登录成功。
+- [x] 已绑定会话访问即使不带设备头或携带其他设备头，也只刷新登录时绑定的设备记录，不新建伪关联。
+- [x] 既有 NULL 会话使用有效请求头时保持当前活动登记兼容；用户认证集成、build、fmt、可用 Clippy 与 diff check 通过。
+
+短计划：先扩展 `tests/users.rs` 覆盖登录会话绑定和请求头替换，确认当前认证链失败；再增加带设备 ID 的 Web 登录服务入口，令普通登录入口保持兼容；身份读取后优先使用存储设备 ID，历史 NULL 会话才回退到已校验请求头；最后运行用户认证回归及常规检查。
+
+结果（2026-10-20）：Web 登录将有效 UUID v4 规范化后写入新会话；会话身份读取优先采用已绑定 ID，旧会话才回退到请求头。无效或缺失设备头仍可登录且会话关联为空，设备记录失败仍不改变登录或后续授权响应。
+
+验证：新增回归先因会话设备字段为空而失败；实现后精确用例通过，并验证绑定会话在请求头缺失、改变或无效时只刷新原设备，NULL 历史会话继续按有效头记录。`cargo test --locked --test users -- --test-threads=1` 最终 20/20 通过；首次整目标运行中管理员删除测试出现一次 503，单项复跑及完整目标重跑均通过。`cargo build --locked`、`cargo fmt --all -- --check`、Clippy 放行 7 类既有诊断后的全 targets 检查及 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

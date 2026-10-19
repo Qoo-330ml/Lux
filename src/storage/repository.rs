@@ -4072,8 +4072,6 @@ pub(crate) struct NewMediaChapterMarker {
 #[derive(Debug)]
 pub(crate) struct StoredWebSession {
     pub(crate) csrf_token_hash: Vec<u8>,
-    // Read by the Web authentication boundary when LUX-752 binds session activity.
-    #[allow(dead_code)]
     pub(crate) device_id: Option<String>,
     pub(crate) user_id: String,
     pub(crate) username_normalized: String,
