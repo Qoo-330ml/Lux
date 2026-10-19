@@ -13606,6 +13606,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：管理员用户列表和详情现在返回预设名称与完整来源快照，未应用的用户返回 `null`；列表通过一次批量来源查询，用户编辑资料后的详情响应也保留来源。`users` target 3/3、Rust build、fmt check 和 diff check 通过；回归覆盖删除自定义预设后来源仍可读。全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
 
+#### LUX-649：为 Web 接入应用权限预设的 API 合同
+
+范围：为 Web API 类型加入管理员用户预设来源详情，并新增将权限预设应用到单个用户的客户端方法。客户端向 LUX-646 端点发送 `presetId`，携带现有 CSRF token 并处理 204 空响应。本任务不添加页面按钮或批量应用。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 用户类型包含 nullable 的预设来源详情字段。
+- [x] 应用方法正确编码用户 ID、发送请求体和 CSRF，并把 204 转为 `undefined`。
+- [x] API 客户端定向测试、Web build 和 diff check 通过。
+
+短计划：先添加客户端契约回归并确认方法缺失；再补类型与 POST 方法，最后运行定向 Vitest 和 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-646、LUX-648。
+
+结果（2026-10-19）：为管理员用户类型增加可空预设来源详情，并新增应用预设 POST 客户端方法。`api-client.test.ts` 64/64、Web build 通过。`pnpm --dir web test -- api-client` 在运行 Node 布局断言阶段先失败（详情页 lazy import、Hero 标题行高、移动端媒体卡片宽度、触控卡片操作），未执行 Vitest；直接 Vitest target 已独立通过。Hero 行高断言也受工作区既有 `web/src/react.css` 修改影响，该文件未纳入任务提交。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

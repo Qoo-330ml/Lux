@@ -343,6 +343,25 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
   });
 
+  it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(
+        new LuxApiClient().applyAdminUserPermissionPreset("user/1", "preset-1"),
+      ).resolves.toBeUndefined();
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/user%2F1/permission-preset");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify({ presetId: "preset-1" }));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("uses the session-only password change contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
 

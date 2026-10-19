@@ -1132,6 +1132,13 @@ export class LuxApiClient {
     );
   }
 
+  applyAdminUserPermissionPreset(userId: string, presetId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/permission-preset`,
+      { method: "POST", body: JSON.stringify({ presetId }) },
+    );
+  }
+
   adminUser(userId: string) {
     return this.request<{ user?: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,

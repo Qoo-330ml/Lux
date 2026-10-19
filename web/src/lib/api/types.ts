@@ -545,6 +545,14 @@ export type AdminUser = LuxUser & {
   lastActivityAt?: number | null;
   currentPlaybackCount?: number;
   presetSource?: string | null;
+  presetSourceDetails?: AdminUserPermissionPresetSourceDetails | null;
+};
+
+export type AdminUserPermissionPresetSourceDetails = {
+  id: string;
+  name: string;
+  version: number;
+  appliedAt: number;
 };
 
 export type AdminUserPlaybackPolicy = {
