@@ -748,6 +748,73 @@ async fn admin_list_user_sessions(
     }
 }
 
+async fn admin_list_user_devices(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = i64::from(page.saturating_sub(1)).saturating_mul(i64::from(page_size));
+    match database
+        .list_user_devices_page(crate::storage::UserDevicePageQuery {
+            user_id: &user_id,
+            offset,
+            limit: i64::from(page_size),
+        })
+        .await
+    {
+        Ok((devices, total_count)) => Json(json!({
+            "devices": devices.iter().map(|device| json!({
+                "deviceId": device.device_id,
+                "deviceName": device.device_name,
+                "deviceType": device.device_type,
+                "clientName": device.client_name,
+                "clientVersion": device.client_version,
+                "firstSeenAt": device.first_seen_at,
+                "lastSeenAt": device.last_seen_at,
+                "lastRemoteIp": device.last_remote_ip,
+            })).collect::<Vec<_>>(),
+            "page": page,
+            "pageSize": page_size,
+            "totalCount": total_count,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn admin_revoke_user_session(
     headers: HeaderMap,
     Path((user_id, session_id)): Path<(String, String)>,
@@ -2627,6 +2694,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/sessions",
             get(admin_list_user_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/devices",
+            get(admin_list_user_devices),
         )
         .route(
             "/api/v1/admin/users/{user_id}/sessions/{session_id}",

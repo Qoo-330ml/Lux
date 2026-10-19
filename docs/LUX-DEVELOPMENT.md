@@ -15605,6 +15605,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因 `UserDevicePageQuery` 与分页方法缺失而编译失败；实现后 `cargo test --locked --lib user_device_` 2/2，覆盖目标用户隔离、所有摘要字段、同时间稳定排序、总数、连续/空页、负偏移和 100 条上限。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许已知 9 类既有诊断类别的全目标 Clippy 通过。严格全量 Clippy 仍受前序记录的 9 条未修改代码诊断阻断；无 schema 或 API 改动。
 
+#### LUX-745：开放管理员用户设备清单 API
+
+范围：将 LUX-744 的有界设备分页查询开放为管理员只读接口。返回设备 ID、名称、类型、客户端、版本、首次/最近活动和展示 IP；默认页码 1、页大小 20，服务端页大小限制 1–100。仅需要管理员认证，不需要 CSRF；无效用户 ID 返回 400，不存在用户返回 404。本任务不增加 Web API client 或页面，不实现访问活动刷新、设备操作或黑名单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可读取目标用户设备分页和总数；排序继承 storage 的最近活动倒序及设备 ID 正序。
+- [x] 未认证拒绝，非管理员禁止；GET 不要求 CSRF；无效/不存在目标 ID 返回文档规定状态。
+- [x] 响应只包含设备摘要，不含会话 token、密码或其他认证凭证。
+- [x] `users` 定向集成回归、Rust build、fmt 与 diff check 通过，API 文档已更新。
+
+短计划：先在 `tests/users` 添加未认证/非管理员、分页摘要、排序和错误 ID 回归并确认新路由未注册；再接入 storage 查询和管理员用户存在性校验；最后运行 `users` 定向目标、build、fmt 与 diff check。
+
+#### LUX-745 验证记录
+
+结果（2026-10-20）：新增 `GET /api/v1/admin/users/{userId}/devices`，只允许管理员读取。页码默认 1 并钳制最小值，页大小默认 20 并限制 1–100；响应只含设备摘要，不包含 user ID 或登录凭证。用户 ID 格式错误返回 400、用户不存在返回 404；GET 只需管理员认证，无 CSRF 要求。
+
+验证：TDD RED 回归先因新路由返回 404（预期未认证 401）；实现后 `cargo test --locked --test users -- --test-threads=1` 为 20/20，覆盖未认证/非管理员、设备字段、稳定分页、页码/页大小钳制、400/404 错误及无需 CSRF。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许前序记录 9 类既有诊断类别的全目标 Clippy 通过；严格全量 Clippy 仍有相同 9 条未改代码诊断。`docs/API.md` 已登记合同；不接入 Web client/UI、后续活动接线、黑名单或 ACL。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

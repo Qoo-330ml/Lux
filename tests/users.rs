@@ -3812,6 +3812,151 @@ async fn admin_can_view_and_stop_only_user_server_controlled_playback()
 }
 
 #[tokio::test]
+async fn admin_can_list_user_devices_with_pagination_and_auth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let target = UserStore::new(database.clone())?
+        .create_user("device-target", "Device Target", "target password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let path = format!("{base_url}/api/v1/admin/users/{}/devices", target.id);
+
+    let unauthenticated = client.get(&path).send().await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "device-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    let target_cookie = cookie_pair(target_login.headers());
+    let forbidden = client
+        .get(&path)
+        .header(COOKIE, &target_cookie)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    for (device_id, name, client_name, seen_at) in [
+        ("device-b", "Phone B", "Infuse", 300_i64),
+        ("device-a", "Phone A", "Lux Web", 300_i64),
+        ("device-c", "Tablet C", "Kodi", 200_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, device_name, device_type, client_name,
+                 client_version, first_seen_at, last_seen_at, last_remote_ip
+             ) VALUES (?, ?, ?, 'TEST', ?, '1.2.3', ?, ?, '203.0.113.10')",
+        )
+        .bind(target.id.to_string())
+        .bind(device_id)
+        .bind(name)
+        .bind(client_name)
+        .bind(seen_at - 10)
+        .bind(seen_at)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, device_name, device_type, client_name,
+             client_version, first_seen_at, last_seen_at
+         ) VALUES (?, 'admin-private-device', 'Admin Device', 'WEB', 'Lux Web', '1.0', 1, 999)",
+    )
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let first_page = client
+        .get(format!("{path}?page=1&pageSize=1"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(first_page.status(), reqwest::StatusCode::OK);
+    let first_body = first_page.json::<Value>().await?;
+    assert_eq!(first_body["page"], 1);
+    assert_eq!(first_body["pageSize"], 1);
+    assert_eq!(first_body["totalCount"], 3);
+    assert_eq!(first_body["devices"].as_array().map(Vec::len), Some(1));
+    let device = &first_body["devices"][0];
+    assert_eq!(device["deviceId"], "device-a");
+    assert_eq!(device["deviceName"], "Phone A");
+    assert_eq!(device["deviceType"], "TEST");
+    assert_eq!(device["clientName"], "Lux Web");
+    assert_eq!(device["clientVersion"], "1.2.3");
+    assert_eq!(device["firstSeenAt"], 290);
+    assert_eq!(device["lastSeenAt"], 300);
+    assert_eq!(device["lastRemoteIp"], "203.0.113.10");
+    assert!(device.get("token").is_none());
+    assert!(device.get("userId").is_none());
+
+    let second_page = client
+        .get(format!("{path}?page=2&pageSize=1"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    let second_body = second_page.json::<Value>().await?;
+    assert_eq!(second_body["totalCount"], 3);
+    assert_eq!(second_body["devices"][0]["deviceId"], "device-b");
+
+    let clamped = client
+        .get(format!("{path}?page=0&pageSize=101"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(clamped.status(), reqwest::StatusCode::OK);
+    let clamped_body = clamped.json::<Value>().await?;
+    assert_eq!(clamped_body["page"], 1);
+    assert_eq!(clamped_body["pageSize"], 100);
+
+    let invalid_id = client
+        .get(format!("{base_url}/api/v1/admin/users/not-a-user/devices"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_id.status(), reqwest::StatusCode::BAD_REQUEST);
+    let missing_id = uuid::Uuid::now_v7().to_string();
+    let missing_user = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{missing_id}/devices"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_list_user_web_sessions_without_exposing_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
