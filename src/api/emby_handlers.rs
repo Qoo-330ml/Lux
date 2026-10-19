@@ -2542,6 +2542,9 @@ pub(super) async fn require_emby_user_with_query(
     {
         return Err(StatusCode::FORBIDDEN);
     }
+    if let Some(token) = emby_token_from_headers(headers).or_else(|| query.api_key.clone()) {
+        record_emby_device_access(headers, state, auth, &token, &user.id.to_string()).await;
+    }
     Ok(user)
 }
 
@@ -2595,7 +2598,53 @@ pub(super) async fn require_emby_principal_with_query(
     {
         return Err(StatusCode::FORBIDDEN);
     }
+    if let Some(user) = principal.user() {
+        record_emby_device_access(headers, state, auth, &token, &user.id.to_string()).await;
+    }
     Ok(principal)
+}
+
+async fn record_emby_device_access(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &EmbyAuthService,
+    token: &str,
+    user_id: &str,
+) {
+    let Some(database) = state.database.as_ref() else {
+        return;
+    };
+    let device = match auth.device_info(token).await {
+        Ok(Some(device)) => device,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::warn!("failed to read Emby device for user activity");
+            return;
+        }
+    };
+    let Some(device_id) = bounded_emby_device_field(&device.device_id) else {
+        return;
+    };
+    let device_name = bounded_emby_device_field(&device.device);
+    let client_name = bounded_emby_device_field(&device.client);
+    let client_version = bounded_emby_device_field(&device.version);
+    let last_remote_ip = request_client_ip(headers, &state.remote_access);
+    if database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id,
+            device_id: &device_id,
+            device_name: device_name.as_deref(),
+            device_type: Some("EMBY"),
+            client_name: client_name.as_deref().unwrap_or("Unknown"),
+            client_version: client_version.as_deref(),
+            last_remote_ip: last_remote_ip.as_deref(),
+            seen_at: super::playback::current_unix_timestamp(),
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!("failed to update Emby user device activity");
+    }
 }
 
 pub(super) fn emby_access_principal(

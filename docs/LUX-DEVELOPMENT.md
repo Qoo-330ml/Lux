@@ -15688,6 +15688,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 在同一 authenticated request 带有效设备 ID、旧 `last_seen_at` 时失败；实现后 `tests/users` 串行 20/20，最后精确回归 1/1，另覆盖首次时间不变、无效设备 ID 跳过和设备存储失败时受保护请求仍成功。Rust build、fmt check、`git diff --check` 与放行既有 Clippy 诊断类别后的全目标 Clippy 通过。严格全目标 Clippy 仍受 10 条既有、位于未改文件的诊断阻断，本任务相关文件没有新增诊断。
 
+#### LUX-749：通过 Emby 有效访问刷新设备活跃时间
+
+范围：已签发的 Emby 用户凭证通过认证及远程访问策略后，使用凭证关联的客户端声明设备刷新用户设备清单最近活动，并更新可用展示 IP。首次出现时间不变；无可识别设备信息时跳过；设备存储失败不得阻断已通过认证的请求，日志不包含用户或设备字段。共享管理员 API Key 不代表普通用户设备，不写设备清单。不增加黑名单或 IP ACL。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/emby_handlers.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] Emby 用户登录后使用同一凭证访问受保护端点，会刷新同一用户设备的 `last_seen_at` 与可用展示 IP，`first_seen_at` 不变。
+- [x] 无设备 ID 的既有凭证不创建伪设备；设备清单写入失败不改变已认证请求响应。
+- [x] Emby 认证集成目标、build、fmt、可用 Clippy 检查与 diff check 通过。
+
+短计划：在 `tests/emby_auth.rs` 复用真实登录流程并把设备最近活动置旧，先验证后续受保护请求未更新；再在共享 Emby 用户凭证解析通过远程访问检查后，依据 token 的安全设备摘要 best-effort 更新设备记录；最后运行 Emby 认证集成目标、build、fmt 与 Clippy。
+
+结果（2026-10-20）：Emby 用户凭证访问经过身份和远程访问检查后，按凭证关联的设备摘要 best-effort 刷新用户设备清单的最近活动时间及展示 IP；首次出现时间保持不变。无设备 ID 时跳过清单写入，设备查询或 upsert 错误只写不含标识的通用告警且不改变认证响应。共享管理员 API Key 不关联普通用户设备。
+
+验证：TDD RED 的后续有效 Emby 请求未刷新旧设备时间；实现后 `cargo test --locked --test emby_auth -- --test-threads=1` 11/11 通过，覆盖活动时间/IP 更新、首次时间稳定、无设备 ID 跳过与设备更新失败仍返回 200。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。定向 Clippy 放行 7 类既有诊断后通过；严格 `cargo clippy --locked --test emby_auth -- -D warnings` 仍被未改文件的既有诊断阻断，本次修改文件无新增诊断。Cargo 输出目录在 Toshiba 挂载盘。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
