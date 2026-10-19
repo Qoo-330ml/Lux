@@ -30,22 +30,28 @@ function installCookieDocument(initialCookie: string) {
 function installLocalStorage(initialValue: string | null) {
   const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   let value = initialValue;
+  let deviceId: string | null = null;
   Object.defineProperty(globalThis, "localStorage", {
     configurable: true,
     value: {
       getItem(key: string) {
-        return key === "lux_csrf_token" ? value : null;
+        if (key === "lux_csrf_token") return value;
+        if (key === "lux_device_id") return deviceId;
+        return null;
       },
       setItem(key: string, nextValue: string) {
         if (key === "lux_csrf_token") value = nextValue;
+        if (key === "lux_device_id") deviceId = nextValue;
       },
       removeItem(key: string) {
         if (key === "lux_csrf_token") value = null;
+        if (key === "lux_device_id") deviceId = null;
       },
     },
   });
   return {
     current: () => value,
+    deviceId: () => deviceId,
     restore: () => {
       if (storageDescriptor) {
         Object.defineProperty(globalThis, "localStorage", storageDescriptor);
@@ -118,6 +124,58 @@ describe("LuxApiClient", () => {
     expect(path).toBe("/api/v1/setup/status");
     expect(options?.credentials).toBe("same-origin");
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
+  });
+
+  it("sends and persists one random device ID across API requests", async () => {
+    const storage = installLocalStorage(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      const client = new LuxApiClient();
+      await client.request("/api/v1/device-probe");
+      const firstId = (fetchMock.mock.calls[0]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+
+      expect(firstId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(storage.deviceId()).toBe(firstId);
+
+      await client.request("/api/v1/second-device-probe");
+      const secondId = (fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+      expect(secondId).toBe(firstId);
+    } finally {
+      storage.restore();
+    }
+  });
+
+  it("continues requests with one temporary device ID when browser storage is blocked", async () => {
+    const restoreClientState = installBlockedClientState();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      const client = new LuxApiClient();
+      await client.request("/api/v1/device-probe");
+      await client.request("/api/v1/second-device-probe");
+      const firstId = (fetchMock.mock.calls[0]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+      const secondId = (fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+
+      expect(firstId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(secondId).toBe(firstId);
+    } finally {
+      restoreClientState();
+    }
   });
 
   it("reads content restriction index readiness from the admin endpoint", async () => {

@@ -15522,6 +15522,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因观察类型及 `upsert_user_device` 缺失而编译失败；实现后 `cargo test --locked --lib user_device_observations_merge_monotonically_and_are_user_scoped` 1/1、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和仅允许 LUX-739 所记录 9 条既有 Clippy 诊断类别的全目标 Clippy 通过。完整 Clippy 的 9 条既有诊断仍未修复；本任务只新增 `repository.rs`、`mod.rs`、`users.rs` 和存储测试，不接认证或 ACL。
 
+#### LUX-741：为 Web 请求提供稳定设备标识
+
+范围：Web API 客户端生成并持久化随机、无个人资料含义的浏览器设备 ID，并在同源 API 请求中发送 `X-Lux-Device-Id`。优先使用浏览器本地存储；存储受限时以内存临时标识继续请求，不阻断登录。该标识仅供设备清单关联，服务端不得将其作为身份认证、授权或 ACL 凭据。本任务不接入服务端写入或展示设备记录。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 请求携带格式受限的稳定设备 ID；同一浏览器连续请求复用该 ID。
+- [x] 首次生成使用安全随机源并持久化；读取/写入本地存储失败时请求继续且有进程内稳定 ID。
+- [x] 定向 API client 回归、冻结依赖安装、Web build 与 diff check 通过。
+
+短计划：先添加共享请求头回归并确认现有客户端不发送设备 ID；再加入有界 UUID 生成、存储和请求头；最后运行 API client 定向 Vitest、Web build 和 diff check。
+
+#### LUX-741 验证记录
+
+结果（2026-10-20）：共享 Web API 客户端为请求附加 `X-Lux-Device-Id`。ID 使用 Web Crypto 生成 UUID v4，校验已存值格式后复用；无法读取或写入 localStorage 时以内存 ID 保持页面生命周期内稳定，并且不阻断请求。若存储随后恢复可用，会持久化已生成的内存 ID。设备 ID 仅用于服务端设备清单归并，不作为认证凭证。
+
+验证：TDD RED 两项 API client 回归因请求缺少设备 ID 而失败；最终 `tests/api-client.test.ts` 79/79，冻结依赖安装和 `pnpm --dir web build` 通过。完整 `pnpm --dir web test` 为 740 passed、4 failed；失败仍集中于既有 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项和 `media-query-polling.test.tsx` 1 项，本任务未改这些文件。构建通过 TypeScript 检查；diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

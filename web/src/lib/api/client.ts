@@ -110,8 +110,58 @@ import type {
 
 const csrfCookie = "lux_csrf";
 const csrfTokenStorageKey = "lux_csrf_token";
+const deviceIdStorageKey = "lux_device_id";
+const deviceIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HOME_REQUEST_TIMEOUT_MS = 15_000;
 let inMemoryCsrfToken = "";
+let inMemoryDeviceId = "";
+
+function createClientDeviceId(): string {
+  try {
+    if (typeof globalThis.crypto === "undefined") return "";
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  } catch {
+    return "";
+  }
+}
+
+function readClientDeviceId(): string {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const stored = localStorage.getItem(deviceIdStorageKey);
+      if (stored && deviceIdPattern.test(stored)) return stored;
+    }
+  } catch {
+    // Storage restrictions should not prevent an API request.
+  }
+
+  if (inMemoryDeviceId) {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(deviceIdStorageKey, inMemoryDeviceId);
+      }
+    } catch {
+      // Keep the existing process-local ID when storage remains blocked.
+    }
+    return inMemoryDeviceId;
+  }
+  const generated = createClientDeviceId();
+  if (!generated) return "";
+  inMemoryDeviceId = generated;
+
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(deviceIdStorageKey, generated);
+    }
+  } catch {
+    // Keep the ID in memory for this page lifetime when storage is unavailable.
+  }
+  return generated;
+}
 
 export type LibrarySortBy = "Name" | "DateCreated" | "PremiereDate" | "CommunityRating";
 export type LibrarySortOrder = "Ascending" | "Descending";
@@ -244,6 +294,8 @@ export class LuxApiClient {
     const method = options.method?.toUpperCase() ?? "GET";
     const headers = new Headers(options.headers);
     headers.set("Accept", "application/json");
+    const deviceId = readClientDeviceId();
+    if (deviceId) headers.set("X-Lux-Device-Id", deviceId);
     if (options.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
