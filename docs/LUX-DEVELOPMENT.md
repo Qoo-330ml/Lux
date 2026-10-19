@@ -14802,6 +14802,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`tests/api-client.test.ts` 72/72、`pnpm --dir web build` 和 `git diff --check` 通过；未运行完整 Web 测试套件。
 
+#### LUX-707：在用户列表批量启用或禁用账号
+
+范围：在用户列表现有本页勾选操作区加入批量启用/禁用按钮。变更前确认所选人数、逐项用户名称及禁用/启用影响；提交 LUX-705 API 后逐项显示成功或错误原因。变更后清空勾选并刷新列表。本任务不选择当前筛选的其他分页用户。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/tests/admin-user-batch-actions.test.tsx`。
+
+验收标准：
+
+- [x] 启用和禁用按钮只作用于当前页明确勾选的用户，并分别提供有目标名称与影响说明的确认。
+- [x] 每项显示用户名称和成功/稳定失败原因；成功后清空勾选并刷新用户列表。
+- [x] 换页、筛选或排序重置选择；请求中和偏好复制弹窗打开时禁用冲突操作。
+- [x] 定向列表组件回归、Web build 与 `git diff --check` 通过。
+
+短计划：先增加组件回归，确认选中用户后缺少批量状态按钮并失败；再接入 LUX-706 客户端方法，添加启用/禁用确认、逐项结果、错误映射和成功刷新；最后跑用户批量动作 Vitest、Web build 与 diff check。
+
+验证：运行 `pnpm --dir web exec vitest run tests/admin-user-batch-actions.test.tsx`、`pnpm --dir web build` 和 `git diff --check`。
+
+结果（2026-10-19）：用户列表新增批量启用/禁用操作，仅提交当前页勾选的 ID；确认框列出人数、名称并说明禁用时已交给播放器的 STRM 链接无法强制中断、重新启用需重新登录。服务端逐项结果展示本地用户名及错误原因，成功后清空勾选并刷新列表。批量请求和偏好复制期间禁用冲突操作；搜索、筛选、分页和排序变化清除旧选择与结果。
+
+验证：`tests/admin-user-batch-actions.test.tsx` 6/6、`pnpm --dir web build` 和 `git diff --check` 通过。未运行完整 Web 测试套件。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

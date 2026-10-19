@@ -44,7 +44,7 @@ function user(id: string, usernameNormalized: string, displayName: string): Admi
   };
 }
 
-describe("AdminUsersPage batch permission preset actions", () => {
+describe("AdminUsersPage batch user actions", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -52,6 +52,73 @@ describe("AdminUsersPage batch permission preset actions", () => {
     act(() => root.unmount());
     container.remove();
     vi.restoreAllMocks();
+  });
+
+  it("confirms and disables only selected users on the current page, then shows per-user results", async () => {
+    const alice = user("user-a", "alice", "爱丽丝");
+    const bob = { ...user("user-b", "bob", "鲍勃"), isDisabled: true };
+    const charlie = user("user-c", "charlie", "查理");
+    const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [alice, bob, charlie], page: 1, pageSize: 20, totalCount: 4 });
+    vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [preset] });
+    vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays: 7 } as AdminSettings);
+    const updateStatus = vi.spyOn(api, "updateAdminUserStatusBatch").mockResolvedValue({
+      isDisabled: true,
+      results: [
+        { userId: alice.id, success: true, errorCode: null },
+        { userId: bob.id, success: false, errorCode: "LAST_MANAGER" },
+      ],
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValue(true);
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("查理"));
+      expect(container.querySelector<HTMLButtonElement>('button[aria-label="批量禁用用户"]')?.disabled).toBe(true);
+      container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
+      container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.click();
+    });
+    const disableButton = container.querySelector<HTMLButtonElement>('button[aria-label="批量禁用用户"]');
+    expect(disableButton).toBeTruthy();
+    expect(disableButton?.disabled).toBe(false);
+
+    await act(async () => {
+      disableButton?.click();
+    });
+    expect(updateStatus).not.toHaveBeenCalled();
+
+    await act(async () => {
+      disableButton?.click();
+      await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith([alice.id, bob.id], true));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    });
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining("爱丽丝、鲍勃"));
+    expect(confirm.mock.calls.at(-1)?.[0]).not.toContain("查理");
+    expect(container.textContent).toContain("爱丽丝：成功");
+    expect(container.textContent).toContain("鲍勃：最后一个管理员不能失去管理权限");
+    expect(container.textContent).toContain("当前页已选 0 人");
+  });
+
+  it("confirms enabling selected disabled users and reports that a new login is required", async () => {
+    const disabledUser = { ...user("user-disabled", "disabled", "已禁用用户"), isDisabled: true };
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [disabledUser], page: 1, pageSize: 20, totalCount: 1 });
+    vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [preset] });
+    vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays: 7 } as AdminSettings);
+    const updateStatus = vi.spyOn(api, "updateAdminUserStatusBatch").mockResolvedValue({
+      isDisabled: false,
+      results: [{ userId: disabledUser.id, success: true, errorCode: null }],
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已禁用用户"));
+      container.querySelector<HTMLInputElement>('input[aria-label="选择已禁用用户"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="批量启用用户"]')?.click();
+      await vi.waitFor(() => expect(updateStatus).toHaveBeenCalledWith([disabledUser.id], false));
+    });
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("需要重新登录"));
+    expect(container.textContent).toContain("已禁用用户：成功");
   });
 
   it("applies a preset only to explicitly selected users on the current page and shows per-user results", async () => {
