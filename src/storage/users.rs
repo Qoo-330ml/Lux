@@ -1,10 +1,22 @@
 use super::*;
+use crate::storage::UserPlaybackPolicy;
+use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 
 use std::time::{Duration, Instant};
 
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
+const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
+const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
+const SECONDS_PER_DAY: i64 = 86_400;
+
+fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
+    value
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| (1..=MAX_USER_DELETION_GRACE_DAYS).contains(days))
+        .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS)
+}
 
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -37,9 +49,9 @@ impl Database {
             .query(
                 "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
-                is_admin, can_manage_server
+                is_admin, can_manage_server, max_simultaneous_playbacks
             )
-            SELECT ?, ?, ?, ?, 1, 1
+            SELECT ?, ?, ?, ?, 1, 1, 2
             WHERE NOT EXISTS (SELECT 1 FROM users)",
             )
             .bind(id)
@@ -72,22 +84,93 @@ impl Database {
         is_admin: bool,
         has_password: bool,
     ) -> Result<(), StorageError> {
+        self.insert_user_with_email(NewStoredUser {
+            id,
+            username_normalized,
+            display_name,
+            password_hash,
+            is_admin,
+            has_password,
+            email: None,
+        })
+        .await
+    }
+
+    pub(crate) async fn insert_user_with_email(
+        &self,
+        user: NewStoredUser<'_>,
+    ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
-                is_admin, can_manage_server, has_password
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                is_admin, can_manage_server, has_password, email,
+                max_simultaneous_playbacks
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2)",
         )
-        .bind(id)
-        .bind(username_normalized)
-        .bind(display_name)
-        .bind(password_hash)
-        .bind(database_flag(is_admin))
-        .bind(database_flag(is_admin))
-        .bind(database_flag(has_password))
+        .bind(user.id)
+        .bind(user.username_normalized)
+        .bind(user.display_name)
+        .bind(user.password_hash)
+        .bind(database_flag(user.is_admin))
+        .bind(database_flag(user.is_admin))
+        .bind(database_flag(user.has_password))
+        .bind(user.email)
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn get_user_playback_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserPlaybackPolicy>, StorageError> {
+        self.query(
+            "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                    allow_audio_transcode, allow_video_transcode
+             FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| UserPlaybackPolicy {
+                can_play: row.get::<i64, _>("can_play") != 0,
+                max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
+                allow_remux: row.get::<i64, _>("allow_remux") != 0,
+                allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
+                allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_user_playback_policy(
+        &self,
+        user_id: &str,
+        policy: UserPlaybackPolicy,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE users
+             SET can_play = ?, max_simultaneous_playbacks = ?, allow_remux = ?,
+                 allow_audio_transcode = ?, allow_video_transcode = ?, updated_at = unixepoch()
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(database_flag(policy.can_play))
+        .bind(policy.max_simultaneous_playbacks)
+        .bind(database_flag(policy.allow_remux))
+        .bind(database_flag(policy.allow_audio_transcode))
+        .bind(database_flag(policy.allow_video_transcode))
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -102,7 +185,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -113,22 +197,7 @@ impl Database {
         .bind(username_normalized)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredUser {
-                id: row.get("id"),
-                username_normalized: row.get("username_normalized"),
-                display_name: row.get("display_name"),
-                password_hash: row.get("password_hash"),
-                has_password: row.get::<i64, _>("has_password") != 0,
-                is_disabled: row.get::<i64, _>("is_disabled") != 0,
-                is_admin: row.get::<i64, _>("is_admin") != 0,
-                can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-                can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-                can_download: row.get::<i64, _>("can_download") != 0,
-                last_login_at: row.get("last_login_at"),
-                last_activity_at: row.get("last_activity_at"),
-            })
-        })
+        .map(|row| row.map(stored_user))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -151,7 +220,8 @@ impl Database {
                 "SELECT id, username_normalized, display_name, password_hash,
                         has_password,
                         is_disabled, is_admin, can_manage_server,
-                        can_remote_access, can_download, last_login_at,
+                        can_remote_access, can_download, email, email_verified_at,
+                        deleted_at, deletion_purge_at, last_login_at,
                         COALESCE(
                             (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                              FROM access_tokens at WHERE at.user_id = users.id),
@@ -199,6 +269,125 @@ impl Database {
 
     pub(crate) async fn list_all_users(&self) -> Result<Vec<StoredUser>, StorageError> {
         self.list_users_with_disabled(true).await
+    }
+
+    pub(crate) async fn query_admin_users(
+        &self,
+        status: AdminUserStatusFilter,
+        search: Option<&str>,
+        sort_by: AdminUserSortField,
+        descending: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredAdminUserListItem>, i64), StorageError> {
+        let status_clause = match status {
+            AdminUserStatusFilter::All => "deleted_at IS NULL",
+            AdminUserStatusFilter::Active => "deleted_at IS NULL AND is_disabled = 0",
+            AdminUserStatusFilter::Disabled => "deleted_at IS NULL AND is_disabled = 1",
+            AdminUserStatusFilter::Deleted => "deleted_at IS NOT NULL",
+        };
+        let search_pattern = search.map(|search| {
+            let escaped = search
+                .to_lowercase()
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_");
+            format!("%{escaped}%")
+        });
+        let where_clause = if search_pattern.is_some() {
+            format!(
+                "{status_clause} AND (
+                    LOWER(username_normalized) LIKE ? ESCAPE '!'
+                    OR LOWER(display_name) LIKE ? ESCAPE '!'
+                    OR LOWER(COALESCE(email, '')) LIKE ? ESCAPE '!'
+                )"
+            )
+        } else {
+            status_clause.to_owned()
+        };
+        let count_query = format!("SELECT COUNT(*) FROM users WHERE {where_clause}");
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        if let Some(search_pattern) = search_pattern.as_deref() {
+            count_statement = count_statement
+                .bind(search_pattern)
+                .bind(search_pattern)
+                .bind(search_pattern);
+        }
+        let total_count = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let max_function = match self.backend() {
+            crate::config::DatabaseBackend::Sqlite => "MAX",
+            crate::config::DatabaseBackend::Postgres => "GREATEST",
+        };
+        let activity_expression = format!(
+            "NULLIF({max_function}(
+                COALESCE(users.last_login_at, 0),
+                COALESCE((SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                          FROM access_tokens at WHERE at.user_id = users.id), 0),
+                COALESCE((SELECT MAX(COALESCE(ws.last_seen_at, ws.created_at))
+                          FROM web_sessions ws WHERE ws.user_id = users.id), 0),
+                COALESCE((SELECT MAX(ps.last_event_at)
+                          FROM playback_sessions ps WHERE ps.user_id = users.id), 0),
+                COALESCE((SELECT MAX(wps.last_heartbeat_at)
+                          FROM web_playback_sessions wps WHERE wps.user_id = users.id), 0)
+            ), 0)"
+        );
+        let sort_column = match sort_by {
+            AdminUserSortField::Created => "created_at",
+            AdminUserSortField::LastLogin => "last_login_at",
+            AdminUserSortField::LastActivity => "last_activity_at",
+        };
+        let direction = if descending { "DESC" } else { "ASC" };
+        let list_query = format!(
+            "SELECT id, username_normalized, display_name, has_password,
+                    is_disabled, is_admin, can_manage_server, can_remote_access,
+                    can_download, email, email_verified_at, deleted_at,
+                    deletion_purge_at, last_login_at,
+                    {activity_expression} AS last_activity_at,
+                    created_at,
+                    (SELECT COUNT(*) FROM (
+                        SELECT ps.play_session_id
+                        FROM playback_sessions ps
+                        WHERE ps.user_id = users.id
+                          AND ps.state IN ('PLAYING', 'PAUSED')
+                          AND ps.last_event_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+                        UNION
+                        SELECT wps.play_session_id
+                        FROM web_playback_sessions wps
+                        WHERE wps.user_id = users.id AND wps.state = 'ACTIVE'
+                          AND wps.last_heartbeat_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+                          AND wps.expires_at >= unixepoch()
+                    ) active_playback_sessions) AS current_playback_count
+             FROM users
+             WHERE {where_clause}
+             ORDER BY {sort_column} {direction} NULLS LAST,
+                      username_normalized ASC, id ASC
+             LIMIT ? OFFSET ?"
+        );
+        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
+        if let Some(search_pattern) = search_pattern.as_deref() {
+            list_statement = list_statement
+                .bind(search_pattern)
+                .bind(search_pattern)
+                .bind(search_pattern);
+        }
+        let rows = list_statement
+            .bind(limit.clamp(1, 100))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let users = rows.into_iter().map(stored_admin_user_list_item).collect();
+        Ok((users, total_count))
     }
 
     pub(crate) async fn find_user_display_names(
@@ -252,7 +441,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -295,7 +485,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -338,7 +529,8 @@ impl Database {
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download, last_login_at,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
                          FROM access_tokens at WHERE at.user_id = users.id),
@@ -356,11 +548,55 @@ impl Database {
         })
     }
 
+    pub(crate) async fn update_user_profile(
+        &self,
+        user_id: &str,
+        display_name: Option<&str>,
+        email: Option<Option<&str>>,
+    ) -> Result<Option<StoredUser>, StorageError> {
+        let email_was_provided = email.is_some();
+        let email = email.flatten();
+        self.query(
+            "UPDATE users
+             SET display_name = COALESCE(?, display_name),
+                 email = CASE WHEN ? != 0 THEN ? ELSE email END,
+                 email_verified_at = CASE
+                    WHEN ? != 0 AND LOWER(COALESCE(email, '')) != LOWER(COALESCE(?, ''))
+                    THEN NULL ELSE email_verified_at END,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(display_name)
+        .bind(database_flag(email_was_provided))
+        .bind(email)
+        .bind(database_flag(email_was_provided))
+        .bind(email)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.find_user_by_id(user_id).await
+    }
+
     pub(crate) async fn update_user(
         &self,
         user_id: &str,
         update: UpdateUser<'_>,
     ) -> Result<Option<StoredUser>, StorageError> {
+        Ok(self
+            .update_user_with_hls_session_ids(user_id, update)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    pub(crate) async fn update_user_with_hls_session_ids(
+        &self,
+        user_id: &str,
+        update: UpdateUser<'_>,
+    ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
         let retry_deadline = Instant::now() + SQLITE_USER_UPDATE_RETRY_WINDOW;
         loop {
             match self.update_user_once(user_id, &update).await {
@@ -380,7 +616,7 @@ impl Database {
         &self,
         user_id: &str,
         update: &UpdateUser<'_>,
-    ) -> Result<Option<StoredUser>, StorageError> {
+    ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
         let mut transaction = self
             .pool
             .begin()
@@ -391,7 +627,7 @@ impl Database {
             })?;
         let Some(current) = self
             .query(
-                "SELECT is_disabled, can_manage_server
+                "SELECT is_disabled, can_manage_server, deleted_at
              FROM users WHERE id = ?",
             )
             .bind(user_id)
@@ -404,6 +640,9 @@ impl Database {
         else {
             return Ok(None);
         };
+        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+            return Ok(None);
+        }
         let current_disabled = current.get::<i64, _>("is_disabled") != 0;
         let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
         let next_disabled = update.is_disabled.unwrap_or(current_disabled);
@@ -417,7 +656,8 @@ impl Database {
             let remaining: i64 = self
                 .query_scalar(
                     "SELECT COUNT(*) FROM users
-                 WHERE can_manage_server = 1 AND is_disabled = 0 AND id != ?",
+                 WHERE can_manage_server = 1 AND is_disabled = 0
+                   AND deleted_at IS NULL AND id != ?",
                 )
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
@@ -430,6 +670,22 @@ impl Database {
                 return Err(StorageError::LastManager);
             }
         }
+        let hls_session_ids = if !current_disabled && next_disabled {
+            self.query_scalar(
+                "SELECT id FROM web_playback_sessions
+                 WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .bind(user_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        } else {
+            Vec::new()
+        };
         self.query(
             "UPDATE users
              SET display_name = COALESCE(?, display_name),
@@ -458,6 +714,70 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        if !current_disabled && next_disabled {
+            let now: i64 = self
+                .query_scalar("SELECT unixepoch()")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "UPDATE web_sessions
+                 SET revoked_at = ?, updated_at = ?
+                 WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE access_tokens
+                 SET revoked_at = ?, updated_at = ?
+                 WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE playback_sessions
+                 SET state = 'STOPPED', is_paused = 0, last_event_at = ?
+                 WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED')",
+            )
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE web_playback_sessions
+                 SET state = 'STOPPED', updated_at = ?
+                 WHERE user_id = ? AND state = 'ACTIVE'",
+            )
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -465,7 +785,10 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.find_user_by_id(user_id).await
+        Ok(self
+            .find_user_by_id(user_id)
+            .await?
+            .map(|user| (user, hls_session_ids)))
     }
 
     pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
@@ -527,6 +850,239 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+
+    pub(crate) async fn soft_delete_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(current) = self
+            .query(
+                "SELECT is_disabled, can_manage_server, deleted_at
+                 FROM users WHERE id = ?",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+            return Ok(None);
+        }
+        let was_disabled = current.get::<i64, _>("is_disabled") != 0;
+        let can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        if can_manage_server && !was_disabled {
+            let remaining: i64 = self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM users
+                     WHERE can_manage_server = 1 AND is_disabled = 0
+                       AND deleted_at IS NULL AND id != ?",
+                )
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if remaining == 0 {
+                return Err(StorageError::LastManager);
+            }
+        }
+        let now: i64 = self
+            .query_scalar("SELECT unixepoch()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let configured_grace_days: Option<String> = self
+            .query_scalar(
+                "SELECT value FROM server_settings
+                 WHERE key = 'user_deletion_grace_days'",
+            )
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let grace_days = normalize_user_deletion_grace_days(configured_grace_days);
+        let hls_session_rows = self
+            .query(
+                "SELECT id FROM web_playback_sessions
+                 WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'",
+            )
+            .bind(user_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let hls_session_ids = hls_session_rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect::<Vec<_>>();
+
+        self.query(
+            "UPDATE users
+             SET is_disabled_before_delete = ?, is_disabled = 1,
+                 deleted_at = ?, deletion_purge_at = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(database_flag(was_disabled))
+        .bind(now)
+        .bind(now.saturating_add(grace_days.saturating_mul(SECONDS_PER_DAY)))
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE web_sessions
+             SET revoked_at = ?, updated_at = ?
+             WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE access_tokens
+             SET revoked_at = ?, updated_at = ?
+             WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE playback_sessions
+             SET state = 'STOPPED', is_paused = 0, last_event_at = ?
+             WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED')",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE web_playback_sessions
+             SET state = 'STOPPED', updated_at = ?
+             WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(hls_session_ids))
+    }
+
+    pub(crate) async fn restore_deleted_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE users
+                 SET is_disabled = is_disabled_before_delete,
+                     is_disabled_before_delete = 0,
+                     deleted_at = NULL, deletion_purge_at = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND deleted_at IS NOT NULL",
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn purge_deleted_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        let result = self
+            .query("DELETE FROM users WHERE id = ? AND deleted_at IS NOT NULL")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn purge_expired_deleted_users(
+        &self,
+        now: i64,
+        batch_limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows = self
+            .query(
+                "DELETE FROM users
+                 WHERE id IN (
+                     SELECT id FROM users
+                     WHERE deleted_at IS NOT NULL AND deletion_purge_at <= ?
+                     ORDER BY deletion_purge_at ASC, id ASC
+                     LIMIT ?
+                 )
+                   AND deleted_at IS NOT NULL AND deletion_purge_at <= ?
+                 RETURNING id",
+            )
+            .bind(now)
+            .bind(batch_limit.clamp(1, 100))
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect())
     }
 
     pub(crate) async fn find_user_emby_configuration(
@@ -810,7 +1366,8 @@ impl Database {
         self.query(
             "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
                     u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
-                    u.can_remote_access, u.can_download, u.last_login_at,
+                    u.can_remote_access, u.can_download, u.email, u.email_verified_at,
+                    u.deleted_at, u.deletion_purge_at, u.last_login_at,
                     COALESCE(
                         (SELECT MAX(COALESCE(at2.last_seen_at, at2.created_at))
                          FROM access_tokens at2 WHERE at2.user_id = u.id),
@@ -823,22 +1380,7 @@ impl Database {
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredUser {
-                id: row.get("id"),
-                username_normalized: row.get("username_normalized"),
-                display_name: row.get("display_name"),
-                password_hash: row.get("password_hash"),
-                has_password: row.get::<i64, _>("has_password") != 0,
-                is_disabled: row.get::<i64, _>("is_disabled") != 0,
-                is_admin: row.get::<i64, _>("is_admin") != 0,
-                can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-                can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-                can_download: row.get::<i64, _>("can_download") != 0,
-                last_login_at: row.get("last_login_at"),
-                last_activity_at: row.get("last_activity_at"),
-            })
-        })
+        .map(|row| row.map(stored_user))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -1367,6 +1909,43 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn user_deletion_grace_days(&self) -> Result<i64, StorageError> {
+        let value: Option<String> = self
+            .query_scalar(
+                "SELECT value FROM server_settings
+                 WHERE key = 'user_deletion_grace_days'",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(normalize_user_deletion_grace_days(value))
+    }
+
+    pub(crate) async fn set_user_deletion_grace_days(&self, days: i64) -> Result<(), StorageError> {
+        if !(1..=MAX_USER_DELETION_GRACE_DAYS).contains(&days) {
+            return Err(StorageError::Serialization(
+                "user deletion grace period is outside the allowed range".to_owned(),
+            ));
+        }
+        self.query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('user_deletion_grace_days', ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(days.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
     }
 
     pub(crate) async fn user_uses_admin_library_order(

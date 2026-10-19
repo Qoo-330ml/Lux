@@ -10,6 +10,19 @@ import { LoginPage } from "../src/features/auth/LoginPage";
 import { ApiError, api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 
+const libraryRouteChunk = vi.hoisted(() => {
+  let resolve!: () => void;
+  const loaded = new Promise<void>((done) => { resolve = done; });
+  return { loaded, resolve, started: false, complete: false };
+});
+
+vi.mock("../src/features/library/LibrariesPage", async () => {
+  libraryRouteChunk.started = true;
+  await libraryRouteChunk.loaded;
+  libraryRouteChunk.complete = true;
+  return { LibrariesPage: () => <div data-testid="loaded-library-route">媒体库页面</div> };
+});
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("LoginPage session state", () => {
@@ -45,6 +58,7 @@ describe("LoginPage session state", () => {
       );
     });
 
+    expect(container.querySelector(".lux-auth-card-animated")).not.toBeNull();
     expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
     expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
 
@@ -514,5 +528,40 @@ describe("LoginPage session state", () => {
     });
     expect(api.me).toHaveBeenCalledTimes(2);
     expect(queryClient.getQueryData(queryKeys.me)).toEqual({ user, serverName: "客厅 Lux" });
+  });
+
+  it("keeps the authenticated shell visible while a lazy route chunk is loading", async () => {
+    const user = { id: "user-1", usernameNormalized: "admin", canManageServer: true };
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+    vi.spyOn(api, "me").mockResolvedValue({ user, serverName: "客厅 Lux" });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/libraries"]}>
+            <App />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-route-skeleton"), container.innerHTML).not.toBeNull());
+    });
+
+    expect(container.querySelector(".lux-header")).not.toBeNull();
+    expect(container.querySelector(".lux-desktop-nav")).not.toBeNull();
+    expect(container.querySelector(".lux-state-screen")).toBeNull();
+    expect(libraryRouteChunk.started).toBe(true);
+
+    await act(async () => libraryRouteChunk.resolve());
+    await act(async () => {
+      await vi.waitFor(() => expect(libraryRouteChunk.complete).toBe(true));
+      await vi.waitFor(() => expect(container.querySelector("[data-testid=loaded-library-route]")).not.toBeNull());
+    });
   });
 });

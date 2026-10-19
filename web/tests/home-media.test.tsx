@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
-import { ContinueWatchingRail, MediaCard, MediaRail, posterUrlWithFallback } from "../src/features/home/media";
+import { ContinueWatchingRail, MediaCard, MediaRail, posterUrlWithFallback, recentPlaybackLabel } from "../src/features/home/media";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -72,23 +72,30 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector<HTMLAnchorElement>(".lux-continue-card")?.getAttribute("href")).toBe(
       "/watch/episode-1",
     );
-    expect(container.querySelector(".lux-continue-card .lux-rating")?.textContent).toBe("8.4");
-    expect(container.querySelector(".lux-continue-card .lux-rating svg")).toBeNull();
+    expect(container.querySelector(".lux-continue-card .lux-rating")).toBeNull();
     expect(container.querySelector(".lux-continue-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-1/images/thumb?tag=episode-thumb-tag");
     expect(container.querySelector(".lux-progress span")?.getAttribute("style")).toContain("width: 33%");
     expect(container.querySelector(".lux-continue-remaining")?.textContent).toBe("还剩 4m");
+    expect(container.querySelector(".lux-continue-recency")).toBeNull();
   });
 
-  it("shows the series name below an episode resume title", () => {
+  it("shows the series title, formatted episode, and recent viewing for an episode", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     const episode = {
       id: "episode-2",
-      title: "第二集",
+      title: "用魔法打败魔法",
       itemType: "EPISODE" as const,
-      seriesName: "示例剧集",
+      seriesName: "我不是大师",
+      parentIndexNumber: 1,
+      indexNumber: 5,
+      runtimeTicks: 36_000_000_000,
+      userData: {
+        positionTicks: 1_000_000_000,
+        lastPlayedAt: Math.floor((Date.now() - 30 * 60 * 1000) / 1000),
+      },
     };
 
     act(() => {
@@ -99,8 +106,54 @@ describe("ContinueWatchingRail", () => {
       );
     });
 
-    expect(container.querySelector(".lux-continue-copy strong")?.textContent).toBe("第二集");
-    expect(container.querySelector(".lux-continue-copy small")?.textContent).toBe("示例剧集");
+    expect(container.querySelector(".lux-continue-primary strong")?.textContent).toBe("我不是大师");
+    expect(container.querySelector(".lux-continue-context")?.textContent).toBe("S01E05·用魔法打败魔法");
+    expect(container.querySelector(".lux-continue-recency")?.textContent).toBe("半小时前看到这里");
+  });
+
+  it("shows a movie title, remaining time, year, and recent viewing on separate lines", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <ContinueWatchingRail items={[{
+            id: "movie-continue",
+            title: "蜘蛛侠：崭新之日",
+            itemType: "MOVIE",
+            productionYear: 2026,
+            runtimeTicks: 72_000_000_000,
+            userData: {
+              positionTicks: 18_000_000_000,
+              lastPlayedAt: Math.floor((Date.now() - 25 * 60 * 1000) / 1000),
+            },
+          }]} />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-continue-primary strong")?.textContent).toBe("蜘蛛侠：崭新之日");
+    expect(container.querySelector(".lux-continue-remaining")?.textContent).toBe("还剩 1h 30m");
+    expect(container.querySelector(".lux-continue-context")?.textContent).toBe("2026");
+    expect(container.querySelector(".lux-continue-recency")?.textContent).toBe("25 分钟前看到这里");
+  });
+
+  it("uses warm and timezone-local relative playback copy", () => {
+    const now = new Date(2026, 9, 17, 15, 0, 0);
+    const at = (day: number, hour: number, minute = 0) =>
+      Math.floor(new Date(2026, 9, day, hour, minute).getTime() / 1000);
+
+    expect(recentPlaybackLabel(at(17, 14, 58), now.getTime())).toBe("刚才看到这里");
+    expect(recentPlaybackLabel(at(17, 14, 30), now.getTime())).toBe("半小时前看到这里");
+    expect(recentPlaybackLabel(at(17, 12, 30), now.getTime())).toBe("2 小时前看到这里");
+    expect(recentPlaybackLabel(at(17, 9), now.getTime())).toBe("今天上午看到这里");
+    expect(recentPlaybackLabel(at(16, 20), now.getTime())).toBe("昨天看到这里，接着来");
+    expect(recentPlaybackLabel(at(13, 10), now.getTime())).toBe("4 天前看到这里");
+    expect(recentPlaybackLabel(at(7, 10), now.getTime())).toBe("上次看到这里，回来接着看");
+    expect(recentPlaybackLabel(null, now.getTime())).toBeUndefined();
+    expect(recentPlaybackLabel(at(17, 16), now.getTime())).toBeUndefined();
   });
 
   it("shows HomeVideos progress and opens the video player from continue watching", () => {

@@ -24,12 +24,18 @@ pub enum AdminEventScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserEventScope {
     Home,
+    Item,
+    Library,
+    Favorites,
 }
 
 impl UserEventScope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Home => "home",
+            Self::Item => "item",
+            Self::Library => "library",
+            Self::Favorites => "favorites",
         }
     }
 }
@@ -51,6 +57,7 @@ impl AdminEventScope {
 
 #[derive(Clone)]
 pub struct AdminEventHub {
+    user_events: Option<UserEventHub>,
     sender: broadcast::Sender<AdminEventScope>,
     jobs_event_state: Arc<StdMutex<AdminJobsEventState>>,
 }
@@ -79,9 +86,30 @@ impl AdminEventHub {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
+            user_events: None,
             sender,
             jobs_event_state: Arc::new(StdMutex::new(AdminJobsEventState::default())),
         }
+    }
+
+    pub fn with_user_events(mut self, user_events: UserEventHub) -> Self {
+        self.user_events = Some(user_events);
+        self
+    }
+
+    fn publish_user_invalidation(&self, scope: AdminEventScope) {
+        let Some(user_events) = &self.user_events else {
+            return;
+        };
+        let scope = match scope {
+            AdminEventScope::All | AdminEventScope::Metadata | AdminEventScope::Jobs => {
+                UserEventScope::Item
+            }
+            AdminEventScope::Libraries => UserEventScope::Library,
+            AdminEventScope::Users | AdminEventScope::Settings => UserEventScope::Home,
+            AdminEventScope::Dashboard | AdminEventScope::Plugins => return,
+        };
+        user_events.publish(scope);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AdminEventScope> {
@@ -94,6 +122,7 @@ impl AdminEventHub {
             return;
         }
         let _ = self.sender.send(scope);
+        self.publish_user_invalidation(scope);
     }
 
     pub fn publish_jobs_progress(&self) {
@@ -135,6 +164,7 @@ impl AdminEventHub {
     }
 
     pub fn publish_jobs_now(&self) {
+        self.publish_user_invalidation(AdminEventScope::Jobs);
         if let Ok(mut state) = self.jobs_event_state.lock() {
             state.scheduled = false;
             state.dirty = false;
@@ -232,6 +262,30 @@ mod tests {
     use super::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope};
 
     #[tokio::test]
+    async fn committed_admin_changes_refresh_user_surfaces_without_progress_noise() {
+        let user_events = UserEventHub::new();
+        let mut receiver = user_events.subscribe();
+        let hub = AdminEventHub::new().with_user_events(user_events);
+
+        hub.publish_jobs_progress();
+        hub.publish(AdminEventScope::Dashboard);
+        hub.publish(AdminEventScope::Plugins);
+        assert!(receiver.try_recv().is_err());
+
+        for (admin_scope, user_scope) in [
+            (AdminEventScope::Metadata, UserEventScope::Item),
+            (AdminEventScope::Jobs, UserEventScope::Item),
+            (AdminEventScope::Libraries, UserEventScope::Library),
+            (AdminEventScope::Users, UserEventScope::Home),
+            (AdminEventScope::Settings, UserEventScope::Home),
+            (AdminEventScope::All, UserEventScope::Item),
+        ] {
+            hub.publish(admin_scope);
+            assert_eq!(receiver.try_recv(), Ok(user_scope));
+        }
+    }
+
+    #[tokio::test]
     async fn publishes_scopes_to_all_subscribers() {
         let hub = AdminEventHub::new();
         let mut first = hub.subscribe();
@@ -305,6 +359,9 @@ mod tests {
         assert_eq!(AdminEventScope::Metadata.as_str(), "metadata");
         assert_eq!(AdminEventScope::Settings.as_str(), "settings");
         assert_eq!(UserEventScope::Home.as_str(), "home");
+        assert_eq!(UserEventScope::Item.as_str(), "item");
+        assert_eq!(UserEventScope::Library.as_str(), "library");
+        assert_eq!(UserEventScope::Favorites.as_str(), "favorites");
     }
 
     #[tokio::test]

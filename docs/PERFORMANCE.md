@@ -2,6 +2,69 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-561 多管线共享后台预算（2026-10-16）
+
+实现新增进程级共享预算，协调扫描准备与指纹、本地 NFO/图片计算、ffprobe 和缩略图 ffmpeg。预算容量按可见 CPU 与 cgroup CPU 限额推导，也可用 `LUX_BACKGROUND_CPU_BUDGET` 显式设置；运行时仍保留各管线原有局部并发上限。功能测试用于证明准入、取消与回收语义，不作为 CPU 性能结果。
+
+项目所有者于 2026-10-16 明确表示本任务不用完成性能 A/B，因此没有运行混合负载 A/B，也没有 CPU p95、吞吐、内存或前台响应对比数据。执行时环境亦未配置 `LUX_PERF_MEDIA_ROOT`，没有可用 ffmpeg，且未配置 `POSTGRES_TEST_DATABASE`。报告中的 15% CPU p95 降幅仍只是待验证目标；自动容量仍是未经性能验证的候选默认值，不据此声称性能收益。
+
+## LUX-562 动态 SQL 构建与字符串分配基线（2026-10-16）
+
+环境：macOS `arm64`，Rust `1.97.1`；生产源码基线 `e7107bfe`，仅新增测试专用 harness。命令固定为 release、单线程，使用 Toshiba 共享 Cargo target：
+
+```bash
+CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --release --locked --lib storage::repository::sql_query_benchmarks::dynamic_sql_allocation_baseline --features performance-benchmarks -- --ignored --nocapture --test-threads=1
+```
+
+该 harness 单独统计分配与耗时，覆盖 SQLite 静态/owned SQL 适配、PostgreSQL 120 占位符适配、1/100/200/2,900/5,000 行 VALUES CTE 字符串构造、200 条路径绑定（32/128/512 字节）及 SQLite 单连接 120 种 SQL 形状的冷执行、缓存重放和淘汰重放。Any 绑定用例只构造 SQLx Query，不连接后端；SQLite case 使用内存数据库。缓存容量/驻留条数不等同于 prepare 次数或命中率，时间也不是整链路扫描或数据库服务端性能。
+
+先用上述 Cargo 命令编译并通过一次；随后在没有其他 Cargo 构建或高 CPU 测试运行时，直接顺序运行同一测试二进制五轮：
+
+```bash
+for i in 1 2 3 4 5; do
+  /Volumes/Toshiba/mywork/Lux/target/release/deps/luxd-b56c43d60e82dde1 --ignored --exact storage::repository::sql_query_benchmarks::dynamic_sql_allocation_baseline --nocapture --test-threads=1
+done
+```
+
+分配计数与字节在五轮完全相同；表中耗时为五轮中位数及最小–最大值。单次操作的分配数、分配字节和 realloc 数/字节均按 harness 的 iteration 数归一化。
+静态 SQLite SQL 输出的内存地址与输入不同（`sqlite_static_adapter_pointer_preserved=false`），确认当前 adapter 有一次完整文本分配；本条只证明适配层复制，不代表数据库执行成本。
+
+| 工作负载 | 分配 / 次 | 分配字节 / 次 | realloc / 次（字节） | 耗时中位数 [范围] |
+|---|---:|---:|---:|---:|
+| SQLite 静态 SQL adapter | 1 | 81 | 0 (0) | 25 [20–25] ns |
+| SQLite owned SQL adapter | 1 | 81 | 0 (0) | 27 [26–35] ns |
+| PostgreSQL 120 参数 adapter | 121 | 1,615 | 1 (830) | 3,311 [3,057–3,443] ns |
+| VALUES CTE，1 行 | 3 | 135 | 0 (0) | 72 [69–76] ns |
+| VALUES CTE，100 行 | 3 | 2,214 | 2 (1,587) | 383 [381–388] ns |
+| VALUES CTE，200 行 | 3 | 4,314 | 2 (3,087) | 621 [610–622] ns |
+| VALUES CTE，2,900 行 | 3 | 61,014 | 2 (43,587) | 6,873 [6,765–6,967] ns |
+| VALUES CTE，5,000 行 | 3 | 105,114 | 2 (75,087) | 12,919 [12,620–13,430] ns |
+| Any query，200 paths × 32 B | 401 | 14,496 | 6 (12,096) | 9,210 [9,036–9,427] ns |
+| Any query，200 paths × 128 B | 401 | 33,696 | 6 (12,096) | 8,828 [8,494–9,362] ns |
+| Any query，200 paths × 512 B | 401 | 110,496 | 6 (12,096) | 10,365 [10,206–10,977] ns |
+
+SQLx SQLite statement cache 的默认容量为 100。120 种不同形状首次执行后驻留 100 条；重放 100 条最近形状后仍驻留 100 条；再执行最早被淘汰的 20 条后仍驻留 100 条。五轮的 cold 120 条耗时中位数为 10,143 μs（9,726–10,295），缓存内重放 100 条为 1,314 μs（1,244–1,459），淘汰后重放 20 条为 534 μs（501–580）。这是内存 SQLite 的时间观察与驻留数量断言，不是 driver prepare 次数或 hit rate 的测量。
+
+上述结果只用于比较后续局部实现。本机 ARM64 合成数据不外推 FNOS/NAS/x86_64，也不构成扫描 CPU、完整查询延迟或生产收益结论。
+
+## LUX-571 动态 SQL 优化完成门禁与综合结论（2026-10-17）
+
+最终选择是 **A+C**：有限的完整 SQL 模板缓存减少重复构造，安全读取按容量桶复用查询形状，写入保留精确行数；同时借用 SQL 和媒体文件记录，消除适配层及索引物化路径中的多余复制。B（临时表 + JOIN）暂缓，因为连接/事务生命周期和清理成本更复杂，当前没有证据表明它能改善已测热点。分项实测完整记录见 `docs/LUX-DEVELOPMENT.md` 的 LUX-565–LUX-570。
+
+| 工作负载 | 动态/复制基线 | 模板/借用结果 | 测量边界 |
+|---|---:|---:|---|
+| Manifest 基线路径，257 条 | 600 ns（592–918） | 18 ns（18–22） | SQL 构造，不含执行/分配 |
+| 目录写入，200 行 INSERT | 844 ns，3 alloc / 7,996 B | 23 ns，0 alloc | SQL 文本构造 |
+| delta verify，100 行 | 1,056 ns，3 alloc / 6,364 B，另 1 realloc / 4,932 B | 57 ns，0 alloc | SQL 文本构造 |
+| Movie 记录集合，256 条 | clone：73,408 ns，3,073 alloc / 150,928 B | 引用：70 ns，1 alloc / 2,048 B | 仅集合构造 |
+| Episode 记录集合，256 条 | clone：97,378 ns，3,841 alloc / 204,660 B | 引用：42 ns，1 alloc / 2,048 B | 仅集合构造 |
+
+这些是本机 macOS arm64 上的局部合成微基准；不同 harness 的耗时不可相加。没有测到完整扫描 CPU/p95、SQLite/PostgreSQL 执行收益或 FNOS/NAS/x86_64 收益。
+
+最终只运行一次 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --all-targets`。lib 为 955 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14，`tests/probe.rs` 为 21/21。该命令在 `tests/scanned_metadata.rs` 停止，结果 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（2 项实际、1 项预期；此前已在基线 `3b4b7325` 重现）和 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；本次未重跑）。后续 targets 未执行，不能称全量 Rust 门禁通过。`cargo build --locked`、fmt 和全 targets/all features Clippy 已在 S6 代码变更后通过，文档收尾未重跑。
+
+PostgreSQL 测试要求本地实例。为完成运行时验证，使用已缓存的 PostgreSQL 16 镜像启动只绑定 `127.0.0.1:55432` 的临时容器，执行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database -- --ignored --test-threads=1`，18/18 通过；随后删除容器并确认 55432 不再监听。PostgreSQL 模板文本和参数序号有单元测试覆盖，`postgres_database` 的真实后端迁移、manifest 和扫描集成也已通过。本次没有运行所有散布在 lib target 中的 ignored PostgreSQL tests。
+
 ## 基准目标
 
 规格目标：10,000 部电影、50,000 集剧集；数据库预热、单页 50 条、扫描同时运行。API 目标为首页 p95 < 400 ms、媒体库首屏 p95 < 300 ms、搜索 p95 < 500 ms、详情 p95 < 200 ms、继续观看 p95 < 300 ms、缓存图片 p95 < 150 ms，扫描期间前台 p95 < 1 s 且不超过空闲时 2 倍。
@@ -62,6 +125,17 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 这组结果证明 512 路配置可被接受且全局 semaphore 没有超过硬上限；当前开发机观察值受动态背压和进程启动开销影响，
 不能据此声称目标 NAS 的实际吞吐。ffprobe 默认配置为 256；4/8/16 核环境的正常有效目标分别为 128/256/512，压力升高时会降档。本次 512 个源在四档请求下均成功完成。
+
+## LUX-561 ffprobe 完成速率控制诊断
+
+本机 ARM64 模拟对照使用相同 8,192 个 fixture、75 ms fake probe 延迟和 release harness。旧版固定默认并发与修复定时器后的候选结果如下。候选运行时源码是 `2687c484` 加未提交工作树修正，包含 60% 饱和资格线及固定间隔 page tick，但**还使用 1/8 升档步长**；最终工作树已改成 1/4，因此候选行不代表最终代码。
+
+| 日期 | 代码版本 | 架构 / available_parallelism | 模式 / 样本 | items/s | p50 / p95 service | 总耗时 | 峰值进程 | 进程 CPU | 失败/超时 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-10-16 | `1e7c2ea8`（旧版） | macOS ARM64 / 10 | simulation / 8,192 | 134.85 | 80.525 / 81.394 ms | 60,750 ms | 16 | 5,561 ms | 0 / 0 |
+| 2026-10-16 | `2687c484` + 工作树修复（非最终步长） | macOS ARM64 / 10 | simulation / 8,192 | 104.36 | 80.531 / 81.220 ms | 78,497 ms | 14 | 5,563 ms | 0 / 0 |
+
+命令：`LUX_PROBE_BENCH_MODE=simulation LUX_PROBE_BENCH_FILE_COUNT=8192 LUX_PROBE_BENCH_DELAY_MS=75 cargo test --release --locked --test performance lux_561_probe_throughput_benchmark -- --ignored --nocapture --test-threads=1`（Cargo 输出目录为 Toshiba 共享 `target`）。此单轮模拟显示候选比旧版低约 22.6% 吞吐，不能作为性能达标证据，也不能外推真实 ffprobe 或 NAS/x86 性能。固定 tick 已修正候选持续负载中控制器未能评估的问题；随后把升档步长从 1/8 调到 1/4。按项目所有者要求没有重复基准；最终 1/4 版本及真实本地 ffprobe 的 A/B 尚无测量，LUX-561 的性能验收仍未完成。
 
 ## Web 首屏资源记录
 
@@ -1909,6 +1983,32 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 
 补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes` 通过 `lux-*` 人物路径覆盖 canonical index unchanged write；相同字节保留 inode，metadata 变化仍更新 NFO。`local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets` 覆盖改名目录和同一 canonical person 新增 identity；分别遗漏两个指纹字段时测试均能复现错误复用，恢复后通过。回归只验证写入结果，不提供系统调用耗时或生产性能数据。
 
+### LUX-550 Web 详情页渲染隔离（2026-10-16）
+
+环境：本机 macOS `arm64`，相同锁文件依赖。对照为干净快照 `8c8d5c13`，优化代码为 `5c5661ab`。详情入口从 1102 行拆为 80 行的组合层，其余逻辑按关注点移入子组件；没有改变 15 秒轮询策略。
+
+固定 Vitest 场景使用 100 个合成人物，初次渲染后对 playback query cache 连续写入五次不同收藏状态，统计展示组件调用增量：
+
+| 展示区域 | 对照额外渲染 | 优化后额外渲染 |
+| --- | ---: | ---: |
+| 演员 | 5 | 0 |
+| 剧照 | 5 | 0 |
+| NFO | 5 | 0 |
+
+收藏按钮实际状态仍随五次更新变化。其他回归确认剧集数据更新不会重算海报或更新无关区域，剧照变化不会重算海报，item 变化仍刷新标题/人物/NFO。拆分中间版本 `da70cd64` 曾产生父剧 4 个、剧集 2 个 observer，provider 共享后分别为 1 个；这是防止拆分引入重复订阅的回归，原始未拆分基线本就各为 1 个，不能将 4→1、2→1 当作相对原始基线的请求收益。
+
+相同 production build 的 JS 文件大小（Vite 十进制 kB；不含公共 vendor、CSS、图片和随后打开的编辑器）：
+
+| 产物 | 对照 | 优化后 | 对照 gzip | 优化后 gzip |
+| --- | ---: | ---: | ---: | ---: |
+| 应用入口 | 124.09 kB | 105.58 kB | 33.47 kB | 28.73 kB |
+| 详情路由 | 54.31 kB | 58.74 kB | 16.05 kB | 17.20 kB |
+| 两项合计 | 178.40 kB | 164.32 kB | 49.52 kB | 45.93 kB |
+
+详情路由自身增加了边界与 provider 代码。提取纯展示工具并移除媒体卡片对编辑器的静态依赖后，五个编辑器分别生成约 2.64–6.40 kB 的动态 JS chunk；入口与详情两项合计减少 14.08 kB。Playwright 对生产 bundle 的合成页面记录到初次进入详情请求编辑器数量为 0，首次打开五种编辑器时分别请求对应 chunk。关闭后组件卸载，chunk 会留在浏览器模块缓存中。
+
+复现使用 `web/tests/media-detail-performance.test.tsx`、`scripts/detail-browser-smoke.mjs` 和 `scripts/detail-editor-failure-smoke.mjs`；详情相关 Vitest 43/43、静态回归 35/35 与生产构建通过。完整 Web 检查仍有基线已复现的两项静态和四项 Vitest 失败，详见 `COMPATIBILITY.md`。这里测量的是组件调用、observer 数和构建产物体积，不是浏览器 FPS、主线程耗时、网络墙钟或生产 CPU 收益；未进行真实后端、移动设备、FNOS/NAS 或 x86 性能测量。
+
 ### LUX-CPU NAS 部署复测
 
 2026-10-08 在飞牛 NAS（Intel Core i9-12900H，16 CPU，`uname -m=x86_64`）部署提交 `5a542b36`。数据集为现有 PostgreSQL 媒体库（约 890,000 条 filesystem entry、367,000 条 media source；来自修复前 `EXPLAIN` 估算）。部署前 `docker stats --no-stream` 两次采样间隔 12 秒，PostgreSQL 分别占用 1439% 和 1469% CPU；`pg_stat_activity` 同时观察到 21 条相同的 `COUNT(DISTINCT media_sources...)` 全库计数查询，最长运行约 96 秒。
@@ -1916,3 +2016,230 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 新 amd64 镜像在 NAS 使用 `docker buildx bake --load --set app.platform=linux/amd64 ... app` 构建，revision 标签为 `5a542b36`；以 `docker compose up -d --no-deps lux` 替换 Lux，PostgreSQL 未重建。容器内 `/health/live`、`/health/ready`，主机映射端口 readiness 和公网 readiness 均成功；ready 报告 `databaseWritable=true`、`schemaVersion=157`。重启后首个 12 秒窗口 PostgreSQL CPU 从 424% 降到 10.06%；再观察 45 秒后降至 1.32%，Lux 为 20.64%。此时活跃查询列表中不再有全库计数，最近 60 秒没有 metadata refresh 调度或 `.nfo`/`.tmp` 日志。
 
 这是目标 NAS 生产库上的短时前后观测，不是固定负载下的 A/B 或长期 p95 基准。重启后的首分钟仍有本地 metadata backfill 与缺少 `org.lux.tmdb` 插件的告警，因此 Lux CPU 数字包含启动后工作；没有据此声称所有扫描/刮削负载下 CPU 恒定。观察窗口内，原先持续占满 PostgreSQL 的重复全库计数停止，修复达到本次线上复测目标。
+
+### Web 首页懒加载与交互更新（refactoring plan 9–12）
+
+2026-10-16 在本机 `arm64` 工作区比较 `origin/test` 基线提交 `8c8d5c13` 与优化提交 `0ca53559`。两边均使用仓库锁定的 Web 依赖，并运行 `corepack pnpm@10 --dir web build`。Vite 入口 JS 从 124.09 kB（gzip 33.47 kB）降到 104.19 kB（gzip 28.67 kB），减少 19.90 kB（16.0%）及 gzip 4.80 kB（14.3%）。五个媒体卡编辑器现在各自进入按需 chunk；例如 metadata editor 为 3.90 kB、subtitle editor 为 4.98 kB、image editor 为 5.08 kB、identifier 为 6.40 kB、delete dialog 为 2.64 kB（均为 Vite 输出的未压缩大小）。
+
+这是一项相同本机、锁定依赖下的静态产物对比，不是运行时 LCP/INP、网络传输或用户交互时延测量；也不代表 NAS/x86 性能。浏览器中的真实触屏拖动与菜单点击尚未验证，因此这里不据此声称设备端体验验收完成。
+
+### LUX-555–560 Web 首页缓存与事件查询策略（2026-10-15）
+
+首页四区块保持独立加载，QueryClient 的库列表缓存直接提供旧库 ID，让最新资源与过期库列表刷新并发；新的库 ID 到达后切换 query key。首页 staleTime 为 30 秒，默认 QueryClient 60 秒配置不变。SSE 在线时首页/详情停止周期请求；断线或不支持 EventSource 时前台每 30 秒兜底，后台不轮询。首次失败且没有首页数据时仍由用户显式重试。
+
+本机 macOS arm64 / Chromium / 固定本地 HTTP+原生 SSE fixture，同一电影详情启用 item、images、playback 三个查询。基线来源固定为 `8c8d5c13` 的 Web 代码；初始加载与 SSE 初次同步完成后清零计数，无数据事件和导航：
+
+| 场景 | 观察窗口 | 详情周期 HTTP 请求 |
+| --- | --- | --- |
+| 基线，SSE 在线 | 65 秒 | 12（每个查询 4 次） |
+| 本次实现，SSE 在线 | 83 秒 | 0 |
+| 本次实现，SSE 断线 | 约 30 秒 | 3（每个查询 1 次） |
+
+浏览器还验证了首页进入已加载详情路由后立即返回不新增四区块请求，以及 SSE 失效更新详情、原生重连重新同步后 69 秒零周期请求。首次 SSE 握手不会再次失效已加载的详情缓存，因此初始 item/images/playback 各请求一次；只有断线重连才触发一次全量媒体展示同步。自动化真实 QueryClient/组件时钟回归覆盖在线 60 秒零周期、断线 30 秒刷新和重连后再停轮询；缓存回归覆盖 30 秒内/外回访及库 ID 变化。
+
+计数不包含初次读取、重连同步或真实业务事件引起的请求；事件驱动刷新仍会发起 HTTP。没有测量 Core Web Vitals、滚动帧率、生产库查询耗时或 FNOS/NAS CPU，不将本机 fixture 结果外推为生产收益。
+
+### SQLite Manifest 写事务初始观测（2026-10-16，LUX-561）
+
+源码行为基线为 `test` 提交 `1e7c2ea8`，本机 macOS `arm64`，60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）。第一次启用 SQLite 写锁探针的样本记录到 `transaction_begin` p95 96 µs、`transaction_commit` p95 61,853 µs、`transaction_total` p50/p95 260,617 / 326,562 µs，batch p50/p95 469 / 602 ms，127 条 DML。旧实现尚未记录 `transaction_body`，因此 `transaction_total` 不能区分事务内工作和 BEGIN 等待；`transaction_commit` 是单独的 COMMIT 耗时。锁探针每 100 ms 通过同一连接池执行空 `BEGIN IMMEDIATE`/`COMMIT`，自身会产生写竞争；其等待 p50/p95 为 90 / 253,306 µs。
+
+该轮与另一条共享 Toshiba `target` 的 Rust release 编译并行，样本只用于发现需要新增事务体计时，不作为稳定基线或收益比较。无探针初跑的 `transaction_total` p95 为 47,692 µs，但同样没有隔离编译负载，且探针开关改变了写竞争条件，故两者不可直接作 A/B。尚未取得无并发编译、可重复的无探针基线；没有据此判断事务锁持有时长、CPU 收益或 NAS/FNOS 表现。
+
+增加事务体观测后的同 fixture release 样本如下。两轮均启用会主动争用写锁的探针；首轮编译期间共享 target 有其他 Cargo 竞争。第二轮复用构建产物，60k 扫描 5.40 秒完成。
+
+| 样本 | BEGIN p95 | body p50 / p95 | COMMIT p50 / p95 | total p50 / p95 | DML / SQL | batch p50 / p95 | 探针等待 p95 | body outcome |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 67 µs | 169,479 / 199,544 µs | 39,511 / 56,269 µs | 211,908 / 243,481 µs | 127 / 372 | 393 / 446 ms | 232,899 µs | 9 success |
+| 2 | 46 µs | 156,997 / 188,235 µs | 39,974 / 45,379 µs | 201,188 / 233,658 µs | 127 / 370 | 355 / 400 ms | 223,689 µs | 9 success |
+
+两轮的 DML 均低于旧 `<209` 门槛。样本只证明阶段与结果进入报告、60k release gate 仍通过；由于探针自身制造写竞争，不能视作无探针基线，也不代表事务锁等待的纯粹测量。
+
+### SQLite Manifest 事务预算候选筛选（2026-10-16，LUX-564）
+
+在同一 `performance-benchmarks` release binary、本机 macOS `arm64`、60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）上筛选。各候选均使用 SQLite FULL synchronous 与固定连接池配置；scan/DML 样本关闭同池锁探针，候选值由 `LUX_PERF_DISCOVERY_TRANSACTION_FILES` 注入。512 smoke 另使用 1,000 文件单目录 fixture。`transaction_body` 只统计 Manifest storage 事务体，不包含 BEGIN/COMMIT；预算只约束 SQLite 完整写事务，streamed reader 仍单独保持 8,000 文件。
+
+60k 单轮筛选结果：
+
+| 事务预算 | 事务体 p95 | 首扫 | unchanged 重扫 | 目录 API p95 | foreground p95 | DML | `<209` |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+| 512 | 11.9 ms | 2,690 ms | 3,038 ms | 585 ms | 322 ms | 984 | 否 |
+| 1,024 | 23.4 ms | 2,405 ms | 2,127 ms | 531 ms | 288 ms | 504 | 否 |
+| 2,048 | 50.4 ms | 2,372 ms | 1,109 ms | 539 ms | 320 ms | 264 | 否 |
+| 4,000 | 108.6 ms | 2,426 ms | 1,361 ms | 544 ms | 295 ms | 189 | 是 |
+| 8,000 | 185.3 ms | 2,379 ms | 1,118 ms | 500 ms | 254 ms | 133 | 是 |
+
+512 单目录 smoke 通过：1,000 文件、两个正向提交片、事务体 p95 9.8 ms、DML 33。它确认小预算和超大目录路径可执行，但不是完整 60k 筛选的替代。
+
+各轮原始 release 报告与命令输出保存在本任务临时目录 `/tmp/lux564-sqlite-budget/`。
+
+对 4,000、2,048 和 8,000 进行三轮交错样本；另对 5,000 与 8,000 进行三轮交错扩展样本。下表给出逐轮中位数；扫描 CPU 使用进程用户态与系统态时间之和，WAL/RSS 为报告值。百分比以同组 8,000 中位数为基准：
+
+| 交错组 | 预算 | body p50 / p95 | 首扫 / CPU | batch p95 | unchanged 重扫 | 目录 API / foreground p95 | WAL / peak RSS | DML |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A/B | 8,000 | 156.7 / 198.4 ms | 2,279 / 2,919 ms | 331 ms | 1,101 ms | 662 / 437 ms | 20.69 / 298.3 MiB | 133 |
+| A/B | 4,000 | 81.8 / 104.5 ms | 2,326 / 2,896 ms | 331 ms | 1,383 ms（+25.6%） | 617 / 358 ms | 11.41 / 274.5 MiB | 189 |
+| A/B | 2,048 | 41.4 / 51.3 ms | 2,453 / 3,047 ms | 343 ms | 1,154 ms（+4.8%） | 633 / 438 ms | 7.19 / 265.5 MiB | 264 |
+| 5k extension | 8,000 | 166.0 / 198.6 ms | 2,324 / 2,926 ms | 329 ms | 1,124 ms | 683 / 435 ms | 20.69 / 301.7 MiB | 133 |
+| 5k extension | 5,000 | 69.7 / 131.5 ms | 2,337 / 2,940 ms | 332 ms | 1,258 ms（+11.9%） | 616 / 362 ms | 13.81 / 295.4 MiB | 189 |
+
+以下列出每轮首扫与重扫采样，预算 5,000 使用独立的三轮扩展组：
+
+| 交错组 | 预算 | 轮次 | body p95 | 首扫 | batch p95 | unchanged | 目录 API p95 | foreground p95 | DML |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| A/B | 8,000 | 1 | 203.8 ms | 2,279 ms | 331 ms | 1,084 ms | 433 ms | 272 ms | 133 |
+| A/B | 8,000 | 2 | 198.4 ms | 2,269 ms | 339 ms | 1,101 ms | 693 ms | 443 ms | 133 |
+| A/B | 8,000 | 3 | 190.2 ms | 2,314 ms | 318 ms | 1,121 ms | 662 ms | 437 ms | 133 |
+| A/B | 4,000 | 1 | 104.5 ms | 2,333 ms | 332 ms | 1,373 ms | 545 ms | 332 ms | 189 |
+| A/B | 4,000 | 2 | 103.7 ms | 2,295 ms | 331 ms | 1,462 ms | 617 ms | 358 ms | 189 |
+| A/B | 4,000 | 3 | 105.1 ms | 2,326 ms | 327 ms | 1,383 ms | 735 ms | 495 ms | 189 |
+| A/B | 2,048 | 1 | 51.3 ms | 2,453 ms | 353 ms | 1,154 ms | 633 ms | 372 ms | 264 |
+| A/B | 2,048 | 2 | 51.0 ms | 2,382 ms | 338 ms | 1,196 ms | 600 ms | 438 ms | 264 |
+| A/B | 2,048 | 3 | 57.5 ms | 2,539 ms | 343 ms | 1,093 ms | 724 ms | 489 ms | 264 |
+| 5k extension | 8,000 | 1 | 184.0 ms | 2,324 ms | 314 ms | 1,124 ms | 517 ms | 287 ms | 133 |
+| 5k extension | 8,000 | 2 | 200.8 ms | 2,324 ms | 337 ms | 1,145 ms | 692 ms | 435 ms | 133 |
+| 5k extension | 8,000 | 3 | 198.6 ms | 2,307 ms | 329 ms | 1,098 ms | 683 ms | 454 ms | 133 |
+| 5k extension | 5,000 | 1 | 176.2 ms | 2,435 ms | 403 ms | 1,270 ms | 611 ms | 348 ms | 189 |
+| 5k extension | 5,000 | 2 | 131.5 ms | 2,337 ms | 332 ms | 1,258 ms | 616 ms | 362 ms | 189 |
+| 5k extension | 5,000 | 3 | 126.2 ms | 2,310 ms | 329 ms | 1,251 ms | 710 ms | 475 ms | 189 |
+
+5,000 的首扫、CPU、batch 和前台指标相对基线变化较小，但 unchanged 重扫超过 5% 回退门。4,000 首扫约慢 2.1%，batch p95 持平，目录与 foreground API p95 分别改善约 6.8% 和 18.1%；WAL 少约 44.9%。它的写者竞争收益明显，但 unchanged 重扫约慢 25.6%。2,048 的重扫门通过，然而违反不可放宽的 DML `<209` 门。扩展单轮的 6,000 与 7,000 分别记录 unchanged 重扫 1,222 / 1,338 ms，也没有显示比 5,000 更有利的趋势。
+
+独立竞争实验使用第二个 SQLite pool，每 25 ms 通过 `BEGIN IMMEDIATE` 执行并提交一条 `scan_jobs.updated_at` progress update；每个样本成功提交约 27–39 次，无失败 outcome。DML 报告减去了该竞争器自己的 UPDATE，scan-only DML 不包含这部分工作。下表为三轮 p95 中位数：
+
+| 预算 | pool acquire p95 | BEGIN admission p95 | progress update 完整事务 p95 | DML |
+|---:|---:|---:|---:|---:|
+| 8,000 | 36 µs | 222.2 ms | 222.2 ms | 133 |
+| 5,000 | 43 µs | 157.2 ms | 157.2 ms | 189 |
+| 4,000 | 40 µs | 111.9 ms | 106.2 ms | 189 |
+| 2,048 | 49 µs | 69.7 ms | 69.9 ms | 264 |
+
+独立写者三轮原始 p95（顺序与上表 budget 对应）为：8,000 BEGIN / 完整事务 `222.2 / 222.2`、`220.0 / 220.0`、`228.1 / 228.2 ms`；4,000 为 `111.9 / 112.0`、`112.4 / 104.0`、`106.1 / 106.2 ms`；2,048 为 `72.1 / 69.9`、`69.7 / 49.5`、`63.4 / 70.4 ms`。5,000 扩展组中，8,000 为 `223.9 / 223.9`、`231.3 / 231.4`、`225.4 / 225.4 ms`；5,000 为 `161.0 / 161.1`、`157.2 / 157.2`、`131.1 / 131.2 ms`。每组数值分别为 BEGIN admission / 完整 progress update 事务 p95。
+
+4,000 的完整竞争写入 p95 比 8,000 低约 52.2%，但仍略高于期望的 100 ms；5,000 只降低约 30%。2,048 达到绝对时延目标，但 DML 超门。竞争写者只在首扫窗口运行，不代表生产服务的播放进度、metadata/probe 更新或取消请求；p99 未由当前采样器单独报告。
+
+以上首轮选择结论是在 SQLite `seen_filesystem_entries` 更新仍使用 2,900 行参数分片时得出的。随后定位到该 CAS 更新每行绑定 3 个值、语句另有 3 个固定绑定；SQLite 连接上限为 32,766，因此将该语句单独改为 `(32766 - 3) / 3 = 10,921` 行上限，PostgreSQL 继续使用原分片大小。SQL 仍使用原有 `matching` CTE 和 fingerprint CAS；没有采用曾测试后被拒绝的 `UPDATE FROM` 变体。新增存储回归覆盖 fingerprint 匹配、fingerprint 已变化和 missing 行，证明只有精确匹配的活动文件更新 generation，其余路径仍进入 seen-path ledger。
+
+在这个存储优化后的同一 release binary、相同 fixture 和无锁探针条件下，对 4,000 与 8,000 做五轮交错复测。下表为逐项中位数；百分比以 8,000 为基准：
+
+| 预算 | body p50 / p95 | 首扫 | batch p95 | unchanged 重扫 | 目录 API p95 | foreground p95 | CPU | WAL / peak RSS | DML / 正向提交片 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8,000 | 156.8 / 186.0 ms | 2,285 ms | 328 ms | 1,117 ms | 599 ms | 377 ms | 2,854 ms | 20.69 / 316.9 MiB | 133 / 8 |
+| 4,000 | 79.6 / 105.4 ms | 2,275 ms（-0.4%） | 321 ms（-2.1%） | 1,035 ms（-7.3%） | 602 ms（+0.5%） | 370 ms（-1.9%） | 2,873 ms（+0.7%） | 11.41 / 275.3 MiB | 189 / 15 |
+
+五轮交错 A/B 的逐轮扫描值如下，保留了首轮系统噪声样本；默认选择使用上表五轮中位数：
+
+| 预算 | 轮次 | body p50 / p95 | 首扫 | batch p95 | unchanged 重扫 | 目录 API p95 | foreground p95 | DML |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4,000 | 1 | 166.8 / 227.5 ms | 4,566 ms | 663 ms | 1,936 ms | 709 ms | 385 ms | 189 |
+| 8,000 | 1 | 164.1 / 363.4 ms | 2,930 ms | 585 ms | 1,093 ms | 531 ms | 307 ms | 133 |
+| 4,000 | 2 | 80.0 / 105.9 ms | 2,302 ms | 323 ms | 1,019 ms | 520 ms | 309 ms | 189 |
+| 8,000 | 2 | 156.8 / 183.2 ms | 2,285 ms | 328 ms | 1,150 ms | 599 ms | 395 ms | 133 |
+| 4,000 | 3 | 79.4 / 105.4 ms | 2,275 ms | 321 ms | 1,045 ms | 630 ms | 408 ms | 189 |
+| 8,000 | 3 | 163.5 / 186.0 ms | 2,243 ms | 308 ms | 1,107 ms | 666 ms | 427 ms | 133 |
+| 4,000 | 4 | 79.3 / 95.0 ms | 2,232 ms | 314 ms | 1,035 ms | 602 ms | 370 ms | 189 |
+| 8,000 | 4 | 150.0 / 237.1 ms | 2,418 ms | 384 ms | 1,146 ms | 610 ms | 377 ms | 133 |
+| 4,000 | 5 | 79.6 / 102.5 ms | 2,274 ms | 314 ms | 1,029 ms | 578 ms | 352 ms | 189 |
+| 8,000 | 5 | 147.8 / 186.0 ms | 2,205 ms | 312 ms | 1,117 ms | 592 ms | 354 ms | 133 |
+
+额外筛选 5,000、6,000、7,000：DML 均为 189；单轮 unchanged 重扫分别为 1,148、1,072、1,183 ms。7,000 超过当前 8,000 五轮中位数 5% 回退门。5,000 与 6,000 的扫描样本通过该门，但独立写者三轮实验显示二者没有达到至少 50% 的 p95 改善目标，因而不优于 4,000 的完整候选结果。
+
+独立写者组同样关闭同池锁探针，使用第二个 pool 每 25 ms 提交一次真实 `scan_jobs.updated_at` progress update；三轮每次均有 27–38 个完整事务样本且无错误。表中是各轮 p95 的中位数：
+
+| 预算 | pool acquire p95 | BEGIN admission p95 | progress update 完整事务 p95 | 相对 8,000 改善 |
+|---:|---:|---:|---:|---:|
+| 8,000 | 24 µs | 222.8 ms | 223.1 ms | 基线 |
+| 6,000 | 34 µs | 150.6 ms | 150.2 ms | 32.7% |
+| 5,000 | 39 µs | 124.1 ms | 126.4 ms | 43.3% |
+| 4,000 | 24 µs | 112.0 ms | 107.1 ms | 52.0% |
+
+存储优化后的独立竞争写者逐轮 BEGIN / 完整事务 p95（ms）为：4,000 `113.0 / 113.1`、`112.0 / 107.1`、`104.5 / 104.5`；5,000 `124.1 / 126.4`、`151.1 / 151.1`、`121.5 / 121.6`；6,000 `150.6 / 150.6`、`150.2 / 150.2`、`150.7 / 147.3`；8,000 `222.8 / 223.1`、`222.2 / 222.2`、`224.3 / 224.4`。每轮样本约 27–38，错误数均为 0。
+
+事务参数优化后的 5,000、6,000、7,000 一轮筛选值如下；它们用于淘汰候选，不替代对 4,000/8,000 的五轮 A/B：
+
+| 预算 | 首扫 | batch p95 | unchanged 重扫 | 目录 API p95 | foreground p95 | DML |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5,000 | 2,859 ms | 410 ms | 1,148 ms | 538 ms | 309 ms | 189 |
+| 6,000 | 2,409 ms | 413 ms | 1,072 ms | 524 ms | 303 ms | 189 |
+| 7,000 | 2,202 ms | 315 ms | 1,183 ms | 568 ms | 333 ms | 189 |
+
+因此将 SQLite 完整写事务默认预算固定为 4,000，streamed reader 仍独立保持 8,000，PostgreSQL 默认路径不变。4,000 满足首扫、unchanged 重扫、前台 API、batch 尾延迟与 `<209 DML` 门，并把竞争写者 p95 降低 52.0%；完整竞争写入 p95 为 107.1 ms，略高于 100 ms 的期望目标。当前写者采样器报告 p50/p95；每轮样本量仅约 27–38，不据此声称 p99/max 达标。结果来自本机 ARM64 fixture，不外推 FNOS/NAS 或 x86_64。此前失败的 all-targets 基线用例与 PostgreSQL gate 状态见 `docs/LUX-DEVELOPMENT.md` 的 LUX-564 记录。
+
+### LUX-561 Manifest 反连接分页 SQLx 基线（2026-10-16）
+
+本地 macOS `arm64`、SQLx 0.9、实际 SQLite 3.51.3。忽略测试使用两个 root，每 root 合成 60,000 个 live FILE；目标 Manifest 只包含 `root-a`，generation 全部旧于本轮，单目录路径按字典序排列，页大小 500。完整 SQLite migrations 执行后运行 `ANALYZE`。测试 target：
+
+```bash
+CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target \
+  cargo test --locked --lib storage::repository::jobs::tests::manifest_diff_antijoin_benchmark -- --ignored --nocapture
+```
+
+三轮 SQLx 查询基线：
+
+| 路径 | 三轮耗时 | 中位数 | query-wrapper 调用数 | 工作内容 |
+|---|---:|---:|---:|---|
+| format 3 LITE generation 候选 | 3965 / 3887 / 3908 ms | 3908 ms | 121 | 120 个 500 项页及末尾空页；按 (root, path) tuple 游标 |
+| PERSISTED 目录候选 | 11279 / 18450 / 16241 ms | 16241 ms | 1561 | 候选页从头重新查询；每页另执行 delta 基线核验和写入 chunk |
+
+SQLx 实际 EXPLAIN QUERY PLAN 中，两条查询的 seen/delta 子查询均通过完整键索引查找；filesystem 外层选择 (library_root_id, id) WHERE entry_kind='FILE' AND is_missing=0 回填索引并按 root 扫描候选，随后用临时 B-tree 排序。tuple cursor 未转为 path 范围。PERSISTED 目录查询同样按 root 扫描并临时排序，且每页从头枚举。Manifest、job 的 SCAN 是本 fixture 各只有一行的小表，不是 filesystem 全表扫描。
+
+PERSISTED 的三轮方差较大，且耗时包括 delta 核验/写入，并不等同单条查询执行时间。wrapper 调用数包括同一批次内的辅助 SQL，不代表网络往返次数；SQLite 测试数据库位于临时目录。目录候选查询与 LITE 查询的 WHERE 子句和覆盖范围不同，不能单独从两个表格耗时推出查询变慢。后续 A/B 会保持同一 fixture 和工作量，并分别统计候选读取与 delta 阶段耗时。
+
+同一 SQLx fixture 上另外交错执行旧 COUNT 与新的 `CASE WHEN EXISTS` 完成检查各三轮，验证返回值为候选数/存在标志一致。root-a 有 60k 条 FILE；首部场景全部 60k 条符合候选条件，末尾场景仅最后一个 id 符合，无候选场景则全部标记为当前 generation。原始耗时（ms）与中位数：
+
+| 候选分布 | COUNT 三轮 / 中位数 | EXISTS 三轮 / 中位数 |
+|---|---:|---:|
+| 全部符合，首项已有候选 | 86.09 / 66.61 / 142.84；86.09 | 3.47 / 0.91 / 0.70；0.91 |
+| 唯一候选在最后一个 id | 37.23 / 26.87 / 30.11；30.11 | 19.36 / 22.90 / 11.51；19.36 |
+| 无候选 | 34.23 / 32.12 / 41.90；34.23 | 32.96 / 40.38 / 34.17；34.17 |
+
+这验证了 `(COUNT > 0)` 与 EXISTS 的真值一致。早期命中时 EXISTS 可短路；末尾命中收益较小，无候选时仍要检查整个 root，单轮差异落在样本波动范围内。测试直接用 SQLx 执行查询，没有包含 `finish_scan_manifest_diff` 的事务建立、后续计数和状态写入时间，也未覆盖 PostgreSQL。
+
+#### 固定 root keyset 候选查询
+
+保持相同的两个 root、每 root 60k FILE、page size 500 和旧 generation fixture，先在未改生产查询上保存三轮基线，再在固定 root/path keyset 查询上运行两组各三轮样本。样本为顺序运行而非同一轮交错；机器有其他 Cargo 构建活动，候选结果组间波动明显，因此同时保留原始组，不只报单个改善比例。
+
+| 查询 | 未改实现三轮 / 中位数 | 固定 root 组 1 三轮 / 中位数 | 固定 root 组 2 三轮 / 中位数 |
+|---|---:|---:|---:|
+| LITE 候选枚举 | 7,333 / 5,234 / 6,235；6,235 ms | 275 / 272 / 273；273 ms | 713 / 705 / 767；713 ms |
+| PERSISTED 候选枚举 + delta 写入 | 16,943 / 15,777 / 16,097；16,097 ms | 1,608 / 2,054 / 1,595；1,608 ms | 2,301 / 2,262 / 2,284；2,284 ms |
+
+第二组 PERSISTED 样本把阶段拆开：候选读取为 682 / 671 / 689 ms，delta 核验与写入为 1,514 / 1,485 / 1,490 ms。两版候选页调用数相同（121，含末尾空页）；PERSISTED 总 wrapper query calls 也同为 1,561，因为每个 delta 写批仍要做基线核验、INSERT 和计数更新。性能差异来自页读取访问范围，而不是减少 SQL 语句数。
+
+SQLx SQLite 3.51.3 的原计划按 root 使用 `idx_filesystem_entries_local_metadata_backfill (library_root_id, id)`，对 tuple cursor 临时排序；PERSISTED 目录页还从 root 开头重枚举。新计划改为 `SEARCH fe USING INDEX sqlite_autoindex_filesystem_entries_2 (library_root_id=? AND relative_path>?)`，seen/delta 继续使用完整复合键 covering index，root guard 使用 `idx_scan_manifest_roots_state`，未出现 filesystem 候选排序临时 B-tree。计划中的 manifest/job 小表 SCAN 每个仅一行。
+
+这些是本机合成 SQLx SQLite 数据，不是全量扫描/API 的结论；候选计时有明显组间波动。完整 LUX-270 fixture 的交错 A/B 已完成，结果如下。
+
+#### 完整 LUX-270 fixture 交错 A/B
+
+在同一 macOS ARM64 环境交错运行 8 轮基线与候选，使用固定 60k 文件/600 目录 fixture，比较完整首扫、无变化重扫与前台/catalog 请求。候选二进制编译时 B 实现仍在工作树中、尚未提交；其代码随后成为 `e70a487e`。二进制记录的 `commit` 字段因此仍显示 `a670c192`；本次只有后续参数对象整理，不改变 SQL 或调度语义。
+
+| 指标 | 基线 8 轮中位数 | 候选 8 轮中位数 | 变化 |
+|---|---:|---:|---:|
+| Manifest 首扫 | 2,383.5 ms | 2,406.5 ms | +0.96% |
+| 无变化重扫 | 1,167.5 ms | 1,185.5 ms | +1.54% |
+| 前台请求 p95 | 338 ms | 339 ms | +0.30% |
+| 冷 catalog 列表 p95 | 578 ms | 591.5 ms | +2.34% |
+| 热 catalog 列表 p95 | 431.5 ms | 423.5 ms | -1.85% |
+| batch p95 | 334.5 ms | 346 ms | +3.44% |
+
+每项以八个原始样本计算中位数。首扫/无变化重扫/前台请求/cold catalog/warm catalog/batch 的基线样本依次为：`[2416, 2337, 2351, 2243, 2231, 2449, 2450, 2429]` / `[1175, 1338, 1160, 1094, 1095, 1251, 1095, 1197]` / `[260, 343, 345, 271, 340, 321, 336, 347]` / `[518, 610, 596, 522, 569, 607, 538, 587]` / `[416, 452, 424, 404, 432, 431, 472, 449]` / `[359, 328, 326, 316, 315, 342, 379, 341]` ms；候选对应样本为 `[2478, 2564, 2387, 2227, 2427, 2426, 2295, 2384]` / `[1193, 1171, 1185, 1105, 1232, 1201, 1142, 1186]` / `[357, 312, 357, 278, 387, 294, 345, 333]` / `[602, 532, 611, 539, 671, 530, 593, 590]` / `[421, 424, 440, 366, 461, 408, 423, 480]` / `[399, 439, 351, 314, 337, 341, 358, 341]` ms。
+
+这组完整扫描没有观测到超过 5% 的中位数回退；候选枚举本身的合成 SQLite 查询 A/B 与 EXPLAIN 计划见上文。完整扫描 fixture 不包含删除项，删除候选访问路径的直接收益由固定 root SQLx fixture 单独衡量；因此不能把局部候选查询耗时降幅当作完整扫描加速或 CPU 降幅。
+
+以上仅为本机合成 SQLite 和 ARM64 结果，没有 PostgreSQL runtime、磁盘冷缓存、真实媒体目录、并发全量/增量流量、FNOS/NAS 或 x86 数据；不得据此表述生产 CPU 降幅。
+
+### PostgreSQL merged-into 部分索引 A/B
+
+2026-09-27 的 PostgreSQL 16.15 / 60,000 文件、600 目录固定 fixture A/B 评估了 `media_items.merged_into_item_id` 部分索引。三轮交错结果：首扫索引中位数由 5,788 ms 降至 5,229 ms（快约 9.7%）；`movie_item_insert` 由 1,817 ms 降至 1,538 ms（快约 15.3%）；无变化重扫、前台请求、目录列表和 batch p95 未观察到回退。fixture 的 60,600 条媒体记录在该列均为空，完整索引占 409,600 bytes，部分索引占 8,192 bytes。WAL 集群级 delta 中位数高约 2.8%，需继续观察。SQLite 不变。该实验的历史候选 migration 编号为 0150；当前 0150 已被 HOMEVIDEOS migration 占用，因此同一索引定义在本版通过 PostgreSQL migration 0182 应用。历史 A/B 数据不表示本次发布重跑了基准。
+
+### 缩略图重试领取与剧集合并层级更新
+
+2026-10-05 的固定 SQLite 回归中，205 条缩略图重试每轮上限仍为 100；领取 SQL 从一次读取加逐行 UPDATE 的 101 次降为一次读取加一个有界 `UPDATE ... RETURNING` 的 2 次。空队列仍只读取一次；返回顺序、重试时间与租约语义保持。
+
+同日的剧集合并 fixture 包含 20 个没有目标季度的源季度，层级更新 SQL 从逐季度处理的 28 次降至两个有界批次后的 9 次；另以 101 个季度和 101 个分集验证 100 ID 批次边界，调用数为 11。匹配季度的状态合并路径保持原样。两项计数仅代表固定 SQLite fixture 的 storage SQL 调用，不代表事务墙钟、PostgreSQL、NAS 或生产吞吐；本次发布未运行测试。
+
+### 扫描物化、来源读取与关机回收的历史 SQL 计数
+
+2026-10-05 的固定 SQLite 回归记录：205 个嵌套剧集目录的本地元数据来源读取从 208 次降至 4 次；205 个 Manifest 未解析文件首次物化为 12 次 SQL，已有父目录时再次物化为 6 次；252 个 Manifest 根目录初始化从逐根写入的 507 次降至有界批次的 9 次；205 个旧版扫描任务关机回收从 214 次降至 9 次。扫描层级行恢复使用每批最多 100 条 identity 映射的 CTE UPDATE。
+
+这些数字来自对应功能分支的固定 SQLite fixture 历史记录；本次把逻辑适配到当前实现后没有重跑测试或计数。它们不表示事务墙钟、PostgreSQL、NAS 或生产吞吐收益。全量扫描专用队列只串行化索引阶段，索引终结后释放队列，允许下一媒体库开始索引。

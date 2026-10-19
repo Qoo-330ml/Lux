@@ -459,6 +459,56 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_due_automatic_fill_missing_library_ids(
+        &self,
+        after_library_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let limit = limit.clamp(1, AUTOMATIC_FILL_MISSING_DISPATCH_PAGE_MAX);
+        let query = "SELECT DISTINCT jobs.library_id
+                     FROM metadata_reidentify_jobs jobs
+                     LEFT JOIN server_settings legacy_retry
+                       ON legacy_retry.key = 'metadata_fill_missing_legacy_retry_after'
+                     WHERE jobs.library_id IS NOT NULL
+                       AND jobs.mode = 'FILL_MISSING'
+                       AND jobs.dispatch_source = 'AUTOMATIC'
+                       AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
+                       AND jobs.cancel_requested = 0
+                       AND EXISTS (
+                           SELECT 1
+                           FROM metadata_reidentify_job_items items
+                           WHERE items.job_id = jobs.id
+                             AND items.status = 'FAILED'
+                             AND items.error = 'SCRAPER_UNAVAILABLE'
+                             AND items.automatic_retry_consumed = 0
+                             AND items.request_fingerprint IS NOT NULL
+                             AND COALESCE(
+                                 items.automatic_retry_after,
+                                 CASE WHEN items.automatic_retry_count = 0
+                                      THEN CAST(legacy_retry.value AS BIGINT)
+                                      ELSE NULL END
+                             ) <= unixepoch()
+                       )";
+        let rows = if let Some(after_library_id) = after_library_id {
+            let query = format!("{query} AND jobs.library_id > ? ORDER BY jobs.library_id LIMIT ?");
+            self.query_scalar(sqlx::AssertSqlSafe(query))
+                .bind(after_library_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            let query = format!("{query} ORDER BY jobs.library_id LIMIT ?");
+            self.query_scalar(sqlx::AssertSqlSafe(query))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+        };
+        rows.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn finish_metadata_reidentify_job(
         &self,
         job_id: &str,
@@ -619,6 +669,98 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    pub(crate) async fn list_shutdown_interrupted_metadata_reidentify_job_ids(
+        &self,
+        after_job_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT jobs.id
+             FROM metadata_reidentify_jobs jobs
+             WHERE jobs.status = 'CANCELLED'
+               AND jobs.error = 'SERVER_SHUTDOWN'
+               AND (? IS NULL OR jobs.id > ?)
+               AND EXISTS (
+                   SELECT 1 FROM metadata_reidentify_job_items items
+                   WHERE items.job_id = jobs.id
+                     AND (items.status IN ('PENDING', 'RUNNING')
+                          OR (items.status = 'FAILED' AND items.error = 'SERVER_SHUTDOWN'))
+               )
+             ORDER BY jobs.id LIMIT ?",
+        )
+        .bind(after_job_id)
+        .bind(after_job_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn resume_metadata_reidentify_job_after_shutdown(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_jobs
+                 SET status = 'QUEUED',
+                     processed_count = (
+                         SELECT COUNT(*) FROM metadata_reidentify_job_items
+                         WHERE job_id = ? AND status = 'COMPLETED'
+                     ),
+                     cancel_requested = 0, error = NULL, started_at = NULL,
+                     finished_at = NULL, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'CANCELLED' AND error = 'SERVER_SHUTDOWN'
+                   AND EXISTS (
+                       SELECT 1 FROM metadata_reidentify_job_items
+                       WHERE job_id = metadata_reidentify_jobs.id
+                         AND (status IN ('PENDING', 'RUNNING')
+                              OR (status = 'FAILED' AND error = 'SERVER_SHUTDOWN'))
+                   )",
+            )
+            .bind(job_id)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if result.rows_affected() == 1 {
+            self.query(
+                "UPDATE metadata_reidentify_job_items
+                 SET status = 'PENDING', candidate_count = 0, error = NULL,
+                     automatic_retry_after = NULL, automatic_retry_consumed = 0,
+                     claimed_request_fingerprint = NULL,
+                     claimed_request_capabilities_json = '[]', updated_at = unixepoch()
+                 WHERE job_id = ? AND (
+                     status IN ('PENDING', 'RUNNING')
+                     OR (status = 'FAILED' AND error = 'SERVER_SHUTDOWN')
+                 )",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn list_metadata_reidentify_items(
         &self,
         job_id: &str,
@@ -654,6 +796,26 @@ impl Database {
             "SELECT CASE WHEN EXISTS(
                  SELECT 1 FROM metadata_reidentify_job_items
                  WHERE job_id = ? AND status = 'FAILED'
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn metadata_reidentify_job_has_completed_items(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND status = 'COMPLETED'
              ) THEN 1 ELSE 0 END",
         )
         .bind(job_id)
@@ -702,31 +864,6 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    /// Libraries whose most recent FILL_MISSING job was cancelled by a
-    /// shutdown or restart, so their scraping stopped before finishing.
-    pub(crate) async fn list_libraries_with_interrupted_fill_missing_job(
-        &self,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query_scalar(
-            "SELECT library_id FROM (
-                 SELECT library_id, status, error,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY library_id ORDER BY created_at DESC, id DESC
-                        ) AS recency
-                 FROM metadata_reidentify_jobs
-                 WHERE mode = 'FILL_MISSING' AND library_id IS NOT NULL
-             ) latest
-             WHERE recency = 1 AND status = 'CANCELLED' AND error = 'SERVER_SHUTDOWN'
-             ORDER BY library_id LIMIT 1000",
-        )
-        .fetch_all(&self.pool)
-        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

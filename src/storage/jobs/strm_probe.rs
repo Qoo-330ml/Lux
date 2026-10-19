@@ -5,6 +5,14 @@ impl Database {
         &self,
         job: NewStrmProbeJob<'_>,
     ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         self.query(
             "INSERT INTO strm_probe_jobs (
                 id, operation_id, library_id, status, concurrency,
@@ -24,13 +32,27 @@ impl Database {
         .bind(job.thumbnail_position_percent)
         .bind(job.target_scan_job_id)
         .bind(job.total_count)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        if job.total_count > 0 {
+            self.mark_strm_probe_sources_pending_in_transaction(
+                &mut transaction,
+                job.library_id,
+                job.target_scan_job_id,
+            )
+            .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn has_active_strm_probe_jobs(&self) -> Result<bool, StorageError> {
@@ -226,6 +248,45 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let cancelled_library_id: Option<String> = self
+            .query_scalar(
+                "SELECT library_id FROM strm_probe_jobs
+                 WHERE id = ? AND cancel_requested = 1
+                   AND status IN ('PENDING', 'RUNNING')",
+            )
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some(library_id) = cancelled_library_id {
+            self.query(
+                "UPDATE media_sources
+                 SET probe_status = 'NOT_CONFIGURED', probe_error = NULL,
+                     updated_at = unixepoch()
+                 WHERE source_kind = 'STRM_URL' AND probe_status = 'PENDING'
+                   AND item_id IN (
+                       SELECT id FROM media_items WHERE library_id = ?
+                   )",
+            )
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         self.query(
             "UPDATE strm_probe_jobs
              SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
@@ -236,12 +297,18 @@ impl Database {
         .bind(status)
         .bind(error)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 }

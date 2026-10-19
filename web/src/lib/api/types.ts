@@ -56,6 +56,11 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
+export type AccountProfile = LuxUser & {
+  email?: string | null;
+  emailVerifiedAt?: number | null;
+};
+
 export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED" | `PLUGIN:${string}`;
 
 export type LoginBackgroundItem = {
@@ -104,6 +109,7 @@ export type UserData = {
   isFavorite?: boolean;
   playCount?: number;
   positionTicks?: number;
+  lastPlayedAt?: number | null;
   /** @deprecated Older Web clients used this name; prefer positionTicks. */
   playbackPositionTicks?: number;
 };
@@ -530,6 +536,43 @@ export type AdminPluginConfigImageUpload = {
 export type AdminUser = LuxUser & {
   isDisabled: boolean;
   isAdmin: boolean;
+  email?: string | null;
+  emailVerifiedAt?: number | null;
+  deletedAt?: number | null;
+  deletionPurgeAt?: number | null;
+  createdAt?: number;
+  lastLoginAt?: number | null;
+  lastActivityAt?: number | null;
+  currentPlaybackCount?: number;
+  presetSource?: string | null;
+};
+
+export type AdminUserPlaybackPolicy = {
+  canPlay: boolean;
+  maxSimultaneousPlaybacks: number;
+  allowRemux: boolean;
+  allowAudioTranscode: boolean;
+  allowVideoTranscode: boolean;
+};
+
+export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
+export type AdminUserSortBy = "createdAt" | "lastLoginAt" | "lastActivityAt";
+export type AdminUserSortOrder = "asc" | "desc";
+
+export type AdminUserListQuery = {
+  page: number;
+  pageSize: number;
+  search?: string;
+  status: AdminUserListStatus;
+  sortBy: AdminUserSortBy;
+  sortOrder: AdminUserSortOrder;
+};
+
+export type AdminUserListResponse = {
+  users: AdminUser[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
 };
 
 export type AdminEmbyMigrationConnection = {
@@ -790,9 +833,12 @@ export type AdminJob = {
   cursor?: string | null;
   processedCount?: number;
   totalCount?: number | null;
+  processedMediaCount?: number | null;
   discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   error?: string | null;
+  hasPostprocessingIssues?: boolean;
+  canRetry?: boolean;
   createdAt?: string | number;
   startedAt?: string | number | null;
   finishedAt?: string | number | null;
@@ -825,6 +871,7 @@ export type AdminTaskActivity = {
   status: "PENDING" | "QUEUED" | "RUNNING" | string;
   processedCount?: number;
   totalCount?: number | null;
+  processedMediaCount?: number | null;
   discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   currentItem?: string | null;
@@ -1055,6 +1102,7 @@ export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
+  userDeletionGraceDays?: number;
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;

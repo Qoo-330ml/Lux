@@ -1,4 +1,7 @@
 use super::*;
+use crate::storage::sql_templates::{
+    manifest_delta_insert_template, manifest_delta_verify_template,
+};
 
 impl Database {
     pub(super) async fn insert_manifest_delta_rows_in_transaction(
@@ -10,12 +13,19 @@ impl Database {
         let mut batch_counts = [0_i64; 4];
         let mut batch_inserted_count = 0_usize;
         for chunk in deltas.chunks(SCAN_MANIFEST_DELTA_BATCH_SIZE) {
-            let tuple = "(?, ?, ?, ?, ?, ?, ?)";
-            let values = std::iter::repeat_n(tuple, chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let verify_query = format!(
-                "WITH incoming (
+            let mut verify = match manifest_delta_verify_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                chunk.len(),
+            ) {
+                Ok(sql) => self.query_scalar(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let tuple = "(?, ?, ?, ?, ?, ?, ?)";
+                    let values = std::iter::repeat_n(tuple, chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "WITH incoming (
                      id, library_root_id, relative_path, observation_sequence,
                      delta_kind, base_filesystem_entry_id, base_fingerprint
                  ) AS (VALUES {values})
@@ -43,8 +53,10 @@ impl Database {
                             AND incoming.base_fingerprint IS NULL)
                     )
                  LIMIT 1"
-            );
-            let mut verify = self.query_scalar(sqlx::AssertSqlSafe(verify_query));
+                    );
+                    self.query_scalar(sqlx::AssertSqlSafe(query))
+                }
+            };
             for delta in chunk {
                 verify = verify
                     .bind(delta.id)
@@ -69,18 +81,28 @@ impl Database {
                 ));
             }
 
-            let insert_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let insert_query = format!(
-                "INSERT INTO scan_manifest_deltas (
+            let mut insert = match manifest_delta_insert_template(
+                &self.filesystem_path_templates,
+                self.backend(),
+                chunk.len(),
+            ) {
+                Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                Err(_) => {
+                    let insert_values =
+                        std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                    let query = format!(
+                        "INSERT INTO scan_manifest_deltas (
                      id, manifest_id, library_root_id, relative_path,
                      observation_sequence, delta_kind, base_filesystem_entry_id, base_fingerprint
                  ) VALUES {insert_values}
                  ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING
                  RETURNING delta_kind"
-            );
-            let mut insert = self.query(sqlx::AssertSqlSafe(insert_query));
+                    );
+                    self.query(sqlx::AssertSqlSafe(query))
+                }
+            };
             for delta in chunk {
                 insert = insert
                     .bind(delta.id)

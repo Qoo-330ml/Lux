@@ -856,21 +856,20 @@ pub(super) async fn emby_visible_library_items(
     state: &AppState,
     principal: AccessPrincipal,
 ) -> Result<Vec<Value>, StatusCode> {
-    let Some(access) = state.access.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
     let Some(libraries) = state.libraries.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let accessible_library_ids = access
-        .accessible_library_ids(principal)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let (order_scope, collection_count) = emby_library_order_scope(state, principal).await?;
+    let accessible_library_ids = order_scope
+        .iter()
+        .filter(|library_id| library_id.as_str() != GLOBAL_COLLECTION_LIBRARY_ID)
+        .cloned()
+        .collect::<Vec<_>>();
     let views = libraries
         .list_libraries_for_user(
             &principal.user_id_string(),
             principal.is_admin,
-            &accessible_library_ids,
+            &order_scope,
         )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -896,17 +895,60 @@ pub(super) async fn emby_visible_library_items(
             child_count,
         ));
     }
+    if collection_count > 0 {
+        items.push(emby_global_collection_library_json(
+            &state.server_id,
+            collection_count,
+        ));
+    }
+    let order = libraries
+        .saved_library_order_for_user(
+            &principal.user_id_string(),
+            principal.is_admin,
+            &order_scope,
+        )
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let order_index = order
+        .into_iter()
+        .enumerate()
+        .map(|(index, library_id)| (library_id, index))
+        .collect::<HashMap<_, _>>();
+    items.sort_by_key(|item| {
+        item["Id"]
+            .as_str()
+            .map(emby_internal_id)
+            .and_then(|library_id| order_index.get(&library_id))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    Ok(items)
+}
+
+pub(super) async fn emby_library_order_scope(
+    state: &AppState,
+    principal: AccessPrincipal,
+) -> Result<(Vec<String>, i64), StatusCode> {
+    let access = state
+        .access
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut library_ids = access
+        .accessible_library_ids(principal)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let collections = catalog
         .list_global_collection_cards(principal, 0, 1)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     if collections.total > 0 {
-        items.push(emby_global_collection_library_json(
-            &state.server_id,
-            collections.total,
-        ));
+        library_ids.push(GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
     }
-    Ok(items)
+    Ok((library_ids, collections.total))
 }
 
 fn emby_global_collection_library_json(server_id: &str, child_count: i64) -> Value {
@@ -4624,6 +4666,7 @@ pub(super) fn emby_signed_direct_stream_url(
         user.is_admin,
         item_id,
         &source.id,
+        play_session_id,
         expires_at,
     )?;
     let mut url = emby_media_source_stream_url(item_id, source);

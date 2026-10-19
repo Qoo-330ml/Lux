@@ -354,8 +354,10 @@ impl Database {
                 MetadataAutoMatchPolicy::Enabled => true,
                 MetadataAutoMatchPolicy::Disabled => false,
                 MetadataAutoMatchPolicy::UseLibrarySetting => {
+                    // Full-scan positives and realtime increments share the single
+                    // visible "new/changed resources" switch.
                     self.query_scalar::<i64>(
-                        "SELECT scan_missing_metadata_auto_match_enabled
+                        "SELECT realtime_metadata_auto_match_enabled
                          FROM libraries WHERE id = ?",
                     )
                     .bind(library_id)
@@ -635,7 +637,7 @@ impl Database {
         Ok(commit)
     }
 
-    async fn build_metadata_fill_missing_requests(
+    pub(crate) async fn build_metadata_fill_missing_requests(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,

@@ -104,6 +104,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 
 PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_preload_libraries` 中加入 `pg_stat_statements` 并重启 PostgreSQL，再在 Lux 使用的数据库执行 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;`。Lux 只读取已启用的统计，不会修改 PostgreSQL 配置或创建 extension。统计累计值受 `pg_stat_statements_reset()` 影响，报告不返回原始 SQL。
 - `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`stats`（已启用媒体库中未移除的 `movieCount`、`seriesCount`，以及未禁用用户的 `userCount`）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。近期登录/播放活动来自配置目录文件日志；用户名称与媒体标题只从当前数据库记录补全，已删除目标显示为空。剧集目标额外返回可空的 `targetSeriesTitle`、`targetSeasonNumber` 和 `targetSeriesSeasonCount`，供管理台按剧名、（多季时）季号、集名展示。正在播放数据只返回安全的媒体/轨道摘要、可空的 `remoteIp` 客户端来源 IP，以及可空的 `remoteIpLocation`（`location`、`district`、`street`、`isp`）。归属地只读取进程内缓存；首次遇到公网 IP 时由后台异步查询 Hiofd，失败或未完成时为 `null`，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
+- `GET /api/v1/events`：已登录 Web 用户的同源 SSE 失效通知，无需 CSRF。首帧 `ready` 为 `{"version":1}`；`invalidate` 为 `{"scope":"home|item|library|favorites"}`，仅通知重新读取经过权限校验的 API，不携带媒体 ID、媒体库 ID、用户 ID 或业务数据。每 15 秒注释心跳；丢帧时发送 `home`，客户端应失效所有媒体展示缓存。管理员已提交修改和任务状态切换通知普通用户；高频任务进度不转发。客户端可使用可选 `itemId`/`libraryId` 收窄对应缓存，但当前服务端只发送 scope。事件连接正常时媒体页停止周期请求，断线后前台每 30 秒轮询；重连时全量失效媒体展示缓存。
 - `GET /api/v1/admin/events`：管理员 Web session 的 SSE 失效通知流，不要求 CSRF。响应为 `text/event-stream`、禁止缓存并关闭反向代理缓冲；首帧为 `event: ready` 与 `{"version":1}`，变更帧为 `event: invalidate` 与 `{"scope":"dashboard|jobs|libraries|plugins|users|metadata|settings|all"}`，每 15 秒发送注释心跳。广播丢帧时发送 `all`，客户端应重新读取所有管理员查询；流不传输业务数据或敏感信息。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计和近期活动事件，与 `/api/v1/admin/audit` 兼容；只读 `/config/logs/` 活动 JSONL 与保留归档，按创建时间和 ID 倒序分页，支持 `page`、`pageSize`。LUX-316 启动迁移完成后不再查询数据库日志表。
 - `GET /api/v1/admin/logs/export?from=YYYY-MM-DD&to=YYYY-MM-DD`：管理员按 UTC 日期导出持久化 JSON 日志；单日范围返回按时间拼接的原始 JSONL，多日范围返回包含每日文件的 ZIP。不传日期时默认最近 7 个 UTC 日，日期范围最多 31 天，可读取活动日文件及 `/config/logs/archive/` 中保留的分段。
@@ -200,6 +201,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，默认只返回电影和整剧，不返回季度或单集；结果执行媒体库 ACL。剧集季度/单集通过条目层级接口读取。
 - `GET /api/v1/home/carousel`：返回当前用户最多 7 条推荐轮播资源（`recommended`），执行媒体库 ACL。服务端只缓存这一组推荐数据，并按用户、权限与可见媒体库范围隔离；`home` 更新事件会使其失效。
 - `GET /api/v1/continue-watching?page=1&pageSize=10`：分页返回当前用户继续观看条目和准确总数，执行媒体库 ACL；`pageSize` 上限为 100。
+- Lux 媒体条目的 `userData.lastPlayedAt` 为当前用户最近播放该条目的 Unix 秒时间戳；未知或从未播放时为 `null`。该字段随首页、继续观看、媒体目录和详情中的 Lux 媒体条目返回，不改变 Emby 响应。
 - `GET /api/v1/home`：保留兼容响应，包含继续观看、推荐、可见媒体库和每库最新资源；所有内容执行媒体库 ACL，`recentlyAdded` 字段继续保留。Lux Web 首页改用轮播、继续观看、媒体库及每库条目的独立查询；此兼容接口只有推荐轮播使用服务端缓存，其余区块每次实时读取。
 - Catalog 聚合接口排队超过 2 秒时返回 503 和 `error.code=CATALOG_BUSY`，并附 `Retry-After: 2`。`/api/v1/home` 与 `/api/v1/home/carousel` 使用独立的有界 worker 池，避免搜索和目录请求占满轮播 worker；两类 Lux 请求超过排队上限时返回相同错误。Emby 兼容路由保留原来的空 503 响应形状并附相同重试提示。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看、收藏状态，以及该条目的活动播放状态（`state`、`isPaused`、`lastEventAt`）。

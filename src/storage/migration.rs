@@ -527,11 +527,11 @@ pub(super) async fn ensure_server_id(
     }
 
     let generated = Uuid::now_v7().to_string();
-    sqlx::query(sqlx::AssertSqlSafe(adapt_sql_for_backend(
+    sqlx::query(adapt_sql_for_backend(
         backend,
         "INSERT INTO lux_meta (key, value) VALUES ('server_id', ?)
          ON CONFLICT(key) DO NOTHING",
-    )))
+    ))
     .bind(generated)
     .execute(&mut *transaction)
     .await?;

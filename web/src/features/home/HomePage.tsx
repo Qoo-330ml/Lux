@@ -1,11 +1,11 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AnimatePresence, motion } from "framer-motion";
 import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
+import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, LuxUser, MediaItem } from "../../lib/api/types";
 import { readAccountSettings } from "../account/account-settings";
 import {
@@ -16,10 +16,15 @@ import {
   writeHomeCarouselCache,
 } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
+import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
+
+const EMPTY_LIBRARIES: Library[] = [];
+const EMPTY_MEDIA_ITEMS: MediaItem[] = [];
 
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
+  const sseState = useSseConnectionState();
   const accountSettings = useMemo(() => readAccountSettings(user.id), [user.id]);
   const cachedCarousel = useMemo(() => readHomeCarouselCache(user.id), [user.id]);
   const carousel = useQuery({
@@ -27,36 +32,36 @@ export function HomePage({ user }: { user: LuxUser }) {
     queryFn: ({ signal }) => api.homeCarousel(signal),
     initialData: cachedCarousel?.data,
     initialDataUpdatedAt: cachedCarousel?.savedAt,
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const librariesQuery = useQuery({
     queryKey: queryKeys.libraries,
     queryFn: ({ signal }) => api.homeLibraries(signal),
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const continueWatchingQuery = useQuery({
     queryKey: queryKeys.homeContinueWatching,
     queryFn: ({ signal }) => api.homeContinueWatching(signal),
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
-  const libraries = librariesQuery.data?.libraries ?? [];
-  const libraryIds = libraries.map((library) => library.id);
+  const libraries = librariesQuery.data?.libraries ?? EMPTY_LIBRARIES;
+  const libraryIds = useMemo(() => libraries.map((library) => library.id), [libraries]);
   const latestLibrariesQuery = useQuery({
     queryKey: queryKeys.homeLatestLibraries(libraryIds),
     queryFn: ({ signal }) => api.homeLibrariesLatest(libraryIds, signal),
     enabled: libraryIds.length > 0,
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
     refetchIntervalInBackground: false,
   });
   const latestItemsByLibraryId = useMemo(() => {
@@ -71,11 +76,11 @@ export function HomePage({ user }: { user: LuxUser }) {
     if (carousel.data) writeHomeCarouselCache(user.id, carousel.data);
   }, [carousel.data, user.id]);
 
-  const continueWatching = continueWatchingQuery.data?.items ?? [];
-  const slides = heroSlides({
-    recommended: carousel.data?.recommended ?? [],
+  const continueWatching = continueWatchingQuery.data?.items ?? EMPTY_MEDIA_ITEMS;
+  const slides = useMemo(() => heroSlides({
+    recommended: carousel.data?.recommended ?? EMPTY_MEDIA_ITEMS,
     continueWatching,
-  });
+  }), [carousel.data?.recommended, continueWatching]);
   const heroIsLoading = slides.length === 0 && (
     carousel.isPending || carousel.isFetching ||
     librariesQuery.isPending || librariesQuery.isFetching ||
@@ -104,7 +109,12 @@ export function HomePage({ user }: { user: LuxUser }) {
                   </div>
                 ) : null}
                 {librariesQuery.data && libraries.length ? libraries.map((library) => (
-                  <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />
+                  <LibraryCard
+                    key={library.id}
+                    library={library}
+                    coverItems={library.id === GLOBAL_COLLECTION_LIBRARY_ID ? latestItemsByLibraryId.get(library.id) : undefined}
+                    onPrefetch={() => void prefetchLibraryPage(queryClient, library)}
+                  />
                 )) : null}
                 {librariesQuery.data && !libraries.length ? <EmptyLibraries /> : null}
               </div>
@@ -140,8 +150,8 @@ export function HomePage({ user }: { user: LuxUser }) {
   );
 }
 
-export function homeRefetchInterval(data: unknown): number | false {
-  return data === undefined ? false : queryRefreshIntervals.mediaSurface;
+export function homeRefetchInterval(data: unknown, sseState: SseConnectionState = "disconnected"): number | false {
+  return data === undefined || sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
 }
 
 function HomeLatestRail({
@@ -180,14 +190,14 @@ function HomeLatestRail({
   return <MediaRail title={title} items={items ?? []} linkTo={`/libraries/${library.id}`} />;
 }
 
-function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
+const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
   items: MediaItem[];
   continueWatching: MediaItem[];
   isLoading: boolean;
   showEmptyState: boolean;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
-  const slideKey = items.map((item) => item.id).join("|");
+  const slideKey = useMemo(() => items.map((item) => item.id).join("|"), [items]);
 
   useEffect(() => setActiveIndex(0), [slideKey]);
 
@@ -219,13 +229,19 @@ function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
 
   return (
     <section className="lux-hero" aria-label="精选媒体轮播" aria-roledescription="carousel" aria-busy={isLoading}>
-      <AnimatePresence initial={false}>
-        {image ? <motion.img key={`backdrop-${item?.id}`} className="lux-hero-backdrop" src={image} alt="" decoding="async" fetchPriority="high" initial={{ opacity: 0, scale: 1.04 }} animate={{ opacity: 1, scale: 1.015 }} exit={{ opacity: 0 }} transition={{ duration: 0.55, ease: "easeOut" }} /> : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
-      </AnimatePresence>
+      {image ? (
+        <img
+          key={`backdrop-${item?.id}`}
+          className="lux-hero-backdrop lux-hero-backdrop-animated"
+          src={image}
+          alt=""
+          decoding="async"
+          fetchPriority="high"
+        />
+      ) : <div className="lux-hero-backdrop lux-hero-backdrop-empty" />}
       <div className="lux-hero-overlay" />
-      <AnimatePresence initial={false} mode="wait">
-        {item || showEmptyState ? (
-          <motion.div key={item?.id ?? "empty"} className="lux-hero-copy" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.38 }}>
+      {item || showEmptyState ? (
+          <div key={item?.id ?? "empty"} className="lux-hero-copy lux-hero-copy-animated" role="group" aria-roledescription="slide" aria-label={item ? `第 ${safeIndex + 1} 条精选，共 ${items.length} 条：${mediaTitle(item)}` : "Lux 精选内容"}>
             <h1 className={titleClassName}>
               {logo ? <img className="lux-hero-logo" src={logo} alt={item ? mediaTitle(item) : "Lux 精选内容"} decoding="async" /> : <span className="lux-hero-title-text">{title}</span>}
             </h1>
@@ -242,12 +258,11 @@ function HeroCarousel({ items, continueWatching, isLoading, showEmptyState }: {
               </div>
               {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
             </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+          </div>
+      ) : null}
     </section>
   );
-}
+});
 
 function heroPlaybackItem(item: MediaItem, continueWatching: MediaItem[]) {
   if (item.itemType === "SERIES") {

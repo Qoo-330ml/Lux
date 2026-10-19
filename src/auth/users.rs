@@ -1,7 +1,10 @@
 use crate::{
     auth::password::{PasswordError, PasswordService},
     domain::ids::UserId,
-    storage::{Database, StorageError, UpdateUser},
+    storage::{
+        AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser, StorageError,
+        StoredAdminUserListItem, UpdateUser, UserPlaybackPolicy,
+    },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +21,34 @@ pub struct UserRecord {
     pub can_download: bool,
     pub last_login_at: Option<i64>,
     pub last_activity_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminUserProfile {
+    pub user: UserRecord,
+    pub email: Option<String>,
+    pub email_verified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+    pub deletion_purge_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdminUserListEntry {
+    pub user: UserRecord,
+    pub email: Option<String>,
+    pub email_verified_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+    pub deletion_purge_at: Option<i64>,
+    pub created_at: i64,
+    pub current_playback_count: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdminUserPage {
+    pub entries: Vec<AdminUserListEntry>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total_count: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,20 +119,34 @@ impl UserStore {
         password: &str,
         is_admin: bool,
     ) -> Result<UserRecord, UserStoreError> {
+        self.create_user_with_email(username, display_name, password, is_admin, None)
+            .await
+    }
+
+    pub async fn create_user_with_email(
+        &self,
+        username: &str,
+        display_name: &str,
+        password: &str,
+        is_admin: bool,
+        email: Option<&str>,
+    ) -> Result<UserRecord, UserStoreError> {
         let username_normalized = normalize_username(username)?;
         let display_name = normalized_display_name(display_name, &username_normalized);
+        let email = email.map(normalize_email).transpose()?;
         let password_hash = self.passwords.hash_password(password)?;
         let id = UserId::new();
 
         self.database
-            .insert_user(
-                &id.to_string(),
-                &username_normalized,
-                &display_name,
-                &password_hash,
+            .insert_user_with_email(NewStoredUser {
+                id: &id.to_string(),
+                username_normalized: &username_normalized,
+                display_name: &display_name,
+                password_hash: &password_hash,
                 is_admin,
-                true,
-            )
+                has_password: true,
+                email: email.as_deref(),
+            })
             .await?;
 
         Ok(UserRecord {
@@ -179,12 +224,90 @@ impl UserStore {
             .collect()
     }
 
+    pub(crate) async fn list_admin_users(
+        &self,
+        status: AdminUserStatusFilter,
+        search: Option<&str>,
+        sort_by: AdminUserSortField,
+        descending: bool,
+        page: i64,
+        page_size: i64,
+    ) -> Result<AdminUserPage, UserStoreError> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let (stored, total_count) = self
+            .database
+            .query_admin_users(status, search, sort_by, descending, page_size, offset)
+            .await?;
+        let entries = stored
+            .into_iter()
+            .map(admin_user_list_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AdminUserPage {
+            entries,
+            page,
+            page_size,
+            total_count,
+        })
+    }
+
     pub async fn find_by_id(&self, user_id: &str) -> Result<Option<UserRecord>, UserStoreError> {
         self.database
             .find_user_by_id(user_id)
             .await?
             .map(user_record)
             .transpose()
+    }
+
+    pub async fn find_admin_profile_by_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AdminUserProfile>, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        self.database
+            .find_user_by_id(user_id)
+            .await?
+            .map(admin_user_profile)
+            .transpose()
+    }
+
+    pub(crate) async fn get_playback_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserPlaybackPolicy>, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        let Some(profile) = self.find_admin_profile_by_id(user_id).await? else {
+            return Ok(None);
+        };
+        if profile.deleted_at.is_some() {
+            return Ok(None);
+        }
+        self.database
+            .get_user_playback_policy(user_id)
+            .await
+            .map_err(UserStoreError::from)
+    }
+
+    pub(crate) async fn update_playback_policy(
+        &self,
+        user_id: &str,
+        policy: UserPlaybackPolicy,
+    ) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        if policy.max_simultaneous_playbacks < 0 {
+            return Err(UserStoreError::InvalidPlaybackPolicy);
+        }
+        self.database
+            .update_user_playback_policy(user_id, policy)
+            .await
+            .map_err(UserStoreError::from)
     }
 
     pub async fn find_by_username(
@@ -216,6 +339,17 @@ impl UserStore {
         user_id: &str,
         update: UserUpdate<'_>,
     ) -> Result<Option<UserRecord>, UserStoreError> {
+        Ok(self
+            .update_user_with_hls_session_ids(user_id, update)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    pub(crate) async fn update_user_with_hls_session_ids(
+        &self,
+        user_id: &str,
+        update: UserUpdate<'_>,
+    ) -> Result<Option<(UserRecord, Vec<String>)>, UserStoreError> {
         let password_hash = update
             .password
             .filter(|password| !password.is_empty())
@@ -223,7 +357,7 @@ impl UserStore {
             .transpose()?;
         let updated = match self
             .database
-            .update_user(
+            .update_user_with_hls_session_ids(
                 user_id,
                 UpdateUser {
                     display_name: update.display_name,
@@ -242,7 +376,35 @@ impl UserStore {
             Err(StorageError::LastManager) => return Err(UserStoreError::LastManager),
             Err(error) => return Err(UserStoreError::Storage(error)),
         };
-        updated.map(user_record).transpose()
+        updated
+            .map(|(user, session_ids)| user_record(user).map(|user| (user, session_ids)))
+            .transpose()
+    }
+
+    pub async fn update_profile(
+        &self,
+        user_id: &str,
+        display_name: Option<&str>,
+        email: Option<Option<&str>>,
+    ) -> Result<Option<AdminUserProfile>, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        let display_name = display_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let email = email
+            .map(|email| email.map(normalize_email).transpose())
+            .transpose()?;
+        self.database
+            .update_user_profile(
+                user_id,
+                display_name,
+                email.as_ref().map(|email| email.as_deref()),
+            )
+            .await?
+            .map(admin_user_profile)
+            .transpose()
     }
 
     pub async fn change_password(
@@ -291,6 +453,34 @@ impl UserStore {
             Err(StorageError::LastManager) => Err(UserStoreError::LastManager),
             Err(error) => Err(UserStoreError::Storage(error)),
         }
+    }
+
+    pub async fn soft_delete_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        match self.database.soft_delete_user(user_id).await {
+            Ok(deleted) => Ok(deleted),
+            Err(StorageError::LastManager) => Err(UserStoreError::LastManager),
+            Err(error) => Err(UserStoreError::Storage(error)),
+        }
+    }
+
+    pub async fn restore_deleted_user(&self, user_id: &str) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        Ok(self.database.restore_deleted_user(user_id).await?)
+    }
+
+    pub async fn purge_deleted_user(&self, user_id: &str) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        Ok(self.database.purge_deleted_user(user_id).await?)
     }
 
     pub async fn create_initial_admin(
@@ -437,9 +627,35 @@ fn normalized_display_name(display_name: &str, username_normalized: &str) -> Str
     }
 }
 
+fn normalize_email(email: &str) -> Result<String, UserStoreError> {
+    let email = email.trim().to_lowercase();
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err(UserStoreError::InvalidEmail);
+    };
+    if email.chars().count() > 254
+        || email.matches('@').count() != 1
+        || local.is_empty()
+        || local.chars().count() > 64
+        || domain.len() < 3
+        || !domain.contains('.')
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+        || email.chars().any(char::is_whitespace)
+    {
+        return Err(UserStoreError::InvalidEmail);
+    }
+    Ok(email)
+}
+
 #[derive(Debug)]
 pub enum UserStoreError {
     InvalidUsername,
+    InvalidEmail,
+    InvalidPlaybackPolicy,
     InvalidUserId(String),
     SetupAlreadyCompleted,
     Password(PasswordError),
@@ -463,6 +679,10 @@ impl std::fmt::Display for UserStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidUsername => formatter.write_str("username must be 1-128 characters"),
+            Self::InvalidEmail => formatter.write_str("email address is invalid"),
+            Self::InvalidPlaybackPolicy => {
+                formatter.write_str("simultaneous playback limit cannot be negative")
+            }
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::SetupAlreadyCompleted => {
                 formatter.write_str("initial setup has already completed")
@@ -482,6 +702,8 @@ impl std::error::Error for UserStoreError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::InvalidUsername
+            | Self::InvalidEmail
+            | Self::InvalidPlaybackPolicy
             | Self::InvalidUserId(_)
             | Self::SetupAlreadyCompleted
             | Self::LastManager => None,
@@ -517,5 +739,52 @@ fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, UserSto
         can_download: stored.can_download,
         last_login_at: stored.last_login_at,
         last_activity_at: stored.last_activity_at,
+    })
+}
+
+fn admin_user_list_entry(
+    stored: StoredAdminUserListItem,
+) -> Result<AdminUserListEntry, UserStoreError> {
+    let id = stored
+        .id
+        .parse()
+        .map_err(|error: uuid::Error| UserStoreError::InvalidUserId(error.to_string()))?;
+    Ok(AdminUserListEntry {
+        user: UserRecord {
+            id,
+            username_normalized: stored.username_normalized,
+            display_name: stored.display_name,
+            has_password: stored.has_password,
+            is_disabled: stored.is_disabled,
+            is_admin: stored.is_admin,
+            can_manage_server: stored.can_manage_server,
+            can_remote_access: stored.can_remote_access,
+            can_download: stored.can_download,
+            last_login_at: stored.last_login_at,
+            last_activity_at: stored.last_activity_at,
+        },
+        email: stored.email,
+        email_verified_at: stored.email_verified_at,
+        deleted_at: stored.deleted_at,
+        deletion_purge_at: stored.deletion_purge_at,
+        created_at: stored.created_at,
+        current_playback_count: stored.current_playback_count,
+    })
+}
+
+fn admin_user_profile(
+    stored: crate::storage::StoredUser,
+) -> Result<AdminUserProfile, UserStoreError> {
+    let email = stored.email.clone();
+    let email_verified_at = stored.email_verified_at;
+    let deleted_at = stored.deleted_at;
+    let deletion_purge_at = stored.deletion_purge_at;
+    let user = user_record(stored)?;
+    Ok(AdminUserProfile {
+        user,
+        email,
+        email_verified_at,
+        deleted_at,
+        deletion_purge_at,
     })
 }

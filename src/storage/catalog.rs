@@ -334,37 +334,48 @@ impl Database {
                 source,
             })?;
         let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let item_id: String = row.get("item_id");
-            let updated = self
-                .query(
-                    "UPDATE thumbnail_scraper_retries
-                     SET status = 'RUNNING', claimed_until = ?, updated_at = ?
-                     WHERE item_id = ? AND (
-                         (status = 'PENDING' AND next_retry_at <= ?)
-                         OR (status = 'RUNNING' AND claimed_until <= ?)
-                     )",
-                )
-                .bind(claimed_until)
+        if !rows.is_empty() {
+            let placeholders = std::iter::repeat_n("?", rows.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut update = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE thumbnail_scraper_retries
+                 SET status = 'RUNNING', claimed_until = ?, updated_at = ?
+                 WHERE item_id IN ({placeholders}) AND (
+                     (status = 'PENDING' AND next_retry_at <= ?)
+                     OR (status = 'RUNNING' AND claimed_until <= ?)
+                 )
+                 RETURNING item_id"
+            )));
+            update = update.bind(claimed_until).bind(now);
+            for row in &rows {
+                update = update.bind(row.get::<String, _>("item_id"));
+            }
+            let claimed_ids = update
                 .bind(now)
-                .bind(&item_id)
                 .bind(now)
-                .bind(now)
-                .execute(&mut *transaction)
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
-                })?;
-            if updated.rows_affected() == 1 {
-                claimed.push(StoredThumbnailScraperRetry {
-                    item_id,
-                    status: "RUNNING".to_owned(),
-                    attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
-                        .unwrap_or(u32::MAX),
-                    first_attempt_at: row.get("first_attempt_at"),
-                    next_retry_at: row.get("next_retry_at"),
-                });
+                })?
+                .into_iter()
+                .map(|row| row.get::<String, _>("item_id"))
+                .collect::<std::collections::HashSet<_>>();
+            // RETURNING has no ordering guarantee; retain the original due-time order.
+            for row in rows {
+                let item_id: String = row.get("item_id");
+                if claimed_ids.contains(&item_id) {
+                    claimed.push(StoredThumbnailScraperRetry {
+                        item_id,
+                        status: "RUNNING".to_owned(),
+                        attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
+                            .unwrap_or(u32::MAX),
+                        first_attempt_at: row.get("first_attempt_at"),
+                        next_retry_at: row.get("next_retry_at"),
+                    });
+                }
             }
         }
         transaction
@@ -919,7 +930,8 @@ impl Database {
         let fts_query = format!(
             "SELECT mi.id FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN libraries l ON l.id = mi.library_id
+                               AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE media_search MATCH ? AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
@@ -950,7 +962,8 @@ impl Database {
 
         let like_query_sql = format!(
             "SELECT mi.id FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN libraries l ON l.id = mi.library_id
+                               AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
@@ -1029,7 +1042,8 @@ impl Database {
         let like_query_sql = format!(
             "SELECT mi.id FROM media_search ms
              JOIN media_items mi ON mi.id = ms.item_id
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN libraries l ON l.id = mi.library_id
+                               AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
                     OR ms.aliases ILIKE ? ESCAPE '\\')
                AND mi.removed_at IS NULL
@@ -1709,6 +1723,25 @@ impl Database {
         query: &ResumeItemsQuery<'_>,
         latest_episode_per_series: bool,
     ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        self.list_resume_items_with_next_episode(query, latest_episode_per_series, false)
+            .await
+    }
+
+    pub(crate) async fn list_home_resume_items_with_total(
+        &self,
+        query: &ResumeItemsQuery<'_>,
+        latest_episode_per_series: bool,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        self.list_resume_items_with_next_episode(query, latest_episode_per_series, true)
+            .await
+    }
+
+    async fn list_resume_items_with_next_episode(
+        &self,
+        query: &ResumeItemsQuery<'_>,
+        latest_episode_per_series: bool,
+        include_next_unplayed_episode: bool,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
         if query.library_ids.is_empty() || query.item_types.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -1720,6 +1753,11 @@ impl Database {
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
+        let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
+            include_next_unplayed_episode,
+            &library_placeholders,
+            resume_rank,
+        );
         let statement_sql = format!(
             "WITH candidates AS (
                  SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
@@ -1738,12 +1776,7 @@ impl Database {
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
-             ),
-             ranked AS (
-                 SELECT id, sort_title, last_played_at,
-                        {resume_rank} AS resume_rank
-                 FROM eligible
-             ),
+             ){next_episode_ctes}{ranking_ctes},
              qualified AS (
                  SELECT id, sort_title, last_played_at,
                         COUNT(*) OVER () AS resume_total
@@ -1807,6 +1840,22 @@ impl Database {
                 .map(|value| CatalogBind::Text(value)),
         );
         binds.push(CatalogBind::Integer(query.played_percent));
+        if include_next_unplayed_episode {
+            binds.push(CatalogBind::Text(query.user_id));
+            binds.extend(
+                query
+                    .library_ids
+                    .iter()
+                    .map(|value| CatalogBind::Text(value)),
+            );
+            binds.push(CatalogBind::Text(query.user_id));
+            binds.extend(
+                query
+                    .library_ids
+                    .iter()
+                    .map(|value| CatalogBind::Text(value)),
+            );
+        }
         binds.push(CatalogBind::Integer(query.limit));
         binds.push(CatalogBind::Integer(query.offset));
         let (rows, total) = self
@@ -1815,12 +1864,9 @@ impl Database {
         if rows.is_empty() && (query.offset > 0 || query.limit <= 0) {
             let total = self
                 .count_resume_items(
-                    query.user_id,
-                    query.library_ids,
-                    query.item_types,
-                    query.played_percent,
-                    query.minimum_ticks,
+                    query,
                     latest_episode_per_series,
+                    include_next_unplayed_episode,
                 )
                 .await?;
             return Ok((rows, total));
@@ -1830,24 +1876,26 @@ impl Database {
 
     pub(crate) async fn count_resume_items(
         &self,
-        user_id: &str,
-        library_ids: &[String],
-        item_types: &[&str],
-        played_percent: i64,
-        minimum_ticks: i64,
+        query: &ResumeItemsQuery<'_>,
         latest_episode_per_series: bool,
+        include_next_unplayed_episode: bool,
     ) -> Result<i64, StorageError> {
-        if library_ids.is_empty() || item_types.is_empty() {
+        if query.library_ids.is_empty() || query.item_types.is_empty() {
             return Ok(0);
         }
-        let item_type_placeholders = std::iter::repeat_n("?", item_types.len())
+        let item_type_placeholders = std::iter::repeat_n("?", query.item_types.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let library_placeholders = std::iter::repeat_n("?", library_ids.len())
+        let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
+        let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
+            include_next_unplayed_episode,
+            &library_placeholders,
+            resume_rank,
+        );
         let statement_sql = format!(
             "WITH candidates AS (
                  SELECT mi.id, mi.item_type, mi.series_id,
@@ -1866,31 +1914,138 @@ impl Database {
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
-             ),
-             ranked AS (
-                 SELECT {resume_rank} AS resume_rank
-                 FROM eligible
-             )
+             ){next_episode_ctes}{ranking_ctes}
              SELECT COUNT(*) FROM ranked WHERE resume_rank = 1"
         );
         let mut statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(statement_sql))
-            .bind(user_id);
-        for item_type in item_types {
+            .bind(query.user_id);
+        for item_type in query.item_types {
             statement = statement.bind(*item_type);
         }
-        statement = statement.bind(minimum_ticks);
-        for library_id in library_ids {
+        statement = statement.bind(query.minimum_ticks);
+        for library_id in query.library_ids {
             statement = statement.bind(library_id);
         }
+        statement = statement.bind(query.played_percent);
+        if include_next_unplayed_episode {
+            statement = statement.bind(query.user_id);
+            for library_id in query.library_ids {
+                statement = statement.bind(library_id);
+            }
+            statement = statement.bind(query.user_id);
+            for library_id in query.library_ids {
+                statement = statement.bind(library_id);
+            }
+        }
         statement
-            .bind(played_percent)
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    fn resume_next_episode_query_parts(
+        include_next_unplayed_episode: bool,
+        library_placeholders: &str,
+        resume_rank: &str,
+    ) -> (String, String) {
+        if !include_next_unplayed_episode {
+            return (
+                String::new(),
+                format!(
+                    ", ranked AS (
+                         SELECT id, sort_title, last_played_at,
+                                {resume_rank} AS resume_rank
+                         FROM eligible
+                     )"
+                ),
+            );
+        }
+
+        let next_episode_ctes = format!(
+            ", completed_episodes_ranked AS (
+                 SELECT mi.series_id, mi.season_number, mi.episode_number,
+                        us.last_played_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mi.series_id
+                            ORDER BY us.last_played_at DESC NULLS LAST,
+                                     mi.season_number DESC NULLS LAST,
+                                     mi.episode_number DESC NULLS LAST,
+                                     mi.id DESC
+                        ) AS played_rank
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type = 'EPISODE' AND mi.series_id IS NOT NULL
+                   AND mi.season_number IS NOT NULL AND mi.episode_number IS NOT NULL
+                   AND mi.removed_at IS NULL AND mi.library_id IN ({library_placeholders})
+                   AND us.is_played = 1{CATALOG_VISIBLE_PREDICATE}
+             ),
+             latest_completed_episode AS (
+                 SELECT series_id, season_number, episode_number, last_played_at
+                 FROM completed_episodes_ranked
+                 WHERE played_rank = 1
+             ),
+             next_episodes_ranked AS (
+                 SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
+                        mi.episode_number, mi.sort_title,
+                        COALESCE(us.last_played_at, completed.last_played_at) AS last_played_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mi.series_id
+                            ORDER BY mi.season_number ASC, mi.episode_number ASC,
+                                     mi.sort_title, mi.id
+                        ) AS next_rank
+                 FROM latest_completed_episode completed
+                 JOIN media_items mi
+                   ON mi.series_id = completed.series_id
+                  AND (mi.season_number > completed.season_number
+                    OR (mi.season_number = completed.season_number
+                        AND mi.episode_number > completed.episode_number))
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type = 'EPISODE'
+                   AND mi.season_number IS NOT NULL AND mi.episode_number IS NOT NULL
+                   AND mi.has_available_source = 1 AND mi.removed_at IS NULL
+                   AND mi.library_id IN ({library_placeholders})
+                   AND COALESCE(us.is_played, 0) = 0
+                   AND COALESCE(us.hide_from_resume, 0) = 0{CATALOG_VISIBLE_PREDICATE}
+             ),
+             next_episode AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at
+                 FROM next_episodes_ranked
+                 WHERE next_rank = 1
+             )"
+        );
+        let ranking_ctes = format!(
+            ", combined AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at, 0 AS candidate_priority
+                 FROM eligible
+                 UNION ALL
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at, 1 AS candidate_priority
+                 FROM next_episode
+             ),
+             deduplicated AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY id ORDER BY candidate_priority
+                        ) AS candidate_rank
+                 FROM combined
+             ),
+             ranked AS (
+                 SELECT id, sort_title, last_played_at,
+                        {resume_rank} AS resume_rank
+                 FROM deduplicated
+                 WHERE candidate_rank = 1
+             )"
+        );
+        (next_episode_ctes, ranking_ctes)
     }
 
     fn resume_rank_expression(latest_episode_per_series: bool) -> &'static str {
@@ -2716,7 +2871,8 @@ impl Database {
                 id, item_id, source_kind, filesystem_entry_id,
                 edition_name, quality_label, container, size,
                 external_url, strm_target_kind, is_default, probe_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
         )
         .bind(source.id)
         .bind(source.item_id)
@@ -2729,6 +2885,7 @@ impl Database {
         .bind(source.external_url)
         .bind(source.strm_target_kind)
         .bind(database_flag(source.is_default))
+        .bind(source.source_kind)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -4835,7 +4992,7 @@ impl Database {
             self.query(
                 "UPDATE media_sources
                  SET container = NULL, size = NULL, duration_ticks = NULL, bitrate = NULL,
-                     probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                     probe_status = 'NOT_CONFIGURED', probe_error = NULL, updated_at = unixepoch()
                  WHERE id = ? AND source_kind = 'STRM_URL'",
             )
             .bind(source_id)
@@ -5119,7 +5276,8 @@ impl Database {
         };
         let query_with_fingerprint = format!(
             "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
-                    fe.fingerprint, ms.duration_ticks,
+                    fe.fingerprint, fe.relative_path, fe.size, fe.modified_at,
+                    fe.device, fe.inode, ms.duration_ticks,
                     episode.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
                     episode.season_number, episode.episode_number,
@@ -5155,7 +5313,8 @@ impl Database {
         );
         let query_without_fingerprint = format!(
             "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
-                    fe.fingerprint, ms.duration_ticks,
+                    fe.fingerprint, fe.relative_path, fe.size, fe.modified_at,
+                    fe.device, fe.inode, ms.duration_ticks,
                     episode.provider_ids_json,
                     series.provider_ids_json AS series_provider_ids_json,
                     episode.season_number, episode.episode_number,
@@ -5229,6 +5388,11 @@ impl Database {
                     item_id: row.get("item_id"),
                     season_id: row.get("season_id"),
                     fingerprint: row.get("fingerprint"),
+                    relative_path: row.get("relative_path"),
+                    size: row.get("size"),
+                    modified_at: row.get("modified_at"),
+                    device: row.get("device"),
+                    inode: row.get("inode"),
                     duration_ticks: row.get("duration_ticks"),
                     provider_ids_json: row.get("provider_ids_json"),
                     series_provider_ids_json: row.get("series_provider_ids_json"),
@@ -5253,28 +5417,57 @@ impl Database {
         &self,
         job: NewChapterDetectionJob<'_>,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "INSERT INTO chapter_detection_jobs (
-                id, library_id, plugin_id, status, concurrency,
-                intro_window_seconds, credits_window_seconds, match_threshold, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(job.id)
-        .bind(job.library_id)
-        .bind(job.plugin_id)
-        .bind(job.concurrency)
-        .bind(job.intro_window_seconds)
-        .bind(job.credits_window_seconds)
-        .bind(job.match_threshold)
-        .bind(job.total_count)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if !self
+            .lock_scan_fingerprint_migration_state(&mut transaction, job.library_id)
+            .await?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        let result = self
+            .query(
+                "INSERT INTO chapter_detection_jobs (
+                    id, library_id, plugin_id, status, concurrency,
+                    intro_window_seconds, credits_window_seconds, match_threshold, total_count
+                 ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(job.id)
+            .bind(job.library_id)
+            .bind(job.plugin_id)
+            .bind(job.concurrency)
+            .bind(job.intro_window_seconds)
+            .bind(job.credits_window_seconds)
+            .bind(job.match_threshold)
+            .bind(job.total_count)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn insert_chapter_detection_job_items(
@@ -5957,6 +6150,71 @@ impl Database {
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_media_probe_ready(&self, source_id: &str) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE media_sources
+             SET probe_status = 'READY', probe_error = NULL, updated_at = unixepoch()
+             WHERE id = ? AND source_kind = 'STRM_URL' AND probe_status = 'PENDING'",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_strm_probe_sources_pending_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        library_id: &str,
+        target_scan_job_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let result = if let Some(scan_job_id) = target_scan_job_id {
+            let query = format!(
+                "UPDATE media_sources
+                 SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 WHERE id IN (
+                     SELECT ms.id
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE mi.library_id = ? AND mi.removed_at IS NULL
+                       AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
+                       AND {}
+                 )",
+                incremental_scan_scope_sql(self.backend)
+            );
+            self.query(sqlx::AssertSqlSafe(query))
+                .bind(library_id)
+                .bind(scan_job_id)
+                .execute(&mut **transaction)
+                .await
+        } else {
+            self.query(
+                "UPDATE media_sources
+                 SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 WHERE id IN (
+                     SELECT ms.id
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE mi.library_id = ? AND mi.removed_at IS NULL
+                       AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
+                 )",
+            )
+            .bind(library_id)
+            .execute(&mut **transaction)
+            .await
+        };
+        result.map(|_| ()).map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })

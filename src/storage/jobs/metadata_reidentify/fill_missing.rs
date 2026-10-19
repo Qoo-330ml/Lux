@@ -6,6 +6,7 @@ mod request_flow;
 
 const FILL_MISSING_DISPATCH_SOURCE_EXPLICIT: &str = "EXPLICIT";
 const FILL_MISSING_DISPATCH_SOURCE_AUTOMATIC: &str = "AUTOMATIC";
+const FILL_MISSING_RETRY_PAGE_MAX: i64 = 100;
 
 struct ActiveFillMissingItem {
     job_id: String,
@@ -131,6 +132,128 @@ impl Database {
         let plan = request_flow::plan_fill_missing_request_updates(requests, state);
         self.persist_fill_missing_request_plan(transaction, library_id, plan)
             .await
+    }
+
+    pub(crate) async fn enqueue_due_automatic_fill_missing_retries(
+        &self,
+        library_id: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        if library_id.trim().is_empty() {
+            return Err(StorageError::Conflict(
+                "automatic fill-missing retry requires a library".to_owned(),
+            ));
+        }
+        let limit = limit.clamp(1, FILL_MISSING_RETRY_PAGE_MAX);
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let rows = self
+            .query(
+                "SELECT DISTINCT items.item_id
+                 FROM metadata_reidentify_job_items items
+                 JOIN metadata_reidentify_jobs jobs ON jobs.id = items.job_id
+                 LEFT JOIN server_settings legacy_retry
+                   ON legacy_retry.key = 'metadata_fill_missing_legacy_retry_after'
+                 WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
+                   AND jobs.dispatch_source = 'AUTOMATIC'
+                   AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
+                   AND jobs.cancel_requested = 0
+                   AND items.status = 'FAILED'
+                   AND items.error = 'SCRAPER_UNAVAILABLE'
+                   AND items.automatic_retry_consumed = 0
+                   AND items.request_fingerprint IS NOT NULL
+                   AND COALESCE(
+                       items.automatic_retry_after,
+                       CASE WHEN items.automatic_retry_count = 0
+                            THEN CAST(legacy_retry.value AS BIGINT)
+                            ELSE NULL END
+                   ) <= unixepoch()
+                 ORDER BY items.item_id LIMIT ?",
+            )
+            .bind(library_id)
+            .bind(limit)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if rows.is_empty() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(Vec::new());
+        }
+        let item_ids = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("item_id"))
+            .collect::<Vec<_>>();
+        self.lock_media_items_for_update(&mut transaction, &item_ids)
+            .await?;
+        let requests = self
+            .build_metadata_fill_missing_requests(&mut transaction, library_id, &item_ids, &[])
+            .await?;
+        let current_request_item_ids = requests
+            .iter()
+            .map(|request| request.item_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let obsolete_item_ids = item_ids
+            .iter()
+            .filter(|item_id| !current_request_item_ids.contains(item_id.as_str()))
+            .collect::<Vec<_>>();
+        for batch in obsolete_item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE metadata_reidentify_job_items
+                 SET automatic_retry_consumed = 1, updated_at = unixepoch()
+                 WHERE status = 'FAILED' AND error = 'SCRAPER_UNAVAILABLE'
+                   AND automatic_retry_consumed = 0
+                   AND item_id IN ({placeholders})
+                   AND EXISTS (
+                       SELECT 1 FROM metadata_reidentify_jobs jobs
+                       WHERE jobs.id = metadata_reidentify_job_items.job_id
+                         AND jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
+                         AND jobs.dispatch_source = 'AUTOMATIC'
+                         AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
+                   )"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in batch {
+                statement = statement.bind(item_id.as_str());
+            }
+            statement
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        let job_ids = self
+            .enqueue_or_update_fill_missing_requests_in_transaction(
+                &mut transaction,
+                library_id,
+                &requests,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(job_ids)
     }
 
     pub(crate) async fn create_or_merge_fill_missing_job(

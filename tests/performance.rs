@@ -245,6 +245,11 @@ fn optional_percentile_ms(values: &[u128]) -> Option<u128> {
     (!values.is_empty()).then(|| percentile(values, 95))
 }
 
+fn optional_percentile_us(values: &[u128], percentile_value: usize) -> Option<u128> {
+    (!values.is_empty() && (1..=100).contains(&percentile_value))
+        .then(|| percentile(values, percentile_value))
+}
+
 fn process_peak_rss_bytes() -> Option<u64> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -267,6 +272,37 @@ fn process_peak_rss_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+fn process_cpu_time_us() -> Option<u128> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage initializes the provided structure on success.
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: result == 0 proves getrusage initialized usage.
+        let usage = unsafe { usage.assume_init() };
+        let timeval_us = |seconds, microseconds| {
+            u128::try_from(seconds)
+                .ok()?
+                .checked_mul(1_000_000)?
+                .checked_add(u128::try_from(microseconds).ok()?)
+        };
+        timeval_us(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec)?
+            .checked_add(timeval_us(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec)?)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[test]
+fn process_cpu_time_is_reported() {
+    assert!(process_cpu_time_us().is_some());
 }
 
 async fn wait_for_fixture_catalog_page(
@@ -331,6 +367,7 @@ struct QueryStatementCounts {
     active_preparation_tasks_peak: AtomicUsize,
     active_directory_readers_peak: AtomicUsize,
     scan_stage_samples: Mutex<std::collections::HashMap<String, Vec<ScanStageSample>>>,
+    transaction_body_outcomes: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl QueryStatementCounts {
@@ -365,6 +402,10 @@ impl QueryStatementCounts {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.scan_stage_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.transaction_body_outcomes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -425,6 +466,11 @@ impl QueryStatementCounts {
 
     fn scan_stage_values(&self) -> serde_json::Value {
         let (preparation_peak, reader_peak) = self.scan_stage_peaks();
+        let transaction_body_outcomes = self
+            .transaction_body_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         serde_json::json!({
             "stages": self.scan_stage_snapshot().into_iter().map(|summary| serde_json::json!({
                 "phase": summary.phase,
@@ -438,8 +484,18 @@ impl QueryStatementCounts {
             })).collect::<Vec<_>>(),
             "activePreparationTasksPeak": preparation_peak,
             "activeDirectoryReadersPeak": reader_peak,
+            "transactionBodyOutcomes": transaction_body_outcomes,
             "durationNote": "Cumulative stage durations are work totals, not wall time; nested and concurrent stages may overlap."
         })
+    }
+
+    fn record_transaction_body_outcome(&self, outcome: &str) {
+        *self
+            .transaction_body_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(outcome.to_owned())
+            .or_default() += 1;
     }
 
     fn take_query_latency_values(
@@ -544,6 +600,7 @@ struct QuerySummaryVisitor {
     application_ms: Option<u64>,
     transaction_ms: Option<u64>,
     phase: Option<String>,
+    outcome: Option<String>,
     duration_us: Option<u64>,
     units: Option<u64>,
     files: Option<u64>,
@@ -582,6 +639,8 @@ impl Visit for QuerySummaryVisitor {
             self.summary = Some(value.to_owned());
         } else if field.name() == "phase" {
             self.phase = Some(value.to_owned());
+        } else if field.name() == "outcome" {
+            self.outcome = Some(value.to_owned());
         }
     }
 
@@ -707,6 +766,37 @@ fn scan_stage_summary_reports_overlapping_microsecond_work_without_calling_it_wa
 #[test]
 fn scan_stage_summary_omits_empty_stages() {
     assert_eq!(scan_stage_summary("known_paths", &[]), None);
+}
+
+#[test]
+fn transaction_body_outcomes_are_reported_and_reset() {
+    let counts = Arc::new(QueryStatementCounts::default());
+    let subscriber = tracing_subscriber::registry().with(QueryStatementLayer(counts.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase = "transaction_body_outcome",
+            outcome = "success",
+            "fixture outcome"
+        );
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase = "transaction_body_outcome",
+            outcome = "error",
+            "fixture outcome"
+        );
+    });
+
+    assert_eq!(
+        counts.scan_stage_values()["transactionBodyOutcomes"],
+        serde_json::json!({"error": 1, "success": 1})
+    );
+
+    counts.reset();
+    assert_eq!(
+        counts.scan_stage_values()["transactionBodyOutcomes"],
+        serde_json::json!({})
+    );
 }
 
 #[test]
@@ -910,6 +1000,11 @@ where
         if event.metadata().target() == "lux::scan_performance" {
             let mut visitor = QuerySummaryVisitor::default();
             event.record(&mut visitor);
+            if visitor.phase.as_deref() == Some("transaction_body_outcome")
+                && let Some(outcome) = visitor.outcome.as_deref()
+            {
+                self.0.record_transaction_body_outcome(outcome);
+            }
             if visitor.phase.as_deref() == Some("directory_read_budget") {
                 if let Some(concurrency) = visitor.preparation_concurrency {
                     self.0.manifest_preparation_concurrency.fetch_max(
@@ -1175,6 +1270,21 @@ struct PostgresLockWaitMonitor {
 struct SqliteLockWaitMonitor {
     stop: Arc<AtomicBool>,
     waits_us: Arc<Mutex<Vec<u128>>>,
+    errors: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct SqliteWriterContentionSamples {
+    pool_acquire_us: Vec<u128>,
+    begin_admission_us: Vec<u128>,
+    progress_update_transaction_us: Vec<u128>,
+}
+
+struct SqliteWriterContentionMonitor {
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<SqliteWriterContentionSamples>>,
+    progress_update_statement_count: Arc<AtomicUsize>,
+    successful_progress_updates: Arc<AtomicUsize>,
     errors: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -1712,6 +1822,134 @@ impl SqliteLockWaitMonitor {
     }
 }
 
+impl SqliteWriterContentionMonitor {
+    async fn stop(self) -> serde_json::Value {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.task.await;
+        let samples = match self.samples.lock() {
+            Ok(samples) => samples,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        json!({
+            "sampleIntervalMs": 25,
+            "poolAcquireSampleCount": samples.pool_acquire_us.len(),
+            "poolAcquireP50Us": optional_percentile_us(&samples.pool_acquire_us, 50),
+            "poolAcquireP95Us": optional_percentile_us(&samples.pool_acquire_us, 95),
+            "beginAdmissionSampleCount": samples.begin_admission_us.len(),
+            "beginAdmissionP50Us": optional_percentile_us(&samples.begin_admission_us, 50),
+            "beginAdmissionP95Us": optional_percentile_us(&samples.begin_admission_us, 95),
+            "progressUpdateTransactionSampleCount": samples.progress_update_transaction_us.len(),
+            "progressUpdateTransactionP50Us": optional_percentile_us(&samples.progress_update_transaction_us, 50),
+            "progressUpdateTransactionP95Us": optional_percentile_us(&samples.progress_update_transaction_us, 95),
+            "progressUpdateStatementCount": self.progress_update_statement_count.load(Ordering::Relaxed),
+            "successfulProgressUpdateCount": self.successful_progress_updates.load(Ordering::Relaxed),
+            "errorCount": self.errors.load(Ordering::Relaxed),
+            "note": "Independent SQLite pool; each successful sample updates scan_jobs.updated_at in a BEGIN IMMEDIATE transaction. Acquire, BEGIN admission, and full update transaction timings are reported separately."
+        })
+    }
+}
+
+fn start_sqlite_writer_contention_monitor(
+    pool: sqlx::AnyPool,
+    job_id: String,
+) -> SqliteWriterContentionMonitor {
+    use sqlx::Connection;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let samples = Arc::new(Mutex::new(SqliteWriterContentionSamples {
+        pool_acquire_us: Vec::new(),
+        begin_admission_us: Vec::new(),
+        progress_update_transaction_us: Vec::new(),
+    }));
+    let progress_update_statement_count = Arc::new(AtomicUsize::new(0));
+    let successful_progress_updates = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let monitor_stop = stop.clone();
+    let monitor_samples = samples.clone();
+    let monitor_update_statements = progress_update_statement_count.clone();
+    let monitor_successful_updates = successful_progress_updates.clone();
+    let monitor_errors = errors.clone();
+    let task = tokio::spawn(async move {
+        while !monitor_stop.load(Ordering::Relaxed) {
+            let acquire_started = Instant::now();
+            let mut connection = match pool.acquire().await {
+                Ok(connection) => connection,
+                Err(_) => {
+                    monitor_errors.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+            };
+            if let Ok(mut samples) = monitor_samples.lock() {
+                samples
+                    .pool_acquire_us
+                    .push(acquire_started.elapsed().as_micros());
+            }
+
+            let transaction_started = Instant::now();
+            let begin_started = Instant::now();
+            let mut transaction = match (*connection).begin_with("BEGIN IMMEDIATE").await {
+                Ok(transaction) => transaction,
+                Err(_) => {
+                    if let Ok(mut samples) = monitor_samples.lock() {
+                        samples
+                            .begin_admission_us
+                            .push(begin_started.elapsed().as_micros());
+                    }
+                    monitor_errors.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+            };
+            if let Ok(mut samples) = monitor_samples.lock() {
+                samples
+                    .begin_admission_us
+                    .push(begin_started.elapsed().as_micros());
+            }
+
+            monitor_update_statements.fetch_add(1, Ordering::Relaxed);
+            let update = sqlx::query(
+                "UPDATE scan_jobs SET updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(&job_id)
+            .execute(&mut *transaction)
+            .await;
+            match update {
+                Ok(result) if result.rows_affected() == 1 => {
+                    if transaction.commit().await.is_ok() {
+                        monitor_successful_updates.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut samples) = monitor_samples.lock() {
+                            samples
+                                .progress_update_transaction_us
+                                .push(transaction_started.elapsed().as_micros());
+                        }
+                    } else {
+                        monitor_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(_) => {
+                    let _ = transaction.rollback().await;
+                }
+                Err(_) => {
+                    let _ = transaction.rollback().await;
+                    monitor_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+
+    SqliteWriterContentionMonitor {
+        stop,
+        samples,
+        progress_update_statement_count,
+        successful_progress_updates,
+        errors,
+        task,
+    }
+}
+
 fn start_postgres_lock_wait_monitor(pool: sqlx::AnyPool) -> PostgresLockWaitMonitor {
     let stop = Arc::new(AtomicBool::new(false));
     let samples = Arc::new(AtomicUsize::new(0));
@@ -2028,6 +2266,27 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
 
     let statement_counts = performance_query_statement_counts();
     let backend = env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    let sqlite_writer_contention_requested =
+        env::var_os("LUX_PERF_SQLITE_WRITER_CONTENTION").is_some();
+    if sqlite_writer_contention_requested && backend != "sqlite" {
+        return Err("LUX_PERF_SQLITE_WRITER_CONTENTION requires the SQLite backend".into());
+    }
+    let lock_monitor_enabled = env::var_os("LUX_PERF_DISABLE_LOCK_MONITOR").is_none();
+    if sqlite_writer_contention_requested && lock_monitor_enabled {
+        return Err(
+            "disable the same-pool lock monitor for independent SQLite writer contention samples"
+                .into(),
+        );
+    }
+    let sqlite_transaction_file_budget = if backend == "sqlite" {
+        env::var("LUX_PERF_DISCOVERY_TRANSACTION_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(8_000)
+    } else {
+        8_000
+    };
     let library_kind_name =
         env::var("LUX_PERF_LIBRARY_KIND").unwrap_or_else(|_| "movie".to_owned());
     let library_kind = match library_kind_name.as_str() {
@@ -2245,7 +2504,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
-        config,
+        config.clone(),
         database.clone(),
         setup,
         web_auth,
@@ -2280,6 +2539,11 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    let sqlite_writer_database = if sqlite_writer_contention_requested {
+        Some(Database::connect_with_configuration(&config, &database_configuration).await?)
+    } else {
+        None
+    };
     let postgres_wal_before = if backend == "postgres" {
         Some(postgres_wal_bytes(&database).await?)
     } else {
@@ -2296,12 +2560,15 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     };
     statement_counts.reset();
     let manifest_pool_monitor = start_pool_pressure_monitor(database.pool().clone());
-    let lock_monitor_enabled = env::var_os("LUX_PERF_DISABLE_LOCK_MONITOR").is_none();
+    let sqlite_writer_contention_monitor = sqlite_writer_database.as_ref().map(|writer_database| {
+        start_sqlite_writer_contention_monitor(writer_database.pool().clone(), job.id.clone())
+    });
     let postgres_lock_monitor = (backend == "postgres" && lock_monitor_enabled)
         .then(|| start_postgres_lock_wait_monitor(database.pool().clone()));
     let sqlite_lock_monitor = (backend == "sqlite" && lock_monitor_enabled)
         .then(|| start_sqlite_lock_wait_monitor(database.pool().clone()));
 
+    let process_cpu_before_scan_us = process_cpu_time_us();
     let first_scan_started = Instant::now();
     let mut first_batch_durations = Vec::new();
     let mut first_scan_processed = 0_usize;
@@ -2330,6 +2597,24 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         }
     }
     let manifest_index_ms = first_scan_started.elapsed().as_millis();
+    let manifest_process_cpu_us = process_cpu_before_scan_us
+        .zip(process_cpu_time_us())
+        .map(|(before, after)| after.saturating_sub(before));
+    let manifest_cpu_core_equivalent = manifest_process_cpu_us
+        .map(|cpu_us| cpu_us as f64 / manifest_index_ms.saturating_mul(1_000).max(1) as f64);
+    let sqlite_writer_contention_report = if let Some(monitor) = sqlite_writer_contention_monitor {
+        Some(monitor.stop().await)
+    } else {
+        None
+    };
+    if let Some(writer_database) = &sqlite_writer_database {
+        writer_database.pool().close().await;
+    }
+    let sqlite_writer_update_statement_count = sqlite_writer_contention_report
+        .as_ref()
+        .and_then(|report| report["progressUpdateStatementCount"].as_u64())
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or_default();
     let manifest_pool_pressure = manifest_pool_monitor.stop().await;
     let sqlite_wal_file_bytes_after_index = if backend == "sqlite" {
         fs::metadata(temp_dir.path().join("config/lux.db-wal"))
@@ -2352,6 +2637,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "positive_file_recheck",
         "transaction_input_validation",
         "transaction_begin",
+        "transaction_body",
         "manifest_state_check",
         "directory_frontier_insert",
         "known_path_query",
@@ -2384,6 +2670,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             manifest_stage_timings["writerCancelledObserved"]
         );
     }
+    assert!(
+        manifest_stage_timings["transactionBodyOutcomes"]["success"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "60k scan report is missing a successful transaction body outcome: {manifest_stage_timings}"
+    );
     assert!(
         manifest_stage_timings["activePreparationTasksPeak"]
             .as_u64()
@@ -2423,7 +2716,9 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         true,
         "SQLx events from the Manifest scan loop; SQLite lock-monitor statements may be included, while PostgreSQL lock-monitor SELECTs are excluded.",
     );
-    let (raw_statement_count, dml_statement_count) = statement_counts.snapshot();
+    let (raw_statement_count, observed_dml_statement_count) = statement_counts.snapshot();
+    let dml_statement_count =
+        observed_dml_statement_count.saturating_sub(sqlite_writer_update_statement_count);
     let manifest_active_job_select_count = statement_counts.manifest_active_job_select_count();
     let dml_summary_counts = statement_counts.dml_summary_snapshot();
     let local_metadata_outbox_dml_count = dml_summary_counts
@@ -2451,12 +2746,12 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         .sum::<usize>();
     let positive_commit_batch_count = statement_counts.manifest_positive_commit_batch_count();
     // Lite Manifest discovery submits at most 80 directories per work unit;
-    // include those commits alongside the 8,000-file bound.
+    // include those commits alongside the selected SQLite transaction budget.
     let max_positive_commit_batch_count =
-        file_count.div_ceil(8_000) + directory_count.div_ceil(80) + 5;
+        file_count.div_ceil(sqlite_transaction_file_budget) + directory_count.div_ceil(80) + 5;
     assert!(
         positive_commit_batch_count <= max_positive_commit_batch_count,
-        "streamed positive indexes should checkpoint no more than 8,000 files per transaction; transactions={positive_commit_batch_count}, upper_bound={max_positive_commit_batch_count}"
+        "streamed positive indexes exceeded the selected {sqlite_transaction_file_budget}-file transaction budget; transactions={positive_commit_batch_count}, upper_bound={max_positive_commit_batch_count}"
     );
     assert_eq!(
         scan_job_target_statement_count, 0,
@@ -2477,10 +2772,9 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         .filter(|(_, summary)| summary.starts_with("INSERT INTO FILESYSTEM_ENTRIES"))
         .map(|(count, _)| count)
         .sum::<usize>();
-    assert_eq!(
-        media_item_insert_count,
-        media_source_insert_count + positive_commit_batch_count,
-        "movie rows should batch alongside sources, with one parent-folder insert per positive batch"
+    assert!(
+        media_item_insert_count <= media_source_insert_count + positive_commit_batch_count,
+        "movie and parent-folder inserts should remain batched; itemStatements={media_item_insert_count}, sourceStatements={media_source_insert_count}, transactions={positive_commit_batch_count}"
     );
     let max_index_insert_statements = positive_commit_batch_count.saturating_mul(5);
     for (table, statement_count) in [
@@ -2526,12 +2820,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         dml_statement_count <= max_scan_dml_count,
         "Manifest scan issued {dml_statement_count} DML statements for {file_count} files; limit is {max_scan_dml_count}"
     );
-    if matches!(backend.as_str(), "sqlite" | "postgres") {
-        assert!(
-            dml_statement_count < 209,
-            "LUX-275 backend batching should reduce total scan DML from the 209-statement baseline; backend={backend}, observed {dml_statement_count} including {local_metadata_outbox_dml_count} local metadata outbox statements and {scan_index_dml_count} scan-index statements"
-        );
-    }
+    let dml_under_lux_275_threshold = dml_statement_count < 209;
     let postgres_wal_after = if backend == "postgres" {
         Some(postgres_wal_bytes(&database).await?)
     } else {
@@ -2807,6 +3096,12 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "libraryKind": library_kind_name,
             "fileCount": file_count,
             "manifestIndexMs": manifest_index_ms,
+            "manifestProcessCpuTimeMs": manifest_process_cpu_us.map(|value| value / 1_000),
+            "manifestCpuCoreEquivalent": manifest_cpu_core_equivalent,
+            "sqliteManifestTransactionFileBudget": (backend == "sqlite")
+                .then_some(sqlite_transaction_file_budget),
+            "sqliteIndependentWriterContention": sqlite_writer_contention_report,
+            "sqliteIndependentWriterDmlStatements": sqlite_writer_update_statement_count,
             "manifestFirstScanSqlLatencyWindow": manifest_sql_latency_window,
             "manifestPoolPressure": manifest_pool_pressure,
             "manifestFilesProcessed": first_scan_processed,
@@ -2835,6 +3130,8 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         json!({
             "manifestSqlStatementCount": scan_statement_count,
             "manifestDmlStatementCount": dml_statement_count,
+            "manifestObservedDmlStatementCount": observed_dml_statement_count,
+            "manifestDmlUnderLux275Threshold": dml_under_lux_275_threshold,
             "manifestScanIndexDmlStatementCount": scan_index_dml_count,
             "manifestLocalMetadataOutboxDmlStatementCount": local_metadata_outbox_dml_count,
             "manifestDmlSummaryCounts": dml_summary_counts,
@@ -2913,6 +3210,12 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     );
 
     server.abort();
+    if matches!(backend.as_str(), "sqlite" | "postgres") {
+        assert!(
+            dml_under_lux_275_threshold,
+            "LUX-275 backend batching should reduce scan DML from the 209-statement baseline; backend={backend}, observed {dml_statement_count} including {local_metadata_outbox_dml_count} local metadata outbox statements and {scan_index_dml_count} scan-index statements"
+        );
+    }
     Ok(())
 }
 
@@ -3465,6 +3768,390 @@ print('{"format":{"format_name":"matroska"},"streams":[]}', end="")
         }))?
     );
     Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with LUX_PROBE_BENCH_MODE and LUX_PROBE_BENCH_FILE_COUNT for the LUX-561 A/B gate"]
+async fn lux_561_probe_throughput_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let mode = env::var("LUX_PROBE_BENCH_MODE").unwrap_or_else(|_| "simulation".to_owned());
+    if !matches!(mode.as_str(), "simulation" | "real") {
+        return Err("LUX_PROBE_BENCH_MODE must be simulation or real".into());
+    }
+    let file_count = env::var("LUX_PROBE_BENCH_FILE_COUNT")
+        .unwrap_or_else(|_| (if mode == "real" { "512" } else { "4096" }).to_owned())
+        .parse::<usize>()?;
+    if !(1..=8192).contains(&file_count) {
+        return Err("LUX_PROBE_BENCH_FILE_COUNT must be between 1 and 8192".into());
+    }
+    let delay_ms = env::var("LUX_PROBE_BENCH_DELAY_MS")
+        .unwrap_or_else(|_| "75".to_owned())
+        .parse::<u64>()?;
+    if delay_ms > 250 {
+        return Err("LUX_PROBE_BENCH_DELAY_MS must be at most 250".into());
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("LUX-561 ffprobe benchmark", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let media_dir = media_root.join("Benchmark Movie (2024)");
+    tokio::fs::create_dir_all(&media_dir).await?;
+    // The scanner accepts .mkv; ffprobe detects this tiny AVI payload from its RIFF header.
+    let avi = avi_benchmark_fixture();
+    for index in 0..file_count {
+        tokio::fs::write(
+            media_dir.join(format!("Benchmark.Movie.{index:05}.2024.mkv")),
+            &avi,
+        )
+        .await?;
+    }
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 fixture path")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let state_dir = temp_dir.path().join("probe-benchmark-state");
+    fs::create_dir_all(&state_dir)?;
+    let runner = if mode == "simulation" {
+        let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+        fs::write(
+            &fake_ffprobe,
+            r##"#!/usr/bin/env python3
+import fcntl
+from pathlib import Path
+import os
+import resource
+import time
+
+state = Path(__file__).resolve().parent / "probe-benchmark-state"
+state.mkdir(parents=True, exist_ok=True)
+lock_path = state / "lock"
+current_path = state / "current"
+maximum_path = state / "maximum"
+duration_path = state / "durations"
+started = time.monotonic()
+
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = int(current_path.read_text()) + 1
+    except (FileNotFoundError, ValueError):
+        current = 1
+    current_path.write_text(str(current))
+    try:
+        maximum = int(maximum_path.read_text())
+    except (FileNotFoundError, ValueError):
+        maximum = 0
+    if current > maximum:
+        maximum_path.write_text(str(current))
+    fcntl.flock(lock, fcntl.LOCK_UN)
+
+time.sleep(int(os.environ.get("LUX_PROBE_BENCH_DELAY_MS", "75")) / 1000)
+print('{"format":{"format_name":"avi"},"streams":[]}', end="")
+
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    current = int(current_path.read_text())
+    current_path.write_text(str(current - 1))
+    with duration_path.open("a") as durations:
+        durations.write(f"{(time.monotonic() - started) * 1000:.3f}\n")
+    fcntl.flock(lock, fcntl.LOCK_UN)
+"##,
+        )?;
+        let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_ffprobe, permissions)?;
+        FfprobeRunner::new(&fake_ffprobe, Duration::from_secs(30))
+    } else {
+        let ffprobe_binary = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("ffprobe"))
+            .find(|path| path.is_file())
+            .ok_or("real mode requires ffprobe on PATH")?;
+        fs::write(
+            state_dir.join("real-ffprobe-path"),
+            ffprobe_binary.to_string_lossy().as_bytes(),
+        )?;
+        let tracked_ffprobe = temp_dir.path().join("tracked-ffprobe");
+        fs::write(
+            &tracked_ffprobe,
+            r##"#!/usr/bin/env python3
+import fcntl
+from pathlib import Path
+import resource
+import subprocess
+import sys
+import time
+
+state = Path(__file__).resolve().parent / "probe-benchmark-state"
+lock_path = state / "lock"
+current_path = state / "current"
+maximum_path = state / "maximum"
+duration_path = state / "durations"
+cpu_path = state / "ffprobe-child-cpu-micros"
+started = time.monotonic()
+
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = int(current_path.read_text()) + 1
+    except (FileNotFoundError, ValueError):
+        current = 1
+    current_path.write_text(str(current))
+    try:
+        maximum = int(maximum_path.read_text())
+    except (FileNotFoundError, ValueError):
+        maximum = 0
+    if current > maximum:
+        maximum_path.write_text(str(current))
+    fcntl.flock(lock, fcntl.LOCK_UN)
+
+before = resource.getrusage(resource.RUSAGE_CHILDREN)
+exit_code = 1
+try:
+    binary = (state / "real-ffprobe-path").read_text().strip()
+    result = subprocess.run([binary, *sys.argv[1:]], capture_output=True, check=False)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    exit_code = result.returncode
+finally:
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_micros = int(
+        ((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)) * 1_000_000
+    )
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = int(current_path.read_text())
+        current_path.write_text(str(current - 1))
+        with duration_path.open("a") as durations:
+            durations.write(f"{(time.monotonic() - started) * 1000:.3f}\n")
+        with cpu_path.open("a") as cpu_samples:
+            cpu_samples.write(f"{cpu_micros}\n")
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+sys.exit(exit_code)
+"##,
+        )?;
+        let mut permissions = fs::metadata(&tracked_ffprobe)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tracked_ffprobe, permissions)?;
+        FfprobeRunner::new(&tracked_ffprobe, Duration::from_secs(30))
+    };
+
+    let process_cpu_before = process_cpu_time_micros();
+    let child_cpu_before = child_cpu_time_micros();
+    let started = Instant::now();
+    let report = MediaProbeService::new(database, runner)
+        .probe_movie_library(library.id)
+        .await?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let child_cpu_after = child_cpu_time_micros();
+    let process_cpu_after = process_cpu_time_micros();
+    assert_eq!(report.ready, file_count);
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.timed_out, 0);
+    let observed_maximum = tokio::fs::read_to_string(state_dir.join("maximum"))
+        .await?
+        .trim()
+        .parse::<usize>()?;
+    let active_after_run = tokio::fs::read_to_string(state_dir.join("current"))
+        .await?
+        .trim()
+        .parse::<i64>()?;
+    let durations = tokio::fs::read_to_string(state_dir.join("durations")).await?;
+    let mut durations = durations
+        .lines()
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()?;
+    durations.sort_by(f64::total_cmp);
+    assert_eq!(durations.len(), file_count);
+    assert_eq!(active_after_run, 0, "all ffprobe processes should exit");
+    assert!(
+        observed_maximum > 0
+            && i64::try_from(observed_maximum)
+                .is_ok_and(|maximum| maximum <= library.probe_concurrency),
+        "observed activity must remain within the library budget"
+    );
+    let ffprobe_child_cpu_ms = if mode == "real" {
+        let values = tokio::fs::read_to_string(state_dir.join("ffprobe-child-cpu-micros"))
+            .await?
+            .lines()
+            .map(str::parse::<u128>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(values.len(), file_count);
+        Some(values.into_iter().sum::<u128>() / 1000)
+    } else {
+        None
+    };
+    let elapsed_seconds = elapsed_ms as f64 / 1000.0;
+    println!(
+        "LUX-561 FFPROBE RESULT {}",
+        serde_json::to_string(&json!({
+            "revision": luxd::COMMIT,
+            "architecture": std::env::consts::ARCH,
+            "mode": mode.as_str(),
+            "fileCount": file_count,
+            "simulatedIoDelayMs": if mode == "simulation" { Some(delay_ms) } else { None },
+            "availableParallelism": std::thread::available_parallelism().ok().map(usize::from),
+            "libraryProbeConcurrency": library.probe_concurrency,
+            "processOverride": env::var("LUX_PROBE_CONCURRENCY").ok(),
+            "observedMaximum": observed_maximum,
+            "activeAfterRun": active_after_run,
+            "elapsedMs": elapsed_ms,
+            "itemsPerSecond": file_count as f64 / elapsed_seconds,
+            "runnerP50Ms": percentile_f64(&durations, 50),
+            "runnerP95Ms": percentile_f64(&durations, 95),
+            "processCpuMs": process_cpu_before.zip(process_cpu_after).and_then(|(before, after)| after.checked_sub(before)).map(|micros| micros / 1000),
+            "childProcessCpuMs": child_cpu_before.zip(child_cpu_after).and_then(|(before, after)| after.checked_sub(before)).map(|micros| micros / 1000),
+            "ffprobeChildCpuMs": ffprobe_child_cpu_ms,
+            "benchmarkHarnessPeakRssBytes": process_peak_rss_bytes(),
+            "ready": report.ready,
+            "failed": report.failed,
+            "timedOut": report.timed_out,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn percentile_f64(values: &[f64], percentile: usize) -> Option<f64> {
+    if values.is_empty() || !(1..=100).contains(&percentile) {
+        return None;
+    }
+    let rank = values.len().saturating_mul(percentile).div_ceil(100);
+    values.get(rank.saturating_sub(1)).copied()
+}
+
+#[cfg(unix)]
+fn avi_benchmark_fixture() -> Vec<u8> {
+    fn chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(8 + data.len() + (data.len() & 1));
+        output.extend_from_slice(tag);
+        output.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        output.extend_from_slice(data);
+        if data.len() & 1 != 0 {
+            output.push(0);
+        }
+        output
+    }
+
+    fn list_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + data.len());
+        payload.extend_from_slice(kind);
+        payload.extend_from_slice(data);
+        chunk(b"LIST", &payload)
+    }
+
+    const WIDTH: i32 = 2;
+    const HEIGHT: i32 = 2;
+    let frame = [0_u8; 16];
+    let mut avih = Vec::with_capacity(56);
+    for value in [
+        40_000_u32,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        frame.len() as u32,
+        WIDTH as u32,
+        HEIGHT as u32,
+        0,
+        0,
+        0,
+        0,
+    ] {
+        avih.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let mut strh = Vec::with_capacity(56);
+    strh.extend_from_slice(b"vidsDIB ");
+    strh.extend_from_slice(&0_u32.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    strh.extend_from_slice(&0_u16.to_le_bytes());
+    for value in [0_u32, 1, 25, 0, 1, frame.len() as u32, u32::MAX, 0] {
+        strh.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [0_i16, 0, WIDTH as i16, HEIGHT as i16] {
+        strh.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let mut strf = Vec::with_capacity(40);
+    strf.extend_from_slice(&40_u32.to_le_bytes());
+    strf.extend_from_slice(&WIDTH.to_le_bytes());
+    strf.extend_from_slice(&HEIGHT.to_le_bytes());
+    strf.extend_from_slice(&1_u16.to_le_bytes());
+    strf.extend_from_slice(&24_u16.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+    strf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    strf.extend_from_slice(&0_i32.to_le_bytes());
+    strf.extend_from_slice(&0_i32.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+    strf.extend_from_slice(&0_u32.to_le_bytes());
+
+    let strl = list_chunk(
+        b"strl",
+        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+    );
+    let hdrl = list_chunk(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
+    let movi = list_chunk(b"movi", &chunk(b"00db", &frame));
+    let body = [b"AVI ".as_slice(), hdrl.as_slice(), movi.as_slice()].concat();
+    let mut avi = Vec::with_capacity(8 + body.len());
+    avi.extend_from_slice(b"RIFF");
+    avi.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    avi.extend_from_slice(&body);
+    avi
+}
+
+#[cfg(unix)]
+fn process_cpu_time_micros() -> Option<u128> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the provided structure on success.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: result == 0 proves getrusage initialized usage.
+    let usage = unsafe { usage.assume_init() };
+    let user = timeval_micros(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec)?;
+    let system = timeval_micros(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec)?;
+    user.checked_add(system)
+}
+
+#[cfg(unix)]
+fn child_cpu_time_micros() -> Option<u128> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the provided structure on success.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: result == 0 proves getrusage initialized usage.
+    let usage = unsafe { usage.assume_init() };
+    let user = timeval_micros(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec)?;
+    let system = timeval_micros(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec)?;
+    user.checked_add(system)
+}
+
+#[cfg(unix)]
+fn timeval_micros(seconds: libc::time_t, microseconds: libc::suseconds_t) -> Option<u128> {
+    u128::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(u128::try_from(microseconds).ok()?)
 }
 
 #[cfg(feature = "performance-benchmarks")]

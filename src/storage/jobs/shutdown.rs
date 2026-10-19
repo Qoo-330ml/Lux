@@ -22,46 +22,36 @@ impl Database {
         let mut cancelled = 0_u64;
         let mut legacy_scan_events = Vec::new();
 
-        let legacy_scan_ids: Vec<String> = self
-            .query_scalar(
-                "SELECT id FROM scan_jobs
+        let legacy_scan_rows = self
+            .query(
+                "UPDATE scan_jobs
+                 SET status = 'CANCELLED', cancel_requested = 0, error = ?, cursor = NULL,
+                     current_item = NULL, scan_phase = 'IDLE', finished_at = unixepoch(),
+                     updated_at = unixepoch()
                  WHERE job_type = 'RECONCILE_LIBRARY'
+                   AND status IN ('PENDING', 'RUNNING', 'COMPLETED')
                    AND (
                        status IN ('PENDING', 'RUNNING')
                        OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING')
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_manifests WHERE job_id = scan_jobs.id
-                   )",
+                   )
+                 RETURNING id",
             )
+            .bind(Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST)
             .fetch_all(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        for job_id in &legacy_scan_ids {
-            let result = self
-                .query(
-                    "UPDATE scan_jobs
-                     SET status = 'CANCELLED', cancel_requested = 0, error = ?, cursor = NULL,
-                         current_item = NULL, scan_phase = 'IDLE', finished_at = unixepoch(),
-                         updated_at = unixepoch()
-                     WHERE id = ? AND status IN ('PENDING', 'RUNNING', 'COMPLETED')",
-                )
-                .bind(Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST)
-                .bind(job_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            cancelled = cancelled.saturating_add(result.rows_affected());
-            if result.rows_affected() == 1 {
-                legacy_scan_events.push(job_id.clone());
-            }
-        }
+        cancelled = cancelled.saturating_add(legacy_scan_rows.len() as u64);
+        legacy_scan_events.extend(
+            legacy_scan_rows
+                .into_iter()
+                .map(|row| row.get::<String, _>("id")),
+        );
 
         for query in [
             "UPDATE scan_jobs

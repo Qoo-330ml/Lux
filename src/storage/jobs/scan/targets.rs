@@ -1,5 +1,122 @@
 use super::*;
 
+// Separate EXISTS predicates let SQLite use each stage's partial index even when
+// the job retains a large number of completed targets.
+const UNFINISHED_TARGETS: &str = "(EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id AND t.probe_state IN ('PENDING', 'FAILED')
+) OR EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id AND t.metadata_state IN ('PENDING', 'FAILED')
+) OR EXISTS (
+    SELECT 1 FROM scan_job_targets t WHERE t.job_id = sj.id AND t.thumbnail_state IN ('PENDING', 'FAILED')
+))";
+const UNREADY_TARGETS: &str = "EXISTS (
+    SELECT 1 FROM scan_manifests m WHERE m.job_id = sj.id
+      AND m.workflow_version IN (2, 3) AND m.discovery_format_version = 3
+      AND m.postprocessing_targets_ready = 0
+)";
+
+fn postprocessing_issues_predicate() -> String {
+    format!("sj.status = 'COMPLETED' AND sj.job_type = 'RECONCILE_LIBRARY'
+        AND sj.scan_phase = 'IDLE'
+        AND (COALESCE(sj.error, '') = 'POSTPROCESSING_FAILED' OR {UNFINISHED_TARGETS} OR {UNREADY_TARGETS})")
+}
+
+impl Database {
+    pub(crate) async fn scan_job_retry_states(
+        &self,
+        job_ids: &[String],
+    ) -> Result<HashMap<String, StoredScanJobRetryState>, StorageError> {
+        let mut states = HashMap::with_capacity(job_ids.len());
+        for chunk in job_ids.chunks(SCAN_DML_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT sj.id,
+                CASE WHEN {} THEN 1 ELSE 0 END AS issues,
+                CASE WHEN {UNFINISHED_TARGETS} THEN 1 ELSE 0 END AS unfinished,
+                CASE WHEN {UNREADY_TARGETS} THEN 1 ELSE 0 END AS unready,
+                CASE WHEN EXISTS (SELECT 1 FROM reconciliation_scan_entries r
+                    WHERE r.job_id = sj.id AND r.status = 'PENDING')
+                    THEN 1 ELSE 0 END AS legacy_work,
+                CASE WHEN EXISTS (SELECT 1 FROM scan_jobs active
+                    WHERE active.library_id = sj.library_id AND active.job_type = sj.job_type
+                      AND active.status IN ('PENDING', 'RUNNING'))
+                    THEN 1 ELSE 0 END AS active_job
+                FROM scan_jobs sj WHERE sj.id IN ({placeholders})",
+                postprocessing_issues_predicate()
+            );
+            // Only fixed predicates and generated placeholders enter SQL; IDs are bound below.
+            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                states.insert(
+                    row.get("id"),
+                    StoredScanJobRetryState {
+                        has_postprocessing_issues: row.get::<i64, _>("issues") != 0,
+                        has_unfinished_targets: row.get::<i64, _>("unfinished") != 0,
+                        targets_need_materialization: row.get::<i64, _>("unready") != 0,
+                        has_legacy_work: row.get::<i64, _>("legacy_work") != 0,
+                        has_active_job: row.get::<i64, _>("active_job") != 0,
+                    },
+                );
+            }
+        }
+        Ok(states)
+    }
+
+    pub(crate) async fn list_admin_scan_jobs(
+        &self,
+        status: Option<&str>,
+        has_postprocessing_issues: Option<bool>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJob>, StorageError> {
+        let Some(has_issues) = has_postprocessing_issues else {
+            return self.list_scan_jobs(status, offset, limit).await;
+        };
+        let predicate = postprocessing_issues_predicate();
+        let predicate = if has_issues {
+            predicate
+        } else {
+            format!("NOT ({predicate})")
+        };
+        let sql = format!(
+            "SELECT sj.* FROM scan_jobs sj WHERE ({predicate})
+            {} ORDER BY sj.created_at DESC, sj.id DESC LIMIT ? OFFSET ?",
+            if status.is_some() {
+                "AND sj.status = ?"
+            } else {
+                ""
+            }
+        );
+        // Predicates contain only static SQL; all external values use bind parameters.
+        let mut query = self.query(sqlx::AssertSqlSafe(sql));
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+}
+
 pub(in crate::storage::repository::jobs) fn prune_sidecar_directories(
     mut directories: Vec<String>,
 ) -> Vec<String> {
@@ -571,7 +688,6 @@ impl Database {
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE t.job_id = ? AND t.target_type = 'SOURCE'
                AND t.probe_state = 'PENDING'
-               AND ms.probe_status = 'PENDING'
                AND fe.is_missing = 0
              ORDER BY t.target_id
              LIMIT ? OFFSET ?",
@@ -1202,7 +1318,7 @@ impl Database {
         self.query(
             "UPDATE media_sources
              SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
-             WHERE id IN (
+             WHERE source_kind = 'LOCAL_FILE' AND id IN (
                  SELECT source_id FROM scan_job_targets
                  WHERE job_id = ? AND target_type = 'SOURCE'
                    AND probe_state = 'FAILED' AND source_id IS NOT NULL
@@ -1235,42 +1351,38 @@ impl Database {
             source,
         })
     }
+}
 
-    pub(crate) async fn has_scan_job_targets(&self, job_id: &str) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM scan_job_targets WHERE job_id = ?
-             ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
+#[cfg(test)]
+mod retry_diagnostic_tests {
+    use super::*;
 
-    pub(crate) async fn has_unready_scan_manifest_postprocessing_targets(
-        &self,
-        job_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM scan_manifests
-                 WHERE job_id = ? AND workflow_version IN (2, 3)
-                   AND discovery_format_version = 3
-                   AND postprocessing_targets_ready = 0
-             ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
+    #[tokio::test]
+    async fn scan_retry_diagnostics_use_unfinished_stage_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
         })
+        .await?;
+        let sql =
+            format!("EXPLAIN QUERY PLAN SELECT sj.id FROM scan_jobs sj WHERE {UNFINISHED_TARGETS}");
+        let rows = database
+            .query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(database.pool())
+            .await?;
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for stage in ["probe", "metadata", "thumbnail"] {
+            assert!(
+                plan.contains(&format!("idx_scan_job_targets_{stage}")),
+                "{plan}"
+            );
+        }
+        Ok(())
     }
 }

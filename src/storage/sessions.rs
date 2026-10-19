@@ -1,6 +1,276 @@
 use super::*;
+use crate::storage::{
+    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, PlaybackAdmissionResult,
+};
 
 impl Database {
+    pub(crate) async fn check_playback_admission(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Option<PlaybackAdmissionResult>, StorageError> {
+        let Some(policy) = self.get_user_playback_policy(user_id).await? else {
+            return Ok(None);
+        };
+        let stale_before = now
+            .max(0)
+            .saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        let active_playback_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM (
+                     SELECT play_session_id FROM playback_admissions
+                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
+                     UNION
+                     SELECT play_session_id FROM playback_sessions
+                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
+                 ) active_playbacks",
+            )
+            .bind(user_id)
+            .bind(stale_before)
+            .bind(user_id)
+            .bind(stale_before)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let decision = if !policy.can_play {
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::PlaybackDisabled)
+        } else if policy.max_simultaneous_playbacks > 0
+            && active_playback_count >= policy.max_simultaneous_playbacks
+        {
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+        } else {
+            PlaybackAdmissionDecision::Admitted
+        };
+        Ok(Some(PlaybackAdmissionResult {
+            decision,
+            active_playback_count,
+            max_simultaneous_playbacks: policy.max_simultaneous_playbacks,
+        }))
+    }
+
+    // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
+    #[allow(dead_code)]
+    pub(crate) async fn reserve_playback_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+    ) -> Result<Option<PlaybackAdmissionResult>, StorageError> {
+        let mut transaction = self.begin_playback_admission_transaction().await?;
+        let row_lock = if self.backend() == crate::config::DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let policy_query = format!(
+            "SELECT can_play, max_simultaneous_playbacks FROM users WHERE id = ?{row_lock}"
+        );
+        let policy = self
+            .query(sqlx::AssertSqlSafe(policy_query))
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(policy) = policy else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(None);
+        };
+        let can_play = policy.get::<i64, _>("can_play") != 0;
+        let limit = policy.get::<i64, _>("max_simultaneous_playbacks");
+        let now = now.max(0);
+        let stale_before = now.saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        self.query(
+            "UPDATE playback_admissions SET state = 'RELEASED'
+             WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at <= ?",
+        )
+        .bind(user_id)
+        .bind(stale_before)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let active_sessions = self
+            .query(
+                "SELECT COUNT(*) AS active_count,
+                        COALESCE(MAX(CASE WHEN play_session_id = ? THEN 1 ELSE 0 END), 0)
+                            AS session_is_active
+                 FROM (
+                     SELECT play_session_id FROM playback_admissions
+                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
+                     UNION
+                     SELECT play_session_id FROM playback_sessions
+                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
+                 ) active_playbacks",
+            )
+            .bind(play_session_id)
+            .bind(user_id)
+            .bind(stale_before)
+            .bind(user_id)
+            .bind(stale_before)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let active_count = active_sessions.get::<i64, _>("active_count");
+        let session_is_active = active_sessions.get::<i64, _>("session_is_active") != 0;
+        let decision = if !can_play {
+            Some(PlaybackAdmissionDecision::Denied(
+                PlaybackAdmissionDenialReason::PlaybackDisabled,
+            ))
+        } else if limit > 0 && active_count >= limit && !session_is_active {
+            Some(PlaybackAdmissionDecision::Denied(
+                PlaybackAdmissionDenialReason::ConcurrentLimit,
+            ))
+        } else {
+            None
+        };
+        if let Some(decision) = decision {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(Some(PlaybackAdmissionResult {
+                decision,
+                active_playback_count: active_count,
+                max_simultaneous_playbacks: limit,
+            }));
+        }
+
+        self.query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES (?, ?, 'ACTIVE', ?, ?)
+             ON CONFLICT(user_id, play_session_id) DO UPDATE SET
+                 state = 'ACTIVE',
+                 admitted_at = CASE
+                     WHEN playback_admissions.state = 'ACTIVE'
+                      AND playback_admissions.last_seen_at > ?
+                     THEN playback_admissions.admitted_at
+                     ELSE excluded.admitted_at
+                 END,
+                 last_seen_at = excluded.last_seen_at",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(now)
+        .bind(now)
+        .bind(stale_before)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let active_playback_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM (
+                     SELECT play_session_id FROM playback_admissions
+                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
+                     UNION
+                     SELECT play_session_id FROM playback_sessions
+                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
+                 ) active_playbacks",
+            )
+            .bind(user_id)
+            .bind(stale_before)
+            .bind(user_id)
+            .bind(stale_before)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(PlaybackAdmissionResult {
+            decision: PlaybackAdmissionDecision::Admitted,
+            active_playback_count,
+            max_simultaneous_playbacks: limit,
+        }))
+    }
+
+    pub(crate) async fn renew_existing_playback_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let max_function = self.scalar_max_function();
+        let stale_before = now
+            .max(0)
+            .saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        let query = format!(
+            "UPDATE playback_admissions
+             SET last_seen_at = {max_function}(last_seen_at, ?)
+             WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'
+               AND last_seen_at > ?"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(now.max(0))
+            .bind(user_id)
+            .bind(play_session_id)
+            .bind(stale_before)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    // LUX-620 calls this after playback stop, failure, or expiry.
+    #[allow(dead_code)]
+    pub(crate) async fn release_playback_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let max_function = self.scalar_max_function();
+        let query = format!(
+            "UPDATE playback_admissions
+             SET state = 'RELEASED', last_seen_at = {max_function}(last_seen_at, ?)
+             WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(now.max(0))
+            .bind(user_id)
+            .bind(play_session_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn set_user_item_played(
         &self,
         user_id: &str,

@@ -1,10 +1,45 @@
 mod repository;
+// LUX-564 lands the cache foundation before S3a adds its first production caller.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod sql_templates;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetadataAutoMatchPolicy {
     UseLibrarySetting,
     Enabled,
     Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserPlaybackPolicy {
+    pub(crate) can_play: bool,
+    pub(crate) max_simultaneous_playbacks: i64,
+    pub(crate) allow_remux: bool,
+    pub(crate) allow_audio_transcode: bool,
+    pub(crate) allow_video_transcode: bool,
+}
+
+// LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaybackAdmissionDenialReason {
+    PlaybackDisabled,
+    ConcurrentLimit,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaybackAdmissionDecision {
+    Admitted,
+    Denied(PlaybackAdmissionDenialReason),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackAdmissionResult {
+    pub(crate) decision: PlaybackAdmissionDecision,
+    pub(crate) active_playback_count: i64,
+    pub(crate) max_simultaneous_playbacks: i64,
 }
 
 #[cfg(test)]
@@ -551,32 +586,34 @@ pub use repository::{
 
 #[allow(unused_imports)]
 pub(crate) use repository::{
-    CatalogFilterQuery, CatalogSort, ChapterDetectionOutcomeUpdate,
-    ChapterDetectionSourceStateUpdate, DEFAULT_PLAYED_PERCENT, DashboardStats,
-    DatabasePoolSnapshot, DevicePairingRedeemResult, EmbyMigrationHandledItemBatch,
+    AdminUserSortField, AdminUserStatusFilter, CatalogFilterQuery, CatalogSort,
+    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate, DEFAULT_PLAYED_PERCENT,
+    DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult, EmbyMigrationHandledItemBatch,
     EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch, EmbyMigrationItemPageBatch,
     EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
     EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
-    ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata, LibrarySettingsUpdate,
-    LocalNfoDefaultsRepair, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, ManifestDeltaBatchCommit,
-    ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult, ManifestExistingFileUpdate,
-    ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage,
-    MediaInfoChapterUpdate, MediaMetadataUpdate, MediaProbeUpdate, MediaStreamUpdate,
-    MetadataCapabilityResult, MetadataImageAttemptUpdate, MetadataImageUnavailable,
-    MigrationMediaIdentityLookup, MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent,
-    NewChapterDetectionJob, NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob,
-    NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing, NewEmbyMigrationJob, NewEpisodeFile,
-    NewFilesystemEntry, NewHierarchyItem, NewLibrary, NewLibraryRoot, NewMediaChapterMarker,
-    NewMediaItem, NewMediaSource, NewMetadataCandidate, NewMovieFile, NewNotificationDestination,
-    NewNotificationEvent, NewPersonCredit, NewPlaybackEvent, NewScanLocalMetadataBatch,
-    NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
-    NewScanManifestFilesystemEntry, NewScanManifestIndexedFile, NewScanManifestPositiveIndex,
-    NewScanManifestRoot, NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
-    NewScanManifestUnresolvedFile, NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
+    FilesystemEntryUpdate, ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata,
+    LibrarySettingsUpdate, LocalNfoDefaultsRepair, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
+    ManifestDeltaBatchCommit, ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult,
+    ManifestExistingFileUpdate, ManifestPostprocessingTargetBatchResult,
+    ManifestPostprocessingTargetPage, MediaInfoChapterUpdate, MediaMetadataUpdate,
+    MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataImageAttemptUpdate,
+    MetadataImageUnavailable, MigrationMediaIdentityLookup, MigrationPersonIdentityLookup,
+    NewAccessToken, NewAuditEvent, NewChapterDetectionJob, NewChapterDetectionJobItem,
+    NewCollection, NewDanmakuMatchJob, NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing,
+    NewEmbyMigrationJob, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewLibrary,
+    NewLibraryRoot, NewMediaChapterMarker, NewMediaItem, NewMediaSource, NewMetadataCandidate,
+    NewMovieFile, NewNotificationDestination, NewNotificationEvent, NewPersonCredit,
+    NewPlaybackEvent, NewScanLocalMetadataBatch, NewScanManifest, NewScanManifestDelta,
+    NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestFilesystemEntry,
+    NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
+    NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile,
+    NewStoredUser, NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
     PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReconciliationBatchCommit,
-    ReconciliationBatchCommitResult, ResumeItemsQuery, SelectedMetadataUpdate,
-    StoredAccessTokenDevice, StoredActivityEvent, StoredCanonicalPerson,
+    ReconciliationBatchCommitResult, ResumeItemsQuery, ScanFingerprintMigrationCommit,
+    ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate, StoredAccessTokenDevice,
+    StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
     StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,
     StoredCatalogItemCounts, StoredCatalogRow, StoredChapterDetectionItem,
     StoredChapterDetectionJob, StoredChapterDetectionSource, StoredChapterDetectionSourceState,
@@ -599,10 +636,12 @@ pub(crate) use repository::{
     StoredPersonIdentityMove, StoredPersonIndexRebuildJob, StoredPersonMatchCandidate,
     StoredPipelineStageActivity, StoredPipelineStageKind, StoredPipelineStatusCounts,
     StoredPlaybackHistoryEvent, StoredPlaybackSession, StoredPlaybackSource,
-    StoredReconciliationScanEntry, StoredScanJob, StoredScanJobCounts, StoredScanJobMetadataPage,
-    StoredScanJobMetadataSources, StoredScanJobPath, StoredScanLocalMetadataBackfillPage,
-    StoredScanLocalMetadataBatch, StoredScanLocalMetadataSource, StoredScanManifest,
-    StoredScanManifestDelta, StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
+    StoredReconciliationScanEntry, StoredScanFingerprintMigrationCandidate,
+    StoredScanFingerprintMigrationCursor, StoredScanJob, StoredScanJobCounts,
+    StoredScanJobMetadataPage, StoredScanJobMetadataSources, StoredScanJobPath,
+    StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
+    StoredScanLocalMetadataSource, StoredScanManifest, StoredScanManifestDelta,
+    StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
     StoredScanManifestFilesystemBaseline, StoredScanManifestPostprocessingRoot,
     StoredScanManifestPostprocessingState, StoredScanManifestRemovalCandidate,
     StoredScheduledTaskConfig, StoredScheduledTaskPlan, StoredScheduledTaskPlanLibrary,

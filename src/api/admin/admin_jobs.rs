@@ -882,6 +882,7 @@ pub(crate) struct AdminJobsQuery {
     pub(crate) page_size: Option<i64>,
     pub(crate) status: Option<String>,
     pub(crate) search: Option<String>,
+    pub(crate) has_postprocessing_issues: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -931,12 +932,17 @@ pub(crate) async fn admin_list_jobs(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match database
-        .list_scan_jobs(status.as_deref(), offset, limit)
-        .await
+    match crate::application::admin_scan_jobs::list_admin_scan_jobs(
+        database,
+        status.as_deref(),
+        query.has_postprocessing_issues,
+        offset,
+        limit,
+    )
+    .await
     {
         Ok(jobs) => Json(json!({
-            "jobs": jobs.iter().map(scan_job_json_from_storage).collect::<Vec<_>>(),
+            "jobs": jobs.iter().map(admin_scan_job_json).collect::<Vec<_>>(),
             "page": offset / limit + 1,
             "pageSize": limit,
         }))
@@ -956,8 +962,8 @@ pub(crate) async fn admin_get_job(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match database.find_scan_job(&job_id).await {
-        Ok(Some(job)) => Json(json!({ "job": scan_job_json_from_storage(&job) })).into_response(),
+    match crate::application::admin_scan_jobs::find_admin_scan_job(database, &job_id).await {
+        Ok(Some(job)) => Json(json!({ "job": admin_scan_job_json(&job) })).into_response(),
         Ok(None) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -1105,6 +1111,13 @@ pub(crate) async fn admin_retry_scan(
         .into_response()
 }
 
+fn admin_scan_job_json(job: &crate::application::admin_scan_jobs::AdminScanJob) -> Value {
+    let mut value = scan_job_json_from_storage(&job.job);
+    value["hasPostprocessingIssues"] = json!(job.has_postprocessing_issues);
+    value["canRetry"] = json!(job.can_retry);
+    value
+}
+
 pub(crate) fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) -> Value {
     json!({
         "id": job.id,
@@ -1115,6 +1128,7 @@ pub(crate) fn scan_job_json_from_storage(job: &crate::storage::StoredScanJob) ->
         "cursor": job.cursor,
         "processedCount": job.processed_count,
         "totalCount": job.total_count,
+        "processedMediaCount": job.processed_media_count,
         "discoveryCompleted": job.discovery_completed,
         "cancelRequested": job.cancel_requested,
         "error": job.error,
@@ -1150,6 +1164,7 @@ pub(crate) fn scan_job_json(job: &crate::application::scanner::ScanJob) -> Value
         "cursor": job.cursor,
         "processedCount": job.processed_count,
         "totalCount": job.total_count,
+        "processedMediaCount": 0,
         "discoveryCompleted": job.discovery_completed,
         "cancelRequested": job.cancel_requested,
         "error": job.error,

@@ -1246,6 +1246,24 @@ impl CatalogService {
             .await
     }
 
+    pub async fn list_home_continue_watching(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        self.list_continue_watching_for_library_ids_with_grouping(
+            &library_ids,
+            user_id,
+            offset,
+            limit,
+            true,
+        )
+        .await
+    }
+
     pub(crate) async fn list_continue_watching_for_library_ids(
         &self,
         library_ids: &[String],
@@ -1259,7 +1277,6 @@ impl CatalogService {
             offset,
             limit,
             true,
-            &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await
     }
@@ -1277,7 +1294,6 @@ impl CatalogService {
             offset,
             limit,
             true,
-            &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await
     }
@@ -1288,25 +1304,27 @@ impl CatalogService {
         user_id: &str,
         offset: i64,
         limit: i64,
-        latest_episode_per_series: bool,
-        item_types: &[&str],
+        include_next_unplayed_episode: bool,
     ) -> Result<CatalogPage, CatalogError> {
         let (played_percent, minimum_ticks) = self.database.home_resume_settings(user_id).await?;
-        let (rows, total) = self
-            .database
-            .list_resume_items_with_total(
-                &ResumeItemsQuery {
-                    user_id,
-                    library_ids,
-                    item_types,
-                    played_percent,
-                    minimum_ticks,
-                    offset,
-                    limit,
-                },
-                latest_episode_per_series,
-            )
-            .await?;
+        let query = ResumeItemsQuery {
+            user_id,
+            library_ids,
+            item_types: &["MOVIE", "EPISODE", "VIDEO"],
+            played_percent,
+            minimum_ticks,
+            offset,
+            limit,
+        };
+        let (rows, total) = if include_next_unplayed_episode {
+            self.database
+                .list_home_resume_items_with_total(&query, true)
+                .await?
+        } else {
+            self.database
+                .list_resume_items_with_total(&query, true)
+                .await?
+        };
         Ok(CatalogPage {
             items: assemble_items(rows),
             total,

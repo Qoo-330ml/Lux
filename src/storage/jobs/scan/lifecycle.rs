@@ -10,24 +10,52 @@ impl Database {
         total_count: i64,
         auto_metadata_match: bool,
     ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO scan_jobs (
-                id, library_id, job_type, status, generation, total_count, auto_metadata_match
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(library_id)
-        .bind(job_type)
-        .bind(generation)
-        .bind(total_count)
-        .bind(database_flag(auto_metadata_match))
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        for _ in 0..50 {
+            let mut transaction = self.begin_scan_write_transaction().await?;
+            if !self
+                .lock_scan_fingerprint_migration_state(&mut transaction, library_id)
+                .await?
+            {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+            self.query(
+                "INSERT INTO scan_jobs (
+                    id, library_id, job_type, status, generation, total_count,
+                    auto_metadata_match
+                 ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(library_id)
+            .bind(job_type)
+            .bind(generation)
+            .bind(total_count)
+            .bind(database_flag(auto_metadata_match))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        }
+        Err(StorageError::Conflict(
+            "scan fingerprint migration lease did not clear in time".to_owned(),
+        ))
     }
 
     pub(crate) async fn enable_scan_job_auto_metadata_match(
@@ -79,7 +107,8 @@ impl Database {
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -104,7 +133,8 @@ impl Database {
         let rows = if let Some(status) = status {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
-                        processed_count, total_count, cancel_requested, error,
+                        processed_count, total_count, processed_media_count,
+                        cancel_requested, error,
                         created_at, started_at, finished_at,
                         discovery_completed, auto_metadata_match,
                         current_item, scan_phase
@@ -119,7 +149,8 @@ impl Database {
         } else {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
-                        processed_count, total_count, cancel_requested, error,
+                        processed_count, total_count, processed_media_count,
+                        cancel_requested, error,
                         created_at, started_at, finished_at,
                         discovery_completed, auto_metadata_match,
                         current_item, scan_phase
@@ -144,7 +175,8 @@ impl Database {
     ) -> Result<Vec<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -191,7 +223,8 @@ impl Database {
     ) -> Result<Vec<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -233,7 +266,8 @@ impl Database {
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -258,7 +292,8 @@ impl Database {
     ) -> Result<Option<StoredScanJob>, StorageError> {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
-                    processed_count, total_count, cancel_requested, error,
+                    processed_count, total_count, processed_media_count,
+                    cancel_requested, error,
                     created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
@@ -534,7 +569,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'COMPLETED', error = NULL, cursor = NULL,
+                 SET status = 'COMPLETED', error = 'POSTPROCESSING_FAILED', cursor = NULL,
                      current_item = NULL, cancel_requested = 0,
                      scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
                      updated_at = unixepoch()
@@ -573,6 +608,40 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let library_id = self
+            .query_scalar::<Option<String>>("SELECT library_id FROM scan_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .flatten();
+        let Some(library_id) = library_id else {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+        if !self
+            .lock_scan_fingerprint_migration_state(&mut transaction, &library_id)
+            .await?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
         let result = self
             .query(
                 "UPDATE scan_jobs
@@ -587,12 +656,35 @@ impl Database {
                    AND scan_phase = 'IDLE'
                    AND NOT EXISTS (
                        SELECT 1 FROM reconciliation_scan_entries
-                       WHERE job_id = ?
-                   )",
+                       WHERE job_id = ? AND status = 'PENDING'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_jobs active
+                       WHERE active.library_id = scan_jobs.library_id
+                         AND active.job_type = scan_jobs.job_type
+                         AND active.status IN ('PENDING', 'RUNNING')
+                   )
+                   AND (status != 'COMPLETED' OR EXISTS (
+                       SELECT 1 FROM scan_job_targets t WHERE t.job_id = scan_jobs.id
+                         AND (t.probe_state IN ('PENDING', 'FAILED')
+                           OR t.metadata_state IN ('PENDING', 'FAILED')
+                           OR t.thumbnail_state IN ('PENDING', 'FAILED'))
+                   ) OR EXISTS (
+                       SELECT 1 FROM scan_manifests m WHERE m.job_id = scan_jobs.id
+                         AND m.workflow_version IN (2, 3) AND m.discovery_format_version = 3
+                         AND m.postprocessing_targets_ready = 0
+                   ))",
             )
             .bind(id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -602,20 +694,62 @@ impl Database {
     }
 
     pub(crate) async fn retry_scan_job(&self, id: &str) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE scan_jobs
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let library_id = self
+            .query_scalar::<Option<String>>("SELECT library_id FROM scan_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .flatten();
+        let Some(library_id) = library_id else {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+        if !self
+            .lock_scan_fingerprint_migration_state(&mut transaction, &library_id)
+            .await?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        let result = self
+            .query(
+                "UPDATE scan_jobs
              SET status = 'PENDING', cancel_requested = 0, error = NULL,
                  current_item = NULL, scan_phase = 'IDLE',
                  started_at = NULL, finished_at = NULL, updated_at = unixepoch()
              WHERE id = ? AND status IN ('FAILED', 'CANCELLED')",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 }

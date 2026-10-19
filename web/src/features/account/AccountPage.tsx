@@ -17,7 +17,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { Library, LuxUser } from "../../lib/api/types";
+import type { AuthSession, Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
 import { useAvatar } from "../../components/layout/LuxShell";
 import { calculateAvatarCrop, cropAvatarImage, DEFAULT_AVATAR_CROP, type AvatarCrop } from "./avatar-image";
@@ -34,6 +34,7 @@ import {
 export function AccountPage({ user }: { user: LuxUser }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const accountProfile = useQuery({ queryKey: queryKeys.accountProfile, queryFn: () => api.accountProfile() });
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const playbackSettings = useQuery({ queryKey: queryKeys.userSettings, queryFn: () => api.userSettings() });
   const libraryOrder = useQuery({ queryKey: queryKeys.libraryOrder, queryFn: () => api.libraryOrder() });
@@ -55,6 +56,8 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [playedPercent, setPlayedPercent] = useState("95");
   const [playedPercentNotice, setPlayedPercentNotice] = useState<string | null>(null);
   const [profileName, setProfileName] = useState(user.displayName || user.usernameNormalized);
+  const [profileEmail, setProfileEmail] = useState("");
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -159,6 +162,28 @@ export function AccountPage({ user }: { user: LuxUser }) {
     },
     onError: (error) => setPasswordNotice(error instanceof Error ? `密码修改失败：${error.message}` : "密码修改失败，请重试。"),
   });
+
+  const saveProfile = useMutation({
+    mutationFn: () => api.updateAccountProfile({ displayName: profileName, email: profileEmail }),
+    onSuccess: ({ user: updatedUser }) => {
+      setProfileName(updatedUser.displayName || updatedUser.usernameNormalized);
+      setProfileEmail(updatedUser.email ?? "");
+      setProfileNotice("账户资料已保存");
+      queryClient.setQueryData(queryKeys.accountProfile, { user: updatedUser });
+      queryClient.setQueryData<AuthSession>(queryKeys.me, (current) => current
+        ? { ...current, user: { ...current.user, ...updatedUser } }
+        : current);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.me });
+    },
+    onError: (error) => setProfileNotice(error instanceof Error ? `资料保存失败：${error.message}` : "资料保存失败，请重试。"),
+  });
+
+  useEffect(() => {
+    const profileUser = accountProfile.data?.user;
+    if (!profileUser) return;
+    setProfileName(profileUser.displayName || profileUser.usernameNormalized);
+    setProfileEmail(profileUser.email ?? "");
+  }, [accountProfile.data?.user]);
 
   useEffect(() => {
     if (
@@ -547,10 +572,18 @@ export function AccountPage({ user }: { user: LuxUser }) {
               </div>
             </div>
             <div className="lux-setting-divider" />
-            <div className="lux-setting-form-grid lux-account-form-grid">
+            <form className="lux-setting-form-grid lux-account-form-grid" onSubmit={(event) => { event.preventDefault(); setProfileNotice(null); saveProfile.mutate(); }}>
               <label className="lux-setting-field"><span>显示名称</span><input value={profileName} onChange={(event) => setProfileName(event.target.value)} /></label>
               <label className="lux-setting-field"><span>账号</span><input value={user.usernameNormalized} readOnly /></label>
-            </div>
+              <label className="lux-setting-field"><span>邮箱</span><input type="email" value={profileEmail} onChange={(event) => setProfileEmail(event.target.value)} autoComplete="email" placeholder="可选" /></label>
+              <div className="lux-setting-field lux-account-profile-save">
+                <span>邮箱状态</span>
+                <small>{accountProfile.isPending ? "正在读取资料…" : accountProfile.data?.user.emailVerifiedAt ? "邮箱已验证" : profileEmail ? "邮箱未验证；邮件验证功能接入后可发送验证邮件。" : "尚未设置邮箱"}</small>
+                <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={saveProfile.isPending || accountProfile.isPending}>{saveProfile.isPending ? "保存中…" : "保存资料"}</button>
+              </div>
+            </form>
+            {accountProfile.error ? <p className="lux-error-copy" role="alert">账户资料读取失败：{accountProfile.error.message}</p> : null}
+            {profileNotice ? <p className={saveProfile.error ? "lux-error-copy" : "lux-account-notice"} role={saveProfile.error ? "alert" : "status"}>{profileNotice}</p> : null}
             <form className="lux-password-panel" onSubmit={submitPasswordChange}>
               <input className="lux-visually-hidden" type="text" value={user.usernameNormalized} readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" />
               <div className="lux-setting-block-heading"><div><strong>修改密码</strong><p>使用一个没有在其他服务重复使用的新密码。</p></div><ShieldCheck size={18} aria-hidden="true" /></div>

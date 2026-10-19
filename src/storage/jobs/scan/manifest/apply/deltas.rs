@@ -39,6 +39,29 @@ impl Database {
         let mut removed_sidecar_paths = Vec::new();
         let mut removed_media_entry_ids = Vec::new();
         let mut delta_updates = Vec::with_capacity(batch.deltas.len());
+        let unresolved_files_to_materialize = batch
+            .deltas
+            .iter()
+            .filter(|delta| {
+                delta.delta_kind == "ADD"
+                    && !unstable_ids.contains(delta.id.as_str())
+                    && claimed_add_paths.contains(&delta.relative_path)
+                    && root_state.as_deref() == Some("COMPLETE")
+            })
+            .filter_map(|delta| unresolved_files.get(delta.relative_path.as_str()))
+            .map(|file| (**file).clone())
+            .collect::<Vec<_>>();
+        self.materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
+            transaction,
+            batch.library_id,
+            batch.library_root_id,
+            &unresolved_files_to_materialize,
+        )
+        .await?;
+        result.created_items = result
+            .created_items
+            .saturating_add(unresolved_files_to_materialize.len());
+
         for delta in batch.deltas {
             let mut state = "APPLIED";
             let mut error = None;
@@ -77,6 +100,7 @@ impl Database {
                                         .to_owned(),
                                 )
                             })?,
+                            delta.device,
                             delta.inode,
                             delta.fingerprint.as_deref().ok_or_else(|| {
                                 StorageError::Conflict(
@@ -90,7 +114,7 @@ impl Database {
 
                 let applied = match delta.delta_kind.as_str() {
                     "ADD" => {
-                        let Some((entry_kind, _, _, _, _)) = observation else {
+                        let Some((entry_kind, _, _, _, _, _)) = observation else {
                             return Err(StorageError::Conflict(
                                 "add delta is missing its observation".to_owned(),
                             ));
@@ -104,20 +128,8 @@ impl Database {
                             false
                         } else if movie_files.contains_key(delta.relative_path.as_str())
                             || episode_files.contains_key(delta.relative_path.as_str())
+                            || unresolved_files.contains_key(delta.relative_path.as_str())
                         {
-                            new_paths.push(delta.relative_path.clone());
-                            true
-                        } else if let Some(file) =
-                            unresolved_files.get(delta.relative_path.as_str())
-                        {
-                            self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
-                                transaction,
-                                batch.library_id,
-                                batch.library_root_id,
-                                file,
-                            )
-                            .await?;
-                            result.created_items = result.created_items.saturating_add(1);
                             new_paths.push(delta.relative_path.clone());
                             true
                         } else if sidecar_entries.contains_key(delta.relative_path.as_str()) {
@@ -135,7 +147,8 @@ impl Database {
                                 "change delta has no baseline entry".to_owned(),
                             ));
                         };
-                        let Some((entry_kind, size, modified_at, inode, fingerprint)) = observation
+                        let Some((entry_kind, size, modified_at, device, inode, fingerprint)) =
+                            observation
                         else {
                             return Err(StorageError::Conflict(
                                 "change delta is missing its observation".to_owned(),
@@ -159,6 +172,7 @@ impl Database {
                                     expected_missing,
                                     size,
                                     modified_at,
+                                    device,
                                     inode,
                                     fingerprint,
                                     generation: batch.generation,
@@ -183,6 +197,7 @@ impl Database {
                                     expected_missing,
                                     size,
                                     modified_at,
+                                    device,
                                     inode,
                                     fingerprint,
                                     generation: batch.generation,
@@ -209,6 +224,7 @@ impl Database {
                                     expected_missing,
                                     size,
                                     modified_at,
+                                    device,
                                     inode,
                                     fingerprint,
                                     generation: batch.generation,
@@ -225,7 +241,7 @@ impl Database {
                         } else {
                             self.query(
                                 "UPDATE filesystem_entries
-                                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                                SET size = ?, modified_at = ?, device = ?, inode = ?, fingerprint = ?,
                                      last_seen_generation = ?, is_missing = 0,
                                      updated_at = unixepoch()
                                  WHERE id = ? AND library_root_id = ? AND relative_path = ?
@@ -234,6 +250,7 @@ impl Database {
                             )
                             .bind(size)
                             .bind(modified_at)
+                            .bind(device)
                             .bind(inode)
                             .bind(fingerprint)
                             .bind(batch.generation)

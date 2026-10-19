@@ -1,4 +1,5 @@
 import type {
+  AccountProfile,
   AuthSession,
   AdminAuditEvent,
   AdminDashboard,
@@ -33,6 +34,9 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
+  AdminUserPlaybackPolicy,
+  AdminUserListQuery,
+  AdminUserListResponse,
   AdminMetadataCandidate,
   AdminMetadataBatchConfirmation,
   AdminItemMergeResult,
@@ -315,6 +319,17 @@ export class LuxApiClient {
 
   me() {
     return this.request<AuthSession>("/api/v1/auth/me");
+  }
+
+  accountProfile() {
+    return this.request<{ user: AccountProfile }>("/api/v1/auth/profile");
+  }
+
+  updateAccountProfile(input: { displayName: string; email: string }) {
+    return this.request<{ user: AccountProfile }>("/api/v1/auth/profile", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
   }
 
   userSettings() {
@@ -1070,8 +1085,57 @@ export class LuxApiClient {
     );
   }
 
-  adminUsers() {
-    return this.request<{ users?: AdminUser[] }>("/api/v1/admin/users");
+  adminUsers(options: Partial<AdminUserListQuery> = {}) {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      pageSize: String(options.pageSize ?? 20),
+      status: options.status ?? "all",
+      sortBy: options.sortBy ?? "lastActivityAt",
+      sortOrder: options.sortOrder ?? "desc",
+    });
+    if (options.search?.trim()) params.set("search", options.search.trim());
+    return this.request<AdminUserListResponse>(`/api/v1/admin/users?${params}`);
+  }
+
+  adminUser(userId: string) {
+    return this.request<{ user?: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  adminUserPlaybackPolicy(userId: string) {
+    return this.request<{ policy: AdminUserPlaybackPolicy }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-policy`,
+    );
+  }
+
+  updateAdminUserPlaybackPolicy(userId: string, input: AdminUserPlaybackPolicy) {
+    return this.request<{ policy: AdminUserPlaybackPolicy }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-policy`,
+      { method: "PUT", body: JSON.stringify(input) },
+    );
+  }
+
+  adminUserAvatarUrl(userId: string, cacheKey?: string) {
+    const path = `/api/v1/admin/users/${encodeURIComponent(userId)}/avatar`;
+    return cacheKey ? `${path}?v=${encodeURIComponent(cacheKey)}` : path;
+  }
+
+  uploadAdminUserAvatar(userId: string, file: File) {
+    return this.request<{ avatarUrl: string }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/avatar`,
+      { method: "PUT", headers: { "Content-Type": file.type }, body: file },
+    );
+  }
+
+  updateAdminUserProfile(
+    userId: string,
+    input: { displayName: string; email: string },
+  ) {
+    return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/profile`,
+      { method: "PATCH", body: JSON.stringify(input) },
+    );
   }
 
   createAdminUser(input: {
@@ -1101,8 +1165,22 @@ export class LuxApiClient {
   }
 
   deleteAdminUser(userId: string) {
-    return this.request<void>(
+    return this.request<{ user: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  restoreAdminUser(userId: string) {
+    return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/restore`,
+      { method: "POST" },
+    );
+  }
+
+  purgeAdminUser(userId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/purge`,
       { method: "DELETE" },
     );
   }
@@ -1120,14 +1198,17 @@ export class LuxApiClient {
     );
   }
 
-  adminJobs(status?: string) {
+  adminJobs(status?: string, filter?: { hasPostprocessingIssues?: boolean }) {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);
+    if (filter?.hasPostprocessingIssues !== undefined) {
+      params.set("hasPostprocessingIssues", String(filter.hasPostprocessingIssues));
+    }
     return this.request<{ jobs?: AdminJob[] }>(`/api/v1/admin/jobs?${params}`);
   }
 
-  adminJobEvents(jobId: string, level = "ERROR") {
-    const params = new URLSearchParams({ page: "1", pageSize: "1", level });
+  adminJobEvents(jobId: string, level = "ERROR", options?: { pageSize?: number }) {
+    const params = new URLSearchParams({ page: "1", pageSize: String(options?.pageSize ?? 1), level });
     return this.request<AdminJobEventPage>(
       `/api/v1/admin/jobs/${encodeURIComponent(jobId)}/events?${params}`,
     );

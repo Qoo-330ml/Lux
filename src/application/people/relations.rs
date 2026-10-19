@@ -317,12 +317,9 @@ impl PeopleService {
         let relation_guard = self.relation_lock_for(&relation_path).await;
         let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
-        acquire_exclusive_file_lock(&lock_path).await?;
-        let result = self
-            .update_item_actor_metadata_locked(item_id, &relation_path, provider, actors)
-            .await;
-        let _ = fs::remove_file(&lock_path).await;
-        result
+        let _file_lock_guard = acquire_exclusive_file_lock(&lock_path).await?;
+        self.update_item_actor_metadata_locked(item_id, &relation_path, provider, actors)
+            .await
     }
 
     pub(super) async fn update_item_actor_metadata_locked(
@@ -427,19 +424,16 @@ impl PeopleService {
         let relation_guard = self.relation_lock_for(&relation_path).await;
         let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
-        acquire_exclusive_file_lock(&lock_path).await?;
-        let result = self
-            .persist_item_actors_with_source_locked(
-                item_id,
-                provider,
-                actors,
-                source_fingerprint,
-                &relation_path,
-                deferred_credits,
-            )
-            .await;
-        let _ = fs::remove_file(&lock_path).await;
-        result
+        let _file_lock_guard = acquire_exclusive_file_lock(&lock_path).await?;
+        self.persist_item_actors_with_source_locked(
+            item_id,
+            provider,
+            actors,
+            source_fingerprint,
+            &relation_path,
+            deferred_credits,
+        )
+        .await
     }
 
     pub(super) async fn persist_item_actors_with_source_locked(
@@ -1245,8 +1239,8 @@ impl PeopleService {
         options: PersonManifestWriteOptions<'_>,
     ) -> Result<(), PeopleError> {
         let manifest_path = person_dir.join(PERSON_MANIFEST);
-        acquire_person_manifest_lock(&manifest_path).await?;
-        let result = async {
+        let _manifest_lock_guard = acquire_person_manifest_lock(&manifest_path).await?;
+        async {
             let existing = read_people_file(&manifest_path).await?;
             let mut manifest = existing
                 .map(|bytes| {
@@ -1344,8 +1338,6 @@ impl PeopleService {
                 .await?;
             write_atomically(&manifest_path, &bytes).await
         }
-        .await;
-        let _ = fs::remove_file(&manifest_path.with_file_name(".person.json.lock")).await;
-        result
+        .await
     }
 }

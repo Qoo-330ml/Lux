@@ -29,6 +29,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
     let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET max_simultaneous_playbacks = 0 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let viewer = UserStore::new(database.clone())?
         .create_user("viewer", "Viewer", "viewer password", false)
         .await?;
@@ -170,6 +174,31 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await?;
     assert_eq!(generic_stream.status(), reqwest::StatusCode::OK);
     assert_eq!(generic_stream.bytes().await?.as_ref(), b"0123456789");
+    let tampered_play_session =
+        generic_direct_url.replacen("PlaySessionId=", "PlaySessionId=forged-", 1);
+    let tampered_play_session_stream = client
+        .get(format!("{base_url}{tampered_play_session}"))
+        .send()
+        .await?;
+    assert_eq!(
+        tampered_play_session_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let without_play_session = generic_direct_url
+        .split_once("&PlaySessionId=")
+        .and_then(|(prefix, rest)| {
+            rest.split_once('&')
+                .map(|(_, suffix)| format!("{prefix}&{suffix}"))
+        })
+        .ok_or("direct URL has no PlaySessionId")?;
+    let missing_play_session_stream = client
+        .get(format!("{base_url}{without_play_session}"))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_play_session_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let yamby_playback = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .header(
@@ -361,6 +390,419 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 }
 
 #[tokio::test]
+async fn emby_direct_playback_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8098".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET max_simultaneous_playbacks = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Admission.Movie.2024.mkv"), b"0123456789").await?;
+    tokio::fs::write(
+        root.join("Admission Remote 2024.strm"),
+        "https://example.invalid/media/movie.mp4\n",
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT mi.id FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Admission.Movie.2024.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let emby_item_id = emby_public_id(&item_id);
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="PlaybackTest", Device="Mac", DeviceId="admission-test", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+
+    let first_info = client
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first_info.status(), reqwest::StatusCode::OK);
+    let first_body = first_info.json::<Value>().await?;
+    let first_play_session_id = first_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing first play session id")?
+        .to_owned();
+    let first_url = first_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing first direct stream URL")?
+        .to_owned();
+
+    let second_info = client
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second_info.status(), reqwest::StatusCode::OK);
+    let second_body = second_info.json::<Value>().await?;
+    let media_source_id = second_body["MediaSources"][0]["Id"]
+        .as_str()
+        .ok_or("missing media source id")?
+        .to_owned();
+    let second_play_session_id = second_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing second play session id")?
+        .to_owned();
+    let second_url = second_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing second direct stream URL")?
+        .to_owned();
+    assert_ne!(first_play_session_id, second_play_session_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'"
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "PlaybackInfo prechecks must not reserve a slot"
+    );
+
+    let head = client.head(format!("{base_url}{first_url}")).send().await?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'"
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "HEAD must not reserve a slot"
+    );
+
+    let first_stream = client.get(format!("{base_url}{first_url}")).send().await?;
+    assert_eq!(first_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(first_stream.bytes().await?.as_ref(), b"0123456789");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'"
+        )
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "the first GET must reserve one slot"
+    );
+
+    let repeated_range = client
+        .get(format!("{base_url}{first_url}"))
+        .header(RANGE, "bytes=1-3")
+        .send()
+        .await?;
+    assert_eq!(
+        repeated_range.status(),
+        reqwest::StatusCode::PARTIAL_CONTENT
+    );
+    assert_eq!(repeated_range.bytes().await?.as_ref(), b"123");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'"
+        )
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "Range requests must reuse the PlaySessionId"
+    );
+
+    sqlx::query(
+        "UPDATE playback_admissions SET admitted_at = unixepoch() - 10,
+             last_seen_at = unixepoch() - 10
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&first_play_session_id)
+    .execute(database.pool())
+    .await?;
+    let last_seen_before_pause: i64 = sqlx::query_scalar(
+        "SELECT last_seen_at FROM playback_admissions WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&first_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    let paused = client
+        .post(format!("{base_url}/Sessions/Playing/Progress"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": media_source_id,
+            "PlaySessionId": first_play_session_id,
+            "PositionTicks": 3,
+            "RunTimeTicks": 10,
+            "IsPaused": true,
+            "DeviceId": "admission-test"
+        }))
+        .send()
+        .await?;
+    assert_eq!(paused.status(), reqwest::StatusCode::NO_CONTENT);
+    let last_seen_after_pause: i64 = sqlx::query_scalar(
+        "SELECT last_seen_at FROM playback_admissions WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&first_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(last_seen_after_pause > last_seen_before_pause);
+
+    let second_stream = client.get(format!("{base_url}{second_url}")).send().await?;
+    assert_eq!(
+        second_stream.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    let denial = second_stream.text().await?;
+    assert!(denial.contains("当前 1 路"), "unexpected denial: {denial}");
+    assert!(denial.contains("上限 1 路"), "unexpected denial: {denial}");
+
+    let denied_info = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str()), ("forceTranscode", "true")])
+        .json(&json!({
+            "MediaSourceId": media_source_id,
+            "EnableDirectPlay": true,
+            "EnableDirectStream": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(denied_info.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let denied_info_body = denied_info.text().await?;
+    assert!(
+        denied_info_body.contains("当前 1 路"),
+        "unexpected denial: {denied_info_body}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "a denied PlaybackInfo request must not create an HLS session"
+    );
+
+    let stopped = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "PlaySessionId": first_play_session_id
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'"
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "STOPPED must release the admission"
+    );
+
+    let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Admission Remote 2024.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let strm_item_public_id = emby_public_id(&strm_item_id);
+    let strm_info = client
+        .get(format!(
+            "{base_url}/Items/{strm_item_public_id}/PlaybackInfo"
+        ))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(strm_info.status(), reqwest::StatusCode::OK);
+    let strm_body = strm_info.json::<Value>().await?;
+    let strm_play_session_id = strm_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing STRM play session id")?
+        .to_owned();
+    let strm_url = strm_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing STRM direct stream URL")?
+        .to_owned();
+    let strm_handoff = client.get(format!("{base_url}{strm_url}")).send().await?;
+    assert_eq!(strm_handoff.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        strm_handoff.headers()[reqwest::header::LOCATION],
+        "https://example.invalid/media/movie.mp4"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "STRM handoff must reserve a playback slot"
+    );
+    let blocked_while_strm_active = client.get(format!("{base_url}{second_url}")).send().await?;
+    assert_eq!(
+        blocked_while_strm_active.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    let stopped_strm = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": strm_item_public_id,
+            "MediaSourceId": strm_source_id,
+            "PlaySessionId": strm_play_session_id
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped_strm.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let admitted_after_stop = client.get(format!("{base_url}{second_url}")).send().await?;
+    assert_eq!(admitted_after_stop.status(), reqwest::StatusCode::OK);
+    sqlx::query("UPDATE users SET can_play = 0 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let disabled_info = client
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(disabled_info.status(), reqwest::StatusCode::FORBIDDEN);
+    let disabled_stream = client.get(format!("{base_url}{second_url}")).send().await?;
+    assert_eq!(disabled_stream.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "disabling playback must preserve the already-admitted session"
+    );
+    let stopped_second = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "PlaySessionId": second_play_session_id
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped_second.status(), reqwest::StatusCode::NO_CONTENT);
+
+    sqlx::query("UPDATE users SET can_play = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let legacy_device_id = "legacy-admission-device";
+    let legacy_session_id = format!("{item_id}:{legacy_device_id}");
+    let legacy_stream = client
+        .get(format!("{base_url}/Videos/{emby_item_id}/{media_source_id}/stream.mkv"))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("MediaSourceId", media_source_id.as_str()),
+        ])
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                "Emby UserId={},Client=PlaybackTest,Device=Mac,DeviceId={legacy_device_id},Version=1",
+                admin.id
+            ),
+        )
+        .send()
+        .await?;
+    assert_eq!(legacy_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(legacy_stream.bytes().await?.as_ref(), b"0123456789");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions
+             WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(admin.id.to_string())
+        .bind(&legacy_session_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "legacy requests must use a stable item/device session id"
+    );
+    let stopped_legacy = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": media_source_id,
+            "DeviceId": legacy_device_id
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped_legacy.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions
+             WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(admin.id.to_string())
+        .bind(&legacy_session_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "legacy STOPPED callback must release the stable fallback session"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -445,6 +887,14 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
         .send()
         .await?;
     assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM playback_admissions WHERE user_id = ?",)
+            .bind(admin.id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        0,
+        "playback callbacks must not create admission records"
+    );
 
     let sessions = client
         .get(format!("{base_url}/Sessions"))
@@ -654,7 +1104,11 @@ async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET max_simultaneous_playbacks = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -1021,17 +1475,84 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     let device_profile_starts = config
         .config_dir
         .join("web-playback")
-        .join(device_profile_hls_session_id)
+        .join(&device_profile_hls_session_id)
         .join("starts.log");
     assert!(
         !device_profile_starts.exists(),
         "PlaybackInfo must reserve the Emby HLS session without starting FFmpeg"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "PlaybackInfo must not occupy a playback slot"
+    );
+
+    let second_hls_info = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str()), ("forceTranscode", "true")])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": true,
+            "EnableDirectStream": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(second_hls_info.status(), reqwest::StatusCode::OK);
+    let second_hls_body = second_hls_info.json::<Value>().await?;
+    let second_hls_play_session_id = second_hls_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing second HLS session")?
+        .to_owned();
+    let second_hls_url = second_hls_body["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .ok_or("missing second HLS URL")?
+        .to_owned();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "preparing another HLS session must not occupy a slot"
+    );
+
+    let head_manifest = client
+        .head(format!("{base_url}{device_profile_url}"))
+        .send()
+        .await?;
+    assert_eq!(head_manifest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "HEAD manifest must not occupy a slot"
     );
     let device_profile_manifest = client
         .get(format!("{base_url}{device_profile_url}"))
         .send()
         .await?;
     assert_eq!(device_profile_manifest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "the first manifest GET must admit the session"
+    );
     let device_profile_manifest = device_profile_manifest.text().await?;
     assert!(
         !device_profile_starts.exists(),
@@ -1040,6 +1561,40 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert!(device_profile_manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
     assert!(device_profile_manifest.contains("#EXT-X-ENDLIST\n"));
     assert!(device_profile_manifest.contains("#EXTINF:2.336000,"));
+    let blocked_hls = client
+        .get(format!("{base_url}{second_hls_url}"))
+        .send()
+        .await?;
+    assert_eq!(blocked_hls.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let blocked_hls_body = blocked_hls.text().await?;
+    assert!(blocked_hls_body.contains("当前 1 路"));
+    let second_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE play_session_id = ?")
+            .bind(&second_hls_play_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(second_hls_state, "STOPPED");
+    let second_hls_session_id = second_hls_play_session_id
+        .strip_prefix("lux-emby:")
+        .ok_or("invalid second HLS play session")?;
+    assert!(
+        !config
+            .config_dir
+            .join("web-playback")
+            .join(second_hls_session_id)
+            .exists(),
+        "denied HLS session resources must be removed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "a denied HLS session must not stop or replace the admitted session"
+    );
     let resumed_seek_segment_url = device_profile_manifest
         .lines()
         .find(|line| line.contains("segment_001230.m4s?"))
@@ -1052,6 +1607,16 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert_eq!(
         resumed_seek_segment.bytes().await?.as_ref(),
         b"segment-1230"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "HLS segments must reuse the manifest admission"
     );
     let beginning_segment_url = device_profile_manifest
         .lines()
@@ -1069,6 +1634,59 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         tokio::fs::read_to_string(&device_profile_starts).await?,
         "1230\n0\n"
     );
+    let device_profile_tier: i64 =
+        sqlx::query_scalar("SELECT tier FROM web_playback_sessions WHERE id = ?")
+            .bind(&device_profile_hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        (3..=4).contains(&device_profile_tier),
+        "this DeviceProfile request needs video transcoding"
+    );
+    sqlx::query("UPDATE users SET allow_video_transcode = 0 WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let revoked_device_profile_segment = client
+        .get(format!("{base_url}{beginning_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        revoked_device_profile_segment.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let reused_revoked_device_profile_segment = client
+        .get(format!("{base_url}{beginning_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        reused_revoked_device_profile_segment.status(),
+        reqwest::StatusCode::GONE
+    );
+    let revoked_device_profile_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(&device_profile_hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(revoked_device_profile_state, "STOPPED");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "revoking the HLS tier releases the Emby admission"
+    );
+    assert!(
+        !config
+            .config_dir
+            .join("web-playback")
+            .join(&device_profile_hls_session_id)
+            .exists(),
+        "revoking the HLS tier removes Emby temporary resources"
+    );
     let device_profile_stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .query(&[("api_key", token.as_str())])
@@ -1083,6 +1701,20 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         device_profile_stopped.status(),
         reqwest::StatusCode::NO_CONTENT
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "STOPPED must release the HLS admission"
+    );
+    sqlx::query("UPDATE users SET allow_video_transcode = 1 WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
 
     let get_with_device_profile = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
@@ -1398,6 +2030,38 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
             .join("web-playback")
             .join(session_id)
             .exists()
+    );
+
+    sqlx::query(
+        "UPDATE users SET allow_remux = 0, allow_audio_transcode = 0,
+             allow_video_transcode = 0 WHERE id = ?",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    let policy_denied_transcoding = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": false,
+            "EnableDirectStream": false,
+            "EnableTranscoding": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        policy_denied_transcoding.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "a policy-denied Emby request must not leave an HLS session"
     );
 
     let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(

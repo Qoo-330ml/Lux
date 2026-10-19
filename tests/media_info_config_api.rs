@@ -48,6 +48,7 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         config_dir,
     };
     let database = Database::connect(&config).await?;
+    let database_for_assertions = database.clone();
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -83,6 +84,51 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         .ok_or("missing library id")?
         .to_owned();
 
+    let media_root = temp_dir.path().join("remote-media");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(
+        media_root.join("Remote.Movie.2024.strm"),
+        "https://example.invalid/movie.mkv",
+    )
+    .await?;
+    let media_root_path = media_root.to_string_lossy().into_owned();
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('auto-strm-root', ?, ?, ?, 1, 1)",
+    )
+    .bind(&library_id)
+    .bind(&media_root_path)
+    .bind(&media_root_path)
+    .execute(database_for_assertions.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation, is_missing
+         ) VALUES ('auto-strm-entry', 'auto-strm-root', 'Remote.Movie.2024.strm',
+                   'FILE', 48, 1, 'generation', 0)",
+    )
+    .execute(database_for_assertions.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('auto-strm-item', ?, 'MOVIE', 'Remote Movie', 'remote movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database_for_assertions.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, external_url,
+             strm_target_kind, probe_status
+         ) VALUES ('auto-strm-source', 'auto-strm-item', 'STRM_URL', 'auto-strm-entry',
+                  'https://example.invalid/movie.mkv', 'URL', 'NOT_CONFIGURED')",
+    )
+    .execute(database_for_assertions.pool())
+    .await?;
+
     let installed = client
         .post(format!(
             "{base_url}/api/v1/admin/plugins/org.lux.strm-media-info/install"
@@ -116,6 +162,23 @@ async fn media_info_plugin_config_api_drives_a_background_run()
     assert_eq!(
         updated.json::<Value>().await?["plugin"]["configValues"]["concurrency"],
         3
+    );
+    let mut auto_queued = false;
+    for _ in 0..100 {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM strm_probe_jobs WHERE library_id = ?")
+                .bind(&library_id)
+                .fetch_one(database_for_assertions.pool())
+                .await?;
+        if count > 0 {
+            auto_queued = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        auto_queued,
+        "saving a new library selection should queue a STRM job"
     );
 
     let scheduled = client
@@ -153,6 +216,18 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         .cloned()
         .ok_or("missing STRM plugin")?;
     assert_eq!(plugin["configValues"]["schedule"], "0 4 * * *");
+
+    for _ in 0..200 {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')",
+        )
+        .fetch_one(database_for_assertions.pool())
+        .await?;
+        if active == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     let run = client
         .post(format!(

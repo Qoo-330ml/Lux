@@ -223,7 +223,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(dialog?.textContent).toContain("文件夹");
     expect(dialog?.textContent).not.toContain("开启后，实时索引完成会为受影响的新资源提交元数据和图片补全任务。");
     expect(
-      dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库实时新增资源自动刮削']")?.checked,
+      dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库新增/变化资源自动刮削']")?.checked,
     ).toBe(true);
     const nameInput = dialog?.querySelector<HTMLInputElement>("#new-library-name");
     const rootInput = dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库根路径']");
@@ -293,7 +293,7 @@ describe("AdminLibrariesPage library cards", () => {
     await act(async () => document.querySelector<HTMLButtonElement>("[data-value='HOMEVIDEOS']")?.click());
 
     expect(dialog?.querySelector(".lux-admin-scraper-list-field")).toBeNull();
-    expect(dialog?.querySelector("[aria-label='新媒体库实时新增资源自动刮削']")).toBeNull();
+    expect(dialog?.querySelector("[aria-label='新媒体库新增/变化资源自动刮削']")).toBeNull();
     const nameInput = dialog?.querySelector<HTMLInputElement>("#new-library-name");
     await act(async () => {
       if (!nameInput) throw new Error("new library name input missing");
@@ -606,7 +606,7 @@ describe("AdminLibrariesPage library cards", () => {
     await act(async () => document.querySelector<HTMLButtonElement>("[data-value='HOMEVIDEOS']")?.click());
 
     expect(dialog?.querySelector(".lux-admin-scraper-list-field")).toBeNull();
-    expect(dialog?.querySelector("[aria-label='01每日更新 实时新增资源自动刮削']")).toBeNull();
+    expect(dialog?.querySelector("[aria-label='01每日更新 新增/变化资源自动刮削']")).toBeNull();
     await act(async () => {
       [...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
         .find((button) => button.textContent?.includes("保存修改"))
@@ -699,7 +699,7 @@ describe("AdminLibrariesPage library cards", () => {
       watchToggle?.click();
       await vi.waitFor(() => expect(updateLibrary).toHaveBeenCalledWith("library-1", { realtimeWatchEnabled: false }));
     });
-    const toggle = container.querySelector<HTMLInputElement>("[aria-label='01每日更新 实时新增资源自动刮削']");
+    const toggle = container.querySelector<HTMLInputElement>("[aria-label='01每日更新 新增/变化资源自动刮削']");
     expect(toggle?.checked).toBe(false);
 
     await act(async () => {

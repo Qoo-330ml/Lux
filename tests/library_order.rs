@@ -63,7 +63,7 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))

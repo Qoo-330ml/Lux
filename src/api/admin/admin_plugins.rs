@@ -338,6 +338,12 @@ pub(crate) async fn admin_uninstall_plugin(
         )
         .into_response();
     };
+    if is_strm_media_info_plugin(&plugin_id)
+        && let Some(service) = state.strm_probe.as_ref()
+        && let Err(error) = service.cancel_active_jobs().await
+    {
+        tracing::error!(%error, "STRM probe jobs could not be cancelled before plugin uninstall");
+    }
     match plugins.uninstall(&plugin_id).await {
         Ok(()) => {
             record_audit_event(
@@ -379,8 +385,22 @@ pub(crate) async fn admin_update_plugin_enabled(
         )
         .into_response();
     };
+    if is_strm_media_info_plugin(&plugin_id)
+        && !request.enabled
+        && let Some(service) = state.strm_probe.as_ref()
+        && let Err(error) = service.cancel_active_jobs().await
+    {
+        tracing::error!(%error, "STRM probe jobs could not be cancelled before plugin disable");
+    }
     match plugins.set_enabled(&plugin_id, request.enabled).await {
         Ok(plugin) => {
+            if is_strm_media_info_plugin(&plugin_id)
+                && let Some(service) = state.strm_probe.as_ref()
+            {
+                if request.enabled {
+                    service.schedule_configured_jobs_when_available();
+                }
+            }
             record_audit_event(
                 &state,
                 &headers,
@@ -429,12 +449,35 @@ pub(crate) async fn admin_update_plugin_config(
         )
         .into_response();
     };
+    let is_strm_media_info = is_strm_media_info_plugin(&plugin_id);
+    let previous_library_ids = if is_strm_media_info {
+        configured_media_info_library_ids(plugins).await
+    } else {
+        None
+    };
     let result = plugins
         .update_dynamic_config(&plugin_id, request.values)
         .await;
     match result {
         Ok(plugin) => {
+            let selection_changed = is_strm_media_info
+                && previous_library_ids != configured_media_info_library_ids(plugins).await;
+            if selection_changed
+                && let Some(service) = state.strm_probe.as_ref()
+                && let Err(error) = service.cancel_active_jobs().await
+            {
+                tracing::error!(%error, "STRM probe jobs could not be cancelled after library selection changed");
+            }
             plugins.restart(&plugin_id).await;
+            if selection_changed
+                && plugins
+                    .enabled_media_info_settings()
+                    .await
+                    .is_ok_and(|settings| settings.is_some())
+                && let Some(service) = state.strm_probe.as_ref()
+            {
+                service.schedule_configured_jobs_when_available();
+            }
             record_audit_event(
                 &state,
                 &headers,
@@ -452,6 +495,26 @@ pub(crate) async fn admin_update_plugin_config(
         }
         Err(error) => plugin_error(&headers, error),
     }
+}
+
+fn is_strm_media_info_plugin(plugin_id: &str) -> bool {
+    matches!(
+        plugin_id,
+        crate::application::plugins::MEDIA_INFO_PLUGIN_ID | "org.lux.media-info"
+    )
+}
+
+async fn configured_media_info_library_ids(plugins: &PluginService) -> Option<Vec<String>> {
+    let mut library_ids = plugins
+        .media_info_settings()
+        .await
+        .ok()?
+        .library_ids
+        .into_iter()
+        .map(|library_id| library_id.to_string())
+        .collect::<Vec<_>>();
+    library_ids.sort();
+    Some(library_ids)
 }
 
 pub(crate) async fn admin_upload_plugin_config_image(

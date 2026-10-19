@@ -24,6 +24,21 @@ struct MergeHierarchyItem {
     episode_number: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
+enum MergeHierarchyItemType {
+    Season,
+    Episode,
+}
+
+impl MergeHierarchyItemType {
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Season => "SEASON",
+            Self::Episode => "EPISODE",
+        }
+    }
+}
+
 const MAX_MERGE_ROOTS_PER_QUERY: usize = 100;
 const MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE: usize = 100;
 
@@ -308,6 +323,8 @@ impl Database {
                 target_series_id,
             )
             .await?;
+        let mut unmatched_season_ids = Vec::new();
+        let mut unmatched_season_episode_ids = Vec::new();
         for source_season in source_seasons {
             let target_season = source_season
                 .season_number
@@ -322,31 +339,9 @@ impl Database {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let Some(target_season_id) = target_season else {
-                self.query(
-                    "UPDATE media_items
-                     SET parent_id = ?, series_id = ?, updated_at = unixepoch()
-                     WHERE id = ? AND item_type = 'SEASON'",
-                )
-                .bind(target_series_id)
-                .bind(target_series_id)
-                .bind(&source_season.id)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-                let episode_ids = source_episodes
-                    .iter()
-                    .map(|episode| episode.id.clone())
-                    .collect::<Vec<_>>();
-                self.move_series_episodes_in_transaction(
-                    transaction,
-                    &episode_ids,
-                    None,
-                    target_series_id,
-                )
-                .await?;
+                unmatched_season_ids.push(source_season.id);
+                unmatched_season_episode_ids
+                    .extend(source_episodes.iter().map(|episode| episode.id.clone()));
                 continue;
             };
 
@@ -418,14 +413,31 @@ impl Database {
                     .await?;
                 }
             }
-            self.move_series_episodes_in_transaction(
+            self.move_series_hierarchy_items_in_transaction(
                 transaction,
                 &unmatched_episode_ids,
+                MergeHierarchyItemType::Episode,
                 Some(&target_season_id),
                 target_series_id,
             )
             .await?;
         }
+        self.move_series_hierarchy_items_in_transaction(
+            transaction,
+            &unmatched_season_ids,
+            MergeHierarchyItemType::Season,
+            Some(target_series_id),
+            target_series_id,
+        )
+        .await?;
+        self.move_series_hierarchy_items_in_transaction(
+            transaction,
+            &unmatched_season_episode_ids,
+            MergeHierarchyItemType::Episode,
+            None,
+            target_series_id,
+        )
+        .await?;
         Ok(())
     }
 
@@ -639,17 +651,15 @@ impl Database {
         Ok(())
     }
 
-    async fn move_series_episodes_in_transaction(
+    async fn move_series_hierarchy_items_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        episode_ids: &[String],
+        item_ids: &[String],
+        item_type: MergeHierarchyItemType,
         parent_id: Option<&str>,
         series_id: &str,
     ) -> Result<(), StorageError> {
-        for chunk in episode_ids.chunks(MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
+        for chunk in item_ids.chunks(MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -657,13 +667,15 @@ impl Database {
                 format!(
                     "UPDATE media_items
                      SET parent_id = ?, series_id = ?, updated_at = unixepoch()
-                     WHERE id IN ({placeholders}) AND item_type = 'EPISODE'"
+                     WHERE id IN ({placeholders}) AND item_type = '{}'",
+                    item_type.as_sql()
                 )
             } else {
                 format!(
                     "UPDATE media_items
                      SET series_id = ?, updated_at = unixepoch()
-                     WHERE id IN ({placeholders}) AND item_type = 'EPISODE'"
+                     WHERE id IN ({placeholders}) AND item_type = '{}'",
+                    item_type.as_sql()
                 )
             };
             let mut query = self.query(sqlx::AssertSqlSafe(query_text));
@@ -671,8 +683,8 @@ impl Database {
                 query = query.bind(parent_id);
             }
             query = query.bind(series_id);
-            for episode_id in chunk {
-                query = query.bind(episode_id);
+            for item_id in chunk {
+                query = query.bind(item_id);
             }
             query
                 .execute(&mut **transaction)
@@ -968,8 +980,8 @@ mod tests {
 
         assert_eq!(
             database.query_count(),
-            19,
-            "expected batched root and episode reads instead of one read per item/season"
+            8,
+            "expected batched root, season, and episode writes"
         );
         Ok(())
     }
@@ -1065,6 +1077,115 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(moved_episode_count, EPISODE_COUNT as i64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_merge_batches_unmatched_hierarchy_across_update_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ITEM_COUNT: usize = 101;
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Mixed, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let target_series_id = "merge-boundary-target-series";
+        let source_series_id = "merge-boundary-source-series";
+        insert_merge_item(
+            &database,
+            &library_id,
+            MergeTestItem {
+                id: target_series_id,
+                item_type: "SERIES",
+                parent_id: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+            },
+        )
+        .await?;
+        insert_merge_item(
+            &database,
+            &library_id,
+            MergeTestItem {
+                id: source_series_id,
+                item_type: "SERIES",
+                parent_id: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+            },
+        )
+        .await?;
+        for number in 1..=ITEM_COUNT {
+            let season_id = format!("merge-boundary-season-{number:03}");
+            let episode_id = format!("merge-boundary-episode-{number:03}");
+            insert_merge_item(
+                &database,
+                &library_id,
+                MergeTestItem {
+                    id: &season_id,
+                    item_type: "SEASON",
+                    parent_id: Some(source_series_id),
+                    series_id: Some(source_series_id),
+                    season_number: Some(number as i64),
+                    episode_number: None,
+                },
+            )
+            .await?;
+            insert_merge_item(
+                &database,
+                &library_id,
+                MergeTestItem {
+                    id: &episode_id,
+                    item_type: "EPISODE",
+                    parent_id: Some(&season_id),
+                    series_id: Some(source_series_id),
+                    season_number: Some(number as i64),
+                    episode_number: Some(1),
+                },
+            )
+            .await?;
+        }
+
+        database.reset_query_count();
+        database
+            .merge_media_items(
+                target_series_id,
+                &[target_series_id.to_owned(), source_series_id.to_owned()],
+            )
+            .await?;
+
+        assert_eq!(database.query_count(), 11);
+        let moved_season_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE parent_id = ? AND series_id = ? AND item_type = 'SEASON'",
+        )
+        .bind(target_series_id)
+        .bind(target_series_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(moved_season_count, ITEM_COUNT as i64);
+        let moved_episode_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM media_items episodes
+             JOIN media_items seasons ON seasons.id = episodes.parent_id
+             WHERE episodes.item_type = 'EPISODE'
+               AND episodes.series_id = ?
+               AND seasons.item_type = 'SEASON'
+               AND seasons.parent_id = ?
+               AND episodes.season_number = seasons.season_number",
+        )
+        .bind(target_series_id)
+        .bind(target_series_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(moved_episode_count, ITEM_COUNT as i64);
         Ok(())
     }
 

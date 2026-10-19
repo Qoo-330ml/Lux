@@ -10,6 +10,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use super::sql_templates::SqlTemplateCache;
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
@@ -56,6 +57,8 @@ mod subtitles;
 mod media;
 #[path = "media_merge.rs"]
 mod media_merge;
+#[path = "scan_fingerprint_migration.rs"]
+mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
 #[path = "metadata.rs"]
 mod metadata;
@@ -151,6 +154,13 @@ pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize 
     }
 }
 
+pub(crate) fn manifest_seen_filesystem_update_chunk_size(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS.saturating_sub(3) / 3,
+        DatabaseBackend::Postgres => manifest_path_query_chunk_size(backend),
+    }
+}
+
 pub(crate) fn media_item_hierarchy_insert_chunk_size(backend: DatabaseBackend) -> usize {
     let (chunk_size, max_bind_parameters) = match backend {
         DatabaseBackend::Sqlite => (
@@ -174,7 +184,7 @@ mod manifest_positive_index_batch_tests {
         MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW, POSTGRES_MAX_BIND_PARAMETERS,
         SQLITE_MAX_BIND_PARAMETERS, manifest_existing_file_update_chunk_size,
         manifest_path_query_chunk_size, manifest_positive_index_insert_chunk_size,
-        media_item_hierarchy_insert_chunk_size,
+        manifest_seen_filesystem_update_chunk_size, media_item_hierarchy_insert_chunk_size,
     };
 
     #[test]
@@ -222,6 +232,19 @@ mod manifest_positive_index_batch_tests {
     }
 
     #[test]
+    fn seen_filesystem_update_batches_use_all_safe_sqlite_parameters() {
+        let sqlite_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Sqlite);
+        let postgres_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Postgres);
+
+        assert_eq!(sqlite_size, 10_921);
+        assert_eq!(
+            postgres_size,
+            manifest_path_query_chunk_size(DatabaseBackend::Postgres)
+        );
+        assert!(sqlite_size * 3 + 3 <= SQLITE_MAX_BIND_PARAMETERS);
+    }
+
+    #[test]
     fn hierarchy_batches_respect_media_item_bind_limits() {
         let sqlite_size = media_item_hierarchy_insert_chunk_size(DatabaseBackend::Sqlite);
         let postgres_size = media_item_hierarchy_insert_chunk_size(DatabaseBackend::Postgres);
@@ -258,7 +281,7 @@ use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConf
 use crate::observability::logs::{LogStore, NewAuditLogEvent};
 
 // Keep the embedded migrator source coupled to newly added migration files.
-static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
+static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
 // SQLite migration 0126 used this checksum before the ALTER TABLE default was made compatible
@@ -366,6 +389,7 @@ pub struct Database {
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
+    filesystem_path_templates: Arc<SqlTemplateCache>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -510,6 +534,7 @@ impl Database {
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
+            filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -526,6 +551,22 @@ impl Database {
     }
 
     async fn begin_metadata_write_transaction(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        let transaction = if self.backend == DatabaseBackend::Sqlite {
+            self.pool.begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.pool.begin().await
+        };
+        transaction.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    // LUX-620 consumes this transaction helper through the admission methods in `sessions`.
+    #[allow(dead_code)]
+    pub(crate) async fn begin_playback_admission_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
         let transaction = if self.backend == DatabaseBackend::Sqlite {
@@ -562,6 +603,49 @@ impl Database {
                 })?;
         }
         Ok(transaction)
+    }
+
+    pub(crate) async fn lock_scan_fingerprint_migration_state(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO scan_fingerprint_migration_state (library_id)
+             VALUES (?) ON CONFLICT (library_id) DO NOTHING",
+        )
+        .bind(library_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_fingerprint_migration_state SET updated_at = updated_at
+             WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query_scalar(
+            "SELECT CASE WHEN lease_token IS NOT NULL
+                              AND lease_expires_at > unixepoch()
+                         THEN 1 ELSE 0 END
+             FROM scan_fingerprint_migration_state WHERE library_id = ?",
+        )
+        .bind(library_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map(|value: i64| value == 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn lock_media_items_for_update(
@@ -890,10 +974,7 @@ impl Database {
     ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
-        sqlx::query(sqlx::AssertSqlSafe(adapt_sql_for_backend(
-            self.backend,
-            sql,
-        )))
+        sqlx::query(adapt_sql_for_backend(self.backend, sql))
     }
 
     fn query_as<O>(
@@ -905,10 +986,7 @@ impl Database {
     {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
-        sqlx::query_as(sqlx::AssertSqlSafe(adapt_sql_for_backend(
-            self.backend,
-            sql,
-        )))
+        sqlx::query_as(adapt_sql_for_backend(self.backend, sql))
     }
 
     fn query_scalar<O>(
@@ -920,10 +998,7 @@ impl Database {
     {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
-        sqlx::query_scalar(sqlx::AssertSqlSafe(adapt_sql_for_backend(
-            self.backend,
-            sql,
-        )))
+        sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
 }
 
@@ -975,7 +1050,7 @@ pub(crate) struct StoredCatalogItemCounts {
     pub(crate) item_count: i64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredUser {
     pub(crate) id: String,
     pub(crate) username_normalized: String,
@@ -987,8 +1062,58 @@ pub(crate) struct StoredUser {
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+    pub(crate) email: Option<String>,
+    pub(crate) email_verified_at: Option<i64>,
+    pub(crate) deleted_at: Option<i64>,
+    pub(crate) deletion_purge_at: Option<i64>,
     pub(crate) last_login_at: Option<i64>,
     pub(crate) last_activity_at: Option<i64>,
+}
+
+pub(crate) struct NewStoredUser<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) username_normalized: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password_hash: &'a str,
+    pub(crate) is_admin: bool,
+    pub(crate) has_password: bool,
+    pub(crate) email: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminUserStatusFilter {
+    All,
+    Active,
+    Disabled,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminUserSortField {
+    Created,
+    LastLogin,
+    LastActivity,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredAdminUserListItem {
+    pub(crate) id: String,
+    pub(crate) username_normalized: String,
+    pub(crate) display_name: String,
+    pub(crate) has_password: bool,
+    pub(crate) is_disabled: bool,
+    pub(crate) is_admin: bool,
+    pub(crate) can_manage_server: bool,
+    pub(crate) can_remote_access: bool,
+    pub(crate) can_download: bool,
+    pub(crate) email: Option<String>,
+    pub(crate) email_verified_at: Option<i64>,
+    pub(crate) deleted_at: Option<i64>,
+    pub(crate) deletion_purge_at: Option<i64>,
+    pub(crate) last_login_at: Option<i64>,
+    pub(crate) last_activity_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) current_playback_count: i64,
 }
 
 #[derive(Debug)]
@@ -999,7 +1124,7 @@ pub(crate) struct StoredAccessTokenDevice {
     pub(crate) client_version: String,
 }
 
-fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
+pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
     StoredUser {
         id: row.get("id"),
         username_normalized: row.get("username_normalized"),
@@ -1011,8 +1136,34 @@ fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
         can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
         can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
         can_download: row.get::<i64, _>("can_download") != 0,
+        email: row.get("email"),
+        email_verified_at: row.get("email_verified_at"),
+        deleted_at: row.get("deleted_at"),
+        deletion_purge_at: row.get("deletion_purge_at"),
         last_login_at: row.get("last_login_at"),
         last_activity_at: row.get("last_activity_at"),
+    }
+}
+
+pub(crate) fn stored_admin_user_list_item(row: sqlx::any::AnyRow) -> StoredAdminUserListItem {
+    StoredAdminUserListItem {
+        id: row.get("id"),
+        username_normalized: row.get("username_normalized"),
+        display_name: row.get("display_name"),
+        has_password: row.get::<i64, _>("has_password") != 0,
+        is_disabled: row.get::<i64, _>("is_disabled") != 0,
+        is_admin: row.get::<i64, _>("is_admin") != 0,
+        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
+        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
+        can_download: row.get::<i64, _>("can_download") != 0,
+        email: row.get("email"),
+        email_verified_at: row.get("email_verified_at"),
+        deleted_at: row.get("deleted_at"),
+        deletion_purge_at: row.get("deletion_purge_at"),
+        last_login_at: row.get("last_login_at"),
+        last_activity_at: row.get("last_activity_at"),
+        created_at: row.get("created_at"),
+        current_playback_count: row.get("current_playback_count"),
     }
 }
 
@@ -1299,6 +1450,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
+    pub(crate) processed_media_count: Option<i64>,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
     pub(crate) created_at: i64,
@@ -1308,6 +1460,15 @@ pub(crate) struct StoredScanJob {
     pub(crate) auto_metadata_match: bool,
     pub(crate) current_item: Option<String>,
     pub(crate) scan_phase: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StoredScanJobRetryState {
+    pub(crate) has_postprocessing_issues: bool,
+    pub(crate) has_unfinished_targets: bool,
+    pub(crate) targets_need_materialization: bool,
+    pub(crate) has_legacy_work: bool,
+    pub(crate) has_active_job: bool,
 }
 
 #[allow(dead_code)] // Storage tests exercise the single-batch enqueue contract.
@@ -1410,6 +1571,10 @@ pub(crate) struct NewScanManifestPositiveIndex {
 pub(crate) struct NewScanManifestSeenFilesystemEntry {
     pub(crate) filesystem_entry_id: String,
     pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
 }
 
@@ -1418,6 +1583,7 @@ pub(crate) struct NewScanManifestFilesystemEntry<'a> {
     pub(crate) relative_path: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) last_seen_change_kind: Option<&'a str>,
@@ -1451,6 +1617,7 @@ pub(crate) struct ManifestExistingFileUpdate<'a> {
     pub(crate) expected_missing: bool,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) generation: &'a str,
@@ -1564,6 +1731,10 @@ pub(crate) struct StoredScanManifestDiffCandidate {
 pub(crate) struct StoredScanManifestFilesystemBaseline {
     pub(crate) id: String,
     pub(crate) entry_kind: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) is_missing: bool,
 }
@@ -1574,6 +1745,16 @@ pub(crate) struct StoredScanManifestRemovalCandidate {
     pub(crate) relative_path: String,
     pub(crate) base_filesystem_entry_id: String,
     pub(crate) base_fingerprint: Option<Vec<u8>>,
+}
+
+pub(crate) struct ScanManifestRemovalCandidateQuery<'a> {
+    pub(crate) manifest_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) discovery_format_version: i64,
+    pub(crate) uncovered_only: bool,
+    pub(crate) directories: Option<&'a [StoredScanManifestDirectory]>,
+    pub(crate) after_relative_path: Option<&'a str>,
+    pub(crate) limit: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -1602,6 +1783,7 @@ pub(crate) struct NewScanManifestEntry {
     pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
+    pub(crate) fingerprint_pending: bool,
 }
 
 pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
@@ -1749,6 +1931,7 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),
+        processed_media_count: row.get("processed_media_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
         created_at: row.get("created_at"),
@@ -1859,6 +2042,11 @@ fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
     pub(crate) relative_path: String,
+    pub(crate) entry_kind: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) last_seen_generation: String,
     pub(crate) is_missing: bool,
@@ -1869,6 +2057,35 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) series_provider_ids_json: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanFingerprintMigrationCandidate {
+    pub(crate) entry_id: String,
+    pub(crate) library_id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) root_path: String,
+    pub(crate) root_is_available: bool,
+    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) attempts: i64,
+}
+
+pub(crate) struct ScanFingerprintMigrationCommit<'a> {
+    pub(crate) candidate: &'a StoredScanFingerprintMigrationCandidate,
+    pub(crate) fingerprint_v2: &'a [u8],
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: i64,
+    pub(crate) inode: i64,
+    pub(crate) lease_token: &'a str,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanFingerprintMigrationCursor {
+    pub(crate) root_id: Option<String>,
+    pub(crate) relative_path: Option<String>,
+    pub(crate) completed_at: Option<i64>,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredItemSourceLocator {
     pub(crate) root_path: String,
@@ -1876,6 +2093,8 @@ pub(crate) struct StoredItemSourceLocator {
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) title: String,
     pub(crate) production_year: Option<i32>,
 }
@@ -1892,6 +2111,11 @@ fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
     StoredFilesystemEntry {
         id: row.get("id"),
         relative_path: row.get("relative_path"),
+        entry_kind: row.get("entry_kind"),
+        size: row.get("size"),
+        modified_at: row.get("modified_at"),
+        device: row.get("device"),
+        inode: row.get("inode"),
         fingerprint: row.get("fingerprint"),
         last_seen_generation: row.get("last_seen_generation"),
         is_missing: row.get::<i64, _>("is_missing") != 0,
@@ -3389,6 +3613,11 @@ pub(crate) struct StoredChapterDetectionSource {
     pub(crate) item_id: String,
     pub(crate) season_id: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) provider_ids_json: Option<String>,
     pub(crate) series_provider_ids_json: Option<String>,
@@ -3666,8 +3895,19 @@ pub(crate) struct NewFilesystemEntry<'a> {
     pub(crate) entry_kind: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
+    pub(crate) last_seen_generation: &'a str,
+}
+
+pub(crate) struct FilesystemEntryUpdate<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) last_seen_generation: &'a str,
 }
 
@@ -3677,6 +3917,7 @@ pub(crate) struct FilesystemEntryMove<'a> {
     pub(crate) relative_path: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) generation: &'a str,
@@ -3731,6 +3972,8 @@ pub(crate) struct NewMovieFile {
     pub(crate) relative_path: String,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
     pub(crate) title: String,
     pub(crate) sort_title: String,
@@ -3752,6 +3995,7 @@ pub(crate) struct NewEpisodeFile {
     pub(crate) relative_path: String,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
     pub(crate) series_identity: String,
@@ -3863,17 +4107,25 @@ impl std::fmt::Display for StorageError {
     }
 }
 
-fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -> String {
+fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -> sqlx::SqlStr {
     let sql = sql.into_sql_str();
+    let source = sql.as_str();
     if backend == DatabaseBackend::Sqlite {
-        return sql.as_str().to_owned();
+        return sql;
     }
 
-    let mut adapted = String::with_capacity(sql.as_str().len() + 8);
+    let placeholder_count = source.bytes().filter(|byte| *byte == b'?').count();
+    if placeholder_count == 0 {
+        return sql;
+    }
+
+    let placeholder_width = placeholder_count.ilog10() as usize + 1;
+    let estimated_growth = placeholder_count.saturating_mul(placeholder_width + 1);
+    let mut adapted = String::with_capacity(source.len().saturating_add(estimated_growth));
     let mut parameter_index = 1;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
-    let mut characters = sql.as_str().chars().peekable();
+    let mut characters = source.chars().peekable();
     while let Some(character) = characters.next() {
         match character {
             '\'' if !in_double_quote => {
@@ -3892,13 +4144,14 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
             }
             '?' if !in_single_quote && !in_double_quote => {
                 adapted.push('$');
-                adapted.push_str(&parameter_index.to_string());
+                // Formatting into String cannot fail, but the formatting API returns Result.
+                let _ = std::fmt::Write::write_fmt(&mut adapted, format_args!("{parameter_index}"));
                 parameter_index += 1;
             }
             _ => adapted.push(character),
         }
     }
-    adapted
+    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(adapted))
 }
 
 impl std::error::Error for StorageError {
@@ -3916,3 +4169,7 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 #[path = "repository_tests.rs"]
 mod repository_tests;
+
+#[cfg(all(test, feature = "performance-benchmarks"))]
+#[path = "sql_query_benchmarks.rs"]
+mod sql_query_benchmarks;

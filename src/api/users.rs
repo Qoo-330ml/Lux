@@ -948,6 +948,96 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
     .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AuthProfilePatch {
+    display_name: Option<String>,
+    email: Option<String>,
+}
+
+fn account_profile_json(profile: &crate::auth::users::AdminUserProfile) -> Value {
+    let mut user = user_json(&profile.user);
+    user["email"] = json!(profile.email);
+    user["emailVerifiedAt"] = json!(profile.email_verified_at);
+    json!({ "user": user })
+}
+
+pub(super) async fn auth_account_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users.find_admin_profile_by_id(&user.id.to_string()).await {
+        Ok(Some(profile)) => Json(account_profile_json(&profile)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(super) async fn auth_update_account_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AuthProfilePatch>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let email = request.email.as_deref().map(|email| {
+        let email = email.trim();
+        if email.is_empty() { None } else { Some(email) }
+    });
+    match users
+        .update_profile(
+            &session.user.id.to_string(),
+            request.display_name.as_deref(),
+            email,
+        )
+        .await
+    {
+        Ok(Some(profile)) => Json(account_profile_json(&profile)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(UserStoreError::InvalidEmail) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "邮箱格式无效",
+        )
+        .into_response(),
+        Err(UserStoreError::Storage(error)) if error.is_unique_violation() => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该邮箱已被其他账户使用",
+        )
+        .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "账户资料暂时无法保存",
+        )
+        .into_response(),
+    }
+}
+
 pub(super) async fn auth_create_device_pairing(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1352,6 +1442,7 @@ pub(super) async fn auth_update_settings(
         if let Some(home) = state.home.as_ref() {
             home.invalidate();
         }
+        state.user_events.publish_home_coalesced().await;
     }
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1450,6 +1541,32 @@ async fn effective_library_order(
         .await
 }
 
+async fn library_order_access_scope(
+    state: &AppState,
+    principal: AccessPrincipal,
+) -> Result<Vec<String>, StatusCode> {
+    let access = state
+        .access
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut library_ids = access
+        .accessible_library_ids(principal)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let collections = catalog
+        .list_global_collection_cards(principal, 0, 1)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if collections.total > 0 {
+        library_ids.push(crate::storage::GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
+    }
+    Ok(library_ids)
+}
+
 pub(super) async fn auth_library_order(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1461,13 +1578,10 @@ pub(super) async fn auth_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+    let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(status) => return status.into_response(),
     };
     match effective_library_order(
         libraries,
@@ -1512,13 +1626,10 @@ pub(super) async fn auth_update_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+    let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(status) => return status.into_response(),
     };
     let (use_admin_library_order, _) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
@@ -1552,6 +1663,7 @@ pub(super) async fn auth_update_library_order(
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
+            state.user_events.publish_home_coalesced().await;
             Json(json!({ "libraryOrder": library_order })).into_response()
         }
         Err(LibraryServiceError::InvalidLibraryOrder(message)) => api_error(
@@ -2098,6 +2210,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/auth/login", post(users::auth_login))
         .route("/api/v1/auth/logout", post(users::auth_logout))
         .route("/api/v1/auth/me", get(users::auth_me))
+        .route(
+            "/api/v1/auth/profile",
+            get(users::auth_account_profile).patch(users::auth_update_account_profile),
+        )
         .route(
             "/api/v1/auth/device-pairings",
             post(users::auth_create_device_pairing),

@@ -57,7 +57,7 @@ impl Database {
                         job_items.request_fingerprint,
                         job_items.request_capabilities_json,
                         CASE WHEN job_items.automatic_retry_count = 0
-                                  AND jobs.status = 'DEFERRED'
+                                  AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                                   AND job_items.status = 'FAILED'
                                   AND job_items.error = 'SCRAPER_UNAVAILABLE'
                                   AND job_items.request_fingerprint IS NOT NULL
@@ -66,7 +66,7 @@ impl Database {
                         CASE WHEN COALESCE(
                                 job_items.automatic_retry_after,
                                 CASE WHEN job_items.automatic_retry_count = 0
-                                          AND jobs.status = 'DEFERRED'
+                                          AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                                           AND job_items.status = 'FAILED'
                                           AND job_items.error = 'SCRAPER_UNAVAILABLE'
                                           AND job_items.request_fingerprint IS NOT NULL
@@ -77,7 +77,7 @@ impl Database {
                         CASE WHEN COALESCE(
                                 job_items.automatic_retry_after,
                                 CASE WHEN job_items.automatic_retry_count = 0
-                                          AND jobs.status = 'DEFERRED'
+                                          AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                                           AND job_items.status = 'FAILED'
                                           AND job_items.error = 'SCRAPER_UNAVAILABLE'
                                           AND job_items.request_fingerprint IS NOT NULL
@@ -105,7 +105,7 @@ impl Database {
                  ) OR (
                      jobs.mode = 'FILL_MISSING'
                      AND jobs.dispatch_source = 'AUTOMATIC'
-                     AND jobs.status = 'DEFERRED'
+                     AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                      AND jobs.cancel_requested = 0
                      AND job_items.status = 'FAILED'
                      AND job_items.error = 'SCRAPER_UNAVAILABLE'
@@ -114,7 +114,7 @@ impl Database {
                  ) OR (
                      jobs.mode = 'FILL_MISSING'
                      AND jobs.dispatch_source = 'EXPLICIT'
-                     AND jobs.status = 'DEFERRED'
+                     AND jobs.status IN ('DEFERRED', 'COMPLETED_WITH_ISSUES')
                      AND jobs.cancel_requested = 0
                      AND job_items.status = 'FAILED'
                      AND job_items.error = 'SCRAPER_UNAVAILABLE'
@@ -154,7 +154,7 @@ impl Database {
                     explicit_items.insert(item_id);
                     continue;
                 }
-                if job_status == "DEFERRED" {
+                if matches!(job_status.as_str(), "DEFERRED" | "COMPLETED_WITH_ISSUES") {
                     let fingerprint: Option<Vec<u8>> = row.get("request_fingerprint");
                     let capabilities: String = row.get("request_capabilities_json");
                     let snapshot_key = (item_id.clone(), fingerprint.clone(), capabilities.clone());

@@ -1,42 +1,44 @@
 use super::*;
 
 impl Database {
-    pub(super) async fn count_manifest_diff_remaining_changes(
+    pub(super) async fn has_manifest_diff_remaining_changes(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
         manifest_id: &str,
         workflow_version: i64,
         discovery_format_version: i64,
         discovery_mode: &str,
-    ) -> Result<i64, StorageError> {
-        let remaining_changes: i64 = if is_lite_manifest_discovery(
+    ) -> Result<bool, StorageError> {
+        let has_remaining_changes: i64 = if is_lite_manifest_discovery(
             workflow_version,
             discovery_format_version,
             discovery_mode,
         ) {
             self.query_scalar(
-                "SELECT COUNT(*)
-                 FROM filesystem_entries fe
-                 JOIN scan_manifest_roots root
-                   ON root.manifest_id = ?
-                  AND root.library_root_id = fe.library_root_id
-                  AND root.state = 'COMPLETE'
-                 JOIN scan_manifests manifest ON manifest.id = root.manifest_id
-                 JOIN scan_jobs job ON job.id = manifest.job_id
-                 WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
-                   AND COALESCE(fe.last_seen_generation, '') <> job.generation
-                   AND NOT EXISTS (
-                       SELECT 1 FROM scan_manifest_seen_paths seen
-                       WHERE seen.manifest_id = root.manifest_id
-                         AND seen.library_root_id = fe.library_root_id
-                         AND seen.relative_path = fe.relative_path
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM scan_manifest_deltas delta
-                       WHERE delta.manifest_id = root.manifest_id
-                         AND delta.library_root_id = fe.library_root_id
-                         AND delta.relative_path = fe.relative_path
-                   )",
+                "SELECT CASE WHEN EXISTS (
+                     SELECT 1
+                     FROM filesystem_entries fe
+                     JOIN scan_manifest_roots root
+                       ON root.manifest_id = ?
+                      AND root.library_root_id = fe.library_root_id
+                      AND root.state = 'COMPLETE'
+                     JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+                     JOIN scan_jobs job ON job.id = manifest.job_id
+                     WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                       AND COALESCE(fe.last_seen_generation, '') <> job.generation
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_seen_paths seen
+                           WHERE seen.manifest_id = root.manifest_id
+                             AND seen.library_root_id = fe.library_root_id
+                             AND seen.relative_path = fe.relative_path
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_deltas delta
+                           WHERE delta.manifest_id = root.manifest_id
+                             AND delta.library_root_id = fe.library_root_id
+                             AND delta.relative_path = fe.relative_path
+                       )
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(manifest_id)
             .fetch_one(&mut **transaction)
@@ -47,62 +49,64 @@ impl Database {
             })?
         } else if matches!(workflow_version, 2 | 3) && discovery_format_version == 3 {
             self.query_scalar(
-                "SELECT COUNT(*)
-                 FROM filesystem_entries fe
-                 JOIN scan_manifest_roots root
-                   ON root.manifest_id = ?
-                  AND root.library_root_id = fe.library_root_id
-                  AND root.state = 'COMPLETE'
-                 JOIN scan_manifests manifest ON manifest.id = root.manifest_id
-                 JOIN scan_jobs job ON job.id = manifest.job_id
-                 WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
-                   AND EXISTS (
-                       SELECT 1
-                       FROM scan_manifest_directories directory
-                       WHERE directory.manifest_id = root.manifest_id
-                         AND directory.library_root_id = fe.library_root_id
-                         AND directory.state = 'COMPLETE'
-                         AND (
-                             (directory.relative_path = ''
-                              AND fe.relative_path NOT LIKE '%/%' ESCAPE '\\')
-                             OR (directory.relative_path <> ''
-                                 AND fe.relative_path LIKE (
-                                     REPLACE(
+                "SELECT CASE WHEN EXISTS (
+                     SELECT 1
+                     FROM filesystem_entries fe
+                     JOIN scan_manifest_roots root
+                       ON root.manifest_id = ?
+                      AND root.library_root_id = fe.library_root_id
+                      AND root.state = 'COMPLETE'
+                     JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+                     JOIN scan_jobs job ON job.id = manifest.job_id
+                     WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                       AND EXISTS (
+                           SELECT 1
+                           FROM scan_manifest_directories directory
+                           WHERE directory.manifest_id = root.manifest_id
+                             AND directory.library_root_id = fe.library_root_id
+                             AND directory.state = 'COMPLETE'
+                             AND (
+                                 (directory.relative_path = ''
+                                  AND fe.relative_path NOT LIKE '%/%' ESCAPE '\\')
+                                 OR (directory.relative_path <> ''
+                                     AND fe.relative_path LIKE (
                                          REPLACE(
-                                             REPLACE(directory.relative_path, '\\', '\\\\'),
-                                             '%',
-                                             '\\%'
-                                         ),
-                                         '_',
-                                         '\\_'
-                                     ) || '/%'
-                                 ) ESCAPE '\\'
-                                 AND fe.relative_path NOT LIKE (
-                                     REPLACE(
+                                             REPLACE(
+                                                 REPLACE(directory.relative_path, '\\', '\\\\'),
+                                                 '%',
+                                                 '\\%'
+                                             ),
+                                             '_',
+                                             '\\_'
+                                         ) || '/%'
+                                     ) ESCAPE '\\'
+                                     AND fe.relative_path NOT LIKE (
                                          REPLACE(
-                                             REPLACE(directory.relative_path, '\\', '\\\\'),
-                                             '%',
-                                             '\\%'
-                                         ),
-                                         '_',
-                                         '\\_'
-                                     ) || '/%/%'
-                                 ) ESCAPE '\\')
-                         )
-                   )
-                   AND COALESCE(fe.last_seen_generation, '') <> job.generation
-                   AND NOT EXISTS (
-                       SELECT 1 FROM scan_manifest_seen_paths seen
-                       WHERE seen.manifest_id = ?
-                         AND seen.library_root_id = fe.library_root_id
-                         AND seen.relative_path = fe.relative_path
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM scan_manifest_deltas delta
-                       WHERE delta.manifest_id = ?
-                         AND delta.library_root_id = fe.library_root_id
-                         AND delta.relative_path = fe.relative_path
-                   )",
+                                             REPLACE(
+                                                 REPLACE(directory.relative_path, '\\', '\\\\'),
+                                                 '%',
+                                                 '\\%'
+                                             ),
+                                             '_',
+                                             '\\_'
+                                         ) || '/%/%'
+                                     ) ESCAPE '\\')
+                             )
+                       )
+                       AND COALESCE(fe.last_seen_generation, '') <> job.generation
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_seen_paths seen
+                           WHERE seen.manifest_id = ?
+                             AND seen.library_root_id = fe.library_root_id
+                             AND seen.relative_path = fe.relative_path
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_deltas delta
+                           WHERE delta.manifest_id = ?
+                             AND delta.library_root_id = fe.library_root_id
+                             AND delta.relative_path = fe.relative_path
+                       )
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(manifest_id)
             .bind(manifest_id)
@@ -115,27 +119,29 @@ impl Database {
             })?
         } else if matches!(workflow_version, 2 | 3) {
             self.query_scalar(
-                "SELECT COUNT(*)
-                 FROM filesystem_entries fe
-                 JOIN scan_manifest_roots root
-                   ON root.manifest_id = ?
-                  AND root.library_root_id = fe.library_root_id
-                  AND root.state = 'COMPLETE'
-                 WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
-                   AND COALESCE((
-                       SELECT observed.entry_kind
-                       FROM scan_manifest_entries observed
-                       WHERE observed.manifest_id = ?
-                         AND observed.library_root_id = fe.library_root_id
-                         AND observed.relative_path = fe.relative_path
-                       ORDER BY observed.observation_sequence DESC LIMIT 1
-                   ), '') <> 'FILE'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM scan_manifest_deltas delta
-                       WHERE delta.manifest_id = ?
-                         AND delta.library_root_id = fe.library_root_id
-                         AND delta.relative_path = fe.relative_path
-                   )",
+                "SELECT CASE WHEN EXISTS (
+                     SELECT 1
+                     FROM filesystem_entries fe
+                     JOIN scan_manifest_roots root
+                       ON root.manifest_id = ?
+                      AND root.library_root_id = fe.library_root_id
+                      AND root.state = 'COMPLETE'
+                     WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                       AND COALESCE((
+                           SELECT observed.entry_kind
+                           FROM scan_manifest_entries observed
+                           WHERE observed.manifest_id = ?
+                             AND observed.library_root_id = fe.library_root_id
+                             AND observed.relative_path = fe.relative_path
+                           ORDER BY observed.observation_sequence DESC LIMIT 1
+                       ), '') <> 'FILE'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_deltas delta
+                           WHERE delta.manifest_id = ?
+                             AND delta.library_root_id = fe.library_root_id
+                             AND delta.relative_path = fe.relative_path
+                       )
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(manifest_id)
             .bind(manifest_id)
@@ -148,8 +154,8 @@ impl Database {
             })?
         } else {
             self.query_scalar(
-                "SELECT
-                    (SELECT COUNT(*)
+                "SELECT CASE WHEN EXISTS (
+                     SELECT 1
                      FROM scan_manifest_entries observed
                      JOIN scan_manifest_roots root
                        ON root.manifest_id = observed.manifest_id
@@ -176,9 +182,9 @@ impl Database {
                            WHERE delta.manifest_id = observed.manifest_id
                              AND delta.library_root_id = observed.library_root_id
                              AND delta.relative_path = observed.relative_path
-                       ))
-                    +
-                    (SELECT COUNT(*)
+                       )
+                 ) OR EXISTS (
+                     SELECT 1
                      FROM filesystem_entries fe
                      JOIN scan_manifest_roots root
                        ON root.manifest_id = ?
@@ -199,7 +205,8 @@ impl Database {
                            WHERE delta.manifest_id = ?
                              AND delta.library_root_id = fe.library_root_id
                              AND delta.relative_path = fe.relative_path
-                       ))",
+                       )
+                 ) THEN 1 ELSE 0 END",
             )
             .bind(manifest_id)
             .bind(manifest_id)
@@ -212,7 +219,7 @@ impl Database {
                 source,
             })?
         };
-        Ok(remaining_changes)
+        Ok(has_remaining_changes != 0)
     }
 
     pub(super) async fn count_manifest_diff_unchanged_entries(

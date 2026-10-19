@@ -64,10 +64,60 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
         sqlx::query_scalar("SELECT id FROM media_items WHERE title = '银河护卫队'")
             .fetch_one(database.pool())
             .await?;
+    let collections_library_id: String =
+        sqlx::query_scalar("SELECT id FROM libraries WHERE system_kind = 'COLLECTIONS'")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             identity_key, has_available_source
+         ) VALUES ('logical-search-work', ?, 'MOVIE', '银河护卫队', '银河护卫队',
+                   'ONLINE_CONFIRMED', 'global-work:tmdb:search-test', 1)",
+    )
+    .bind(&collections_library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_work_items (work_item_id, movie_provider, movie_provider_id)
+         VALUES ('logical-search-work', 'tmdb', 'search-test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_work_sources (work_item_id, source_item_id, sort_order)
+         VALUES ('logical-search-work', ?, 0)",
+    )
+    .bind(&chinese_id)
+    .execute(database.pool())
+    .await?;
     let hidden_movie_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Hidden Movie'")
             .fetch_one(database.pool())
             .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             identity_key, has_available_source
+         ) VALUES ('logical-partial-search-work', ?, 'MOVIE', 'Hidden Movie', 'hidden movie',
+                   'ONLINE_CONFIRMED', 'global-work:tmdb:partial-search-test', 1)",
+    )
+    .bind(&collections_library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_work_items (work_item_id, movie_provider, movie_provider_id)
+         VALUES ('logical-partial-search-work', 'tmdb', 'partial-search-test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_work_sources (work_item_id, source_item_id, sort_order)
+         VALUES ('logical-partial-search-work', ?, 0)",
+    )
+    .bind(&hidden_movie_id)
+    .execute(database.pool())
+    .await?;
     let initial_fts_sort_title: String =
         sqlx::query_scalar("SELECT sort_title FROM media_search WHERE item_id = ?")
             .bind(&hidden_movie_id)

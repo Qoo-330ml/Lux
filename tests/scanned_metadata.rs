@@ -1191,7 +1191,7 @@ async fn cancelling_scan_during_running_local_image_claim_cancels_before_complet
 
 #[cfg(unix)]
 #[tokio::test]
-async fn unreadable_local_poster_keeps_image_check_retryable()
+async fn unreadable_local_poster_is_skipped_without_blocking_batch()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{os::unix::fs::PermissionsExt, time::Duration};
 
@@ -1265,63 +1265,34 @@ async fn unreadable_local_poster_keeps_image_check_retryable()
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
-    let completeness: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT local_state, is_missing FROM item_metadata_completeness
-         WHERE item_id = ? AND capability = 'POSTER'",
-    )
-    .bind(&item_id)
-    .fetch_optional(database.pool())
-    .await?;
-
     assert_eq!(
-        batch.0, "FAILED",
-        "permission failure must keep the image batch retryable"
+        batch.0, "COMPLETED",
+        "an unreadable image must be skipped instead of blocking the whole batch"
+    );
+    assert!(
+        batch.1.is_some(),
+        "the image stage should complete after skipping the unreadable file"
+    );
+    assert!(
+        batch
+            .2
+            .as_deref()
+            .is_some_and(|error| error.contains("local image")),
+        "the skipped image should be visible on the completed batch: {batch:?}"
     );
     assert_eq!(
-        batch.1, None,
-        "failed image reads must not complete image stage"
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "the unreadable poster must not be indexed"
     );
-    assert_eq!(
-        completeness, None,
-        "failed image reads must not confirm poster missing"
-    );
-
     let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
     permissions.set_mode(0o644);
     tokio::fs::set_permissions(&poster_path, permissions).await?;
-    sqlx::query(
-        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
-         WHERE job_id = ? AND status = 'FAILED'",
-    )
-    .bind(&job.id)
-    .execute(database.pool())
-    .await?;
-    let retried = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
-            )
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-            let poster: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
-            )
-            .bind(&item_id)
-            .fetch_one(database.pool())
-            .await?;
-            if status == "COMPLETED" && poster == 1 {
-                return Ok::<_, sqlx::Error>(true);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or(Ok(false))?;
-    assert!(
-        retried,
-        "restoring poster permissions should let the batch retry"
-    );
     Ok(())
 }
 

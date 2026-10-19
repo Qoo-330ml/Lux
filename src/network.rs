@@ -1,4 +1,8 @@
-use std::{env, fmt, net::IpAddr};
+use std::{
+    borrow::Cow,
+    env, fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use reqwest::{Client, ClientBuilder, Proxy, Url};
 
@@ -104,9 +108,14 @@ impl RemoteAccessPolicy {
         &self,
         peer: Option<&str>,
         forwarded_for: Option<&str>,
+        real_ip: Option<&str>,
+        forwarded: Option<&str>,
     ) -> Option<IpAddr> {
         peer.and_then(|value| value.parse::<IpAddr>().ok())?;
-        forwarded_for.and_then(first_forwarded_ip)
+        forwarded_for
+            .and_then(first_forwarded_ip)
+            .or_else(|| real_ip.and_then(|value| value.trim().parse().ok()))
+            .or_else(|| forwarded.and_then(first_standard_forwarded_ip))
     }
 
     pub fn is_secure_request(&self, _peer: Option<&str>, forwarded_proto: Option<&str>) -> bool {
@@ -122,6 +131,99 @@ fn first_forwarded_ip(value: &str) -> Option<IpAddr> {
         .next()
         .map(str::trim)
         .and_then(|value| value.parse::<IpAddr>().ok())
+}
+
+fn first_standard_forwarded_ip(value: &str) -> Option<IpAddr> {
+    // RFC 7239: later elements identify proxies, not the original client.
+    let (element, _) = split_forwarded_component(value, b',')?;
+    let mut remaining = Some(element);
+    let mut address = None;
+    while let Some(value) = remaining {
+        let (pair, rest) = split_forwarded_component(value, b';')?;
+        remaining = rest;
+        if pair.trim().is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=')?;
+        if name.trim().eq_ignore_ascii_case("for") {
+            if address.is_some() {
+                return None;
+            }
+            address = Some(forwarded_node_ip(value.trim())?);
+        }
+    }
+    address
+}
+
+fn split_forwarded_component(value: &str, separator: u8) -> Option<(&str, Option<&str>)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && byte == separator {
+            return Some((&value[..index], Some(&value[index + 1..])));
+        }
+    }
+    (!quoted && !escaped).then_some((value, None))
+}
+
+fn forwarded_node_ip(value: &str) -> Option<IpAddr> {
+    let Some(quoted) = value.strip_prefix('"') else {
+        return value.parse::<Ipv4Addr>().ok().map(IpAddr::V4);
+    };
+    let quoted = quoted.strip_suffix('"')?;
+    let value = if quoted.contains('\\') {
+        let mut decoded = String::with_capacity(quoted.len());
+        let mut chars = quoted.chars();
+        while let Some(character) = chars.next() {
+            decoded.push(if character == '\\' {
+                chars.next()?
+            } else {
+                character
+            });
+        }
+        Cow::Owned(decoded)
+    } else {
+        Cow::Borrowed(quoted)
+    };
+    let (address, port) = if let Some(node) = value.strip_prefix('[') {
+        let (address, suffix) = node.split_once(']')?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?)
+        };
+        (IpAddr::V6(address.parse::<Ipv6Addr>().ok()?), port)
+    } else {
+        let (address, port) = value
+            .split_once(':')
+            .map_or((value.as_ref(), None), |(address, port)| {
+                (address, Some(port))
+            });
+        (IpAddr::V4(address.parse::<Ipv4Addr>().ok()?), port)
+    };
+    if let Some(port) = port {
+        let valid = if let Some(obfuscated) = port.strip_prefix('_') {
+            !obfuscated.is_empty()
+                && obfuscated
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        } else {
+            !port.is_empty()
+                && port.len() <= 5
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        };
+        if !valid {
+            return None;
+        }
+    }
+    Some(address)
 }
 
 fn first_forwarded_proto(value: &str) -> Option<&str> {

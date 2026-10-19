@@ -40,6 +40,7 @@ impl Database {
                 relative_path: &positive.relative_path,
                 size: observation.size,
                 modified_at: observation.modified_at,
+                device: observation.device,
                 inode: observation.inode,
                 fingerprint,
                 last_seen_change_kind: Some(
@@ -74,7 +75,7 @@ impl Database {
                 positive.delta_kind == "ADD" && claimed_add_paths.contains(&positive.relative_path)
             })
             .filter_map(|positive| match &positive.file {
-                NewScanManifestIndexedFile::Movie(file) => Some(file.clone()),
+                NewScanManifestIndexedFile::Movie(file) => Some(file),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -84,7 +85,7 @@ impl Database {
                 positive.delta_kind == "ADD" && claimed_add_paths.contains(&positive.relative_path)
             })
             .filter_map(|positive| match &positive.file {
-                NewScanManifestIndexedFile::Episode(file) => Some(file.clone()),
+                NewScanManifestIndexedFile::Episode(file) => Some(file),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -92,7 +93,7 @@ impl Database {
         let mut result = ManifestDiscoveryPositiveIndexResult::default();
         let movie_materialization_started = Instant::now();
         result.created_items = self
-            .insert_movie_files_without_filesystem_entries_in_transaction(
+            .insert_movie_files_without_filesystem_entries_refs_in_transaction(
                 transaction,
                 library_id,
                 library_root_id,
@@ -109,7 +110,7 @@ impl Database {
         );
         let episode_materialization_started = Instant::now();
         result.created_items = result.created_items.saturating_add(
-            self.insert_episode_files_without_filesystem_entries_in_transaction(
+            self.insert_episode_files_without_filesystem_entries_refs_in_transaction(
                 transaction,
                 library_id,
                 library_root_id,
@@ -128,6 +129,7 @@ impl Database {
 
         let mut changed_sidecar_paths = Vec::new();
         let mut existing_updates = Vec::new();
+        let mut unresolved_files_to_materialize = Vec::new();
         let positive_change_application_started = Instant::now();
 
         for positive in positives {
@@ -140,13 +142,7 @@ impl Database {
                         NewScanManifestIndexedFile::Movie(_)
                         | NewScanManifestIndexedFile::Episode(_) => {}
                         NewScanManifestIndexedFile::Unresolved(file) => {
-                            self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
-                                transaction,
-                                library_id,
-                                library_root_id,
-                                file,
-                            )
-                            .await?;
+                            unresolved_files_to_materialize.push(file.clone());
                             result.created_items = result.created_items.saturating_add(1);
                         }
                         NewScanManifestIndexedFile::Sidecar(_) => {
@@ -184,6 +180,7 @@ impl Database {
                                 expected_missing,
                                 size: observation.size,
                                 modified_at: observation.modified_at,
+                                device: observation.device,
                                 inode: observation.inode,
                                 fingerprint: observation.fingerprint.as_slice(),
                                 generation,
@@ -205,6 +202,7 @@ impl Database {
                                 expected_missing,
                                 size: observation.size,
                                 modified_at: observation.modified_at,
+                                device: observation.device,
                                 inode: observation.inode,
                                 fingerprint: observation.fingerprint.as_slice(),
                                 generation,
@@ -226,6 +224,7 @@ impl Database {
                                 expected_missing,
                                 size: observation.size,
                                 modified_at: observation.modified_at,
+                                device: observation.device,
                                 inode: observation.inode,
                                 fingerprint: observation.fingerprint.as_slice(),
                                 generation,
@@ -267,6 +266,14 @@ impl Database {
                 }
             }
         }
+
+        self.materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
+            transaction,
+            library_id,
+            library_root_id,
+            &unresolved_files_to_materialize,
+        )
+        .await?;
 
         let applied_existing_ids = self
             .apply_manifest_existing_files_batch_in_transaction(transaction, &existing_updates)

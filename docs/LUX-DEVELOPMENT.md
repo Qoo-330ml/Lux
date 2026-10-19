@@ -278,6 +278,7 @@ Lux 的核心价值不是功能数量，而是：
 - 用户有权访问的多个媒体库入口。
 - 搜索入口。
 - 普通搜索按逻辑资源返回电影和整剧，不把季度、单集作为默认结果；剧集层级在进入剧集详情后浏览。Emby 客户端明确通过 `IncludeItemTypes=Season` 或 `Episode` 搜索时，保留对应层级结果。
+- 首页分区标题、精选轮播纯文字标题，以及媒体详情页的标题、原文名、标语和分区标题，在桌面与移动端使用随 Web 包分发的 Libre Bodoni 与 Noto Serif SC（Didone/宋体风格）；首页媒体卡片片名中文保持无衬线，英文可用 Libre Bodoni；不依赖设备预装字体，图片 Logo 不受影响。
 
 媒体库浏览首版支持：
 
@@ -304,6 +305,8 @@ Lux 的核心价值不是功能数量，而是：
 - 默认不足 2 分钟的进度不进入继续观看。
 - 继续观看的最短进度由管理员在全局设置中调整；自动标记已看的百分比由用户在个人设置中调整。
 - Lux Web 首页和 Emby Resume 按剧集聚合继续观看进度：同一剧有多条符合继续观看条件的单集时，只展示季号优先、集号其次最大的单集进度；并列时使用最近播放时间决胜。电影保持逐条显示。
+- Lux Web 首页和 Emby Resume 在某剧最近播放的已看单集之后没有更靠后的合格未完成进度时，显示季号、集号顺序中其后的第一集未看且可播放单集；该单集没有进度时从 0 开始。
+- Lux Web 继续观看卡片的电影首行显示片名和剩余时长，第二行显示年份；剧集首行显示剧名和剩余时长，第二行显示季集号与单集标题。第三行以自然的短句显示当前续看条目的最近播放时间；未知时间不显示该行，不把当前单集的播放时间描述成上一集完播时间。
 - 收到播放开始、进度和停止事件时采用幂等更新。
 - 客户端重复、乱序或延迟上报时，不允许进度无理由倒退；显式从头播放除外。
 - 电影和单集达到已看阈值后自动标记为已看；季度在其全部未删除且可播放的单集均已看后标记为已看，剧集在其全部季度的可播放单集均已看后标记为已看。
@@ -317,7 +320,7 @@ Lux 的核心价值不是功能数量，而是：
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求。URL 型 `.strm` 的解析请求由 Lux 直连目标并绕过全局出站代理，但不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
 - 远程访问权限由用户策略控制。
-- Lux 会优先使用 X-Forwarded-For、X-Forwarded-Proto 等反代请求头；远程访问权限不再依据来源 IP 判断。
+- Lux 展示的客户端 IP 按有效的 X-Forwarded-For、X-Real-IP、Forwarded 顺序读取；Forwarded 只采用首个代理元素的 for 参数，支持 IPv4、带方括号的 IPv6 和可选端口。转发 IP 缺失或无效时不把反代对端地址当作真实客户端 IP。HTTPS 判断仍读取 X-Forwarded-Proto；远程访问权限不再依据来源 IP 判断。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
 ### 3.14 管理与可观测性
@@ -452,9 +455,11 @@ Lux 的核心价值不是功能数量，而是：
 - 默认扫描时常驻内存目标小于 750 MB。
 - 所有后台队列有界；队列满时合并事件或施加背压，不无限增长。
 - 元数据补全使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 的 worker 默认并发均为 4；`FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
-- ffprobe 默认并发 256，可按媒体库配置 1 至 512；实际运行的单库有效上限为 512、进程全局硬上限为 512，
-  并根据 CPU、内存和前台 p95 动态降档。4 核 NAS 的默认有效并发目标为 128，8 核目标为 256，16 核及以上目标为 512；ffprobe 只处理本轮
-  fingerprint 变化或新增的 source，未变化 source 不得重复探测。
+- ffprobe 自动进程预算为 `ceil(effective_cpu_cores × 4)`，范围 1 至 512；没有 cgroup 限额时使用标准库
+  `available_parallelism`，Linux 可见的 v1/v2 quota 与 cpuset 共同取较小容量。新库将自动预算写入每库设置；
+  已有每库配置保留，但运行时不能超过进程预算。`LUX_PROBE_CONCURRENCY` 数值覆盖自动进程预算。
+  本地 ffprobe 的活动并发从约有效 CPU 核数起步，后续仅依据成功完成速率试探和回退，并结合近期前台延迟及内存保护；
+  CPU 使用率不参与 probe 控制，进程全局硬上限为 512。ffprobe 只处理本轮 fingerprint 变化或新增的 source，未变化 source 不得重复探测。
 - TMDb 请求必须经过 `org.lux.tmdb` 插件；插件统一限制最多 16 个并发请求、每秒最多发起 32 次请求，并实现指数退避和抖动。
 - SQLite 写事务短小，批次默认 100 至 500 项；禁止把整个库放入单个事务。
 
@@ -520,7 +525,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_FFMPEG_CONCURRENCY=2`。ffprobe 默认按有效 CPU 容量自动设置进程预算为 `ceil(CPU 核数 × 4)`，上限 512；Compose 未设置 `LUX_PROBE_CONCURRENCY` 时传空值启用自动预算。活动并发从约 CPU 核数起步，再按本地 ffprobe 成功完成速率自适应调整；首页延迟或 cgroup 内存压力升高时保护性降档，不依赖 CPU 使用率。管理员可通过 `LUX_PROBE_CONCURRENCY` 显式覆盖预算。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立控制 ffprobe 和 ffmpeg 子进程。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -1308,7 +1313,11 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 
 指定条目的批量重新识别仍使用持久化任务队列：管理员一次提交 1-100 个条目，服务端去重后以 `QUEUED` 创建任务并在后台逐条处理；每条记录 `PENDING/RUNNING/COMPLETED/FAILED`、候选数量和稳定错误代码，任务通过 `GET /api/v1/admin/metadata/reidentify/{jobId}` 查询。条目级失败不会把整批伪装成基础设施失败，父任务以 `COMPLETED_WITH_ISSUES` 完成；只有任务无法收尾等基础设施故障才使用 `FAILED`。刮削器暂不可用的批次可以使用 `DEFERRED` 表示延后。该指定条目接口只负责重新搜索并生成 pending 候选，供管理员处理；失败、有问题或延后的任务可通过 `POST /api/v1/admin/metadata/reidentify/{jobId}` 重新排队未完成条目。
 
-每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务；服务重启时遗留的活动任务标记为 `CANCELLED`，不会自动重新进入 `PENDING`。
+每个元数据任务持久化 `job_scope`（`ITEMS` 或 `LIBRARY`）和可选的 `library_id`；指定条目任务明确使用 `ITEMS`，同库条目仍记录其媒体库身份，整库任务明确使用 `LIBRARY` 和真实媒体库身份。历史任务默认按 `ITEMS` 处理，不根据条目数量推断范围。单进程内同一时刻只允许一个活动的整库元数据任务。服务重启标记为 `CANCELLED` / `SERVER_SHUTDOWN` 的元数据任务，在下次启动时恢复原任务 ID，只将未完成子项重新排队；已完成子项和管理员主动取消的任务保持原状。`FILL_MISSING` 仅在媒体库仍启用且仍选中刮削器时恢复；没有可用刮削器的库不得创建待运行任务。
+
+自动 `FILL_MISSING` 因刮削器暂不可用而 `DEFERRED` 时，调度服务按持久化的 item 退避截止时间独立轮询并重排到期失败项，不依赖媒体库扫描或用户计划任务；只有自动来源、仍启用且选中刮削器的媒体库、未消费的带快照 `SCRAPER_UNAVAILABLE` 失败项可自动重试。每项仍按既有 5 分钟、30 分钟、最多 6 小时退避，成功后停止，持续不可用则继续延期。
+
+自动识别结果必须区分“没有找到候选”和“找到候选但分数不足”：前者以 `NO_CANDIDATE` 和候选数 0 记录；后者以 `LOW_CONFIDENCE` 记录实际候选数，候选及媒体识别状态保留为 `PENDING` 供管理员复核。两种情况都让父任务显示 `COMPLETED_WITH_ISSUES`，条目本身仍为 `COMPLETED`。达到现有自动匹配门槛的结果仍自动确认；本任务不调整门槛或评分算法。
 
 媒体库级“整库元数据匹配”使用同一持久化队列，但默认以 `FILL_MISSING` 自动处理：逐条先使用所属媒体库的主刮削器处理全部能力，某项能力为空、无效、不支持或重试失败时再由按顺序启用的备用刮削器接管该项；身份达到高置信度后自动选择最佳候选，再调用补充刮削器合并单值缺失项和去重后的多值项，按媒体库图像策略下载图片并原子写回 NFO/图片；低置信度条目只保留候选并进入待处理状态。新建媒体库首次扫描完成后也自动提交该队列。
 
@@ -1723,8 +1732,9 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 任务使用 dedupe_key，例如 library_id + normalized_path + job_type。重复事件合并。
 
 管理员计划使用独立的计划 ID 作为调度游标键；计划到点只产生一次批次语义的派发请求，目标媒体库
-仍各自进入对应运行队列。全量扫描默认最大并发为 1，实时增量扫描在批次边界优先领取资源；计划未
-完成时下一次触发不得重复创建同一媒体库的活动运行任务。
+仍各自进入对应运行队列。全量扫描索引默认最大并发为 1；一个库完成索引后即可释放共享索引资源，
+其后处理可以与下一个库的索引重叠。实时增量扫描在批次边界优先领取资源；计划未完成时下一次触发
+不得重复创建同一媒体库的活动运行任务。
 
 ### 18.2 重试
 
@@ -1855,7 +1865,6 @@ services:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
       LUX_SCAN_CONCURRENCY: "2"
-      LUX_PROBE_CONCURRENCY: "8"
       LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
       TZ: "Asia/Shanghai"
@@ -2099,6 +2108,12 @@ services:
 | LUX-207 | web/src/features/player/、web/tests/；实现来源可追溯的手势、自动隐藏和时间轴交互 |
 | LUX-208 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；Media Session、移动端安全区和兼容性收尾 |
 | LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
+| LUX-578 | migrations/、migrations-postgres/、tests/storage.rs、docs/LUX-DEVELOPMENT.md；增加逐任务唯一媒体进度台账 |
+| LUX-579 | src/storage/jobs/scan/manifest/discovery/presence.rs、src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-580 | src/storage/jobs/scan/lifecycle.rs、src/storage/repository.rs、src/application/scanner/tests.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md |
+| LUX-581 | src/application/admin_task_activity.rs、src/api/admin/admin_jobs.rs、src/api/admin/admin_scheduled_tasks.rs、tests/、docs/LUX-DEVELOPMENT.md |
+| LUX-582 | web/src/lib/api/types.ts、web/src/features/admin/AdminOperationsPage.tsx、web/tests/admin-operations.test.tsx、docs/LUX-DEVELOPMENT.md |
+| LUX-583 | web/src/features/activity/ScanActivityPopover.tsx、web/tests/scan-activity.test.tsx、docs/LUX-DEVELOPMENT.md |
 | LUX-210 | docs/LUX-DEVELOPMENT.md；关闭 LuxPlayer 核心阶段并定义字幕、弹幕后续边界 |
 | LUX-211 | src/api/mod.rs、tests/、web/src/features/player/、web/tests/、docs/；将字幕轨绑定到当前媒体源并实现原生 WebVTT 生命周期 |
 | LUX-212 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有的安全文本字幕解析与渲染 |
@@ -2203,6 +2218,8 @@ services:
 | LUX-306 | src/application/metadata.rs、tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；海报 worker 批量写入及复测 |
 | LUX-307 | docs/LUX-DEVELOPMENT.md、docs/API.md、src/api/media.rs、tests/catalog.rs；Lux 媒体条目响应公开入库时间 |
 | LUX-308 | docs/LUX-DEVELOPMENT.md、web/src/lib/api/types.ts、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；资源详情显示添加时间 |
+| LUX-576 | docs/LUX-DEVELOPMENT.md、docs/API.md、src/api/media.rs、tests/catalog.rs；Lux 媒体 userData 公开最近播放时间 |
+| LUX-577 | docs/LUX-DEVELOPMENT.md、web/src/lib/api/types.ts、web/src/features/home/media.tsx、web/src/react.css、web/tests/home-media.test.tsx；继续观看卡片三行信息与最近观看文案 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2847,6 +2864,7 @@ services:
 - 播放进度达到用户阈值或停止事件达到用户阈值时，电影/单集自动标记为已看。
 - Emby 兼容播放回调成功保存进度后，通过普通用户 `home` 事件通知 Lux Web 重新读取继续观看；事件不携带媒体或用户数据，继续观看仍在每次首页请求时实时查询。
 - 首页和 Emby Resume 对符合条件的同剧单集只显示季号、集号靠后的进度；总数按电影条目和剧集分组后的卡片数计算。
+- 首页和 Emby Resume 在最近播放的已看单集之后没有更靠后的合格未完成进度时，继续观看显示其后的第一集未看且可播放单集；未开始播放时进度为 0。
 - 季度和剧集按未删除且可播放的单集聚合已看状态；空容器不自动标记。
 
 验证：边界值测试、播放事件集成测试、剧集聚合测试和 Resume API。
@@ -3582,6 +3600,14 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 执行全库校验、补漏和按 `existingInfoPolicy` 处理。插件未安装、未启用、配置无效、媒体库未选中或本次
 没有 STRM 来源时，不发起插件 RPC。
 
+STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选中的 STRM 来源，以及插件未启用时的来源，
+状态为 `NOT_CONFIGURED`；只有已持久化 STRM 探测作业覆盖的来源才进入 `PENDING`。保存新的媒体库选择后，
+宿主自动取消旧选择对应的活动作业，并为当前选中的媒体库排入全库处理；插件重新启用时也会按当前配置
+排入处理。作业创建与来源转为 `PENDING` 在同一数据库事务中完成。作业完成时来源转为 `READY` 或实际
+错误状态；作业取消时未处理来源恢复为 `NOT_CONFIGURED`。普通扫描不会把未配置来源留在探测队列，
+并会将对应扫描探测阶段记为跳过。历史 STRM `PENDING` 状态由迁移 0181 改为 `NOT_CONFIGURED`，
+随后由当前插件配置决定是否重新排队。
+
 插件 manifest 必须声明 `type: "media_probe"`、`category: "MEDIA"` 和
 `capabilities: ["media.probe"]`。插件进程不能访问 Lux SQLite、媒体根目录或内部任务对象；
 插件错误、超时、异常退出和超限输出不能导致 Lux 主进程退出。RPC、任务事件、错误消息和旁车
@@ -3595,6 +3621,7 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 验收：
 
 - [ ] 管理员只能选择已有媒体库，未选媒体库不创建任务、不发起插件 RPC；空选择、无效 ID、并发超范围均被拒绝。
+- [ ] 未选中或未启用插件的 STRM 来源为 `NOT_CONFIGURED`，不占用普通 ffprobe 队列；保存新的媒体库选择或重新启用插件后，所选来源通过持久化后台作业重新处理，作业取消后未处理来源不遗留 `PENDING`。
 - [ ] 插件详情页展示并保存媒体库多选、并发数、媒体信息开关、缩略图开关、缩略图位置百分比、已有媒体信息处理方式、旁车写回和五段式 cron 配置；配置文件原子保存且权限受限，插件列表回显非敏感值；任务与日志页可以修改同一份 STRM 计划。
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启会取消 PENDING/RUNNING 任务且不自动领取新源；失败或取消任务可以重试。
@@ -5708,13 +5735,13 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 数据、媒体索引和 Webhook 投递 outbox 不属于被取消的作业实例。
 
 服务启动并完成数据库迁移后，先在一个事务中将上一次异常退出遗留的活动作业，以及扫描中仍处于
-`COMPLETED + POSTPROCESSING` 的作业，标记为 `CANCELLED`，并记录稳定错误码 `SERVER_SHUTDOWN`；之后不再
-调用旧的 `resume_*_jobs` 自动恢复入口。优雅关闭时，在关闭数据库连接前再次执行同一清理，覆盖关闭窗口内的
-活动作业。计划任务在后续调度周期可以创建新的作业实例，但不恢复被取消的旧实例。
+`COMPLETED + POSTPROCESSING` 的作业，标记为 `CANCELLED`，并记录稳定错误码 `SERVER_SHUTDOWN`。优雅关闭时，
+在关闭数据库连接前再次执行同一清理，覆盖关闭窗口内的活动作业。元数据识别任务按 LUX-572 恢复原任务中
+未完成的子项；其他作业仍保留取消记录并等待既有主动重试或后续计划任务。
 
-例外（元数据补全，2026-10-14 修订）：被取消的作业实例仍不恢复，但每次启动后，对「最近一个 `FILL_MISSING`
-作业被 `SERVER_SHUTDOWN` 取消且已选择刮削器」的媒体库，各新建一个库级 `FILL_MISSING` 作业并按库依次
-执行，使中断的在线刮削自动补完；已完整的条目不发起刮削请求。同时，元数据作业不得在仍有 `PENDING`
+元数据识别恢复（LUX-572）：被取消的任务历史保留；启动后将 `SERVER_SHUTDOWN` 元数据任务中仍未完成的子项
+原子地恢复到同一个任务 ID。`FILL_MISSING` 仅在媒体库仍启用且仍选中刮削器时恢复；已完成条目不重复刮削。
+同时，元数据作业不得在仍有 `PENDING`
 条目时记为完成（以 `FAILED` / `QUEUE_INCOMPLETE` 结束），无法派发的作业记为 `FAILED` / `DISPATCH_FAILED`
 而不是长期停留在 `QUEUED`。
 
@@ -6957,6 +6984,10 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-28 PostgreSQL 扫描写事务启用事务局部 `SET LOCAL synchronous_commit = off`，普通 metadata 写事务与 SQLite 不变。60k fixture 六轮 A/B 的首扫索引汇总中位数从 5.599 降到 5.236 秒；末三轮反序交错子集为 5.390→5.188 秒，约快 3.7%。累计提交等待中位数约从 78.9 降到 2.35 ms；target、重扫和前台 p95 未观察到超过 5% 的回退。PostgreSQL 异常退出可能丢失近期已确认的整笔扫描事务，但不会造成数据库不一致；启动会取消未完成任务而不自动续跑，需要重新发起扫描。完整样本与限制见 `docs/PERFORMANCE.md`；本结果不关闭 LUX-275 双后端阶段门。
 
+2026-10-18 将 PostgreSQL `media_items.merged_into_item_id` 索引改为只覆盖非空合并关系的部分索引。历史 60k/600 fixture A/B 首扫中位数从 5.788 降至 5.229 秒（约快 9.7%），`movie_item_insert` 中位数从 1.817 降至 1.538 秒；候选 WAL 中位数高约 2.8%，需继续观察。SQLite schema 不变。历史候选使用 0150 版本号；当前 PostgreSQL 0150 已用于 HOMEVIDEOS，因此以新 migration `0182_partial_merged_into_index.sql` 承载相同 schema 变更。完整样本见 `docs/PERFORMANCE.md`，LUX-275 双后端阶段门仍开放。
+
+0.6.10 发布集成还适配了扫描和关机路径的有界批处理：嵌套剧集目录来源读取、未解析 Manifest 文件物化、Manifest 根目录初始化、已移除层级行恢复及旧版扫描任务回收。全量扫描用独立容量为 1 的队列约束索引阶段；索引终结后释放队列与共享扫描许可，使下一媒体库可在前一任务继续后处理时开始索引。对应固定 SQLite fixture 的历史 SQL 计数及验证边界见 `docs/PERFORMANCE.md`；本次发布按要求未运行测试、构建或 lint，LUX-275 的完整性能阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`migrations-postgres/0147_drop_media_search_item_fk.sql`、`migrations-postgres/0148_drop_scan_job_targets_job_fk.sql`、`migrations-postgres/0149_statement_timestamp_unixepoch.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
@@ -7128,14 +7159,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 | 入口或情形 | 本地检查 | 在线补缺 |
 | --- | --- | --- |
-| 新建全量扫描 | 正向批次提交后立即排队 | 成功确认缺失且策略允许时排入独立 FILL_MISSING |
-| 手动全量/局部扫描 | 只处理对应范围 | 使用独立扫描补缺设置；不得扩大为整库刷新 |
-| 实时增量扫描 | 只处理本次变化条目 | 继续尊重 `realtime_metadata_auto_match_enabled` |
-| 升级后的既有媒体库 | 正常处理 | 新扫描补缺开关初值沿用既有实时自动匹配开关；明确关闭状态不得被 migration 打开 |
+| 新建全量扫描 | 正向批次提交后立即排队 | 只对本次正向新增/变化条目，成功确认缺失且统一开关允许时排入独立 FILL_MISSING |
+| 手动全量/局部扫描 | 只处理对应范围 | 复用同一开关；不得扩大为整库刷新 |
+| 实时增量扫描 | 只处理本次变化条目 | 复用同一开关 `realtime_metadata_auto_match_enabled` |
+| 本地元数据回填/刷新 | 正常处理 | 只记录缺失，不排在线补缺；老资源由管理员手动刷新 |
+| 升级后的既有媒体库 | 正常处理 | 统一开关沿用既有实时自动匹配值；明确关闭状态不得被 migration 打开 |
 | 无可用 provider、策略关闭或 VIDEO/HOMEVIDEOS | 正常适用的本地规则 | 记录原因或保持禁止，不发起网络请求 |
 | 本地检查失败或根不可用 | 记录可重试异常 | 不标记为已确认缺失，不提交在线请求 |
 
-对新建媒体库，新扫描缺失自动补全默认开启；管理员可以单独关闭。缺失任务按现有最多 100 项的定向 FILL_MISSING 作业合并，同一条目/输入版本的活跃工作去重，并在执行时重新评估缺失，只补空值且不覆盖本地或锁定数据。升级不得在 migration 中扫描文件、访问 provider 或为历史全库一次性创建刮削任务。
+对新建媒体库，新增/变化资源自动刮削默认开启；管理员只需维护一个开关。全量扫描只对本次新增/变化条目使用该开关，未变化的老条目不会被自动重刮。历史 `scan_missing_metadata_auto_match_enabled` 仅保留兼容，不再作为运行时策略来源。缺失任务按现有最多 100 项的定向 FILL_MISSING 作业合并，同一条目/输入版本的活跃工作去重，并在执行时重新评估缺失，只补空值且不覆盖本地或锁定数据。升级不得在 migration 中扫描文件、访问 provider 或为历史全库一次性创建刮削任务。
 
 `ScanCompleted` webhook 和 `JOB_COMPLETED` 继续表示 Manifest 索引及缺失确认完成；`POSTPROCESSING`/`IDLE` 继续描述本地扫描后处理阶段。在线补缺保持独立任务与自己的状态、尝试和取消入口。前端刷新按批次合并，图片使用更新后的 image tag，列表仍有分页与服务端上限，不等待浏览器逐项确认，也不为 10,000 条目逐条构造请求。
 
@@ -11333,6 +11365,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 更新实现与验证（2026-10-15）：`MediaNfoPanel.tsx` 移除外围卡片并收紧分区留白；`react.css` 移除对应边框样式、将 tagline 调至 `1rem`，并去掉官方网站上方短线。新增的渲染回归和布局检查分别为 33/33、31/31；冻结锁文件安装和 Web production build 通过，`git diff --check` 通过。Web 全量检查仍有不相关失败：静态 Node 检查 137/139（首页卡片尺寸、触屏操作规则 2 项）；完整 Vitest 596/600（首页继续观看评分、首页媒体库焦点预取、媒体库卡片预取与合集链接 4 项）。
 
+布局更新（2026-10-18）：宽屏媒体详情页将 tagline 放到主视觉右上方的留白区域；窄屏继续沿用详情内容流中的位置。
+
 #### LUX-537：对齐 Emby 鉴权凭据优先级与重复 query 行为
 
 范围：根据官方 Emby 4.10.1.0 原生 ARM64 临时实例实测，在 Emby 路由入口统一选择凭据，避免不同令牌 query 名称映射到同一 Serde 字段而返回 400。标准优先级为 HTTP `X-Emby-Token`、query `X-Emby-Token`、authorization 的 `Token`、HTTP `X-MediaBrowser-Token`、query `api_key`；非空无效高优先级凭据不回退。Lux 已有扩展仅在标准来源均为空时回退。保留现有 principal、管理员权限、媒体库 ACL 和签名播放票据规则；不改变原生 `/api/v1`。
@@ -11538,6 +11572,8 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 预计文件（不超过 5 个）：Web API client/types、库列表/合集页/详情组件、Web 测试及本文档。
 
+补充实现（2026-10-18）：虚拟合集库的 Web 入口封面优先使用当前用户可访问合集自身的海报，再以成员电影海报补足；首页和媒体库列表一致，无可用海报时显示专属合集封面样式。封面仅在客户端组合，不写入共享库数据，避免跨用户 ACL 泄露。Web 生产构建通过；本次未运行自动化测试或浏览器视觉验收。
+
 #### LUX-543：接入 Emby 合集库与系列浏览
 
 范围：Emby 用户库列表提供 `CollectionType=boxsets` 的系统入口；合集显示为 `BoxSet`，成员显示为唯一逻辑 `Movie`。不同媒体库的同片副本不重复显示为多个系列成员。
@@ -11661,6 +11697,1438 @@ JSON 请求先复现原实现的 405，再通过集成回归；库测试验证�
 实施结果（2026-10-15）：图像编辑器当前图片 URL 追加 `?tag=<contentTag>`，内容标签缺失时使用图片行 ID。TDD 回归在修复前因缺少版本参数失败，修复后 `media-editors.test.tsx` 7/7 通过。冻结锁文件安装与 Web production build 通过。
 
 全量 `pnpm test` 的静态检查为 141 passed、2 failed：失败来自未修改的 `home-media-layout.test.mjs` 和 `responsive-layout.test.mjs`。因脚本在静态检查失败后停止，另行运行完整 Vitest：74 个文件中 599 passed、4 failed，失败位于未修改的 HomePage、home-media 与 library-card 测试；`media-editors.test.tsx` 7/7 通过。`git diff --check` 通过。没有 Rust、API 或数据库变更，未部署 FNOS。
+
+#### LUX-550：隔离媒体详情页查询与交互渲染
+
+范围：落实项目所有者提供的前端重构方案第三项。路由入口仅订阅当前 item；Hero、操作区、版本/轨道选择、剧集、演员、剧照和 NFO 按关注点拆分。操作区独立持有 playback query、操作及编辑器状态，编辑器按需动态导入；剧集和剧照查询只更新相关子树。保留 15 秒刷新、API、布局与现有用户流程；SSE 刷新策略属于方案第五项，不在本任务引入。
+
+验收：
+
+- [x] playback、剧集、剧照查询变化不重渲染无关 Hero、演员和 NFO；真实数据变化仍展示最新值。
+- [x] 保留电影/视频/剧集/季度/单集布局、季海报回退、单季展开、分集分页和下一集播放。
+- [x] 保留版本/音轨/字幕切换、收藏/已看、元数据确认、下一个待确认、编辑与删除流程。
+- [x] 编辑器仅在打开时动态加载；保持加载和失败反馈。
+- [x] 针对性回归、完整 Web 检查及真实浏览器验证已执行，优化前后数据与既有失败均记录；完整 Web 门禁尚未全绿，见下方结果。
+
+预计文件按四个代码增量与最终验证增量拆分，每次提交不超过五个文件：
+
+1. 本文档、`web/src/features/detail/MediaDetailPage.tsx`、`MediaDetailSections.tsx`、`web/tests/media-detail-performance.test.tsx`：隔离演员/剧照/NFO。
+2. `MediaDetailPage.tsx`、`MediaEpisodesSection.tsx`、`useMediaEpisodes.ts`、性能回归：隔离剧集查询与列表。
+3. `MediaDetailPage.tsx`、`MediaDetailHero.tsx`、`MediaSourcePanel.tsx`、`media-source.ts`、`web/tests/detail-layout.test.mjs`：拆分 Hero 与版本轨道状态。
+4. `MediaDetailPage.tsx`、`MediaDetailActions.tsx`、共享 `MediaEditorBoundary.tsx`、`web/tests/detail-logo-layout.test.mjs`、详情回归：操作区和编辑器延迟加载。
+5. 本文档、`docs/COMPATIBILITY.md`、`docs/PERFORMANCE.md` 与两个浏览器验证脚本：验收与证据。
+
+实施中另按至多五文件的独立提交提取 `home/media-display.tsx`，移除详情和编辑器对媒体卡片模块的静态依赖；卡片入口仅调整共享编辑器的动态导入和加载边界，未执行方案第一项的卡片结构或多选重构。父剧查询与剧集查询各由一个 provider 持有，避免拆分后增加轮询 observer；Hero 仅订阅图片查询中的 logo 值。
+
+验证结果（2026-10-16，代码 `5c5661ab`，对照 `8c8d5c13`）：100 演员、五次 playback 更新时，演员/剧照/NFO 各自额外渲染从 5 次降为 0 次，实际收藏状态仍更新。详情入口从 1102 行降到 80 行。生产构建的入口与详情 JS 合计从 178.40 kB 降为 164.32 kB（不含公共 vendor；gzip 49.52→45.93 kB），五个编辑器各自形成动态 chunk。具体测量边界见 `docs/PERFORMANCE.md`。
+
+- 冻结依赖安装、TypeScript、生产构建通过；详情/性能/编辑器边界 Vitest 43/43，相关 Node 静态回归 35/35 通过。
+- 完整 `pnpm --dir web test` 的 Node 阶段 142 passed、2 failed，脚本因此未进入 Vitest；随后单独完整 Vitest 为 608 passed、4 failed。六项失败均在干净基线 `8c8d5c13` 复现：移动卡片尺寸和 touch selector 静态断言两项，继续观看评分、首页库卡片预取、库卡片预取及虚拟合集旧链接断言四项。完整门禁不能记为通过。
+- Playwright Chrome `155.0.8059.41` 使用本分支 production bundle 和合成 API，验证 1440/390 px 无横向溢出、五编辑器按需下载与关闭卸载、版本/音轨、收藏/已看、元数据保存、指定版本删除失败反馈、单季展开、分页、下一集和季海报回退；额外模拟 chunk 延迟/失败，确认详情保留且错误可关闭。无非预期浏览器错误；删除 fixture 的一次 HTTP 409 属预期。
+- 本机 macOS `arm64`；`cargo fmt --all -- --check` 通过，Cargo 输出目录指定 Toshiba 共享 target。无 Rust/API/数据库/依赖变更，未运行 Rust build/test/clippy，未部署或验证 FNOS/x86、真实服务器与客户端性能。
+
+#### LUX-551：拆分媒体卡片并按需加载编辑器
+
+范围：执行前端重构方案第一项。将 MediaCard 拆为 memo 外壳、纯展示层、操作触发层及条件加载的编辑器层；五种编辑器按打开动作动态导入。库页多选传递稳定回调和条目 ID，单张卡片选择不重绘其余卡片。保持首页、库页、搜索、收藏、文件夹和只读合集卡片的既有展示及操作语义。
+
+验收：
+
+- [x] 无关父状态更新不重绘 props 未变的卡片；选择单项只更新目标卡片，操作状态不重绘展示层。
+- [x] 五种编辑器初次展示卡片时均不加载，仅打开对应功能时加载和挂载；关闭卸载，删除保留默认源选择及成功移除行为。
+- [x] 标题、年份、图片版本、评分、集数、进度、待确认标记、导航、错误提示及只读/文件夹限制保留并有回归。
+- [x] 冻结依赖安装、Web 测试、生产构建及相关 Playwright 流程验证完成；记录本机 ARM 性能与首屏 bundle 前后数据，不把方案预期比例当作实测结果。
+
+预计增量：一（4 文件）：本文档、`web/src/features/home/media.tsx`、`media-card-editors.tsx`、`web/tests/media-card-loading.test.tsx`；二（至多 5 文件）：`media.tsx`、`media-card.tsx`、`media-card-visual.tsx`、`media-card-overlay.tsx`、`web/tests/media-card-performance.test.tsx`；三（至多 5 文件）：`web/src/features/library/LibraryPage.tsx`、库页性能回归、随组件搬迁调整的静态布局测试、本文档和性能记录。每个增量测试通过后独立提交。
+
+实施结果（2026-10-16）：在 `codex/lux-551-media-card-performance` 分支完成三个独立增量。`MediaCard` 现在由 memo 外壳、`MediaCardVisual`、`MediaCardCopy`、`MediaCardOverlay` 和 `MediaCardEditors` 组成；五个编辑器改为动态导入，仅对应操作打开时请求。操作回调保持稳定，库页选择回调按条目 ID 复用，避免选择一个条目时为全部卡片创建新闭包。新增加载、显示状态、操作状态、文件夹/只读限制、库页选择和媒体卡片性能回归。
+
+验证：Toshiba 已挂载，本机 `uname -m=arm64`。`CI=true corepack pnpm@10 --dir web install --frozen-lockfile`、`CI=true corepack pnpm@10 --dir web build` 通过；媒体卡片和库页选择定向 Vitest 5/5 通过。120 张卡片的 Playwright 基准中，12 次无关父级更新的展示读取从基线 1,440 次降为 0，React 提交耗时由每次约 5.4–18.1ms 降为 0–0.2ms；编辑器动态模块在卡片初次展示时未请求，打开元数据编辑器后只请求对应模块。桌面和 320px 移动视口截图确认编辑器布局可见且无重叠。
+
+全量 `pnpm test` 的 Node 静态检查在基线 `c05d0eb0` 和本分支均为 141/143：两项旧断言分别期待已变更的首页媒体库卡片尺寸，以及旧的触控操作 CSS 选择器。Vitest 单独运行时，基线为 599/603，本分支为 605/609；四项相同的既有失败位于继续观看评分断言、首页库卡片预取，以及库卡片预取和虚拟合集旧选择器。此次新增/修改的媒体卡片与库页选择测试均通过。未部署或访问 FNOS。
+
+#### LUX-552：媒体库网格虚拟化
+
+范围：落实用户提供的前端重构方案第二项，使用 `@tanstack/react-virtual` 按行虚拟化 LibraryPage 已加载的媒体；上下各缓冲两行，沿用现有 CSS 响应式列宽和窗口滚动。分页查询与底部 IntersectionObserver 继续负责加载，不扩大到其他页面或其他重构项。
+
+验收：
+
+- [x] 500+ 已加载条目只挂载可视行与缓冲行，首尾条目均可滚动访问。
+- [x] 响应式列数与真实行高同步，元数据徽章、窗口缩放和不满行不重叠、不裁切。
+- [x] 排序、筛选、文件夹、合集、跨屏批量选择及原有分页/失败重试行为继续可用。
+- [x] 增加自动化回归并完成本机浏览器前后对比、Web 单测与构建；记录失败和未验证边界。
+
+预计文件分三个增量：依赖及登记（`web/package.json`、`web/pnpm-lock.yaml`、本文档）；实现及回归（`web/src/features/library/LibraryGrid.tsx`、`web/src/features/library/LibraryPage.tsx`、`web/src/react.css`、`web/tests/library-grid.test.tsx`，必要时扩展 `web/tests/library-page.test.ts`）；验收记录（本文档、`docs/COMPATIBILITY.md`）。每个增量不超过 5 个文件。
+
+参考：[TanStack Virtualizer API](https://tanstack.com/virtual/latest/docs/api/virtualizer) 的 `scrollMargin`、`measureElement`、`gap` 与 `rangeExtractor`。
+
+实现与验证（2026-10-15）：`LibraryGrid` 使用窗口虚拟化和真实行高测量，响应式列数直接读取现有 CSS 网格，包含上下两行缓冲；保留聚焦卡片所在行，窗口列数变化时保留其父节点身份和编辑草稿。行使用 `top` 定位，避免 transform 改变卡片内 fixed 对话框的包含块。列表提供位置/总数语义，库页继续持有跨屏选择。虚拟化依赖单独分包，只随库页加载（production gzip 约 8.42KB）。追加增量仅涉及 `web/vite.config.ts` 的分包规则，以及 `LibraryGrid.tsx`/回归测试中的聚焦卡片身份保留。
+
+TDD：原实现加载 504 项时实际挂载 504 张卡片，节点上限回归先失败；列数变化导致编辑草稿丢失的回归同样先失败再修复。最终 `library-grid.test.tsx` 5/5、`library-page.test.ts` 19/19 通过。冻结锁文件安装、TypeScript 检查、Web production build、`cargo fmt --all -- --check` 和 `git diff --check` 通过。本任务没有 Rust 行为变化，未运行 Cargo 编译、Clippy 或 Rust 测试；Cargo fmt 使用 Toshiba 共享 target。
+
+浏览器验证：本机 macOS arm64、Headless Chrome 155、Playwright。504 项模拟数据在 320/768/1024/1440px 宽度的首屏分别挂载 8/12/20/28 张卡片；首尾可达、无水平溢出和行间重叠。跨屏多选、从 24 项连续分页至 504 项（最后 42 张卡片）、打开实际卡片编辑器后从 1440px 缩至 320px 保留草稿均通过，无 pageerror。1440×900 下三轮交替 A/B 中，基线 `c05d0eb0` 的卡片/DOM 节点数为 504/10294，本实现为 28/648；初始 React Profiler 各次提交耗时总和的中位数从 138.2ms 降至 47.6ms（约 65.6%）。此数据来自开发构建、内存缓存、无真实海报的本机模拟数据，不代表真实网络、NAS 或移动设备性能，也不是 INP/LCP 指标。
+
+全量检查边界：`pnpm test` 的静态测试 141 passed、2 failed，脚本在此停止；独立运行完整 Vitest 为 605 passed、4 failed（75 文件通过、3 文件失败）。失败为首页卡片紧凑宽度、触屏操作控件静态断言、继续观看评分、首页预取入口，以及 LibraryCard 预取和只读合集入口。六个失败均用原始基线的 `LibraryPage.tsx` 与 `react.css` 复现，相关其他源码和测试与基线一致，未扩展本任务处理。完整 Web gate 因既有失败未全绿。未推送、合并或部署；Safari/iOS 真实设备未验证。
+
+#### LUX-553：优化横向滚动栏与前端动画
+
+范围：落实前端重构方案第七项和第八项。横向滚动栏在滚动时不再逐事件同步读取元素几何信息；移动端导航、首页 Hero 轮播和登录卡片使用 CSS 动画，消除应用主入口对 `framer-motion` 的依赖。保留滚动按钮、导航开关、轮播切换、视觉布局和现有文案；动画遵从减少动态效果设置。
+
+验收：
+
+- [x] `HorizontalScrollRail` 通过 `IntersectionObserver` 更新首尾边界状态，滚动事件路径不调用 `getBoundingClientRect()`；内容或尺寸变化后箭头状态仍正确。
+- [x] 不支持 `IntersectionObserver` 的环境有节流回退；滚动按钮仍按视口比例平滑滚动，到达边界后正确隐藏对应按钮。
+- [x] 移动导航和 Hero 背景/文案在状态变化时平滑过渡；关闭导航后不可点击、聚焦或被辅助技术访问。
+- [x] 登录、首页和移动导航动画使用 CSS，所有 `framer-motion` 调用点移除后依赖可删除；减少动态效果模式禁用新增动画。
+- [x] 自动化回归覆盖滚动边界、导航开关、轮播切换和动画减少策略；真实浏览器流程通过。
+- [ ] Web 全量检查通过。执行记录见下方；当前失败均在本任务未修改的测试中。
+- [x] 记录 ARM64 环境优化前后主入口 JS/gzip 体积；不得将构建体积差异表述为真实设备帧率或 RUM 数据。
+
+预计分五个增量，每次不超过五个文件：
+
+1. 本文档、`web/src/components/layout/HorizontalScrollRail.tsx`、`web/tests/horizontal-scroll-rail.test.tsx`。
+2. 本文档、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、`web/tests/lux-shell.test.tsx`。
+3. 本文档、`web/src/features/home/HomePage.tsx`、`web/src/react.css`、`web/tests/home-page.test.tsx`、`web/tests/home-hero-layout.test.mjs`。
+4. 本文档、`web/src/features/auth/LoginPage.tsx`、`web/src/react.css`、`web/tests/login-page.test.tsx`。
+5. 本文档、`web/package.json`、`web/pnpm-lock.yaml`、`web/vite.config.ts`。
+
+实施结果（2026-10-16）：`HorizontalScrollRail` 用首尾卡片的 `IntersectionObserver` 可见边界更新滚动箭头，滚动路径不再同步读取 DOM 几何；内容替换时重新绑定端点，缺少 IntersectionObserver 时使用 requestAnimationFrame 合并的尺寸指标回退。移动导航、Hero 背景和文案、登录卡片改用 CSS 动画，并保留减少动态效果支持；删除 `framer-motion` 依赖及 Vite 分块规则。
+
+验证：新增与相关回归通过：`horizontal-scroll-rail.test.tsx` 7/7、`lux-shell.test.tsx` 18/18、`home-hero-layout.test.mjs` 9/9、`login-page.test.tsx` 13/13。`home-page.test.tsx` 为 16/17，唯一失败是已有的媒体库分页预取夹具测试；它在本任务改动前的基线运行中也失败。冻结锁文件安装、生产构建和 `git diff --check` 通过。真实 Playwright 浏览器使用本地 API mock 复核了移动端 Hero、导航开关与继续观看滚动；导航关闭时带 `aria-hidden` 和 `inert`，浏览器控制台错误为 0。未访问生产数据或部署环境。
+
+Web 全量检查未全绿：`pnpm test` 的静态层为 141 passed、2 failed，失败在未修改的 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；脚本因静态层失败而未继续，另行运行完整 Vitest 后为 74 个文件、601 passed、4 failed，失败分布在未修改的 HomePage、home-media 与 library-card 测试。相关失败与本任务修改文件无关，保持为未通过验收项，不为此扩大任务范围。
+
+ARM64（`uname -m`：`arm64`）生产构建中，优化前入口 JS 为 124.09 kB / 33.47 kB gzip，另有静态依赖的 motion chunk 128.88 kB / 42.37 kB gzip；优化后入口 JS 为 124.49 kB / 33.70 kB gzip，motion chunk 已移除。按入口和该静态 motion chunk 合计，构建 JS 体积约减少 128.48 kB / 42.14 kB gzip；该数据只表示构建产物体积，不代表运行帧率或 RUM 表现。
+
+#### LUX-554：路由切换时保留 Lux 导航
+
+范围：普通懒加载页面的 Suspense fallback 放在 LuxShell 内容区，路由 chunk 加载时 header 和主导航保持可见；管理页子路由的 fallback 限定在 `.lux-admin-content`，管理侧栏保持可见。常用主导航和账户入口在指针进入或键盘聚焦时预加载目标页面 chunk。播放器路由继续使用全屏加载态。不改变页面数据、API 或路由权限。
+
+验收：
+
+- [x] 延迟加载媒体库页面 chunk 时，LuxShell header 和主导航保持可见，内容区显示轻量 skeleton；加载完成后页面正常替换。
+- [x] 延迟加载管理页 chunk 时，主导航、管理侧栏保持可见，只有管理内容区显示 skeleton；加载完成后 dashboard 正常替换。
+- [x] 桌面与移动导航，以及账户入口的焦点/指针预加载有回归；播放器路由仍位于全屏 Suspense fallback 下。
+- [x] 冻结依赖安装、生产构建、相关 Web 回归和真实浏览器流程已运行；浏览器使用 2.5 秒本地 chunk 延迟及 mock API，未据此声称生产性能数值。
+- [x] 已执行全量 Web 检查，并在干净 `test` 基线复现相同的 6 个既有失败；项目所有者于 2026-10-16 确认仅对 LUX-554 按基线例外关闭。全局 Web 完成门仍未通过。
+
+预计文件：`web/src/app/App.tsx`、`web/src/features/admin/AdminLayout.tsx`、`web/src/components/layout/LuxShell.tsx`、`web/src/react.css`、相关 Web 测试及本文档。实现拆为路由边界与导航预加载两个独立提交。
+
+实施结果（2026-10-16）：浏览器在 2.5 秒延迟媒体库模块时确认 header/nav 可见且没有全屏 loading；延迟管理 dashboard 模块时确认 LuxShell 与管理侧栏可见，内容 skeleton 在模块加载后消失。目标回归：`app-code-splitting.test.mjs` 5/5，`login-page.test.tsx` 14/14，管理事件/预加载 15/15，LuxShell 17/17、路由预加载 1/1；`pnpm install --frozen-lockfile` 与 `pnpm build` 通过。
+
+全量 `pnpm test` 的静态检查为 143/145，失败在 `home-media-layout.test.mjs` 与 `responsive-layout.test.mjs`；单独 Vitest 为 601/605，4 个失败在 `home-page.test.tsx`、`home-media.test.tsx` 和 `library-card.test.tsx`。在干净 `test` 基线 `8c8d5c13` 重跑这 5 个失败目标，静态目标为 38/40、Vitest 目标为 28/32，完全重现同一组失败；相关测试与组件文件相对基线均未修改。本任务没有 Rust/API/数据库变更；全量 Web 完成门仍未全绿，未部署。
+
+#### LUX-555：首页查询缓存与缓存媒体库并发
+
+范围：落实前端重构方案第四项的短期方案及第五项的首页 staleTime。首页四个独立区块的查询保持 30 秒新鲜；回访期间复用 QueryClient 缓存。现有 `librariesQuery.data` 已同步提供缓存库 ID，不额外复制缓存或恢复慢聚合请求。冷启动无库 ID 时仍先加载媒体库，不声称消除冷启动 waterfall。
+
+预计文件（3 个）：`web/src/features/home/HomePage.tsx`、`web/tests/home-query-policy.test.tsx`、本文档。
+
+验收：
+
+- [x] 30 秒内回访不重新请求四个首页区块；过期后正常刷新。
+- [x] 有缓存库 ID 时最新资源与媒体库刷新并发；服务器返回不同 ID 后请求新的分组。
+- [x] 首页定向回归、Web 全量检查和浏览器验证均已执行；全量基线失败在后续实施记录中单独列出。
+
+#### LUX-556：共享用户 SSE 连接状态
+
+范围：Shell 继续独占一条用户事件连接，以 React context 向内容页共享连接状态。未连接、不支持 EventSource 或 error 时为 disconnected；open 后 connected，重连仍复用同一 EventSource；卸载移除监听并关闭连接。
+
+预计文件（4 个）：`web/src/features/activity/useUserEvents.ts`、`web/src/components/layout/LuxShell.tsx`、`web/tests/user-events.test.tsx`、本文档。
+
+验收：连接、断连、重连、浏览器不支持与卸载关闭均有组件回归。后续任务接入条件轮询。
+
+#### LUX-557：用户事件覆盖详情与收藏缓存
+
+范围：接收 home/item/library/favorites 事件；兼容既有仅带 home 的服务器，并刷新详情、图像、播放信息、子项、收藏、人物与合集缓存。可选 itemId/libraryId 收窄相应缓存；不失效正在播放的 bootstrap/session。所有媒体查询保留在途请求与尾随刷新，首页首次失败仍保留手动重试，防止事件风暴反复启动失败请求。
+
+预计文件（4 个）：`web/src/features/activity/useUserEvents.ts`、`web/tests/user-events.test.tsx`、`web/tests/lux-shell.test.tsx`、本文档。
+
+验收：各作用域、可选 ID、无效 payload、会话缓存保留及已有首页在途请求保护均有回归。
+
+#### LUX-558：为用户查询补齐服务端失效来源
+
+范围：UserEventScope 增加 item/library/favorites 字符串，仍只发送无业务数据的 scope。应用状态将用户 hub 装配到管理员事件中心；元数据修改、库/访问权限/设置修改及任务关键状态向普通用户发送失效，高频 jobs progress 不转发。服务端广播丢帧仍回退 home，前端按全部媒体展示缓存处理。
+
+预计文件（5 个）：`src/application/admin_events.rs`（含库测试）、`src/api/legacy.rs`、`tests/admin_events.rs`、`docs/API.md`、本文档。
+
+验收：作用域 wire names、管理员修改桥接、进度不转发有库测试；执行最窄 `cargo test --locked --lib application::admin_events::tests`，再以 `--test admin_events` 验证鉴权与 SSE 帧。所有 Cargo 命令使用 Toshiba 统一 target。
+
+#### LUX-559：媒体页在线停轮询与断线兜底
+
+范围：首页四项查询和详情六项查询读取共享 SSE 状态；在线不做周期请求，断线/不支持 EventSource 时前台每 30 秒轮询。首页未有成功数据的失败请求仍由显式重试恢复。QueryClient 默认 60 秒 staleTime、单次重试及禁止焦点刷新保持既有配置；首页覆盖为 30 秒。
+
+预计文件（5 个）：`web/src/features/home/HomePage.tsx`、`web/src/features/detail/MediaDetailPage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/media-query-polling.test.tsx`、本文档。
+
+验收：真实 QueryClient 与组件的虚拟时钟回归覆盖首页/详情一分钟在线零周期请求、断线 30 秒刷新与重连停轮询。定向 5 文件 / 65 项测试及 TypeScript、Web production build 通过；全量与浏览器检查后汇总。
+
+#### LUX-564：选择并固定 SQLite Manifest 写事务预算
+
+范围：保持 streamed reader 8,000 文件上限独立，为 SQLite 完整写事务固定经过 release A/B 验证的默认预算；比较 512、1,024、2,048、4,000、5,000、6,000、7,000、8,000，使用相同 60k/600 fixture、FULL synchronous 和固定池配置。扫描/DML 组关闭锁探针；独立竞争组从第二个 SQLite pool 周期性提交真实 scan-job progress update，分开记录 pool acquire、BEGIN IMMEDIATE admission、完整写入延迟和 outcome。PostgreSQL 默认路径不变。
+
+实施文件：`src/application/scanner/jobs/commit_batches.rs`（SQLite 默认预算与回归）、`src/storage/repository.rs`（SQLite 专用 presence CAS 行批次上限）、`src/storage/jobs/scan/manifest/discovery/presence.rs`（应用上限）、`src/storage/jobs/tests.rs`（fingerprint CAS 回归）。A/B 复用 `tests/performance.rs` 现有报告入口，结果记录于 `docs/PERFORMANCE.md`。
+
+验收：
+
+- [x] reader 仍按 8,000 文件读取，事务预算单独设定；release 基准报告明确记录实际事务预算和进程 CPU 时间。
+- [x] SQLite presence 更新单条语句最多分片 10,921 项（每项 3 个 bind + 3 个固定 bind，保持 SQLite 32,766 参数上限内），PostgreSQL 分片保持原值；fingerprint 匹配、旧 fingerprint 与 missing 行回归通过，CAS 与 seen-path ledger 语义不变。
+- [x] 确认 4,000 为默认事务预算：存储批次优化后 4,000/8,000 无锁 A/B 交错五轮中位数分别为首扫 2,275/2,285 ms、unchanged 重扫 1,035/1,117 ms、目录 API p95 602/599 ms、foreground p95 370/377 ms、batch p95 321/328 ms、DML 189/133，4,000 的 WAL/RSS 更低。独立写者完整事务 p95 三轮中位数为 4,000 107.1 ms、5,000 126.4 ms、6,000 150.2 ms、8,000 223.1 ms；4,000 相对 8,000 改善 52.0%，且保持 `<209 DML` 门。7,000 的单轮 unchanged 重扫超过 5% 门；5,000/6,000 未达到 50% 写者 p95 改善目标。100 ms 是期望值，4,000 实测 107.1 ms；本机 ARM64 fixture 不外推 FNOS/NAS 或 x86_64。
+- [ ] 完整 Rust all-targets gate 未通过。最终 `cargo build --locked`、`cargo fmt --all -- --check` 与全 targets / features Clippy 通过；`storage::repository::jobs` 为 16/16，串行 `scanning_jobs` 为 89/89。并行 `scanning_jobs` 首次有 1 项报 SQLite `database is locked`，该用例隔离重跑 1/1、串行全目标通过。
+- [ ] 当前分支 `cargo test --locked --all-targets -- --test-threads=1` 的库测试为 884 passed / 1 failed / 23 ignored；失败为 `application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`，其 actor-credit 并发失败项集合不符合断言，隔离重跑 1/1 通过。此前 all-targets 在 `1e7c2ea8` 上已复现 `scanned_metadata::failed_local_poster_insert_does_not_mark_image_stage_complete`；跳过它后的测试曾因 `web_static::same_origin_web_assets_are_served_by_rust` 固定资产断言停止，使用同一构建产物在基线也复现。当前完整 gate 不能报绿。
+- [x] PostgreSQL runtime gate 通过：临时 PostgreSQL 16 Alpine 容器只绑定 localhost，数据库数据位于 tmpfs；`cargo test --locked --test postgres_database -- --include-ignored --test-threads=1` 为 18/18。测试后容器已停止并自动删除。
+
+候选中间值的单轮筛选、逐轮 A/B、独立写者样本、此前基线测试复现及门禁限制见 `docs/PERFORMANCE.md`。
+#### LUX-563：SQLite Manifest 已提交分片的恢复与幂等
+
+范围：用实际文件 SQLite 验证 PERSISTED Manifest 在首片提交、后片失败、数据库连接关闭并重新打开后，可从 durable directory frontier 重试。重试必须保留此前完成的目录和正向索引，不重复 observed/processed 计数，也不重复 outbox source IDs 或 batch sequence。仅在发现存储合同缺陷时另拆最小 storage 修复任务。
+
+预计文件（2 个）：`tests/scanning_jobs.rs`、本文档。分别验证 LUX-562 的 256 文件 streamed SQLite 分片重开恢复，以及 PERSISTED discovery 在 8,000 条 observation reader chunk 提交后、下一事务失败时的重开恢复；不改公共模型、schema 或 SQL 行为。
+
+验收：
+
+- [x] 重开 SQLite 后 manifest/job checkpoint 持久；完成目录不重新入队，未完成目录恢复为可处理 frontier。
+- [x] 同一 job 重试完成后，manifest/root observed 与 completed 计数精确，generation 索引文件完整，outbox source IDs 与 batch sequences 全唯一。
+- [x] 256 文件切片和 PERSISTED 8,000 条 observation reader-chunk 后续事务失败，均在关闭并重开 SQLite 后从 durable frontier 恢复；既有 PERSISTED shutdown-resume 与 LITE retry 回归仍通过。
+
+定向验证：`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_discovery_keeps_committed_slices_when_a_later_slice_fails -- --exact --ignored`、`cargo test --locked --test scanning_jobs manifest_discovery_reopens_and_retries_persisted_frontier_idempotently -- --exact`、`cargo test --locked --test scanning_jobs shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier -- --exact`、`cargo test --locked --test scanning_jobs failed_manifest_discovery_retries_its_pending_frontier_safely -- --exact`。
+
+验收结果：两个实际 SQLite 注入故障测试均通过关闭连接、重开数据库和同 job retry 验证；256 文件 LITE 分片最终索引/outbox 各 1,025 条唯一，PERSISTED 在首个 8,000 observation chunk 后保留 7,998 个正向索引并从持久 frontier 完成 8,001 个文件，计数与 outbox source IDs / batch sequences 无重复。既有 shutdown-resume 与失败 retry 各 1/1，`scanning_jobs` 串行完整目标 89/89 通过。首轮完整目标的两个 ffprobe 用例曾分别报 NULL 解码和 TIMEOUT，单独重跑均通过，随后完整串行目标也全绿；最终预算 A/B 与完整 Rust gate 留待 LUX-564。
+
+#### LUX-562：SQLite Manifest discovery 按完整事务分片
+
+范围：在 application 层、基线读取和正向索引准备之前，将 SQLite 的 Pending Manifest directory chunks 按有界文件数、总 observation entries、child frontier 和 completed-directory 数分成有序微批次。每片独立执行完整 storage 事务；DIRECTORY observation 与对应 child frontier 同片，跨片目录的 `completed_directory` 只落在最后一片。每片重新读取数据库基线并执行现有文件/root/目录复核。PostgreSQL 保留现有聚合事务路径。
+
+预计文件（5 个）：`src/application/scanner/jobs/manifest_discovery.rs`、新建 `src/application/scanner/jobs/commit_batches.rs`、`src/application/scanner/tests.rs`、`tests/scanning_jobs.rs`、本文档。
+
+初始 SQLite 文件预算保持 8,000，与当前最大 streamed file budget 一致；测试 feature 可注入较小值以验证实际事务边界，不增加用户配置或持久化 schema。此任务不选择最终生产预算，也不修改 `<209 DML` 门槛。
+
+验收：
+
+- [x] 分片器覆盖空/单条/边界/超限/多倍输入，混合文件、子目录和 completion；顺序保留，每个 observation/frontier 恰好一次，且每片所有维度均不越预算。
+- [x] SQLite integration fixture 注入 256 文件预算后证明 1,025 个文件跨多个独立 root checkpoint 事务提交；父目录只在最后一片完成，索引、outbox source IDs 与计数无遗漏/重复。
+- [x] SQLite 默认预算保持 8,000；PostgreSQL 保留单一聚合批次路径；注入第二片错误后后续片停止，首片索引/outbox 保留且 completion 未提前写入。
+- [x] 分片在基线查询、positive preparation 和 identity recheck 之前；storage 的一次调用仍全成或全败。
+
+定向验证：`cargo test --locked --lib commit_batches`、`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_streams_large_directory_discovery_in_bounded_chunks -- --exact`、`LUX_PERF_DISCOVERY_TRANSACTION_FILES=256 cargo test --locked --features performance-benchmarks --test scanning_jobs manifest_discovery_keeps_committed_slices_when_a_later_slice_fails -- --exact --ignored`，随后运行 `cargo test --locked --test scanning_jobs`。
+
+验收结果：分片器单测 3/3；256 文件预算的 1,025 文件成功与第二片故障注入测试均通过；默认构建下完整 `scanning_jobs` 目标串行运行 88/88 通过，覆盖 8,000 文件默认预算。结构检查确认 SQLite 每片都重新读取基线并进入原有完整 storage 事务，PostgreSQL 直接保留原批次；格式与 diff 检查通过。最终预算选择和 A/B 性能门留待 LUX-564。
+
+#### LUX-561：记录 Manifest 写事务体耗时与结果
+
+范围：为 Manifest discovery 写事务单独记录事务体时间，排除 `BEGIN IMMEDIATE` 获取写者资格和 `COMMIT` 时间；记录事务体成功/失败计数，不记录错误文本或业务标识。只增加观测，不改变事务边界、批次大小、存储语义或性能门槛。
+
+预计文件（4 个）：`src/storage/jobs/scan/manifest/discovery/coordinator.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、本文档。
+
+验收：
+
+- [x] release Manifest 基准报告包含 `transaction_body` p50/p95 和事务体 outcome 计数，至少存在成功样本。
+- [x] 事务体错误分支只记录耗时及 `error` 标签；计数器回归覆盖 success/error 事件，日志不记录错误内容或用户数据。
+- [x] 事务计时能与 BEGIN 等待、COMMIT 分开；现有 `<209 DML` 门槛和事务行为不变。
+- [x] 只记录 ARM64 本机观测，不推断 NAS/FNOS 性能收益；更新性能记录并保留干扰因素。
+
+最窄目标：`cargo test --locked --test performance`；release 基准：`LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark ./scripts/run-performance.sh`。
+
+实施结果（2026-10-16）：storage 现在分别记录 `transaction_body`、BEGIN 和 COMMIT，事务体事件只带 success/error 与条目计数。性能报告序列化并 reset outcome 计数；定向单测通过，60k SQLite release 基准 1/1 通过，两轮各观测到 9 个成功 body。两轮首扫 `transaction_body` p95 为 199,544 / 188,235 µs，DML 均为 127，低于原 `<209` 门槛。探针启用时的写锁等待 p95 为 232,899 / 223,689 µs；探针会主动争用写锁，所以数据只用于说明观测已接通和门槛未回归，不作为无探针性能基线。性能测试目标 18 passed、5 ignored；格式检查通过。
+
+#### LUX-560：用户状态修改向其他会话发送失效
+
+范围：Web/Emby 收藏、已看修改在状态持久化及容器状态同步成功后发布无 ID 的 favorites/item 用户事件；Web 两种播放事件路径、账户库顺序和排序策略更新发布合并 home 事件。人物收藏同样发 favorites。HTTP 响应和认证/CSRF/ACL 保持既有合同。
+
+预计文件（5 个）：`src/api/playback.rs`、`src/api/users.rs`、`src/api/legacy.rs`、`tests/user_query_events.rs`、本文档。
+
+验收：真实 HTTP/SSE 回归先复现收藏写入后收不到事件的超时，随后验证事件到达后数据库已反映收藏/已看状态，并覆盖播放进度和媒体库排序。最窄目标 `cargo test --locked --test user_query_events --test resume_favorites --test web_playback`。
+
+实施结果（2026-10-15）：按用户选择保留首页独立区块；已有缓存库 ID 时并发请求最新资源，不恢复聚合请求。首页 30 秒 freshness、共享单条 SSE、媒体缓存失效及断线 30 秒前台兜底已实现。后端补齐管理员修改及用户状态修改通知，仅广播 scope，不传业务数据。
+
+验证：定向 Web 5 文件 / 65 项、TypeScript 和 production build 通过；事件中心库测试 7/7，`admin_events` 3/3，`user_query_events`、`resume_favorites`、`web_playback` 共 6/6 通过。Web 全量静态检查 141 passed、2 failed，完整 Vitest 613 passed、4 failed；6 个失败在原始基线同样复现，涉及未修改的卡片尺寸、触控按钮可见性、继续观看评分及旧卡片链接选择器。未修改这些无关 UI 行为或测试。
+
+真实 Chromium 使用固定本地 API/SSE fixture：基线 65 秒产生 12 次详情周期请求，新实现 83 秒为 0；首页进入详情后 30 秒内返回为 0 次首页请求。初始 SSE 握手不会重复已加载的 item/images/playback 请求；SSE 事件立即刷新标题/收藏状态；断线约 30 秒后详情、图片、播放信息各请求一次；原生 SSE 重连触发媒体缓存重新同步并保持单条连接，随后 69 秒为 0 次周期请求。此为本机 arm64 的请求策略验证，不是生产数据集、NAS CPU 或滚动帧率结论。
+
+Rust 完成门禁（macOS `arm64`，Toshiba 已挂载，Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`）：`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。目标回归 `application::admin_events::tests` 7/7、`admin_events` 3/3、`user_query_events` 1/1、`resume_favorites` 4/4、`web_playback` 1/1、`scanned_series_metadata` 3/3、`scanning_jobs` 88/88 通过。
+
+完整 `cargo test --locked --all-targets` 在 `scanned_metadata::manifest_scan_indexes_poster_while_local_nfo_is_blocked` 停滞超过 23 分钟后中断；此前 1,311 项通过、0 项失败、47 项忽略。该目标按单线程复跑为 22/23：唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 得到 2 张图片、预期 1 张，是此前已有的 NFO 海报回滚问题；按 4 线程复跑为 20/23，另有 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound` 和 `blocked_first_local_poster_does_not_block_manifest_scan` 的 FIFO 超时。相关阶段记录也报告 FIFO 用例在并行运行时可能超过 60 秒；本轮全量测试因此不能标为通过。串行 `scanned_series_metadata`、`scanning_jobs` 的定向回归通过。
+
+Web 冻结安装、TypeScript 和 production build 通过。完整 `pnpm test` 静态部分为 141 passed、2 failed；Vitest 为 613 passed、4 failed。六项失败均在原始代码基线 `8c8d5c13` 复现，涉及既有卡片尺寸、触控操作显示、继续观看评分和卡片链接选择器。新增/相关 65 项 Web 回归通过。自动化测试、ARM 本机和固定浏览器 fixture 结果不代表 NAS 或生产性能。未推送、合并或部署。
+
+#### LUX-551：Emby API 路径大小写不敏感
+
+范围：Emby 兼容路由在根路径和 `/emby` 前缀下均按 ASCII 大小写不敏感匹配。只归一化已注册 Emby 路由的静态路径片段，保留动态路径参数、query、HTTP 方法和 Lux 原生 `/api/v1` 路由语义；未知路由继续走原有 fallback。
+
+验收：
+
+- [x] Emby 登录、公开发现和受保护接口对静态路径段的大小写变体返回相同的 JSON/状态语义，根路径及 `/emby` 前缀均覆盖。
+- [x] 动态用户/条目 ID 与 query 内容保持原值；原生 Lux API 路径不参与大小写归一化。
+- [x] 自动化回归先在现有实现下失败，修复后通过；兼容性记录仅陈述本机集成测试证据，不声称第三方客户端实测通过。
+
+预计文件（5 个）：本文档、`src/api/emby.rs`、`src/api/routes.rs`、`tests/emby_system.rs`、`docs/COMPATIBILITY.md`。
+
+实现结果：Emby 路由表记录注册路径模板；请求进入 Axum 路由器前，只对已注册 Emby 路由的静态片段恢复其规范大小写。根路径和 `/emby` 共用同一组路由模板，动态参数、query、方法和原生 API 路径保持不变。
+
+验证：定向 Emby 集成测试、相关播放/字幕集成测试、2 个归一化单测、构建、格式检查和 Clippy 均通过。全量 `cargo test --locked --all-targets` 在未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 失败；单独重跑仍以图片数量实际 2、预期 1 失败，故全量门未通过。未验证 MoviePilot/第三方播放器实机，也未部署 FNOS。
+
+#### LUX-561：扫描指纹与后台 CPU 热点优化
+
+范围：结合 CPU 热点分析的扫描指纹短路和多管线后台并发预算。扫描指纹采用经 stat 快照验证的复用与版本化 XXH3-v2；后台计算、扫描准备、NFO/图片计算、ffprobe 和缩略图共用进程级预算。性能 A/B 按项目所有者 2026-10-16 的要求免除，未据此声称实际 CPU 或 NAS 收益。
+
+设计记录： [A+C 扫描指纹方案](SCAN-FINGERPRINT-A-C-DESIGN.md)、[原 SHA 比较记录](SHA256-FINGERPRINT-OPTIMIZATION.md)及[多管线 CPU 预算设计](SCAN-CPU-BUDGET-DESIGN.md)。同一任务的两个实现分支已合并；下列完整门禁结果以本次合并后的验证为准。
+
+##### 扫描指纹实现
+
+可靠的完整 stat 快照命中时复用原指纹；新文件或确认变化时写入显式版本化的 XXH3-v2。旧 SHA-v1 行按需验证并预热快照，不因算法差异触发后处理。服务就绪后由一个全局串行 worker 低速逐库迁移旧扫描 SHA；迁移前后检查 stat、验证 v1 并通过 CAS 替换规范指纹。迁移不是媒体变化。旧任务、NFO、人物和章节引用保留兼容读取；inode 不能单独判等，缓存与规范行均使用路径和指纹锚定。
+
+当前实现包括 SQLite/PostgreSQL 前向迁移、持久游标与延期记录、每库短租约、missing 指纹清理、无引用且过期墓碑的有界清理；迁移 worker 启动延迟 60 秒，全局最多每 50ms 处理一个条目。人物关系快照中的旧引用目前由兼容读取验证，不会随规范 filesystem entry 迁移而主动重写。worker 使用固定节流和忙库让步，尚未实现基于 CPU、IO 或前台 p95 的动态降速。
+
+待验证的指纹验收：
+
+- [ ] v1/v2 格式和稳定编码具备 golden vectors；所有入口双读兼容后才启用 v2 写入，旧 unchanged 数据不因迁移重处理。
+- [ ] 可靠暖命中不计算摘要；未知字段、不可靠根和损坏快照回退；SQLite/PostgreSQL 迁移、批量 snapshot 读取与原子提交通过。
+- [ ] 移动/硬链接、并发、取消、根替换、CAS 与旧任务恢复回归通过；NFO/人物/章节合同无意外变化，内容改写检测边界明确。
+- [ ] 单个全局迁移 worker 低速逐库逐文件工作；限速、资源暂停、忙库让步、断点恢复和候选索引通过，完成条目清除旧扫描 SHA，延期/失败不伪报完成。
+- [ ] missing FILE 指纹立即清空；仅对无媒体源引用且所属媒体库无活跃扫描的超期墓碑分批清理，并覆盖 SQLite/PostgreSQL。
+- [ ] 纯算法迁移不产生媒体变化/后处理目标；章节派生 input 与人物关系引用具备等价性迁移及崩溃恢复；普通扫描不能回写 v1。
+- [ ] 完成定向与全量 Rust 检查；分别记录冷升级与暖重扫的 CPU、墙钟、SQL/DML、体积和前台 p95。
+
+##### 后台共享预算实现
+
+通过进程级 singleton semaphore 共用后台工作预算，容量按 CPU/cgroup 推导并支持 `LUX_BACKGROUND_CPU_BUDGET` 覆盖。Discovery 与 Manifest preparation 保留有界 reader/JoinSet；指纹、NFO/图片、probe、thumbnail 的后台 CPU 片段接入同一预算，同时保留已有专用进程上限。调用者取消后，blocking closure 和受监督子进程仍持有预算，子进程确认回收后才释放名额。指标记录全局与分 stage 活跃/等待峰值、p50/p95/max、取消等待、运行中取消及子进程清理中计数；样本有界，日志不含路径或环境变量原值。
+
+分支合并前的记录：预算核心定向单测 9/9；`scanner` 18/18、`scanning_jobs` 88/88、`probe` 20/20、`thumbnails` 18/18、`background_work_budget` 1/1、`metadata` 21/21、`scanned_series_metadata` 3/3。`scanned_metadata` 为 22/23；唯一失败 `failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净基线 `1e7c2ea8` 也以实际 2、预期 1 复现，因此全量 Rust 测试门未通过。分支上的 `cargo build --locked`、fmt 与 clippy 通过；性能 A/B 按项目所有者要求免除，CPU 收益和自动容量仍无实测结论。
+
+三分支合并后验证（2026-10-17）：`cargo build --locked`、`cargo fmt --all -- --check`、全 targets/all features Clippy、shell 语法、两组 Python 单测、Web 冻结依赖安装与 production build 通过。`cargo test --locked --all-targets` 在 `tests/scanned_metadata.rs` 以 exit 101 终止：lib 963 passed、24 ignored；该 target 22 passed、1 failed，唯一失败仍为 `failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1，已在干净基线复现），后续 targets 未执行。Web Node 测试为 145/148（3 项失败），单独运行的 Vitest 为 644/650（6 项失败）；失败涉及的 Web 页面和测试文件与合并前 `origin/test` 相同，这三条后端功能分支没有 Web 文件改动。完整 Rust/Web 测试门未全部通过。
+
+后台预算验收：
+
+- [x] 比较全局 Semaphore、管线互斥/优先级调度、共享有界线程池，并以当前源码核实 probe CPU 采样及 Tokio blocking pool 的行为。
+- [x] 定义共享范围、容量、进程单例、局部并发叠加、取消/进程回收、防嵌套死锁、前台与 DB 等待隔离及指标。
+- [x] 项目所有者评审并批准设计（2026-10-16）；代码接入 Discovery/Manifest、指纹、NFO/图片、probe 和 thumbnail。
+- [x] 取消后的 blocking 工作和受监督子进程在清理完成前继续占用预算；设置日志与有界指标。
+- [ ] 完整 Rust 完成门全部通过；性能 A/B 按项目所有者明确指示免除，不把 CPU 收益或自动默认容量作为实测结论。
+##### ffprobe CPU 容量与完成速率自适应
+
+本地 ffprobe 的自动进程预算使用 ceil(effective_cpu_cores × 4) 并限制在 1 至 512；Linux 有可见的 cgroup v1/v2 quota 与 cpuset 时取保守交集，并缓存容量结果。首次活动并发从约 CPU 核数起步，之后只按本地 ffprobe 成功完成速率调整；首页延迟和可见 cgroup 内存压力只用于保护性降档，不读取 CPU 使用率。每库配置上限、LUX_PROBE_CONCURRENCY 环境变量覆盖、分页持久化和正常关停边界保留；远程 STRM 插件仍走独立调度。容器默认不再注入固定 probe 并发 8，共享后台 CPU 预算还会限制本地 ffprobe 实际活动量。
+
+实现方案与分步记录见 [FFPROBE-CONCURRENCY-DESIGN.md](FFPROBE-CONCURRENCY-DESIGN.md) 和 [FFPROBE-CONCURRENCY-CODE-PLAN.md](FFPROBE-CONCURRENCY-CODE-PLAN.md)。子进程所有权由独立 runner 管理；自适应 probe permit 与共享后台 CPU permit 都在确认进程退出后释放。
+
+ffprobe 分支的验证记录：定向探测器测试通过；cargo build --locked、fmt 和全 targets/all-features Clippy 通过。该分支全量 Cargo 测试在 lib 阶段 914 passed、1 failed、23 ignored 后停止，唯一失败为旧断言期待 1/8 步长下并发 6；更新断言后该定向用例通过。之后的集成 targets 未执行，Linux 交叉构建因缺少 x86_64-linux-gnu-gcc 未启动。ARM64 模拟负载发现忙碌时重置 sleep 导致采样 tick 不推进，修复为固定 tick；后续将上调步长改为 1/4，但真实 ffprobe A/B 尚未测量。具体数据和限制见 docs/PERFORMANCE.md；本机结果不外推为 NAS/x86 性能。
+
+#### LUX-562：动态 SQL 构建与字符串分配基线
+
+范围：为 CPU 热点分析第五点建立可重复的局部基线；只使用合成输入，不访问线上 FNOS 数据库，不改变生产查询行为。后续 SQLite SQL 转交、PostgreSQL 占位符改写、有限 SQL 模板复用和业务字符串借用仍须各自登记为后续任务。
+
+设计记录：[动态 SQL 构建与字符串分配优化设计](DYNAMIC-SQL-OPTIMIZATION-PLAN.md)。基线源码为 `origin/test` 提交 `e7107bfe`。测试专用分配计数器只在 `performance-benchmarks` feature 下编译，测量窗口外关闭；普通生产构建不引入该 allocator。
+
+验收：
+
+- [x] ignored release harness 分别测量 SQLite 静态/owned SQL 适配、PostgreSQL 120 占位符改写、1/100/200/2,900/5,000 行 VALUES CTE 构造、200 条不同长度路径的 Any 参数绑定，以及 SQLite 单连接 statement-cache 冷执行/热重放/淘汰重放。
+- [x] 在 Toshiba 共享 Cargo target 上完成五轮；逐项报告分配数/字节与耗时的中位数和范围，报告 120 种 SQL 形状相对 100 条缓存容量的驻留行为。
+- [x] 记录本机架构、Rust 版本、基线提交和可复跑命令；明确结果仅是本机合成微基准，不外推 NAS/x86 性能，也不声称扫描整链路收益。
+- [x] 定向 release 基准、格式、普通构建和 all-targets/all-features Clippy 通过；普通 `cargo build --locked` 不启用测试 allocator。
+- [x] 执行并记录 `cargo test --locked --all-targets`。该命令在 `scanned_metadata` 停止：`failed_local_poster_insert_does_not_mark_image_stage_complete` 在干净 `e7107bfe` 基线也以实际 2、预期 1 复现；`manifest_scan_indexes_poster_while_local_nfo_is_blocked` 在并行全量运行中失败，但隔离重跑通过。不将全量 Rust 门禁报告为绿。
+
+预计文件（4 个）：`src/storage/sql_query_benchmarks.rs`、`docs/PERFORMANCE.md`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。基准模块挂接已在 LUX-562 工作分支的基线 harness checkpoint 中完成。
+
+实施记录（2026-10-16）：Toshiba 已挂载，本机 `arm64`，Rust `1.97.1`。五轮 release 微基准分配数/字节稳定；静态 SQLite SQL adapter 的指针未保留、每次分配 81 字节；PostgreSQL 120 参数 adapter 为 121 次分配、1,615 字节；5,000 行 VALUES CTE 构造为 105,114 字节。五轮中位数、范围、缓存 100/120 形状驻留结果与复跑命令见 `docs/PERFORMANCE.md`。定向 ignored benchmark 通过；`cargo fmt --all -- --check`、普通 `cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 `cargo test --locked --all-targets` 的 lib target 为 929 passed、0 failed、23 ignored；随后 `scanned_metadata` 为 21 passed、2 failed，后续 targets 未执行。已在干净 `e7107bfe` worktree 复现其中的既有 poster 计数失败，并隔离复跑通过慢 NFO 测试。`tests/performance.rs` 编译时有两条既有 dead-code warning；它们不影响 Clippy，未触及相关测试代码。本任务没有生产查询行为改动，完整 Rust 全量门禁仍非绿色。
+
+#### LUX-563：SQLite SQL 直传与 PostgreSQL 占位符改写分配优化
+
+范围：优化查询入口的 SQL 字符串适配；SQLite 直接转交 SQLx `SqlStr`，PostgreSQL 仅在确有未引用 `?` 时构造改写文本，并在同一个 `String` 中写出 `$N`，不为每个编号建立临时 `String`。同步更新迁移查询入口和 LUX-562 合成基准夹具。绑定值、SQL 引号解析规则、查询语义和数据库 schema 保持不变。不在本任务实现模板缓存或 IN 分桶。
+
+预计文件（5 个）：`src/storage/repository.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite 对静态 `&str`、owned `String` 与 `Arc<str>` 保持原 SQL 缓冲区地址；对应测试先失败再通过。
+- [x] PostgreSQL 对无占位符 SQL 保留原地址；改写覆盖单双引号内问号、转义单引号和 `$10`–`$13` 多位编号。
+- [x] repository 三种查询入口及迁移查询使用新的 `SqlStr` 返回值；adapter 定向单测与 `server_id_survives_database_reopen` 通过。
+- [x] 重跑 LUX-562 release 基准，记录静态/owned SQLite adapter 与 120 参数 PostgreSQL adapter 的分配变化；其余基线项目不变。
+- [x] `cargo fmt --all -- --check`、定向测试和任务完成阶段规定的全量门禁均有明确结果；既有基线失败单独报告，不称全量测试通过。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮，安静窗口内直接复跑编译后的测试二进制。静态 SQLite adapter 为 0 allocations / 0 B，时间中位数 2 ns（2–6）；owned SQLite adapter 为 0 / 0 B，中位数 10 ns（8–13）；PostgreSQL 120 参数改写为 1 allocation / 887 B / 0 reallocations，中位数 1,304 ns（1,301–1,367）。相对 LUX-562 基线，静态 SQLite 从 1 allocation / 81 B 降为零；PostgreSQL 从 121 allocations / 1,615 B / 1 realloc 降为 1 / 887 B / 0。VALUES CTE、Any 参数绑定及 statement-cache 行为不属于本步优化，五轮结果保持在基线波动范围内。本机合成微基准不外推为 NAS/x86 或扫描整链路收益。
+
+完成门禁记录（2026-10-16）：`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 931 passed、0 failed、23 ignored；随后在 `tests/scanned_metadata.rs` 为 21 passed、2 failed 并停止，后续 targets 未执行。`failed_local_poster_insert_does_not_mark_image_stage_complete` 隔离重跑仍为实际 2、预期 1，且已在干净 `e7107bfe` 基线复现（见 LUX-562）；并行失败的 `manifest_scan_indexes_poster_while_local_nfo_is_blocked` 隔离重跑通过。全量 Rust 测试门禁明确为非绿色。
+
+#### LUX-564：有限 SQL 模板缓存基础
+
+范围：建立 storage 内部、仅供受控查询族使用的完整 SQL 模板缓存。模板键固定包含有限查询族、后端、枚举版本与形状；缓存共享最终 SQL 的 `Arc<str>`，模板生成在单个 `String` 中完成并验证绑定预算。每个查询族/后端/版本保留满批模板和最多 4 个尾批模板；总缓存文本不超过 8 MiB，另有 256 条全局应急上限。构造发生在缓存锁外，锁毒化时退回未缓存构造。此任务只实现缓存/构造器基础，不添加尚无调用者的 repository 查询入口，不改扫描查询调用点，不引入任意 SQL 字符串键、数据库 schema 或新依赖。
+
+预计文件（5 个）：`src/storage/sql_templates.rs`（新增并含单测）、`src/storage/mod.rs`、`src/storage/sql_query_benchmarks.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。首个专用 repository 查询入口在后续接入真实 filesystem 读取时一同实现。
+
+验收：
+
+- [x] 非法/越界模板形状在构造前拒绝；SQLite 与 PostgreSQL 完整 SQL 文本及绑定编号正确；实际绑定数不匹配时拒绝发布。
+- [x] 相同有限键重复/并发请求最终复用同一 `Arc<str>`；SQL 构造不在缓存锁内，毒化锁退回未缓存构造。
+- [x] 每个模板族仅保留满批与最多 4 个尾批；文本预算不超过 8 MiB、全局条目数不超过 256；超预算模板可用但不留存在缓存中。
+- [x] 基准比较缓存命中和 SQL 构造成本；实际查询入口与 query counter 在后续工作包按调用点验收。
+- [x] 定向单测、模板构造基准、格式、构建与 Clippy 有明确结果；本任务全量门禁按阶段记录失败，不称其为绿色。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮，直接复跑编译后的测试二进制。PostgreSQL 128 个路径参数（另含 root 参数）的 adapter 改写耗时中位数 1,488 ns（1,484–1,613），每次 1 allocation / 981 B / 0 reallocations；缓存命中为 16 ns（16–17）、0 allocations / 0 B；冷构造并发布为 1,192 ns（1,172–1,291）、4 allocations / 2,156 B / 0 reallocations。热命中消除了逐请求 SQL 生成和分配；冷构造仍比 adapter 快，但保留一次性构造成本。该构造微基准不包含数据库执行，不代表查询或扫描整链路收益，也不外推 NAS/x86。
+
+完成门禁记录（2026-10-16）：`cargo test --locked --lib storage::sql_templates::tests -- --test-threads=1` 为 9 passed；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 940 passed、0 failed、23 ignored，之前的若干集成 target 通过；在 `tests/libraries_api.rs` 并行运行时，`admin_can_create_list_and_add_library_root_with_csrf` 一次收到 503 `DATABASE_UNAVAILABLE`（预期 200），测试 target 因此中止。该用例隔离运行及该 target 串行运行均通过；干净 `e7107bfe` 基线的并行 target 三次也通过，候选分支之后的并行复跑通过。当前证据不足以确认这次并行失败的根因，也不足以判定为代码回归；全量门禁仍明确为非绿色，后续完成门禁需继续观察并报告，不能把未运行的后续 target 算作通过。
+
+#### LUX-565：filesystem 路径批量查询复用模板
+
+范围：将 `list_filesystem_entries_for_paths` 从每批动态 `format!`、占位符 `Vec` 和 `join` 改为 S2 的有限 SQL 模板缓存。按路径数量选 power-of-two IN 桶（超过 256 时使用现有 500 项上限），不足桶容量的末尾参数绑定 typed NULL；每批仍最多 500 条、仍发起一次查询，保留 SQL 投影、绑定顺序、root 隔离和返回 map 语义。不修改其他扫描查询族，不调整批次大小、事务或公共接口。
+
+预计文件（5 个）：`src/storage/filesystem.rs`、`src/storage/repository.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验收：
+
+- [x] 1、3/4、256/257、500/501 路径数边界与缺失路径结果一致；相同相对路径在其他 root 的记录不泄漏。
+- [x] 输入 0 条路径不执行查询；1–500 条仍一次查询，501 条仍两次查询，`query_count` 与旧实现一致。
+- [x] 绑定先 root 后 paths，padding 使用 typed NULL；SQLite 实际查询通过，SQL 模板缓存命中且热路径不再拼 SQL 或分配占位符集合。
+- [x] 定向 repository 测试先红后绿；格式、构建与 Clippy 结果明确，全量门禁的失败按证据报告。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮、每轮每种构造 50,000 次。对 127 个路径，旧式 exact SQL 构造中位数 327 ns（297–551）；查询 bucket 128 后的缓存命中（含 bucket 选择）为 18 ns（18–26）。这是 SQL 构造时间对照，不包含 SQLite/SQLx 执行，也不测数据库计划或整链路；typed NULL 对执行耗时的影响留待最终阶段验证。A/B 使用 `performance-benchmarks` feature 下默认忽略的 `filesystem_path_template_construction_benchmark`。
+
+完成门禁记录（2026-10-16）：定向 `filesystem_path_reads_reuse_bucketed_templates_without_extra_queries` 为 1 passed，S2 模板单测为 10 passed；release A/B harness 为 1 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过。`cargo test --locked --all-targets` 的 lib target 为 942 passed、0 failed、23 ignored；到 `tests/libraries_api.rs` 时，13 项通过，`admin_can_create_list_and_add_library_root_with_csrf` 再次在并行运行中收到 503 `DATABASE_UNAVAILABLE`（预期 200），后续 targets 未执行。该 target 串行运行 14/14 通过；同一个失败在 S2 全量门禁中已先出现，故不能归因于 LUX-565。随后在干净基线 `e7107bfe` 按“lib target 完成后立即并行运行 `libraries_api`”复核：lib 为 929 passed、0 failed、23 ignored，`libraries_api` 为 14/14 通过；因此该 503 未能在基线复现，根因仍未查明，完整 Rust 门禁仍为非绿色。PostgreSQL 模板编号有单测覆盖，本步没有独立 PostgreSQL 实例验证实际 NULL 绑定。
+
+#### LUX-566：manifest 基线路径查询复用模板
+
+范围：将 `list_scan_manifest_filesystem_baselines` 从每批动态占位符 `Vec`、`join` 和 `format!` 改为专用有限 SQL 模板。按后端路径数量选择不小于输入数的最小 power-of-two IN 桶，超过最后一个二次幂时使用该后端现有批次上限（SQLite 2,900、PostgreSQL 5,000）；不足桶容量的路径绑定 typed NULL。每批仍按原后端上限分块并执行一次查询，保持 root 过滤、投影、绑定顺序、空输入、HashMap 结果语义和查询计数。不改 manifest 批次、事务或其他查询族。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/diff.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。
+
+验收：
+
+- [x] 空输入不查询；单批、分桶两侧、SQLite 最大批次与跨批次结果和旧实现一致，缺失/重复路径不产生额外结果。
+- [x] root 隔离、完整 baseline 字段、每个 chunk 一次查询及 query counter 保持；SQLite typed NULL 实际查询通过。
+- [x] SQLite 与 PostgreSQL 模板固定参数、IN 容量、占位符编号和绑定顺序正确；容量不超过原后端批次上限。
+- [x] repository 行为测试先红后绿；SQL 构造 A/B、格式、构建与 Clippy 有明确记录，全量门禁失败按证据报告。
+
+微基准记录（2026-10-16）：本机 `arm64`、Rust `1.97.1`，release harness 五轮、每轮每种构造 50,000 次。257 个路径的旧式精确 SQL 构造中位数 600 ns（592–918）；计算桶容量并命中 512 项模板的中位数 18 ns（18–22）。结果只包括 SQL 构造，不包括 SQLite/SQLx 执行、绑定和分配计数；大容量 NULL 绑定对数据库执行的影响留待 S7 整链路复测。A/B 使用 `performance-benchmarks` feature 下默认忽略的 `manifest_baseline_template_construction_benchmark`。
+
+完成门禁记录（2026-10-16）：`cargo test --locked --lib manifest_baseline -- --test-threads=1` 为 2 passed；`cargo test --locked --test scanning_jobs` 为 88 passed。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 release A/B harness 均通过。`cargo test --locked --all-targets` 的 lib target 为 944 passed、0 failed、23 ignored；`tests/libraries_api.rs` 为 14/14。随后 `tests/probe.rs` 有 20 passed、1 failed：`probe_runner_terminates_when_stderr_exceeds_the_runtime_limit` 超过测试超时；该用例隔离重跑通过，probe target 串行运行 21/21。其余后续 targets 未执行，因此完整 Rust 门禁仍记为非绿色。失败发生在本任务未修改的 probe 代码，现有证据未能确认其根因或证明基线表现。默认 all-targets 未运行 PostgreSQL 实例；PostgreSQL 模板文本和绑定编号由单测验证，运行时 PG 验证留待 S7。
+
+#### LUX-567：manifest 发现路径与 presence 模板
+
+范围：缓存 manifest 发现的旧格式/V3 known-path 查询，以及 V3 presence 更新、部分成功回读、seen-path ledger 插入的精确行数 SQL 模板。模板按后端原有路径批次上限分块，不改查询次数、语义、绑定顺序或事务。全成功更新时借用输入路径；部分成功时只将回读结果持有为 owned 字符串。支持 PostgreSQL presence update 的 35,002 个绑定，并保留 SQLite 绑定上限。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/discovery/paths.rs`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`src/storage/sql_templates.rs`、`src/storage/repository_tests.rs`、本文档。
+
+验收：
+
+- [x] SQL 模板覆盖旧格式和 V3 known-path、V3 update/readback/ledger insert；后端占位符、参数顺序、边界绑定数正确，模板复用且缓存有界。
+- [x] SQLite 行为测试覆盖 known path、更新全成功与部分成功回读、seen-path 写入、格式版本切换及计数结果；原扫描语义和 query counter 保持。
+- [x] `successfully_seen_paths` 在全成功路径借用输入，部分成功回读使用 owned 数据；无生命周期扩大或公共 API 变化。
+- [x] 定向测试、格式、构建、Clippy 与完整门禁按实际结果记录；PostgreSQL 运行时验证留至 S7。
+
+完成门禁记录（2026-10-16）：manifest SQL 模板单测 4/4、presence repository 回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 中 lib target 为 948 passed、0 failed、23 ignored，`libraries_api` 为 14/14，`probe` 为 21/21；随后 `tests/scanned_metadata.rs` 有 22 passed、1 failed，失败为 `failed_local_poster_insert_does_not_mark_image_stage_complete`。在未包含 LUX-567 的基线提交 `3b4b7325` 上串行重跑该 target，同一用例以相同断言失败（22/23），确认该失败先于本任务存在。当前分支串行 target 另有一次 `local_nfo_retry_excludes_non_retryable_conflict_item` 的 `RowNotFound`，该用例隔离重跑通过，基线串行 target 也通过。完整 all-targets 门禁仍为非绿色；PostgreSQL 运行时验证留待 S7。
+
+#### LUX-568：Manifest 目录 frontier SQL 模板
+
+范围：缓存 `insert_manifest_directory_frontier` 的精确行数 `VALUES` 模板，以及 `complete_manifest_directory_frontier` 的精确行数 `IN` 更新模板。沿用 `SCAN_DML_CHUNK_SIZE`、lite mode 早退、冲突忽略、`state <> 'COMPLETE'`、固定参数和绑定顺序、原 transaction 与 rows-affected 计数；不补假行、不增加查询、不调整批次或事务。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/discovery/frontier.rs`、`src/storage/sql_templates.rs`、`src/storage/jobs/tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite/PostgreSQL 模板覆盖 1/满批/尾批行数，绑定编号和顺序正确，同键复用缓存且缓存保持有界；超过现有 200 行批次上限时拒绝模板形状。
+- [x] SQLite 回归覆盖 201 个目录的跨批插入、冲突重放、完成状态及完成计数；查询次数与旧实现相同，lite mode 仍不写 frontier。
+- [x] 记录满批与尾批 SQL 构造的动态基线/模板热命中 A/B；定向测试、格式、构建、Clippy 与完整门禁按实际结果记录。PostgreSQL 运行时验证留待 S7。
+
+当前实现记录（2026-10-16）：定向模板测试 3/3、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。满批 200 行构造：INSERT 动态基线中位数 844 ns、3 次分配/7,996 B，模板热命中 23 ns、0 次分配；COMPLETE 更新基线 474 ns、3 次分配/4,234 B，模板 23 ns、0 次分配。尾批 17 行：INSERT 基线 177 ns、3 次分配/1,042 B，模板 24 ns、0 次分配；COMPLETE 基线 109 ns、3 次分配/757 B，模板 24 ns、0 次分配。五轮本机 arm64 release 数据仅代表 SQL 文本构造，不含 SQLx/SQLite 执行、扫描整链路或 NAS 性能。PostgreSQL 运行时和一次完整 all-targets 门禁统一留至 S7；本工作包期间启动的重复 all-targets 测试按用户要求中断，未形成新的全量结果。
+
+#### LUX-569：Manifest delta SQL 模板
+
+范围：缓存 delta 基线冲突校验 CTE、delta INSERT/RETURNING、finalizer state/error CASE 更新三个精确行数模板。沿用 100 行 chunk、同一 transaction、校验与冲突分类、ON CONFLICT DO NOTHING、RETURNING 计数、PENDING CAS、affected-row guard、attempt_count、参数顺序和批次边界；CASE SQL 不再通过克隆整段 `String` 生成第二份。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/diff/insert.rs`、`src/storage/jobs/scan/manifest/apply/finalize.rs`、`src/storage/sql_templates.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] SQLite/PostgreSQL 模板覆盖首行、满批与尾批，绑定编号和顺序一致，缓存复用且尾部形状有界，超过 100 行拒绝模板。
+- [x] 现有 SQLite 回归覆盖 250 行跨批 delta、同值重放、冲突重试、malformed ADD；apply 覆盖 bounded batch、增量写入 CAS、失败回滚和 cancel/resume，attempt_count 与计数不变。
+- [x] 记录满批/尾批 SQL 构造 A/B 与定向测试、格式、构建、Clippy 的实际结果；完整门禁和 PostgreSQL 运行时验证留至 S7。
+
+结果（2026-10-16）：verify/INSERT/finalize 使用精确行数模板，fallback、bind 顺序和事务边界保持。模板单测 2/2、250 行 delta 幂等/冲突回归 1/1、`tests/scanning_jobs.rs` 88/88 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，full 100 行 2,000 次、tail 17 行 5,000 次）结果为平均单次构造时间：verify 满批动态 1,056 ns（3 alloc/6,364 B，另 1 realloc/4,932 B），模板命中 57 ns（0 alloc）；INSERT 满批 468 ns（3/4,822 B，另 2 realloc/8,409 B），模板 24 ns（0 alloc）；finalize 满批 878 ns（6/6,838 B，另 3 realloc/10,192 B），模板 24 ns（0 alloc）。尾批 verify 156 ns（3/3,127 B）→25 ns，INSERT 177 ns（3/1,336 B，另 1 realloc/1,248 B）→30 ns，finalize 565 ns（6/1,609 B，另 1 realloc/1,084 B）→45 ns，模板命中均 0 alloc。该 A/B 仅测 SQL 文本构造，不含数据库执行、扫描整链路或 NAS。完整 all-targets 与实际 PostgreSQL 运行时验证留至 S7。
+
+#### LUX-570：Manifest 正向索引借用媒体文件记录
+
+范围：已成功 claim 的 ADD 电影/剧集文件以 `&NewMovieFile` / `&NewEpisodeFile` 传入媒体物化与预取 helper，移除 `indexes.rs` 中整条文件记录的 `.clone()`。已有 owned-slice 调用方通过一次引用列表适配继续使用；不改变 claim 胜者、item/source 归并、层级关系、事务边界或公共 API。
+
+预计文件（5 个）：`src/storage/jobs/scan/manifest/indexes.rs`、`src/storage/media.rs`、`src/storage/repository_tests.rs`、`src/storage/sql_query_benchmarks.rs`、本文档。
+
+验收：
+
+- [x] 正向索引只收集已 claim 的借用 Movie/Episode 记录；媒体 helper 内部消费引用列表，不复制文件记录中的 String 和 fingerprint Vec。
+- [x] SQLite 回归覆盖 claim 竞态、重复电影来源/文件夹与 provider ID 合并、剧集/季度/分集层级及默认来源选择。
+- [x] release 对比记录 clone 和引用列表的分配次数/字节；定向测试、格式、构建、Clippy 按实际结果记录。完整门禁与 PostgreSQL 运行时验证留至 S7。
+
+结果（2026-10-17）：正向索引直接传入 Movie/Episode 借用记录，原有 owned-slice helper 通过一次 `Vec<&File>` 轻量适配，业务 SQL、排序和事务行为不变。借用 Movie helper 1/1、借用 Episode hierarchy helper 1/1 通过。`tests/scanning_jobs.rs` 目标为 87 passed、1 failed；claim race、重复电影来源/provider ID、streamed positive index 等相关用例通过，唯一失败 `manifest_scan_queues_attachment_removal_only_after_root_confirmation` 报 SQLite `database is locked`。按用户要求未隔离重跑。`cargo build --locked`、fmt、全 targets/all features Clippy 和 `git diff --check` 通过。单次 release A/B（arm64，256 records、100 次）中 Movie clone 为 73,408 ns、3,073 alloc/150,928 B；引用列表 70 ns、1 alloc/2,048 B。Episode clone 为 97,378 ns、3,841 alloc/204,660 B；引用列表 42 ns、1 alloc/2,048 B。测量只比较记录集合构造，不含 SQLite 或扫描整链路。完整 all-targets 与 PostgreSQL 运行时验证留至 S7。
+
+#### LUX-571：动态 SQL 优化完成门禁与综合记录
+
+范围：完成 S0–S6 后进行一次 Rust 全目标门禁，确认 PostgreSQL 测试环境，汇总 A+C 方案的局部性能证据与未覆盖边界。没有新增代码改动。
+
+预计文件（3 个）：`docs/PERFORMANCE.md`、本文档、`docs/DYNAMIC-SQL-OPTIMIZATION-PLAN.md`。
+
+验收：
+
+- [x] 记录 A+C 结论、B 的取舍、已完成的分项 A/B 和本机/微基准测量边界。
+- [x] 只运行一次最终 `cargo test --locked --all-targets`，如实记录失败 target 和未执行的后续 targets。
+- [x] 检查并记录 PostgreSQL runtime 可用性；无本地测试实例时标记未验证，不将 ignored tests 视为通过。
+- [ ] 完整 Rust all-targets 门禁全部通过。
+- [x] 实际 PostgreSQL runtime 集成测试通过。
+
+结果（2026-10-17）：最终 Rust 命令使用 `/Volumes/Toshiba/mywork/Lux/target`，运行一次后在 `tests/scanned_metadata.rs` 以 exit 101 结束。lib 为 955 passed、0 failed、23 ignored；该集成 target 为 21 passed、2 failed：`failed_local_poster_insert_does_not_mark_image_stage_complete`（实际 2、预期 1；此前已在基线 `3b4b7325` 重现）与 `local_nfo_retry_excludes_non_retryable_conflict_item`（`RowNotFound`；此次不重跑）。此前完成的 `libraries_api` 14/14、`probe` 21/21；其余后续 targets 未执行。S6 代码后的 `cargo build --locked`、`cargo fmt --all -- --check` 和全 targets/all features Clippy 已通过，文档收尾未重复运行。PostgreSQL 使用只绑定 `127.0.0.1:55432` 的临时 16 版容器运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database -- --ignored --test-threads=1`，18/18 通过；随后容器已删除且端口不再监听。完整 Rust 门禁仍未通过；PostgreSQL runtime 项已完成。局部性能数据仅证明 SQL 文本/记录集合构造下降，不代表扫描整链路或生产 CPU 收益。
+
+#### LUX-561：优化 Manifest 删除反连接与分页扫描
+
+范围：针对 CPU 热点分析第六项，在不改变 Manifest、文件路径和删除安全合同的前提下，降低删除候选分页重复枚举，并将只用于判断完成与否的差异统计改为存在性检查。format 3/LITE、PERSISTED v3、workflow 2/3 与 legacy 路径均须保留各自语义。seen-path/delta 继续使用完整复合键反连接。先用 SQLx 双后端 fixture 建立可复现基线，再以固定 root、相对路径 keyset 查询复用 `(library_root_id, relative_path)` 现有索引；不默认增加索引。
+
+验收：
+
+- [x] EXISTS 完成检查与原差异集合一致；精确报告计数保持；root 完整性、取消/job fencing 与事务边界不变。
+- [x] 各格式删除候选集合与基线逐项相同；跨 root 同名路径、多页、直接子项、通配符路径、父目录缺失、uncovered 路径、并发增量、取消恢复和 CAS 均有覆盖。
+- [x] SQLite 实际运行计划与固定 A/B fixture 已验证；完整扫描及前台请求所有观测中位数均在 5% 回退门内。PostgreSQL、FNOS 无本次运行时证据，详见限制，不外推。
+- [x] 实测未证明新增 generation 索引能带来净收益；继续使用现有索引，无 schema/migration 变更。
+- [x] 定向 `storage`/`scanning_jobs` 测试、性能记录、fmt、build、全目标 Clippy 与全量 Rust 完成门结果均已记录；全量门有基线失败，未标为通过。
+
+方案和增量文件计划：[`NOT-EXISTS-OPTIMIZATION-PLAN.md`](NOT-EXISTS-OPTIMIZATION-PLAN.md)。storage SQLx 基线及语义回归位于 `src/storage/jobs/tests.rs`，端到端分页回归在 `tests/scanning_jobs.rs`；查询实现位于 `src/storage/jobs/scan/manifest/diff.rs`、`src/storage/jobs/scan/manifest/diff/finish.rs` 和 `src/application/scanner/jobs/manifest_index.rs`。完整扫描 A/B 复用 `tests/performance.rs`。结果更新到本文、`docs/PERFORMANCE.md` 与 `docs/COMPATIBILITY.md`。若索引增量单独证明有必要，再按新增 migration 单独拆分并验证空库与旧库升级。
+
+### 增量顺序
+
+1. 在未修改查询上运行可复现的 SQLx 基线，记录实际后端版本、查询计划与代表性规模数据。
+2. [x] 将四种差异完成检查改为 EXISTS，并补齐各格式语义回归。
+3. [x] 将删除候选调度改为固定 root 的 keyset page；保留各版本目录覆盖和 generation/observation 条件，并以端到端场景验证差异集合和 finish retry。
+4. [x] 交错测量基线与实现；只有整 root missing 更新被证明为独立热点时，才评估额外索引。
+5. [x] 执行全量完成门并记录双后端、ARM64、FNOS/x86 的证据边界。
+
+增量 A 进度（2026-10-16）：四种完成检查现以 `CASE WHEN EXISTS` 返回 0/1；workflow 1 的 observed 与 filesystem 两类候选保持独立短路判断，精确 `unchanged_count` 查询未改。LITE、PERSISTED v3、workflow 2 format 2 和 workflow 1 候选/delta 行为回归通过。SQLx SQLite 对照显示首个候选在文件顺序前部时 COUNT/EXISTS 中位数 86.1/0.91 ms，唯一候选在末尾时为 30.1/19.4 ms，无候选时为 34.2/34.2 ms；仅为本机 60k 合成库查询样本，不代表完整扫描收益。完整原始样本见 `docs/PERFORMANCE.md`。
+
+增量 B 进度（2026-10-16）：候选现在先用有界 COMPLETE-root 页分组，再在固定 root 内按 `relative_path` 标量游标读取；PERSISTED v3 每次处理同 root 的最多 128 个 COMPLETE 目录，并为每个目录页单独推进候选游标。storage 回归覆盖两 root 同名路径、多页、seen/delta/current-generation 排除、目录直接子项与根目录、uncovered 路径、`A`/`AB`、`%`/`_`/反斜杠和中文。`cargo test --locked --test scanning_jobs` 88/88 通过。SQLx SQLite 的固定 root 计划使用已有 `(library_root_id, relative_path)` 唯一索引范围并取消临时排序；候选枚举和 delta 写入的 A/B 样本及波动见 `docs/PERFORMANCE.md`。未新增 migration 或 generation 索引。
+
+验收结果（2026-10-16）：EXISTS 完成检查保留 workflow 1 两种候选来源的独立检查；精确 `unchanged_count` 未改。LITE、PERSISTED v3、workflow 2 format 2 与 workflow 1 的差异集合和 finish/retry 行为由 storage 与 `scanning_jobs` 回归覆盖。固定 root/path keyset 使用现有唯一索引，seen/delta 仍使用完整复合键反连接；无新增索引或迁移。完整 LUX-270 fixture 的 8 轮交错中位数：首扫 2,383.5/2,406.5 ms、无变化重扫 1,167.5/1,185.5 ms、前台 p95 338/339 ms、目录列表 p95 578/591.5 ms、热目录列表 p95 431.5/423.5 ms、batch p95 334.5/346 ms（基线/候选）；最大观测回退 3.44%，在 5% 门内。完整样本见 `docs/PERFORMANCE.md`。
+
+代码验证：`cargo test --locked --lib manifest_removal_candidates_page_within_root_and_preserve_directory_scopes`、`cargo test --locked --test scanning_jobs`（88/88）、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；以上 Cargo 命令均将 target 指向 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。`./scripts/check-all.sh` 的 Rust 全量测试未通过：串行执行到未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 时，插入 2 张海报、断言预期 1 张；在干净基线 `1e7c2ea8` 上的同一精确测试得到相同失败。合并参数对象后的全目标重跑另在 `login_background_plugin_is_refreshed_in_worker_and_served_from_cache` 遇到 15 秒超时，单独精确重跑通过（1/1）。并行执行另曾出现 `libraries_api` 的临时 503，隔离及串行目标重跑通过（14/14）。因此全量 Rust 完成门如实记录为未通过，现有证据不将这些故障归因于 LUX-561。Web 冻结安装和 production build 通过；当前工作树 `pnpm test` 静态阶段为 145/148，Vitest 单独运行是 650/655；这些失败涉及未修改的 Web 页面/CSS/组件查询用例，未在本任务归因或修复。未验证 PostgreSQL runtime、FNOS/x86_64、生产 NAS 或部署行为。
+
+#### LUX-572：重启后恢复未完成的元数据识别任务
+
+范围：关闭或重启仍统一保留 `SERVER_SHUTDOWN` 任务历史，但下次启动恢复原元数据任务 ID，不为同一批未完成工作重复创建整库任务。原子地把遗留 `RUNNING/PENDING` 子项（以及迁移后标为 `FAILED/SERVER_SHUTDOWN` 的子项）重新排队；已完成子项不重跑，管理员主动取消和其他终态不恢复。`FILL_MISSING` 只有媒体库仍启用且仍配置主刮削器时恢复；指定条目任务沿用当前媒体库/刮削器选择处理，不可用条目在任务处理中完成为明确跳过结果。继续使用有界 dispatcher，不等待识别完成后才启动 HTTP 服务。
+
+预计文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/034-cancel-jobs-on-shutdown.md`、`src/api/legacy.rs`、`src/application/reidentify.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`tests/reidentify.rs`。
+
+验收：
+
+- [x] 仅 `CANCELLED/SERVER_SHUTDOWN` 的元数据任务恢复原任务 ID；恢复事务同时更新父任务和未完成子项，重复调用幂等。
+- [x] 已完成子项不重复请求；`PENDING/RUNNING` 和迁移后 `FAILED/SERVER_SHUTDOWN` 子项恢复；管理员主动取消或无可用刮削器时不创建待运行任务。
+- [x] `ITEMS` 与库级 `FILL_MISSING` 按各自范围派发；整库任务仍串行，恢复筛选和状态更新有界、幂等。
+- [x] 更新 ADR-034 与 §13.5 重启语义；无 schema 变化。定向测试、build、fmt 和 Clippy 结果见本任务记录。
+
+验证：`cargo test --locked --test reidentify -- --test-threads=1`（24/24）、`cargo fmt --all -- --check`、`cargo build --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；所有 Cargo build/test/clippy 命令将 `CARGO_TARGET_DIR` 设为 `/Volumes/Toshiba/mywork/Lux/target`。本机为 `arm64`；未验证 FNOS/x86_64 与生产部署，完整 `--all-targets` 测试门禁在这组关联修复完成后统一运行。
+
+#### LUX-573：刮削器恢复后自动重试延期的补缺任务
+
+范围：LUX-402 已为带请求快照的自动 `FILL_MISSING` 失败项保存 5 分钟、30 分钟、最多 6 小时的退避，但当前只有后续扫描会重新提交这些项。利用现有 15 秒后台调度轮询到期的自动延期项，从已保存的媒体完整度生成当前指纹与能力集合，复用请求快照去重事务创建自动重试任务，再经每媒体库有界 dispatcher 执行并消费旧失败记录。仅处理 `AUTOMATIC` 来源、未消费且带请求快照的失败；新尝试继承逐项失败次数，并确认媒体库仍启用且仍选中刮削器。不得触发整库扫描或人工/其他错误重试。
+
+预计文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/reidentify.rs`、`src/application/scheduled_tasks.rs`、`src/storage/jobs/metadata_reidentify/fill_missing.rs`、`src/storage/jobs/metadata_reidentify/lifecycle.rs`、`src/storage/metadata.rs`、`tests/scheduled_tasks.rs`。
+
+验收：
+
+- [x] 调度轮询独立发现到期自动 provider 失败，即使没有新扫描或用户计划任务也会重新排队；未到期项不会提前重试。
+- [x] 重试沿用当前完整度指纹和快照去重，经原有 dispatcher 创建一次自动尝试；保留 item 失败次数并在持续不可用时进入下一档退避，服务恢复后完成并停止重试。
+- [x] 不重试人工来源、已消费快照、非 provider 错误、未启用/未选刮削器的媒体库；整个过程不发起扫描，查询和每次调度页有界。
+- [x] 不增加 schema/API 变化；自动重试回归、build、fmt 和 Clippy 通过。调度目标存在一项在本任务基线中同样失败的 STRM cron 测试。
+
+验证：`cargo test --locked --test scheduled_tasks due_automatic_metadata_retry_runs_without_a_scan_or_user_schedule -- --exact --nocapture`（1/1）、`cargo test --locked --test reidentify -- --test-threads=1`（24/24）通过。`scheduled_tasks` 目标 8/9 通过；`enabled_strm_task_runs_once_per_matching_cron_minute` 断言得到 0 而非 1，在干净基线 `3c7dd6be` 上精确重跑得到相同失败。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过；Cargo build/test/clippy 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。未部署 FNOS/x86_64；全量 `--all-targets` 门禁在全部三项修复结束后运行。
+
+#### LUX-574：区分无候选与低分候选的识别结果
+
+范围：自动识别时将零候选记为 `NO_CANDIDATE`，将存在但未达到当前自动确认门槛的候选记为 `LOW_CONFIDENCE` 并保留候选待人工复核。任务条目保持已完成状态并保存候选数；两种结果都汇总为 `COMPLETED_WITH_ISSUES`。不改变自动阈值、评分算法、数据库 schema 或 API 结构。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/reidentify.rs`、`src/api/admin/admin_metadata.rs`、`src/application/scanner/tests.rs`、`tests/reidentify.rs`。
+
+验收：
+
+- [x] 搜索无候选时以 `NO_CANDIDATE`、候选数 0 记录并汇总为 `COMPLETED_WITH_ISSUES`；失败服务仍单独记录为 `SCRAPER_UNAVAILABLE`。
+- [x] 低分候选以 `LOW_CONFIDENCE` 和候选数记录，媒体识别状态与候选保持 `PENDING`，可由管理员复核，父任务显示 `COMPLETED_WITH_ISSUES`。
+- [x] 高分自动确认与指定条目候选搜索语义不变；新增及原有 Rust 回归通过，不部署到 FNOS。
+
+验证：测试先按新断言复现旧行为失败，随后 `cargo test --locked --test reidentify -- --test-threads=1`（24/24）、`cargo test --locked --lib application::reidentify`（42/42）和扫描器空搜索回归（1/1）通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 `cargo test --locked --all-targets` 的库测试 966 通过、24 忽略，集成测试在 `scanned_metadata` 的 `failed_local_poster_insert_does_not_mark_image_stage_complete`（22/23）停止；同一失败已在干净基线 `5548259d` 精确复现。Cargo build/test/clippy 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`；未部署 FNOS/x86_64。
+
+#### LUX-575：在管理任务详情中区分无候选与低分待复核
+
+范围：Web 管理任务列表和详情把 `NO_CANDIDATE` 显示为“没有找到匹配候选”，把 `LOW_CONFIDENCE` 显示为低分候选已保留、等待人工复核；不改变任务 API 或页面布局。
+
+预计文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminOperationsPage.tsx`。
+
+验收：
+
+- [x] 任务汇总错误标签和逐条问题详情均能区分无候选与低分待复核。
+- [x] TypeScript 构建通过；Web 全套测试结果与干净基线对照并记录。
+
+验证：`pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。`pnpm --dir web test` 有 3 项布局/代码拆分断言失败；在干净基线 `5548259d` 上同样 145 通过、3 失败（详情编辑器懒加载断言、移动媒体卡片宽度断言、触屏媒体卡片操作断言）。
+
+#### LUX-576：Lux 媒体 userData 公开最近播放时间
+
+范围：在 Lux 媒体条目的 `userData` 中增加当前用户最近播放该条目的 Unix 秒时间戳 `lastPlayedAt`，供继续观看卡片生成相对时间文案。未知或从未播放时返回 `null`；不改变 Emby DTO、播放状态写入和数据库 schema。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/media.rs`、`tests/catalog.rs`。
+
+验收：
+
+- [x] Lux 首页、继续观看、媒体目录和详情响应的 `userData.lastPlayedAt` 与已存储的 `last_played_at` 一致，单位为 Unix 秒；无值为 `null`。
+- [x] Emby `LastPlayedDate`、播放时间存储和 ACL 行为保持不变。
+- [x] Catalog API 回归通过；API 文档记录字段含义与空值行为。
+
+依赖：LUX-074。先在现有 Catalog API 集成场景增加有值与空值响应断言，再添加 Lux DTO 字段。
+
+结果：Lux `userData` 现在公开存储的 `lastPlayedAt` 秒级时间戳，未知值序列化为 `null`。Catalog 集成测试在首页、继续观看、目录及详情响应中覆盖有值和空值；Emby 响应保持不变。验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`（3/3）；本机 `arm64`。未改数据库 schema 或播放状态写入。
+
+#### LUX-577：继续观看卡片三行信息与最近观看文案
+
+范围：调整 Lux Web 首页继续观看卡片的标题层级，并根据 `userData.lastPlayedAt` 显示简短、自然的最近观看提示。电影首行显示电影名与剩余时间，第二行显示年份；电视剧首行显示剧名与剩余时间，第二行显示 `SxxExx·单集标题`。第三行按最近播放时间使用“刚才看到这里”“半小时前看到这里”“今天上午看到这里”“昨天看到这里，接着来”等文案。不得仅凭当前集播放时间声称上一集已完播；缺少最近播放时间时隐藏第三行。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/home/media.tsx`、`web/src/react.css`、`web/tests/home-media.test.tsx`。
+
+验收：
+
+- [x] 电影与电视剧按指定顺序显示标题、剩余时间和上下文；季集格式为 `S01E05·用魔法打败魔法`。
+- [x] 最近观看文案覆盖刚刚、分钟、小时、今天、昨天和较早记录；无时间值时不渲染第三行。
+- [x] 保留播放入口、进度条、横版封面和桌面/移动端卡片尺寸规则。
+- [x] Web 定向卡片测试和生产构建通过。
+- [ ] 完整 Web 测试与布局检查全部通过。
+
+依赖：LUX-576。先补充卡片顺序、年份、季集格式与相对时间回归，再修改组件和样式。
+
+结果（2026-10-17）：卡片定向测试 13/13 通过，生产构建通过。全量 Vitest 为 648/652，另 4 项首页预取、媒体库卡片预取/合集链接和详情轮询用例失败；Node 布局检查为 5/6，失败断言仍要求媒体库封面宽度 `min(170px,52vw)`，当前样式为 `min(180px,56vw)`。`pnpm test` 在 Node 静态检查阶段失败于 3 项详情懒加载、首页卡片宽度和触屏卡片操作断言，因此未执行该脚本内的 Vitest 阶段。Web 生产构建通过；上述全量检查尚未全绿。
+
+#### LUX-578：为全量扫描增加唯一媒体进度台账
+
+范围：为全量扫描任务保存已处理媒体条目的去重集合和累计数量，供后续扫描进度接口使用。SQLite 与 PostgreSQL 均须支持；不预扫媒体库总数，不改变现有文件发现和文件计数语义。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0183_scan_job_processed_media.sql`、`migrations-postgres/0183_scan_job_processed_media.sql`、`tests/storage.rs`。
+
+验收：
+
+- [x] 空数据库迁移创建 `processed_media_count` 和逐任务唯一媒体台账；删除扫描任务时台账级联删除。
+- [x] SQLite 与 PostgreSQL migration 一致，不需要预填充历史扫描数据。
+- [x] 空库迁移回归通过。
+
+结果（2026-10-18）：SQLite 空库迁移创建计数列和去重台账；回归验证唯一约束与扫描任务删除级联通过。PostgreSQL migration 已加入并由同一回归检查关键结构；尚未连接 PostgreSQL 实例执行 migration。
+
+#### LUX-579：扫描期间累计已处理的唯一影片和整部剧
+
+范围：全量扫描每个目录块完成文件登记后，在同一事务中按媒体 ID 去重累计进度。电影按电影条目计数；剧集库按 `series_id` 计整部剧，同一剧的多季、多集只计一次。附属文件、未识别文件不计入。原有文件数保留给内部诊断，不读取目录总量、不增加第二次文件遍历。
+
+预计文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/manifest/discovery/presence.rs`、`tests/scanning_jobs.rs`。
+
+验收：
+
+- [x] 同一电影的多个版本只计一部；同一剧的多集、多季只计一部剧；附属文件不计数。
+- [x] 未变更的已索引媒体也能在全量扫描过程中计数；worker 重建后继续任务不重复计数。
+- [x] 计数随扫描块提交到新字段；不改变旧文件计数。
+- [x] 扫描任务目标测试通过。
+
+依赖：LUX-578。先添加影片、剧集和附属文件混合场景的回归，再在已有 presence 事务中写入去重台账。
+
+结果（2026-10-18）：Manifest presence 事务会从本批已登记的文件中聚合电影条目 ID，剧集文件映射到 `series_id`，并通过任务级唯一键累计；旧版任务的空计数不回填。集成回归覆盖同片多版本、跨季多集、附属文件、未变更文件、运行中计数以及重建 worker 后继续处理。`cargo test --locked --test scanning_jobs full_scan_counts_unique_movies_and_whole_series_during_discovery -- --exact` 通过。
+
+#### LUX-580：从扫描任务存储模型读取媒体进度
+
+范围：`StoredScanJob` 暴露独立的可空 `processed_media_count`。新任务从 0 开始；升级前创建的任务保持空值，因为无法可靠地回溯其扫描进度。原有文件计数字段不变。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/repository.rs`、`src/application/scanner/tests.rs`、`src/storage/repository_tests.rs`。
+
+验收：
+
+- [x] 查找、分页列表和活动列表均能读取新计数，旧任务的计数保持空值。
+- [x] 原有文件计数与扫描生命周期行为不变。
+- [x] Rust 存储与扫描任务目标检查通过。
+
+依赖：LUX-579。先补存储模型映射，再扩展查询列并读取计数。
+
+结果（2026-10-18）：`StoredScanJob` 的查找、分页和活动查询都读取独立媒体计数；升级前的任务保持 `None`，新任务使用默认 0。干净验证 worktree 中 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib scan_job_media_progress_is_loaded_from_job_queries` 与 `cargo fmt --all -- --check` 通过。共享工作区未提交的 `src/application/metadata.rs` 当前有独立类型错误，因此没有把共享工作区的构建状态算作本任务验证结果。
+
+#### LUX-581：在管理员扫描任务接口公开媒体进度
+
+范围：管理员任务列表、任务详情和全局活动接口公开独立的 `processedMediaCount`。保留兼容的文件 `processedCount`/`totalCount` 字段；新字段只用于全量扫描媒体进度。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_task_activity.rs`、`src/api/admin/admin_jobs.rs`、`src/api/admin/admin_scheduled_tasks.rs`、一个相关 Rust API 集成测试文件。
+
+验收：
+
+- [x] 管理任务列表、详情、活动接口均返回 `processedMediaCount`，且与存储计数一致。
+- [x] 既有文件计数字段及其他任务的 JSON 行为不变。
+- [x] Rust API 定向回归通过。
+
+依赖：LUX-580。先补接口响应断言，再映射已存储计数。
+
+结果（2026-10-18）：管理员扫描任务列表、详情、活动接口公开可空的 `processedMediaCount`；创建/重试响应从 0 开始。接口回归验证新字段与存储一致，且文件计数字段不变。干净验证 worktree 中 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test admin_events admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts -- --exact` 通过。
+
+#### LUX-582：管理运行记录显示媒体处理数量
+
+范围：全量扫描的管理运行记录将右侧进度改为已处理电影/剧集数量，不显示文件数、总数或百分比。电影库显示“已处理 N 部电影”，剧集库按整部剧显示“已处理 N 部剧”；百分比进度改为不确定进度条。其他任务和增量扫描保持原展示。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`。
+
+验收：
+
+- [x] 全量电影库显示已处理电影数，全量剧集库显示去重后的整部剧数。
+- [x] 全量扫描不显示文件分母或百分比；其他任务沿用现有行为。
+- [x] 管理运行记录 Web 定向回归通过。
+
+依赖：LUX-581。先补电影库、剧集库和非全量任务的渲染断言，再修改运行记录文案。
+
+结果（2026-10-18）：运行记录按媒体库类型显示已处理电影数、整部剧数或通用媒体数，全量扫描使用不确定进度条并隐藏文件数；没有媒体计数的旧任务显示“媒体进度不可用”。增量扫描和其他任务保留原文件进度。`pnpm --dir web exec vitest run tests/admin-operations.test.tsx` 通过（23/23）。
+
+#### LUX-583：全局活动浮层显示媒体处理数量
+
+范围：全局后台活动浮层对全量扫描显示已处理的电影或整部剧数量，并使用不确定进度条；不显示发现到的文件总数或百分比。其他活动保持原行为。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/lib/api/types.ts`、`web/tests/scan-activity.test.tsx`、`web/tests/lux-shell.test.tsx`。
+
+验收：
+
+- [x] 浮层在电影库显示电影数，在剧集库按整部剧显示；全量扫描进度条无百分比。
+- [x] 增量扫描及其他后台任务进度不变。
+- [x] 活动浮层 Web 定向回归通过。
+
+依赖：LUX-581。先补活动浮层回归，再修改计数标签和进度显示。
+
+结果（2026-10-18）：全局活动浮层对全量电影库显示电影数、剧集库显示整部剧数，并使用无百分比的不确定进度；增量扫描和其他后台任务继续按文件进度显示。旧任务没有可靠媒体计数时显示“媒体进度不可用”。活动浮层回归通过（6/6），Shell 集成回归通过（1/1），Web build 通过。
+
+完成门禁（2026-10-18）：Rust 格式、build 和 Clippy 通过；扫描计数与管理员 API 定向测试通过。`cargo test --locked --all-targets` 在既有的 NFO actor-credit 回归失败，且该失败已在任务基线 `62c1d2ac` 上复现。完整 Web Vitest 为 651 通过、4 个无关失败；`pnpm --dir web test` 还在静态布局阶段因 3 条首页/触屏 CSS 断言失败而未启动 Vitest。
+
+### 扫描后处理诊断与重试修复
+
+本组修复保留 `COMPLETED`、`JOB_COMPLETED` 和 `ScanCompleted` 的索引完成语义。管理员任务接口通过附加的后处理问题标记和重试能力呈现未完成工作；旧 workflow 与 workflow 2/3 仍沿用各自的检查点恢复合同。
+
+#### LUX-584：保留扫描后处理失败错误码
+
+范围：后处理失败收尾仍进入 `COMPLETED/IDLE`，在现有 `error` 字段保存稳定的 `POSTPROCESSING_FAILED`。重试开始和后处理成功时清除错误；不变更数据库状态集合或完成通知时序。
+
+预计文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/lifecycle.rs`、`tests/scanning_jobs.rs`、`tests/postgres_database.rs`。
+
+验收：
+
+- [x] 失败目标和 workflow 3 目标物化失败均保留稳定错误码及可恢复状态。
+- [x] 恢复后重试清除错误，已完成目标与游标不被重置。
+- [x] SQLite 扫描回归及 PostgreSQL 对应合同通过。
+
+验证：`cargo test --locked --test scanning_jobs` 中后处理失败/恢复相关用例；PostgreSQL 对应恢复用例。
+
+后续增量依次补存储诊断、管理员 API 和 Web 流程，每个增量完成后再进入下一项。
+
+结果（2026-10-18）：先确认旧实现无法保留错误码，再补最小存储修复。SQLite 后处理回归 8/8、根目录替换恢复 1/1，以及本地 PostgreSQL 16 workflow 3 恢复 1/1 通过；重试开始和最终成功均清除错误码。
+
+#### LUX-585：批量读取后处理问题与恢复条件
+
+范围：存储层按任务批量读取未完成阶段、未物化检查点、旧工作队列和同库同类型活跃任务；管理员问题筛选在分页之前执行。历史任务不依赖错误码或日志，终态目标不算未完成工作。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/jobs/scan/targets.rs`、`src/storage/repository_tests.rs`。
+
+验收：
+
+- [x] 旧任务的 PENDING/FAILED 和 workflow 2/3 未物化目标被识别；DONE/SKIPPED、运行中和增量任务不误报。
+- [x] 检测旧队列及同库同类型冲突，分页查询没有逐任务 SQL。
+- [x] 问题筛选在分页前执行，存储定向测试通过。
+
+依赖：LUX-584。先补诊断矩阵和分页回归，再实现批量查询。
+
+结果（2026-10-18）：未实现筛选时分页断言先失败；补上数据库筛选后，SQLite 与本地 PostgreSQL 16 的同一诊断矩阵均通过（2/2）。十个任务只查一次，超过批次上限按块查询，空集合不查库。
+
+#### LUX-586：统一重试资格并保护后处理重试竞争
+
+范围：读取能力和实际重试共用恢复判断；仅剩终态目标的任务不可重试。后处理重试在事务内复核活跃冲突及未完成工作，重复请求不回退成新建扫描。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/scanner/jobs/lifecycle.rs`、`src/storage/jobs/scan/lifecycle.rs`、`src/storage/jobs/scan/targets.rs`、`tests/scanning_jobs.rs`。
+
+验收：
+
+- [x] 正常完成和全部 DONE/SKIPPED 的任务拒绝重试。
+- [x] 保留检查点的后处理重试沿用任务 ID，重复/冲突请求不产生新任务。
+- [x] 旧 workflow 迁移恢复与既有后处理回归通过。
+
+依赖：LUX-585。先补终态目标和并发重试回归。
+
+结果（2026-10-18）：终态目标用例先在旧判断上失败。统一资格判断并补上事务内复核后，后处理回归 9/9、重试及旧 workflow 恢复回归 7/7 通过；待处理旧队列阻止后处理重试，已完成旧队列不阻止；同库冲突和并发重复请求均被拒绝。
+
+#### LUX-587：管理员接口暴露后处理问题和重试能力
+
+范围：管理员扫描列表和详情附加 `hasPostprocessingIssues`、`canRetry`，共享 LUX-586 资格判断；列表支持 `hasPostprocessingIssues=true/false` 筛选，保留原有状态白名单和分页上限；移除被批量诊断替代的旧查询。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_scan_jobs.rs`、`src/api/admin/admin_jobs.rs`、`src/storage/jobs/scan/reconciliation.rs`、`tests/job_events_api.rs`。
+
+验收：
+
+- [x] 历史失败、未物化目标、正常完成和运行中任务返回正确能力。
+- [x] 列表与详情字段一致，问题筛选先于分页，冲突重试返回 409。
+- [x] 事件仍可读取 WARN/ERROR；管理员接口回归通过。
+
+依赖：LUX-586。先补管理员 API 合同测试。
+
+结果（2026-10-18）：新增用例先因缺少能力字段失败；实现后 `job_events_api` 2/2 通过，覆盖历史空错误码、v3 未物化检查点、分页、WARN 原因和 409/202 重试。既有用例的登录失败在干净基线 `8b019cef` 同样复现；本机开启系统代理，测试客户端显式直连回环地址后通过。
+
+#### LUX-588：Web 显示后处理问题并提供重试
+
+范围：扫描问题使用警告状态和“索引已完成，后处理未完成”提示，重试按钮使用 `canRetry`；按需读取 WARN/ERROR 原因并提供缺失日志回退。问题筛选使用扫描专属条件，重试后刷新任务及事件缓存。
+
+预计文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-operations.test.tsx`。
+
+验收：
+
+- [x] 历史问题显示警告、原因入口和允许的重试；正常完成、运行中和冲突任务不误显示重试。
+- [x] 根目录 WARN 原因可见，日志缺失或读取失败不阻断重试。
+- [x] 问题筛选包含扫描与元数据任务；重试后清除旧状态与原因缓存。
+- [x] 管理运行记录定向测试、Web 构建及真实浏览器流程验证完成。
+
+依赖：LUX-587。先补交互测试，再实现 UI。
+
+结果（2026-10-18）：新增交互先复现 5 个失败；修复后管理运行记录 27/27、Web 构建通过。另补旧事件缓存断言，先确认只 invalidation 不会清除旧数据，再于重试成功后移除缓存。Playwright 在真实 Chromium、构建产物及受控 API fixture 下验证警告、WARN 原因、扫描/元数据混合问题筛选、重试后转为 POSTPROCESSING 且隐藏旧原因；390px 页面无横向溢出，控制台 0 error/0 warning。此项是浏览器 UI 证明，不代表 FNOS 部署或真实库恢复验证。
+
+#### LUX-589：诊断查询使用既有阶段索引
+
+范围：后处理诊断按阶段分别使用 EXISTS，复用现有 PENDING/FAILED 部分索引，避免列表读取已完成目标的全部行；不增加索引或迁移。
+
+预计文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/jobs/scan/targets.rs`（含查询计划回归）。
+
+验收：
+
+- [x] SQLite 查询计划使用三个阶段部分索引，诊断及筛选含义不变。
+- [x] SQLite/PostgreSQL 诊断矩阵通过。
+
+依赖：LUX-588。先用实际数据库 schema 复现查询走目标主键范围扫描，再调整查询形状。
+
+结果（2026-10-18）：查询计划回归先明确显示目标主键范围扫描并失败；按阶段拆开 EXISTS 后使用现有三个部分索引。查询计划、SQLite 诊断矩阵及本地 PostgreSQL 16 诊断矩阵 3/3 通过；未增加 schema 或迁移，不将此查询计划结果外推为 NAS 性能测量。
+
+#### LUX-591：调整查询计划测试的模块位置
+
+范围：将查询计划测试移到生产代码之后，满足 Clippy `items_after_test_module`；不改变查询或运行时行为。
+
+预计修改文件：`src/storage/jobs/scan/targets.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 查询计划和 SQLite/PostgreSQL 诊断矩阵继续通过。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
+依赖：LUX-589。Clippy 已复现测试模块位置错误，先调整位置，再复跑相关检查。
+
+结果（2026-10-18）：只移动测试模块，查询计划和 SQLite/PostgreSQL 诊断矩阵 3/3 通过；完整 Clippy 与格式检查通过。完整测试中超时的 local metadata worker 用例在同一最终代码单独复跑通过，完整门禁仍保留原失败结果。
+
+#### LUX-590：记录后处理重试修复的兼容与完成门禁
+
+范围：记录 LUX-584 至 LUX-589 的 API、历史任务恢复、浏览器验证及完整检查结果；不增加运行时行为。
+
+预计修改文件：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。
+
+验收标准：
+
+- [x] 记录索引完成语义、附加 API 字段、问题筛选和旧 workflow 恢复合同。
+- [x] 记录 SQLite、PostgreSQL、接口、Web 和真实浏览器的证据范围。
+- [x] 完整门禁失败逐项与干净基线对照，不以定向通过代替全量通过。
+
+依赖：LUX-589、LUX-591。先完成最终检查与基线对照，再写入兼容记录。
+
+结果（2026-10-18）：`docs/COMPATIBILITY.md` 记录合同及验证边界。相关后处理、诊断、PostgreSQL、接口、Web 回归与 Chromium 受控接口验证通过，build、fmt、Clippy 和 Shell/Python 工具检查通过。完整 Rust 库测试 972 通过、4 失败、25 ignored；三个存储失败在基线复现，worker 超时用例在最终代码和基线单独通过。完整扫描 target 为 89 通过、2 个基线复现失败；Web 静态 145 通过/3 失败，完整 Vitest 655 通过/4 失败，七项均在基线复现。完整门禁未通过，不扩展修复无关问题；未合并、推送或部署。
+
+#### LUX-592：兼容 X-Real-IP 和 Forwarded 客户端 IP
+
+范围：扩展播放会话和活动记录共用的客户端 IP 读取逻辑，按 X-Forwarded-For、X-Real-IP、Forwarded 的有效值顺序回退；保留现有账号认证、ACL、限流和 HTTPS 判断行为。
+
+预计修改文件：`src/network.rs`、`src/api/legacy.rs`、`tests/remote.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。
+
+验收标准：
+
+- [x] 无需代理 CIDR 配置，支持 X-Real-IP 的单个 IPv4/IPv6 地址。
+- [x] 支持 RFC 7239 Forwarded 首个元素中的 for，包含大小写不敏感参数名、引号、IPv6 和可选端口；unknown、混淆标识及异常值不作为 IP。
+- [x] 有效 X-Forwarded-For 优先；无效高优先级头允许回退；不从后续代理元素猜测原始客户端 IP。
+- [x] 真实 HTTP 集成测试覆盖根路径和 /emby 播放回调，验证保存的 IP 与 GET /Sessions 的 RemoteEndPoint。
+- [x] 记录定向测试、Rust 完成门禁和本机架构；真实 Lucky/FNOS 部署验证单独说明。
+
+验证：`cargo test --locked --test remote --test sessions --test playback --test admin_dashboard`；Rust build、all-targets test、fmt 和 Clippy 完成门禁。
+
+依赖：LUX-092。
+
+结果（2026-10-19）：新增回环 HTTP 测试先在旧逻辑上复现：只携带 `X-Real-IP` 的播放事件落库 IP 为 `None`。接入共用入口后，`remote` 8/8、`sessions` 2/2、`playback` 3/3、`admin_dashboard` 1/1 通过；其中新增播放回归覆盖根路径和 `/emby`、X-Real-IP/Forwarded 的 IPv4/IPv6，以及数据库与会话接口输出。解析回归覆盖优先级、无效值回退、引号/转义/端口和拒绝后续代理地址。原有 remote HTTP 用例首次受本机代理影响返回 502；为测试进程设置 `NO_PROXY`/`no_proxy=127.0.0.1,localhost` 后通过，生产出站代理配置未改动。
+
+本机为 macOS `arm64`，全部 Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 在库测试阶段得到 973 passed、3 failed、25 ignored，后续集成 targets 未运行；相关集成 targets 已按上述定向命令独立通过。三个失败分别为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`（实际 0、预期 1）、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`（空集合越界）和 `changed_local_fill_request_during_running_item_is_not_lost`（实际 0、预期 1）。三项均在干净基线 `842f9870` 以各自完整测试名和 `--lib -- --exact` 单独复现相同失败，临时 worktree 已清理；完整 Rust 门禁仍未通过。
+
+真实 Lucky、FNOS/x86_64 和第三方播放器尚未验证，本任务未推送或部署。请求头全部缺失时仍无法恢复客户端地址，兼容合同见 `docs/COMPATIBILITY.md`。
+#### LUX-593：用户管理页面结构
+
+范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码、活动记录和外挂字幕入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 管理员可以从用户列表进入全局设置和任意用户详情。
+- [x] 详情页覆盖设计方案中规划的用户模块入口，页面结构适配小屏。
+- [x] 未实现模块清楚显示占位提示，不提供无后端支撑的交互开关。
+- [x] 当前创建、编辑、禁用和删除用户流程不因路由结构调整而改变。
+
+依赖：用户管理设计已由 `docs/USER-MANAGEMENT-DESIGN.md` 登记。账号生命周期与用户查询在后续独立 `LUX-*` 任务实施；播放与转码权限须等待阶段门确认。
+
+结果（2026-10-19）：新增用户列表视图占位、用户详情模块导航和全局用户设置导航。模块一、三、六及其他待实施模块均未新增业务行为。`pnpm --dir web build` 通过；未部署。
+
+#### LUX-594：账号资料与回收站数据模型
+
+范围：为用户补充可选邮箱、邮箱验证时间和软删除/清理时间字段；为邮箱建立不区分大小写的唯一索引，并在 SQLite 与 PostgreSQL 中同步迁移。现有用户邮箱为空且维持原有启用状态；本任务只建立持久化基础，不改变 API、登录或删除行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0184_user_account_profile.sql`、`migrations-postgres/0184_user_account_profile.sql`、`src/storage/repository.rs`、`src/storage/users.rs`。
+
+验收标准：
+
+- [ ] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
+- [x] 用户查询统一映射新增字段；邮箱为空允许重复，非空邮箱不区分大小写唯一。
+- [x] 不改变当前登录、用户删除及公开 API 行为。
+
+依赖：LUX-593。后续模块一任务逐步接通 API、用户界面和账号生命周期。
+
+结果（2026-10-19）：SQLite/PostgreSQL 迁移、邮箱唯一索引和用户存储映射已实现；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过。迁移尚未在数据库实例执行，未运行测试。
+
+#### LUX-595：管理员账号资料 API
+
+范围：管理员创建用户时可选填写邮箱；详情接口返回单个用户的资料；独立资料更新接口可修改显示名称和邮箱。邮箱输入做基本格式校验并大小写归一化；修改地址清除原验证时间，不把未验证地址标记为已验证。权限更新仍沿用现有接口。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [ ] 管理员可获取用户详情并创建/更新邮箱；同一邮箱大小写变体被唯一约束拒绝。
+- [ ] 修改邮箱后验证时间为空；旧账号为空邮箱时保持兼容。
+- [ ] 邮箱格式错误返回 400，不泄漏数据库或账户敏感信息。
+
+依赖：LUX-594。
+
+结果（2026-10-19）：新增管理员单用户详情、创建时设置邮箱和独立资料更新接口；邮箱统一小写、执行基本格式检查、重复地址映射为冲突，地址变更会清除验证时间。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与 `cargo fmt --all -- --check` 通过；未运行测试。
+
+#### LUX-596：管理员账号资料详情页
+
+范围：详情页直接按用户 ID 读取资料，并实现模块一中的显示名称、邮箱编辑和邮箱验证状态展示。保存成功后同步更新列表/详情缓存；其余模块继续保持占位。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 详情页不依赖加载全量用户列表；不存在用户显示明确状态。
+- [x] 管理员可保存显示名称与邮箱，显示邮箱未验证状态和服务端错误。
+- [x] 模块六仍只有占位文案，不出现可操作的播放/转码开关。
+
+依赖：LUX-595。
+
+结果（2026-10-19）：详情页改为按用户 ID 请求资料；模块一资料表单可更新显示名称、邮箱并呈现验证状态。模块六保持禁用占位。`pnpm --dir web build` 通过；未部署。
+
+#### LUX-597：账号软删除与恢复存储服务
+
+范围：实现账号软删除、7 天清理期限、恢复和回收站彻底删除存储操作。禁用和软删除都撤销 Web/Emby 凭证并停止数据库中活跃的 Emby/Web 播放会话；软删除保留资料与权限、保存原禁用状态；恢复原禁用状态但不恢复已撤销凭证或播放会话。拒绝删除最后一个有效管理账户。仅提供存储与应用服务方法，不接通 HTTP 或页面操作。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository.rs`、`src/auth/users.rs`。
+
+验收标准：
+
+- [ ] 删除保留账号和关联数据 7 天，保存的恢复状态准确。
+- [ ] 禁用或删除撤销两类令牌并停止两类数据库播放会话；过期或重复删除不会破坏状态。
+- [ ] 恢复清除删除时间并还原此前启用/禁用状态，且不恢复旧凭证。
+- [ ] 最后一名有效管理员受保护，彻底删除只接受已进入回收站的账号。
+
+依赖：LUX-596。
+
+结果（2026-10-19）：存储层新增 7 天软删除、恢复、仅回收站账号彻底删除；禁用/删除事务会撤销 Web 会话和 Emby 令牌并将两类播放记录标为停止。`cargo fmt --all -- --check` 与 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过；HTTP 操作尚未接通，未运行测试。
+
+#### LUX-598：禁用和删除时停止服务端 HLS 进程
+
+范围：提供应用服务停止指定服务端 HLS 会话进程的方法。生命周期存储事务负责捕获目标用户的活跃 HLS 会话 ID，API 在事务提交后调用该方法；停止失败写入不含凭证的会话级日志并继续清理其他会话，不改变 Web 端播放协议。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`。
+
+验收标准：
+
+- [x] 禁用和软删除的数据库事务捕获目标用户当前活跃的服务端 HLS 会话。
+- [x] 停止方法逐个释放 HLS 进程与临时目录，单项失败不阻断后续会话清理。
+- [x] Cargo 构建与格式检查通过。
+
+依赖：LUX-597。
+
+结果（2026-10-19）：新增逐项停止指定 HLS 进程入口，活跃会话 ID 由 LUX-597/599 的生命周期事务捕获。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与格式检查通过；入口在 LUX-599 管理员生命周期 API 中接通。未运行测试。
+
+#### LUX-599：管理员账号生命周期 API
+
+范围：管理员删除用户改为软删除并返回回收站期限；新增恢复和彻底删除端点。禁用、软删除事务性撤销凭证、停止数据库播放会话并返回同时捕获的服务端 HLS 会话 ID，提交后交给播放服务终止。Emby 管理接口的禁用和删除沿用相同语义；移除不再需要的独立会话查询；彻底删除账号时清理头像文件。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`src/api/emby_handlers.rs`、`src/storage/sessions.rs`、`src/application/playback/session.rs`。
+
+验收标准：
+
+- [x] 管理员删除将账号放入 7 天回收站；恢复还原禁用状态；彻底删除只接受回收站账号。
+- [x] Lux 与 Emby 管理入口禁用或删除后撤销 Web/Emby 凭证、停止数据库会话并终止捕获的服务端 HLS 进程。
+- [x] 最后一名有效管理员保护和错误状态码保持正确；API 不返回原始凭证。
+- [x] Cargo 构建与格式检查通过。
+
+依赖：LUX-597、LUX-598。
+
+结果（2026-10-19）：Lux 管理删除改为回收站，新增恢复和提前彻底删除；Emby 管理删除同步软删除。禁用/删除事务返回被停止的服务端 HLS ID，并在提交后终止进程；彻底删除会清理头像文件。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和格式检查通过，未运行测试。
+
+#### LUX-600：用户个人资料编辑
+
+范围：为登录用户提供受 CSRF 保护的资料读取和更新接口，并在账户页保存自己的显示名称和邮箱，展示邮箱验证状态。修改邮箱时沿用存储层清除验证时间的行为；邮件发送和邮箱验证流程留给注册邮件任务。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、`web/src/features/account/AccountPage.tsx`。
+
+验收标准：
+
+- [x] 读取和修改仅作用于当前登录账号；修改接口要求有效会话和 CSRF。
+- [x] 用户可保存显示名称、邮箱，邮箱变更后显示未验证状态；非法或重复邮箱返回明确错误。
+- [x] 页面同步更新当前会话显示名称，不影响头像和密码修改流程。
+- [x] Web 构建通过。
+
+依赖：LUX-594、LUX-595。
+
+结果（2026-10-19）：新增当前登录用户的个人资料读取/更新 API，并在账户页保存显示名称和邮箱；邮箱更新由既有存储逻辑清除验证时间，当前显示未验证状态。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、Rust 格式检查和 `pnpm --dir web build` 通过。邮件验证发送尚未接通，未运行测试。
+
+#### LUX-601：管理员用户查询与分页 API
+
+范围：管理员用户列表支持用户名/显示名称/邮箱搜索、账号状态筛选、创建时间/最近登录/最近活动排序及服务端分页。默认每页 20 条，上限 100 条；返回匹配总数、邮箱资料、近期活动时间与 Web/Emby 合并去重的当前播放数。默认列表排除回收站账号，`deleted` 状态专供回收站视图。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [x] 服务端先过滤和排序再分页，页大小默认 20 且不超过 100；返回准确匹配总数。
+- [x] 搜索覆盖用户名、显示名称、邮箱；状态与排序仅接受定义选项。
+- [x] 最近活跃合并登录/访问与播放活动；当前播放数覆盖 Web/Emby 且按会话去重、沿用 90 秒活跃窗口。
+- [x] Cargo 构建与格式检查通过。
+
+依赖：LUX-594、LUX-597、LUX-600。
+
+结果（2026-10-19）：用户列表 API 支持分页、状态、搜索、排序及匹配总数；最近活动汇总 Web/Emby 凭证、Web 会话和播放事件，当前播放合并两种播放表并按播放会话去重。页大小默认 20、最大 100，默认排除回收站账号。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和格式检查通过；未运行测试。
+
+#### LUX-602：用户列表与回收站界面
+
+范围：用户管理页接入模块三分页查询，提供搜索、状态、排序和翻页控件；列表展示邮箱、最近登录/活动和当前播放数。回收站视图展示删除时间与到期清理时间，并接通恢复、提前彻底删除；普通列表删除提示改为进入 7 天回收站。待审批仍保持模块二占位。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 列表控件驱动服务端搜索、筛选、排序与分页，显示匹配总数和当前播放数。
+- [x] 回收站显示清理时间，可恢复或经确认提前彻底删除；成功后刷新列表。
+- [x] 普通列表删除明确告知进入回收站并保留期为 7 天；待审批仍不提供虚假操作。
+- [x] Web 构建通过。
+
+依赖：LUX-593、LUX-599、LUX-601。
+
+结果（2026-10-19）：用户列表接入搜索、状态筛选、排序、分页和播放/活动信息；删除后进入回收站，提供恢复与提前彻底删除并明确影响范围。待审批维持占位。`pnpm --dir web build` 通过；未运行测试、未部署。
+
+#### LUX-603：回收站到期自动清理
+
+范围：添加有界后台清理 worker，每分钟至多清理 50 个已超过默认 7 天期限的回收站账号；数据库条件保证只清理仍处于回收站且期限已到的账号，恢复与自动清理并发时由数据库决定唯一成功操作。数据库删除后移除头像文件，单个头像删除失败只记录不含敏感数据的错误并继续下一项。用户详情、权限、偏好、设备、活动和播放数据按现有用户外键级联规则清理，不删除媒体文件。清理期限配置留在全局设置后续任务。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/user_cleanup.rs`、`src/application/mod.rs`、`src/api/legacy.rs`。
+
+验收标准：
+
+- [x] worker 分钟级运行，单次处理数量有界；启动时不立即执行清理。
+- [x] 只清理到期且仍在回收站的账号，恢复与清理竞态不误删已恢复账号。
+- [x] 成功清理账号后移除头像；单项失败不会阻断其余清理。
+- [x] Rust 构建与格式检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 `/Volumes/Toshiba` 已挂载。
+
+依赖：LUX-597、LUX-599。
+
+结果（2026-10-19）：后台 worker 每分钟最多原子清理 50 个已到期账号；恢复后的账号不匹配删除条件，头像清理逐项执行。Cargo build、fmt check 与 diff check 通过。Clippy 检查发现用户创建函数参数数量和排序枚举命名两项 lint，分别在 LUX-604、LUX-605 跟进；未运行测试或部署。
+
+#### LUX-604：整理用户创建存储输入
+
+范围：将用户创建存储方法的身份、凭证、初始权限和邮箱字段收敛为命名输入结构，保持 SQL、绑定顺序和账户创建行为不变，以消除参数数量 lint。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/auth/users.rs`。
+
+验收标准：
+
+- [x] 新结构涵盖原调用的所有字段；SQLite/PostgreSQL 插入 SQL 和绑定顺序不变。
+- [x] Rust 构建、格式检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-595。
+
+结果（2026-10-19）：`NewStoredUser` 命名输入结构取代七个独立字段参数，SQL 和绑定顺序未变。Cargo build、fmt check 与 diff check 通过；未运行测试。
+
+#### LUX-605：整理用户列表排序字段命名
+
+范围：缩短内部排序字段枚举变体名称，保留 API 的 `createdAt`、`lastLoginAt`、`lastActivityAt` 参数和对应 SQL 排序列不变。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [x] 内部枚举不再重复 `At` 后缀，API 参数与 SQL 映射不变。
+- [x] Rust 构建、格式检查和 Clippy 全目标检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo clippy --locked --all-targets --all-features -- -D warnings`、`git diff --check`。
+
+依赖：LUX-601、LUX-604。
+
+结果（2026-10-19）：内部变体改为 `Created`、`LastLogin`、`LastActivity`，对外查询字段和数据库排序列保持原样。Cargo build、fmt check、全目标/all-features Clippy 与 diff check 通过；未运行测试。
+
+#### LUX-606：管理员用户头像 API
+
+范围：新增管理员读取与更新指定用户头像的 API，复用现有私有头像存储、内容校验和 5 MiB 上限。读取不要求 CSRF；更新要求管理员会话和 CSRF，或通过现有共享管理员 API key 鉴权。缺失头像返回 404；不返回用户凭证或文件系统路径。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_users.rs`。
+
+验收标准：
+
+- [x] 头像读取和更新只允许管理员访问；上传复用现有格式、大小和路径校验。
+- [x] 无头像返回 404，响应为正确图片 MIME 类型且私有缓存需重新验证。
+- [x] Rust 构建与格式检查通过；未运行测试。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-594、LUX-595。
+
+结果（2026-10-19）：新增受管理员鉴权的目标用户头像 GET/PUT；写入要求 CSRF 并复用已有 5 MiB、格式和私有目录校验，GET 返回实际 MIME、私有重验证缓存，缺失返回 404。Cargo build、fmt 和 diff check 通过；未运行测试。
+
+#### LUX-607：管理用户头像页面
+
+范围：列表和回收站显示用户头像，详情资料页显示并允许管理员更新头像；图片通过 LUX-606 管理员 API 获取和保存，上传后立即刷新图片缓存。列表展示预设来源；当前尚无预设模型的账号明确显示“未设置”。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
+
+验收标准：
+
+- [x] 普通列表与回收站显示头像；头像缺失或读取失败时显示通用图标。
+- [x] 管理员可从详情页更新头像，上传成功后显示新图片并报告失败。
+- [x] 列表显示当前预设来源状态，不虚构未配置的预设。
+- [x] Web 构建通过；未运行测试。
+
+验证：`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-593、LUX-601、LUX-606。
+
+结果（2026-10-19）：列表和回收站改为懒加载管理员头像，缺失或失败时显示默认图标；详情资料页可更新头像并刷新缓存，失败会显示接口错误。用户列表明确显示预设来源（当前无预设时为“未设置”）。`pnpm --dir web build` 与 diff check 通过；未运行测试或部署。
+
+#### LUX-608：用户详情账号状态操作
+
+范围：在用户详情资料页显示并维护账号状态，支持启用、禁用、软删除、恢复和确认后彻底删除；已删除账号资料只读。回收站行提供进入详情的入口。复用既有管理员 API 与最后管理员保护。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-profile-lifecycle.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情显示正常、禁用或回收站状态，并展示对应可用操作。
+- [x] 生命周期操作明确确认破坏性影响，成功后同步详情/列表缓存并导航到正确视图。
+- [x] 已删除用户资料只读，仍可恢复或经确认彻底删除。
+- [x] Web 构建通过；新增行为回归按用户管理测试目标执行。
+
+验证：`pnpm --dir web build`、`pnpm --dir web exec vitest run tests/admin-user-profile-lifecycle.test.tsx`、`git diff --check`。完整 Web 门禁在阶段验收执行。
+
+依赖：LUX-596、LUX-599、LUX-602。
+
+结果（2026-10-19）：详情资料卡和页面标题统一呈现正常、禁用或回收站状态；生命周期面板支持启用、禁用、移入回收站、恢复和确认后彻底删除。成功后刷新详情/列表缓存并返回对应列表视图，回收站账号的资料与头像输入为只读。新增 4 项回归覆盖状态、确认、只读和恢复导航；定向 Vitest 4/4 通过，Web 构建在阶段门复跑。
+
+#### LUX-609：对齐用户列表回收站回归和路由测试环境
+
+范围：更新用户列表删除回归，使其验证移入回收站而非旧的永久删除行为；为使用 URL 状态和 React Router 链接的用户列表测试补充内存路由容器。不改变生产运行时行为。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/tests/admin-users-delete.test.tsx`、`web/tests/admin-users-access.test.tsx`。
+
+验收标准：
+
+- [x] 列表删除回归断言 7 天软删除确认文案、API 结果和列表刷新。
+- [x] 用户列表查询和权限回归在 MemoryRouter 中渲染。
+- [x] 用户列表、权限和详情生命周期定向 Vitest 目标通过。
+
+验证：`pnpm --dir web exec vitest run tests/admin-users-delete.test.tsx tests/admin-users-access.test.tsx tests/admin-user-profile-lifecycle.test.tsx`、`git diff --check`。
+
+结果（2026-10-19）：更新软删除断言并为用户列表测试补齐 MemoryRouter；三个相关文件组 13/13 用例通过。完整 Web 门禁在阶段验收执行。
+
+#### LUX-610：读取可配置的用户删除宽限期
+
+范围：软删除用户时从 `server_settings` 读取删除宽限天数，并将清理期限固化到该用户记录。默认值保持 7 天；已有回收站账号不因后续配置修改而改变其清理时间。不新增迁移或修改已经记录的期限。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 未配置时软删除仍保留 7 天。
+- [x] 配置其他有效天数后，新删除账号的计划清理时间按该值计算。
+- [x] 非法或超范围存储值不能导致立即清理。
+- [x] SQLite 存储回归及 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib configured_user_deletion_grace_period`、`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-597、LUX-599。
+
+结果（2026-10-19）：软删除在事务中读取 `user_deletion_grace_days`，仅接受 1–3650 天，缺失或非法值安全回退 7 天；新期限在删除时固化，配置修改不重算回收站记录。新增存储回归覆盖默认 7 天、自定义 30 天和非法 0 值；定向 Cargo 测试 1/1、fmt 和 diff check 通过。
+
+#### LUX-611：开放用户删除宽限期管理员设置接口
+
+范围：在现有管理员设置 API 中读取和更新用户删除宽限天数，沿用管理员会话和 CSRF 边界。只接受 1–3650 天，默认 7 天；非法设置整体拒绝，不修改已进入回收站账号的期限。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] 管理员 GET 返回当前删除宽限期，缺省为 7 天。
+- [x] PATCH 保存有效范围并返回新值；范围外数值返回 400。
+- [x] 设置只影响之后移入回收站的账号，已有到期时间保持不变。
+- [x] `admin_dashboard` 集成目标和 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test admin_dashboard`、`cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+结果（2026-10-19）：管理员设置 GET/PATCH 增加 `userDeletionGraceDays`，默认 7 天，允许 1–3650 天；缺省保持原值，范围外返回明确 400，审计事件记录新值。接口回归覆盖默认、保存 30 天、拒绝 0/3651 且拒绝后值不变；`admin_dashboard` 1/1、fmt 和 diff check 通过。回环测试设置 `NO_PROXY/no_proxy=127.0.0.1,localhost`。
+
+#### LUX-612：在用户全局设置页维护删除宽限期
+
+范围：将“删除与活动保留”设置页中的用户删除宽限期接入既有管理员设置 API。保存后更新界面缓存；清楚说明新值只作用于后续移入回收站的账号，活动记录保留继续显示未实施状态。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/lib/api/types.ts`、`web/tests/admin-user-retention-settings.test.tsx`。
+
+验收标准：
+
+- [x] 默认或缺省值显示 7 天，管理员可配置 1–3650 天。
+- [x] 无效值不能提交；保存成功后更新查询缓存并显示成功状态，失败时保留可重试界面。
+- [x] 已在回收站的用户期限不因修改设置而改变，活动记录保留仍为占位。
+- [x] 用户管理设置回归与 Web 构建通过。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-retention-settings.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+结果（2026-10-19）：用户全局设置“删除与活动保留”页接入删除宽限天数表单，支持 1–3650 天；缺省显示 7 天，失败保留可重试表单并显示错误，成功同步管理员设置缓存。页面说明修改不重算现有账号期限，活动记录保留继续占位。新增 3 项回归通过，Web 构建通过。
+
+#### LUX-613：隔离账户头像测试中的资料接口响应
+
+范围：为账户头像上传页面测试显式模拟账号资料接口，避免该测试的头像上传 fetch 响应被错误复用为资料查询响应。不改变生产运行时行为。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`web/tests/account-settings.test.tsx`。
+
+验收标准：
+
+- [x] 头像上传回归覆盖既有账号资料查询并通过。
+- [x] 账户设置 Vitest 目标通过。
+
+验证：`pnpm --dir web exec vitest run tests/account-settings.test.tsx`、`git diff --check`。
+
+结果（2026-10-19）：头像上传测试独立 mock `/api/v1/auth/profile` 查询返回，不再复用头像 PUT 的 `avatarUrl` 响应；账户设置 Vitest 23/23 通过。
+
+#### LUX-614：为用户播放策略建立持久化字段
+
+范围：为用户增加播放许可、同时播放上限、封装转换、音频转码和视频转码策略字段。已存在账号迁移后保持允许播放与转码、并发不限（`0`）；新账号默认 2 路及管理员读写界面由后续任务实现。本任务不改变播放准入行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0185_user_playback_policy.sql`、`migrations-postgres/0185_user_playback_policy.sql`、`src/storage/repository_tests.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL migration 均增加 `can_play`、`max_simultaneous_playbacks`、`allow_remux`、`allow_audio_transcode`、`allow_video_transcode`，包含布尔值与非负并发上限约束。
+- [x] 从空 SQLite 数据库启动仍可完成全部 migration。
+- [x] 默认值保留既有账号的播放/转码行为，并将并发上限初始化为不限。
+- [x] 新增 SQLite 与 PostgreSQL 引导回归覆盖所有字段默认值。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_playback_policy_migration_defaults`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database --no-run`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-593、LUX-599、LUX-602、阶段门确认。
+
+结果（2026-10-19）：SQLite 与 PostgreSQL 增加五项策略列；旧账号默认允许播放和转码、并发不限。SQLite 回归验证从空库启动及旧账号行经 migration 后的值，定向测试 1/1 通过。PostgreSQL bootstrap 回归已补充，但本机 `127.0.0.1:55432` 未监听，本次未执行该忽略测试；未部署。
+
+#### LUX-615：存储层读取与更新播放策略
+
+范围：为存储层增加读取和更新用户播放策略的方法；通过应用创建的普通用户和首个管理员默认设置为 2 路同时播放。迁移已有账号仍为 `0`（不限）。本任务不接管理员接口、不实施播放准入或转码限制。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新建普通账号和首个管理员通过应用存储方法创建时默认 2 路。
+- [x] 可读取和更新播放、并发、封装转换、音频转码、视频转码五项策略。
+- [x] 负并发上限被数据库约束拒绝；已删除或不存在的账号不能被更新。
+- [x] 定向 SQLite 存储回归及 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib new_user_playback_policy_defaults_to_two_and_updates`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-614。
+
+结果（2026-10-19）：普通用户和首个管理员的应用创建路径显式设为 2 路；migration 对已有用户的 0（不限）保持不变。存储层增加五项策略读取/更新，负并发被 CHECK 拒绝，已软删除/不存在账号不接受更新。定向测试 1/1 通过，未部署。
+
+#### LUX-616：开放管理员播放策略接口
+
+范围：增加管理员读取及完整替换用户播放策略的 API。`maxSimultaneousPlaybacks=0` 表示不限；拒绝负值。修改要求管理员会话和 CSRF，并记录策略值审计事件；回收站账号只读。本任务不实施播放准入或转码限制。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可通过 `GET /api/v1/admin/users/{userId}/playback-policy` 读取五项策略。
+- [x] CSRF 保护的 `PUT` 接收完整策略并返回保存结果；负上限返回 400，未知或回收站用户返回 404。
+- [x] 普通用户不能访问；成功变更产生 `USER_PLAYBACK_POLICY_UPDATED` 审计事件，不记录凭证。
+- [x] 兼容文档说明接口字段和 `0` 不限语义；定向 users 集成测试通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_users_and_last_manager_is_protected`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-615。
+
+结果（2026-10-19）：新增管理员专用 GET/PUT，PUT 通过 CSRF 校验并要求五字段完整提交；负并发上限返回 400，`0` 原样保存为不限，普通用户无权访问，回收站用户读写均返回 404。每次成功写入记录策略值审计事件，不含认证信息。`users` 定向集成测试 1/1 通过，接口及 `0` 语义已记入兼容文档；未部署。
+
+#### LUX-617：在用户详情接入播放策略表单
+
+范围：将管理员策略 API 接到“播放与转码”模块，提供允许播放、并发上限、封装转换、音频转码和视频转码设置。说明 `0` 表示不限及当前尚未由准入逻辑执行；回收站账号只读。不展示远程访问或码率伪开关。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/admin-user-playback-policy.test.tsx`。
+
+验收标准：
+
+- [x] 播放与转码模块加载已保存策略并可完整保存五项设置。
+- [x] 并发上限只接受非负整数，`0` 明确显示为不限；保存失败时保留用户输入。
+- [x] 回收站账号不请求写入且呈现只读说明；页面标明播放准入仍待实施。
+- [x] 定向 Vitest、Web 构建通过，桌面与窄屏模块布局无溢出。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-playback-policy.test.tsx`、`pnpm --dir web build`、`git diff --check`。另用本地真实浏览器检查用户详情的播放策略流程。
+
+依赖：LUX-616。
+
+结果（2026-10-19）：用户详情的“播放与转码”读取并保存五项策略，非法并发数禁止提交且保存失败保留草稿；回收站账号不请求策略 API。页面说明 `0` 表示不限并标明准入逻辑待后续任务接入。定向 Vitest 3/3、Web 构建通过；Playwright 本地真实浏览器在接口 mock 下完成桌面和 390px 窄屏检查、保存交互及 PUT 载荷确认，无页面横向溢出或控制台错误。未部署。
+
+#### LUX-618：为共享播放准入建立数据表
+
+范围：为后续共享播放准入保存每位用户、播放会话的占位状态及准入/续租时间。SQLite 与 PostgreSQL 均迁移；本任务只建立 schema 与升级回归，不接入存储操作或播放路由。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0186_user_playback_admissions.sql`、`migrations-postgres/0186_user_playback_admissions.sql`、`src/storage/repository_tests.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 两种数据库都建立用户外键、`(user_id, play_session_id)` 主键、有效状态与时间约束，以及状态/续租时间索引。
+- [x] SQLite 从空库应用迁移及从旧 schema 升级均通过；既有播放记录保留。
+- [x] PostgreSQL bootstrap 回归加入占位表字段、约束和索引断言。
+- [x] SQLite 定向迁移测试、PostgreSQL 集成目标编译和 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_playback_admission_migration`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-617。
+
+结果（2026-10-19）：SQLite 定向迁移回归 1/1 通过，覆盖新库 schema、复合主键、用户外键、状态与时间约束，以及旧播放记录保留。PostgreSQL 集成目标成功编译；19 个测试因需要本地 PostgreSQL 全部 ignored，因此 bootstrap 断言尚未运行时验证。Rust 格式检查与 `git diff --check` 通过。此任务只建立 schema，未实现准入逻辑。
+
+#### LUX-619：原子执行共享播放准入
+
+范围：在 storage 层增加播放会话准入、续租和释放操作。SQLite 用立即写事务串行准入，PostgreSQL 锁定用户行；计数合并活跃占位与 `playback_sessions` 中活跃/暂停会话，按用户和播放会话 ID 去重。沿用 90 秒活跃窗口；`0` 表示不限，禁止播放策略拒绝准入，同一现有会话在额度降低后可继续续租。此任务不接入 Web/Emby/STRM 路由。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/sessions.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 并发争抢最后一个名额时，数据库只准入一个新会话；同一会话续租不重复占用名额。
+- [x] 旧播放记录与新占位按会话去重；暂停会话计入额度，停止释放，超过 90 秒的未续租占位不再计数。
+- [x] 并发上限降低时保留现存会话并拒绝新会话；`0` 不限，`can_play=false` 拒绝准入。
+- [x] SQLite 定向存储回归、Rust 格式检查通过；PostgreSQL 分支编译验证通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib playback_admission`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-618、LUX-617。
+
+结果（2026-10-19）：`playback_admission` 定向存储测试 3/3 通过，覆盖同用户并发争抢、续租复用、停止释放、旧播放记录去重、暂停计数、额度下调、不限额、禁播和 90 秒过期回收。PostgreSQL 集成目标编译通过，但 19 个测试均因需要本地 PostgreSQL 而 ignored；PostgreSQL 行锁逻辑尚未运行时验证。Rust 格式检查与 `git diff --check` 通过。播放入口接入留给后续任务。
+
+#### LUX-620：Web 播放入口接入准入占位
+
+范围：Web 创建播放会话/Bootstrap 时只检查当前策略与额度，不占用名额；Web 直放、STRM Range 与服务端 HLS 的实际 GET 请求原子准入。同一会话后续分片、Range、播放回调及已准入心跳复用名额；暂停保留名额，停止、删除、失败时释放。HEAD 和被动信息查询不占名额。拒绝响应需明确说明当前播放数与上限。本任务不接入 Emby PlaybackInfo/视频取流接口。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/sessions.rs`、`src/application/playback/session.rs`、`src/api/playback.rs`、`tests/web_playback.rs`。
+
+验收标准：
+
+- [x] Web 发链接只预检；只有实际媒体 GET 才创建准入记录，重复访问同一会话不重复占用。
+- [x] 活跃心跳续租，暂停仍计数；停止、删除和失败会话释放名额，失效心跳不创建新名额。
+- [x] 达到上限或禁止播放时返回包含当前播放数与策略上限的错误；竞争发生在发链接之后时，实际取流仍再次原子拒绝。
+- [x] Web playback 定向集成测试及 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-619。
+
+结果（2026-10-19）：Web playback 定向集成测试 1/1 通过，覆盖直放、STRM Range 与服务端 HLS 的发链接预检和实际取流准入；HEAD 不占位，重复请求复用会话名额。测试也验证了播放上限/禁播错误详情、暂停计数、活跃心跳续租、失效心跳不续占、STOPPED/删除/取流失败释放名额。`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成测试访问 localhost 时设置 `NO_PROXY=127.0.0.1,localhost`，避免开发机代理截获本地请求。
+
+#### LUX-621：将 Emby 直放票据绑定到播放会话
+
+范围：Emby `PlaybackInfo` 签发的直放 URL 必须将其 `PlaySessionId` 纳入 HMAC 票据，并在流请求时验证同一 ID。防止客户端修改 URL 中的会话 ID、借此拆分并发计数；现有 URL 字段、外部代理交接和票据有效期保持兼容。此任务只建立可验证的会话身份，不实施 Emby 播放准入。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/emby_catalog.rs`、`src/api/media.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 直放票据签名包含用户、条目、媒体源、播放会话 ID 和过期时间。
+- [x] 票据缺少或篡改 `PlaySessionId` 时，Emby 取流返回未授权；原签名 URL 仍可播放。
+- [x] Emby playback 定向集成测试及 Rust 格式检查通过。
+
+验证：定向测试 `local_file_stream_supports_full_head_range_acl_and_path_safety` 通过（1/1）；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-620。
+
+#### LUX-622：接入 Emby 直放准入
+
+范围：Emby `PlaybackInfo` 签发媒体链接前只读检查 `can_play` 与当前并发额度；额度不足时返回包含当前播放数和上限的错误，且不创建 HLS 会话。Emby 直放链接的实际 GET（含 Range）及 STRM 外部 URL 交接时，按 `PlaySessionId` 原子准入；HEAD 不占位，同一会话重复取流复用名额。Emby `PLAYING`/`PAUSED` 回调只续租已有且未过期的准入占位，不创建准入占位；`STOPPED` 回调停止并释放相同会话。兼容未带 Lux 签名票据的旧直放请求，并使用 Emby 回调共享的稳定会话身份，不接受客户端任意更换 ID 拆分并发计数。本任务不接入 Emby HLS 实际分片准入。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`src/api/media.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] `PlaybackInfo` 额度预检不占位；达到上限或禁止播放时返回当前播放数和上限，不创建 HLS 会话。
+- [x] 直放/STRM 首次 GET 原子占位，HEAD 不占位；Range 与同一 `PlaySessionId` 的重复 GET 复用名额，超额新会话被拒绝且不影响已有会话。
+- [x] 有效 `PLAYING`/`PAUSED` 回调续租，`STOPPED` 释放；没有有效占位的回调不新建准入记录。
+- [x] Emby playback 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback` 通过（4/4）；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-619、LUX-621。
+
+结果（2026-10-19）：PlaybackInfo 仅做准入预检，满额时拒绝 direct 与强制转码请求，未创建 HLS 会话。签名直放 GET 和 STRM 302 交接均按会话占位；HEAD 不占位，Range 复用占位，管理员并发上限从 1 到达后新会话被拒绝，原会话保留。PAUSED 续租、STOPPED 释放已验证；无播放 GET 的回调不创建占位。旧式直放使用条目/设备稳定会话 ID，STOPPED 无 PlaySessionId 时可释放。未部署。
+
+#### LUX-623：接入 Emby HLS 实际准入
+
+范围：Emby HLS manifest、初始化文件及媒体分片的实际 GET 在签名、会话、条目、源和资产均验证并可提供内容后，按对应 `lux-emby` `PlaySessionId` 原子准入；同一 HLS 会话的 manifest、分片、重复请求复用名额。HEAD 和 PlaybackInfo 预检不占位。满额或禁播时返回当前播放数与上限，并停止未准入的新 HLS 会话以回收其服务端资源；不得停止已有获准会话。Emby STOPPED 回调释放准入。本任务仅接入 Emby HLS，不改变 Web HLS 或 FFmpeg 服务器级并发策略。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/playback.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] PlaybackInfo 创建 HLS 会话后无准入记录；HEAD manifest 不占位，实际 GET manifest 才原子占位。
+- [x] 后续 HLS 初始化文件/分片 GET 与重复请求复用同一名额；额度满时拒绝另一条已签发 HLS 会话并清理该会话，已有会话仍可继续读取。
+- [x] STOPPED 回调释放对应 HLS 准入记录；拒绝或 HEAD 不创建准入记录。
+- [x] Emby HLS 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback` 通过（4/4）；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-619、LUX-622。
+
+结果（2026-10-19）：PlaybackInfo 创建 HLS 会话、HEAD manifest 均不占位；首次成功 manifest GET 占用一席，初始化文件/媒体分片共用并续租同一会话。并发上限 1 时，另一条已签发链接的 GET 返回 429，停止该 HLS 会话并删除其资源；已获准分片仍可读取。STOPPED 释放会话占位。未部署。
+
+#### LUX-624：按用户策略筛选服务端播放档位
+
+范围：Web 与 Emby 创建本地媒体 HLS 会话时，按当前用户 `allow_remux`、`allow_audio_transcode`、`allow_video_transcode` 与服务端可用能力共同选择最低允许档位。当前硬件/软件视频转码输出同时转码音频，因此必须同时允许音频与视频转码。直放不受转码权限影响；STRM 始终只允许外部直放。客户端请求了服务端播放但其可用档位全部被用户策略禁止时，拒绝请求且不创建 HLS 会话。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 直放优先且不受转码权限影响；STRM 不创建 Remux、转码或 HLS 会话。
+- [x] Remux、音频转码、硬件/软件视频转码分别遵守用户策略；禁止低档位时可选择其他允许且服务器可用的档位。
+- [x] 所有兼容档位都被禁止时，Web 与 Emby 明确拒绝，不创建或遗留 HLS 会话。
+- [x] Web 与 Emby 定向集成测试，以及 Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-614、LUX-615、LUX-617、LUX-620、LUX-623。
+
+结果（2026-10-19）：Web 与 Emby 共用的会话服务按用户策略和服务器能力选择最低允许 HLS 档位；硬件/软件视频转码还要求音频转码许可，因为当前 FFmpeg 输出同时转码音频。所有可用转码档位被禁用时，在写入会话或启动 HLS 前返回 403。直放及 STRM 的外部直放决策保持原样。策略单元测试 3/3、`web_playback` 1/1、`playback` 4/4 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --all-targets --all-features -- -D warnings` 被两个既有 `clippy::too_many_arguments` 报错阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`，本任务未修改这两个函数签名。未部署。
+
+#### LUX-625：复核已签发 HLS 链接的转码权限
+
+范围：每次授权 Web 或 Emby 的签名 HLS manifest、初始化文件、媒体分片前，重新读取该用户当前播放策略，并按会话已存档位判断是否仍允许。Remux 需要 `allow_remux`，音频转码需要 `allow_audio_transcode`，硬件/软件视频转码需要同时允许视频和音频转码（当前 HLS 输出会转码两者）。策略变更撤销了当前会话所需权限时，拒绝本次资源请求，停止 HLS、释放播放准入并删除临时资源。仅检查 HLS 会话，不改变直放与 STRM 外部交接合同。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`、`src/application/playback/session.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 每次 HLS manifest/初始化文件/分片请求（包含 HEAD）使用当前策略校验会话档位；权限已撤销时不返回 HLS 资源。
+- [x] 权限撤销时会话停止、准入名额释放、HLS 临时目录清理；原票据后续重用仍被拒绝。
+- [x] Web 与 Emby 集成回归覆盖已签发链接被撤权后的取流行为；直放和 STRM 仍遵守现有边界。
+- [x] 在兼容性文档记录 Emby 策略拒绝与撤权后签名 HLS 链接的响应合同。
+- [x] 定向 `web_playback` 与 `playback` 测试、Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-624。
+
+结果（2026-10-19）：共享签名资源授权在每次 Web/Emby HLS manifest、初始化文件或分片请求（HEAD 也包含）读取当前策略。撤销会话所需转码权限后，请求返回 403，HLS 会话停止、准入释放、临时目录清除；再次使用票据返回 410。Web 测试覆盖 tier 2 与 HEAD 拒绝，Emby 测试覆盖硬件/软件视频转码档撤权；定向 `web_playback` 1/1、`playback` 4/4 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过。Emby 策略拒绝及 HLS 票据失效响应合同已加入兼容性文档。未部署。
 
 ## 29. 参考资料
 

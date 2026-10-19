@@ -106,10 +106,11 @@
 
 ### P2：全量扫描策略和实时补全策略边界不够清晰
 
-`complete_local_metadata_completeness_for_item_ids` 对全量/backfill 使用 library 的 `scan_missing_metadata_auto_match_enabled`，对 incremental 使用 scan job 的快照。这个边界必须继续保持明确：
+`complete_local_metadata_completeness_for_item_ids` 对全量扫描的正向新增/变化条目和 incremental 共用 media library 的 `realtime_metadata_auto_match_enabled`，对 incremental 继续使用 scan job 创建时的策略快照。这个边界必须继续保持明确：
 
-- 全量扫描是否允许在线补全必须由库策略显式决定；
+- 全量扫描只允许对本次正向新增/变化条目在线补全，不得扩大为整库刷新；
 - incremental 必须只使用创建 job 时保存的策略快照；
+- 后台回填和精确目录本地刷新只记录缺失，不排在线补全；
 - workflow 3 不得在扫描末尾再次创建整库 FILL_MISSING。
 
 已实现（LUX-404）：调用入口使用具名 trigger 和解析后的策略类型，覆盖全量扫描、增量扫描、后台回填与精确目录本地刷新，禁用时不探测刮削器；策略和存储合同回归通过。

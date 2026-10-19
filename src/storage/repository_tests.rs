@@ -1,4 +1,127 @@
 use super::*;
+use crate::storage::{
+    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserPlaybackPolicy,
+};
+
+#[tokio::test]
+async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    assert_scan_job_retry_diagnostics(&database, temp.path()).await
+}
+
+async fn assert_scan_job_retry_diagnostics(
+    database: &Database,
+    temp: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Diagnostics", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let cases = [
+        ("normal", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("done", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("pending", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("failed", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("unready-v2", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        ("unready-v3", "RECONCILE_LIBRARY", "COMPLETED", "IDLE", None),
+        (
+            "marker",
+            "RECONCILE_LIBRARY",
+            "COMPLETED",
+            "IDLE",
+            Some("POSTPROCESSING_FAILED"),
+        ),
+        (
+            "processing",
+            "RECONCILE_LIBRARY",
+            "COMPLETED",
+            "POSTPROCESSING",
+            None,
+        ),
+        ("incremental", "INCREMENTAL_SCAN", "COMPLETED", "IDLE", None),
+        ("active", "RECONCILE_LIBRARY", "RUNNING", "DISCOVERY", None),
+    ];
+    for (index, (id, kind, status, phase, error)) in cases.iter().enumerate() {
+        database.query("INSERT INTO scan_jobs (id, library_id, job_type, status, scan_phase, error, generation, created_at) VALUES (?, ?, ?, ?, ?, ?, 'generation', ?)")
+            .bind(id).bind(&library_id).bind(kind).bind(status).bind(phase).bind(error)
+            .bind(index as i64).execute(database.pool()).await?;
+    }
+    for (id, state) in [
+        ("done", "DONE"),
+        ("pending", "PENDING"),
+        ("failed", "FAILED"),
+        ("processing", "PENDING"),
+        ("incremental", "PENDING"),
+    ] {
+        database.query("INSERT INTO scan_job_targets (job_id, target_type, target_id, item_id, change_kind, metadata_state) VALUES (?, 'ITEM', 'item', 'item', 'NEW', ?)")
+            .bind(id).bind(state).execute(database.pool()).await?;
+    }
+    for (id, workflow) in [("unready-v2", 2_i64), ("unready-v3", 3_i64)] {
+        database.query("INSERT INTO scan_manifests (id, job_id, library_id, state, workflow_version, discovery_format_version, postprocessing_targets_ready) VALUES (?, ?, ?, 'POSTPROCESSING', ?, 3, 0)")
+            .bind(id)
+            .bind(id).bind(&library_id).bind(workflow).execute(database.pool()).await?;
+    }
+    let ids: Vec<String> = cases.iter().map(|case| case.0.to_owned()).collect();
+    database.reset_query_count();
+    let states = database.scan_job_retry_states(&ids).await?;
+    assert_eq!(
+        database.query_count(),
+        1,
+        "one batched query, not one per task"
+    );
+    for id in ["pending", "failed", "unready-v2", "unready-v3", "marker"] {
+        assert!(states[id].has_postprocessing_issues, "{id}");
+    }
+    for id in ["normal", "done", "processing", "incremental", "active"] {
+        assert!(!states[id].has_postprocessing_issues, "{id}");
+    }
+    assert!(states["pending"].has_unfinished_targets);
+    assert!(!states["done"].has_unfinished_targets);
+    assert!(states["unready-v3"].targets_need_materialization);
+    assert!(states["normal"].has_active_job);
+    assert!(!states["incremental"].has_active_job);
+    assert!(!states["pending"].has_legacy_work);
+    let first = database
+        .list_admin_scan_jobs(None, Some(true), 0, 2)
+        .await?;
+    assert_eq!(
+        first.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        ["marker", "unready-v3"]
+    );
+    let second = database
+        .list_admin_scan_jobs(Some("COMPLETED"), Some(true), 2, 2)
+        .await?;
+    assert_eq!(
+        second.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        ["unready-v2", "failed"]
+    );
+    let clean = database
+        .list_admin_scan_jobs(None, Some(false), 0, 20)
+        .await?;
+    assert_eq!(clean.len(), 5);
+    assert!(database.scan_job_retry_states(&[]).await?.is_empty());
+    let root_path = temp.join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = libraries
+        .add_root(library.id, root_path.to_str().ok_or("root path")?)
+        .await?
+        .root;
+    database.query("INSERT INTO reconciliation_scan_entries (job_id, library_root_id, relative_path, entry_type) VALUES ('pending', ?, '', 'DIRECTORY')")
+        .bind(root.id.to_string()).execute(database.pool()).await?;
+    let ids = vec!["pending".to_owned(); SCAN_DML_CHUNK_SIZE + 1];
+    database.reset_query_count();
+    let states = database.scan_job_retry_states(&ids).await?;
+    assert_eq!(database.query_count(), 2);
+    assert!(states["pending"].has_legacy_work);
+    Ok(())
+}
 use crate::{
     application::{
         access::MediaAccessService,
@@ -207,6 +330,7 @@ async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_sc
                 entry_kind: "FILE",
                 size: 1,
                 modified_at: 1,
+                device: None,
                 inode: None,
                 fingerprint: b"fingerprint",
                 last_seen_generation: "strm-count-generation",
@@ -404,6 +528,92 @@ async fn scan_job_metadata_target_selection_uses_one_query_without_a_local_sourc
         1,
         "pending state and the unavailable-source result should share one bounded page query"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrying_failed_scan_probe_keeps_unconfigured_strm_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root).await?;
+    let root = LibraryService::new(database.clone())
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 media root")?,
+        )
+        .await?
+        .root;
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES ('unselected-strm-entry', ?, 'Unselected.strm', 'FILE', 1, 1,
+                       'generation', 0)",
+        )
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('unselected-strm-item', ?, 'MOVIE', 'Unselected', 'unselected',
+                       'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, external_url, probe_status
+             ) VALUES ('unselected-strm-source', 'unselected-strm-item', 'STRM_URL',
+                       'unselected-strm-entry', 'https://example.invalid/movie',
+                       'NOT_CONFIGURED')",
+        )
+        .execute(database.pool())
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, source_id, item_id, change_kind,
+                 probe_state, updated_at
+             ) VALUES (?, 'SOURCE', 'unselected-strm-source', 'unselected-strm-source',
+                       'unselected-strm-item', 'NEW', 'FAILED', 1)",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    database.retry_failed_scan_job_targets(&job.id).await?;
+
+    let probe_status: String = database
+        .query_scalar("SELECT probe_status FROM media_sources WHERE id = 'unselected-strm-source'")
+        .fetch_one(database.pool())
+        .await?;
+    let probe_state: String = database
+        .query_scalar(
+            "SELECT probe_state FROM scan_job_targets
+             WHERE job_id = ? AND target_id = 'unselected-strm-source'",
+        )
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(probe_status, "NOT_CONFIGURED");
+    assert_eq!(probe_state, "PENDING");
     Ok(())
 }
 
@@ -671,6 +881,232 @@ async fn local_nfo_state_batch_rolls_back_metadata_and_fills_only_missing_defaul
     .await?;
     database.commit_local_nfo_state_batch(&[], &repairs).await?;
     database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_local_metadata_sources_batch_nested_series_directories() {
+    const DIRECTORY_COUNT: usize = 205;
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Local metadata sources", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, root_path.to_str().expect("media root"))
+        .await
+        .expect("root");
+    let root_id = root.root.id.to_string();
+    let library_id = library.id.to_string();
+    let mut poster_entry_ids = Vec::with_capacity(DIRECTORY_COUNT);
+    for index in 0..DIRECTORY_COUNT {
+        let series_id = format!("local-source-series-{index:03}");
+        let season_id = format!("local-source-season-{index:03}");
+        let episode_id = format!("local-source-episode-{index:03}");
+        let poster_entry_id = format!("local-source-poster-entry-{index:03}");
+        let episode_entry_id = format!("local-source-episode-entry-{index:03}");
+        let directory = format!("Series {index:03}");
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status)
+             VALUES (?, ?, 'SERIES', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&series_id)
+        .bind(&library_id)
+        .bind(&series_id)
+        .bind(&series_id)
+        .execute(database.pool())
+        .await
+        .expect("series");
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, parent_id, series_id, season_number,
+                  title, sort_title, identification_status)
+             VALUES (?, ?, 'SEASON', ?, ?, 1, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&season_id)
+        .bind(&library_id)
+        .bind(&series_id)
+        .bind(&series_id)
+        .bind(&season_id)
+        .bind(&season_id)
+        .execute(database.pool())
+        .await
+        .expect("season");
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, parent_id, series_id, season_number,
+                  episode_number, title, sort_title, identification_status)
+             VALUES (?, ?, 'EPISODE', ?, ?, 1, 1, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&episode_id)
+        .bind(&library_id)
+        .bind(&season_id)
+        .bind(&series_id)
+        .bind(&episode_id)
+        .bind(&episode_id)
+        .execute(database.pool())
+        .await
+        .expect("episode");
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &poster_entry_id,
+                library_root_id: &root_id,
+                relative_path: &format!("{directory}/poster.jpg"),
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                device: None,
+                inode: None,
+                fingerprint: b"poster",
+                last_seen_generation: "generation",
+            })
+            .await
+            .expect("poster entry");
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &episode_entry_id,
+                library_root_id: &root_id,
+                relative_path: &format!("{directory}/Season 1/Episode.mkv"),
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                device: None,
+                inode: None,
+                fingerprint: b"episode",
+                last_seen_generation: "generation",
+            })
+            .await
+            .expect("episode entry");
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default)
+             VALUES (?, ?, 'LOCAL_FILE', ?, 1)",
+        )
+        .bind(format!("local-source-media-source-{index:03}"))
+        .bind(&episode_id)
+        .bind(&episode_entry_id)
+        .execute(database.pool())
+        .await
+        .expect("episode source");
+        poster_entry_ids.push(poster_entry_id);
+    }
+
+    database.reset_query_count();
+    let sources = database
+        .list_scan_local_metadata_sources(&poster_entry_ids)
+        .await
+        .expect("local metadata sources");
+    assert_eq!(sources.len(), DIRECTORY_COUNT);
+    assert_eq!(database.query_count(), 4);
+}
+
+#[tokio::test]
+async fn manifest_unresolved_files_use_bounded_batch_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    const FILE_COUNT: usize = 205;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Manifest unresolved", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = LibraryService::new(database.clone())
+        .add_root(
+            library.id,
+            root_path.to_str().ok_or("non-UTF-8 media root")?,
+        )
+        .await?;
+    let root_id = root.root.id.to_string();
+    let mut files = Vec::with_capacity(FILE_COUNT);
+    for index in 0..FILE_COUNT {
+        let relative_path = format!("folder-{index}/video-{index}.mkv");
+        let filesystem_entry_id = format!("unresolved-entry-{index}");
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: &filesystem_entry_id,
+                library_root_id: &root_id,
+                relative_path: &relative_path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                device: None,
+                inode: None,
+                fingerprint: b"fixture",
+                last_seen_generation: "generation",
+            })
+            .await?;
+        files.push(NewScanManifestUnresolvedFile {
+            item_id: format!("unresolved-item-{index}"),
+            filesystem_entry_id,
+            source_id: format!("unresolved-source-{index}"),
+            relative_path,
+            size: 1,
+            modified_at: 1,
+            inode: None,
+            fingerprint: b"fixture".to_vec(),
+            title: format!("Video {index}"),
+            identity_key: format!("unresolved:{root_id}:video-{index}"),
+            source_kind: "LOCAL_FILE".to_owned(),
+            container: "mkv".to_owned(),
+            external_url: None,
+            strm_target_kind: None,
+            home_video: false,
+        });
+    }
+
+    let mut transaction = database.pool().begin().await?;
+    database.reset_query_count();
+    database
+        .materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
+            &mut transaction,
+            &library_id,
+            &root_id,
+            &files,
+        )
+        .await?;
+    assert_eq!(database.query_count(), 12);
+    transaction.commit().await?;
+
+    let item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = 'UNRESOLVED'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources WHERE source_kind = 'LOCAL_FILE'
+         AND item_id IN (SELECT id FROM media_items WHERE library_id = ?)",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    let parent_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items item
+         JOIN media_items parent ON item.parent_id = parent.id
+         WHERE item.library_id = ? AND item.item_type = 'UNRESOLVED'
+           AND parent.item_type = 'FOLDER'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_count, FILE_COUNT as i64);
+    assert_eq!(source_count, FILE_COUNT as i64);
+    assert_eq!(parent_count, FILE_COUNT as i64);
     Ok(())
 }
 
@@ -1758,6 +2194,105 @@ async fn thumbnail_scraper_retries_are_persisted_and_claimed_at_due_times() {
     assert_eq!(completed.attempt_count, 3);
     assert_eq!(completed.first_attempt_at, first_attempt_at);
     assert_eq!(completed.next_retry_at, None);
+}
+
+#[tokio::test]
+async fn thumbnail_scraper_retry_claims_use_one_bounded_update() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('retry-lib', 'Retries', 'MOVIE')")
+        .execute(database.pool())
+        .await
+        .expect("retry library");
+    sqlx::query(
+        "WITH RECURSIVE numbers(n) AS (
+             SELECT 0 UNION ALL SELECT n + 1 FROM numbers WHERE n < 204
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         )
+         SELECT 'retry-item-' || printf('%03d', n), 'retry-lib', 'MOVIE',
+                'Retry ' || n, 'retry ' || n, 'LOCAL_CONFIRMED'
+         FROM numbers",
+    )
+    .execute(database.pool())
+    .await
+    .expect("retry items");
+    for index in 0..205 {
+        assert!(
+            database
+                .ensure_thumbnail_scraper_retry(&format!("retry-item-{index:03}"), 1, 10)
+                .await
+                .expect("seed retry")
+        );
+    }
+
+    database.reset_query_count();
+    let claimed = database
+        .claim_due_thumbnail_scraper_retries(10, 20, 128)
+        .await
+        .expect("claim retries");
+    assert_eq!(claimed.len(), 100);
+    assert_eq!(database.query_count(), 2);
+    assert!(
+        claimed
+            .windows(2)
+            .all(|pair| pair[0].item_id < pair[1].item_id)
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thumbnail_scraper_retries WHERE status = 'PENDING'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("pending retries");
+    assert_eq!(pending, 105);
+    let claimed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thumbnail_scraper_retries
+         WHERE status = 'RUNNING' AND claimed_until = 20 AND updated_at = 10",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("claim lease");
+    assert_eq!(claimed_count, 100);
+    let remaining = database
+        .claim_due_thumbnail_scraper_retries(19, 30, 100)
+        .await
+        .expect("claim other pending retries");
+    assert_eq!(remaining.len(), 100);
+    assert_eq!(remaining[0].item_id, "retry-item-100");
+    assert_eq!(
+        database
+            .claim_due_thumbnail_scraper_retries(19, 30, 100)
+            .await
+            .expect("claim tail")
+            .len(),
+        5
+    );
+    database.reset_query_count();
+    assert!(
+        database
+            .claim_due_thumbnail_scraper_retries(19, 30, 100)
+            .await
+            .expect("no early reclaim")
+            .is_empty()
+    );
+    assert_eq!(database.query_count(), 1);
+    database.reset_query_count();
+    let reclaimed = database
+        .claim_due_thumbnail_scraper_retries(20, 40, 100)
+        .await
+        .expect("reclaim expired lease");
+    assert_eq!(reclaimed.len(), 100);
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(reclaimed[0].item_id, "retry-item-000");
+    assert!(reclaimed.iter().all(|retry| retry.status == "RUNNING"
+        && retry.attempt_count == 1
+        && retry.first_attempt_at == 1
+        && retry.next_retry_at == Some(10)));
 }
 
 #[tokio::test]
@@ -5277,7 +5812,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(item_ids.len(), 4);
     let library_id = library.id.to_string();
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5326,7 +5861,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         assert_eq!(completeness.is_missing, Some(true));
     }
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5372,7 +5907,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(incremental_disabled.updated_count, 1);
     assert!(incremental_disabled.scheduled_job_ids.is_empty());
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5508,7 +6043,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .expect("deduplicate replay against the deferred fill-missing job");
     assert!(replayed_deferred_job.scheduled_job_ids.is_empty());
 
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await
@@ -5971,7 +6506,7 @@ async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
         .create_library("Deferred snapshot", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -6191,7 +6726,7 @@ async fn postgres_changed_fill_request_consumes_obsolete_provider_failure()
             .await?;
         let library_id = library.id.to_string();
         database
-            .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+            .query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
             .bind(&library_id)
             .execute(database.pool())
             .await?;
@@ -6357,7 +6892,7 @@ async fn automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_sc
         .create_library("Fill backoff", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -6592,7 +7127,7 @@ async fn automatic_fill_missing_retry_backoff_is_consumed_after_a_successful_ret
         .create_library("Retry consumption", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
-    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -7289,7 +7824,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
 
     let library_id = library.id.to_string();
     database
-        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -7378,7 +7913,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .finish_metadata_reidentify_job(existing_fill_missing_job_id, "COMPLETED", None)
         .await?;
     database
-        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
         .await?;
@@ -10216,6 +10751,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -11681,6 +12217,388 @@ async fn media_source_library_page_respects_limit_and_offset() {
 }
 
 #[tokio::test]
+async fn filesystem_path_reads_reuse_bucketed_templates_without_extra_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Filesystem path templates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_root_path = temp_dir.path().join("first-media-root");
+    let other_root_path = temp_dir.path().join("other-media-root");
+    tokio::fs::create_dir_all(&first_root_path)
+        .await
+        .expect("first media root");
+    tokio::fs::create_dir_all(&other_root_path)
+        .await
+        .expect("other media root");
+    let library_service = LibraryService::new(database.clone());
+    let first_root = library_service
+        .add_root(
+            library.id,
+            first_root_path.to_str().expect("UTF-8 first media root"),
+        )
+        .await
+        .expect("first library root")
+        .root;
+    let other_root = library_service
+        .add_root(
+            library.id,
+            other_root_path.to_str().expect("UTF-8 other media root"),
+        )
+        .await
+        .expect("other library root")
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let other_root_id = other_root.id.to_string();
+    for (entry_id, root_id, path) in [
+        (
+            "filesystem-template-first",
+            first_root_id.as_str(),
+            "first.mkv",
+        ),
+        (
+            "filesystem-template-last",
+            first_root_id.as_str(),
+            "last.mkv",
+        ),
+        (
+            "filesystem-template-other-root",
+            other_root_id.as_str(),
+            "first.mkv",
+        ),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                device: None,
+                inode: None,
+                fingerprint: b"fingerprint",
+                last_seen_generation: "filesystem-template-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+
+    database.reset_query_count();
+    let empty = database
+        .list_filesystem_entries_for_paths(&first_root_id, &[])
+        .await
+        .expect("empty path lookup");
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 0);
+
+    database.reset_query_count();
+    let one_path = database
+        .list_filesystem_entries_for_paths(&first_root_id, &["first.mkv".to_owned()])
+        .await
+        .expect("one path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 1);
+    assert_eq!(one_path["first.mkv"].id, "filesystem-template-first");
+
+    database.reset_query_count();
+    let three_paths = database
+        .list_filesystem_entries_for_paths(
+            &first_root_id,
+            &[
+                "first.mkv".to_owned(),
+                "missing-middle.mkv".to_owned(),
+                "last.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("three path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(three_paths.len(), 2);
+    assert_eq!(three_paths["first.mkv"].id, "filesystem-template-first");
+    assert_eq!(three_paths["last.mkv"].id, "filesystem-template-last");
+
+    database.reset_query_count();
+    let four_paths = database
+        .list_filesystem_entries_for_paths(
+            &first_root_id,
+            &[
+                "first.mkv".to_owned(),
+                "missing-one.mkv".to_owned(),
+                "missing-two.mkv".to_owned(),
+                "last.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("four path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(four_paths.len(), 2);
+
+    database.reset_query_count();
+    let other_root_entry = database
+        .list_filesystem_entries_for_paths(&other_root_id, &["first.mkv".to_owned()])
+        .await
+        .expect("same relative path in other root");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        other_root_entry["first.mkv"].id,
+        "filesystem-template-other-root"
+    );
+
+    let paths_with_matches_at = |count: usize, first: usize, last: usize| {
+        let mut paths = (0..count)
+            .map(|index| format!("missing-{index}.mkv"))
+            .collect::<Vec<_>>();
+        paths[first] = "first.mkv".to_owned();
+        paths[last] = "last.mkv".to_owned();
+        paths
+    };
+
+    for (count, first, last, cached_shapes) in
+        [(256, 0, 255, 3), (257, 0, 256, 4), (500, 0, 499, 4)]
+    {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, first, last);
+        let entries = database
+            .list_filesystem_entries_for_paths(&first_root_id, &paths)
+            .await
+            .expect("bucket boundary lookup");
+        assert_eq!(database.query_count(), 1, "path_count={count}");
+        assert_eq!(
+            database.filesystem_path_templates.entry_count(),
+            cached_shapes
+        );
+        assert_eq!(entries.len(), 2, "path_count={count}");
+    }
+
+    database.reset_query_count();
+    let mut paths = (0..501)
+        .map(|index| format!("missing-{index}.mkv"))
+        .collect::<Vec<_>>();
+    paths[499] = "first.mkv".to_owned();
+    paths[500] = "last.mkv".to_owned();
+    let entries = database
+        .list_filesystem_entries_for_paths(&first_root_id, &paths)
+        .await
+        .expect("cross batch lookup");
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 4);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries["first.mkv"].id, "filesystem-template-first");
+    assert_eq!(entries["last.mkv"].id, "filesystem-template-last");
+    database.close().await;
+}
+
+#[tokio::test]
+async fn manifest_baseline_reads_reuse_bucketed_templates_without_extra_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Manifest baseline templates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_root_path = temp_dir.path().join("first-media-root");
+    let other_root_path = temp_dir.path().join("other-media-root");
+    tokio::fs::create_dir_all(&first_root_path)
+        .await
+        .expect("first media root");
+    tokio::fs::create_dir_all(&other_root_path)
+        .await
+        .expect("other media root");
+    let library_service = LibraryService::new(database.clone());
+    let first_root = library_service
+        .add_root(
+            library.id,
+            first_root_path.to_str().expect("UTF-8 first media root"),
+        )
+        .await
+        .expect("first library root")
+        .root;
+    let other_root = library_service
+        .add_root(
+            library.id,
+            other_root_path.to_str().expect("UTF-8 other media root"),
+        )
+        .await
+        .expect("other library root")
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let other_root_id = other_root.id.to_string();
+    for (entry_id, root_id, path, size, fingerprint) in [
+        (
+            "manifest-baseline-first-root",
+            first_root_id.as_str(),
+            "same.mkv",
+            17,
+            b"first-fingerprint".as_slice(),
+        ),
+        (
+            "manifest-baseline-last-root",
+            first_root_id.as_str(),
+            "last.mkv",
+            23,
+            b"last-fingerprint".as_slice(),
+        ),
+        (
+            "manifest-baseline-other-root",
+            other_root_id.as_str(),
+            "same.mkv",
+            99,
+            b"other-fingerprint".as_slice(),
+        ),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size,
+                modified_at: size + 100,
+                device: None,
+                inode: None,
+                fingerprint,
+                last_seen_generation: "manifest-baseline-template-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+
+    database.reset_query_count();
+    let empty = database
+        .list_scan_manifest_filesystem_baselines(&first_root_id, &[])
+        .await
+        .expect("empty baseline lookup");
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 0);
+
+    database.reset_query_count();
+    let one_path = database
+        .list_scan_manifest_filesystem_baselines(&first_root_id, &["same.mkv".to_owned()])
+        .await
+        .expect("one path baseline lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 1);
+    assert_eq!(one_path.len(), 1);
+    assert_eq!(one_path["same.mkv"].id, "manifest-baseline-first-root");
+    assert_eq!(one_path["same.mkv"].size, 17);
+    assert_eq!(one_path["same.mkv"].modified_at, 117);
+    assert_eq!(
+        one_path["same.mkv"].fingerprint.as_deref(),
+        Some(b"first-fingerprint".as_slice())
+    );
+
+    database.reset_query_count();
+    let three_paths = database
+        .list_scan_manifest_filesystem_baselines(
+            &first_root_id,
+            &[
+                "same.mkv".to_owned(),
+                "same.mkv".to_owned(),
+                "missing.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("duplicate and missing path lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(three_paths.len(), 1);
+    assert_eq!(three_paths["same.mkv"].id, "manifest-baseline-first-root");
+
+    database.reset_query_count();
+    let four_paths = database
+        .list_scan_manifest_filesystem_baselines(
+            &first_root_id,
+            &[
+                "same.mkv".to_owned(),
+                "last.mkv".to_owned(),
+                "missing-one.mkv".to_owned(),
+                "missing-two.mkv".to_owned(),
+            ],
+        )
+        .await
+        .expect("full four-path bucket lookup");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(database.filesystem_path_templates.entry_count(), 2);
+    assert_eq!(four_paths.len(), 2);
+
+    database.reset_query_count();
+    let other_root_entry = database
+        .list_scan_manifest_filesystem_baselines(&other_root_id, &["same.mkv".to_owned()])
+        .await
+        .expect("same relative path in another root");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        other_root_entry["same.mkv"].id,
+        "manifest-baseline-other-root"
+    );
+
+    let paths_with_matches_at = |count: usize, first: usize, last: usize| {
+        let mut paths = (0..count)
+            .map(|index| format!("missing-{index}.mkv"))
+            .collect::<Vec<_>>();
+        paths[first] = "same.mkv".to_owned();
+        paths[last] = "last.mkv".to_owned();
+        paths
+    };
+
+    for (count, first, last, expected_shapes) in
+        [(256, 0, 255, 3), (257, 0, 256, 4), (2_900, 0, 2_899, 5)]
+    {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, first, last);
+        let baselines = database
+            .list_scan_manifest_filesystem_baselines(&first_root_id, &paths)
+            .await
+            .expect("manifest baseline bucket boundary lookup");
+        assert_eq!(database.query_count(), 1, "path_count={count}");
+        assert_eq!(
+            database.filesystem_path_templates.entry_count(),
+            expected_shapes,
+            "path_count={count}"
+        );
+        assert_eq!(baselines.len(), 2, "path_count={count}");
+    }
+
+    for (count, expected_queries) in [(2_901, 2), (5_801, 3)] {
+        database.reset_query_count();
+        let paths = paths_with_matches_at(count, 0, count - 1);
+        let baselines = database
+            .list_scan_manifest_filesystem_baselines(&first_root_id, &paths)
+            .await
+            .expect("manifest baseline cross-chunk lookup");
+        assert_eq!(
+            database.query_count(),
+            expected_queries,
+            "path_count={count}"
+        );
+        assert_eq!(baselines.len(), 2, "path_count={count}");
+        assert_eq!(
+            baselines["same.mkv"].id, "manifest-baseline-first-root",
+            "path_count={count}"
+        );
+        assert_eq!(
+            baselines["last.mkv"].id, "manifest-baseline-last-root",
+            "path_count={count}"
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
 async fn subtitle_stream_query_is_source_scoped_and_paginated() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -11844,6 +12762,8 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
             relative_path: "Movie/Movie.2024.mkv".to_owned(),
             size: 1,
             modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![1],
             title: "Movie".to_owned(),
             sort_title: "movie".to_owned(),
@@ -11863,6 +12783,8 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
             relative_path: "Movie/Movie.2024.Directors.Cut.mkv".to_owned(),
             size: 2,
             modified_at: 2,
+            device: None,
+            inode: None,
             fingerprint: vec![2],
             title: "Movie".to_owned(),
             sort_title: "movie".to_owned(),
@@ -11937,6 +12859,8 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
         relative_path: "Another.Movie.2025.mkv".to_owned(),
         size: 3,
         modified_at: 3,
+        device: None,
+        inode: None,
         fingerprint: vec![3],
         title: "Another Movie".to_owned(),
         sort_title: "another movie".to_owned(),
@@ -11964,6 +12888,234 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
         1
     );
     assert_eq!(database.query_count(), 4);
+}
+
+#[tokio::test]
+async fn manifest_movie_materialization_accepts_borrowed_records_and_reuses_item() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let files = [
+        NewMovieFile {
+            filesystem_entry_id: "borrowed-entry-1".to_owned(),
+            source_id: "borrowed-source-1".to_owned(),
+            relative_path: "Movie/Movie.2024.mkv".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![1],
+            title: "Movie".to_owned(),
+            sort_title: "movie".to_owned(),
+            original_title: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: None,
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: None,
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        },
+        NewMovieFile {
+            filesystem_entry_id: "borrowed-entry-2".to_owned(),
+            source_id: "borrowed-source-2".to_owned(),
+            relative_path: "Movie/Movie.2024.Directors.Cut.mkv".to_owned(),
+            size: 2,
+            modified_at: 2,
+            device: None,
+            inode: None,
+            fingerprint: vec![2],
+            title: "Movie".to_owned(),
+            sort_title: "movie".to_owned(),
+            original_title: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: Some(r#"{"tmdb":"1"}"#.to_owned()),
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: Some("Director's Cut".to_owned()),
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        },
+    ];
+    for file in &files {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+                 ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, 'generation', 'NEW', 0)",
+            )
+            .bind(&file.filesystem_entry_id)
+            .bind(&root_id)
+            .bind(&file.relative_path)
+            .bind(file.size)
+            .bind(file.modified_at)
+            .bind(&file.fingerprint)
+            .execute(database.pool())
+            .await
+            .expect("claimed filesystem entry");
+    }
+    let borrowed_files = files.iter().collect::<Vec<_>>();
+    let mut transaction = database
+        .begin_scan_write_transaction()
+        .await
+        .expect("transaction");
+    let created_items = database
+        .insert_movie_files_without_filesystem_entries_refs_in_transaction(
+            &mut transaction,
+            &library.id.to_string(),
+            &root_id,
+            "generation",
+            &borrowed_files,
+        )
+        .await
+        .expect("borrowed movie materialization");
+    transaction.commit().await.expect("commit");
+
+    assert_eq!(created_items, 1);
+    let counts: (i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT item.id), COUNT(source.id), SUM(source.is_default),
+                MAX(item.provider_ids_json)
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         WHERE item.item_type = 'MOVIE' AND item.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("materialized movie and sources");
+    assert_eq!(counts, (1, 2, 1, Some(r#"{"tmdb":"1"}"#.to_owned())));
+}
+
+#[tokio::test]
+async fn manifest_episode_materialization_accepts_borrowed_records_and_builds_hierarchy() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("shows");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("series root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 series root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let episode = NewEpisodeFile {
+        filesystem_entry_id: "borrowed-episode-entry".to_owned(),
+        source_id: "borrowed-episode-source".to_owned(),
+        relative_path: "Example Show/Season 01/Example.Show.S01E01.mkv".to_owned(),
+        size: 10,
+        modified_at: 1,
+        device: None,
+        inode: None,
+        fingerprint: vec![1, 2, 3],
+        series_identity: format!("series:{root_id}:Example Show"),
+        series_title: "Example Show".to_owned(),
+        series_sort_title: "example show".to_owned(),
+        series_production_year: Some(2024),
+        series_provider_ids_json: Some(r#"{"tvdb":"123"}"#.to_owned()),
+        season_identity: format!("series:{root_id}:Example Show:season:1"),
+        season_number: 1,
+        episode_identity: format!(
+            "episode:{root_id}:Example Show/Season 01/Example.Show.S01E01.mkv"
+        ),
+        episode_title: "Pilot".to_owned(),
+        episode_sort_title: "pilot".to_owned(),
+        episode_number: 1,
+        episode_absolute_number: None,
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: None,
+        quality_label: Some("1080p".to_owned()),
+        container: "mkv".to_owned(),
+        external_url: None,
+    };
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 fingerprint, last_seen_generation, last_seen_change_kind, is_missing
+             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, 'generation', 'NEW', 0)",
+        )
+        .bind(&episode.filesystem_entry_id)
+        .bind(&root_id)
+        .bind(&episode.relative_path)
+        .bind(episode.size)
+        .bind(episode.modified_at)
+        .bind(&episode.fingerprint)
+        .execute(database.pool())
+        .await
+        .expect("claimed filesystem entry");
+
+    let borrowed_episodes = [&episode];
+    let mut transaction = database
+        .begin_scan_write_transaction()
+        .await
+        .expect("transaction");
+    let created_items = database
+        .insert_episode_files_without_filesystem_entries_refs_in_transaction(
+            &mut transaction,
+            &library.id.to_string(),
+            &root_id,
+            "generation",
+            &borrowed_episodes,
+        )
+        .await
+        .expect("borrowed episode materialization");
+    transaction.commit().await.expect("commit");
+
+    assert_eq!(created_items, 3);
+    let hierarchy_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT SUM(CASE WHEN item_type = 'SERIES' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN item_type = 'SEASON' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN item_type = 'EPISODE' THEN 1 ELSE 0 END)
+         FROM media_items WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("series hierarchy");
+    assert_eq!(hierarchy_counts, (1, 1, 1));
+    let default_sources: i64 = sqlx::query_scalar(
+        "SELECT SUM(source.is_default) FROM media_sources source
+         JOIN media_items episode ON episode.id = source.item_id
+         WHERE episode.library_id = ? AND episode.item_type = 'EPISODE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("default episode source");
+    assert_eq!(default_sources, 1);
 }
 
 #[tokio::test]
@@ -11995,6 +13147,8 @@ async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
             relative_path: "First.Remote.2024.strm".to_owned(),
             size: 1,
             modified_at: 1,
+            device: None,
+            inode: None,
             fingerprint: vec![1],
             title: "First Remote".to_owned(),
             sort_title: "first remote".to_owned(),
@@ -12014,6 +13168,8 @@ async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
             relative_path: "Second.Remote.2025.strm".to_owned(),
             size: 1,
             modified_at: 2,
+            device: None,
+            inode: None,
             fingerprint: vec![2],
             title: "Second Remote".to_owned(),
             sort_title: "second remote".to_owned(),
@@ -12083,6 +13239,8 @@ async fn movie_batch_insert_refreshes_existing_parent_folders_as_a_set() {
         relative_path: format!("{folder}/{name}.202{index}.mkv"),
         size: 1,
         modified_at: index as i64,
+        device: None,
+        inode: None,
         fingerprint: vec![index as u8],
         title: format!("{name} {index}"),
         sort_title: format!("{name} {index}"),
@@ -12184,6 +13342,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -12250,6 +13409,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -12378,6 +13538,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -12618,6 +13779,636 @@ async fn server_settings_are_written_with_one_upsert() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn configured_user_deletion_grace_period_sets_purge_deadline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    for user_id in [
+        "default-retention-user",
+        "custom-retention-user",
+        "invalid-retention-user",
+    ] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash
+             ) VALUES (?, ?, ?, 'test')",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .soft_delete_user("default-retention-user")
+        .await?
+        .expect("default retention user is deleted");
+    let default_deadline: (i64, i64) =
+        sqlx::query_as("SELECT deleted_at, deletion_purge_at FROM users WHERE id = ?")
+            .bind("default-retention-user")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(default_deadline.1 - default_deadline.0, 7 * 86_400);
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('user_deletion_grace_days', '30')",
+    )
+    .execute(database.pool())
+    .await?;
+    database
+        .soft_delete_user("custom-retention-user")
+        .await?
+        .expect("custom retention user is deleted");
+    let custom_deadline: (i64, i64) =
+        sqlx::query_as("SELECT deleted_at, deletion_purge_at FROM users WHERE id = ?")
+            .bind("custom-retention-user")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(custom_deadline.1 - custom_deadline.0, 30 * 86_400);
+
+    sqlx::query(
+        "UPDATE server_settings SET value = '0'
+         WHERE key = 'user_deletion_grace_days'",
+    )
+    .execute(database.pool())
+    .await?;
+    database
+        .soft_delete_user("invalid-retention-user")
+        .await?
+        .expect("invalid retention user is deleted");
+    let invalid_deadline: (i64, i64) =
+        sqlx::query_as("SELECT deleted_at, deletion_purge_at FROM users WHERE id = ?")
+            .bind("invalid-retention-user")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(invalid_deadline.1 - invalid_deadline.0, 7 * 86_400);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_playback_policy_migration_defaults_keep_existing_playback_compatible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    let policy: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode
+         FROM users WHERE id = 'playback-policy-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    assert_eq!(policy, (1, 0, 1, 1, 1));
+
+    let legacy_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE users (id TEXT PRIMARY KEY);
+         INSERT INTO users (id) VALUES ('legacy-playback-policy-user');",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0185_user_playback_policy.sql"
+    ))
+    .execute(&legacy_pool)
+    .await?;
+    let migrated_policy: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode
+         FROM users WHERE id = 'legacy-playback-policy-user'",
+    )
+    .fetch_one(&legacy_pool)
+    .await?;
+    assert_eq!(migrated_policy, (1, 0, 1, 1, 1));
+    assert!(
+        sqlx::query(
+            "UPDATE users SET max_simultaneous_playbacks = -1
+         WHERE id = 'legacy-playback-policy-user'",
+        )
+        .execute(&legacy_pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE users SET can_play = 2 WHERE id = 'legacy-playback-policy-user'",)
+            .execute(&legacy_pool)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_playback_admission_migration_creates_constrained_ledger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'playback_admissions'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        table_exists, 1,
+        "fresh SQLite databases need the admission ledger"
+    );
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('admission-ledger-user', 'admission-ledger-user', 'Admission Ledger', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO playback_admissions (
+             user_id, play_session_id, state, admitted_at, last_seen_at
+         ) VALUES ('admission-ledger-user', 'play-session-1', 'ACTIVE', 100, 100)",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('admission-ledger-user', 'play-session-1', 'ACTIVE', 101, 101)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "a user cannot have duplicate rows for one playback session"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('missing-admission-user', 'play-session-2', 'ACTIVE', 100, 100)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "admissions must reference an existing user"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('admission-ledger-user', 'play-session-3', 'UNKNOWN', 100, 100)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "admission state must be constrained"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('admission-ledger-user', 'play-session-4', 'ACTIVE', 100, 99)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "last-seen time cannot precede admission time"
+    );
+
+    let legacy_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE users (id TEXT PRIMARY KEY);
+         INSERT INTO users (id) VALUES ('legacy-admission-user');
+         CREATE TABLE playback_sessions (
+             id TEXT PRIMARY KEY,
+             user_id TEXT NOT NULL,
+             play_session_id TEXT NOT NULL
+         );
+         INSERT INTO playback_sessions (id, user_id, play_session_id)
+         VALUES ('legacy-playback', 'legacy-admission-user', 'legacy-session');",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0186_user_playback_admissions.sql"
+    ))
+    .execute(&legacy_pool)
+    .await?;
+    let legacy_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'playback_admissions'
+         )",
+    )
+    .fetch_one(&legacy_pool)
+    .await?;
+    assert_eq!(
+        legacy_table_exists, 1,
+        "existing SQLite databases need the ledger migration"
+    );
+    let legacy_playback_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM playback_sessions WHERE id = 'legacy-playback'")
+            .fetch_one(&legacy_pool)
+            .await?;
+    assert_eq!(
+        legacy_playback_count, 1,
+        "migration must preserve old playback records"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user_id = "playback-admission-user";
+    database
+        .insert_user(user_id, user_id, "Playback Admission", "test", false, true)
+        .await?;
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+
+    let now = 1_000_i64;
+    let (first, second) = tokio::join!(
+        database.reserve_playback_admission(user_id, "admission-session-a", now),
+        database.reserve_playback_admission(user_id, "admission-session-b", now),
+    );
+    let first = first?.expect("user exists");
+    let second = second?.expect("user exists");
+    assert_ne!(first.decision, second.decision);
+    let (accepted_session, denied) = if first.decision == PlaybackAdmissionDecision::Admitted {
+        ("admission-session-a", second)
+    } else {
+        ("admission-session-b", first)
+    };
+    assert_eq!(
+        denied.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+    );
+    assert_eq!(denied.active_playback_count, 1);
+
+    let renewal = database
+        .reserve_playback_admission(user_id, accepted_session, now + 1)
+        .await?
+        .expect("user exists");
+    assert_eq!(renewal.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(renewal.active_playback_count, 1);
+    assert!(
+        database
+            .release_playback_admission(user_id, accepted_session, now + 2)
+            .await?
+    );
+    assert!(
+        !database
+            .release_playback_admission(user_id, accepted_session, now + 2)
+            .await?
+    );
+
+    let retry = database
+        .reserve_playback_admission(user_id, "admission-session-c", now + 3)
+        .await?
+        .expect("user exists");
+    assert_eq!(retry.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(retry.active_playback_count, 1);
+
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 0,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    for session_id in ["admission-session-d", "admission-session-e"] {
+        let unlimited = database
+            .reserve_playback_admission(user_id, session_id, now + 4)
+            .await?
+            .expect("user exists");
+        assert_eq!(unlimited.decision, PlaybackAdmissionDecision::Admitted);
+    }
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    for session_id in [
+        "admission-session-c",
+        "admission-session-d",
+        "admission-session-e",
+    ] {
+        let existing = database
+            .reserve_playback_admission(user_id, session_id, now + 5)
+            .await?
+            .expect("user exists");
+        assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(existing.active_playback_count, 3);
+    }
+    let new_session = database
+        .reserve_playback_admission(user_id, "admission-session-f", now + 6)
+        .await?
+        .expect("user exists");
+    assert_eq!(
+        new_session.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+    );
+    assert_eq!(new_session.active_playback_count, 3);
+
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: false,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    let disabled = database
+        .reserve_playback_admission(user_id, "admission-session-g", now + 7)
+        .await?
+        .expect("user exists");
+    assert_eq!(
+        disabled.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::PlaybackDisabled)
+    );
+    assert_eq!(disabled.active_playback_count, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user_id = "legacy-playback-admission-user";
+    database
+        .insert_user(
+            user_id,
+            user_id,
+            "Legacy Playback Admission",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback Admission", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('playback-admission-item', ?, 'MOVIE', 'Admission', 'Admission', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    database
+        .record_playback_event(NewPlaybackEvent {
+            user_id,
+            item_id: "playback-admission-item",
+            media_source_id: None,
+            play_session_id: "legacy-play-session",
+            device_id: "test-device",
+            client: None,
+            device_name: None,
+            client_version: None,
+            device_type: None,
+            remote_ip: None,
+            state: "PAUSED",
+            position_ticks: 10,
+            duration_ticks: Some(100),
+            played_percent: 95,
+            is_paused: true,
+        })
+        .await?;
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    let existing = database
+        .reserve_playback_admission(user_id, "legacy-play-session", now)
+        .await?
+        .expect("user exists");
+    assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(existing.active_playback_count, 1);
+    let denied = database
+        .reserve_playback_admission(user_id, "new-play-session", now)
+        .await?
+        .expect("user exists");
+    assert_eq!(
+        denied.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+    );
+
+    database
+        .record_playback_event(NewPlaybackEvent {
+            user_id,
+            item_id: "playback-admission-item",
+            media_source_id: None,
+            play_session_id: "legacy-play-session",
+            device_id: "test-device",
+            client: None,
+            device_name: None,
+            client_version: None,
+            device_type: None,
+            remote_ip: None,
+            state: "STOPPED",
+            position_ticks: 10,
+            duration_ticks: Some(100),
+            played_percent: 95,
+            is_paused: false,
+        })
+        .await?;
+    assert!(
+        database
+            .release_playback_admission(user_id, "legacy-play-session", now + 1)
+            .await?
+    );
+    let stale_admission = database
+        .reserve_playback_admission(user_id, "stale-play-session", now + 2)
+        .await?
+        .expect("user exists");
+    assert_eq!(stale_admission.active_playback_count, 1);
+    let after_stale = database
+        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92)
+        .await?
+        .expect("user exists");
+    assert_eq!(after_stale.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(after_stale.active_playback_count, 1);
+    let stale_state: String = sqlx::query_scalar(
+        "SELECT state FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = 'stale-play-session'",
+    )
+    .bind(user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_state, "RELEASED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_playback_policy_defaults_to_two_and_updates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    assert!(
+        database
+            .insert_initial_user(
+                "initial-playback-policy-user",
+                "initial-playback-policy-user",
+                "Initial Playback Policy",
+                "test",
+            )
+            .await?
+    );
+    database
+        .insert_user(
+            "new-playback-policy-user",
+            "new-playback-policy-user",
+            "New Playback Policy",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+
+    let default_policy = UserPlaybackPolicy {
+        can_play: true,
+        max_simultaneous_playbacks: 2,
+        allow_remux: true,
+        allow_audio_transcode: true,
+        allow_video_transcode: true,
+    };
+    for user_id in ["initial-playback-policy-user", "new-playback-policy-user"] {
+        assert_eq!(
+            database.get_user_playback_policy(user_id).await?,
+            Some(default_policy)
+        );
+    }
+
+    let updated_policy = UserPlaybackPolicy {
+        can_play: false,
+        max_simultaneous_playbacks: 1,
+        allow_remux: false,
+        allow_audio_transcode: false,
+        allow_video_transcode: true,
+    };
+    assert!(
+        database
+            .update_user_playback_policy("new-playback-policy-user", updated_policy)
+            .await?
+    );
+    assert_eq!(
+        database
+            .get_user_playback_policy("new-playback-policy-user")
+            .await?,
+        Some(updated_policy)
+    );
+
+    let invalid_policy = UserPlaybackPolicy {
+        max_simultaneous_playbacks: -1,
+        ..updated_policy
+    };
+    assert!(
+        database
+            .update_user_playback_policy("new-playback-policy-user", invalid_policy)
+            .await
+            .is_err()
+    );
+    assert!(
+        !database
+            .update_user_playback_policy("missing-playback-policy-user", updated_policy)
+            .await?
+    );
+    database
+        .soft_delete_user("new-playback-policy-user")
+        .await?
+        .ok_or("user soft delete should succeed")?;
+    assert!(
+        !database
+            .update_user_playback_policy("new-playback-policy-user", updated_policy)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn uninstalling_a_plugin_batches_library_scraper_rewrites()
 -> Result<(), Box<dyn std::error::Error>> {
     const REMOVED_PLUGIN: &str = "org.lux.removed-scraper";
@@ -12808,6 +14599,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -12896,6 +14688,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -13396,6 +15189,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
+        filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -13443,10 +15237,49 @@ fn provider_identity_uses_the_selected_scraper_without_falling_back_to_another_i
 fn postgres_placeholder_adapter_preserves_quoted_question_marks() {
     let sql = "SELECT ?, '?' AS literal, \"?\" AS identifier, ?";
     assert_eq!(
-        adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sql).as_str(),
         "SELECT $1, '?' AS literal, \"?\" AS identifier, $2"
     );
-    assert_eq!(adapt_sql_for_backend(DatabaseBackend::Sqlite, sql), sql);
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Sqlite, sql).as_str(),
+        sql
+    );
+}
+
+#[test]
+fn sqlite_sql_adapter_preserves_static_owned_and_arc_storage() {
+    let static_sql = "SELECT 1";
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, static_sql);
+    assert!(std::ptr::eq(static_sql.as_ptr(), adapted.as_str().as_ptr()));
+
+    let owned_sql = String::from("SELECT 2");
+    let owned_pointer = owned_sql.as_ptr();
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(owned_sql));
+    assert!(std::ptr::eq(owned_pointer, adapted.as_str().as_ptr()));
+
+    let shared_sql: std::sync::Arc<str> = std::sync::Arc::from("SELECT 3");
+    let shared_pointer = shared_sql.as_ptr();
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(shared_sql));
+    assert!(std::ptr::eq(shared_pointer, adapted.as_str().as_ptr()));
+}
+
+#[test]
+fn postgres_sql_adapter_preserves_unmodified_text_and_numbers_placeholders() {
+    let no_parameters = "SELECT 'no parameters'";
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Postgres, no_parameters);
+    assert!(std::ptr::eq(
+        no_parameters.as_ptr(),
+        adapted.as_str().as_ptr()
+    ));
+
+    let parameters = std::iter::repeat_n("?", 12).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT ?, '?' AS literal, \"?\" AS identifier, 'it''s ?' AS escaped_literal, {parameters}"
+    );
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sqlx::AssertSqlSafe(sql)).as_str(),
+        "SELECT $1, '?' AS literal, \"?\" AS identifier, 'it''s ?' AS escaped_literal, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13"
+    );
 }
 
 #[tokio::test]
@@ -13909,6 +15742,69 @@ async fn scan_job_status_counts_are_aggregated_in_storage() {
 }
 
 #[tokio::test]
+async fn scan_job_media_progress_is_loaded_from_job_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Scan media progress", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO scan_jobs (
+             id, library_id, job_type, status, generation, processed_media_count
+         ) VALUES
+             ('scan-media-progress-running', ?, 'RECONCILE_LIBRARY', 'RUNNING', 'g1', 7),
+             ('scan-media-progress-legacy', ?, 'RECONCILE_LIBRARY', 'COMPLETED', 'g2', NULL)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("scan jobs");
+
+    let found = database
+        .find_scan_job("scan-media-progress-running")
+        .await
+        .expect("find scan job")
+        .expect("running scan job");
+    assert_eq!(found.processed_media_count, Some(7));
+    let legacy = database
+        .find_scan_job("scan-media-progress-legacy")
+        .await
+        .expect("find legacy scan job")
+        .expect("legacy scan job");
+    assert_eq!(legacy.processed_media_count, None);
+
+    let listed = database
+        .list_scan_jobs(None, 0, 10)
+        .await
+        .expect("list scan jobs");
+    assert_eq!(
+        listed
+            .iter()
+            .find(|job| job.id == "scan-media-progress-running")
+            .and_then(|job| job.processed_media_count),
+        Some(7)
+    );
+    let active = database
+        .list_scan_jobs_for_activity(10)
+        .await
+        .expect("list active scan jobs");
+    assert_eq!(
+        active
+            .iter()
+            .find(|job| job.id == "scan-media-progress-running")
+            .and_then(|job| job.processed_media_count),
+        Some(7)
+    );
+}
+
+#[tokio::test]
 async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -13938,6 +15834,7 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
             entry_kind: "FILE",
             size: 10,
             modified_at: 20,
+            device: None,
             inode: Some(30),
             fingerprint: b"old-fingerprint",
             last_seen_generation: "old-generation",
@@ -13953,14 +15850,15 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
 
     database.reset_query_count();
     database
-        .update_filesystem_entry(
-            "filesystem-entry-update",
-            40,
-            50,
-            b"new-fingerprint",
-            Some(60),
-            "new-generation",
-        )
+        .update_filesystem_entry(FilesystemEntryUpdate {
+            id: "filesystem-entry-update",
+            size: 40,
+            modified_at: 50,
+            fingerprint: b"new-fingerprint",
+            device: None,
+            inode: Some(60),
+            last_seen_generation: "new-generation",
+        })
         .await
         .expect("filesystem entry update");
     assert_eq!(database.query_count(), 2);
@@ -13992,7 +15890,7 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
     .expect("mark filesystem entry missing again");
     database.reset_query_count();
     database
-        .mark_filesystem_entry_seen("filesystem-entry-update", "seen-generation", Some(70))
+        .mark_filesystem_entry_seen("filesystem-entry-update", "seen-generation", None, Some(70))
         .await
         .expect("mark filesystem entry seen");
     assert_eq!(database.query_count(), 2);
@@ -14005,6 +15903,231 @@ async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
     .await
     .expect("seen filesystem entry");
     assert_eq!(seen, (Some(70), "seen-generation".to_owned(), 0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filesystem_entry_inode_match_requires_the_same_device()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Device scoped inode lookup", LibraryKind::Movie, false)
+        .await?;
+    let first_root_path = temp_dir.path().join("first-root");
+    let second_root_path = temp_dir.path().join("second-root");
+    tokio::fs::create_dir_all(&first_root_path).await?;
+    tokio::fs::create_dir_all(&second_root_path).await?;
+    let first_root = libraries
+        .add_root(library.id, first_root_path.to_str().ok_or("non-UTF8 root")?)
+        .await?
+        .root;
+    let first_root_id = first_root.id.to_string();
+    let second_root = libraries
+        .add_root(
+            library.id,
+            second_root_path.to_str().ok_or("non-UTF8 root")?,
+        )
+        .await?
+        .root;
+    let second_root_id = second_root.id.to_string();
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "same-inode-on-another-device",
+            library_root_id: &first_root_id,
+            relative_path: "old-name.mkv",
+            entry_kind: "FILE",
+            size: 10,
+            modified_at: 20,
+            device: Some(1),
+            inode: Some(42),
+            fingerprint: b"fingerprint",
+            last_seen_generation: "generation",
+        })
+        .await?;
+
+    let entry = database
+        .find_filesystem_entry_by_inode(
+            &library.id.to_string(),
+            &second_root_id,
+            2,
+            42,
+            "new-name.mkv",
+        )
+        .await?;
+
+    assert!(entry.is_none());
+    database.close().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scan_fingerprint_migration_replaces_legacy_token_and_persists_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Fingerprint migration", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(
+        media_root.join("movie.mkv"),
+        b"metadata-only fingerprint fixture",
+    )
+    .await?;
+    let root = libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-UTF8 root")?)
+        .await?
+        .root;
+    let root_id = root.id.to_string();
+    let metadata = std::fs::metadata(media_root.join("movie.mkv"))?;
+    let size = i64::try_from(metadata.len())?;
+    let modified_at = i64::try_from(
+        metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+    )?;
+    let device = i64::try_from(metadata.dev())?;
+    let inode = i64::try_from(metadata.ino())?;
+    let legacy = crate::application::scanner::compute_file_fingerprint(
+        "movie.mkv",
+        size,
+        modified_at,
+        Some(device as u64),
+        Some(inode as u64),
+    );
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "migration-entry",
+            library_root_id: &root_id,
+            relative_path: "movie.mkv",
+            entry_kind: "FILE",
+            size,
+            modified_at,
+            device: Some(device),
+            inode: Some(inode),
+            fingerprint: &legacy,
+            last_seen_generation: "migration-generation",
+        })
+        .await?;
+
+    let library_id = library.id.to_string();
+    let cursor = database
+        .ensure_scan_fingerprint_migration_state(&library_id)
+        .await?;
+    let candidate = database
+        .find_scan_fingerprint_migration_candidate(&library_id, &cursor)
+        .await?
+        .ok_or("legacy candidate not found")?;
+    let lease_token = "migration-lease";
+    assert!(
+        database
+            .claim_scan_fingerprint_migration_lease(&library_id, lease_token)
+            .await?
+    );
+    let fingerprint_v2 = crate::application::scanner::compute_scan_fingerprint_v2(
+        "movie.mkv",
+        size,
+        modified_at,
+        Some(device as u64),
+        Some(inode as u64),
+    );
+    assert!(
+        database
+            .migrate_scan_fingerprint_candidate(ScanFingerprintMigrationCommit {
+                candidate: &candidate,
+                fingerprint_v2: &fingerprint_v2,
+                size,
+                modified_at,
+                device,
+                inode,
+                lease_token,
+            },)
+            .await?
+    );
+
+    let stored: (Vec<u8>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT fingerprint, device, inode FROM filesystem_entries WHERE id = 'migration-entry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored.0, fingerprint_v2);
+    assert_ne!(stored.0, legacy);
+    assert_eq!((stored.1, stored.2), (Some(device), Some(inode)));
+    let persisted_cursor = database
+        .ensure_scan_fingerprint_migration_state(&library_id)
+        .await?;
+    assert_eq!(persisted_cursor.root_id.as_deref(), Some(root_id.as_str()));
+    assert_eq!(persisted_cursor.relative_path.as_deref(), Some("movie.mkv"));
+    assert!(
+        database
+            .find_scan_fingerprint_migration_candidate(&library_id, &persisted_cursor)
+            .await?
+            .is_none()
+    );
+
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "migration-missing-entry",
+            library_root_id: &root_id,
+            relative_path: "gone.mkv",
+            entry_kind: "FILE",
+            size,
+            modified_at,
+            device: Some(device),
+            inode: Some(inode),
+            fingerprint: &legacy,
+            last_seen_generation: "migration-generation",
+        })
+        .await?;
+    sqlx::query("DROP TRIGGER trg_filesystem_entries_clear_missing_fingerprint_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1
+         WHERE id = 'migration-missing-entry'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .scan_fingerprint_migration_has_pending_entries(&library_id)
+            .await?
+    );
+    assert!(
+        database
+            .clear_one_missing_scan_fingerprint(&library_id)
+            .await?
+    );
+    let missing_fingerprint: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT fingerprint FROM filesystem_entries
+         WHERE id = 'migration-missing-entry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing_fingerprint, None);
+    assert!(
+        !database
+            .scan_fingerprint_migration_has_pending_entries(&library_id)
+            .await?
+    );
+    database.close().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -15842,6 +17965,8 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_
         relative_path: first_path.to_owned(),
         size: 7,
         modified_at: 1,
+        device: None,
+        inode: None,
         fingerprint: vec![1, 2, 3],
         title: "Atomic Movie".to_owned(),
         sort_title: "atomic movie".to_owned(),
@@ -17898,6 +20023,8 @@ fn strm_file(index: i64, relative_path: &str) -> NewMovieFile {
         relative_path: relative_path.to_owned(),
         size: 1,
         modified_at: index,
+        device: None,
+        inode: None,
         fingerprint: vec![index as u8],
         title: format!("Scope {index}"),
         sort_title: format!("scope {index}"),
@@ -18980,6 +21107,145 @@ async fn assert_removed_media_item_purge(
             .await?,
         1
     );
+    assert_missing_filesystem_entry_purge(database).await?;
+    Ok(())
+}
+
+async fn assert_missing_filesystem_entry_purge(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_service = LibraryService::new(database.clone());
+    let library = library_service
+        .create_library("Missing entry purge", LibraryKind::Movie, false)
+        .await?;
+    let active_library = library_service
+        .create_library("Active scan purge", LibraryKind::Movie, false)
+        .await?;
+    let root_dir = tempfile::tempdir()?;
+    let active_root_dir = tempfile::tempdir()?;
+    let root_id = uuid::Uuid::now_v7().to_string();
+    let active_root_id = uuid::Uuid::now_v7().to_string();
+    for (root_id, library_id, path) in [
+        (root_id.as_str(), library.id.to_string(), root_dir.path()),
+        (
+            active_root_id.as_str(),
+            active_library.id.to_string(),
+            active_root_dir.path(),
+        ),
+    ] {
+        let path = path.to_str().ok_or("non-UTF8 test root")?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES (?, ?, ?, ?, 1, 0)",
+            )
+            .bind(root_id)
+            .bind(library_id)
+            .bind(path)
+            .bind(path)
+            .execute(database.pool())
+            .await?;
+    }
+    ScanJobService::new(database.clone())
+        .create_movie_scan_job(active_library.id)
+        .await?;
+
+    let mut expected_retained_entries = Vec::new();
+    for (relative_path, missing, age_days, linked) in [
+        ("expired-oldest.mkv", 1_i64, 90_i64, false),
+        ("expired-middle.mkv", 1, 60, false),
+        ("expired-newest.mkv", 1, 45, false),
+        ("recent.mkv", 1, 2, false),
+        ("live.mkv", 0, 90, false),
+        ("source-linked.mkv", 1, 90, true),
+    ] {
+        let entry_id = uuid::Uuid::now_v7().to_string();
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation, is_missing, updated_at
+                 ) VALUES (?, ?, ?, 'FILE', 1, 1, 'purge-test', ?,
+                           unixepoch() - ? * 86400)",
+            )
+            .bind(&entry_id)
+            .bind(&root_id)
+            .bind(relative_path)
+            .bind(missing)
+            .bind(age_days)
+            .execute(database.pool())
+            .await?;
+        if missing == 0 || age_days < 30 || linked {
+            expected_retained_entries.push(entry_id.clone());
+        }
+        if linked {
+            let item_id = uuid::Uuid::now_v7().to_string();
+            database
+                .query(
+                    "INSERT INTO media_items (
+                         id, library_id, item_type, title, sort_title, identification_status
+                     ) VALUES (?, ?, 'MOVIE', 'Retained source', 'retained source',
+                               'LOCAL_CONFIRMED')",
+                )
+                .bind(&item_id)
+                .bind(library.id.to_string())
+                .execute(database.pool())
+                .await?;
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+                     VALUES (?, ?, 'LOCAL_FILE', ?)",
+                )
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(item_id)
+                .bind(&entry_id)
+                .execute(database.pool())
+                .await?;
+        }
+    }
+
+    let active_entry_id = uuid::Uuid::now_v7().to_string();
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing, updated_at
+             ) VALUES (?, ?, 'active-scan.mkv', 'FILE', 1, 1, 'purge-test', 1,
+                       unixepoch() - 90 * 86400)",
+        )
+        .bind(&active_entry_id)
+        .bind(&active_root_id)
+        .execute(database.pool())
+        .await?;
+    expected_retained_entries.push(active_entry_id.clone());
+
+    let retention = 30 * 86_400;
+    assert_eq!(
+        database
+            .purge_expired_missing_filesystem_entries(retention, 1, 2, std::time::Duration::ZERO,)
+            .await?,
+        2
+    );
+    assert_eq!(
+        database
+            .purge_expired_missing_filesystem_entries(retention, 1, 2, std::time::Duration::ZERO,)
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .purge_expired_missing_filesystem_entries(retention, 1, 2, std::time::Duration::ZERO,)
+            .await?,
+        0
+    );
+
+    expected_retained_entries.sort();
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM filesystem_entries ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(remaining, expected_retained_entries);
     Ok(())
 }
 
@@ -19172,6 +21438,312 @@ async fn postgres_media_items_are_normalized_to_one_default_source()
         let database = database.clone();
         async move {
             assert_media_source_defaults_are_normalized(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_discovery_presence_templates_preserve_path_and_generation_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    database
+        .query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('presence-lib', 'Presence', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('presence-root', 'presence-lib', '/presence', '/presence', 1, 0)",
+        )
+        .execute(database.pool())
+        .await?;
+    let roots = [NewScanManifestRoot {
+        library_root_id: "presence-root",
+    }];
+    let manifest = NewScanManifest {
+        id: "presence-manifest",
+        job_id: "presence-job",
+        library_id: "presence-lib",
+        roots: &roots,
+    };
+    database
+        .create_full_scan_manifest_job(
+            "presence-job",
+            "presence-generation",
+            false,
+            &manifest,
+            None,
+        )
+        .await?;
+    assert!(database.claim_scan_job("presence-job").await?);
+
+    for (id, path, fingerprint, generation) in [
+        (
+            "presence-current",
+            "already-seen.mkv",
+            b"current".as_slice(),
+            "presence-generation",
+        ),
+        (
+            "presence-fast",
+            "fast-update.mkv",
+            b"fast".as_slice(),
+            "old-generation",
+        ),
+        (
+            "presence-partial",
+            "partial-update.mkv",
+            b"partial".as_slice(),
+            "old-generation",
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, is_missing
+                 ) VALUES (?, 'presence-root', ?, 'FILE', 10, 20, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(path)
+            .bind(fingerprint)
+            .bind(generation)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let entry = |relative_path: &str, fingerprint: &[u8]| NewScanManifestEntry {
+        relative_path: relative_path.to_owned(),
+        entry_kind: "FILE".to_owned(),
+        size: 11,
+        modified_at: 21,
+        device: None,
+        inode: None,
+        fingerprint: fingerprint.to_vec(),
+        fingerprint_pending: false,
+    };
+    let seen_entry =
+        |id: &str, relative_path: &str, fingerprint: &[u8]| NewScanManifestSeenFilesystemEntry {
+            filesystem_entry_id: id.to_owned(),
+            relative_path: relative_path.to_owned(),
+            size: 11,
+            modified_at: 21,
+            device: None,
+            inode: None,
+            fingerprint: fingerprint.to_vec(),
+        };
+
+    let current_entries = [entry("already-seen.mkv", b"current")];
+    let current_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &current_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&current_chunk)
+            .await?,
+        0,
+        "format 3 treats a path already seen in this generation as known"
+    );
+
+    let fast_entries = [entry("fast-update.mkv", b"fast")];
+    let fast_seen = [seen_entry("presence-fast", "fast-update.mkv", b"fast")];
+    let fast_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &fast_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &fast_seen,
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&fast_chunk)
+            .await?,
+        1,
+        "a full successful presence update counts the file once"
+    );
+    let fast_generation: String = database
+        .query_scalar(
+            "SELECT last_seen_generation FROM filesystem_entries WHERE id = 'presence-fast'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(fast_generation, "presence-generation");
+    let fast_ledger_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM scan_manifest_seen_paths
+             WHERE manifest_id = 'presence-manifest' AND relative_path = 'fast-update.mkv'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        fast_ledger_count, 0,
+        "successful updates do not duplicate the ledger"
+    );
+
+    let partial_entries = [
+        entry("partial-update.mkv", b"partial"),
+        entry("missing-entry.mkv", b"missing"),
+    ];
+    let partial_seen = [
+        seen_entry("presence-partial", "partial-update.mkv", b"partial"),
+        seen_entry("presence-missing", "missing-entry.mkv", b"missing"),
+    ];
+    let partial_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &partial_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &partial_seen,
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&partial_chunk)
+            .await?,
+        2,
+        "partial updates return the updated path and ledger fallback path once each"
+    );
+    let partial_generation: String = database
+        .query_scalar(
+            "SELECT last_seen_generation FROM filesystem_entries WHERE id = 'presence-partial'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(partial_generation, "presence-generation");
+    let ledger_paths: Vec<String> = database
+        .query_scalar(
+            "SELECT relative_path FROM scan_manifest_seen_paths
+             WHERE manifest_id = 'presence-manifest' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(ledger_paths, ["already-seen.mkv", "missing-entry.mkv"]);
+
+    database
+        .query(
+            "UPDATE scan_manifests SET discovery_format_version = 2 WHERE id = 'presence-manifest'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at
+             ) VALUES ('presence-manifest', 'presence-root', 'legacy-known.mkv', 1, 'FILE', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query("UPDATE scan_manifest_roots SET next_observation_sequence = 1 WHERE manifest_id = 'presence-manifest'")
+        .execute(database.pool())
+        .await?;
+    let legacy_entries = [entry("legacy-known.mkv", b"legacy")];
+    let legacy_chunk = NewScanManifestDiscoveryChunk {
+        manifest_id: "presence-manifest",
+        job_id: "presence-job",
+        library_root_id: "presence-root",
+        child_directories: &[],
+        entries: &legacy_entries,
+        positive_indexes: &[],
+        unchanged_paths: &[],
+        seen_filesystem_entries: &[],
+        completed_directory: None,
+    };
+    assert_eq!(
+        database
+            .commit_scan_manifest_discovery_chunk(&legacy_chunk)
+            .await?,
+        0,
+        "legacy format queries known paths from prior manifest observations"
+    );
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_scan_job_retry_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_scan_job_retry_diagnostics(&database, temp_dir.path())
                 .await
                 .map_err(|error| error.to_string())
         }

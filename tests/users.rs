@@ -50,9 +50,11 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .header(COOKIE, &cookie)
         .send()
         .await?;
-    assert_eq!(users.status(), reqwest::StatusCode::OK);
+    let users_status = users.status();
+    let users_body = users.text().await?;
+    assert_eq!(users_status, reqwest::StatusCode::OK, "{users_body}");
     assert_eq!(
-        users.json::<Value>().await?["users"]
+        serde_json::from_str::<Value>(&users_body)?["users"]
             .as_array()
             .map(Vec::len),
         Some(1)
@@ -75,6 +77,92 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .ok_or("missing user id")?
         .to_owned();
 
+    let default_playback_policy = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/playback-policy"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(default_playback_policy.status(), reqwest::StatusCode::OK);
+    let default_policy = default_playback_policy.json::<Value>().await?["policy"].clone();
+    assert_eq!(default_policy["canPlay"], true);
+    assert_eq!(default_policy["maxSimultaneousPlaybacks"], 2);
+    assert_eq!(default_policy["allowRemux"], true);
+    assert_eq!(default_policy["allowAudioTranscode"], true);
+    assert_eq!(default_policy["allowVideoTranscode"], true);
+
+    let playback_policy = json!({
+        "canPlay": false,
+        "maxSimultaneousPlaybacks": 1,
+        "allowRemux": false,
+        "allowAudioTranscode": true,
+        "allowVideoTranscode": false
+    });
+    let updated_playback_policy = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/playback-policy"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&playback_policy)
+        .send()
+        .await?;
+    assert_eq!(updated_playback_policy.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        updated_playback_policy.json::<Value>().await?["policy"],
+        playback_policy
+    );
+    let missing_csrf_update = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/playback-policy"
+        ))
+        .header(COOKIE, &cookie)
+        .json(&playback_policy)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf_update.status(), reqwest::StatusCode::FORBIDDEN);
+    let invalid_playback_policy = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/playback-policy"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": -1,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_playback_policy.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let unlimited_playback_policy = json!({
+        "canPlay": true,
+        "maxSimultaneousPlaybacks": 0,
+        "allowRemux": true,
+        "allowAudioTranscode": true,
+        "allowVideoTranscode": true
+    });
+    let unlimited_update = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/playback-policy"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&unlimited_playback_policy)
+        .send()
+        .await?;
+    assert_eq!(unlimited_update.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        unlimited_update.json::<Value>().await?["policy"],
+        unlimited_playback_policy
+    );
+
     let duplicate = client
         .post(format!("{base_url}/api/v1/admin/users"))
         .header(COOKIE, &cookie)
@@ -89,7 +177,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(
         duplicate.json::<Value>().await?["error"]["message"],
-        "用户名已存在"
+        "用户名或邮箱已存在"
     );
 
     let library = client
@@ -187,6 +275,17 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .send()
         .await?;
     assert_eq!(regular_users.status(), reqwest::StatusCode::FORBIDDEN);
+    let regular_playback_policy = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/playback-policy"
+        ))
+        .header(COOKIE, &regular_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        regular_playback_policy.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
 
     let updated = client
         .patch(format!("{base_url}/api/v1/admin/users/{created_id}"))
@@ -270,15 +369,33 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .header("x-csrf-token", &manager_csrf)
         .send()
         .await?;
-    let deleted_regular_status = deleted_regular.status();
-    let deleted_regular_body = deleted_regular.text().await?;
+    assert_eq!(deleted_regular.status(), reqwest::StatusCode::OK);
+    let deleted_regular_user = deleted_regular.json::<Value>().await?["user"].clone();
+    assert!(deleted_regular_user["deletedAt"].as_i64().is_some());
+    assert!(deleted_regular_user["deletionPurgeAt"].as_i64().is_some());
+    let deleted_policy_update = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{regular_id}/playback-policy"
+        ))
+        .header(COOKIE, &manager_cookie)
+        .header("x-csrf-token", &manager_csrf)
+        .json(&playback_policy)
+        .send()
+        .await?;
     assert_eq!(
-        deleted_regular_status,
-        reqwest::StatusCode::NO_CONTENT,
-        "{deleted_regular_body}"
+        deleted_policy_update.status(),
+        reqwest::StatusCode::NOT_FOUND
     );
+    let deleted_policy_read = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{regular_id}/playback-policy"
+        ))
+        .header(COOKIE, &manager_cookie)
+        .send()
+        .await?;
+    assert_eq!(deleted_policy_read.status(), reqwest::StatusCode::NOT_FOUND);
 
-    let recreated_regular = client
+    let reserved_username = client
         .post(format!("{base_url}/api/v1/admin/users"))
         .header(COOKIE, &manager_cookie)
         .header("x-csrf-token", &manager_csrf)
@@ -288,7 +405,7 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         }))
         .send()
         .await?;
-    assert_eq!(recreated_regular.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(reserved_username.status(), reqwest::StatusCode::CONFLICT);
 
     let audit = client
         .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
@@ -309,6 +426,11 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         audit_events
             .iter()
             .any(|event| event["eventType"] == "USER_UPDATED")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| { event["eventType"] == "USER_PLAYBACK_POLICY_UPDATED" })
     );
     assert!(
         audit_events

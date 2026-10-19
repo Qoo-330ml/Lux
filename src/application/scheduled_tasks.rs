@@ -317,6 +317,11 @@ impl ScheduledTaskService {
                 break;
             }
         }
+        if let Some(metadata) = self.metadata_reidentify.as_ref()
+            && let Err(error) = metadata.retry_due_automatic_fill_missing_jobs().await
+        {
+            tracing::warn!(%error, "due automatic metadata retries could not be scheduled");
+        }
         self.run_due_thumbnail_scraper_retries().await;
         self.cursors
             .lock()

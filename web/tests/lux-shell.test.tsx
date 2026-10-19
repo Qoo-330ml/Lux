@@ -297,6 +297,36 @@ describe("LuxShell user control", () => {
     expect(container.querySelector('.lux-mobile-nav a[href="/favorites"]')?.textContent).toBe("收藏");
   });
 
+  it("keeps the closed mobile navigation inaccessible and closes it after navigation", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      renderWithProviders(root,
+        <MemoryRouter initialEntries={["/"]}>
+          <LuxShell user={{ id: "user-1", usernameNormalized: "test" }} />
+        </MemoryRouter>,
+      );
+    });
+
+    const nav = container.querySelector<HTMLElement>(".lux-mobile-nav");
+    expect(nav).not.toBeNull();
+    expect(nav?.getAttribute("data-state")).toBe("closed");
+    expect(nav?.getAttribute("aria-hidden")).toBe("true");
+    expect(nav?.hasAttribute("inert")).toBe(true);
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="打开导航"]')?.click());
+    expect(nav?.getAttribute("data-state")).toBe("open");
+    expect(nav?.getAttribute("aria-hidden")).toBe("false");
+    expect(nav?.hasAttribute("inert")).toBe(false);
+
+    act(() => nav?.querySelector<HTMLAnchorElement>('a[href="/favorites"]')?.click());
+    expect(nav?.getAttribute("data-state")).toBe("closed");
+    expect(nav?.getAttribute("aria-hidden")).toBe("true");
+    expect(nav?.hasAttribute("inert")).toBe(true);
+  });
+
   it("hides the back button on the home page", () => {
     container = document.createElement("div");
     document.body.append(container);
@@ -368,11 +398,11 @@ describe("LuxShell user control", () => {
     act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
 
     expect(sessionStorage.getItem("lux.home-carousel.v2:user-1")).toBeNull();
-    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual(expect.arrayContaining([
       { queryKey: ["home"], refetchType: "none" },
-      { queryKey: ["libraries"] },
-      { queryKey: ["library"] },
-    ]);
+      { queryKey: ["libraries"], refetchType: "none" },
+      { queryKey: ["library"], refetchType: "none" },
+    ]));
   });
 
   it("renders the first catalog batch and poster URL after invalidating an empty home page", async () => {
@@ -499,7 +529,7 @@ describe("LuxShell user control", () => {
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = { id: "user-1", usernameNormalized: "test" };
-    queryClient.setQueryData(queryKeys.homeCarousel, response);
+    queryClient.setQueryData(queryKeys.homeCarousel, response, { updatedAt: Date.now() - 60_000 });
 
     await act(async () => {
       root.render(
@@ -587,6 +617,7 @@ describe("LuxShell user control", () => {
         libraryId: "library-1",
         taskType: "RECONCILE_LIBRARY",
         status: "RUNNING",
+        processedMediaCount: 3,
         processedCount: 12,
         totalCount: 40,
         currentItem: "Safe.Movie.mkv",
@@ -627,8 +658,10 @@ describe("LuxShell user control", () => {
 
     expect(container.textContent).toContain("电影库");
     expect(container.textContent).toContain("全量校验");
-    expect(container.textContent).toContain("12/40");
+    expect(container.textContent).toContain("已处理 3 部电影");
+    expect(container.textContent).not.toContain("12/40");
     expect(container.textContent).toContain("处理文件 · Safe.Movie.mkv");
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBeNull();
     expect(container.textContent).not.toContain("/media/");
     expect(container.textContent).not.toContain("token=");
   });

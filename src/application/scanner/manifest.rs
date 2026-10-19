@@ -7,7 +7,10 @@ use std::{
 };
 
 use crate::{
-    application::strm_target::{StrmTarget, classify_strm_target},
+    application::{
+        background_work::{BackgroundWorkStage, run_process_background_blocking},
+        strm_target::{StrmTarget, classify_strm_target},
+    },
     domain::ids::FilesystemEntryId,
     storage::{
         NewEpisodeFile, NewMovieFile, NewScanManifestEntry, NewScanManifestIndexedFile,
@@ -623,7 +626,7 @@ pub(super) async fn stat_manifest_relative_file(
     expected_root_inode: Option<i64>,
 ) -> Result<Option<NewScanManifestEntry>, ScannerError> {
     let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || {
+    run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, move || {
         stat_manifest_relative_file_sync(
             &root_path,
             &relative_path,
@@ -646,7 +649,7 @@ pub(super) async fn read_manifest_strm_target(
     expected_observation: NewScanManifestEntry,
 ) -> Result<StrmTarget, ScannerError> {
     let display_path = root_path.join(&relative_path);
-    tokio::task::spawn_blocking(move || {
+    run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, move || {
         read_manifest_strm_target_sync(
             &root_path,
             &relative_path,
@@ -666,12 +669,14 @@ pub(super) async fn stat_manifest_root(
     root_path: PathBuf,
 ) -> Result<NewScanManifestEntry, ScannerError> {
     let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || stat_manifest_root_sync(&root_path))
-        .await
-        .map_err(|source| ScannerError::Io {
-            path: display_path,
-            source: std::io::Error::other(source.to_string()),
-        })?
+    run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, move || {
+        stat_manifest_root_sync(&root_path)
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path,
+        source: std::io::Error::other(source.to_string()),
+    })?
 }
 
 pub(super) fn stat_manifest_root_sync(
@@ -911,7 +916,7 @@ pub(super) async fn verify_manifest_directory_observation(
     expected_directory_observation: NewScanManifestEntry,
 ) -> Result<(), ScannerError> {
     let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || {
+    run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, move || {
         verify_manifest_directory_observation_sync(
             &root_path,
             &expected_root_observation,
@@ -932,21 +937,22 @@ pub(super) async fn verify_manifest_directory_observations(
     let display_path = root_path.clone();
     let directory_count = observations.len();
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        for (expected_root_observation, expected_directory_observation) in observations {
-            verify_manifest_directory_observation_sync(
-                &root_path,
-                &expected_root_observation,
-                &expected_directory_observation,
-            )?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path,
-        source: std::io::Error::other(source.to_string()),
-    })?;
+    let result =
+        run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, move || {
+            for (expected_root_observation, expected_directory_observation) in observations {
+                verify_manifest_directory_observation_sync(
+                    &root_path,
+                    &expected_root_observation,
+                    &expected_directory_observation,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: display_path,
+            source: std::io::Error::other(source.to_string()),
+        })?;
     record_manifest_scan_stage(
         "directory_identity_recheck",
         started,
@@ -1019,19 +1025,20 @@ pub(super) async fn stat_manifest_directory_file_batch(
     let display_path = root_path.clone();
     let file_count = expected_files.len();
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        stat_manifest_directory_file_batch_sync(
-            &root_path,
-            &expected_root_observation,
-            &expected_directory_observation,
-            &expected_files,
-        )
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path,
-        source: std::io::Error::other(source.to_string()),
-    })?;
+    let result =
+        run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, move || {
+            stat_manifest_directory_file_batch_sync(
+                &root_path,
+                &expected_root_observation,
+                &expected_directory_observation,
+                &expected_files,
+            )
+        })
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: display_path,
+            source: std::io::Error::other(source.to_string()),
+        })?;
     record_manifest_scan_stage(
         "positive_file_recheck",
         started,
@@ -1348,7 +1355,6 @@ pub(super) fn manifest_file_observation_matches(
         && expected.modified_at == observed.modified_at
         && expected.device == observed.device
         && expected.inode == observed.inode
-        && expected.fingerprint == observed.fingerprint
 }
 
 pub(super) fn manifest_discovery_index_from_preparation(
@@ -1433,6 +1439,7 @@ pub(super) async fn prepare_manifest_delta(
         device,
         inode,
         fingerprint,
+        fingerprint_pending: false,
     };
     let filename_input = if library_kind == "HOMEVIDEOS" {
         ManifestFilenameInput::HomeVideos

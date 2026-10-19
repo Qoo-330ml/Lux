@@ -1,4 +1,102 @@
 use super::*;
+use crate::application::background_work::{
+    BackgroundWorkStage, acquire_process_background_work, run_process_background_blocking,
+};
+
+fn complete_pending_manifest_fingerprints_sync(
+    entries: &mut [NewScanManifestEntry],
+    baselines: &HashMap<String, crate::storage::StoredScanManifestFilesystemBaseline>,
+) {
+    for entry in entries {
+        if !entry.fingerprint_pending {
+            continue;
+        }
+
+        let reusable_fingerprint = baselines
+            .get(&entry.relative_path)
+            .filter(|baseline| {
+                entry.size >= 0
+                    && entry.modified_at > 0
+                    && entry.device.is_some()
+                    && entry.inode.is_some()
+                    && baseline.entry_kind == "FILE"
+                    && !baseline.is_missing
+                    && baseline.size == entry.size
+                    && baseline.modified_at == entry.modified_at
+                    && baseline.device == entry.device
+                    && baseline.inode == entry.inode
+            })
+            .and_then(|baseline| baseline.fingerprint.as_deref())
+            .filter(|fingerprint| {
+                crate::application::scanner::is_supported_scan_fingerprint(fingerprint)
+            });
+
+        entry.fingerprint = reusable_fingerprint
+            .or_else(|| {
+                baselines
+                    .get(&entry.relative_path)
+                    .filter(|baseline| {
+                        baseline.entry_kind == "FILE"
+                            && !baseline.is_missing
+                            && baseline
+                                .fingerprint
+                                .as_deref()
+                                .is_some_and(|fingerprint| fingerprint.len() == 32)
+                    })
+                    .and_then(|baseline| {
+                        let current_legacy_fingerprint =
+                            crate::application::scanner::compute_file_fingerprint(
+                                &entry.relative_path,
+                                entry.size,
+                                entry.modified_at,
+                                entry.device.and_then(|value| u64::try_from(value).ok()),
+                                entry.inode.and_then(|value| u64::try_from(value).ok()),
+                            );
+                        (baseline.fingerprint.as_deref()
+                            == Some(current_legacy_fingerprint.as_slice()))
+                        .then_some(baseline.fingerprint.as_deref())
+                        .flatten()
+                    })
+            })
+            .map(<[u8]>::to_vec)
+            .unwrap_or_else(|| {
+                crate::application::scanner::compute_scan_fingerprint_v2(
+                    &entry.relative_path,
+                    entry.size,
+                    entry.modified_at,
+                    entry.device.and_then(|value| u64::try_from(value).ok()),
+                    entry.inode.and_then(|value| u64::try_from(value).ok()),
+                )
+            });
+        entry.fingerprint_pending = false;
+    }
+}
+
+async fn complete_pending_manifest_fingerprints(
+    entries: &mut [NewScanManifestEntry],
+    baselines: &HashMap<String, crate::storage::StoredScanManifestFilesystemBaseline>,
+) -> Result<(), ScannerError> {
+    let mut owned_entries = entries.to_vec();
+    let owned_baselines = baselines.clone();
+    owned_entries = run_process_background_blocking(BackgroundWorkStage::Fingerprint, move || {
+        complete_pending_manifest_fingerprints_sync(&mut owned_entries, &owned_baselines);
+        owned_entries
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: PathBuf::from("<manifest-fingerprint>"),
+        source: std::io::Error::other(source.to_string()),
+    })?;
+    entries.clone_from_slice(&owned_entries);
+    Ok(())
+}
+
+#[path = "commit_batches.rs"]
+mod commit_batches;
+use commit_batches::{
+    DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET, ManifestDiscoveryTransactionBudget,
+    split_pending_manifest_directory_chunks,
+};
 
 impl ScanJobService {
     pub(in crate::application::scanner) async fn discover_scan_manifest_directory_batches(
@@ -12,6 +110,7 @@ impl ScanJobService {
             root,
             cancellation,
             stream_files_during_discovery,
+            skip_baseline_queries,
             library_kind,
             preparation_concurrency,
             expected_root_identity,
@@ -40,7 +139,17 @@ impl ScanJobService {
         let open_root_path = root_path.clone();
         let open_relative_directory = relative_directory.to_owned();
         let open_started = Instant::now();
+        let open_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: root_path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let mut reader = tokio::task::spawn_blocking(move || {
+            let _permit = open_permit;
             ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
         })
         .await
@@ -72,13 +181,24 @@ impl ScanJobService {
         loop {
             let read_started = Instant::now();
             let reader_to_move = reader;
-            let (next_reader, batch) =
-                tokio::task::spawn_blocking(move || reader_to_move.next_batch(reader_batch_size))
-                    .await
-                    .map_err(|source| ScannerError::Io {
-                        path: root_path.clone(),
-                        source: std::io::Error::other(source.to_string()),
-                    })??;
+            let read_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: root_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let (next_reader, batch) = tokio::task::spawn_blocking(move || {
+                let _permit = read_permit;
+                reader_to_move.next_batch(reader_batch_size)
+            })
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: root_path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })??;
             reader = next_reader;
             let batch_file_count = batch
                 .entries
@@ -127,13 +247,14 @@ impl ScanJobService {
                 .map(|entry| entry.relative_path.clone())
                 .collect::<Vec<_>>();
             let baseline_started = Instant::now();
-            let baselines = if stream_files_during_discovery {
+            let baselines = if !skip_baseline_queries && !file_paths.is_empty() {
                 self.database
                     .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
                     .await?
             } else {
                 HashMap::new()
             };
+            complete_pending_manifest_fingerprints(&mut observations, &baselines).await?;
             record_manifest_scan_stage(
                 "baseline_query",
                 baseline_started,
@@ -319,6 +440,10 @@ impl ScanJobService {
                         seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
                             filesystem_entry_id: baseline.id.clone(),
                             relative_path: observation.relative_path.clone(),
+                            size: observation.size,
+                            modified_at: observation.modified_at,
+                            device: observation.device,
+                            inode: observation.inode,
                             fingerprint: observation.fingerprint.clone(),
                         });
                         if is_media || is_sidecar {
@@ -575,7 +700,17 @@ impl ScanJobService {
             let open_root_path = root_path.clone();
             let open_relative_directory = relative_directory.clone();
             let open_started = Instant::now();
+            let open_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: root_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             let mut reader = tokio::task::spawn_blocking(move || {
+                let _permit = open_permit;
                 ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
             })
             .await
@@ -593,13 +728,24 @@ impl ScanJobService {
                     return Ok(None);
                 }
                 let read_started = Instant::now();
-                let (next_reader, batch) =
-                    tokio::task::spawn_blocking(move || reader.next_batch(reader_batch_size))
-                        .await
-                        .map_err(|source| ScannerError::Io {
-                            path: root_path.clone(),
-                            source: std::io::Error::other(source.to_string()),
-                        })??;
+                let read_permit = acquire_process_background_work(BackgroundWorkStage::Discovery)
+                    .await
+                    .map_err(|source| ScannerError::Io {
+                        path: root_path.clone(),
+                        source: std::io::Error::other(source.to_string()),
+                    })?;
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let (next_reader, batch) = tokio::task::spawn_blocking(move || {
+                    let _permit = read_permit;
+                    reader.next_batch(reader_batch_size)
+                })
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: root_path.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })??;
                 reader = next_reader;
                 let batch_file_count = batch
                     .entries
@@ -654,8 +800,9 @@ impl ScanJobService {
                             && next_file_count > MANIFEST_STREAMED_INDEX_BATCH_SIZE
                         || next_child_count > DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE)
                 {
+                    let chunks = std::mem::take(&mut pending_chunks);
                     let Some(commit_result) = self
-                        .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                        .commit_pending_manifest_directory_chunks(context, chunks)
                         .await?
                     else {
                         return Ok(None);
@@ -666,7 +813,6 @@ impl ScanJobService {
                     result.created_items = result
                         .created_items
                         .saturating_add(commit_result.created_items);
-                    pending_chunks.clear();
                     pending_entry_count = 0;
                     pending_file_count = 0;
                     pending_child_count = 0;
@@ -688,8 +834,9 @@ impl ScanJobService {
                         && pending_file_count >= MANIFEST_STREAMED_INDEX_BATCH_SIZE
                     || pending_child_count >= DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE
                 {
+                    let chunks = std::mem::take(&mut pending_chunks);
                     let Some(commit_result) = self
-                        .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                        .commit_pending_manifest_directory_chunks(context, chunks)
                         .await?
                     else {
                         return Ok(None);
@@ -700,7 +847,6 @@ impl ScanJobService {
                     result.created_items = result
                         .created_items
                         .saturating_add(commit_result.created_items);
-                    pending_chunks.clear();
                     pending_entry_count = 0;
                     pending_file_count = 0;
                     pending_child_count = 0;
@@ -711,8 +857,9 @@ impl ScanJobService {
             }
         }
         if !pending_chunks.is_empty() {
+            let chunks = std::mem::take(&mut pending_chunks);
             let Some(commit_result) = self
-                .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                .commit_pending_manifest_directory_chunks(context, chunks)
                 .await?
             else {
                 return Ok(None);
@@ -730,8 +877,135 @@ impl ScanJobService {
     pub(in crate::application::scanner) async fn commit_pending_manifest_directory_chunks(
         &self,
         context: ManifestRootDiscoveryContext<'_>,
-        chunks: &[PendingManifestDirectoryChunk],
+        chunks: Vec<PendingManifestDirectoryChunk>,
     ) -> Result<Option<ManifestDiscoveryCommitResult>, ScannerError> {
+        let batches = if matches!(
+            self.database.backend(),
+            crate::config::DatabaseBackend::Sqlite
+        ) {
+            let budget = ManifestDiscoveryTransactionBudget::sqlite(
+                self.manifest_discovery_transaction_file_limit(),
+                MANIFEST_STREAMED_ENTRY_BATCH_SIZE
+                    .saturating_sub(MANIFEST_STREAMED_INDEX_BATCH_SIZE),
+                DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE,
+                MANIFEST_DISCOVERY_BATCH_SIZE,
+            );
+            split_pending_manifest_directory_chunks(chunks, budget)
+        } else if chunks.is_empty() {
+            Vec::new()
+        } else {
+            vec![chunks]
+        };
+
+        let mut committed_result = ManifestDiscoveryCommitResult::default();
+        let mut legacy_variant_paths = Vec::new();
+        let mut has_committed_slice = false;
+        for batch in batches {
+            if context.cancellation.load(Ordering::Acquire) {
+                if has_committed_slice {
+                    self.finish_manifest_discovery_commit_group(
+                        context,
+                        &committed_result,
+                        &legacy_variant_paths,
+                    )
+                    .await?;
+                }
+                return Ok(None);
+            }
+
+            match self
+                .commit_pending_manifest_directory_chunk_slice(context, &batch)
+                .await
+            {
+                Ok(Some((slice_result, slice_legacy_variant_paths))) => {
+                    committed_result.observed_file_count = committed_result
+                        .observed_file_count
+                        .saturating_add(slice_result.observed_file_count);
+                    committed_result.created_items = committed_result
+                        .created_items
+                        .saturating_add(slice_result.created_items);
+                    committed_result.metadata_targets_changed |=
+                        slice_result.metadata_targets_changed;
+                    committed_result.local_metadata_batches_changed |=
+                        slice_result.local_metadata_batches_changed;
+                    legacy_variant_paths.extend(slice_legacy_variant_paths);
+                    has_committed_slice = true;
+                }
+                Ok(None) => {
+                    if has_committed_slice {
+                        self.finish_manifest_discovery_commit_group(
+                            context,
+                            &committed_result,
+                            &legacy_variant_paths,
+                        )
+                        .await?;
+                    }
+                    return Ok(None);
+                }
+                Err(error) => {
+                    if has_committed_slice {
+                        self.finish_manifest_discovery_commit_group(
+                            context,
+                            &committed_result,
+                            &legacy_variant_paths,
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        if has_committed_slice {
+            self.finish_manifest_discovery_commit_group(
+                context,
+                &committed_result,
+                &legacy_variant_paths,
+            )
+            .await?;
+        }
+        Ok(Some(committed_result))
+    }
+
+    fn manifest_discovery_transaction_file_limit(&self) -> usize {
+        #[cfg(feature = "performance-benchmarks")]
+        {
+            std::env::var("LUX_PERF_DISCOVERY_TRANSACTION_FILES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|limit| *limit > 0)
+                .unwrap_or(DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET)
+        }
+        #[cfg(not(feature = "performance-benchmarks"))]
+        {
+            DEFAULT_SQLITE_MANIFEST_TRANSACTION_FILE_BUDGET
+        }
+    }
+
+    async fn finish_manifest_discovery_commit_group(
+        &self,
+        context: ManifestRootDiscoveryContext<'_>,
+        result: &ManifestDiscoveryCommitResult,
+        legacy_variant_paths: &[String],
+    ) -> Result<(), ScannerError> {
+        let movie_identity_reassigned = self
+            .reconcile_legacy_movie_variant_paths(
+                context.job_id,
+                &context.root.id,
+                Path::new(&context.root.canonical_path),
+                legacy_variant_paths,
+            )
+            .await?;
+        self.publish_home_after_manifest_commit(result, movie_identity_reassigned)
+            .await;
+        Ok(())
+    }
+
+    async fn commit_pending_manifest_directory_chunk_slice(
+        &self,
+        context: ManifestRootDiscoveryContext<'_>,
+        chunks: &[PendingManifestDirectoryChunk],
+    ) -> Result<Option<(ManifestDiscoveryCommitResult, Vec<String>)>, ScannerError> {
         let ManifestRootDiscoveryContext {
             job_id,
             manifest_id,
@@ -750,14 +1024,13 @@ impl ScanJobService {
             .map(|entry| entry.relative_path.clone())
             .collect::<Vec<_>>();
         let baseline_started = Instant::now();
-        let baselines =
-            if stream_files_during_discovery && !skip_baseline_queries && !file_paths.is_empty() {
-                self.database
-                    .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
-                    .await?
-            } else {
-                HashMap::new()
-            };
+        let baselines = if !skip_baseline_queries && !file_paths.is_empty() {
+            self.database
+                .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
+                .await?
+        } else {
+            HashMap::new()
+        };
         record_manifest_scan_stage(
             "baseline_query",
             baseline_started,
@@ -768,10 +1041,13 @@ impl ScanJobService {
         let mut positive_indexes_by_chunk = Vec::with_capacity(chunks.len());
         let mut unchanged_paths_by_chunk = Vec::with_capacity(chunks.len());
         let mut seen_filesystem_entries_by_chunk = Vec::with_capacity(chunks.len());
+        let mut prepared_entries_by_chunk = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             if cancellation.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            let mut entries = chunk.entries.clone();
+            complete_pending_manifest_fingerprints(&mut entries, &baselines).await?;
             if stream_files_during_discovery {
                 let Some((positive_indexes, unchanged_paths, seen_filesystem_entries)) = self
                     .prepare_manifest_discovery_positive_indexes(
@@ -784,7 +1060,7 @@ impl ScanJobService {
                             expected_root_identity,
                             expected_root_observation: &chunk.root_observation,
                             expected_directory_observation: &chunk.directory_observation,
-                            entries: &chunk.entries,
+                            entries: &entries,
                             cancellation,
                         },
                     )
@@ -800,6 +1076,7 @@ impl ScanJobService {
                 unchanged_paths_by_chunk.push(Vec::new());
                 seen_filesystem_entries_by_chunk.push(Vec::new());
             }
+            prepared_entries_by_chunk.push(entries);
         }
         if stream_files_during_discovery {
             let observations = chunks
@@ -829,14 +1106,18 @@ impl ScanJobService {
             .zip(&positive_indexes_by_chunk)
             .zip(&unchanged_paths_by_chunk)
             .zip(&seen_filesystem_entries_by_chunk)
+            .zip(&prepared_entries_by_chunk)
             .map(
-                |(((chunk, positive_indexes), unchanged_paths), seen_filesystem_entries)| {
+                |(
+                    (((chunk, positive_indexes), unchanged_paths), seen_filesystem_entries),
+                    entries,
+                )| {
                     NewScanManifestDiscoveryChunk {
                         manifest_id,
                         job_id,
                         library_root_id: &root.id,
                         child_directories: &chunk.child_directories,
-                        entries: &chunk.entries,
+                        entries,
                         positive_indexes,
                         unchanged_paths,
                         seen_filesystem_entries,
@@ -878,23 +1159,13 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
-                let movie_identity_reassigned = self
-                    .reconcile_legacy_movie_variant_paths(
-                        job_id,
-                        &root.id,
-                        Path::new(&root.canonical_path),
-                        &legacy_variant_paths,
-                    )
-                    .await?;
-                self.publish_home_after_manifest_commit(&result, movie_identity_reassigned)
-                    .await;
                 if result.local_metadata_batches_changed {
                     self.notify_local_metadata_outbox_worker();
                 }
                 if result.metadata_targets_changed {
                     self.notify_local_metadata_worker(job_id);
                 }
-                Ok(Some(result))
+                Ok(Some((result, legacy_variant_paths)))
             }
             Err(error) => {
                 if cancellation.load(Ordering::Acquire)

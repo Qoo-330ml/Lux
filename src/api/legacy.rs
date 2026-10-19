@@ -49,7 +49,7 @@ use crate::{
     application::setup::{SetupError, SetupService},
     application::{
         access::{AccessPrincipal, MediaAccessService},
-        admin_events::{AdminEventHub, AdminEventScope, UserEventHub},
+        admin_events::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope},
         candidates::{
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
@@ -206,12 +206,22 @@ pub struct AppState {
 
 impl AppState {
     pub async fn shutdown_background_workers(&self) {
+        if let Err(error) = self.shutdown_background_workers_checked().await {
+            tracing::error!(%error, "background workers could not drain before shutdown");
+        }
+    }
+
+    pub async fn shutdown_background_workers_checked(&self) -> Result<(), String> {
+        crate::application::probe::shutdown_probe_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(metadata_reidentify) = &self.metadata_reidentify {
             metadata_reidentify.shutdown().await;
         }
         if let Some(worker) = &self.global_collection_sync_worker {
             worker.shutdown().await;
         }
+        Ok(())
     }
 
     pub fn ready(
@@ -244,8 +254,8 @@ impl AppState {
             config.clone(),
             database.backend(),
         ));
-        let admin_events = AdminEventHub::new();
         let user_events = UserEventHub::new();
+        let admin_events = AdminEventHub::new().with_user_events(user_events.clone());
         let web_playback = Some(WebPlaybackSessionService::new(
             database.clone(),
             config_dir.clone(),
@@ -563,6 +573,12 @@ impl AppState {
     }
 
     pub async fn start_scheduled_tasks(&self) {
+        if let (Some(database), Some(avatars)) = (&self.database, &self.user_avatars) {
+            crate::application::user_cleanup::spawn_user_cleanup_worker(
+                database.clone(),
+                avatars.clone(),
+            );
+        }
         if let Some(plugins) = self.plugins.as_ref()
             && let Err(error) = plugins.sync_media_info_scheduled_task().await
         {
@@ -614,7 +630,7 @@ impl AppState {
         }
         if let Some(metadata) = self.metadata_reidentify.clone() {
             tokio::spawn(async move {
-                if let Err(error) = metadata.resume_interrupted_fill_missing_jobs().await {
+                if let Err(error) = metadata.resume_interrupted_metadata_jobs().await {
                     tracing::error!(%error, "failed to requeue interrupted metadata scraping");
                 }
             });
@@ -1021,6 +1037,8 @@ fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option
         .reported_client_ip(
             header_str(headers, "x-lux-peer-ip"),
             header_str(headers, "x-forwarded-for"),
+            header_str(headers, "x-real-ip"),
+            header_str(headers, "forwarded"),
         )
         .map(|address| address.to_string())
 }
@@ -1325,7 +1343,10 @@ async fn lux_set_person_favorite(
         .set_user_person_favorite(&user.id.to_string(), &person.id, request.favorite)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.user_events.publish(UserEventScope::Favorites);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

@@ -1,47 +1,61 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::{Arc, OnceLock},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use quick_xml::{events::Event, reader::Reader};
 use serde_json::{Map, Value};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
-    sync::{Mutex as AsyncMutex, OnceCell, Semaphore},
+    io::AsyncWriteExt,
+    sync::{Mutex as AsyncMutex, OnceCell},
     task::JoinSet,
-    time::timeout,
+    time::{MissedTickBehavior, interval_at},
 };
 
 use crate::{
     application::nfo::{NfoWriteError, NfoWriteService},
     application::plugin_protocol::{MediaProbeRpcResult, MediaProbeRpcStreamType},
-    config::{MAX_PROBE_CONCURRENCY, probe_concurrency_override_from_env},
+    config::probe_concurrency_override_from_env,
     domain::{ids::LibraryId, time::duration_to_ticks},
-    observability::resources::ResourceMetrics,
+    observability::resources::{ResourceMetrics, automatic_probe_concurrency, probe_cpu_capacity},
     storage::{Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredMediaSourcePath},
 };
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
-pub(crate) const DEFAULT_PROBE_CONCURRENCY: usize = 256;
+const PROBE_ADMISSION_TICK: Duration = Duration::from_secs(1);
 pub(crate) const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 512;
-static GLOBAL_PROBE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-fn process_probe_hard_cap() -> Result<usize, String> {
+mod runner;
+use runner::read_limited;
+pub use runner::{FfprobeRunner, ProbeError};
+mod adaptive;
+mod concurrency;
+
+pub(crate) async fn shutdown_probe_runtime() -> Result<(), ProbeServiceError> {
+    concurrency::shutdown_global_runtime()
+        .await
+        .map_err(|error| ProbeServiceError::Worker(error.to_string()))
+}
+
+fn process_probe_hard_cap() -> Result<Option<usize>, String> {
     match probe_concurrency_override_from_env().map_err(|error| error.to_string())? {
         Some(value) => usize::try_from(value)
+            .map(Some)
             .map_err(|_| format!("LUX_PROBE_CONCURRENCY '{value}' is not supported")),
-        None => Ok(MAX_PROBE_CONCURRENCY as usize),
+        None => Ok(None),
     }
+}
+
+fn resolve_process_probe_budget(override_budget: Option<usize>, automatic_budget: usize) -> usize {
+    override_budget
+        .unwrap_or(automatic_budget)
+        .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -720,195 +734,13 @@ fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct FfprobeRunner {
-    binary: PathBuf,
-    timeout: Duration,
-}
-
-impl FfprobeRunner {
-    pub fn new(binary: impl Into<PathBuf>, timeout: Duration) -> Self {
-        Self {
-            binary: binary.into(),
-            timeout,
-        }
-    }
-
-    pub fn default_binary() -> Self {
-        Self::new("ffprobe", DEFAULT_TIMEOUT)
-    }
-
-    pub async fn probe_path(&self, path: &Path) -> Result<MediaProbeResult, ProbeError> {
-        let mut child = Command::new(&self.binary)
-            .args([
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-            ])
-            .arg(path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(ProbeError::Io)?;
-        let output = match timeout(self.timeout, collect_process_output(&mut child)).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
-                terminate_child(&mut child).await;
-                return Err(error);
-            }
-            Err(_) => {
-                terminate_child(&mut child).await;
-                return Err(ProbeError::Timeout);
-            }
-        };
-        if !output.status.success() {
-            return Err(ProbeError::Exit {
-                code: output.status.code(),
-                stderr: truncate(&output.stderr),
-            });
-        }
-        parse_probe_json(&output.stdout)
-    }
-}
-
-impl Default for FfprobeRunner {
-    fn default() -> Self {
-        Self::default_binary()
-    }
-}
-
-#[derive(Debug)]
-pub enum ProbeError {
-    Io(std::io::Error),
-    Timeout,
-    Exit { code: Option<i32>, stderr: String },
-    OutputTooLarge,
-    InvalidOutput(String),
-}
-
-impl ProbeError {
-    pub fn failure_status(&self) -> &'static str {
-        match self {
-            Self::Timeout => "TIMEOUT",
-            Self::Exit { .. } => "FAILED",
-            Self::Io(_) => "FAILED",
-            Self::OutputTooLarge | Self::InvalidOutput(_) => "FAILED",
-        }
-    }
-}
-
-impl fmt::Display for ProbeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "ffprobe process failed: {error}"),
-            Self::Timeout => formatter.write_str("ffprobe timed out"),
-            Self::Exit { code, stderr } => {
-                write!(formatter, "ffprobe exited with {:?}: {}", code, stderr)
-            }
-            Self::OutputTooLarge => formatter.write_str("ffprobe output exceeds size limit"),
-            Self::InvalidOutput(error) => write!(formatter, "invalid ffprobe output: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for ProbeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Timeout | Self::Exit { .. } | Self::OutputTooLarge | Self::InvalidOutput(_) => {
-                None
-            }
-        }
-    }
-}
-
-fn truncate(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BYTES)]);
-    text.trim().to_owned()
-}
-
-async fn read_limited<R>(mut reader: R, max_bytes: usize) -> Result<Vec<u8>, ProbeError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).await.map_err(ProbeError::Io)?;
-        if count == 0 {
-            return Ok(bytes);
-        }
-        if bytes.len().saturating_add(count) > max_bytes {
-            return Err(ProbeError::OutputTooLarge);
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-}
-
-struct CollectedProcessOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-async fn collect_process_output(child: &mut Child) -> Result<CollectedProcessOutput, ProbeError> {
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ProbeError::Io(std::io::Error::other("ffprobe stdout pipe is unavailable"))
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        ProbeError::Io(std::io::Error::other("ffprobe stderr pipe is unavailable"))
-    })?;
-    let mut stdout_future = Box::pin(read_limited(stdout, MAX_OUTPUT_BYTES));
-    let mut stderr_future = Box::pin(read_limited(stderr, MAX_ERROR_BYTES));
-    let mut stdout_result = None;
-    let mut stderr_result = None;
-    while stdout_result.is_none() || stderr_result.is_none() {
-        tokio::select! {
-            result = &mut stdout_future, if stdout_result.is_none() => {
-                match result {
-                    Ok(bytes) => stdout_result = Some(Ok(bytes)),
-                    Err(error) => return Err(error),
-                }
-            }
-            result = &mut stderr_future, if stderr_result.is_none() => {
-                match result {
-                    Ok(bytes) => stderr_result = Some(Ok(bytes)),
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    let stdout = stdout_result.ok_or_else(|| {
-        ProbeError::Io(std::io::Error::other("ffprobe stdout read did not finish"))
-    })??;
-    let stderr = stderr_result.ok_or_else(|| {
-        ProbeError::Io(std::io::Error::other("ffprobe stderr read did not finish"))
-    })??;
-    let status = child.wait().await.map_err(ProbeError::Io)?;
-    Ok(CollectedProcessOutput {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-async fn terminate_child(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = timeout(Duration::from_secs(1), child.wait()).await;
-}
-
 #[derive(Clone)]
 pub struct MediaProbeService {
     database: Database,
     runner: FfprobeRunner,
     nfo_writer: Option<NfoWriteService>,
     resources: ResourceMetrics,
-    global_slots: Arc<Semaphore>,
-    process_hard_cap: Result<usize, String>,
+    process_hard_cap: Result<Option<usize>, String>,
 }
 
 type ProbeTaskResult = (
@@ -972,18 +804,11 @@ impl ProbeTargetState {
 impl MediaProbeService {
     pub fn new(database: Database, runner: FfprobeRunner) -> Self {
         let process_hard_cap = process_probe_hard_cap();
-        let global_slot_count = process_hard_cap
-            .as_ref()
-            .copied()
-            .unwrap_or(MAX_EFFECTIVE_PROBE_CONCURRENCY);
         Self {
             database,
             runner,
             nfo_writer: None,
             resources: ResourceMetrics::new(),
-            global_slots: Arc::clone(
-                GLOBAL_PROBE_SLOTS.get_or_init(|| Arc::new(Semaphore::new(global_slot_count))),
-            ),
             process_hard_cap,
         }
     }
@@ -1056,24 +881,24 @@ impl MediaProbeService {
         library_id: LibraryId,
     ) -> Result<ProbeReport, ProbeServiceError> {
         let mut report = ProbeReport::default();
-        let library_id = library_id.to_string();
-        let configured = self.configured_concurrency(&library_id).await?;
+        let library_id_text = library_id.to_string();
+        let configured = self.configured_concurrency(&library_id_text).await?;
         let subtitle_cache = Arc::new(SubtitleDirectoryCache::default());
         let mut offset = 0_i64;
         loop {
             let sources = self
                 .database
                 .list_media_sources_for_library_page(
-                    &library_id,
+                    &library_id_text,
                     LIBRARY_SOURCE_PAGE_SIZE as i64,
                     offset,
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            let concurrency = self.effective_concurrency(configured).await?;
             self.probe_source_page(
                 sources,
-                concurrency,
+                library_id,
+                configured,
                 &mut report,
                 Arc::clone(&subtitle_cache),
             )
@@ -1092,6 +917,9 @@ impl MediaProbeService {
         library_id: &str,
     ) -> Result<ProbeReport, ProbeServiceError> {
         let configured = self.configured_concurrency(library_id).await?;
+        let library_id = library_id
+            .parse::<LibraryId>()
+            .map_err(|error| ProbeServiceError::Worker(format!("invalid library id: {error}")))?;
         let subtitle_cache = Arc::new(SubtitleDirectoryCache::default());
         let mut report = ProbeReport::default();
         loop {
@@ -1102,11 +930,11 @@ impl MediaProbeService {
             if sources.is_empty() {
                 break;
             }
-            let concurrency = self.effective_concurrency(configured).await?;
             let states = self
                 .probe_source_page(
                     sources,
-                    concurrency,
+                    library_id,
+                    configured,
                     &mut report,
                     Arc::clone(&subtitle_cache),
                 )
@@ -1138,83 +966,218 @@ impl MediaProbeService {
     async fn configured_concurrency(&self, library_id: &str) -> Result<usize, ProbeServiceError> {
         // This is the persisted library/request setting. It intentionally
         // remains separate from the process hard cap and runtime backpressure.
+        let automatic_default = automatic_probe_concurrency().await;
         Ok(self
             .database
             .find_library(library_id)
             .await?
             .and_then(|library| usize::try_from(library.probe_concurrency).ok())
-            .unwrap_or(DEFAULT_PROBE_CONCURRENCY)
+            .unwrap_or(automatic_default)
             .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY))
     }
 
-    async fn effective_concurrency(&self, configured: usize) -> Result<usize, ProbeServiceError> {
-        // This is the actual stage limit used by JoinSet and the global
-        // semaphore for this process.
-        let hard_cap = self
+    async fn global_probe_runtime(&self) -> Result<concurrency::ProbeRuntime, ProbeServiceError> {
+        let override_budget = *self
             .process_hard_cap
             .as_ref()
             .map_err(|error| ProbeServiceError::Worker(error.clone()))?;
-        Ok(self
-            .resources
-            .probe_concurrency(configured, *hard_cap)
-            .await
-            .clamp(1, *hard_cap))
+        let capacity = probe_cpu_capacity().await;
+        let automatic_budget = match override_budget {
+            Some(budget) => budget,
+            None => automatic_probe_concurrency().await,
+        };
+        let budget = resolve_process_probe_budget(override_budget, automatic_budget);
+        let starting_limit = capacity
+            .effective_cores
+            .ceil()
+            .clamp(1.0, MAX_EFFECTIVE_PROBE_CONCURRENCY as f64)
+            as usize;
+        tracing::debug!(
+            cpu_capacity_cores = capacity.effective_cores,
+            cpu_capacity_source = ?capacity.source,
+            process_budget = budget,
+            starting_limit,
+            "initialized CPU-aware probe admission"
+        );
+        concurrency::global_runtime(budget, starting_limit, Instant::now())
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))
+    }
+
+    async fn update_probe_pressure(
+        &self,
+        session: &concurrency::ProbeSession,
+    ) -> Result<(), ProbeServiceError> {
+        let pressure = self.resources.probe_pressure().await;
+        session
+            .update_pressure(pressure, Instant::now())
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))
     }
 
     async fn probe_source_page(
         &self,
         sources: Vec<StoredMediaSourcePath>,
-        concurrency: usize,
+        library_id: LibraryId,
+        configured_limit: usize,
         report: &mut ProbeReport,
         subtitle_cache: Arc<SubtitleDirectoryCache>,
     ) -> Result<Vec<(String, ProbeTargetState)>, ProbeServiceError> {
         let mut states = Vec::new();
-        let mut inputs = Vec::with_capacity(sources.len());
+        let mut local_inputs = VecDeque::new();
+        let mut sidecar_inputs = VecDeque::new();
         for source in sources {
-            if source.probe_status != "PENDING" {
+            let path = safe_media_path(&source.root_path, &source.relative_path)?;
+            if is_strm_path(&path) {
+                if source.probe_status != "PENDING"
+                    && !(source.probe_status == "NOT_CONFIGURED" && has_strm_sidecar(&path).await)
+                {
+                    report.skipped += 1;
+                    states.push((source.source_id, ProbeTargetState::Skipped));
+                    continue;
+                }
+                report.attempted += 1;
+                sidecar_inputs.push_back((source, path));
+            } else if source.probe_status == "PENDING" {
+                report.attempted += 1;
+                local_inputs.push_back((source, path));
+            } else {
                 report.skipped += 1;
                 states.push((source.source_id, ProbeTargetState::Skipped));
-                continue;
             }
-            report.attempted += 1;
-            let path = safe_media_path(&source.root_path, &source.relative_path)?;
-            inputs.push((source, path));
         }
 
+        let runtime = self.global_probe_runtime().await?;
+        let session = runtime
+            .register(
+                library_id,
+                configured_limit,
+                local_inputs.len(),
+                Instant::now(),
+            )
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+        self.update_probe_pressure(&session).await?;
+        let page_worker_limit = configured_limit
+            .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+            .min(LIBRARY_SOURCE_PAGE_SIZE);
         let mut pending = JoinSet::<ProbeTaskResult>::new();
-        for (source, path) in inputs {
-            while pending.len() >= concurrency {
-                states.push(
-                    self.collect_probe_task(&mut pending, report, subtitle_cache.as_ref())
-                        .await?,
-                );
+        let first_tick = tokio::time::Instant::now() + PROBE_ADMISSION_TICK;
+        let mut admission_ticks = interval_at(first_tick, PROBE_ADMISSION_TICK);
+        admission_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            if runtime
+                .is_closing()
+                .map_err(|error| ProbeServiceError::Worker(error.to_string()))?
+            {
+                return Err(ProbeServiceError::Worker(
+                    "probe admission is closing".to_owned(),
+                ));
             }
-            let service = self.clone();
-            pending.spawn(async move {
-                let result = service.probe_source_with_slot(&path).await;
-                (source, path, result)
-            });
-        }
-        while !pending.is_empty() {
-            states.push(
-                self.collect_probe_task(&mut pending, report, subtitle_cache.as_ref())
-                    .await?,
+            let mut blocked_version = None;
+            while pending.len() < page_worker_limit {
+                if !local_inputs.is_empty() {
+                    let observed_version = runtime
+                        .version()
+                        .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                    let permit = match session.try_acquire(Instant::now()) {
+                        Ok(Some(permit)) => permit,
+                        Ok(None) => {
+                            blocked_version = Some(observed_version);
+                            let Some((source, path)) = sidecar_inputs.pop_front() else {
+                                break;
+                            };
+                            let service = self.clone();
+                            pending.spawn(async move {
+                                let result = service.probe_strm_sidecars(&path).await;
+                                (source, path, result)
+                            });
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(ProbeServiceError::Worker(error.to_string()));
+                        }
+                    };
+                    let Some((source, path)) = local_inputs.pop_front() else {
+                        return Err(ProbeServiceError::Worker(
+                            "local probe input disappeared after admission".to_owned(),
+                        ));
+                    };
+                    let service = self.clone();
+                    pending.spawn(async move {
+                        let result = service.probe_source_with_permit(&path, permit).await;
+                        (source, path, result)
+                    });
+                    blocked_version = None;
+                    continue;
+                }
+                if let Some((source, path)) = sidecar_inputs.pop_front() {
+                    let service = self.clone();
+                    pending.spawn(async move {
+                        let result = service.probe_strm_sidecars(&path).await;
+                        (source, path, result)
+                    });
+                    continue;
+                }
+                break;
+            }
+
+            if pending.is_empty() && local_inputs.is_empty() && sidecar_inputs.is_empty() {
+                break;
+            }
+
+            let observed_version = blocked_version.unwrap_or(
+                runtime
+                    .version()
+                    .map_err(|error| ProbeServiceError::Worker(error.to_string()))?,
             );
+            if pending.is_empty() {
+                tokio::select! {
+                    changed = runtime.wait_for_change_since(observed_version) => {
+                        changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                    }
+                    _ = admission_ticks.tick() => {
+                        self.update_probe_pressure(&session).await?;
+                        runtime
+                            .tick(Instant::now())
+                            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                    }
+                }
+                continue;
+            }
+
+            tokio::select! {
+                joined = pending.join_next() => {
+                    let joined = joined.ok_or_else(|| {
+                        ProbeServiceError::Worker("probe task set was empty".to_owned())
+                    })?;
+                    states.push(
+                        self.persist_joined_probe_task(
+                            joined,
+                            report,
+                            subtitle_cache.as_ref(),
+                        )
+                        .await?,
+                    );
+                }
+                changed = runtime.wait_for_change_since(observed_version) => {
+                    changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                }
+                _ = admission_ticks.tick() => {
+                    self.update_probe_pressure(&session).await?;
+                    runtime
+                        .tick(Instant::now())
+                        .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                }
+            }
         }
         Ok(states)
     }
 
-    async fn collect_probe_task(
+    async fn persist_joined_probe_task(
         &self,
-        pending: &mut JoinSet<ProbeTaskResult>,
+        joined: Result<ProbeTaskResult, tokio::task::JoinError>,
         report: &mut ProbeReport,
         subtitle_cache: &SubtitleDirectoryCache,
     ) -> Result<(String, ProbeTargetState), ProbeServiceError> {
-        let task = pending
-            .join_next()
-            .await
-            .ok_or_else(|| ProbeServiceError::Worker("probe task set was empty".to_owned()))?
-            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+        let task = joined.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
         let state = self
             .persist_probe_attempt(&task.0, &task.1, task.2, report, subtitle_cache)
             .await?;
@@ -1310,8 +1273,7 @@ impl MediaProbeService {
                 Ok(ProbeTargetState::Done)
             }
             Ok(None) => {
-                // A STRM without a sidecar is owned by the STRM plugin;
-                // leave it pending instead of making SKIP suppress it.
+                // A selected STRM source remains pending for its persisted plugin job.
                 report.skipped += 1;
                 Ok(ProbeTargetState::Skipped)
             }
@@ -1333,28 +1295,12 @@ impl MediaProbeService {
         }
     }
 
-    async fn probe_source_with_slot(
+    async fn probe_source_with_permit(
         &self,
         path: &Path,
+        permit: concurrency::ProbePermit,
     ) -> Result<Option<MediaProbeResult>, ProbeError> {
-        let permit = self
-            .global_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?;
-        let result = self.probe_source(path).await;
-        drop(permit);
-        result
-    }
-
-    async fn probe_source(&self, path: &Path) -> Result<Option<MediaProbeResult>, ProbeError> {
-        if is_strm_path(path) {
-            return Ok(read_media_info_sidecar(path)
-                .await
-                .or(read_nfo_streamdetails(path).await));
-        }
-        match self.runner.probe_path(path).await {
+        match self.runner.probe_path_with_permit(path, permit).await {
             Ok(result) => Ok(Some(result)),
             Err(error) => read_media_info_sidecar(path)
                 .await
@@ -1362,6 +1308,15 @@ impl MediaProbeService {
                 .map(Some)
                 .ok_or(error),
         }
+    }
+
+    async fn probe_strm_sidecars(
+        &self,
+        path: &Path,
+    ) -> Result<Option<MediaProbeResult>, ProbeError> {
+        Ok(read_media_info_sidecar(path)
+            .await
+            .or(read_nfo_streamdetails(path).await))
     }
 }
 
@@ -1375,6 +1330,15 @@ async fn read_media_info_sidecar(path: &Path) -> Option<MediaProbeResult> {
     let stem = path.file_stem()?.to_str()?;
     let sidecar = path.with_file_name(format!("{stem}-mediainfo.json"));
     read_media_info_sidecar_file(&sidecar).await.ok()
+}
+
+async fn has_strm_sidecar(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let media_info = path.with_file_name(format!("{stem}-mediainfo.json"));
+    let nfo = path.with_extension("nfo");
+    fs::try_exists(media_info).await.unwrap_or(false) || fs::try_exists(nfo).await.unwrap_or(false)
 }
 
 pub(crate) async fn read_media_info_sidecar_file(
@@ -1910,9 +1874,17 @@ mod tests {
 
     use super::{
         MediaInfoSidecarContext, MediaProbeResult, MediaStreamResult, ProbeError, StreamType,
-        SubtitleDirectoryCache, serialize_media_info_sidecar_with_context,
-        write_media_info_sidecar_with_context,
+        SubtitleDirectoryCache, resolve_process_probe_budget,
+        serialize_media_info_sidecar_with_context, write_media_info_sidecar_with_context,
     };
+
+    #[test]
+    fn process_probe_budget_uses_auto_capacity_unless_explicitly_overridden() {
+        assert_eq!(resolve_process_probe_budget(None, 40), 40);
+        assert_eq!(resolve_process_probe_budget(Some(8), 40), 8);
+        assert_eq!(resolve_process_probe_budget(Some(900), 40), 512);
+        assert_eq!(resolve_process_probe_budget(Some(0), 40), 1);
+    }
 
     #[tokio::test]
     async fn subtitle_directory_cache_reuses_one_listing_for_an_operation() {

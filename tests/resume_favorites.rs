@@ -966,6 +966,153 @@ async fn homevideo_playback_progress_and_played_state_flow_into_continue_watchin
 }
 
 #[tokio::test]
+async fn home_continue_watching_advances_to_next_unplayed_episode_after_completion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Series", LibraryKind::Series, false)
+        .await?;
+    let admin_id = admin.id.to_string();
+    let series_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'SERIES', 'Continue Series', 'continue series', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&series_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let mut episode_ids = Vec::new();
+    for (episode_number, title) in [
+        (1_i64, "Continue Series S01E01"),
+        (2, "Continue Series S01E02"),
+    ] {
+        let item_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, series_id, season_number,
+                 episode_number, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'EPISODE', ?, 1, ?, ?, ?, 1000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .bind(&series_id)
+        .bind(episode_number)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        episode_ids.push(item_id);
+    }
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, last_played_at
+         ) VALUES (?, ?, 960000000, 1, 100)",
+    )
+    .bind(&admin_id)
+    .bind(&episode_ids[0])
+    .execute(database.pool())
+    .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let session = cookie_value(&web_login, "lux_session")?;
+    let home_resume = client
+        .get(format!(
+            "{base_url}/api/v1/continue-watching?page=1&pageSize=10"
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(home_resume.status(), reqwest::StatusCode::OK);
+    let home_resume_body = home_resume.json::<Value>().await?;
+    assert_eq!(home_resume_body["total"], 1);
+    assert_eq!(home_resume_body["items"][0]["id"], episode_ids[1]);
+    let home_resume_empty_page = client
+        .get(format!("{base_url}/api/v1/continue-watching"))
+        .query(&[("page", "2"), ("pageSize", "1")])
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    let home_resume_empty_page_body = home_resume_empty_page.json::<Value>().await?;
+    assert_eq!(home_resume_empty_page_body["total"], 1);
+    assert_eq!(
+        home_resume_empty_page_body["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let emby_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="ResumeTest", Device="Mac", DeviceId="resume-next-up", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let emby_token = emby_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing Emby token")?
+        .to_owned();
+    for path in [
+        format!("/Users/{admin_id}/Items/Resume"),
+        format!("/emby/Users/{admin_id}/Items/Resume"),
+    ] {
+        let emby_resume = client
+            .get(format!("{base_url}{path}"))
+            .query(&[("api_key", emby_token.as_str()), ("Limit", "10")])
+            .send()
+            .await?;
+        assert_eq!(emby_resume.status(), reqwest::StatusCode::OK);
+        let emby_resume_body = emby_resume.json::<Value>().await?;
+        assert_eq!(emby_resume_body["TotalRecordCount"], 1);
+        assert_eq!(
+            emby_resume_body["Items"][0]["Id"],
+            emby_public_id(&episode_ids[1])
+        );
+        assert_eq!(
+            emby_resume_body["Items"][0]["UserData"]["PlaybackPositionTicks"],
+            0
+        );
+        assert_eq!(emby_resume_body["Items"][0]["UserData"]["Played"], false);
+    }
+
+    server.abort();
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_resume_keeps_only_latest_eligible_episode_per_series()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

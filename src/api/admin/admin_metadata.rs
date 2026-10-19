@@ -1372,6 +1372,7 @@ pub(crate) fn metadata_reidentify_error(
         | MetadataReidentifyError::Scraper(_)
         | MetadataReidentifyError::Selection(_)
         | MetadataReidentifyError::SelectionUnavailable
+        | MetadataReidentifyError::NoCandidate
         | MetadataReidentifyError::LowConfidence
         | MetadataReidentifyError::Candidate(MetadataCandidateError::Storage(_))
         | MetadataReidentifyError::Storage(_) => api_error(

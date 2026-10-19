@@ -1,4 +1,5 @@
 use super::*;
+use tower::{ServiceExt, service_fn};
 
 const CATALOG_WORKER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PERFORMANCE_PROBE_HEADER: &str = "x-lux-performance-probe";
@@ -10,17 +11,18 @@ const MAX_CONCURRENT_HOME_REQUESTS: usize = MAX_CONCURRENT_CATALOG_REQUESTS;
 pub(super) fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
     let resources = state.resources.clone();
+    let (emby_routes, emby_path_templates) = emby::api_routes();
     let catalog_request_slots =
         Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_CATALOG_REQUESTS));
     let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
     let home_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOME_REQUESTS));
-    Router::new()
+    let app = Router::new()
         .route("/logo.svg", get(web_logo))
         .merge(users::api_routes())
         .merge(admin::api_routes())
         .merge(lux_api::api_routes())
-        .merge(emby::api_routes())
-        .nest("/emby", emby::api_routes())
+        .merge(emby_routes.clone())
+        .nest("/emby", emby_routes)
         .fallback_service(
             ServeDir::new(web_root.clone())
                 .append_index_html_on_directories(true)
@@ -152,7 +154,217 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 )
                 .propagate_x_request_id(),
         )
-        .layer(middleware::from_fn(web_asset_cache_policy))
+        .layer(middleware::from_fn(web_asset_cache_policy));
+    case_insensitive_emby_router(app, emby_path_templates)
+}
+
+struct EmbyRoutePatterns {
+    path_templates: Vec<String>,
+    static_prefixes: Vec<String>,
+}
+
+impl EmbyRoutePatterns {
+    fn new(path_templates: Vec<String>) -> Self {
+        let mut path_templates = path_templates;
+        path_templates.sort_by(|left, right| {
+            left.matches('{')
+                .count()
+                .cmp(&right.matches('{').count())
+                .then_with(|| right.len().cmp(&left.len()))
+        });
+        let mut static_prefixes = Vec::new();
+        for template in &path_templates {
+            let mut prefix = String::new();
+            for segment in template.split('/').skip(1) {
+                if segment.contains('{') {
+                    break;
+                }
+                prefix.push('/');
+                prefix.push_str(segment);
+            }
+            if !prefix.is_empty() && !static_prefixes.contains(&prefix) {
+                static_prefixes.push(prefix);
+            }
+        }
+        Self {
+            path_templates,
+            static_prefixes,
+        }
+    }
+
+    fn matches_static_prefix(&self, path: &str) -> bool {
+        self.static_prefixes.iter().any(|prefix| {
+            path.get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                && path
+                    .get(prefix.len()..)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        })
+    }
+}
+
+fn case_insensitive_emby_router(router: Router, path_templates: Vec<String>) -> Router {
+    let path_patterns = Arc::new(EmbyRoutePatterns::new(path_templates));
+    Router::new().fallback_service(service_fn(move |mut request: Request<Body>| {
+        let router = router.clone();
+        let path_patterns = path_patterns.clone();
+        async move {
+            if !is_media_detail_document_navigation(&request) {
+                normalize_emby_request_path(request.uri_mut(), &path_patterns);
+            }
+            router.oneshot(request).await
+        }
+    }))
+}
+
+fn is_media_detail_document_navigation(request: &Request<Body>) -> bool {
+    if request.method() != Method::GET {
+        return false;
+    }
+    let Some(item_id) = request.uri().path().strip_prefix("/items/") else {
+        return false;
+    };
+    if item_id.is_empty() || item_id.contains('/') {
+        return false;
+    }
+    request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept.split(',').any(|media_range| {
+                media_range
+                    .trim()
+                    .split(';')
+                    .next()
+                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+            })
+        })
+}
+
+fn normalize_emby_request_path(uri: &mut axum::http::Uri, path_patterns: &EmbyRoutePatterns) {
+    let path = uri.path();
+    let emby_prefix = path
+        .get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("/emby"))
+        .filter(|_| {
+            path.get(5..)
+                .is_some_and(|remaining| remaining.is_empty() || remaining.starts_with('/'))
+        });
+    let (prefix, route_path) = if emby_prefix.is_some() {
+        let Some(route_path) = path.get(5..) else {
+            return;
+        };
+        ("/emby", route_path)
+    } else {
+        ("", path)
+    };
+    if !path_patterns.matches_static_prefix(route_path) {
+        return;
+    }
+    let Some(normalized_route_path) = path_patterns
+        .path_templates
+        .iter()
+        .find_map(|template| normalize_route_path(route_path, template))
+    else {
+        return;
+    };
+    let normalized_path = format!("{prefix}{normalized_route_path}");
+    if normalized_path == path {
+        return;
+    }
+
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{normalized_path}?{query}"),
+        None => normalized_path,
+    };
+    let Ok(path_and_query) = path_and_query.parse::<axum::http::uri::PathAndQuery>() else {
+        return;
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    if let Ok(normalized_uri) = axum::http::Uri::from_parts(parts) {
+        *uri = normalized_uri;
+    }
+}
+
+fn normalize_route_path(path: &str, template: &str) -> Option<String> {
+    let mut path_segments = path.split('/');
+    let mut template_segments = template.split('/');
+    let mut normalized_path = String::new();
+    let mut index = 0;
+    loop {
+        match (path_segments.next(), template_segments.next()) {
+            (Some(path_segment), Some(template_segment)) => {
+                if index > 0 {
+                    normalized_path.push('/');
+                }
+                normalized_path.push_str(&normalize_route_segment(path_segment, template_segment)?);
+                index += 1;
+            }
+            (None, None) => return Some(normalized_path),
+            _ => return None,
+        }
+    }
+}
+
+fn normalize_route_segment(path: &str, template: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut path_offset = 0;
+    let mut template_offset = 0;
+
+    while template_offset < template.len() {
+        let template_remaining = &template[template_offset..];
+        let Some(parameter_start) = template_remaining.find('{') else {
+            let static_suffix = template_remaining;
+            let path_suffix = path.get(path_offset..)?;
+            if !path_suffix.eq_ignore_ascii_case(static_suffix) {
+                return None;
+            }
+            normalized.push_str(static_suffix);
+            path_offset = path.len();
+            template_offset = template.len();
+            continue;
+        };
+
+        let static_prefix = &template_remaining[..parameter_start];
+        let path_static_prefix = path.get(path_offset..path_offset + static_prefix.len())?;
+        if !path_static_prefix.eq_ignore_ascii_case(static_prefix) {
+            return None;
+        }
+        normalized.push_str(static_prefix);
+        path_offset += static_prefix.len();
+        template_offset += parameter_start;
+
+        let parameter_end = template[template_offset + 1..].find('}')? + template_offset + 1;
+        let suffix_start = parameter_end + 1;
+        let static_suffix = &template[suffix_start..];
+        let path_remaining = path.get(path_offset..)?;
+        let parameter_length = if static_suffix.is_empty() {
+            path_remaining.len()
+        } else {
+            find_ascii_case_insensitive(path_remaining, static_suffix)?
+        };
+        if parameter_length == 0 {
+            return None;
+        }
+        normalized.push_str(path_remaining.get(..parameter_length)?);
+        path_offset += parameter_length;
+        template_offset = suffix_start;
+    }
+
+    (path_offset == path.len()).then_some(normalized)
+}
+
+fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() || needle.len() > value.len() {
+        return None;
+    }
+    (0..=value.len() - needle.len()).find(|start| {
+        value
+            .get(*start..*start + needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+    })
 }
 
 async fn web_asset_cache_policy(request: Request<Body>, next: Next) -> Response {
@@ -328,6 +540,34 @@ fn catalog_route_class(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emby_case_normalization_preserves_dynamic_segments_and_query() {
+        let path_patterns =
+            EmbyRoutePatterns::new(vec!["/Users/{user_id}/Items/{item_id}".to_owned()]);
+        let mut uri: axum::http::Uri =
+            "/eMbY/uSeRs/AbC-123/iTeMs/IMDB:tt456?api_key=A%2FB&Fields=Id%2CName"
+                .parse()
+                .expect("valid test URI");
+
+        normalize_emby_request_path(&mut uri, &path_patterns);
+
+        assert_eq!(uri.path(), "/emby/Users/AbC-123/Items/IMDB:tt456");
+        assert_eq!(uri.query(), Some("api_key=A%2FB&Fields=Id%2CName"));
+    }
+
+    #[test]
+    fn emby_case_normalization_leaves_non_emby_paths_unchanged() {
+        let path_patterns = EmbyRoutePatterns::new(vec!["/Users/{user_id}".to_owned()]);
+        let mut uri: axum::http::Uri = "/API/v1/auth/LoGiN?ReturnUrl=%2FHome"
+            .parse()
+            .expect("valid test URI");
+        let original = uri.clone();
+
+        normalize_emby_request_path(&mut uri, &path_patterns);
+
+        assert_eq!(uri, original);
+    }
 
     #[test]
     fn web_documents_and_assets_receive_version_aware_cache_policy() {

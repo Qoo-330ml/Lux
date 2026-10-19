@@ -51,10 +51,26 @@ struct FileIndexWriteOptions {
     batch_size: usize,
 }
 
-struct MovieParentFolderBatch<'a> {
+trait ParentFolderFile {
+    fn relative_path(&self) -> &str;
+}
+
+impl ParentFolderFile for &NewMovieFile {
+    fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+impl ParentFolderFile for NewScanManifestUnresolvedFile {
+    fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+}
+
+struct MovieParentFolderBatch<'a, T> {
     library_id: &'a str,
     library_root_id: &'a str,
-    files: &'a [NewMovieFile],
+    files: &'a [T],
     folder_cache: &'a mut HashMap<String, String>,
     touched_folders: &'a mut HashSet<String>,
     batch_size: usize,
@@ -446,7 +462,7 @@ impl Database {
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
             "SELECT lr.canonical_path, fe.relative_path,
-                    fe.fingerprint, fe.size, fe.modified_at,
+                    fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
@@ -466,6 +482,8 @@ impl Database {
                 fingerprint: row.get("fingerprint"),
                 size: row.get("size"),
                 modified_at: row.get("modified_at"),
+                device: row.get("device"),
+                inode: row.get("inode"),
                 title: row.get("title"),
                 production_year: row.get("production_year"),
             })
@@ -483,7 +501,7 @@ impl Database {
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
             "SELECT lr.canonical_path, fe.relative_path,
-                    fe.fingerprint, fe.size, fe.modified_at,
+                    fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
@@ -505,6 +523,8 @@ impl Database {
                 fingerprint: row.get("fingerprint"),
                 size: row.get("size"),
                 modified_at: row.get("modified_at"),
+                device: row.get("device"),
+                inode: row.get("inode"),
                 title: row.get("title"),
                 production_year: row.get("production_year"),
             })
@@ -518,20 +538,28 @@ impl Database {
     pub(crate) async fn find_items_by_source_fingerprint(
         &self,
         fingerprint: &[u8],
+        legacy_size: Option<i64>,
+        legacy_modified_at: Option<i64>,
     ) -> Result<Vec<StoredItemSourceLocator>, StorageError> {
         self.query(
             "SELECT lr.canonical_path, fe.relative_path,
-                    fe.fingerprint, fe.size, fe.modified_at,
+                    fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
              FROM media_sources ms
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              JOIN media_items mi ON mi.id = ms.item_id
-             WHERE fe.fingerprint = ?
+             WHERE (fe.fingerprint = ? OR (
+                    length(?) = 32 AND length(fe.fingerprint) = 25
+                    AND fe.size = ? AND fe.modified_at = ?
+             ))
                AND mi.removed_at IS NULL AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id",
         )
         .bind(fingerprint)
+        .bind(fingerprint)
+        .bind(legacy_size)
+        .bind(legacy_modified_at)
         .fetch_all(&self.pool)
         .await
         .map(|rows| {
@@ -542,6 +570,8 @@ impl Database {
                     fingerprint: row.get("fingerprint"),
                     size: row.get("size"),
                     modified_at: row.get("modified_at"),
+                    device: row.get("device"),
+                    inode: row.get("inode"),
                     title: row.get("title"),
                     production_year: row.get("production_year"),
                 })
@@ -613,8 +643,8 @@ impl Database {
         self.query(
             "INSERT INTO filesystem_entries (
                 id, library_root_id, relative_path, entry_kind, size,
-                modified_at, inode, fingerprint, last_seen_generation, is_missing
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                modified_at, device, inode, fingerprint, last_seen_generation, is_missing
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         )
         .bind(entry.id)
         .bind(entry.library_root_id)
@@ -622,6 +652,7 @@ impl Database {
         .bind(entry.entry_kind)
         .bind(entry.size)
         .bind(entry.modified_at)
+        .bind(entry.device)
         .bind(entry.inode)
         .bind(entry.fingerprint)
         .bind(entry.last_seen_generation)
@@ -647,6 +678,7 @@ impl Database {
             expected_missing,
             size,
             modified_at,
+            device,
             inode,
             fingerprint,
             generation,
@@ -661,7 +693,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE filesystem_entries
-                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                 SET size = ?, modified_at = ?, device = ?, inode = ?, fingerprint = ?,
                      last_seen_generation = ?, last_seen_change_kind = ?,
                      is_missing = 0, updated_at = unixepoch()
                  WHERE id = ? AND library_root_id = ? AND relative_path = ?
@@ -670,6 +702,7 @@ impl Database {
             )
             .bind(size)
             .bind(modified_at)
+            .bind(device)
             .bind(inode)
             .bind(fingerprint)
             .bind(generation)
@@ -693,7 +726,8 @@ impl Database {
             "UPDATE media_sources
              SET source_kind = ?, size = ?, container = ?, edition_name = ?,
                  quality_label = ?, external_url = ?, strm_target_kind = ?,
-                 probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 probe_status = CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END,
+                 probe_error = NULL, updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
         )
         .bind(source_kind)
@@ -703,6 +737,7 @@ impl Database {
         .bind(quality_label)
         .bind(external_url)
         .bind(strm_target_kind)
+        .bind(source_kind)
         .bind(filesystem_entry_id)
         .execute(&mut **transaction)
         .await
@@ -746,7 +781,7 @@ impl Database {
         let batch_size = super::manifest_existing_file_update_chunk_size(self.backend());
         for chunk in updates.chunks(batch_size) {
             let values = std::iter::repeat_n(
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 chunk.len(),
             )
             .collect::<Vec<_>>()
@@ -754,13 +789,14 @@ impl Database {
             let query = format!(
                 "WITH incoming(
                      filesystem_entry_id, library_root_id, relative_path, base_fingerprint,
-                     expected_missing, size, modified_at, inode, fingerprint, generation,
+                     expected_missing, size, modified_at, device, inode, fingerprint, generation,
                      last_seen_change_kind, source_kind, edition_name, quality_label, container,
                      external_url, strm_target_kind
                  ) AS (VALUES {values})
                  UPDATE filesystem_entries AS entry
                  SET size = incoming.size,
                      modified_at = incoming.modified_at,
+                     device = incoming.device,
                      inode = incoming.inode,
                      fingerprint = incoming.fingerprint,
                      last_seen_generation = incoming.generation,
@@ -787,6 +823,7 @@ impl Database {
                     .bind(database_flag(update.expected_missing))
                     .bind(update.size)
                     .bind(update.modified_at)
+                    .bind(update.device)
                     .bind(update.inode)
                     .bind(update.fingerprint)
                     .bind(update.generation)
@@ -829,7 +866,8 @@ impl Database {
                      quality_label = incoming.quality_label,
                      external_url = incoming.external_url,
                      strm_target_kind = incoming.strm_target_kind,
-                     probe_status = 'PENDING',
+                     probe_status = CASE WHEN incoming.source_kind = 'STRM_URL'
+                         THEN 'NOT_CONFIGURED' ELSE 'PENDING' END,
                      probe_error = NULL,
                      updated_at = unixepoch()
                  FROM incoming
@@ -937,13 +975,14 @@ impl Database {
             })?;
         let mut all_chunks_inserted = true;
         for chunk in entries.chunks(batch_size) {
-            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values =
+                std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, ?, 0)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
             let query = format!(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation,
+                    modified_at, device, inode, fingerprint, last_seen_generation,
                     last_seen_change_kind, is_missing
                 ) VALUES {values}
                 ON CONFLICT(library_root_id, relative_path) DO NOTHING"
@@ -956,6 +995,7 @@ impl Database {
                     .bind(entry.relative_path)
                     .bind(entry.size)
                     .bind(entry.modified_at)
+                    .bind(entry.device)
                     .bind(entry.inode)
                     .bind(entry.fingerprint)
                     .bind(generation)
@@ -1022,13 +1062,14 @@ impl Database {
     ) -> Result<HashSet<String>, StorageError> {
         let mut inserted_paths = HashSet::with_capacity(entries.len());
         for chunk in entries.chunks(batch_size) {
-            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values =
+                std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, ?, 0)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
             let query = format!(
                 "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation,
+                    modified_at, device, inode, fingerprint, last_seen_generation,
                     last_seen_change_kind, is_missing
                 ) VALUES {values}
                 ON CONFLICT(library_root_id, relative_path) DO NOTHING
@@ -1042,6 +1083,7 @@ impl Database {
                     .bind(entry.relative_path)
                     .bind(entry.size)
                     .bind(entry.modified_at)
+                    .bind(entry.device)
                     .bind(entry.inode)
                     .bind(entry.fingerprint)
                     .bind(generation)
@@ -1080,7 +1122,7 @@ impl Database {
         let result = self
             .query(
                 "UPDATE filesystem_entries
-                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                SET size = ?, modified_at = ?, device = ?, inode = ?, fingerprint = ?,
                      last_seen_generation = ?, last_seen_change_kind = 'SIDECAR',
                      is_missing = 0, updated_at = unixepoch()
                  WHERE id = ? AND library_root_id = ? AND relative_path = ?
@@ -1089,6 +1131,7 @@ impl Database {
             )
             .bind(observation.size)
             .bind(observation.modified_at)
+            .bind(observation.device)
             .bind(observation.inode)
             .bind(observation.fingerprint.as_slice())
             .bind(generation)
@@ -1107,116 +1150,181 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
+    pub(crate) async fn materialize_manifest_unresolved_files_after_filesystem_insert_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
         library_root_id: &str,
-        file: &NewScanManifestUnresolvedFile,
+        files: &[NewScanManifestUnresolvedFile],
     ) -> Result<(), StorageError> {
-        let item_type = if file.home_video {
-            "VIDEO"
-        } else {
-            "UNRESOLVED"
-        };
-        let identification_status = if file.home_video {
-            "LOCAL_CONFIRMED"
-        } else {
-            "PENDING"
-        };
-        let parent_id = self
-            .ensure_movie_parent_folder_in_transaction(
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut folder_cache = self
+            .prefetch_movie_folders_in_transaction(
                 &mut *transaction,
-                library_id,
                 library_root_id,
-                &file.relative_path,
+                files,
+                BATCH_INSERT_CHUNK_SIZE,
             )
             .await?;
-        let existing_item_id = self
-            .query_scalar::<String>(
-                "SELECT id FROM media_items
-                 WHERE library_id = ? AND identity_key = ? LIMIT 1",
-            )
-            .bind(library_id)
-            .bind(&file.identity_key)
-            .fetch_optional(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let item_id = if let Some(item_id) = existing_item_id {
-            self.query(
-                "UPDATE media_items
-                 SET item_type = ?, parent_id = ?, title = ?, sort_title = ?,
-                     original_title = ?, identification_status = ?, removed_at = NULL,
-                     updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(item_type)
-            .bind(parent_id.as_deref())
-            .bind(&file.title)
-            .bind(file.title.to_lowercase())
-            .bind(&file.title)
-            .bind(identification_status)
-            .bind(&item_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            item_id
+        let mut touched_folders = HashSet::new();
+        self.insert_missing_movie_parent_folders_in_transaction(
+            &mut *transaction,
+            MovieParentFolderBatch {
+                library_id,
+                library_root_id,
+                files,
+                folder_cache: &mut folder_cache,
+                touched_folders: &mut touched_folders,
+                batch_size: BATCH_INSERT_CHUNK_SIZE,
+            },
+        )
+        .await?;
+        self.refresh_existing_movie_parent_folders_in_transaction(
+            &mut *transaction,
+            MovieParentFolderBatch {
+                library_id,
+                library_root_id,
+                files,
+                folder_cache: &mut folder_cache,
+                touched_folders: &mut touched_folders,
+                batch_size: BATCH_INSERT_CHUNK_SIZE,
+            },
+        )
+        .await?;
+
+        let parent_ids = files
+            .iter()
+            .map(|file| {
+                movie_parent_folder_id_from_cache(
+                    library_root_id,
+                    &file.relative_path,
+                    &folder_cache,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let unique_identities = files
+            .iter()
+            .map(|file| &file.identity_key)
+            .collect::<HashSet<_>>();
+        // PostgreSQL rejects an UPSERT that affects the same conflict target twice.
+        // Keep input-order updates for duplicate identities, matching the old per-file path.
+        let item_batch_size = if unique_identities.len() == files.len() {
+            BATCH_INSERT_CHUNK_SIZE
         } else {
-            self.query(
+            1
+        };
+        for (chunk, parent_chunk) in files
+            .chunks(item_batch_size)
+            .zip(parent_ids.chunks(item_batch_size))
+        {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, 1)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut item_write = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO media_items (
                      id, library_id, item_type, parent_id, title, sort_title,
-                     original_title, identification_status, identity_key,
-                     has_available_source
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
-            )
-            .bind(&file.item_id)
-            .bind(library_id)
-            .bind(item_type)
-            .bind(parent_id.as_deref())
-            .bind(&file.title)
-            .bind(file.title.to_lowercase())
-            .bind(&file.title)
-            .bind(identification_status)
-            .bind(&file.identity_key)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            file.item_id.clone()
-        };
-        self.query(
-            "INSERT INTO media_sources (
-                 id, item_id, source_kind, filesystem_entry_id, container, size,
-                 external_url, strm_target_kind, is_default, probe_status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                 CASE WHEN EXISTS (
-                     SELECT 1 FROM media_sources WHERE item_id = ? AND is_default = 1
-                 ) THEN 0 ELSE 1 END, 'PENDING')",
-        )
-        .bind(&file.source_id)
-        .bind(&item_id)
-        .bind(&file.source_kind)
-        .bind(&file.filesystem_entry_id)
-        .bind(&file.container)
-        .bind(file.size)
-        .bind(file.external_url.as_deref())
-        .bind(file.strm_target_kind.as_deref())
-        .bind(&item_id)
-        .execute(&mut **transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+                     original_title, identification_status, identity_key, has_available_source
+                 ) VALUES {values}
+                 ON CONFLICT(identity_key) WHERE identity_key IS NOT NULL DO UPDATE SET
+                     item_type = excluded.item_type, parent_id = excluded.parent_id,
+                     title = excluded.title, sort_title = excluded.sort_title,
+                     original_title = excluded.original_title,
+                     identification_status = excluded.identification_status,
+                     removed_at = NULL, updated_at = unixepoch()
+                 WHERE media_items.library_id = excluded.library_id
+                 RETURNING id, identity_key"
+            )));
+            for (file, parent_id) in chunk.iter().zip(parent_chunk) {
+                item_write = item_write
+                    .bind(&file.item_id)
+                    .bind(library_id)
+                    .bind(if file.home_video {
+                        "VIDEO"
+                    } else {
+                        "UNRESOLVED"
+                    })
+                    .bind(parent_id.as_deref())
+                    .bind(&file.title)
+                    .bind(file.title.to_lowercase())
+                    .bind(&file.title)
+                    .bind(if file.home_video {
+                        "LOCAL_CONFIRMED"
+                    } else {
+                        "PENDING"
+                    })
+                    .bind(&file.identity_key);
+            }
+            let item_ids = item_write
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>("identity_key")?,
+                        row.try_get::<String, _>("id")?,
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>, sqlx::Error>>()
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let source_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut source_insert = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH incoming(
+                     id, item_id, source_kind, filesystem_entry_id, container,
+                     size, external_url, strm_target_kind
+                 ) AS (VALUES {source_values})
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, container,
+                     size, external_url, strm_target_kind, is_default, probe_status
+                 )
+                 SELECT incoming.id, incoming.item_id, incoming.source_kind,
+                        incoming.filesystem_entry_id, incoming.container, incoming.size,
+                        incoming.external_url, incoming.strm_target_kind,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM media_sources existing
+                            WHERE existing.item_id = incoming.item_id AND existing.is_default = 1
+                        ) THEN 0 ELSE 1 END,
+                        CASE WHEN incoming.source_kind = 'STRM_URL'
+                             THEN 'NOT_CONFIGURED' ELSE 'PENDING' END
+                 FROM incoming"
+            )));
+            for file in chunk {
+                let item_id = item_ids.get(&file.identity_key).ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest unresolved item was not materialized".to_owned(),
+                    )
+                })?;
+                source_insert = source_insert
+                    .bind(&file.source_id)
+                    .bind(item_id)
+                    .bind(&file.source_kind)
+                    .bind(&file.filesystem_entry_id)
+                    .bind(&file.container)
+                    .bind(file.size)
+                    .bind(file.external_url.as_deref())
+                    .bind(file.strm_target_kind.as_deref());
+            }
+            source_insert
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
     }
 
     async fn ensure_movie_parent_folder_in_transaction(
@@ -1311,7 +1419,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
-        files: &[NewMovieFile],
+        files: &[&NewMovieFile],
         batch_size: usize,
     ) -> Result<HashMap<(String, Option<i64>), PrefetchedMovieItem>, StorageError> {
         let mut sort_titles = files
@@ -1401,22 +1509,22 @@ impl Database {
         Ok(movie_items)
     }
 
-    async fn prefetch_movie_folders_in_transaction(
+    async fn prefetch_movie_folders_in_transaction<T: ParentFolderFile>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_root_id: &str,
-        files: &[NewMovieFile],
+        files: &[T],
         batch_size: usize,
     ) -> Result<HashMap<String, String>, StorageError> {
         let mut identity_keys = HashSet::new();
         for file in files {
             let mut directory_key = String::new();
             let directory = file
-                .relative_path
+                .relative_path()
                 .rsplit_once('/')
                 .map(|(directory, _)| directory)
                 .or_else(|| {
-                    file.relative_path
+                    file.relative_path()
                         .rsplit_once('\\')
                         .map(|(directory, _)| directory)
                 })
@@ -1474,10 +1582,10 @@ impl Database {
         Ok(folders)
     }
 
-    async fn insert_missing_movie_parent_folders_in_transaction(
+    async fn insert_missing_movie_parent_folders_in_transaction<T: ParentFolderFile>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        batch: MovieParentFolderBatch<'_>,
+        batch: MovieParentFolderBatch<'_, T>,
     ) -> Result<(), StorageError> {
         let MovieParentFolderBatch {
             library_id,
@@ -1490,11 +1598,11 @@ impl Database {
         let mut missing = HashMap::<String, MovieParentFolderToInsert>::new();
         for file in files {
             let directory = file
-                .relative_path
+                .relative_path()
                 .rsplit_once('/')
                 .map(|(directory, _)| directory)
                 .or_else(|| {
-                    file.relative_path
+                    file.relative_path()
                         .rsplit_once('\\')
                         .map(|(directory, _)| directory)
                 })
@@ -1652,10 +1760,10 @@ impl Database {
         Ok(())
     }
 
-    async fn refresh_existing_movie_parent_folders_in_transaction(
+    async fn refresh_existing_movie_parent_folders_in_transaction<T: ParentFolderFile>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        batch: MovieParentFolderBatch<'_>,
+        batch: MovieParentFolderBatch<'_, T>,
     ) -> Result<(), StorageError> {
         let MovieParentFolderBatch {
             library_id,
@@ -1668,11 +1776,11 @@ impl Database {
         let mut updates = HashMap::<String, MovieParentFolderUpdate>::new();
         for file in files {
             let directory = file
-                .relative_path
+                .relative_path()
                 .rsplit_once('/')
                 .map(|(directory, _)| directory)
                 .or_else(|| {
-                    file.relative_path
+                    file.relative_path()
                         .rsplit_once('\\')
                         .map(|(directory, _)| directory)
                 })
@@ -1961,6 +2069,7 @@ impl Database {
         generation: &str,
         files: &[NewMovieFile],
     ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
         self.insert_movie_files_batch_in_transaction_inner(
             transaction,
             FileIndexScope {
@@ -1968,7 +2077,7 @@ impl Database {
                 library_root_id,
                 generation,
             },
-            files,
+            &files,
             FileIndexWriteOptions {
                 insert_filesystem_entries: true,
                 batch_size: BATCH_INSERT_CHUNK_SIZE,
@@ -1984,6 +2093,31 @@ impl Database {
         library_root_id: &str,
         generation: &str,
         files: &[NewMovieFile],
+    ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
+        self.insert_movie_files_batch_in_transaction_inner(
+            transaction,
+            FileIndexScope {
+                library_id,
+                library_root_id,
+                generation,
+            },
+            &files,
+            FileIndexWriteOptions {
+                insert_filesystem_entries: false,
+                batch_size: super::manifest_positive_index_insert_chunk_size(self.backend()),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_movie_files_without_filesystem_entries_refs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[&NewMovieFile],
     ) -> Result<usize, StorageError> {
         self.insert_movie_files_batch_in_transaction_inner(
             transaction,
@@ -2005,7 +2139,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         scope: FileIndexScope<'_>,
-        files: &[NewMovieFile],
+        files: &[&NewMovieFile],
         options: FileIndexWriteOptions,
     ) -> Result<usize, StorageError> {
         let FileIndexScope {
@@ -2086,13 +2220,13 @@ impl Database {
         if insert_filesystem_entries {
             for chunk in files.chunks(batch_size) {
                 let values =
-                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
                         .collect::<Vec<_>>()
                         .join(", ");
                 let query = format!(
                     "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                    modified_at, device, inode, fingerprint, last_seen_generation, is_missing
                 ) VALUES {values}"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2103,7 +2237,8 @@ impl Database {
                         .bind(&file.relative_path)
                         .bind(file.size)
                         .bind(file.modified_at)
-                        .bind(Option::<i64>::None)
+                        .bind(file.device)
+                        .bind(file.inode)
                         .bind(&file.fingerprint)
                         .bind(generation);
                 }
@@ -2238,9 +2373,12 @@ impl Database {
         let movie_source_insert_started = Instant::now();
         for chunk in source_rows.chunks(batch_size) {
             let values =
-                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')", chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                std::iter::repeat_n(
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
+                    chunk.len(),
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
                 "INSERT INTO media_sources (
                     id, item_id, source_kind, filesystem_entry_id,
@@ -2263,6 +2401,7 @@ impl Database {
                     .bind(file.external_url.as_deref())
                     .bind(file.strm_target_kind.as_deref())
                     .bind(database_flag(*is_new_item));
+                statement = statement.bind(&file.source_kind);
             }
             statement
                 .execute(&mut **transaction)
@@ -2375,6 +2514,7 @@ impl Database {
         generation: &str,
         files: &[NewEpisodeFile],
     ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
         self.insert_episode_files_batch_in_transaction_inner(
             transaction,
             FileIndexScope {
@@ -2382,7 +2522,7 @@ impl Database {
                 library_root_id,
                 generation,
             },
-            files,
+            &files,
             FileIndexWriteOptions {
                 insert_filesystem_entries: true,
                 batch_size: BATCH_INSERT_CHUNK_SIZE,
@@ -2398,6 +2538,31 @@ impl Database {
         library_root_id: &str,
         generation: &str,
         files: &[NewEpisodeFile],
+    ) -> Result<usize, StorageError> {
+        let files = files.iter().collect::<Vec<_>>();
+        self.insert_episode_files_batch_in_transaction_inner(
+            transaction,
+            FileIndexScope {
+                library_id,
+                library_root_id,
+                generation,
+            },
+            &files,
+            FileIndexWriteOptions {
+                insert_filesystem_entries: false,
+                batch_size: super::manifest_positive_index_insert_chunk_size(self.backend()),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_episode_files_without_filesystem_entries_refs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[&NewEpisodeFile],
     ) -> Result<usize, StorageError> {
         self.insert_episode_files_batch_in_transaction_inner(
             transaction,
@@ -2419,7 +2584,7 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         scope: FileIndexScope<'_>,
-        files: &[NewEpisodeFile],
+        files: &[&NewEpisodeFile],
         options: FileIndexWriteOptions,
     ) -> Result<usize, StorageError> {
         let FileIndexScope {
@@ -2438,13 +2603,13 @@ impl Database {
         if insert_filesystem_entries {
             for chunk in files.chunks(batch_size) {
                 let values =
-                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
                         .collect::<Vec<_>>()
                         .join(", ");
                 let query = format!(
                     "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
-                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                    modified_at, device, inode, fingerprint, last_seen_generation, is_missing
                 ) VALUES {values}"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2455,6 +2620,7 @@ impl Database {
                         .bind(&file.relative_path)
                         .bind(file.size)
                         .bind(file.modified_at)
+                        .bind(file.device)
                         .bind(file.inode)
                         .bind(&file.fingerprint)
                         .bind(generation);
@@ -2635,9 +2801,12 @@ impl Database {
         let mut defaulted_episode_identities = HashSet::new();
         for chunk in files.chunks(batch_size) {
             let values =
-                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')", chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                std::iter::repeat_n(
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
+                    chunk.len(),
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
                 "INSERT INTO media_sources (
                     id, item_id, source_kind, filesystem_entry_id,
@@ -2664,6 +2833,7 @@ impl Database {
                     .bind(file.external_url.as_deref())
                     .bind(file.strm_target_kind.as_deref())
                     .bind(database_flag(is_default));
+                statement = statement.bind(&file.source_kind);
             }
             statement
                 .execute(&mut **transaction)
@@ -2840,6 +3010,7 @@ impl Database {
     where
         I: IntoIterator<Item = &'a BatchHierarchyRow>,
     {
+        let mut updates = Vec::new();
         for row in rows {
             if !removed_identities.contains(&row.identity_key) {
                 continue;
@@ -2847,27 +3018,52 @@ impl Database {
             let Some(item_id) = ids.get(&row.identity_key) else {
                 continue;
             };
-            self.query(
-                "UPDATE media_items
-                 SET library_id = ?, item_type = ?, parent_id = ?, series_id = ?,
-                     season_number = ?, episode_number = ?, absolute_number = ?,
+            updates.push((item_id.as_str(), row));
+        }
+        for chunk in updates.chunks(100) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH revive(id, library_id, item_type, parent_id, series_id,
+                              season_number, episode_number, absolute_number) AS (
+                    VALUES {values}
+                 )
+                 UPDATE media_items
+                 SET library_id = (SELECT library_id FROM revive WHERE revive.id = media_items.id),
+                     item_type = (SELECT item_type FROM revive WHERE revive.id = media_items.id),
+                     parent_id = (SELECT parent_id FROM revive WHERE revive.id = media_items.id),
+                     series_id = (SELECT series_id FROM revive WHERE revive.id = media_items.id),
+                     season_number = (SELECT season_number FROM revive WHERE revive.id = media_items.id),
+                     episode_number = (SELECT episode_number FROM revive WHERE revive.id = media_items.id),
+                     absolute_number = (SELECT absolute_number FROM revive WHERE revive.id = media_items.id),
                      removed_at = NULL, updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(&row.library_id)
-            .bind(row.item_type)
-            .bind(row.parent_id.as_deref())
-            .bind(row.series_id.as_deref())
-            .bind(row.season_number)
-            .bind(row.episode_number)
-            .bind(row.absolute_number)
-            .bind(item_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 WHERE id IN ({placeholders})"
+            )));
+            for (item_id, row) in chunk {
+                query = query
+                    .bind(item_id)
+                    .bind(&row.library_id)
+                    .bind(row.item_type)
+                    .bind(row.parent_id.as_deref())
+                    .bind(row.series_id.as_deref())
+                    .bind(row.season_number)
+                    .bind(row.episode_number)
+                    .bind(row.absolute_number);
+            }
+            for (item_id, _) in chunk {
+                query = query.bind(item_id);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }

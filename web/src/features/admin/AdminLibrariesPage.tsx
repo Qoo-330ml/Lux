@@ -233,7 +233,7 @@ export function AdminLibrariesPage() {
             {kind === "HOMEVIDEOS" ? null : <ScraperListEditor value={scrapers} plugins={pluginItems} onChange={setScrapers} />}
             <ChapterSourceSelect id="new-library-chapter-source" kind={kind} value={chapterSourceId} sources={chapterSourceItems} onChange={setChapterSourceId} />
             <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库启用实时文件监控" checked={createRealtimeWatchEnabled} onChange={(event) => setCreateRealtimeWatchEnabled(event.target.checked)} /><span>启用实时文件监控</span></label>
-            {kind === "HOMEVIDEOS" ? null : <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库实时新增资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} /><span>实时新增资源自动刮削</span></label>}
+            {kind === "HOMEVIDEOS" ? null : <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库新增/变化资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} /><span>新增/变化资源自动刮削</span></label>}
             <section className="lux-library-dialog-section lux-library-create-root-section">
               <div className="lux-library-dialog-section-heading"><div><h3>文件夹</h3><span>创建后自动开始扫描</span></div><Folder size={18} aria-hidden="true" /></div>
               {createRootPaths.length > 0 ? <div className="lux-library-dialog-root-list">{createRootPaths.map((path) => <div className="lux-library-dialog-root-row" key={path}><span title={path}>{path}</span><button className="lux-library-dialog-icon" type="button" aria-label={`移除新媒体库路径 ${path}`} onClick={() => removeCreateRootPath(path)} disabled={create.isPending}><MinusCircle size={18} /></button></div>)}</div> : null}
@@ -559,7 +559,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
               <label className="lux-admin-toggle"><input type="checkbox" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} /><span>启用媒体库</span></label>
               <label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 启用实时文件监控`} checked={library.realtimeWatchEnabled} onChange={(event) => update.mutate({ values: { realtimeWatchEnabled: event.target.checked } })} /><span>启用实时文件监控</span></label>
               {editKind === "HOMEVIDEOS" ? null : <>
-                <label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 实时新增资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} /><span>实时新增资源自动刮削</span></label>
+                <label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 新增/变化资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} /><span>新增/变化资源自动刮削</span></label>
                 <ScraperListEditor value={scrapers} plugins={plugins} onChange={updateScrapers} />
               </>}
               <ChapterSourceSelect id={`library-chapter-source-${library.id}`} kind={editKind} value={chapterSourceId} sources={chapterSources} onChange={updateChapterSource} />

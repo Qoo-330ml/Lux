@@ -169,14 +169,45 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let session_cookie = cookie_value(web_login.headers(), "lux_session");
     let csrf_cookie = cookie_value(web_login.headers(), "lux_csrf");
     let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
+    let initial_settings: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(initial_settings["userDeletionGraceDays"], 7);
+
     let settings = client
         .patch(format!("{base_url}/api/v1/admin/settings"))
         .header(COOKIE, &cookies)
         .header("X-CSRF-Token", &csrf_cookie)
-        .json(&json!({ "serverName": "客厅 Lux" }))
+        .json(&json!({ "serverName": "客厅 Lux", "userDeletionGraceDays": 30 }))
         .send()
         .await?;
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
+    let settings_body: Value = settings.json().await?;
+    assert_eq!(settings_body["userDeletionGraceDays"], 30);
+
+    for invalid_days in [0, 3_651] {
+        let invalid_retention = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "userDeletionGraceDays": invalid_days }))
+            .send()
+            .await?;
+        assert_eq!(invalid_retention.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    let settings_after_rejection: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(settings_after_rejection["userDeletionGraceDays"], 30);
 
     for _ in 0..24 {
         let repeated_login = client

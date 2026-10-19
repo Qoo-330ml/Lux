@@ -1,5 +1,81 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-616 管理员用户播放策略 API（2026-10-19）
+
+管理员可通过 `GET /api/v1/admin/users/{userId}/playback-policy` 读取用户的 `canPlay`、
+`maxSimultaneousPlaybacks`、`allowRemux`、`allowAudioTranscode` 和 `allowVideoTranscode`；
+使用 `PUT` 提交完整策略。并发上限 `0` 表示不限，负值返回 `400`；未知或已回收站用户
+返回 `404`。写入要求管理员会话及 CSRF token，并记录 `USER_PLAYBACK_POLICY_UPDATED`。
+该设置接口不表示播放准入或转码限制已经实施；对应实施任务另行记录。
+
+## LUX-592 反向代理客户端 IP（2026-10-19）
+
+播放会话和登录/播放活动的客户端 IP 按有效 `X-Forwarded-For`、`X-Real-IP`、
+`Forwarded` 顺序回退。`X-Forwarded-For` 沿用首个地址规则；`X-Real-IP` 接受单个
+IPv4/IPv6；`Forwarded` 按 [RFC 7239](https://www.rfc-editor.org/rfc/rfc7239.html)
+读取首个代理元素中的 `for`，支持引号、大小写不敏感参数名、IPv6 方括号和可选端口。
+`unknown`、混淆节点、重复 `for` 或异常地址不作为客户端 IP；首个元素不可用时不采用后续代理 IP。
+
+转发头全部缺失或无效时不把连接对端 IP 当作真实客户端 IP；既有会话仍沿用已记录的地址。
+这些地址继续仅用于展示和活动元数据，账号认证、媒体库 ACL、限流和 `X-Forwarded-Proto`
+的 HTTPS 判断保持原有行为。反代需要实际传递上述 IP 请求头之一；本功能无法恢复未传递的客户端地址。
+
+自动化验证范围：本机 ARM64/SQLite，真实回环 HTTP 的根路径及 `/emby` 播放回调、
+数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`。真实 Lucky、
+FNOS/x86_64 及第三方播放器部署验证待进行；Rust 检查结果见开发规格 LUX-592。
+
+## LUX-146 STRM 媒体源探测状态
+
+媒体源 API 的 `probeStatus` 现在可能为 `NOT_CONFIGURED`，表示该 STRM 来源当前没有被启用插件的媒体库选择
+覆盖，也没有等待运行的探测作业。此状态不会触发普通本地 `ffprobe`。插件库选择保存或插件重新启用后，
+宿主为所选库创建持久化 STRM 作业，来源只有在作业成功落库后才转为 `PENDING`；作业处理结束后转为
+`READY`、`FAILED` 或 `TIMEOUT`。本变更保留原有 API 字段形状，不改变播放或 PlaybackInfo 的行为。
+
+## LUX-561 后台预算与本地 ffprobe 调度兼容性（2026-10-16）
+
+扫描指纹的 stat 命中和 v2 编码不改变 API/Emby DTO、数据库对外模型或扫描完成合同。后台预算只控制 Lux 进程内重工作片段的准入；Discovery/Manifest preparation、扫描指纹、本地 NFO/图片计算、ffprobe 与缩略图共享进程级 CPU 名额，原有每管线和子进程上限继续生效。LUX_BACKGROUND_CPU_BUDGET 留空时按 CPU/cgroup 推导，显式整数夹到 1–32，并在进程初始化时读取。ffprobe 自适应调度只调整内置本地 ffprobe；不读取 CPU 使用率，远程 STRM 插件调度独立。
+
+.strm 的 mediainfo/NFO 旁车仍独立读取，不启动或计入本地 ffprobe；本地视频内容变化仍派生对应探测目标，未变化视频不会因扫描附件变化而重探测。服务关停等待探测会话与活动子进程回收后，再完成后台 worker 关停。
+
+分支合并前的本机定向 Rust 回归覆盖预算原语 9/9、probe 20/20、thumbnails 18/18、跨服务/跨库混合用例 1/1、metadata 21/21、scanned_series_metadata 3/3，混合用例还验证后台预算占用期间前台 metadata 可继续完成。scanned_metadata 22/23，唯一失败也在干净基线 1e7c2ea8 复现。ffprobe 分支的自动化与探测器定向检查记录在开发文档及性能记录中。按项目所有者要求不执行后台混合负载性能 A/B；本任务未部署到 FNOS，这些功能测试不能证明 NAS CPU 降幅或第三方客户端体验变化。
+
+### Manifest 删除差异查询（2026-10-16）
+
+此项只改变内部 Manifest 查询和候选分页方式，不改变 Lux/Emby API、Manifest 格式、客户端请求/响应或数据库 schema。`format 3/LITE`、`PERSISTED v3`、workflow 1/2/3 与 legacy 的删除候选边界继续由完整复合键 seen/delta 反连接保护；分页固定在 COMPLETE root 内按相对路径 keyset 推进。
+
+本机 macOS `arm64` / SQLite 3.51.3：storage 删除候选分页测试、`scanning_jobs` 88/88、build、fmt 和全目标 Clippy 通过。EXPLAIN 使用已有 `(library_root_id, relative_path)` 唯一索引范围，不再为候选排序建立临时 B-tree；未新增索引或 migration。LUX-270 60k/600 fixture 的 8 轮交错首扫、重扫与前台/catalog/batch p95 中位数变化均在 5% 门内，详细样本见 `PERFORMANCE.md`。这不是生产 CPU 或 NAS 性能结论。
+
+完整 Rust 测试门未通过：未修改的 `tests/scanned_metadata.rs::failed_local_poster_insert_does_not_mark_image_stage_complete` 在本分支和干净基线 `1e7c2ea8` 都以实际插入 2 张海报、预期 1 张失败；合并参数对象后的全目标串行重跑还遇到一个 `login_background` 15 秒超时，该精确用例单独重跑通过（1/1）。并行期间另一次 `libraries_api` 503 在隔离及串行目标重跑通过。Web 冻结安装与 production build 通过；当前 `pnpm test` 的静态部分为 145/148，独立 Vitest 为 650/655，失败都在未修改的 Web 页面/CSS/组件查询用例，本任务未修改这些行为或断言。未取得 PostgreSQL、FNOS/x86_64 或部署后验证证据。
+
+## LUX-552 Web 媒体库虚拟化（2026-10-15）
+
+Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在行。列数沿用现有 CSS 网格，行高含待确认徽章与操作提示并动态测量；窗口缩放保留聚焦卡片和未保存的编辑草稿。分页仍由原 `useInfiniteQuery` 和列表底部 sentinel 驱动，选择状态仍由库页持有。文件夹、只读合集、排序、元数据筛选、分页失败重试及批量操作由 19 个库页测试覆盖。
+
+本机 arm64 / Headless Chrome 155 的 Playwright 检查覆盖 320、768、1024、1440px、504 项首尾访问、跨屏多选、24 项起步连续分页，以及实际元数据编辑器缩放后的草稿保留；没有 pageerror。504 项桌面首屏的卡片节点从 504 降至 28。测试数据和 API 返回值为本地模拟，未访问 FNOS；Safari、iOS 与真实大库网络体验仍待实测。
+
+相关定向测试 24/24、冻结依赖安装、TypeScript、production build 与 fmt 通过；全量 Web 检查的 2 个静态失败和 4 个 Vitest 失败均在原始基线复现，详见 LUX-DEVELOPMENT.md 的 LUX-552 验收记录。新增依赖 `@tanstack/react-virtual` 使用独立库页 chunk（约 8.42KB gzip）。
+
+## LUX-555–560 Web 用户事件与查询策略（2026-10-15）
+
+同源、已登录 `/api/v1/events` 继续以 version 1 ready 帧开始，失效 scope 扩展为
+home/item/library/favorites。服务端只广播作用域，不包含用户、媒体、媒体库 ID 或业务数据；
+客户端收到 home 或丢帧恢复通知时重新读取全部媒体展示缓存，响应仍执行原有鉴权和 ACL。
+可选 itemId/libraryId 仅作为客户端收窄能力，当前服务器不发送它们。播放 bootstrap 和 session
+不在失效范围内，避免正在播放的会话被重建。
+
+Web 与通知服务端应一起发布：元数据/图像/媒体库/权限/设置、任务关键状态和收藏/已看/播放进度
+等成功修改会发送用户失效；高频 jobs progress 不转发。SSE 在线时首页/详情无周期请求；
+连接错误或 EventSource 不可用时前台 30 秒兜底，原生重连后全量同步并停止轮询。
+首页四区块仍独立加载，30 秒内回访复用缓存。Emby DTO、数据库 schema、播放票据与认证未变。
+
+macOS arm64 自动化：事件中心库测试 7/7、HTTP/SSE `admin_events` 3/3、用户状态/继续观看/
+Web 播放相关目标 6/6、定向 Web 64/64 通过。Chromium 本地固定 API/SSE fixture 验证在线停轮询、
+断线约 30 秒刷新、事件更新、原生重连和首页快速回访；前后请求计数见 `PERFORMANCE.md`。
+该浏览器 fixture 与 Rust HTTP/SSE 合同测试是独立证据，不代表 FNOS 或真实媒体库已部署验证。
+
+Web 全量存在基线已有的 2 项静态布局断言和 4 项组件断言失败；相同用例在原始基线复现。
+Rust 完整检查最终结果见 `LUX-DEVELOPMENT.md` 的 LUX-560 实施记录。
+
 ## LUX-195 元数据刮削器边界
 
 元数据插件通过 `providerKey` 声明身份命名空间，`pluginId` 只表示安装/运行时实现。应用层统一调用
@@ -13,6 +89,18 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 也不把缺失能力报告为 TMDb 故障。`tmdb`、`douban` 仍是兼容 namespace/alias；此变更不新增数据库 migration。
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
+
+## LUX-550 Web 详情页查询与渲染隔离（2026-10-16）
+
+代码 `5c5661ab` 将详情页拆为 Hero、操作区、版本/轨道、剧集、演员、剧照与 NFO，保留原 API、15 秒刷新和布局。父剧与剧集列表查询各共享一个 observer；五个编辑器仅在打开时动态导入。共享媒体卡片入口也改为动态导入，避免静态引用把编辑器带回应用入口。
+
+本机 macOS `arm64`：详情功能 34/34、性能隔离 7/7、编辑器加载边界 2/2，以及相关 Node 布局/导入检查 35/35 通过。回归覆盖电影、视频、剧集、季度、单集、季海报回退、版本/音频/字幕、收藏/已看、确认与下一个待确认、编辑和删除行为；冻结安装、TypeScript 和生产构建通过。
+
+Playwright Chrome `155.0.8059.41` 对本分支 production bundle 使用合成 API，1440 和 390 px 均无横向溢出。验证首屏不请求编辑器、五编辑器分别按需请求并在关闭后卸载、指定版本播放/删除、音轨、收藏/已看、元数据保存、删除失败提示、单季展开、分集分页、下一集与季海报回退。另模拟编辑器 JS 延迟及失败，详情保持可见，错误可关闭，未出现未捕获页面错误。主流程无非预期控制台错误；刻意返回的删除 HTTP 409 单独计为预期。
+
+复现入口为 `scripts/detail-browser-smoke.mjs` 和同一 Playwright session 中随后执行的 `scripts/detail-editor-failure-smoke.mjs`，使用本地 `vite preview` 的 5199 端口。该结果不代表真实后端、生产库、移动设备或其他客户端兼容性；尚无线上帧率或交互延迟测量。
+
+完整 Web 门禁尚未全绿：`pnpm --dir web test` 静态阶段 142 passed、2 failed；另行完整 Vitest 608 passed、4 failed。失败均在干净 `8c8d5c13` 基线上复现，涉及 `home-media-layout.test.mjs`、`responsive-layout.test.mjs`，及 `home-media.test.tsx` 一项评分、`home-page.test.tsx` 一项预取、`library-card.test.tsx` 两项预取/虚拟合集旧链接断言。本任务未调整这些既有行为或断言。
 
 ## LUX-548 iOS 爆米花继续观看（2026-10-15）
 
@@ -166,9 +254,9 @@ VidHub、SenPlayer、Infuse 或其他第三方客户端已经完成真实客户�
 
 ## Emby Resume 同剧单集聚合
 
-`GET /Users/{userId}/Items/Resume`（包括 `/emby` 前缀）对同一剧只返回一条符合继续观看条件的单集：先按季号、再按集号取最大值；季集号相同时按最近播放时间决胜。电影仍逐条返回。`TotalRecordCount` 和分页都在同剧单集收敛后计算，因此不同 Emby 客户端用该接口生成“继续观看”时不会同时展示同剧的多集。
+`GET /Users/{userId}/Items/Resume`（包括 `/emby` 前缀）对同一剧只返回一条符合继续观看条件的单集：先按季号、再按集号取最大值；季集号相同时按最近播放时间决胜。电影仍逐条返回。若最近播放的单集已看，且没有更靠后的合格未完成进度，Resume 会返回其后的第一集未看且可播放单集，`UserData.PlaybackPositionTicks` 为 `0`、`Played` 为 `false`。`TotalRecordCount` 和分页都在同剧单集收敛后计算。
 
-`tests/resume_favorites.rs` 覆盖根路径和 `/emby` 路径的协议响应；自动化结果证明服务端合同，不替代 SenPlayer、VidHub、Infuse 或其他客户端部署环境的 UI 实测。
+`tests/resume_favorites.rs` 覆盖根路径和 `/emby` 路径的协议响应，包括零进度下一集；自动化结果证明服务端合同，不替代 SenPlayer、VidHub、Infuse 或其他客户端部署环境的 UI 实测。
 
 ## LUX-234 URL 型 `.strm` 容器名兼容（2026-09-22）
 
@@ -206,6 +294,8 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 转码 offer 将 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，同时保持不可直放能力位；Emby 播放回调会刷新会话，`Stopped`
 会回收 FFmpeg 和临时目录。为避免播放器把动态 HLS 清单当前已生成的片段长度当作完整片长，`PlaybackInfo` 响应顶层和每个
 `MediaSources[]` 都返回完整的 `RunTimeTicks`，优先使用选中 source 时长并回退到条目时长；Emby HLS 清单按完整时长立即返回从 `MEDIA-SEQUENCE:0` 开始的 VOD 时间轴、完整分片列表和 `ENDLIST`。`PlaybackInfo` 和已知总时长的 master 清单只登记并保留会话，不占用 FFmpeg 并发名额，也不替换同一 source 正在播放的旧会话；首个 init 或媒体分片请求才替换旧会话、取得名额并启动 generation 0，首个媒体分片可直接决定起点，避免先启动第 `0` 段再被 Harbor 的中段请求立即取消。总时长未知而无法合成完整清单时，物理 `index.m3u8` 请求本身作为首个资源启动 FFmpeg。若 init 先到，合法范围内的 `StartTimeTicks` 只作为首选起点；已知总时长下等于或超过总时长的提示会被忽略。Emby HLS 不把中段物理分片映射为逻辑第 `0` 段；缺失且远离当前输出窗口的分片会按逻辑编号对应的媒体位置重启 FFmpeg。视频转码档位使用四秒关键帧节奏，复制视频流时实际边界仍可落在源关键帧；`-copyts -avoid_negative_ts disabled` 的合同是保留源时间线并避免每次重启从零计时，不承诺任意源文件的绝对 PTS 必然等于 `分片号 × 4 秒`。后续重启使用独立的内部 generation 清单和 init 文件；init 与媒体分片并发请求会跟随当前 generation，旧的并发媒体分片请求不会反向覆盖更新的 seek。重启前重新检查磁盘水位和会话配额，重启失败会终止会话并释放转码名额。客户端省略 `StartTimeTicks` 时，Lux 仍会把未标记为已播放的保存进度作为转码 URL 兼容提示，客户端显式发送的有效值（包括 `0`）优先；实际媒体内容由客户端请求的逻辑分片决定。Lux 自有签名参数仍保留，长期 API token 不写入转码 URL。
+
+用户的转码策略会与 Emby 客户端和服务端能力共同决定本次可用的 HLS 档位：Remux 受 `allow_remux` 控制，音频转码受 `allow_audio_transcode` 控制；当前硬件/软件视频转码输出也会转码音频，因此需要同时允许 `allow_video_transcode` 和 `allow_audio_transcode`。当 POST `PlaybackInfo` 明确需要服务端 HLS、但没有任何策略允许且服务器可用的档位时，返回 `403 Forbidden`，不创建 HLS 会话。仅被动能力协商仍不创建会话；`SupportsTranscoding` 表示客户端与服务端的能力，不代表该用户已获准每种转码档位，具体播放请求仍执行策略检查。每次签名 HLS manifest、初始化文件或分片请求（包含 HEAD）都会复核当前策略；撤销当前会话所需权限时，本次请求返回 403 并停止会话、释放播放准入及清理临时目录。后续重用同一票据返回 `410 Gone`。Web 签名 HLS 资源遵守相同的逐次策略复核。策略变化不会改变直放的转码权限边界；`.strm` 仍只走外部直放/交接，不增加 HLS 或媒体字节代理。
 
 `tests/playback.rs` 已覆盖 Direct Play 优先、本地转码 PlaybackInfo 协商、保存进度对应的第 `1230` 段作为首个请求、随后回到第 `0` 段，以及 manifest/init/segment 实际读取；播放模块测试另覆盖登记会话后不预启动或占用 FFmpeg、未消费的新 offer 不停止旧播放、首个中段请求直接启动 generation 0、init 与 seek 分片并发时跟随当前 generation、越界起点拒绝、真实后向 generation 重启、并发 seek 取代、重启配额和失败清理，
 跨条目和篡改签名拒绝、播放回调刷新/停止清理，以及 URL/路径型 `.strm` 对外声明转码能力但不创建 HLS 会话。该自动化证据
@@ -368,6 +458,12 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 完成时序对两后端相同，且不改变 API、Webhook DTO 或 Emby 合同：扫描期间首页继续读取旧快照；Manifest 索引与缺失确认提交后，任务进入 `status=COMPLETED, scan_phase=POSTPROCESSING`，刷新首页快照并发布一次 `home`，同时按既有时点发出 `ScanCompleted` webhook 和 `JOB_COMPLETED` INFO 运行事件。新 v3 Manifest 随后在后台分批物化 SOURCE/ITEM targets；所有 root cursor 完成的 ready barrier 提交后才启动 NFO、probe、封面和缩略图 worker，全部完成后阶段转为 `IDLE`。format 1/2 活动任务保留原执行器和已创建的 targets。target 物化/处理失败不撤销索引或重发索引完成事件，可从持久游标与未完成 target 状态恢复。INFO 运行事件按现有策略不写入 `scan_job_events` 表；PostgreSQL 根路径/CAS/取消恢复/旧版本升级由 `tests/postgres_database.rs` 覆盖。
 
 验证：0136 完成后 `cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（8/8），包括 PostgreSQL format 3 根目录恢复、checkpoint 重试和升级扫描；SQLite `scanning_jobs` 69/69、`scanner` 16/16、`storage` 28/28。`cargo test --locked --test webhooks --test catalog` 为 8/8。首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1；阶段门 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo test --locked --all-targets` 均通过，机器 `uname -m=arm64`、Rust 1.97.1。两后端 60,000 文件 release 指标见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。PostgreSQL 测试使用本机 ARM64 临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
+
+## LUX-561 Manifest 删除候选兼容
+
+Manifest 删除候选仍只针对 COMPLETE 且身份复核通过的 root；每页保留 generation/最新 observation、seen-path、已存在 delta、目录直接子项/uncovered 判断和原有基线 ID/fingerprint CAS。固定 root 的 path cursor 仅存在于单次执行内；取消、数据库失败或重启仍从头枚举，并依靠已提交的 delta 幂等跳过。完成检查改为存在性判断，报表和应用使用的精确计数没有改变。该优化无 schema migration，不改变 Lux API、Webhook、Emby 或 Manifest 持久格式。
+
+SQLite 语义验证：storage 候选集合回归和 `tests/scanning_jobs.rs` 88/88 通过，覆盖格式分支、目录边界、跨 root 同名路径、特殊路径、uncovered、取消恢复、root 替换与 CAS。SQLx SQLite 3.51.3 计划复用现有 `(library_root_id, relative_path)` 唯一索引范围；性能样本见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。本次没有 PostgreSQL runtime、FNOS/NAS 或 x86 验证；不得将 SQLite 结果外推。
 
 ## LUX-288 渐进扫描与在线补缺兼容边界（规格）
 
@@ -1009,3 +1105,106 @@ U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不
 - 在该临时发现端口下重跑全量，库测试 858 通过、1 失败、22 ignored；失败是项目此前已记录的 `application::playback::hls::tests::emby_init_and_segment_share_the_requested_generation`，在 `src/application/playback/hls.rs:2290` 遇到 `Superseded`。该用例第一轮全量通过、第二轮失败、随后单独运行通过，HLS 文件本任务未修改。全量完成门保留失败，不能由定向通过或单跑通过替代。
 
 本次没有推送或部署，不代表 NanShare/Caddy/Hills 的已部署链路已通过实机验证；也不外推 NAS/x86 或其他 Emby 版本的结果。
+
+## LUX-551：Emby 路径大小写不敏感（2026-10-16）
+
+Lux 在根路径和 `/emby` 前缀下，对已注册 Emby 路由的静态路径片段按 ASCII 大小写不敏感匹配。动态路径参数和 query 保持原值；Lux 原生 `/api/v1` 路由不做此归一化。大小写混合的发现、密码登录和带 query token 的用户接口由 `tests/emby_system.rs` 覆盖；路径归一化单测验证动态片段与 query 保留，以及原生 API 路径不变。
+
+媒体详情页使用的 `GET /items/{itemId}` 与大小写不敏感的 Emby `Items/{itemId}` 路由相同。浏览器以 `Accept: text/html` 打开此地址时保留小写路径并交给 Web SPA fallback；JSON 请求仍归一化到 Emby 接口。回归由 `tests/web_static.rs::media_detail_navigation_is_served_as_html_while_json_uses_emby` 覆盖。
+
+这是本机自动化服务端验证，不代表 MoviePilot 插件或第三方播放器的实机链路已经复测，也不代表 FNOS 已部署此版本。
+
+## 虚拟“合集”媒体库排序（2026-10-18）
+
+当当前用户至少能看到一个全局合集时，虚拟媒体库 ID `00000000-0000-7000-8000-000000000538` 可通过
+`GET/PATCH /api/v1/auth/library-order` 读取和保存顺序。它与普通媒体库共用管理员/个人顺序策略，Web
+`GET /api/v1/libraries`、Emby `Views` 和登录响应中的 `OrderedViews` 按同一有效顺序排列。没有可见合集的用户
+仍不能提交该 ID。合集保持虚拟库身份，不会加入物理媒体库 ACL，也不会改变合集成员的来源库权限过滤。
+
+## LUX-584 至 LUX-591：扫描后处理诊断与重试（2026-10-18）
+
+`scan_jobs.status=COMPLETED`、`JOB_COMPLETED` 和 `ScanCompleted` 继续表示索引完成；本次不增加扫描状态或数据库迁移。后处理失败仍进入 `COMPLETED/IDLE`，但保存稳定错误码 `POSTPROCESSING_FAILED`，重试开始和最终成功时清除。已完成的目标阶段保留，恢复时继续处理未完成阶段。
+
+管理员扫描列表与详情附加布尔字段 `hasPostprocessingIssues`、`canRetry`。历史任务即使 `error=NULL`，仍可由目标阶段的 `PENDING/FAILED`，或 workflow 2/3、format 3 的未就绪目标检查点识别问题；无需重写旧数据。列表支持可选 `hasPostprocessingIssues=true/false`，与既有 `status` 条件组合，并在数据库分页前筛选。现有分页上限、状态白名单及其他消费者的扫描 DTO 保持原合同。
+
+`canRetry` 与重试入口共用资格判断：检查同库同类型活动任务、旧队列待处理工作及未完成目标；只有终态目标的正常完成任务没有重试入口。后处理重试还在事务内复核条件，竞争或重复请求返回 `409`，不会退回新建全库扫描。保留的 Manifest 检查点继续使用原任务 ID；缺少或不能恢复的旧检查点仍沿用既有迁移恢复路径，新建 Manifest 并承接未完成目标。GET 的能力标记是读取时快照，POST 仍负责校验当前状态。
+
+Web 将这些任务显示为“已完成，有问题”，提示“索引已完成，后处理未完成”，使用 `canRetry` 控制重试。全局问题筛选包含扫描及元数据任务。展开原因时按需读取有界的 WARN/ERROR 事件，只显示稳定错误码与已知文案，不显示原始事件详情；日志缺失或读取失败仍保留重试入口。重试成功刷新任务并清除旧原因缓存，进入“后处理进行中”状态。
+
+诊断按页批量读取，目标检查按三个阶段分别使用既有部分索引；查询次数与实际 SQLite 查询计划已有回归覆盖。该证据不等同于 NAS 性能测量。
+
+### 本机验证
+
+环境为 Toshiba 挂载盘、macOS `arm64`；全部 Cargo 命令使用 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。PostgreSQL 为一次性本地 PostgreSQL 16 容器。各增量的失败在实现前复现，详见 LUX-DEVELOPMENT.md 的 LUX-584 至 LUX-589。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 后处理与旧 workflow 定向回归 | 后处理 9/9、重试及旧 workflow 7/7 通过；覆盖保留错误码、清除错误、检查点恢复、已完成阶段保留、重复请求及活动冲突。两组不合并计数。 |
+| 最终诊断回归 | 查询计划、SQLite 诊断矩阵、PostgreSQL 诊断矩阵 3/3 通过；包括历史空错误码、未物化检查点、批量查询次数与分页前筛选。 |
+| PostgreSQL 后处理 | `cargo test --locked --test postgres_database postprocessing -- --ignored --test-threads=1`：2/2 通过。 |
+| 管理员接口 | `job_events_api`：2/2 通过，覆盖列表/详情能力、WARN 原因、筛选分页、409 竞争拒绝和 202 恢复。回环测试客户端显式禁用本机系统代理；原有代理干扰已在基线复现。 |
+| 扫描完整 target | `scanning_jobs`：89 通过、2 失败；两项失败均在干净基线 `8b019cef` 以相同断言复现，见下文。 |
+| Web 定向 | `admin-operations.test.tsx`：27/27 通过；冻结依赖安装、TypeScript/production build 通过。 |
+| 真实浏览器 | Chromium 使用构建产物与受控 API fixture 验证警告、WARN 原因、混合问题筛选、重试后 POSTPROCESSING 和旧原因缓存清除；390px 宽度无横向溢出，控制台 0 error/0 warning。这是 UI 运行时证明，未连接真实媒体库。 |
+| Rust build / fmt / Clippy | 全部通过。Clippy 首次发现新增测试模块位置问题，移动模块后完整 Clippy、fmt 和上述诊断回归重跑通过；移动不改变生产实现。 |
+| Shell / Python 工具 | `bash -n scripts/*.sh` 通过；compatibility-probe 3/3、catalog-fixture 2/2 通过。 |
+
+### 完整门禁仍失败
+
+最终 `cargo test --locked --all-targets` 在库测试阶段得到 **972 passed、4 failed、25 ignored**，因此没有继续运行后面的 integration targets；上述相关 integration targets 已独立运行。全量运行之后只移动查询计划测试模块，随后重跑相关测试、格式与完整 Clippy。四项失败分别为：
+
+- `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`：预期 1，实际 0。
+- `automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`：读取空集合时越界。
+- `changed_local_fill_request_during_running_item_is_not_lost`：预期 1，实际 0。
+- `local_metadata_worker_dispatches_fill_missing_without_blocking_scan`：完整并发运行时超时；在最终代码和干净基线中单独复跑均通过。超时原因未在本任务内修复，仍保留完整门禁失败。
+
+前三项在干净基线 `8b019cef` 均复现。较早一轮全量还出现过 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 的 actor-credit 断言失败，该失败同样在基线复现；它在最终全量中通过。
+
+`scanning_jobs` 的两项失败也在基线逐项复现：`manifest_discovery_reopens_and_retries_persisted_frontier_idempotently` 的提交检查点预期 2、实际 1；`streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_update` 仍断言 schema 181，而当前实际为 183。本次没有修改它们的断言或相关实现。
+
+完整 Web 静态检查为 **145 passed、3 failed**，`pnpm --dir web test` 在这一阶段停止；另行运行完整 Vitest 为 **655 passed、4 failed**。七项均在基线复现：
+
+- 静态：`detail-actions-loading.test.mjs` 的编辑器懒加载、`home-media-layout.test.mjs` 的移动首页横排、`responsive-layout.test.mjs` 的触屏动作样式。
+- Vitest：`home-page.test.tsx` 的媒体库聚焦预取，`library-card.test.tsx` 的 hover/focus 预取及虚拟合集入口，`media-query-polling.test.tsx` 的详情图片轮询计数。
+
+因此不能把本次定向通过或构建通过记为完整项目门禁通过。此次没有合并、推送或部署，不代表 FNOS、NAS/x86 或真实客户端恢复链路已经验证。
+
+## 用户管理阶段 1：页面骨架、账号生命周期与用户查询（2026-10-19）
+
+本轮覆盖用户管理设计模块一的账号资料及基础生命周期、模块三的列表查询基础和页面骨架。管理员列表默认每页 20 条、服务端上限 100 条；用户名、显示名称和邮箱搜索，状态筛选及创建时间/最近登录/最近活跃排序均在分页前执行，并返回匹配总数。普通列表排除回收站账号，回收站支持详情查看、恢复和确认后彻底删除。详情页支持资料、头像与启用/禁用/软删除/恢复操作；邮箱更新不会标为已验证。删除宽限设置通过管理员设置 API 的 `userDeletionGraceDays` 读取和更新，默认 7 天，接受 1–3650 天；列表和详情的删除确认会显示当前配置的期限；配置只影响之后删除的账号，已有清理期限保持不变。
+
+模块三的批量启用、禁用、调整权限、应用预设和复制偏好属于设计阶段 2，本轮未实现。模块六“播放与转码权限”维持无交互的未实施占位，也未新增权限语义。待激活注册、邀请和审批尚未进入阶段 1 的此轮实现范围。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 环境 | `/Volumes/Toshiba` 已挂载；macOS `arm64`；所有 Cargo 命令设置 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`。 |
+| 定向 Rust | 配置删除宽限期存储测试 1/1；`admin_dashboard` 1/1；`user_settings` 1/1；`emby_auth` 9/9；`users` 1/1。`users` 目标同步了已变化的 API 契约：重复账户使用通用冲突文案；软删除返回账号及清理期限；回收站中的用户名在清理前仍受唯一约束。 |
+| 定向 Web | 用户列表、权限路由与生命周期 13/13；`admin-users-delete` 与 `admin-user-profile-lifecycle` 11/11（含配置 14 天时两处确认文案）；删除期限设置 3/3；账户资料设置 23/23。 |
+| Web 依赖与构建 | `pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。 |
+| 完整 Web | `pnpm --dir web test` 的静态阶段 144 通过、4 失败，因此未进入该命令的 Vitest 阶段；独立完整 Vitest 为 662 通过、4 失败（首页预取、媒体库卡片 2 项、详情轮询）。相关用户管理定向回归通过。 |
+| Rust 构建、格式、Clippy | `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。 |
+| 完整 Rust | `cargo test --locked --all-targets` 在库测试结束，972 通过、5 失败、25 忽略；集成 targets 未继续执行。3 个元数据调度失败与先前文档记录的干净基线 `842f9870` 失败相同；另 2 个回环超时项在单独运行时通过，其中 HTTP 回环测试需设置 `NO_PROXY/no_proxy=127.0.0.1,localhost`。完整门禁仍未通过。 |
+| 浏览器与部署 | 使用隔离 Chromium/Playwright、临时 SQLite 数据库和独立本地端口实测用户列表搜索、详情、全局保留设置、创建普通账号、移入回收站及恢复；模块六呈现无操作控件的占位。截图：`output/playwright/user-management-list.png`。控制台 0 warning；7 个资源错误仅为初始化前未登录的 `/auth/me` 401 与无头像账户的头像 API 404，通用头像回退可见；未见脚本异常。未完整审计网络面板；未推送或部署，未验证 FNOS/x86_64。 |
+
+因此阶段 1 的定向实现、构建检查和临时数据库上的真实浏览器交互验证已记录；完整项目门禁仍未通过，网络面板也未完整审阅。阶段 2 不自动开始，等待项目所有者确认阶段结果。
+
+## 用户管理模块六：播放与转码权限（2026-10-19）
+
+新建 Web 或 Emby 播放会话时，服务端按当前用户策略选择可用方案：Direct 不依赖转码开关；STRM 仍为 Direct-only；Remux 受 `allow_remux` 控制；音频转码受 `allow_audio_transcode` 控制。当前 HLS 视频转码命令也会输出 AAC 音频，因此硬件与软件视频转码同时要求 `allow_video_transcode` 和 `allow_audio_transcode`。策略禁止所有兼容转码方案时，创建会话返回 403，且不创建会话或 HLS 资源。服务器未启用硬件编码时，硬件方案不会被选中。
+
+每次读取已签发的服务端 HLS 资源（含 HEAD）都会重新检查当前用户策略。权限撤销后该请求返回 403，并停止会话、释放播放并发占用及清理 HLS 临时资源；同一 ticket 后续请求返回 410。Direct 与 STRM 的资源授权行为未变。此处只完成模块六；设备、会话活动和登录限制等模块七能力未在本轮实现。
+
+### 本机验证
+
+环境为 Toshiba 挂载盘、macOS `arm64`；Cargo 构建、测试与 Clippy 均使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 定向 Rust | `user_policy_`：3/3；`web_playback`：1/1；`playback`：4/4。覆盖新建会话选档及拒绝、Web/Emby 403、已签 HLS ticket 撤权后的拒绝、停止与资源释放。 |
+| Rust build / fmt | `cargo build --locked` 与 `cargo fmt --all -- --check` 通过。 |
+| 完整 Rust | `cargo test --locked --all-targets` 的库 target 为 981 通过、4 失败、25 忽略；4 个失败是扫描/元数据队列用例：`local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 超时，`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate` 与 `changed_local_fill_request_during_running_item_is_not_lost` 预期计数为 1、实际为 0，`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures` 读取空集合时越界。全量命令因此未继续执行 integration targets；模块六定向 targets 均独立通过。 |
+| Clippy | `cargo clippy --locked --all-targets --all-features -- -D warnings` 未通过：`src/api/media.rs::serve_emby_media_file` 和 `src/application/playback/session.rs::verify_emby_direct_stream` 各有 8 个参数，触发 `clippy::too_many_arguments`。本轮未改这两个函数签名。 |
+| Web | 冻结依赖安装与 `pnpm --dir web build` 通过。`pnpm --dir web test` 静态阶段为 144 通过、4 失败（编辑器懒加载、首页 hero 标题行高、首页媒体卡片宽度、触屏卡片动作样式），因此未进入同命令中的 Vitest 阶段。模块六没有 Web UI 改动。 |
+| 浏览器与部署 | 本轮模块六以 API / HLS 服务端策略为改动面，使用定向 Web/播放协议测试验证；未验证真实 HLS 播放器、第三方客户端、FNOS 或 NAS/x86_64，也未推送或部署。 |
+
+因此模块六的定向实现与本机服务端检查已记录；Rust 全量测试、Clippy 和 Web 静态门禁仍未全部通过。未进入模块七或后续阶段。

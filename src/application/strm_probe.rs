@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -73,6 +76,7 @@ pub struct StrmProbeService {
     plugins: PluginService,
     operations: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     incremental_creation_lock: Arc<Mutex<()>>,
+    configured_start_scheduled: Arc<AtomicBool>,
     resources: ResourceMetrics,
 }
 
@@ -83,6 +87,7 @@ impl StrmProbeService {
             plugins,
             operations: Arc::new(Mutex::new(HashMap::new())),
             incremental_creation_lock: Arc::new(Mutex::new(())),
+            configured_start_scheduled: Arc::new(AtomicBool::new(false)),
             resources: ResourceMetrics::new(),
         }
     }
@@ -242,9 +247,38 @@ impl StrmProbeService {
     }
 
     pub async fn create_configured_jobs(&self) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
-        let settings = self.plugins.media_info_settings().await?;
+        let Some(settings) = self.plugins.enabled_media_info_settings().await? else {
+            return Ok(Vec::new());
+        };
+        let configured_library_ids = settings
+            .library_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let source_counts = self
+            .database
+            .list_strm_media_source_counts_for_libraries(&configured_library_ids)
+            .await?;
+        if configured_library_ids
+            .iter()
+            .any(|library_id| !source_counts.contains_key(library_id))
+        {
+            return Err(StrmProbeError::LibraryNotFound);
+        }
+        let selected_library_ids = settings
+            .library_ids
+            .into_iter()
+            .filter(|library_id| {
+                source_counts
+                    .get(&library_id.to_string())
+                    .is_some_and(|count| *count > 0)
+            })
+            .collect::<Vec<_>>();
+        if selected_library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         self.create_jobs(
-            &settings.library_ids,
+            &selected_library_ids,
             StrmProbeOptions {
                 concurrency: settings.concurrency,
                 include_ready: settings.include_ready,
@@ -255,6 +289,54 @@ impl StrmProbeService {
             },
         )
         .await
+    }
+
+    pub async fn cancel_active_jobs(&self) -> Result<(), StrmProbeError> {
+        for job_id in self.database.list_active_strm_probe_job_ids().await? {
+            self.database.request_strm_probe_job_cancel(&job_id).await?;
+        }
+        Ok(())
+    }
+
+    pub fn schedule_configured_jobs_when_available(&self) {
+        if self.configured_start_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match service.create_configured_jobs().await {
+                    Ok(jobs) => {
+                        service
+                            .configured_start_scheduled
+                            .store(false, Ordering::Release);
+                        for job in jobs {
+                            let worker = service.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = worker.run(&job.id).await {
+                                    tracing::error!(
+                                        job_id = %job.id,
+                                        %error,
+                                        "configured STRM probe job stopped"
+                                    );
+                                }
+                            });
+                        }
+                        return;
+                    }
+                    Err(StrmProbeError::AlreadyActive) => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        service
+                            .configured_start_scheduled
+                            .store(false, Ordering::Release);
+                        tracing::error!(%error, "configured STRM probe jobs could not be queued");
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     pub async fn run(&self, job_id: &str) -> Result<(), StrmProbeError> {
@@ -627,6 +709,9 @@ impl StrmProbeService {
         outcome: SourceOutcome,
     ) -> Result<usize, StrmProbeError> {
         if outcome.skipped {
+            self.database
+                .mark_media_probe_ready(&outcome.source_id)
+                .await?;
             return Ok(0);
         }
         let Some(result) = outcome.result else {

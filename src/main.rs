@@ -186,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
+    luxd::application::scan_fingerprint_migration::start(database.clone(), control_rx.clone());
     app_state.start_database_diagnostics().await;
     let shutdown_state = app_state.clone();
     let app = app_with_state(app_state);
@@ -205,7 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = discovery_task.await;
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
-    shutdown_state.shutdown_background_workers().await;
+    if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
+        return Err(std::io::Error::other(error).into());
+    }
 
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
@@ -277,7 +280,9 @@ async fn shutdown_signal(
         }
     }
 
-    app_state.shutdown_background_workers().await;
+    if let Err(error) = app_state.shutdown_background_workers_checked().await {
+        error!(%error, "background workers could not drain before graceful shutdown");
+    }
     let _ = shutdown.send(true);
 }
 

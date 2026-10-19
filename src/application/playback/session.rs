@@ -12,8 +12,9 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::storage::{
-    Database, NewWebPlaybackEvent, NewWebPlaybackSession, StorageError, StoredWebPlaybackSession,
-    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    Database, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
+    StoredWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails,
 };
 
 use super::decision::{
@@ -104,6 +105,7 @@ pub struct SignedResource {
 #[derive(Debug)]
 pub(crate) enum WebPlaybackSessionError {
     Invalid(String),
+    PlaybackPolicyDenied,
     NotFound,
     Expired,
     NotActive,
@@ -115,6 +117,9 @@ impl fmt::Display for WebPlaybackSessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
+            Self::PlaybackPolicyDenied => {
+                formatter.write_str("server-side playback is not allowed by user policy")
+            }
             Self::NotFound => formatter.write_str("web playback session not found"),
             Self::Expired => formatter.write_str("web playback session expired"),
             Self::NotActive => formatter.write_str("web playback session is not active"),
@@ -128,7 +133,11 @@ impl std::error::Error for WebPlaybackSessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::Invalid(_) | Self::NotFound | Self::Expired | Self::NotActive => None,
+            Self::Invalid(_)
+            | Self::PlaybackPolicyDenied
+            | Self::NotFound
+            | Self::Expired
+            | Self::NotActive => None,
             Self::Hls(error) => Some(error),
         }
     }
@@ -204,6 +213,49 @@ impl WebPlaybackSessionService {
         self
     }
 
+    pub(crate) async fn check_playback_admission(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .check_playback_admission(user_id, unix_timestamp())
+            .await?)
+    }
+
+    pub(crate) async fn admit_playback_session(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .reserve_playback_admission(user_id, play_session_id, unix_timestamp())
+            .await?)
+    }
+
+    pub(crate) async fn renew_playback_session_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<bool, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .renew_existing_playback_admission(user_id, play_session_id, unix_timestamp())
+            .await?)
+    }
+
+    pub(crate) async fn release_playback_session_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<bool, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .release_playback_admission(user_id, play_session_id, unix_timestamp())
+            .await?)
+    }
+
     pub(crate) async fn create(
         &self,
         input: CreateWebPlaybackSession<'_>,
@@ -214,12 +266,20 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
+        let policy = self
+            .database
+            .get_user_playback_policy(input.user_id)
+            .await?
+            .ok_or(WebPlaybackSessionError::NotFound)?;
         let capabilities =
             apply_server_capabilities(input.capabilities, self.hls.hardware_transcode_available());
-        let plan = WebPlaybackPlan::from(choose_plan(PlaybackDecisionInput {
-            source_kind: input.source_kind,
-            capabilities,
-        }));
+        let plan = WebPlaybackPlan::from(choose_plan_for_policy(
+            PlaybackDecisionInput {
+                source_kind: input.source_kind,
+                capabilities,
+            },
+            policy,
+        )?);
         let WebPlaybackPlan::Unsupported { .. } = plan else {
             let id = Uuid::now_v7().to_string();
             let play_session_id = format!("{}:{id}", input.play_session_prefix);
@@ -318,11 +378,18 @@ impl WebPlaybackSessionService {
         is_admin: bool,
         item_id: &str,
         media_source_id: &str,
+        play_session_id: &str,
         expires_at: i64,
     ) -> Option<String> {
         self.signer.sign(
             EMBY_DIRECT_STREAM_SESSION_ID,
-            &emby_direct_stream_resource(user_id, is_admin, item_id, media_source_id),
+            &emby_direct_stream_resource(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
             expires_at,
         )
     }
@@ -333,12 +400,19 @@ impl WebPlaybackSessionService {
         is_admin: bool,
         item_id: &str,
         media_source_id: &str,
+        play_session_id: &str,
         expires_at: i64,
         signature: &str,
     ) -> bool {
         self.signer.verify(
             EMBY_DIRECT_STREAM_SESSION_ID,
-            &emby_direct_stream_resource(user_id, is_admin, item_id, media_source_id),
+            &emby_direct_stream_resource(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
             expires_at,
             signature,
             unix_timestamp(),
@@ -368,6 +442,23 @@ impl WebPlaybackSessionService {
         if session.expires_at < now {
             let _ = self.hls.stop(session_id).await;
             return Err(WebPlaybackSessionError::Expired);
+        }
+        if session.plan == "SERVER_HLS" {
+            let policy = self
+                .database
+                .get_user_playback_policy(&session.user_id)
+                .await?
+                .ok_or(WebPlaybackSessionError::NotFound)?;
+            if !playback_policy_allows_hls_tier(policy, session.tier) {
+                if let Err(error) = self.stop(session_id, &session.user_id).await {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %error,
+                        "failed to stop HLS session after playback policy was revoked"
+                    );
+                }
+                return Err(WebPlaybackSessionError::PlaybackPolicyDenied);
+            }
         }
         Ok(session)
     }
@@ -590,7 +681,25 @@ impl WebPlaybackSessionService {
         {
             return Err(WebPlaybackSessionError::NotFound);
         }
+        if let Some(session) = self.database.find_web_playback_session(session_id).await? {
+            let _ = self
+                .database
+                .renew_existing_playback_admission(user_id, &session.play_session_id, now)
+                .await?;
+        }
         Ok(expires_at)
+    }
+
+    pub(crate) async fn stop_server_hls_sessions(&self, session_ids: &[String]) {
+        for session_id in session_ids {
+            if let Err(error) = self.hls.stop(session_id).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    %error,
+                    "failed to stop server HLS session after user access was revoked"
+                );
+            }
+        }
     }
 
     pub(crate) async fn stop(
@@ -598,11 +707,26 @@ impl WebPlaybackSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<(), WebPlaybackSessionError> {
+        let session = self.database.find_web_playback_session(session_id).await?;
         let _ = self.hls.stop(session_id).await;
         let now = unix_timestamp();
         self.database
             .stop_web_playback_session(session_id, user_id, "STOPPED", now)
             .await?;
+        if let Some(session) = session.filter(|session| session.user_id == user_id) {
+            if let Some(playback) = self
+                .database
+                .find_playback_session(user_id, &session.play_session_id)
+                .await?
+            {
+                self.database
+                    .stop_playback_session(&playback.id, now)
+                    .await?;
+            }
+            self.database
+                .release_playback_admission(user_id, &session.play_session_id, now)
+                .await?;
+        }
         Ok(())
     }
 
@@ -693,6 +817,45 @@ impl WebPlaybackSessionService {
                 %error,
                 "failed to mark HLS session"
             );
+            return;
+        }
+        if let Some(playback) = match self
+            .database
+            .find_playback_session(&session.user_id, &session.play_session_id)
+            .await
+        {
+            Ok(playback) => playback,
+            Err(error) => {
+                tracing::warn!(
+                    event = "web_hls_failed_session_cleanup",
+                    session_id = %session_id,
+                    %error,
+                    "failed to load failed HLS playback record"
+                );
+                return;
+            }
+        } {
+            if let Err(error) = self.database.stop_playback_session(&playback.id, now).await {
+                tracing::warn!(
+                    event = "web_hls_failed_session_cleanup",
+                    session_id = %session_id,
+                    %error,
+                    "failed to stop failed HLS playback record"
+                );
+                return;
+            }
+        }
+        if let Err(error) = self
+            .database
+            .release_playback_admission(&session.user_id, &session.play_session_id, now)
+            .await
+        {
+            tracing::warn!(
+                event = "web_hls_failed_session_cleanup",
+                session_id = %session_id,
+                %error,
+                "failed to release failed HLS playback admission"
+            );
         }
     }
 }
@@ -716,6 +879,61 @@ fn apply_server_capabilities(
     // fields describe what the browser can consume.
     capabilities.hardware_transcode = hardware_transcode_available;
     capabilities
+}
+
+fn choose_plan_for_policy(
+    input: PlaybackDecisionInput,
+    policy: UserPlaybackPolicy,
+) -> Result<PlaybackPlan, WebPlaybackSessionError> {
+    let unrestricted_plan = choose_plan(input);
+    if input.source_kind == PlaybackSourceKind::Strm
+        || input.capabilities.direct_play
+        || !matches!(unrestricted_plan, PlaybackPlan::ServerHls { .. })
+    {
+        return Ok(unrestricted_plan);
+    }
+
+    let capabilities = input.capabilities;
+    let candidates = [
+        (
+            capabilities.video_copy_to_fmp4 && capabilities.audio_copy_to_fmp4,
+            policy.allow_remux,
+            ServerTier::Remux,
+        ),
+        (
+            capabilities.video_copy_to_fmp4
+                && (!capabilities.audio_copy_to_fmp4 || !policy.allow_remux),
+            policy.allow_audio_transcode,
+            ServerTier::AudioTranscode,
+        ),
+        (
+            capabilities.hardware_transcode,
+            policy.allow_video_transcode && policy.allow_audio_transcode,
+            ServerTier::HardwareTranscode,
+        ),
+        (
+            capabilities.software_transcode,
+            policy.allow_video_transcode && policy.allow_audio_transcode,
+            ServerTier::SoftwareTranscode,
+        ),
+    ];
+    if let Some((_, _, tier)) = candidates
+        .into_iter()
+        .find(|(available, allowed, _)| *available && *allowed)
+    {
+        return Ok(PlaybackPlan::ServerHls { tier });
+    }
+
+    Err(WebPlaybackSessionError::PlaybackPolicyDenied)
+}
+
+fn playback_policy_allows_hls_tier(policy: UserPlaybackPolicy, tier: i64) -> bool {
+    match tier {
+        1 => policy.allow_remux,
+        2 => policy.allow_audio_transcode,
+        3 | 4 => policy.allow_audio_transcode && policy.allow_video_transcode,
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -771,8 +989,11 @@ fn emby_direct_stream_resource(
     is_admin: bool,
     item_id: &str,
     media_source_id: &str,
+    play_session_id: &str,
 ) -> String {
-    format!("emby-direct-stream\n{user_id}\n{is_admin}\n{item_id}\n{media_source_id}")
+    format!(
+        "emby-direct-stream\n{user_id}\n{is_admin}\n{item_id}\n{media_source_id}\n{play_session_id}"
+    )
 }
 
 #[cfg(test)]
@@ -780,13 +1001,17 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
     use super::{
-        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities, unix_timestamp,
+        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities,
+        choose_plan_for_policy, unix_timestamp,
     };
     use crate::{
         application::{
             libraries::LibraryService,
             playback::{
-                decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
+                decision::{
+                    PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind,
+                    ServerTier, UnsupportedReason,
+                },
                 hls::{HlsManager, HlsSegmentContainer, HlsStartOptions},
                 session::{
                     CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan,
@@ -797,7 +1022,7 @@ mod tests {
         },
         config::Config,
         library::LibraryKind,
-        storage::{NewWebPlaybackSession, WebPlaybackEventClaim},
+        storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
     };
     use uuid::Uuid;
 
@@ -866,6 +1091,160 @@ mod tests {
         );
 
         assert!(normalized.hardware_transcode);
+    }
+
+    #[test]
+    fn user_policy_skips_remux_and_selects_an_allowed_audio_transcode_tier() {
+        let plan = choose_plan_for_policy(
+            PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: PlaybackCapabilities {
+                    direct_play: false,
+                    hls: true,
+                    video_copy_to_fmp4: true,
+                    audio_copy_to_fmp4: true,
+                    hardware_transcode: true,
+                    software_transcode: true,
+                },
+            },
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: true,
+                allow_video_transcode: false,
+            },
+        );
+
+        assert!(matches!(
+            plan,
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::AudioTranscode
+            })
+        ));
+    }
+
+    #[test]
+    fn user_policy_selects_video_transcode_when_lower_tiers_are_forbidden() {
+        let plan = choose_plan_for_policy(
+            PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: PlaybackCapabilities {
+                    direct_play: false,
+                    hls: true,
+                    video_copy_to_fmp4: false,
+                    audio_copy_to_fmp4: true,
+                    hardware_transcode: true,
+                    software_transcode: true,
+                },
+            },
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        );
+
+        assert!(matches!(
+            plan,
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode
+            })
+        ));
+    }
+
+    #[test]
+    fn user_policy_rejects_all_transcoding_without_affecting_direct_or_strm_rules() {
+        let policy = UserPlaybackPolicy {
+            can_play: true,
+            max_simultaneous_playbacks: 2,
+            allow_remux: false,
+            allow_audio_transcode: false,
+            allow_video_transcode: false,
+        };
+        let capabilities = PlaybackCapabilities {
+            direct_play: false,
+            hls: true,
+            video_copy_to_fmp4: true,
+            audio_copy_to_fmp4: true,
+            hardware_transcode: true,
+            software_transcode: true,
+        };
+
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities,
+                },
+                policy,
+            ),
+            Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+        ));
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: true,
+                        ..capabilities
+                    },
+                },
+                policy,
+            ),
+            Ok(PlaybackPlan::Direct)
+        ));
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::Strm,
+                    capabilities,
+                },
+                policy,
+            ),
+            Ok(PlaybackPlan::Unsupported {
+                reason: UnsupportedReason::StrmRequiresDirectPlay,
+            })
+        ));
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        video_copy_to_fmp4: false,
+                        audio_copy_to_fmp4: false,
+                        ..capabilities
+                    },
+                },
+                UserPlaybackPolicy {
+                    allow_remux: false,
+                    allow_audio_transcode: false,
+                    allow_video_transcode: true,
+                    ..policy
+                },
+            ),
+            Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+        ));
+        assert!(
+            matches!(
+                choose_plan_for_policy(
+                    PlaybackDecisionInput {
+                        source_kind: PlaybackSourceKind::LocalFile,
+                        capabilities,
+                    },
+                    UserPlaybackPolicy {
+                        allow_remux: false,
+                        allow_audio_transcode: false,
+                        allow_video_transcode: true,
+                        ..policy
+                    },
+                ),
+                Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+            ),
+            "video transcoding cannot be allowed when the current HLS output also transcodes audio"
+        );
     }
 
     #[cfg(unix)]

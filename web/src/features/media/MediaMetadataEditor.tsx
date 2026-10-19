@@ -2,7 +2,7 @@ import { Lock, Save, Unlock, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import type { ItemMetadata, MediaItem, MetadataFieldName } from "../../lib/api/types";
-import { mediaTitle } from "../home/media";
+import { mediaTitle } from "../home/media-display";
 
 type MediaMetadataEditorProps = {
   item: MediaItem;

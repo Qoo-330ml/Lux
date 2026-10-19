@@ -6,6 +6,7 @@ import { api, ApiError } from "../lib/api/client";
 import { queryKeys } from "../lib/api/query-keys";
 import type { LuxUser } from "../lib/api/types";
 import { LuxShell } from "../components/layout/LuxShell";
+import { attachTouchCardHoverTracking } from "./touch-card-hover";
 import { LoginPage } from "../features/auth/LoginPage";
 import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
@@ -38,6 +39,8 @@ const AdminUsersPage = lazy(loadAdminUsersPage);
 const AdminOperationsPage = lazy(loadAdminOperationsPage);
 const AdminSettingsPage = lazy(loadAdminSettingsPage);
 const AdminChangelogPage = lazy(loadAdminChangelogPage);
+const AdminUserDetailPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserDetailPage }) => ({ default: AdminUserDetailPage })));
+const AdminUserSettingsPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserSettingsPage }) => ({ default: AdminUserSettingsPage })));
 
 export function App() {
   const setup = useQuery({
@@ -77,33 +80,7 @@ function SessionRoutes() {
 }
 
 function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {
-  useEffect(() => {
-    let activeCard: HTMLElement | null = null;
-    const cardAt = (x: number, y: number) => document.elementFromPoint(x, y)
-      ?.closest<HTMLElement>(".lux-media-art-shell, .lux-library-card-cover-shell") ?? null;
-    const setActiveCard = (nextCard: HTMLElement | null) => {
-      if (activeCard === nextCard) return;
-      activeCard?.classList.remove("is-touch-hovered");
-      activeCard = nextCard;
-      activeCard?.classList.add("is-touch-hovered");
-    };
-    const revealCardAtPointer = (event: PointerEvent) => {
-      if (event.pointerType !== "touch" || !event.isPrimary) return;
-      setActiveCard(cardAt(event.clientX, event.clientY));
-    };
-    const clearCardWhenTouchingElsewhere = (event: PointerEvent) => {
-      if (event.pointerType !== "touch" || !event.isPrimary) return;
-      if (cardAt(event.clientX, event.clientY) !== activeCard) setActiveCard(null);
-    };
-
-    document.addEventListener("pointermove", revealCardAtPointer, { passive: true });
-    document.addEventListener("pointerdown", clearCardWhenTouchingElsewhere, { passive: true });
-    return () => {
-      document.removeEventListener("pointermove", revealCardAtPointer);
-      document.removeEventListener("pointerdown", clearCardWhenTouchingElsewhere);
-      setActiveCard(null);
-    };
-  }, []);
+  useEffect(() => attachTouchCardHoverTracking(document, window), []);
 
   return (
     <RouteErrorBoundary>
@@ -112,21 +89,26 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
           <Route path="watch/:itemId" element={<PlayerPage />} />
           <Route element={<LuxShell user={user} serverName={serverName} />}>
             <Route index element={<HomePage user={user} />} />
-            <Route path="libraries" element={<LibrariesPage />} />
-            <Route path="libraries/:libraryId" element={<LibraryPage serverName={serverName} />} />
-            <Route path="favorites" element={<FavoritesPage />} />
-            <Route path="items/:itemId" element={<MediaDetailPage />} />
-            <Route path="collections/:collectionId" element={<CollectionDetailPage />} />
-            <Route path="people/:personId" element={<PersonDetailPage user={user} />} />
-            <Route path="search" element={<SearchPage />} />
+            <Route path="libraries" element={<SuspensePage><LibrariesPage /></SuspensePage>} />
+            <Route path="libraries/:libraryId" element={<SuspensePage><LibraryPage serverName={serverName} /></SuspensePage>} />
+            <Route path="favorites" element={<SuspensePage><FavoritesPage /></SuspensePage>} />
+            <Route path="items/:itemId" element={<SuspensePage><MediaDetailPage /></SuspensePage>} />
+            <Route path="collections/:collectionId" element={<SuspensePage><CollectionDetailPage /></SuspensePage>} />
+            <Route path="people/:personId" element={<SuspensePage><PersonDetailPage user={user} /></SuspensePage>} />
+            <Route path="search" element={<SuspensePage><SearchPage /></SuspensePage>} />
             <Route path="account" element={<Navigate to={`/account/${encodeURIComponent(user.id)}`} replace />} />
-            <Route path="account/:userId" element={<AccountRoute user={user} />} />
-            <Route path="admin" element={user.canManageServer ? <AdminLayout /> : <Navigate to="/" replace />}>
+            <Route path="account/:userId" element={<SuspensePage><AccountRoute user={user} /></SuspensePage>} />
+            <Route path="admin" element={user.canManageServer
+              ? <SuspensePage><AdminLayout /></SuspensePage>
+              : <Navigate to="/" replace />
+            }>
               <Route index element={<AdminDashboardPage />} />
               <Route path="libraries" element={<AdminLibrariesPage />} />
               <Route path="plugins" element={<AdminPluginsPage />} />
               <Route path="notifications" element={<AdminNotificationsPage />} />
               <Route path="users" element={<AdminUsersPage />} />
+              <Route path="users/settings" element={<AdminUserSettingsPage />} />
+              <Route path="users/:userId" element={<AdminUserDetailPage />} />
               <Route path="jobs" element={<AdminOperationsPage />} />
               <Route path="settings" element={<AdminSettingsPage />} />
               <Route path="changelog" element={<AdminChangelogPage />} />
@@ -136,6 +118,24 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
         </Routes>
       </Suspense>
     </RouteErrorBoundary>
+  );
+}
+
+function SuspensePage({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<PageSkeleton />}>
+      {children}
+    </Suspense>
+  );
+}
+
+function PageSkeleton() {
+  return (
+    <div className="lux-route-skeleton" role="status" aria-busy="true" aria-label="正在加载页面">
+      <span className="lux-skeleton-line lux-route-skeleton-title" aria-hidden="true" />
+      <span className="lux-skeleton-line lux-route-skeleton-description" aria-hidden="true" />
+      <div className="lux-skeleton-row lux-route-skeleton-content" aria-hidden="true" />
+    </div>
   );
 }
 

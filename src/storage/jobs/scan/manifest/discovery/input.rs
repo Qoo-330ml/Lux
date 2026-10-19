@@ -59,6 +59,7 @@ where
             let path = std::path::Path::new(&entry.relative_path);
             !matches!(entry.entry_kind.as_str(), "FILE" | "DIRECTORY")
                 || entry.size < 0
+                || entry.fingerprint_pending
                 || path.is_absolute()
                 || path.components().any(|component| {
                     matches!(

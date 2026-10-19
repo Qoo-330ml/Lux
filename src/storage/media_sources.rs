@@ -349,7 +349,10 @@ impl Database {
             })?;
         self.query(
             "UPDATE media_sources
-             SET size = ?, probe_status = 'PENDING', probe_error = NULL,
+             SET size = ?,
+                 probe_status = CASE WHEN source_kind = 'STRM_URL'
+                     THEN 'NOT_CONFIGURED' ELSE 'PENDING' END,
+                 probe_error = NULL,
                  updated_at = unixepoch()
              WHERE filesystem_entry_id = ?",
         )
