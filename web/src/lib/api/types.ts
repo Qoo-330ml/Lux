@@ -615,6 +615,24 @@ export type AdminUserEmbySessionRevokeAllResponse = {
   revokedCount: number;
 };
 
+export type AdminUserDevice = {
+  deviceId: string;
+  deviceName: string | null;
+  deviceType: string | null;
+  clientName: string;
+  clientVersion: string | null;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  lastRemoteIp: string | null;
+};
+
+export type AdminUserDevicePage = {
+  devices: AdminUserDevice[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
 export type AdminUserActivityEvent = {
   id: string;
   userId: string;

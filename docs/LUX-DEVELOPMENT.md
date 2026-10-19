@@ -15626,6 +15626,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 回归先因新路由返回 404（预期未认证 401）；实现后 `cargo test --locked --test users -- --test-threads=1` 为 20/20，覆盖未认证/非管理员、设备字段、稳定分页、页码/页大小钳制、400/404 错误及无需 CSRF。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许前序记录 9 类既有诊断类别的全目标 Clippy 通过；严格全量 Clippy 仍有相同 9 条未改代码诊断。`docs/API.md` 已登记合同；不接入 Web client/UI、后续活动接线、黑名单或 ACL。
 
+#### LUX-746：增加设备清单 Web API 合同
+
+范围：为 LUX-745 管理员设备清单 GET API 增加安全 TypeScript 摘要/分页 DTO 和 client 方法。方法默认 page 1、pageSize 20，正确 URL 编码 user ID，并通过统一请求层读取。本任务不修改详情页 UI、服务端 API、认证或设备刷新行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] DTO 精确映射设备公开摘要字段，不定义用户 ID、token、Cookie 或凭证字段。
+- [x] Client 分页默认参数正确，用户 ID 做路径编码并发送 `page`/`pageSize`。
+- [x] API client 定向 Vitest、冻结依赖安装、Web build 与 diff check 通过。
+- [x] 不改服务端行为或设备 UI。
+
+短计划：先在 `api-client.test.ts` 增加分页参数、默认值、路径编码和响应 DTO 回归并确认 client 方法不存在；再增加 DTO 与 client 方法；最后运行定向 Vitest、冻结安装、Web build 和 diff check。
+
+#### LUX-746 验证记录
+
+结果（2026-10-20）：增加 `AdminUserDevice`/`AdminUserDevicePage` 安全 DTO 和 `adminUserDevices` client 方法。分页默认 1/20，user ID 路径编码，查询参数为 `page`/`pageSize`，读取通过统一请求层 GET，不定义 user ID、token 或 Cookie 字段。未改服务端或 UI。
+
+验证：TDD RED 回归先因 `adminUserDevices` 方法不存在而失败；实现后定向 `tests/api-client.test.ts` 回归通过，冻结依赖安装和 `pnpm --dir web build` 通过。全量 `pnpm --dir web test` 为 741 passed、4 failed：`home-page.test.tsx` 首页库预取 1 项、`library-card.test.tsx` 两项、`media-query-polling.test.tsx` 1 项；与前序记录的四项基线失败相同，设备 API client 用例通过。`git diff --check` 通过；本任务不涉及 Playwright 页面变更。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

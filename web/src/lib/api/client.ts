@@ -41,6 +41,7 @@ import type {
   AdminUserActivityPage,
   AdminUserActivityQuery,
   AdminUser,
+  AdminUserDevicePage,
   AdminUserEmbySessionPage,
   AdminUserPlaybackSessionPage,
   AdminUserEmbySessionRevokeAllResponse,
@@ -1324,6 +1325,13 @@ export class LuxApiClient {
     return this.request<AdminUserEmbySessionRevokeAllResponse>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions`,
       { method: "DELETE" },
+    );
+  }
+
+  adminUserDevices(userId: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserDevicePage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/devices?${params.toString()}`,
     );
   }
 

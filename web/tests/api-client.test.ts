@@ -651,6 +651,53 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("lists admin user devices with paginated safe summary contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        devices: [{
+          deviceId: "device-1",
+          deviceName: "Living Room",
+          deviceType: "EMBY",
+          clientName: "Infuse",
+          clientVersion: "1.2.3",
+          firstSeenAt: 100,
+          lastSeenAt: 200,
+          lastRemoteIp: "192.0.2.10",
+        }],
+        page: 2,
+        pageSize: 5,
+        totalCount: 6,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        devices: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      }), { status: 200 }));
+
+    const client = new LuxApiClient();
+    await expect(client.adminUserDevices("user /1", 2, 5)).resolves.toMatchObject({
+      devices: [{ deviceId: "device-1", clientName: "Infuse", lastSeenAt: 200 }],
+      page: 2,
+      pageSize: 5,
+      totalCount: 6,
+    });
+    await expect(client.adminUserDevices("user-2")).resolves.toMatchObject({
+      devices: [],
+      page: 1,
+      pageSize: 20,
+      totalCount: 0,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/users/user%20%2F1/devices?page=2&pageSize=5",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/admin/users/user-2/devices?page=1&pageSize=20",
+    );
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
+  });
+
   it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     const cookie = installCookieDocument("lux_csrf=csrf-token");
