@@ -31,12 +31,18 @@ export function accountSettingsStorageKey(userId?: string): string {
 }
 
 export function readAccountSettings(userId?: string): AccountSettings {
+  return readStoredAccountSettings(userId) ?? { ...DEFAULT_ACCOUNT_SETTINGS };
+}
+
+export function readStoredAccountSettings(userId?: string): AccountSettings | null {
   const storage = getStorage();
-  if (!storage) return { ...DEFAULT_ACCOUNT_SETTINGS };
+  if (!storage) return null;
 
   try {
-    const stored = JSON.parse(storage.getItem(accountSettingsStorageKey(userId)) ?? "null") as Partial<AccountSettings> | null;
-    if (!stored || typeof stored !== "object") return { ...DEFAULT_ACCOUNT_SETTINGS };
+    const raw = storage.getItem(accountSettingsStorageKey(userId));
+    if (!raw) return null;
+    const stored = JSON.parse(raw) as Partial<AccountSettings> | null;
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
 
     return {
       theme: stored.theme === "light" ? "light" : "dark",
@@ -51,7 +57,7 @@ export function readAccountSettings(userId?: string): AccountSettings {
       autoPlayNextEpisode: stored.autoPlayNextEpisode !== false,
     };
   } catch {
-    return { ...DEFAULT_ACCOUNT_SETTINGS };
+    return null;
   }
 }
 

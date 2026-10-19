@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountPage } from "../src/features/account/AccountPage";
 import { LuxShell } from "../src/components/layout/LuxShell";
 import { api } from "../src/lib/api/client";
-import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
+import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings, readStoredAccountSettings } from "../src/features/account/account-settings";
 import { calculateAvatarCrop } from "../src/features/account/avatar-image";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -89,6 +89,37 @@ describe("account settings", () => {
 
     expect(readAccountSettings("user-a").theme).toBe("light");
     expect(readAccountSettings("user-b").theme).toBe("dark");
+  });
+
+  it("distinguishes stored legacy preferences from defaults and malformed data", () => {
+    expect(readStoredAccountSettings(user.id)).toBeNull();
+    expect(readAccountSettings(user.id)).toEqual(DEFAULT_ACCOUNT_SETTINGS);
+
+    localStorage.setItem(accountSettingsStorageKey(user.id), "{");
+    expect(readStoredAccountSettings(user.id)).toBeNull();
+
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({
+      theme: "light",
+      accentColor: "ocean",
+      showContinueWatching: false,
+      libraryOrder: ["movies", 17],
+      unexpected: "ignored",
+    }));
+    expect(readStoredAccountSettings(user.id)).toEqual({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      theme: "light",
+      accentColor: "ocean",
+      showContinueWatching: false,
+      libraryOrder: ["movies"],
+    });
+  });
+
+  it("returns no legacy snapshot when browser storage access fails", () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("localStorage unavailable");
+    });
+
+    expect(readStoredAccountSettings(user.id)).toBeNull();
   });
 
   it("defaults to silver when no valid accent preference is saved", () => {

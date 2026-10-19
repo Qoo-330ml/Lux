@@ -13763,6 +13763,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：Web API 增加账户偏好响应与完整更新类型，以及 GET/PATCH 客户端方法；写入复用公共请求层的 CSRF 注入。新增 API 客户端合同回归，`api-client.test.ts` 65/65、TypeScript/Web build 与 diff check 通过。
 
+#### LUX-657：区分已保存的本地账户偏好与默认值
+
+范围：为首次服务端迁移提供只读旧浏览器偏好读取函数。仅当指定用户键下存在可解析设置对象时返回经过现有规则归一化的设置；没有数据、无效 JSON 或浏览器存储不可用时返回 `null`，不读取或导入媒体库顺序以外的服务端状态。本任务不接账户 API 或页面。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/account/account-settings.ts`、`web/tests/account-settings.test.tsx`。
+
+验收标准：
+
+- [x] 无本地记录、JSON 损坏或 localStorage 不可用时返回 `null`，不会把代码默认值当成旧用户设置。
+- [x] 有效旧记录保留已知设置并按既有规则补齐缺省/过滤非法字段。
+- [x] `account-settings` 定向 Vitest 和 diff check 通过。
+
+短计划：先添加“无记录/有效旧记录/坏数据/受限存储”回归并确认帮助函数缺失；再抽出现有解析与归一化逻辑，不改变普通读取行为。
+
+验证：`pnpm --dir web exec vitest run tests/account-settings.test.tsx`、`git diff --check`。
+
+依赖：LUX-656。
+
+结果（2026-10-19）：新增 `readStoredAccountSettings`，只返回指定用户键下可解析的设置对象；无记录、JSON 损坏、非对象数据或存储读取抛错均返回 `null`。现有 `readAccountSettings` 继续在无有效旧值时返回相同默认值。`account-settings.test.tsx` 25/25、diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
