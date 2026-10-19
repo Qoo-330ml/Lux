@@ -1,7 +1,11 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, setup::SetupService},
-    auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
+    auth::{
+        emby::{EmbyAuthService, EmbyDeviceInfo},
+        sessions::WebAuthService,
+        users::UserStore,
+    },
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -3147,6 +3151,270 @@ async fn admin_can_revoke_user_web_sessions_without_affecting_other_sessions()
         .send()
         .await?;
     assert_eq!(repeated.status(), reqwest::StatusCode::NOT_FOUND);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_manage_emby_login_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth.clone(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let create_user = |username: &str| {
+        client
+            .post(format!("{base_url}/api/v1/admin/users"))
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&json!({ "username": username, "password": "target password" }))
+            .send()
+    };
+    let target_response = create_user("emby-revoke-target").await?;
+    assert_eq!(target_response.status(), reqwest::StatusCode::CREATED);
+    let target_id = target_response.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing target user id")?
+        .to_owned();
+    let other_response = create_user("emby-revoke-other").await?;
+    assert_eq!(other_response.status(), reqwest::StatusCode::CREATED);
+    let other_id = other_response.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing other user id")?
+        .to_owned();
+
+    let target_sessions = [
+        emby_auth
+            .authenticate_user_id(
+                &target_id,
+                "target password",
+                &EmbyDeviceInfo {
+                    client: "Emby Mobile".to_owned(),
+                    device: "Phone".to_owned(),
+                    device_id: "phone-1".to_owned(),
+                    version: "1.0".to_owned(),
+                    user_id: None,
+                },
+            )
+            .await?
+            .ok_or("target login failed")?,
+        emby_auth
+            .authenticate_user_id(
+                &target_id,
+                "target password",
+                &EmbyDeviceInfo {
+                    client: "Emby TV".to_owned(),
+                    device: "Living Room".to_owned(),
+                    device_id: "tv-1".to_owned(),
+                    version: "2.0".to_owned(),
+                    user_id: None,
+                },
+            )
+            .await?
+            .ok_or("target login failed")?,
+        emby_auth
+            .authenticate_user_id(
+                &target_id,
+                "target password",
+                &EmbyDeviceInfo {
+                    client: "Emby Web".to_owned(),
+                    device: "Browser".to_owned(),
+                    device_id: "browser-1".to_owned(),
+                    version: "3.0".to_owned(),
+                    user_id: None,
+                },
+            )
+            .await?
+            .ok_or("target login failed")?,
+    ];
+    let other_session = emby_auth
+        .authenticate_user_id(
+            &other_id,
+            "target password",
+            &EmbyDeviceInfo {
+                client: "Emby Other".to_owned(),
+                device: "Other Device".to_owned(),
+                device_id: "other-device".to_owned(),
+                version: "1.0".to_owned(),
+                user_id: None,
+            },
+        )
+        .await?
+        .ok_or("other login failed")?;
+
+    let unauthenticated = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions?page=2&pageSize=1"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let page_body = page.json::<Value>().await?;
+    assert_eq!(page_body["page"], 2);
+    assert_eq!(page_body["pageSize"], 1);
+    assert_eq!(page_body["totalCount"], 3);
+    assert_eq!(page_body["sessions"].as_array().map(Vec::len), Some(1));
+    let page_json = page_body.to_string();
+    for session in &target_sessions {
+        assert!(!page_json.contains(&session.token));
+    }
+    assert!(!page_json.contains("tokenHash"));
+    assert!(!page_json.contains("token_hash"));
+
+    let bounded_page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions?pageSize=1000"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(bounded_page["pageSize"], 100);
+    assert_eq!(bounded_page["totalCount"], 3);
+    let invalid_user = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/not-a-user-id/emby-sessions"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_user.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let first_session_id = &target_sessions[0].session_id;
+    let unauthenticated_delete = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions/{first_session_id}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        unauthenticated_delete.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let missing_csrf = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions/{first_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let wrong_owner = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions/{}",
+            other_session.session_id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(wrong_owner.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let revoked_one = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions/{first_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(revoked_one.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(!emby_auth.verify_token(&target_sessions[0].token).await?);
+    assert!(emby_auth.verify_token(&target_sessions[1].token).await?);
+
+    let missing_all_csrf = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_all_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let revoked_all = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(revoked_all.status(), reqwest::StatusCode::OK);
+    assert_eq!(revoked_all.json::<Value>().await?["revokedCount"], 2);
+    for session in &target_sessions {
+        assert!(!emby_auth.verify_token(&session.token).await?);
+    }
+    assert!(emby_auth.verify_token(&other_session.token).await?);
+    let repeated = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/emby-sessions"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(repeated.json::<Value>().await?["revokedCount"], 0);
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit_body = audit.json::<Value>().await?;
+    let audit_events = audit_body["events"]
+        .as_array()
+        .ok_or("missing audit events")?;
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_EMBY_LOGIN_SESSION_REVOKED")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_EMBY_LOGIN_SESSIONS_REVOKED")
+    );
+    let audit_json = audit_body.to_string();
+    for session in &target_sessions {
+        assert!(!audit_json.contains(&session.token));
+    }
+    assert!(!audit_json.contains(&other_session.token));
     server.abort();
     Ok(())
 }

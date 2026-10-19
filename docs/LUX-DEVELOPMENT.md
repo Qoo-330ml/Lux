@@ -14999,6 +14999,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 确认服务方法缺失时测试编译失败；`admin_emby_login_session_revocation` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。不新增 migration；阶段完整 Rust 门禁仍按 LUX-714 所记未通过结果处理。
 
+#### LUX-716：提供管理员 Emby 登录凭证管理 API
+
+范围：新增管理员按用户分页读取 Emby 登录凭证摘要、撤销一条凭证和撤销该用户全部有效凭证的 HTTP API，复用 LUX-715 的 `EmbyAuthService`。分页响应只包含记录 ID、设备/客户端和时间字段；写操作要求管理员 Web session 与 CSRF，并写入不含凭证材料的审计事件。本任务不修改 Web 客户端或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 分页读取验证用户 ID 和账号存在性，页码至少为 1，页大小默认 50 且服务端限制 1–100；不返回 token/hash。
+- [x] 单条及全部撤销仅管理员 Web session + CSRF 可执行；逐项未知/非目标凭证返回 404，成功逐项返回 204，全部撤销返回影响数。
+- [x] 两种撤销写入脱敏审计；回归覆盖未认证、缺 CSRF、用户隔离、分页、凭证撤销生效及响应/审计不含 token/hash。
+- [x] `users` 定向集成测试、Rust build、fmt 与 diff check 通过；同步 API 文档，不新增 migration。
+
+短计划：先添加管理员 Emby 凭证列表及撤销流程的失败集成回归；再接入 LUX-715 服务、错误码与审计；最后同步 API 文档并运行定向集成测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_emby_login_sessions -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-715、LUX-660、LUX-662。
+
+结果（2026-10-20）：新增 `/api/v1/admin/users/{userId}/emby-sessions` 分页读取及全部撤销端点，以及 `{sessionId}` 单条撤销端点。分页固定返回安全摘要；单条和批量写入先执行管理员 Web session + CSRF 检查，目标用户及凭证范围由服务/存储双重限定。单条返回 204，全部返回 `revokedCount`；只有实际撤销时生成不含凭证材料的审计事件。API 文档已同步。
+
+验证：TDD RED 在缺少路由时返回 404；最终 `admin_can_manage_emby_login_sessions` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。集成回归确认分页上限、单项/全部撤销、跨用户隔离、未认证与 CSRF 拒绝、token 失效及响应/审计不含原始 token。无 migration。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

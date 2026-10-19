@@ -826,6 +826,199 @@ async fn admin_revoke_user_session(
     }
 }
 
+async fn admin_list_user_emby_login_sessions(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = i64::from(query.page_size.unwrap_or(50).clamp(1, 100));
+    let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
+    match auth
+        .list_admin_login_sessions(&user_id, page_size, offset)
+        .await
+    {
+        Ok((sessions, total_count)) => Json(json!({
+            "sessions": sessions.iter().map(|session| json!({
+                "id": session.id,
+                "deviceId": session.device_id,
+                "deviceName": session.device_name,
+                "deviceType": session.device_type,
+                "clientName": session.client_name,
+                "clientVersion": session.client_version,
+                "createdAt": session.created_at,
+                "updatedAt": session.updated_at,
+                "lastSeenAt": session.last_seen_at,
+            })).collect::<Vec<_>>(),
+            "page": page,
+            "pageSize": page_size,
+            "totalCount": total_count,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_revoke_user_emby_login_session(
+    headers: HeaderMap,
+    Path((user_id, session_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Ok(session_id) = session_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "登录 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let session_id = session_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match auth.revoke_admin_login_session(&user_id, &session_id).await {
+        Ok(true) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_EMBY_LOGIN_SESSION_REVOKED",
+                Some("emby_login_session"),
+                Some(&session_id),
+                &json!({ "userId": user_id }).to_string(),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "Emby 登录凭证不存在或已撤销",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_revoke_all_user_emby_login_sessions(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match auth.revoke_all_admin_login_sessions(&user_id).await {
+        Ok(revoked_count) => {
+            if revoked_count > 0 {
+                record_audit_event(
+                    &state,
+                    &headers,
+                    "USER_EMBY_LOGIN_SESSIONS_REVOKED",
+                    Some("user"),
+                    Some(&user_id),
+                    &json!({ "userId": user_id, "revokedCount": revoked_count }).to_string(),
+                )
+                .await;
+            }
+            Json(json!({ "revokedCount": revoked_count })).into_response()
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 fn invalid_user_permission_preset_request(headers: &HeaderMap) -> Response {
     api_error(
         headers,
@@ -2120,6 +2313,15 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/sessions/{session_id}",
             delete(admin_revoke_user_session),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/emby-sessions",
+            get(admin_list_user_emby_login_sessions)
+                .delete(admin_revoke_all_user_emby_login_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/emby-sessions/{session_id}",
+            delete(admin_revoke_user_emby_login_session),
         )
         .route(
             "/api/v1/admin/users/{user_id}/permission-preset",
