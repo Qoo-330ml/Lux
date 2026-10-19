@@ -99,6 +99,27 @@ struct AdminUserSessionsQuery {
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+struct AdminUserAccessBlacklistRulesQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateUserAccessBlacklistRuleRequest {
+    rule_type: String,
+    match_value: String,
+    is_enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetUserAccessBlacklistRuleEnabledRequest {
+    is_enabled: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct AdminUserActivityQuery {
     page: Option<i64>,
     page_size: Option<i64>,
@@ -814,6 +835,327 @@ async fn admin_list_user_devices(
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+async fn admin_list_global_user_access_blacklist_rules(
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<AdminUserAccessBlacklistRulesQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    list_user_access_blacklist_rules(&headers, &state, None, query).await
+}
+
+async fn admin_list_scoped_user_access_blacklist_rules(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminUserAccessBlacklistRulesQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    list_user_access_blacklist_rules(&headers, &state, Some(user_id), query).await
+}
+
+async fn list_user_access_blacklist_rules(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: Option<String>,
+    query: AdminUserAccessBlacklistRulesQuery,
+) -> Response {
+    let user_id = match validate_user_access_blacklist_scope(headers, state, user_id, false).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = i64::from(page.saturating_sub(1)).saturating_mul(i64::from(page_size));
+    let scope = user_id.as_deref().map_or(
+        crate::storage::UserAccessBlacklistRuleScope::Global,
+        |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
+    );
+    match database
+        .list_user_access_blacklist_rules_page(crate::storage::UserAccessBlacklistRulePageQuery {
+            scope,
+            offset,
+            limit: i64::from(page_size),
+        })
+        .await
+    {
+        Ok((rules, total_count)) => Json(json!({
+            "rules": rules.iter().map(user_access_blacklist_rule_json).collect::<Vec<_>>(),
+            "page": page,
+            "pageSize": page_size,
+            "totalCount": total_count,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_create_global_user_access_blacklist_rule(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<CreateUserAccessBlacklistRuleRequest>,
+) -> Response {
+    create_user_access_blacklist_rule(&headers, &state, None, request).await
+}
+
+async fn admin_create_scoped_user_access_blacklist_rule(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateUserAccessBlacklistRuleRequest>,
+) -> Response {
+    create_user_access_blacklist_rule(&headers, &state, Some(user_id), request).await
+}
+
+async fn create_user_access_blacklist_rule(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: Option<String>,
+    request: CreateUserAccessBlacklistRuleRequest,
+) -> Response {
+    let user_id = match validate_user_access_blacklist_scope(headers, state, user_id, true).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let Some(rule_type) = crate::application::user_access_rules::UserAccessBlacklistRuleType::parse(
+        &request.rule_type,
+    ) else {
+        return api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "黑名单规则类型无效",
+        )
+        .into_response();
+    };
+    let match_value =
+        match crate::application::user_access_rules::normalize_user_access_blacklist_value(
+            rule_type,
+            &request.match_value,
+        ) {
+            Ok(match_value) => match_value,
+            Err(_) => {
+                return api_error(
+                    headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "黑名单规则值无效",
+                )
+                .into_response();
+            }
+        };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let rule_id = uuid::Uuid::now_v7().to_string();
+    let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let created_by = admin_user_access_blacklist_creator(headers, state).await;
+    match database
+        .insert_user_access_blacklist_rule(crate::storage::NewUserAccessBlacklistRule {
+            id: &rule_id,
+            user_id: user_id.as_deref(),
+            rule_type: rule_type.as_database_value(),
+            match_value: &match_value,
+            is_enabled: request.is_enabled.unwrap_or(true),
+            created_by: created_by.as_deref(),
+            created_at,
+        })
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": rule_id,
+                "userId": user_id,
+                "ruleType": rule_type.as_database_value(),
+                "matchValue": match_value,
+                "isEnabled": request.is_enabled.unwrap_or(true),
+                "createdBy": created_by,
+                "createdAt": created_at,
+                "updatedAt": created_at,
+            })),
+        )
+            .into_response(),
+        Err(error) if error.is_unique_violation() => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该作用范围已存在相同黑名单规则",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_set_global_user_access_blacklist_rule_enabled(
+    headers: HeaderMap,
+    Path(rule_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<SetUserAccessBlacklistRuleEnabledRequest>,
+) -> Response {
+    set_user_access_blacklist_rule_enabled(&headers, &state, None, rule_id, request).await
+}
+
+async fn admin_set_scoped_user_access_blacklist_rule_enabled(
+    headers: HeaderMap,
+    Path((user_id, rule_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<SetUserAccessBlacklistRuleEnabledRequest>,
+) -> Response {
+    set_user_access_blacklist_rule_enabled(&headers, &state, Some(user_id), rule_id, request).await
+}
+
+async fn set_user_access_blacklist_rule_enabled(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: Option<String>,
+    rule_id: String,
+    request: SetUserAccessBlacklistRuleEnabledRequest,
+) -> Response {
+    let user_id = match validate_user_access_blacklist_scope(headers, state, user_id, true).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let scope = user_id.as_deref().map_or(
+        crate::storage::UserAccessBlacklistRuleScope::Global,
+        |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
+    );
+    match database
+        .set_user_access_blacklist_rule_enabled(scope, &rule_id, request.is_enabled)
+        .await
+    {
+        Ok(true) => Json(json!({ "id": rule_id, "isEnabled": request.is_enabled })).into_response(),
+        Ok(false) => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "黑名单规则不存在",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_delete_global_user_access_blacklist_rule(
+    headers: HeaderMap,
+    Path(rule_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    delete_user_access_blacklist_rule(&headers, &state, None, rule_id).await
+}
+
+async fn admin_delete_scoped_user_access_blacklist_rule(
+    headers: HeaderMap,
+    Path((user_id, rule_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    delete_user_access_blacklist_rule(&headers, &state, Some(user_id), rule_id).await
+}
+
+async fn delete_user_access_blacklist_rule(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: Option<String>,
+    rule_id: String,
+) -> Response {
+    let user_id = match validate_user_access_blacklist_scope(headers, state, user_id, true).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let scope = user_id.as_deref().map_or(
+        crate::storage::UserAccessBlacklistRuleScope::Global,
+        |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
+    );
+    match database
+        .delete_user_access_blacklist_rule(scope, &rule_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "黑名单规则不存在",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn validate_user_access_blacklist_scope(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: Option<String>,
+    require_csrf: bool,
+) -> Result<Option<String>, Response> {
+    require_admin(headers, state, require_csrf).await?;
+    let Some(user_id) = user_id else {
+        return Ok(None);
+    };
+    let user_id = user_id
+        .parse::<crate::domain::ids::UserId>()
+        .map_err(|_| {
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户 ID 无效",
+            )
+            .into_response()
+        })?
+        .to_string();
+    let Some(database) = state.database.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => Ok(Some(user_id)),
+        Ok(None) => Err(api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response()),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    }
+}
+
+async fn admin_user_access_blacklist_creator(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<String> {
+    if lux_api_key_from_headers(headers).is_some() {
+        return None;
+    }
+    let session_token = request_cookie(headers, "lux_session")?;
+    let auth = state.auth.as_ref()?;
+    auth.resolve(&session_token)
+        .await
+        .ok()
+        .flatten()
+        .map(|session| session.user.id.to_string())
+}
+
+fn user_access_blacklist_rule_json(rule: &crate::storage::StoredUserAccessBlacklistRule) -> Value {
+    json!({
+        "id": rule.id,
+        "userId": rule.user_id,
+        "ruleType": rule.rule_type,
+        "matchValue": rule.match_value,
+        "isEnabled": rule.is_enabled,
+        "createdBy": rule.created_by,
+        "createdAt": rule.created_at,
+        "updatedAt": rule.updated_at,
+    })
 }
 
 async fn admin_revoke_user_session(
@@ -2699,6 +3041,26 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/devices",
             get(admin_list_user_devices),
+        )
+        .route(
+            "/api/v1/admin/access-blacklist/global",
+            get(admin_list_global_user_access_blacklist_rules)
+                .post(admin_create_global_user_access_blacklist_rule),
+        )
+        .route(
+            "/api/v1/admin/access-blacklist/global/{rule_id}",
+            patch(admin_set_global_user_access_blacklist_rule_enabled)
+                .delete(admin_delete_global_user_access_blacklist_rule),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/access-blacklist",
+            get(admin_list_scoped_user_access_blacklist_rules)
+                .post(admin_create_scoped_user_access_blacklist_rule),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/access-blacklist/{rule_id}",
+            patch(admin_set_scoped_user_access_blacklist_rule_enabled)
+                .delete(admin_delete_scoped_user_access_blacklist_rule),
         )
         .route(
             "/api/v1/admin/users/{user_id}/sessions/{session_id}",

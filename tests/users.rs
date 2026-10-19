@@ -4108,6 +4108,254 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
 }
 
 #[tokio::test]
+async fn admin_can_manage_scoped_user_access_blacklist_rules()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let target_a = UserStore::new(database.clone())?
+        .create_user("blacklist-a", "Blacklist A", "target password", false)
+        .await?;
+    let target_b = UserStore::new(database.clone())?
+        .create_user("blacklist-b", "Blacklist B", "target password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let global_path = format!("{base_url}/api/v1/admin/access-blacklist/global");
+
+    let unauthenticated = client.get(&global_path).send().await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "blacklist-a",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    let target_cookie = cookie_pair(target_login.headers());
+
+    let forbidden_member = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/access-blacklist",
+            target_a.id
+        ))
+        .header(COOKIE, &target_cookie)
+        .send()
+        .await?;
+    assert_eq!(forbidden_member.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let missing_csrf = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({ "ruleType": "CLIENT", "matchValue": "Kodi" }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let invalid_type = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "OPERATING_SYSTEM", "matchValue": "iOS" }))
+        .send()
+        .await?;
+    assert_eq!(invalid_type.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let global_client_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({
+            "ruleType": "CLIENT",
+            "matchValue": "  Jellyfin   Web  "
+        }))
+        .send()
+        .await?;
+    assert_eq!(global_client_rule.status(), reqwest::StatusCode::CREATED);
+    let global_client_rule = global_client_rule.json::<Value>().await?;
+    let global_client_id = global_client_rule["id"].as_str().unwrap().to_owned();
+    assert_eq!(global_client_rule["ruleType"], "CLIENT");
+    assert_eq!(global_client_rule["matchValue"], "jellyfin web");
+    assert_eq!(global_client_rule["userId"], Value::Null);
+    assert_eq!(global_client_rule["createdBy"], admin.id.to_string());
+    assert_eq!(global_client_rule["isEnabled"], true);
+    assert!(global_client_rule.get("token").is_none());
+
+    let duplicate_global_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "CLIENT", "matchValue": "JELLYFIN WEB" }))
+        .send()
+        .await?;
+    assert_eq!(
+        duplicate_global_rule.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+
+    let invalid_cidr = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "192.0.2.1/44" }))
+        .send()
+        .await?;
+    assert_eq!(invalid_cidr.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let global_ip_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "192.0.2.99/24" }))
+        .send()
+        .await?;
+    assert_eq!(global_ip_rule.status(), reqwest::StatusCode::CREATED);
+    let global_ip_rule = global_ip_rule.json::<Value>().await?;
+    let global_ip_id = global_ip_rule["id"].as_str().unwrap().to_owned();
+    assert_eq!(global_ip_rule["matchValue"], "192.0.2.0/24");
+
+    let user_path = format!(
+        "{base_url}/api/v1/admin/users/{}/access-blacklist",
+        target_a.id
+    );
+    let user_client_rule = client
+        .post(&user_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "CLIENT", "matchValue": "jellyfin web" }))
+        .send()
+        .await?;
+    assert_eq!(user_client_rule.status(), reqwest::StatusCode::CREATED);
+    let user_client_rule = user_client_rule.json::<Value>().await?;
+    let user_client_id = user_client_rule["id"].as_str().unwrap().to_owned();
+    assert_eq!(user_client_rule["userId"], target_a.id.to_string());
+
+    let user_a_rules = client
+        .get(&user_path)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(user_a_rules.status(), reqwest::StatusCode::OK);
+    let user_a_rules = user_a_rules.json::<Value>().await?;
+    assert_eq!(user_a_rules["totalCount"], 1);
+    assert_eq!(user_a_rules["rules"][0]["id"], user_client_id);
+
+    let user_b_rules = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/access-blacklist",
+            target_b.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(user_b_rules.status(), reqwest::StatusCode::OK);
+    assert_eq!(user_b_rules.json::<Value>().await?["totalCount"], 0);
+
+    let global_page = client
+        .get(format!("{global_path}?page=0&pageSize=101"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(global_page.status(), reqwest::StatusCode::OK);
+    let global_page = global_page.json::<Value>().await?;
+    assert_eq!(global_page["page"], 1);
+    assert_eq!(global_page["pageSize"], 100);
+    assert_eq!(global_page["totalCount"], 2);
+    assert_eq!(global_page["rules"].as_array().map(Vec::len), Some(2));
+
+    let wrong_scope_update = client
+        .patch(format!("{global_path}/{user_client_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "isEnabled": false }))
+        .send()
+        .await?;
+    assert_eq!(wrong_scope_update.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let missing_update_csrf = client
+        .patch(format!("{global_path}/{global_client_id}"))
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({ "isEnabled": false }))
+        .send()
+        .await?;
+    assert_eq!(missing_update_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let disable_global_rule = client
+        .patch(format!("{global_path}/{global_client_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "isEnabled": false }))
+        .send()
+        .await?;
+    assert_eq!(disable_global_rule.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        disable_global_rule.json::<Value>().await?["isEnabled"],
+        false
+    );
+
+    let wrong_scope_delete = client
+        .delete(format!("{user_path}/{global_ip_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(wrong_scope_delete.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let delete_user_rule = client
+        .delete(format!("{user_path}/{user_client_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(delete_user_rule.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let invalid_user_id = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/not-a-user/access-blacklist"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_user_id.status(), reqwest::StatusCode::BAD_REQUEST);
+    let missing_user_id = uuid::Uuid::now_v7();
+    let missing_user = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{missing_user_id}/access-blacklist"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_list_user_web_sessions_without_exposing_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

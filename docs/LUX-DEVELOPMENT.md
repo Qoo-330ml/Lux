@@ -15832,6 +15832,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：领域测试 5/5、`cargo build --locked`、fmt 检查与 `git diff --check` 通过。
 
+#### LUX-757：开放管理员黑名单规则管理 API
+
+范围：为 LUX-754 至 LUX-756 的设备、客户端和 IP/CIDR 规则提供全站与精确用户范围的管理员 HTTP API，支持有界分页读取、规则创建、启停和删除。创建时执行既有领域规范化；用户范围校验目标账号存在；重复规则返回冲突；所有路径都强制作用域隔离。写请求要求管理员认证和 CSRF（共享管理员 API Key 按既有认证合同处理）。本任务只管理规则数据，不把规则接入登录拒绝、会话撤销或播放授权，也不表示 IP 规则已生效。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`、`src/storage/users.rs`。
+
+验收标准：
+
+- [x] 全站与指定用户规则 API 支持读取、创建、启停、删除及 1–100 条有界分页；用户范围不能读取或修改全站及其他用户规则。
+- [x] 规则类型与值经领域解析/规范化；无效输入返回 400、重复规则返回 409、无效用户 ID 返回 400、目标账号不存在返回 404。
+- [x] 写请求检查管理员与 CSRF；响应仅返回规则安全摘要，不泄漏认证资料。
+- [x] `tests/users` 的 API 定向回归、Rust build、fmt 与 diff check 通过。
+- [x] 规则暂不参与认证或播放拒绝；IP 封禁仍等待可信代理来源解析任务。
+
+短计划：先在 `tests/users.rs` 增加全站/用户范围 CRUD、分页、输入规范化、冲突、认证和 CSRF 回归并确认路由尚未注册；再接入既有 storage 与领域规范化合同；最后同步 API 文档并运行 users 定向目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：新增管理员全站及指定用户规则分页 API，支持设备、客户端和 IP/CIDR 规则创建、启停、删除。请求值经 LUX-756 规范化，重复规则返回 409，跨作用域 ID 按不存在处理；用户范围校验 ID 和目标账号。管理员 Web 写请求检查 CSRF；规则摘要记录 Web 管理员创建者，API Key 创建者按既有合同留空。此任务只提供规则管理 API，未改变认证或播放行为。
+
+验证：TDD RED 先因路由未注册返回 404；实现后 `admin_can_manage_scoped_user_access_blacklist_rules` 通过，覆盖认证/CSRF、规则值校验与规范化、重复冲突、分页、作用域隔离及用户 ID 错误。`cargo test --locked --test users -- --test-threads=1` 在显式绕过本地回环代理后 21/21 通过；首次运行 13 个既有本地 HTTP 用例受代理影响返回 502。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
