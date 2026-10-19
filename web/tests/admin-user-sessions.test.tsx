@@ -93,7 +93,7 @@ describe("AdminUserDetailPage Web session management", () => {
     expect(container.textContent).toContain("第 1 / 2 页");
 
     await act(async () => {
-      findButton("下一页").click();
+      findButton("下一页", ".lux-admin-user-web-sessions").click();
       await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", 2, 20));
       await vi.waitFor(() => expect(container.textContent).toContain("第 2 / 2 页"));
     });
@@ -404,7 +404,8 @@ describe("AdminUserDetailPage Web session management", () => {
     await act(async () => {
       findButton("撤销登录").click();
       await vi.waitFor(() => expect(revoke).toHaveBeenCalledTimes(2));
-      await vi.waitFor(() => expect(container.querySelector('[role="status"]')?.textContent).toContain("Emby 登录已撤销"));
+      await vi.waitFor(() => expect([...container.querySelectorAll('[role="status"]')]
+        .some((status) => status.textContent?.includes("Emby 登录已撤销"))).toBe(true));
     });
   });
 
@@ -450,6 +451,14 @@ describe("AdminUserDetailPage Web session management", () => {
         totalCount: 0,
       });
     }
+    if (!vi.isMockFunction(api.adminUserDevices)) {
+      vi.spyOn(api, "adminUserDevices").mockResolvedValue({
+        devices: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+    }
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -484,8 +493,10 @@ describe("AdminUserDetailPage Web session management", () => {
     });
   }
 
-  function findButton(label: string) {
-    const button = [...container.querySelectorAll<HTMLButtonElement>("button")]
+  function findButton(label: string, scopeSelector?: string) {
+    const scope = scopeSelector ? container.querySelector(scopeSelector) : container;
+    expect(scope, `scope ${scopeSelector ?? "container"}`).toBeTruthy();
+    const button = [...scope!.querySelectorAll<HTMLButtonElement>("button")]
       .find((item) => item.textContent?.includes(label));
     expect(button, `button containing ${label}`).toBeTruthy();
     return button!;

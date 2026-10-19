@@ -15647,6 +15647,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 回归先因 `adminUserDevices` 方法不存在而失败；实现后定向 `tests/api-client.test.ts` 回归通过，冻结依赖安装和 `pnpm --dir web build` 通过。全量 `pnpm --dir web test` 为 741 passed、4 failed：`home-page.test.tsx` 首页库预取 1 项、`library-card.test.tsx` 两项、`media-query-polling.test.tsx` 1 项；与前序记录的四项基线失败相同，设备 API client 用例通过。`git diff --check` 通过；本任务不涉及 Playwright 页面变更。
 
+#### LUX-747：在用户详情展示设备清单
+
+范围：在用户详情“设备与登录”区域接入 LUX-746 设备清单 API，分页展示客户端、设备标识与名称、类型、版本、首次/最近活动及最近展示 IP。提供加载、空结果、读取错误重试和分页状态；所有设备值按普通文本安全展示。本任务只读，不实现设备/客户端封禁、访问活动刷新、登录状态关联或其他设备操作。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-devices.test.tsx`、`web/tests/admin-user-sessions.test.tsx`（为共用详情页的既有会话测试隔离设备 API 请求）。
+
+验收标准：
+
+- [x] 用户详情设备与登录页通过 LUX-746 客户端按页读取设备，并展示公开摘要字段。
+- [x] 加载、空结果、错误重试、总页数及上一页/下一页状态均可访问且正确。
+- [x] 组件定向测试、冻结依赖安装、Web build、浏览器展示检查和 diff check 通过。
+- [x] 不新增设备操作、黑名单、活动写入或登录凭证字段。
+
+短计划：先新增设备字段、默认分页、空结果和失败重试的组件回归并确认当前详情页未调用设备 API；再接入 React Query 与响应式设备表格；最后运行定向 Vitest、冻结依赖安装、Web build、浏览器检查和 diff check。
+
+#### LUX-747 验证记录
+
+结果（2026-10-20）：用户详情“设备与登录”区新增只读设备清单，显示客户端、设备名与标识、类型、版本、首次/最近活动和最近展示 IP；列表默认每页 20 条，提供加载、空态、读取失败重试和分页。窄屏表格在自身容器内滚动，不扩展页面宽度。未新增封禁、设备操作、活动写入、登录状态关联或凭证字段。
+
+验证：设备组件测试 4/4、现有用户会话组件测试 11/11；`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。全量 Web 测试为 745 passed、4 failed，仍为 `home-page.test.tsx`、`library-card.test.tsx` 两项与 `media-query-polling.test.tsx` 的同四项既有基线失败。隔离 Playwright 固定假数据预览在 390×844 显示设备清单；视口和文档宽度均为 390 px，840 px 表格通过 350 px 内层容器滚动，浏览器 console 无错误/警告；截图 `output/playwright/admin-user-devices-390.png`。`git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
