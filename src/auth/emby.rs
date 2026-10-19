@@ -75,6 +75,16 @@ impl EmbyAuthService {
         self.create_access_token(user, device).await.map(Some)
     }
 
+    pub async fn find_failed_authentication_user_id(
+        &self,
+        username: &str,
+    ) -> Result<Option<String>, EmbyAuthError> {
+        Ok(self
+            .users
+            .find_emby_authentication_target_id(username)
+            .await?)
+    }
+
     pub async fn authenticate_user_id(
         &self,
         user_id: &str,

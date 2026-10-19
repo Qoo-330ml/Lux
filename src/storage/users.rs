@@ -570,6 +570,33 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_users_by_display_name_exact(
+        &self,
+        display_name: &str,
+    ) -> Result<Vec<StoredUser>, StorageError> {
+        self.query(
+            "SELECT id, username_normalized, display_name, password_hash,
+                    has_password,
+                    is_disabled, is_admin, can_manage_server,
+                    can_remote_access, can_download, email, email_verified_at,
+                    deleted_at, deletion_purge_at, last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                         FROM access_tokens at WHERE at.user_id = users.id),
+                        last_login_at
+                    ) AS last_activity_at
+             FROM users WHERE display_name = ? ORDER BY id LIMIT 2",
+        )
+        .bind(display_name)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_user).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_users_by_normalized_usernames(
         &self,
         usernames: &[String],

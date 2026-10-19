@@ -643,30 +643,24 @@ impl UserStore {
         self.authenticate_stored_user(stored, password).await
     }
 
+    pub(crate) async fn find_emby_authentication_target_id(
+        &self,
+        username: &str,
+    ) -> Result<Option<String>, UserStoreError> {
+        Ok(self
+            .find_stored_emby_authentication_target(username)
+            .await?
+            .map(|user| user.id))
+    }
+
     pub(crate) async fn authenticate_emby_name(
         &self,
         username: &str,
         password: &str,
     ) -> Result<Option<UserRecord>, UserStoreError> {
-        let username_normalized = normalize_username(username)?;
         let stored = self
-            .database
-            .find_user_by_username(&username_normalized)
+            .find_stored_emby_authentication_target(username)
             .await?;
-        let stored = if stored.is_some() {
-            stored
-        } else {
-            let mut matching_display_names = self
-                .database
-                .list_users()
-                .await?
-                .into_iter()
-                .filter(|user| user.display_name == username.trim());
-            match (matching_display_names.next(), matching_display_names.next()) {
-                (Some(user), None) => Some(user),
-                _ => None,
-            }
-        };
         self.authenticate_stored_user(stored, password).await
     }
 
@@ -716,6 +710,29 @@ impl UserStore {
             last_login_at,
             last_activity_at: stored.last_activity_at,
         }))
+    }
+
+    async fn find_stored_emby_authentication_target(
+        &self,
+        username: &str,
+    ) -> Result<Option<crate::storage::StoredUser>, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        if let Some(user) = self
+            .database
+            .find_user_by_username(&username_normalized)
+            .await?
+        {
+            return Ok(Some(user));
+        }
+        let mut matching_display_names = self
+            .database
+            .find_users_by_display_name_exact(username.trim())
+            .await?;
+        if matching_display_names.len() == 1 {
+            Ok(Some(matching_display_names.remove(0)))
+        } else {
+            Ok(None)
+        }
     }
 }
 

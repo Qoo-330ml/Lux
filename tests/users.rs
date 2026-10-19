@@ -242,6 +242,68 @@ async fn failed_web_logins_are_indexed_only_for_known_users_and_not_rate_limited
 }
 
 #[tokio::test]
+async fn emby_authentication_target_lookup_matches_login_name_rules()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("lookup-admin", "Unique Display", "admin password")
+        .await?;
+    let user_store = UserStore::new(database.clone())?;
+    user_store
+        .create_user(
+            "lookup-duplicate-one",
+            "Duplicate Display",
+            "password one",
+            false,
+        )
+        .await?;
+    user_store
+        .create_user(
+            "lookup-duplicate-two",
+            "Duplicate Display",
+            "password two",
+            false,
+        )
+        .await?;
+    let auth = EmbyAuthService::new(database)?;
+
+    assert_eq!(
+        auth.find_failed_authentication_user_id(" LOOKUP-ADMIN ")
+            .await?
+            .as_deref(),
+        Some(admin.id.to_string().as_str())
+    );
+    assert_eq!(
+        auth.find_failed_authentication_user_id("Unique Display")
+            .await?
+            .as_deref(),
+        Some(admin.id.to_string().as_str())
+    );
+    assert_eq!(
+        auth.find_failed_authentication_user_id("Duplicate Display")
+            .await?,
+        None
+    );
+    assert_eq!(
+        auth.find_failed_authentication_user_id("unknown-name")
+            .await?,
+        None
+    );
+    assert!(
+        auth.find_failed_authentication_user_id("   ")
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_filter_and_page_user_activity_events() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

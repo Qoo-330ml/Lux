@@ -15257,6 +15257,43 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 的集成回归先以 0 条活动失败（预期 6 条）；实现后 `cargo test --locked --test users` 16/16、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --test users --all-features -- -D warnings` 被现有 6 项未修改代码告警阻断，位置为 `src/api/admin/admin_users.rs`、`src/api/media.rs`、`src/application/playback/session.rs`、`src/application/user_permission_copy.rs` 和 `src/storage/users.rs`；本任务未改动这些文件。
 
+#### LUX-728：为 Emby 失败登录解析已知账号
+
+范围：为 Emby 按用户名认证提供与成功认证相同的目标账号解析，包括规范化用户名和唯一精确显示名称回退；使用有界查询，避免登录请求枚举全部用户。只公开内部用户 ID 查询，不改变认证响应或用户公开数据。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/users.rs`、`src/auth/emby.rs`、`src/storage/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 规范化用户名和唯一精确显示名称解析到成功认证对应的用户；重复显示名称、未知及非法名称不解析账号。
+- [x] 显示名称查询最多读取两个候选，不枚举用户列表；数据库错误以现有存储错误类型返回。
+- [x] `users` 定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加服务层目标 ID 回归并确认方法缺失；再复用现有 Emby 用户名/显示名称合同，实现最多读取两个候选的内部解析；最后运行 `users` 集成目标、build、fmt 和 diff check。
+
+依赖：LUX-727。
+
+结果（2026-10-20）：Emby 登录目标解析统一使用规范化账号名及唯一精确显示名称回退。显示名称回退改为 storage 层 `LIMIT 2` 查询：无候选或有歧义均拒绝目标，不再在登录请求里枚举所有账号。内部认证服务可返回目标用户 ID，供失败活动索引复用。
+
+验证：TDD RED 集成回归因 `find_failed_authentication_user_id` 不存在而失败；实现后 `cargo test --locked --test users emby_authentication_target_lookup_matches_login_name_rules` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。既有认证调用点已复用相同解析函数。
+
+#### LUX-729：记录 Emby 已知账号登录失败
+
+范围：在 Emby 按用户名和按用户 ID 登录均被允许尝试且认证失败后，使用 LUX-728 的目标账号解析调用 LUX-726 安全记录器。未知/非法账号、数据库或迁移错误以及入口限流直接拒绝不记录；保持 Emby 状态码、响应体和频率限制合同，不记录客户端凭证或请求内容。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin.rs`、`src/api/emby_handlers.rs`、`src/auth/emby.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] 已知用户名或用户 ID 的密码错误、禁用账号写入 `AUTH_LOGIN_FAILED`，actor 为空并关联目标用户。
+- [ ] 未知/非法目标、认证错误和限流直接拒绝不写用户活动；失败元数据不含用户名、密码、token 或完整 URL。
+- [ ] Emby 失败 HTTP 合同、速率限制和成功认证事件不变，既有审计记录仍产生。
+- [ ] `users` 定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先为 Emby 用户名/ID 认证失败及限流写集成回归并确认活动缺失；再仅在认证返回明确失败的分支查询已知目标并接入记录器；最后运行 `users` 集成目标、build、fmt 和 diff check。
+
+依赖：LUX-726、LUX-728。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
