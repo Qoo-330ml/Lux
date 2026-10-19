@@ -14392,6 +14392,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 `AdminContentRestrictionIndexStatus` 类型和 `adminContentRestrictionIndexStatus()` GET 客户端方法；定向 API 客户端回归 1/1、冻结安装和 Web typecheck/build 通过。完整 `pnpm --dir web test` 为 706 passed、4 failed；失败分布于未改动的 `home-page.test.tsx`、`library-card.test.tsx`（2 项）和 `media-query-polling.test.tsx`，本任务未复现这些失败的基线状态。仓库未配置 Prettier 脚本或依赖，`git diff --check` 作为文本格式检查通过。页面展示留待 LUX-688。
 
+#### LUX-688：在用户内容限制页展示索引进度
+
+范围：将 LUX-686 管理员索引状态显示在用户详情的模块五页面，提供加载、错误重试、无媒体和部分/全部就绪状态。明确说明当前页仅展示索引回填状态，用户限制配置和访问拦截仍未接入。不修改索引 worker 或媒体访问行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-content-restriction.test.tsx`。
+
+验收标准：
+
+- [x] 模块五页以服务端计数显示已索引、待就绪及整体进度。
+- [x] 加载、API 错误和空媒体状态均有清晰、可访问的提示；错误可重试。
+- [x] 页面文案不暗示策略配置或访问拦截已经生效。
+- [x] 组件回归、Web build 与 diff check 通过，窄屏布局无溢出。
+
+短计划：先添加模块五页面组件回归并确认旧占位缺少进度而失败；再以 React Query 接入 LUX-687 客户端并实现各状态与响应式样式；最后跑定向 Vitest、build、浏览器窄屏检查与 diff 检查。
+
+验证：运行 `pnpm --dir web exec vitest run tests/admin-user-content-restriction.test.tsx`、`pnpm --dir web build`、Playwright 本地浏览器检查及 `git diff --check`。
+
+依赖：LUX-686、LUX-687。
+
+结果（2026-10-19）：用户详情模块五页接入服务端索引汇总，展示回填进度并在待处理期间每 5 秒刷新；加载、失败重试、无媒体、部分及全部就绪均有独立状态。页面明确说明用户限制配置和媒体访问拦截尚未接入。组件测试 4/4、Web build 和 diff check 通过。Playwright Chromium 在 390×844 视口显示 76/100、待就绪 24；文档宽度 390px、进度卡片宽 366px，无横向溢出，控制台无错误；预览截图保存在 `output/playwright/user-content-index-390.png`。完整 `pnpm --dir web test` 为 710 passed、4 failed，失败仍为未改动的 `home-page.test.tsx`、`library-card.test.tsx`（2 项）和 `media-query-polling.test.tsx`；该结果与 LUX-687 完整 Web 测试相同，未在本任务重现其基线原因。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -153,3 +153,13 @@
 .lux-admin-user-session-revoke:hover { border-color: color-mix(in srgb, var(--lux-danger, #d86d6d) 55%, transparent); }
 .lux-admin-user-session-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
 .lux-admin-user-session-pagination > div { display: flex; gap: 8px; }
+.lux-admin-user-content-index { display: grid; gap: 12px; max-width: 760px; padding: 18px 20px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: color-mix(in srgb, var(--lux-surface) 65%, transparent); }
+.lux-admin-user-content-index .lux-admin-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; }
+.lux-admin-user-content-index h2 { margin: 4px 0 0; color: var(--lux-text); font-size: .95rem; }
+.lux-admin-user-content-index-progress { display: grid; gap: 8px; min-width: 0; font-size: .76rem; }
+.lux-admin-user-content-index-progress > div { display: flex; justify-content: space-between; gap: 12px; color: var(--lux-muted); }
+.lux-admin-user-content-index-progress strong { color: var(--lux-text); font-variant-numeric: tabular-nums; }
+.lux-admin-user-content-index progress { display: block; width: 100%; height: 8px; overflow: hidden; border: 0; border-radius: 999px; accent-color: var(--lux-accent); }
+.lux-admin-user-content-index progress::-webkit-progress-bar { border-radius: inherit; background: var(--lux-line-soft); }
+.lux-admin-user-content-index progress::-webkit-progress-value { border-radius: inherit; background: var(--lux-accent); }
+.lux-admin-user-content-index-progress .lux-admin-muted, .lux-admin-user-content-index-note { margin: 0; line-height: 1.55; }
