@@ -1264,8 +1264,21 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        self.list_continue_watching_for_library_ids(&library_ids, user_id, offset, limit)
-            .await
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database
+                .user_content_restrictions(&principal.user_id_string())
+                .await?
+        };
+        self.list_continue_watching_for_library_ids(
+            &library_ids,
+            user_id,
+            content_restrictions.as_ref(),
+            offset,
+            limit,
+        )
+        .await
     }
 
     pub async fn list_home_continue_watching(
@@ -1276,12 +1289,20 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database
+                .user_content_restrictions(&principal.user_id_string())
+                .await?
+        };
         self.list_continue_watching_for_library_ids_with_grouping(
             &library_ids,
             user_id,
             offset,
             limit,
             true,
+            content_restrictions.as_ref(),
         )
         .await
     }
@@ -1290,6 +1311,7 @@ impl CatalogService {
         &self,
         library_ids: &[String],
         user_id: &str,
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
@@ -1299,6 +1321,7 @@ impl CatalogService {
             offset,
             limit,
             true,
+            content_restrictions,
         )
         .await
     }
@@ -1316,6 +1339,7 @@ impl CatalogService {
             offset,
             limit,
             true,
+            None,
         )
         .await
     }
@@ -1327,12 +1351,14 @@ impl CatalogService {
         offset: i64,
         limit: i64,
         include_next_unplayed_episode: bool,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<CatalogPage, CatalogError> {
         let (played_percent, minimum_ticks) = self.database.home_resume_settings(user_id).await?;
         let query = ResumeItemsQuery {
             user_id,
             library_ids,
             item_types: &["MOVIE", "EPISODE", "VIDEO"],
+            content_restrictions,
             played_percent,
             minimum_ticks,
             offset,
@@ -3382,6 +3408,223 @@ mod tests {
             )
             .await?;
         assert!(past_end.items.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continue_watching_applies_content_restrictions_before_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "resume-policy-viewer",
+                "Resume Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Resume policy", LibraryKind::Series, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+
+        for (item_id, certification) in [
+            ("resume-policy-visible-movie", "PG"),
+            ("resume-policy-hidden-movie", "R"),
+            ("resume-policy-open-series", "PG"),
+            ("resume-policy-blocked-series", "R"),
+        ] {
+            let item_type = if item_id.ends_with("series") {
+                "SERIES"
+            } else {
+                "MOVIE"
+            };
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, runtime_ticks,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+            if item_type == "MOVIE" {
+                sqlx::query(
+                    "INSERT INTO user_item_state (
+                         user_id, item_id, is_played, position_ticks, last_played_at
+                     ) VALUES (?, ?, 0, 6000000000, 30)",
+                )
+                .bind(&user_id)
+                .bind(item_id)
+                .execute(database.pool())
+                .await?;
+            }
+        }
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('resume-policy-hidden-movie', 'violent')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES (
+                 'resume-policy-unindexed-movie', ?, 'MOVIE',
+                 'Unindexed Movie', 'unindexed movie', 36000000000,
+                 'LOCAL_CONFIRMED', 1
+             )",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, is_played, position_ticks, last_played_at
+             ) VALUES (?, 'resume-policy-unindexed-movie', 0, 6000000000, 25)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+
+        for (series_id, prefix) in [
+            ("resume-policy-open-series", "resume-policy-open"),
+            ("resume-policy-blocked-series", "resume-policy-blocked"),
+        ] {
+            for (episode_number, played) in [(1_i64, true), (2_i64, false)] {
+                let item_id = format!("{prefix}-episode-{episode_number}");
+                sqlx::query(
+                    "INSERT INTO media_items (
+                         id, library_id, item_type, series_id, season_number,
+                         episode_number, title, sort_title, runtime_ticks,
+                         identification_status, has_available_source
+                     ) VALUES (?, ?, 'EPISODE', ?, 1, ?, ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+                )
+                .bind(&item_id)
+                .bind(&library_id)
+                .bind(series_id)
+                .bind(episode_number)
+                .bind(&item_id)
+                .bind(&item_id)
+                .execute(database.pool())
+                .await?;
+                sqlx::query(
+                    "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                     VALUES (?, 'PG')",
+                )
+                .bind(&item_id)
+                .execute(database.pool())
+                .await?;
+                if played {
+                    sqlx::query(
+                        "INSERT INTO user_item_state (
+                             user_id, item_id, is_played, position_ticks, last_played_at
+                         ) VALUES (?, ?, 1, 36000000000, 20)",
+                    )
+                    .bind(&user_id)
+                    .bind(&item_id)
+                    .execute(database.pool())
+                    .await?;
+                }
+            }
+        }
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let before_policy = catalog
+            .list_continue_watching(principal, &user_id, 0, 10)
+            .await?;
+        assert_eq!(
+            before_policy.total,
+            5,
+            "before policy: {:?}",
+            before_policy
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let blocked_tags = vec!["violent".to_owned()];
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &blocked_tags,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+
+        let restricted_page = catalog
+            .list_continue_watching(principal, &user_id, 0, 1)
+            .await?;
+        assert_eq!(restricted_page.total, 2);
+        assert_eq!(restricted_page.items.len(), 1);
+        assert_eq!(restricted_page.items[0].id, "resume-policy-visible-movie");
+        let home_page = catalog
+            .list_home_continue_watching(principal, &user_id, 0, 10)
+            .await?;
+        assert_eq!(home_page.total, 2);
+        assert!(
+            home_page
+                .items
+                .iter()
+                .any(|item| item.id == "resume-policy-visible-movie")
+        );
+        assert!(
+            home_page
+                .items
+                .iter()
+                .any(|item| item.id == "resume-policy-open-episode-2")
+        );
+        let second_page = catalog
+            .list_continue_watching(principal, &user_id, 1, 1)
+            .await?;
+        assert_eq!(second_page.total, 2);
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, "resume-policy-open-episode-2");
         Ok(())
     }
 }

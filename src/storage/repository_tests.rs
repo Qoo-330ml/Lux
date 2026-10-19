@@ -2006,6 +2006,7 @@ async fn home_resume_page_returns_items_and_total_with_one_query() {
                 user_id: &user_id,
                 library_ids: std::slice::from_ref(&library_id),
                 item_types: &["MOVIE"],
+                content_restrictions: None,
                 played_percent: 90,
                 minimum_ticks: 0,
                 offset: 0,
@@ -2028,6 +2029,7 @@ async fn home_resume_page_returns_items_and_total_with_one_query() {
                 user_id: &user_id,
                 library_ids: std::slice::from_ref(&library_id),
                 item_types: &["MOVIE"],
+                content_restrictions: None,
                 played_percent: 90,
                 minimum_ticks: 0,
                 offset: 10,
@@ -2041,6 +2043,100 @@ async fn home_resume_page_returns_items_and_total_with_one_query() {
     assert!(past_end.is_empty());
     assert_eq!(total, 2);
     assert_eq!(database.query_count(), 2);
+}
+
+#[tokio::test]
+async fn resume_items_apply_content_restrictions_before_ranking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("Resume Admin", "resume-admin", "test password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Restricted resume", LibraryKind::Movie, false)
+        .await?;
+    let user_id = admin.id.to_string();
+    let library_id = library.id.to_string();
+    for (item_id, certification) in [("resume-visible", "PG"), ("resume-hidden", "R")] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 2000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, is_played, position_ticks, last_played_at
+             ) VALUES (?, ?, 0, 1000000000, 1)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES (?, ?)",
+        )
+        .bind(item_id)
+        .bind(certification)
+        .execute(database.pool())
+        .await?;
+    }
+    let restrictions = match database
+        .compare_and_swap_user_content_restrictions(
+            &user_id,
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &[],
+                blocked_tags: &[],
+            },
+        )
+        .await?
+    {
+        UserContentRestrictionsCasResult::Updated(value) => value,
+        other => return Err(format!("expected policy update, got {other:?}").into()),
+    };
+    let query = ResumeItemsQuery {
+        user_id: &user_id,
+        library_ids: std::slice::from_ref(&library_id),
+        item_types: &["MOVIE"],
+        content_restrictions: Some(&restrictions),
+        played_percent: 90,
+        minimum_ticks: 0,
+        offset: 0,
+        limit: 10,
+    };
+
+    let (rows, total) = database.list_resume_items_with_total(&query, true).await?;
+
+    assert_eq!(total, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item_id, "resume-visible");
+    let past_end_query = ResumeItemsQuery {
+        offset: 1,
+        limit: 1,
+        ..query
+    };
+    let (past_end, total) = database
+        .list_resume_items_with_total(&past_end_query, true)
+        .await?;
+    assert!(past_end.is_empty());
+    assert_eq!(total, 1);
+    Ok(())
 }
 
 #[tokio::test]

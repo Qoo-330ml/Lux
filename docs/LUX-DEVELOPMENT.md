@@ -14560,6 +14560,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-694。
 
+#### LUX-696：在继续观看候选分页前应用用户内容限制
+
+范围：对 Emby 及独立继续观看 API 的已观看进度条目和“下一集”候选使用 LUX-693 的统一内容限制谓词，并在 SQL 排序、排名和分页前过滤，确保系列/季度父级及未就绪索引不能被直接继续观看列表绕过。管理员保持既有结果。缓存首页快照的策略失效、最近新增和推荐留给后续任务。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 普通用户的继续观看进度项和下一集候选均满足自身及父级内容限制；缺失索引 fail closed。
+- [x] 内容限制在 SQL 的总数、排名与分页前执行；过滤后总数及越界页计数正确。
+- [x] 管理员和无策略用户继续沿用原行为；无标签限制时绑定列表不改变。
+- [x] 存储与 CatalogService 回归覆盖等级过滤、父级、缺索引及下一集候选；相关测试、build、fmt 和 diff check 通过。
+
+短计划：先在 CatalogService 继续观看回归建立带进度的允许/拒绝条目，并确认限制尚未应用；再把可选用户策略加入继续观看查询合同，在候选 CTE 和空页计数路径前执行统一策略谓词；最后跑应用与存储定向测试、Rust build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib continue_watching_applies_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib resume_items_apply_content_restrictions_before_ranking`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+结果（2026-10-19）：Emby/独立继续观看服务及独立首页继续观看入口读取非管理员当前用户策略；存储在已保存进度候选和下一集候选过滤自身/系列/季度，并在计数/排名/分页之前应用相同谓词。缺失索引 fail closed，标签绑定按两个 SQL 候选分支重复且按序传入。存储回归 1/1、CatalogService 回归 1/1、原无策略 resume 页回归 1/1、`tests/resume_favorites.rs` 5/5、Rust build、fmt 和 diff check 通过。`cargo clippy --locked --lib -- -D warnings` 被 4 个参数数目 lint 阻断，其中 2 个是既有 `serve_emby_media_file` / `verify_emby_direct_stream`，另 2 个来自 LUX-695 新增的搜索方法；计划在后续小任务整理搜索查询参数合同。
+
+依赖：LUX-695。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

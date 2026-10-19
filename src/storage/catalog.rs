@@ -1806,12 +1806,20 @@ impl Database {
         let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            query.content_restrictions,
+        );
         let runtime_ticks = resume_runtime_ticks_sql();
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
             include_next_unplayed_episode,
             &library_placeholders,
             resume_rank,
+            &content_restriction_predicate,
         );
         let statement_sql = format!(
             "WITH candidates AS (
@@ -1823,7 +1831,7 @@ impl Database {
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                    AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
-                   AND mi.library_id IN ({library_placeholders})
+                   AND mi.library_id IN ({library_placeholders}){content_restriction_predicate}
              ),
              eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
@@ -1894,6 +1902,7 @@ impl Database {
                 .iter()
                 .map(|value| CatalogBind::Text(value)),
         );
+        binds.extend(content_restriction_binds.iter().copied());
         binds.push(CatalogBind::Integer(query.played_percent));
         if include_next_unplayed_episode {
             binds.push(CatalogBind::Text(query.user_id));
@@ -1910,6 +1919,7 @@ impl Database {
                     .iter()
                     .map(|value| CatalogBind::Text(value)),
             );
+            binds.extend(content_restriction_binds.iter().copied());
         }
         binds.push(CatalogBind::Integer(query.limit));
         binds.push(CatalogBind::Integer(query.offset));
@@ -1944,12 +1954,20 @@ impl Database {
         let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            query.content_restrictions,
+        );
         let runtime_ticks = resume_runtime_ticks_sql();
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
             include_next_unplayed_episode,
             &library_placeholders,
             resume_rank,
+            &content_restriction_predicate,
         );
         let statement_sql = format!(
             "WITH candidates AS (
@@ -1962,7 +1980,7 @@ impl Database {
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                    AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
-                   AND mi.library_id IN ({library_placeholders})
+                   AND mi.library_id IN ({library_placeholders}){content_restriction_predicate}
              ), eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
                         sort_title, last_played_at
@@ -1982,6 +2000,13 @@ impl Database {
         for library_id in query.library_ids {
             statement = statement.bind(library_id);
         }
+        for bind in &content_restriction_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(*value),
+                CatalogBind::Integer(value) => statement.bind(*value),
+                CatalogBind::Real(value) => statement.bind(*value),
+            };
+        }
         statement = statement.bind(query.played_percent);
         if include_next_unplayed_episode {
             statement = statement.bind(query.user_id);
@@ -1991,6 +2016,13 @@ impl Database {
             statement = statement.bind(query.user_id);
             for library_id in query.library_ids {
                 statement = statement.bind(library_id);
+            }
+            for bind in &content_restriction_binds {
+                statement = match bind {
+                    CatalogBind::Text(value) => statement.bind(*value),
+                    CatalogBind::Integer(value) => statement.bind(*value),
+                    CatalogBind::Real(value) => statement.bind(*value),
+                };
             }
         }
         statement
@@ -2006,6 +2038,7 @@ impl Database {
         include_next_unplayed_episode: bool,
         library_placeholders: &str,
         resume_rank: &str,
+        content_restriction_predicate: &str,
     ) -> (String, String) {
         if !include_next_unplayed_episode {
             return (
@@ -2066,7 +2099,7 @@ impl Database {
                    AND mi.has_available_source = 1 AND mi.removed_at IS NULL
                    AND mi.library_id IN ({library_placeholders})
                    AND COALESCE(us.is_played, 0) = 0
-                   AND COALESCE(us.hide_from_resume, 0) = 0{CATALOG_VISIBLE_PREDICATE}
+                   AND COALESCE(us.hide_from_resume, 0) = 0{CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
              ),
              next_episode AS (
                  SELECT id, item_type, series_id, season_number, episode_number,

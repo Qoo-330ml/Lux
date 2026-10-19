@@ -3590,6 +3590,7 @@ pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) library_ids: &'a [String],
     pub(crate) item_types: &'a [&'a str],
+    pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
     pub(crate) played_percent: i64,
     pub(crate) minimum_ticks: i64,
     pub(crate) offset: i64,
