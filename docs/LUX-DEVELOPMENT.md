@@ -13091,6 +13091,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：PlaybackInfo 创建 HLS 会话、HEAD manifest 均不占位；首次成功 manifest GET 占用一席，初始化文件/媒体分片共用并续租同一会话。并发上限 1 时，另一条已签发链接的 GET 返回 429，停止该 HLS 会话并删除其资源；已获准分片仍可读取。STOPPED 释放会话占位。未部署。
 
+#### LUX-624：按用户策略筛选服务端播放档位
+
+范围：Web 与 Emby 创建本地媒体 HLS 会话时，按当前用户 `allow_remux`、`allow_audio_transcode`、`allow_video_transcode` 与服务端可用能力共同选择最低允许档位。直放不受转码权限影响；STRM 始终只允许外部直放。客户端请求了服务端播放但其可用档位全部被用户策略禁止时，拒绝请求且不创建 HLS 会话。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [ ] 直放优先且不受转码权限影响；STRM 不创建 Remux、转码或 HLS 会话。
+- [ ] Remux、音频转码、硬件/软件视频转码分别遵守用户策略；禁止低档位时可选择其他允许且服务器可用的档位。
+- [ ] 所有兼容档位都被禁止时，Web 与 Emby 明确拒绝，不创建或遗留 HLS 会话。
+- [ ] Web 与 Emby 定向集成测试，以及 Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-614、LUX-615、LUX-617、LUX-620、LUX-623。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
