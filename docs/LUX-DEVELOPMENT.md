@@ -262,7 +262,7 @@ Lux 的核心价值不是功能数量，而是：
 - 每个用户的进度、已看状态和收藏独立。
 - 用户可以上传或替换账户头像；头像由服务端校验并持久化到 `/config/user-avatars`，同一账户在不同浏览器登录后可读取相同头像。
 - 用户权限至少包括：
-  - 媒体库权限使用显式允许列表：未指定任何媒体库时可访问全部已启用媒体库；指定一个或多个媒体库后仅可访问指定媒体库；清空指定项后恢复全部媒体库访问。
+  - 媒体库访问模式明确为 `ALL`、`SELECTED` 或 `NONE`。`ALL` 可访问所有已启用媒体库；`SELECTED` 只可访问正向授权的媒体库；`NONE` 不可访问任何媒体库。升级前没有正向授权记录的旧账号迁移为 `ALL`，已有正向记录的账号迁移为 `SELECTED`；迁移不得改变现有账号的可见媒体。
   - 是否允许外网访问。
   - 是否允许使用下载功能。
   - 是否允许进入管理控制台。
@@ -13150,6 +13150,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 依赖：LUX-593。
 
 结果（2026-10-19）：新增导航回归先在原 8 项入口上失败（预期 7、实际 8），移除已取消的外挂字幕入口后，`admin-user-profile-lifecycle` 6/6 通过；Web production build 与 `git diff --check` 通过。用户管理方案和 LUX-593 页面结构同步移除用户级字幕权限；模块五仍约束已有字幕读取的媒体访问，现有字幕播放、元数据编辑与扫描能力未改。
+
+#### LUX-627：为显式媒体库访问模式建立迁移
+
+范围：为用户增加受约束的 `library_access_mode`（`ALL` / `SELECTED` / `NONE`）字段。旧账号按迁移前实际可见范围回填：存在 `can_view=1` 记录时为 `SELECTED`，否则为 `ALL`，从而保持旧行为。字段默认 `ALL` 仅作为兼容性数据库回退；新用户默认权限由后续模块四任务显式写入。本任务只改 schema/migration，不改读取 ACL、管理 API 或新用户创建行为。
+
+预计修改文件（12 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`migrations/0187_user_library_access_mode.sql`、`migrations-postgres/0187_user_library_access_mode.sql`、`src/storage/repository_tests.rs`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/scanner.rs`、`tests/ready_version.rs`。
+
+验收标准：
+
+- [ ] SQLite 与 PostgreSQL 都提供仅允许 `ALL`、`SELECTED`、`NONE` 的非空字段，空库完整启动可应用迁移（SQLite 已运行验证；PostgreSQL 环境不可用，待补运行验证）。
+- [x] 旧用户无正向授权记录（包括只有 `can_view=0` 的历史记录）迁移为 `ALL`；存在正向记录迁移为 `SELECTED`。
+- [x] 新迁移保留既有媒体库授权表记录，且不改动任何读取行为。
+- [x] SQLite 迁移回归、格式检查和 `git diff --check` 通过；受影响的 schema 版本接口/存储目标定向回归通过。
+
+短计划：在主规格与方案中确认旧/新模式语义，先写旧 SQLite 授权数据迁移回归，再补 SQLite/PostgreSQL migration；更新空库启动、PostgreSQL 启动与既有最新 schema 版本断言；不改 ACL 查询和 API。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_mode_migration_preserves_legacy_semantics`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_library_access_mode_migration_runs_from_an_empty_database -- --exact`、受影响的 `admin_health` / `ready_version` / `scanner` / `scanning_jobs` / `danmaku` 定向用例、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database --no-run`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。PostgreSQL migration 另做静态审阅；运行时验证在 PostgreSQL 可用时补充。
+
+依赖：LUX-593、LUX-626。
+
+结果（2026-10-19）：新增 SQLite 旧授权回填和空库启动回归；SQLite 对无授权/仅拒绝/正向授权账号分别回填 `ALL` / `ALL` / `SELECTED`，保留授权行并拒绝非法模式。SQLite 新库非空字段及 `ALL` 默认值验证通过；PostgreSQL bootstrap 断言已更新为 187 并可编译，但本机 `127.0.0.1:55432` 无服务，未完成 PostgreSQL 运行验证。相关 schema 版本断言同步到 187；迁移定向用例与 health/version/scanner/scanning_jobs/danmaku 用例通过，完整 `storage` 目标串行运行 63/63 通过（并行运行时旧 cooldown 时间窗口用例曾波动）。格式与 diff 检查通过；未部署。
 
 ## 29. 参考资料
 

@@ -14046,6 +14046,70 @@ async fn user_playback_admission_migration_creates_constrained_ledger()
 }
 
 #[tokio::test]
+async fn user_library_access_mode_migration_preserves_legacy_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE users (id TEXT PRIMARY KEY);
+         CREATE TABLE user_library_access (
+             user_id TEXT NOT NULL,
+             library_id TEXT NOT NULL,
+             can_view INTEGER NOT NULL
+         );
+         INSERT INTO users (id) VALUES ('legacy-all'), ('legacy-denials-only'), ('legacy-selected');
+         INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES ('legacy-denials-only', 'library-a', 0),
+                    ('legacy-selected', 'library-a', 1);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0187_user_library_access_mode.sql"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let modes: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, library_access_mode FROM users ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        modes,
+        [
+            ("legacy-all".to_owned(), "ALL".to_owned()),
+            ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+            ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+        ]
+    );
+    let legacy_access_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT user_id, library_id, can_view FROM user_library_access
+         ORDER BY user_id, library_id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        legacy_access_rows,
+        [
+            ("legacy-denials-only".to_owned(), "library-a".to_owned(), 0,),
+            ("legacy-selected".to_owned(), "library-a".to_owned(), 1),
+        ]
+    );
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = 'legacy-all'")
+        .execute(&pool)
+        .await?;
+    assert!(
+        sqlx::query("UPDATE users SET library_access_mode = 'INVALID' WHERE id = 'legacy-all'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
