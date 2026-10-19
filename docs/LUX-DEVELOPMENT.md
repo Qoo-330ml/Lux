@@ -13232,6 +13232,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：主规格与 `docs/API.md` 已同步 `ALL` / `SELECTED` / `NONE`，列明旧 PATCH 的兼容语义以及 PUT 对不存在、未启用和重复媒体库的处理。文档核对与 diff 检查通过。
 
+#### LUX-631：Web API 客户端支持显式媒体库权限
+
+范围：为 Web API 类型声明媒体库访问模式；管理员权限 GET 返回强类型模式与选择，客户端增加整组 PUT 更新方法；保留旧逐库 PATCH 方法供兼容调用。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] TypeScript 类型明确限定 `ALL` / `SELECTED` / `NONE`，GET/PUT 响应不再可省略模式。
+- [x] PUT 发送正确路由、JSON 与 CSRF；旧 PATCH 请求合同保持不变。
+- [x] API 客户端定向 Vitest 通过。
+
+短计划：先新增 fetch mock 回归确认 GET 与 PUT 合同，再增加强类型与客户端方法；运行 API 客户端 Vitest、Web build 和 diff 检查。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-629、LUX-630。
+
+结果（2026-10-19）：新增 `AdminUserLibraryAccessMode` 与 GET/PUT 请求响应类型，客户端 PUT 方法发送显式模式和选择；旧逐库 PATCH 方法保持不变。新增 fetch mock 验证路由、请求体和 CSRF。`api-client.test.ts` 63/63 通过，`pnpm --dir web build` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

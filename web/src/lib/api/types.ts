@@ -555,6 +555,17 @@ export type AdminUserPlaybackPolicy = {
   allowVideoTranscode: boolean;
 };
 
+export type AdminUserLibraryAccessMode = "ALL" | "SELECTED" | "NONE";
+
+export type AdminUserLibraryAccess = {
+  libraryAccessMode: AdminUserLibraryAccessMode;
+  libraryIds: string[];
+};
+
+export type AdminUserLibraryAccessUpdateResult = AdminUserLibraryAccess & {
+  userId: string;
+};
+
 export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
 export type AdminUserSortBy = "createdAt" | "lastLoginAt" | "lastActivityAt";
 export type AdminUserSortOrder = "asc" | "desc";

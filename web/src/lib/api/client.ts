@@ -34,6 +34,8 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
+  AdminUserLibraryAccess,
+  AdminUserLibraryAccessUpdateResult,
   AdminUserPlaybackPolicy,
   AdminUserListQuery,
   AdminUserListResponse,
@@ -1186,8 +1188,15 @@ export class LuxApiClient {
   }
 
   adminUserLibraryAccess(userId: string) {
-    return this.request<{ libraryIds?: string[] }>(
+    return this.request<AdminUserLibraryAccess>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/libraries`,
+    );
+  }
+
+  updateAdminUserLibraryAccess(userId: string, access: AdminUserLibraryAccess) {
+    return this.request<AdminUserLibraryAccessUpdateResult>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/libraries`,
+      { method: "PUT", body: JSON.stringify(access) },
     );
   }
 

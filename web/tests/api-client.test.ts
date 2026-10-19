@@ -120,6 +120,49 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("reads and replaces explicit admin library access modes", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("/api/v1/admin/users/user-1/libraries");
+      if (init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          libraryAccessMode: "NONE",
+          libraryIds: [],
+        });
+        expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(JSON.stringify({
+          userId: "user-1",
+          libraryAccessMode: "NONE",
+          libraryIds: [],
+        }), { status: 200 });
+      }
+      expect(init?.method).toBeUndefined();
+      return new Response(JSON.stringify({
+        libraryAccessMode: "SELECTED",
+        libraryIds: ["library-1"],
+      }), { status: 200 });
+    });
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserLibraryAccess("user-1")).resolves.toEqual({
+        libraryAccessMode: "SELECTED",
+        libraryIds: ["library-1"],
+      });
+      await expect(client.updateAdminUserLibraryAccess("user-1", {
+        libraryAccessMode: "NONE",
+        libraryIds: [],
+      })).resolves.toEqual({
+        userId: "user-1",
+        libraryAccessMode: "NONE",
+        libraryIds: [],
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("aborts each homepage section request at its 15-second deadline", async () => {
     vi.useFakeTimers();
     let requestSignal: AbortSignal | undefined;
