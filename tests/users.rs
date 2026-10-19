@@ -2075,6 +2075,222 @@ async fn admin_can_read_content_restriction_index_readiness()
 }
 
 #[tokio::test]
+async fn admin_can_manage_user_content_restrictions() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let users = UserStore::new(database.clone())?;
+    let reader = users
+        .create_user("reader", "Reader", "reader password", false)
+        .await?;
+    let reader_id = reader.id.to_string();
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let url = format!("{base_url}/api/v1/admin/users/{reader_id}/content-restrictions");
+
+    let anonymous = client.get(&url).send().await?;
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let initial = client
+        .get(&url)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), reqwest::StatusCode::OK);
+    assert_eq!(initial.json::<Value>().await?["policy"], Value::Null);
+
+    let reader_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "reader", "password": "reader password" }))
+        .send()
+        .await?;
+    let reader_cookie = cookie_pair(reader_login.headers());
+    let reader_read = client
+        .get(&url)
+        .header(COOKIE, &reader_cookie)
+        .send()
+        .await?;
+    assert_eq!(reader_read.status(), reqwest::StatusCode::FORBIDDEN);
+    let reader_write = client
+        .put(&url)
+        .header(COOKIE, &reader_cookie)
+        .header(
+            "x-csrf-token",
+            cookie_value(reader_login.headers(), "lux_csrf"),
+        )
+        .json(&json!({
+            "expectedVersion": 0,
+            "ratingSystem": "MPA",
+            "maximumRating": "PG-13",
+            "allowUnrated": false,
+            "allowedTags": [],
+            "blockedTags": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(reader_write.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let policy = json!({
+        "expectedVersion": 0,
+        "ratingSystem": "mpa",
+        "maximumRating": "pg-13",
+        "allowUnrated": false,
+        "allowedTags": ["  Action  ", "Drama"],
+        "blockedTags": ["Drama"]
+    });
+    let missing_csrf = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .json(&policy)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let invalid_rating = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "expectedVersion": 0,
+            "ratingSystem": "MPA",
+            "maximumRating": "TV-MA",
+            "allowUnrated": false,
+            "allowedTags": [],
+            "blockedTags": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_rating.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let duplicate_tags = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "expectedVersion": 0,
+            "ratingSystem": "MPA",
+            "maximumRating": null,
+            "allowUnrated": true,
+            "allowedTags": ["Drama", " drama "],
+            "blockedTags": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate_tags.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let too_many_tags = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "expectedVersion": 0,
+            "ratingSystem": "MPA",
+            "maximumRating": null,
+            "allowUnrated": true,
+            "allowedTags": (0..101).map(|index| format!("tag-{index}")).collect::<Vec<_>>(),
+            "blockedTags": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(too_many_tags.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let created = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&policy)
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let created_policy = created.json::<Value>().await?["policy"].clone();
+    assert_eq!(created_policy["ratingSystem"], "MPA");
+    assert_eq!(created_policy["maximumRating"], "PG-13");
+    assert_eq!(created_policy["version"], 1);
+    assert_eq!(created_policy["allowedTags"], json!(["action", "drama"]));
+    assert_eq!(created_policy["blockedTags"], json!(["drama"]));
+
+    let stale = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&policy)
+        .send()
+        .await?;
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+
+    let update = client
+        .put(&url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "expectedVersion": 1,
+            "ratingSystem": "BBFC",
+            "maximumRating": "12A",
+            "allowUnrated": true,
+            "allowedTags": [],
+            "blockedTags": ["Horror"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(update.status(), reqwest::StatusCode::OK);
+    let updated_policy = update.json::<Value>().await?["policy"].clone();
+    assert_eq!(updated_policy["version"], 2);
+    assert_eq!(updated_policy["ratingSystem"], "BBFC");
+    assert_eq!(updated_policy["blockedTags"], json!(["horror"]));
+
+    let readback = client
+        .get(&url)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(readback.status(), reqwest::StatusCode::OK);
+    assert_eq!(readback.json::<Value>().await?["policy"], updated_policy);
+
+    let missing_user_url = format!(
+        "{base_url}/api/v1/admin/users/{}/content-restrictions",
+        uuid::Uuid::now_v7()
+    );
+    let missing_user = client
+        .put(&missing_user_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "expectedVersion": 0,
+            "ratingSystem": "MPA",
+            "maximumRating": null,
+            "allowUnrated": true,
+            "allowedTags": [],
+            "blockedTags": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_list_user_web_sessions_without_exposing_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

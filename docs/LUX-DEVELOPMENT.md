@@ -14413,6 +14413,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：用户详情模块五页接入服务端索引汇总，展示回填进度并在待处理期间每 5 秒刷新；加载、失败重试、无媒体、部分及全部就绪均有独立状态。页面明确说明用户限制配置和媒体访问拦截尚未接入。组件测试 4/4、Web build 和 diff check 通过。Playwright Chromium 在 390×844 视口显示 76/100、待就绪 24；文档宽度 390px、进度卡片宽 366px，无横向溢出，控制台无错误；预览截图保存在 `output/playwright/user-content-index-390.png`。完整 `pnpm --dir web test` 为 710 passed、4 failed，失败仍为未改动的 `home-page.test.tsx`、`library-card.test.tsx`（2 项）和 `media-query-polling.test.tsx`；该结果与 LUX-687 完整 Web 测试相同，未在本任务重现其基线原因。
 
+#### LUX-689：开放管理员用户内容限制策略 API
+
+范围：为管理员提供单用户内容限制策略读取和整组版本化保存 API。读取未配置策略时返回 `policy: null`，维持旧账号无限制行为；写入校验分级体系、最大等级与标签，并以存储 CAS 原子替换策略及允许/禁止标签。成功写入记录不含标签明文的审计摘要；不接 Web 客户端/UI，也不在本任务改变媒体访问。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/mod.rs`、`src/application/user_content_restrictions.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 只有管理员能读取或写入；写入要求管理员 Web session 和 CSRF。
+- [x] 缺省策略以 `null` 返回；创建使用版本 0，更新需匹配版本，冲突返回 409，不存在/不可用账号返回 404。
+- [x] 只接受 MPA、TVPG、BBFC 有效分级；等级须属于所选体系；标签去除首尾空白、规范化小写、拒绝重复/空/超长/控制字符及超过 100 项。
+- [x] 策略及允许/禁止标签整组 CAS 写入，响应含稳定版本和更新时间；审计不包含标签值或凭证。
+- [x] 用户 HTTP 定向回归、build、fmt 与 diff check 通过；API 合同同步。
+
+短计划：先添加管理员/普通用户/匿名权限、缺省读取、校验、CSRF、CAS 冲突及规范化回读的 HTTP 回归并确认路由未开放；再实现应用层输入校验、API 接线和脱敏审计；最后运行 `users` 定向测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_user_content_restrictions -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-677、LUX-678、LUX-688。
+
+结果（2026-10-19）：应用层提供策略读取/更新和规则校验；管理员 GET 对未配置策略返回 `null`，PUT 使用版本 CAS 原子替换分类字段和两组标签。仅管理员可读，写操作通过 CSRF；审计只写分级体系、是否有最大等级、标签数量及版本，不写标签值。分级体系与等级需匹配；标签规范化与媒体索引一致，并拒绝控制字符、空值、超长、重复及每组超过 100 项。HTTP 回归 1/1、应用层回归 2/2、`cargo build --locked`、fmt check 和 diff check 通过。策略配置尚未接 Web 客户端/UI，媒体读取路径也尚未应用限制。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

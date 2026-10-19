@@ -1019,6 +1019,136 @@ pub(crate) async fn admin_set_user_playback_policy(
     }
 }
 
+async fn admin_get_user_content_restrictions(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    match crate::application::user_content_restrictions::get_user_content_restrictions(
+        database, user_id,
+    )
+    .await
+    {
+        Ok(policy) => Json(json!({ "policy": policy })).into_response(),
+        Err(error) => user_content_restrictions_error(&headers, error),
+    }
+}
+
+async fn admin_update_user_content_restrictions(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<
+        crate::application::user_content_restrictions::UpdateUserContentRestrictionsInput,
+    >,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    match crate::application::user_content_restrictions::update_user_content_restrictions(
+        database, user_id, request,
+    )
+    .await
+    {
+        Ok(policy) => {
+            let metadata = json!({
+                "ratingSystem": policy.rating_system,
+                "hasMaximumRating": policy.maximum_rating.is_some(),
+                "allowUnrated": policy.allow_unrated,
+                "allowedTagCount": policy.allowed_tags.len(),
+                "blockedTagCount": policy.blocked_tags.len(),
+                "version": policy.version,
+            })
+            .to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_CONTENT_RESTRICTIONS_UPDATED",
+                Some("user"),
+                Some(&user_id.to_string()),
+                &metadata,
+            )
+            .await;
+            Json(json!({ "policy": policy })).into_response()
+        }
+        Err(error) => user_content_restrictions_error(&headers, error),
+    }
+}
+
+fn user_content_restrictions_error(
+    headers: &HeaderMap,
+    error: crate::application::user_content_restrictions::UserContentRestrictionsError,
+) -> Response {
+    use crate::application::user_content_restrictions::UserContentRestrictionsError as PolicyError;
+
+    match error {
+        PolicyError::InvalidPolicy => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "内容限制策略无效",
+        )
+        .into_response(),
+        PolicyError::VersionConflict => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "内容限制策略已变化，请重新读取后再保存",
+        )
+        .into_response(),
+        PolicyError::NotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在或不可用",
+        )
+        .into_response(),
+        PolicyError::Storage(StorageError::Conflict(_)) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "内容限制策略无效",
+        )
+        .into_response(),
+        PolicyError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "内容限制策略暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
 pub(crate) async fn admin_list_user_library_access(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -1779,6 +1909,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/playback-policy",
             get(admin_get_user_playback_policy).put(admin_set_user_playback_policy),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/content-restrictions",
+            get(admin_get_user_content_restrictions).put(admin_update_user_content_restrictions),
         )
         .route(
             "/api/v1/admin/users/{user_id}/avatar",
