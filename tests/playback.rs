@@ -170,6 +170,31 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await?;
     assert_eq!(generic_stream.status(), reqwest::StatusCode::OK);
     assert_eq!(generic_stream.bytes().await?.as_ref(), b"0123456789");
+    let tampered_play_session =
+        generic_direct_url.replacen("PlaySessionId=", "PlaySessionId=forged-", 1);
+    let tampered_play_session_stream = client
+        .get(format!("{base_url}{tampered_play_session}"))
+        .send()
+        .await?;
+    assert_eq!(
+        tampered_play_session_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let without_play_session = generic_direct_url
+        .split_once("&PlaySessionId=")
+        .and_then(|(prefix, rest)| {
+            rest.split_once('&')
+                .map(|(_, suffix)| format!("{prefix}&{suffix}"))
+        })
+        .ok_or("direct URL has no PlaySessionId")?;
+    let missing_play_session_stream = client
+        .get(format!("{base_url}{without_play_session}"))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_play_session_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let yamby_playback = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .header(

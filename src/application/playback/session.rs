@@ -350,11 +350,18 @@ impl WebPlaybackSessionService {
         is_admin: bool,
         item_id: &str,
         media_source_id: &str,
+        play_session_id: &str,
         expires_at: i64,
     ) -> Option<String> {
         self.signer.sign(
             EMBY_DIRECT_STREAM_SESSION_ID,
-            &emby_direct_stream_resource(user_id, is_admin, item_id, media_source_id),
+            &emby_direct_stream_resource(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
             expires_at,
         )
     }
@@ -365,12 +372,19 @@ impl WebPlaybackSessionService {
         is_admin: bool,
         item_id: &str,
         media_source_id: &str,
+        play_session_id: &str,
         expires_at: i64,
         signature: &str,
     ) -> bool {
         self.signer.verify(
             EMBY_DIRECT_STREAM_SESSION_ID,
-            &emby_direct_stream_resource(user_id, is_admin, item_id, media_source_id),
+            &emby_direct_stream_resource(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
             expires_at,
             signature,
             unix_timestamp(),
@@ -875,8 +889,11 @@ fn emby_direct_stream_resource(
     is_admin: bool,
     item_id: &str,
     media_source_id: &str,
+    play_session_id: &str,
 ) -> String {
-    format!("emby-direct-stream\n{user_id}\n{is_admin}\n{item_id}\n{media_source_id}")
+    format!(
+        "emby-direct-stream\n{user_id}\n{is_admin}\n{item_id}\n{media_source_id}\n{play_session_id}"
+    )
 }
 
 #[cfg(test)]

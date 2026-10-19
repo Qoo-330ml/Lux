@@ -4666,6 +4666,7 @@ pub(super) fn emby_signed_direct_stream_url(
         user.is_admin,
         item_id,
         &source.id,
+        play_session_id,
         expires_at,
     )?;
     let mut url = emby_media_source_stream_url(item_id, source);

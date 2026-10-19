@@ -2398,6 +2398,7 @@ pub(super) struct EmbyStreamQuery {
     pub(super) api_key: Option<String>,
     pub(super) client: Option<String>,
     pub(super) media_source_id: Option<String>,
+    pub(super) play_session_id: Option<String>,
     pub(super) playback_user_id: Option<String>,
     pub(super) playback_is_admin: Option<bool>,
     pub(super) playback_expires: Option<i64>,
@@ -2426,6 +2427,11 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
                 || name.eq_ignore_ascii_case("media_source_id"))
         {
             query.media_source_id = Some(value.into_owned());
+        } else if query.play_session_id.is_none()
+            && (name.eq_ignore_ascii_case("PlaySessionId")
+                || name.eq_ignore_ascii_case("playSessionId"))
+        {
+            query.play_session_id = Some(value.into_owned());
         } else if query.client.is_none()
             && (name.eq_ignore_ascii_case("X-Emby-Client") || name.eq_ignore_ascii_case("client"))
         {
@@ -2475,6 +2481,9 @@ pub(super) fn emby_stream_query_from_path(
     if query.media_source_id.is_none() {
         query.media_source_id = embedded.media_source_id;
     }
+    if query.play_session_id.is_none() {
+        query.play_session_id = embedded.play_session_id;
+    }
     if query.client.is_none() {
         query.client = embedded.client;
     }
@@ -2501,13 +2510,22 @@ pub(super) async fn emby_stream_principal(
     media_source_id: Option<&str>,
 ) -> Result<AccessPrincipal, StatusCode> {
     if emby_stream_query_has_playback_ticket(query) {
-        let (Some(user_id), Some(is_admin), Some(expires_at), Some(signature), Some(source_id)) = (
+        let (
+            Some(user_id),
+            Some(is_admin),
+            Some(expires_at),
+            Some(signature),
+            Some(source_id),
+            Some(play_session_id),
+        ) = (
             query.playback_user_id.as_deref(),
             query.playback_is_admin,
             query.playback_expires,
             query.playback_signature.as_deref(),
             media_source_id,
-        ) else {
+            query.play_session_id.as_deref(),
+        )
+        else {
             return Err(StatusCode::UNAUTHORIZED);
         };
         let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
@@ -2521,6 +2539,7 @@ pub(super) async fn emby_stream_principal(
             is_admin,
             item_id,
             source_id,
+            play_session_id,
             expires_at,
             signature,
         ) {

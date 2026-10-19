@@ -13037,6 +13037,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：Web playback 定向集成测试 1/1 通过，覆盖直放、STRM Range 与服务端 HLS 的发链接预检和实际取流准入；HEAD 不占位，重复请求复用会话名额。测试也验证了播放上限/禁播错误详情、暂停计数、活跃心跳续租、失效心跳不续占、STOPPED/删除/取流失败释放名额。`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成测试访问 localhost 时设置 `NO_PROXY=127.0.0.1,localhost`，避免开发机代理截获本地请求。
 
+#### LUX-621：将 Emby 直放票据绑定到播放会话
+
+范围：Emby `PlaybackInfo` 签发的直放 URL 必须将其 `PlaySessionId` 纳入 HMAC 票据，并在流请求时验证同一 ID。防止客户端修改 URL 中的会话 ID、借此拆分并发计数；现有 URL 字段、外部代理交接和票据有效期保持兼容。此任务只建立可验证的会话身份，不实施 Emby 播放准入。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/emby_catalog.rs`、`src/api/media.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 直放票据签名包含用户、条目、媒体源、播放会话 ID 和过期时间。
+- [x] 票据缺少或篡改 `PlaySessionId` 时，Emby 取流返回未授权；原签名 URL 仍可播放。
+- [x] Emby playback 定向集成测试及 Rust 格式检查通过。
+
+验证：定向测试 `local_file_stream_supports_full_head_range_acl_and_path_safety` 通过（1/1）；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-620。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
