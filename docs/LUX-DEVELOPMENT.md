@@ -14976,6 +14976,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-593、LUX-660。
 
+#### LUX-715：为 Emby 登录凭证管理提供用户范围撤销服务
+
+范围：为模块七管理员 Emby 登录管理增加按凭证记录 ID 撤销单次登录和撤销该用户全部有效登录的存储操作，并由 `EmbyAuthService` 暴露有界摘要分页及撤销服务合同。撤销只能修改目标用户自己的有效凭证；原始 token 和 hash 不离开存储层。本任务不新增 HTTP API、管理页面或迁移。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/auth/emby.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 单条撤销按用户 ID 与凭证记录 ID 联合限定；其他用户、未知 ID、已撤销项不改变数据，且重复撤销安全返回无变化。
+- [x] 全部撤销只更新指定用户仍有效的凭证并返回影响行数；其他用户和既有撤销时间保持不变。
+- [x] Emby 认证服务统一暴露摘要分页、单条撤销和全部撤销，接口不接收或返回 token/hash；SQLite 回归覆盖单条隔离、全量隔离与重复调用。
+- [x] Rust 定向库测试、build、fmt 和 diff check 通过；不新增 migration。
+
+短计划：先添加失败的凭证记录 ID 撤销 SQLite 回归；再实现按用户范围的单条/批量存储命令与 Emby 认证服务封装；最后运行定向库测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib admin_emby_login_session_revocation`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-714。
+
+结果（2026-10-20）：在 `access_tokens` 上新增按用户 ID + 凭证记录 ID 撤销单项的更新，以及撤销指定用户全部有效凭证并返回影响行数的更新；两者都只操作 `revoked_at IS NULL` 项，不读取 token/hash。`EmbyAuthService` 增加安全摘要分页、单项撤销和全部撤销方法，公开摘要仅有设备/客户端/时间元数据。
+
+验证：TDD RED 确认服务方法缺失时测试编译失败；`admin_emby_login_session_revocation` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。不新增 migration；阶段完整 Rust 门禁仍按 LUX-714 所记未通过结果处理。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -1835,6 +1835,46 @@ impl Database {
         Ok((sessions, total_count))
     }
 
+    pub(crate) async fn revoke_user_emby_login_session_for_admin(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE access_tokens
+             SET revoked_at = unixepoch(), updated_at = unixepoch()
+             WHERE user_id = ? AND id = ? AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() > 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn revoke_all_user_emby_login_sessions_for_admin(
+        &self,
+        user_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.query(
+            "UPDATE access_tokens
+             SET revoked_at = unixepoch(), updated_at = unixepoch()
+             WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_user_library_access(
         &self,
         user_id: &str,

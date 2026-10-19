@@ -8,7 +8,7 @@ use crate::{
         users::{UserRecord, UserStore, UserStoreError},
     },
     domain::ids::UserId,
-    storage::{Database, NewAccessToken, StorageError},
+    storage::{Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary},
 };
 
 #[derive(Clone)]
@@ -123,6 +123,46 @@ impl EmbyAuthService {
         Ok(())
     }
 
+    pub async fn list_admin_login_sessions(
+        &self,
+        user_id: &str,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<EmbyLoginSessionSummary>, i64), EmbyAuthError> {
+        let (sessions, total_count) = self
+            .database
+            .list_user_emby_login_sessions_for_admin(user_id, page_size, offset)
+            .await?;
+        Ok((
+            sessions
+                .into_iter()
+                .map(EmbyLoginSessionSummary::from)
+                .collect(),
+            total_count,
+        ))
+    }
+
+    pub async fn revoke_admin_login_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, EmbyAuthError> {
+        Ok(self
+            .database
+            .revoke_user_emby_login_session_for_admin(user_id, session_id)
+            .await?)
+    }
+
+    pub async fn revoke_all_admin_login_sessions(
+        &self,
+        user_id: &str,
+    ) -> Result<u64, EmbyAuthError> {
+        Ok(self
+            .database
+            .revoke_all_user_emby_login_sessions_for_admin(user_id)
+            .await?)
+    }
+
     pub async fn verify_token(&self, token: &str) -> Result<bool, EmbyAuthError> {
         Ok(self
             .database
@@ -154,6 +194,35 @@ impl EmbyAuthService {
             return Ok(None);
         }
         user_record(stored).map(Some)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbyLoginSessionSummary {
+    pub id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub device_type: Option<String>,
+    pub client_name: String,
+    pub client_version: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: Option<i64>,
+}
+
+impl From<StoredEmbyLoginSessionSummary> for EmbyLoginSessionSummary {
+    fn from(session: StoredEmbyLoginSessionSummary) -> Self {
+        Self {
+            id: session.id,
+            device_id: session.device_id,
+            device_name: session.device_name,
+            device_type: session.device_type,
+            client_name: session.client_name,
+            client_version: session.client_version,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            last_seen_at: session.last_seen_at,
+        }
     }
 }
 

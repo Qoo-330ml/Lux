@@ -23353,6 +23353,119 @@ async fn admin_emby_login_session_page_is_bounded_and_excludes_revoked_tokens()
 }
 
 #[tokio::test]
+async fn admin_emby_login_session_revocation_is_scoped_and_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in ["emby-revoke-user", "emby-revoke-other"] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test')",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, user_id, revoked_at) in [
+        ("target-one", "emby-revoke-user", None),
+        ("target-two", "emby-revoke-user", None),
+        ("target-revoked", "emby-revoke-user", Some(777_i64)),
+        ("other-active", "emby-revoke-other", None),
+    ] {
+        let mut token_hash = id.as_bytes().to_vec();
+        token_hash.resize(32, 0);
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, created_at, updated_at, revoked_at
+             ) VALUES (?, ?, ?, ?, 'Emby', ?, '1.2.3', 100, 100, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(format!("device-{id}"))
+        .bind(format!("Device {id}"))
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let emby_auth = crate::auth::emby::EmbyAuthService::new(database.clone())?;
+    let (initial_sessions, initial_count) = emby_auth
+        .list_admin_login_sessions("emby-revoke-user", 100, 0)
+        .await?;
+    assert_eq!(initial_count, 2);
+    assert_eq!(initial_sessions.len(), 2);
+    assert!(
+        initial_sessions
+            .iter()
+            .all(|session| session.id != "target-revoked")
+    );
+
+    assert!(
+        emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "target-one")
+            .await?
+    );
+    assert!(
+        !emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "target-one")
+            .await?
+    );
+    assert!(
+        !emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "other-active")
+            .await?
+    );
+    assert!(
+        !emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "missing-session")
+            .await?
+    );
+
+    let all_revoked = emby_auth
+        .revoke_all_admin_login_sessions("emby-revoke-user")
+        .await?;
+    assert_eq!(all_revoked, 1);
+    assert_eq!(
+        emby_auth
+            .revoke_all_admin_login_sessions("emby-revoke-user")
+            .await?,
+        0
+    );
+    let target_revocations: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, revoked_at FROM access_tokens WHERE user_id = 'emby-revoke-user' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(target_revocations.len(), 3);
+    assert!(
+        target_revocations
+            .iter()
+            .all(|(_, revoked_at)| revoked_at.is_some())
+    );
+    assert_eq!(
+        target_revocations
+            .iter()
+            .find(|(id, _)| id == "target-revoked")
+            .map(|(_, revoked_at)| *revoked_at),
+        Some(Some(777))
+    );
+    let other_revocation: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'other-active'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_revocation, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_pipeline_activity_page_is_bounded_and_aggregates_scan_status()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::StoredPipelineStageKind;
