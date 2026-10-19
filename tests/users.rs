@@ -40,8 +40,10 @@ async fn successful_login_is_written_to_the_user_activity_index()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::builder().no_proxy().build()?;
+    let device_id = "00000000-0000-4000-8000-000000000001";
     let response = client
         .post(format!("http://{address}/api/v1/auth/login"))
+        .header("X-Lux-Device-Id", device_id)
         .json(&json!({
             "username": "activity-user",
             "password": "correct password"
@@ -63,6 +65,60 @@ async fn successful_login_is_written_to_the_user_activity_index()
     assert_eq!(actor_user_id.as_deref(), Some(user_id.as_str()));
     let metadata_json = metadata_json.ok_or("missing login activity metadata")?;
     assert!(!metadata_json.contains("correct password"));
+
+    let (stored_device_id, client_name, device_type, first_seen_at, last_seen_at): (
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT device_id, client_name, device_type, first_seen_at, last_seen_at
+         FROM user_devices WHERE user_id = ?",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_device_id, device_id);
+    assert_eq!(client_name, "Lux Web");
+    assert_eq!(device_type.as_deref(), Some("WEB"));
+    assert!(first_seen_at > 0);
+    assert!(last_seen_at >= first_seen_at);
+
+    let invalid_device_login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .header("X-Lux-Device-Id", "not-a-uuid")
+        .json(&json!({
+            "username": "activity-user",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_device_login.status(), reqwest::StatusCode::OK);
+    let device_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(device_count, 1);
+
+    sqlx::query(
+        "CREATE TRIGGER fail_user_device_insert
+         BEFORE INSERT ON user_devices
+         BEGIN SELECT RAISE(ABORT, 'device inventory unavailable'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let storage_failure_login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .header("X-Lux-Device-Id", "00000000-0000-4000-8000-000000000002")
+        .json(&json!({
+            "username": "activity-user",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(storage_failure_login.status(), reqwest::StatusCode::OK);
 
     let cookie = cookie_pair(response.headers());
     let audit = client

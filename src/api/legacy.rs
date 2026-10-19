@@ -114,8 +114,9 @@ use crate::{
     },
     security::{DevicePairingRateLimiter, LoginRateLimiter},
     storage::{
-        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, PersonListOptions,
-        PersonSort, StorageError, StoredPlaybackSession, WebPlaybackEventClaim,
+        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent,
+        NewUserDeviceObservation, PersonListOptions, PersonSort, StorageError,
+        StoredPlaybackSession, WebPlaybackEventClaim,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};

@@ -15542,6 +15542,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 两项 API client 回归因请求缺少设备 ID 而失败；最终 `tests/api-client.test.ts` 79/79，冻结依赖安装和 `pnpm --dir web build` 通过。完整 `pnpm --dir web test` 为 740 passed、4 failed；失败仍集中于既有 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项和 `media-query-polling.test.tsx` 1 项，本任务未改这些文件。构建通过 TypeScript 检查；diff check 通过。
 
+#### LUX-742：记录 Web 用户成功登录设备
+
+范围：Web 登录成功且通过远程访问策略后，校验 `X-Lux-Device-Id` 为 UUID v4，再将 Lux Web 客户端、WEB 类型和展示 IP 写入用户设备清单。客户端未发送或发送无效 ID 时仍按现有规则完成登录，但不创建设备行。设备登记失败不得撤销成功登录；只记录不含用户或设备字段的存储错误。本任务不更新后续请求活动、不增加查询 API、页面或 ACL。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/legacy.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 使用有效 Web 设备 ID 登录后，当前用户设备清单记录客户端类型、首次/最近活动与可用展示 IP。
+- [x] 缺失或无效设备 ID 不阻断登录，也不会创建未标识设备。
+- [x] 设备观察发生在账号和远程访问检查之后；存储错误不泄露标识且不误报登录失败。
+- [x] `users` 定向集成回归、Rust build、fmt 与 diff check 通过；不改 Emby 行为。
+
+短计划：先扩展成功登录集成回归并确认设备行不存在；再在远程访问授权后校验 UUID v4 并调用 LUX-740 upsert；最后运行 `users` 目标、build、fmt 和 diff check。
+
+#### LUX-742 验证记录
+
+结果（2026-10-20）：Web 登录通过账号与远程访问检查后，才校验 `X-Lux-Device-Id` 为 UUID v4 并以 `Lux Web`/`WEB` 元数据写入设备清单；只在请求来源可用时保存展示 IP。缺少或格式无效的 ID 不影响正常登录，也不生成设备记录。设备 upsert 失败只写不带账号/设备字段的告警，不改变已创建的 Web 会话。Emby 登录与后续有效请求留给后续任务。
+
+验证：`users` 目标串行运行 19/19；集成回归覆盖有效 ID 入库、无效 ID 登录仍成功且不新增设备、设备存储注入失败时登录仍返回 200。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许此前记录的 9 条 Clippy 诊断类别的全目标 Clippy 通过。未放行的全量 Clippy 仍受同一组未修改代码诊断阻断；没有变更 Emby 认证或 ACL。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
