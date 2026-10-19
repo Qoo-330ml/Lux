@@ -921,6 +921,18 @@ export type AdminPlaybackSession = {
   output?: AdminPlaybackOutput | null;
   source?: AdminPlaybackSource | null;
 };
+
+export type AdminUserPlaybackSession = AdminPlaybackSession & {
+  canStop: boolean;
+};
+
+export type AdminUserPlaybackSessionPage = {
+  sessions: AdminUserPlaybackSession[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
 export type AdminPlaybackOutput = {
   container?: string | null;
   videoCodec?: string | null;

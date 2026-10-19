@@ -42,6 +42,7 @@ import type {
   AdminUserActivityQuery,
   AdminUser,
   AdminUserEmbySessionPage,
+  AdminUserPlaybackSessionPage,
   AdminUserEmbySessionRevokeAllResponse,
   AdminUserWebSessionPage,
   AdminUserPermissionPreset,
@@ -1284,6 +1285,20 @@ export class LuxApiClient {
     if (query.to !== undefined) params.set("to", String(query.to));
     return this.request<AdminUserActivityPage>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/activity?${params.toString()}`,
+    );
+  }
+
+  adminUserPlaybackSessions(userId: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserPlaybackSessionPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-sessions?${params.toString()}`,
+    );
+  }
+
+  stopAdminUserPlaybackSession(userId: string, playbackId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-sessions/${encodeURIComponent(playbackId)}`,
+      { method: "DELETE" },
     );
   }
 

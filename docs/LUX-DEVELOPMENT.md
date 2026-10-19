@@ -15442,6 +15442,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 集成回归因新路由返回 404（预期未认证 401）而失败；最终串行运行 `tests/users -- --test-threads=1` 为 19/19，`tests/admin_dashboard` 为 1/1。一次并行运行 `tests/users` 为 18/19，其中既有 `admin_can_manage_users_and_last_manager_is_protected` 在并行时返回 503 而非预期 200；该测试单独重跑通过，具体原因尚未确认。新增回归覆盖分页顺序/总数、媒体摘要、`canStop`、未认证/非管理员、CSRF、目标用户隔离、直放拒绝、HLS 停止、并发准入释放和审计事件。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 仍被 9 项未改动代码错误阻断，位置与 LUX-735 记录相同；本任务涉及的 API 与应用文件未新增 Clippy 诊断。
 
+#### LUX-737：增加用户当前播放 Web API 客户端合同
+
+范围：为 LUX-736 的指定用户当前播放分页读取与单会话停止 API 增加安全 TypeScript DTO 和客户端方法。读取默认每页 20 条，路径参数须 URL 编码；停止复用统一请求层并携带 CSRF。本任务不修改用户详情 UI、设备清单或黑名单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] DTO 包含用户当前播放 API 提供的媒体、播放、设备/IP 摘要和 `canStop`，不定义 token、Cookie 或凭证字段。
+- [x] 分页方法默认页码 1、页大小 20，正确编码用户 ID 并发送 `page`/`pageSize`。
+- [x] 停止方法使用精确 DELETE 路径与统一 CSRF 请求层。
+- [x] API client 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先在 `api-client.test.ts` 增加分页/默认参数、路径编码、停止请求和 CSRF 回归并确认方法缺失时失败；再增加 DTO 与 API client 方法；最后运行定向 Vitest、Web build 和 diff check。
+
+结果（2026-10-20）：新增只含管理播放摘要与 `canStop` 的 `AdminUserPlaybackSession`/分页 DTO，及管理员当前播放分页读取和停止客户端方法。用户 ID、播放 ID 均按路径段编码；分页默认 1/20；停止通过统一请求层 DELETE 并自动携带 CSRF。未新增凭证字段。
+
+验证：TDD RED 回归先因客户端方法缺失而失败；实现后 `tests/api-client.test.ts -t "admin user playback and CSRF-protected stop contracts"` 1/1、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`git diff --check` 通过。完整 `pnpm --dir web test` 为 736 passed、4 failed；失败仍为此前记录的 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项及 `media-query-polling.test.tsx` 1 项，本任务没有修改这些实现/测试文件。无 Rust 或 migration 变化。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

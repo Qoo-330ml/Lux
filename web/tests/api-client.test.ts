@@ -528,6 +528,71 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
   });
 
+  it("uses paginated admin user playback and CSRF-protected stop contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: [{
+          id: "playback-1",
+          userId: "user-1",
+          userName: "Viewer",
+          itemId: "item-1",
+          title: "Example Movie",
+          itemType: "MOVIE",
+          posterAvailable: true,
+          positionTicks: 100,
+          durationTicks: 1000,
+          state: "PLAYING",
+          isPaused: false,
+          lastEventAt: 1_500,
+          client: "Lux Web",
+          clientVersion: "1.0",
+          deviceName: "Living Room",
+          deviceType: "Browser",
+          remoteIp: "192.0.2.1",
+          playbackPlan: "SERVER_HLS",
+          canStop: true,
+        }],
+        page: 3,
+        pageSize: 10,
+        totalCount: 21,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sessions: [], page: 1, pageSize: 20, totalCount: 0 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserPlaybackSessions("user /1", 3, 10)).resolves.toMatchObject({
+        sessions: [{ id: "playback-1", deviceName: "Living Room", remoteIp: "192.0.2.1", canStop: true }],
+        page: 3,
+        pageSize: 10,
+        totalCount: 21,
+      });
+      await expect(client.adminUserPlaybackSessions("user-2")).resolves.toMatchObject({
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+      await expect(client.stopAdminUserPlaybackSession("user /1", "playback/1")).resolves.toBeUndefined();
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "/api/v1/admin/users/user%20%2F1/playback-sessions?page=3&pageSize=10",
+      );
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "/api/v1/admin/users/user-2/playback-sessions?page=1&pageSize=20",
+      );
+      expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[2]?.[0]).toBe(
+        "/api/v1/admin/users/user%20%2F1/playback-sessions/playback%2F1",
+      );
+      expect(fetchMock.mock.calls[2]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[2]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     const cookie = installCookieDocument("lux_csrf=csrf-token");
