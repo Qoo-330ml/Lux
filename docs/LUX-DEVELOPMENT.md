@@ -16053,6 +16053,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`cargo test --locked --test emby_auth -- --test-threads=1` 13/13、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍报 13 项既有诊断，均在本任务未修改位置；本任务文件没有新增诊断。Cargo 命令使用 Toshiba target 目录。集成回归覆盖按名称和用户 ID 登录、可信/不可信代理、缺少 peer、已有 token 撤销、未命中地址、损坏与超限规则、可信代理配置损坏，以及共享管理员 API Key 不受影响。
 
+#### LUX-769：在 Lux API 接受的 Emby 用户凭证中执行 IP/CIDR 黑名单
+
+范围：Lux 原生 `/api/v1` 身份验证兼容 Emby 用户 token 的路径，使用 LUX-766 解析访问 IP，并调用 LUX-768 的逐 token IP 规则检查。命中时撤销 token 并拒绝请求；缺少 peer 且有活动规则时 fail closed。共享管理员 API Key 仍走独立主体解析。本任务不接入已签发的播放 URL/播放票据，也不改用户权限。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] Lux API 上由 Emby 用户 token 建立的主体身份，每次解析均检查全站/用户 IP/CIDR 规则。
+- [x] 命中时拒绝并撤销 Emby token；未命中继续工作；规则或访问 IP 解析错误 fail closed 返回服务不可用。
+- [x] 共享管理员 API Key 不受规则路径影响；users 定向集成目标、build、fmt 和 diff check 通过。
+
+短计划：先在 `tests/users.rs` 建立 Emby token 访问受保护 Lux API 的阻断/撤销与允许地址回归，并确认当前路径会绕过规则；再在 `require_web_principal` 的 Emby token 分支解析访问 IP 并映射服务不可用错误；最后运行 users 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 时允许地址携带 Emby token 访问 `/api/v1/auth/me` 返回 401；接入 LUX-766 来源解析后新增回归通过。完整 `cargo test --locked --test users -- --test-threads=1` 24/24、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍有 13 项既有诊断，未在本任务改动文件中产生新诊断。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

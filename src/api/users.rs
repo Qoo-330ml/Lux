@@ -2299,7 +2299,19 @@ pub(super) async fn require_web_principal(
             )
             .into_response());
         };
-        return match auth.resolve_token(&token).await {
+        let client_ip = match super::request_access_ip(headers, state).await {
+            Ok(client_ip) => client_ip,
+            Err(_) => {
+                return Err(api_error(
+                    headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response());
+            }
+        };
+        return match auth.resolve_token_with_ip(&token, client_ip).await {
             Ok(Some(user)) => {
                 if state.remote_access.is_remote(
                     header_str(headers, "x-lux-peer-ip"),
@@ -2322,6 +2334,13 @@ pub(super) async fn require_web_principal(
                 StatusCode::UNAUTHORIZED,
                 lux::ApiErrorCode::AuthenticationRequired,
                 "需要有效的客户端令牌",
+            )
+            .into_response()),
+            Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
             )
             .into_response()),
             Err(_) => Err(api_error(

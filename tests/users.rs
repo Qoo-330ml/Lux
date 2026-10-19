@@ -12,6 +12,7 @@ use luxd::{
 };
 use reqwest::header::COOKIE;
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -4637,6 +4638,102 @@ async fn web_login_and_existing_sessions_enforce_ip_blacklists_through_trusted_p
         overflow_login.status(),
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_tokens_enforce_ip_blacklists_in_lux_api_routes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let target = UserStore::new(database.clone())?
+        .create_user(
+            "lux-api-emby-ip",
+            "Lux API Emby IP",
+            "target password",
+            false,
+        )
+        .await?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let base_url = format!("http://{address}");
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "lux-api-emby-ip",
+            "Pw": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing Emby token")?
+        .to_owned();
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES ('lux-api-emby-ip-rule', ?, 'IP_CIDR', '198.51.100.0/24', 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(target.id.to_string())
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
+
+    let allowed_address = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header("X-Emby-Token", &token)
+        .header("X-Forwarded-For", "192.0.2.31")
+        .send()
+        .await?;
+    assert_eq!(allowed_address.status(), reqwest::StatusCode::OK);
+
+    let blocked_address = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header("X-Emby-Token", &token)
+        .header("X-Forwarded-For", "198.51.100.31")
+        .send()
+        .await?;
+    assert_eq!(blocked_address.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let token_hash = sha2::Sha256::digest(token.as_bytes()).to_vec();
+    let revoked_at: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE token_hash = ?")
+            .bind(token_hash)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(revoked_at.is_some());
 
     server.abort();
     Ok(())
