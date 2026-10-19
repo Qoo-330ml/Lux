@@ -13485,6 +13485,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增双数据库用户预设来源表，保存应用时的 ID、名称、版本和时间，并在账号彻底删除时级联清理。`storage` target 串行运行 64/64、Rust build、fmt check、diff check 通过；PostgreSQL 迁移通过结构定义断言，本机 PostgreSQL 运行时未验证。第一次并行跑完整 `storage` target 时，时间敏感的既有重试迁移断言失败，单线程复跑通过。
 
+#### LUX-643：同步来源迁移后的其余 schema 版本断言
+
+范围：将 `0188` 来源迁移后的当前 schema 版本断言更新为 188；仅修改现行数据库版本断言，历史迁移版本和迁移序列检查保持原值。本任务不改变运行时代码。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`tests/scanning_jobs.rs`、`tests/scanner.rs`、`tests/danmaku.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 测试中的当前 schema 版本断言均与最新迁移一致，历史迁移断言不变。
+- [x] 对应迁移回归通过，PostgreSQL target 可编译；Rust build、fmt 与 diff check 通过。
+
+短计划：先确认四个目标中的断言用途；更新当前版本值并运行对应迁移测试。
+
+验证：`cargo test --locked --test scanning_jobs streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_update`、`cargo test --locked --test scanner media_catalog_migration_creates_expected_tables`、`cargo test --locked --test danmaku database_migration_creates_danmaku_tables`、`cargo test --locked --test postgres_database --no-run`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-642。
+
+结果（2026-10-19）：将 `scanning_jobs`、`scanner`、`danmaku` 和 PostgreSQL 集成测试中的现行 schema 版本同步为 188，历史迁移编号保持不变。三个 SQLite 定向回归各 1/1、`postgres_database --no-run`、Rust build、fmt check 和 diff check 通过；本机未运行 PostgreSQL 集成服务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
