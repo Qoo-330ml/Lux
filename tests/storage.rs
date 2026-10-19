@@ -22,7 +22,7 @@ async fn user_activity_events_migration_runs_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 194);
+    assert_eq!(database.schema_version().await?, 195);
 
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master
@@ -101,7 +101,14 @@ async fn user_device_inventory_migration_runs_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 194);
+    assert_eq!(database.schema_version().await?, 195);
+
+    let session_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('web_sessions') WHERE name = 'device_id'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(session_columns, 1);
 
     let required_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('user_devices')
@@ -137,6 +144,18 @@ async fn user_device_inventory_migration_runs_from_an_empty_database()
     .execute(database.pool())
     .await?;
     sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES ('legacy-session', 'device-owner', x'01', x'02', unixepoch() + 3600)",
+    )
+    .execute(database.pool())
+    .await?;
+    let legacy_device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(legacy_device_id, None);
+    sqlx::query(
         "INSERT INTO user_devices (
              user_id, device_id, client_name, first_seen_at, last_seen_at
          ) VALUES ('device-owner', 'browser-device', 'Lux Web', 10, 20)",
@@ -164,7 +183,74 @@ async fn user_device_inventory_migration_runs_from_an_empty_database()
     ] {
         assert!(postgres_migration.contains(expected), "missing {expected}");
     }
+    assert_eq!(
+        include_str!("../migrations/0195_web_session_device_id.sql"),
+        include_str!("../migrations-postgres/0195_web_session_device_id.sql")
+    );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_session_device_id_migration_preserves_existing_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations-v194");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid migration filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 194 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-session-owner', 'legacy-session-owner', 'Legacy Session', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES (
+             'legacy-session', 'legacy-session-owner', x'01', x'02', unixepoch() + 3600
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0195_web_session_device_id.sql"),
+        migration_dir.join("0195_web_session_device_id.sql"),
+    )?;
+    Migrator::new(migration_dir).await?.run(&pool).await?;
+
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(&pool)
+            .await?;
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(device_id, None);
+    assert_eq!(version, 195);
     Ok(())
 }
 

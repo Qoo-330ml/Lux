@@ -297,7 +297,16 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
     };
     let (connection, database_name) = create_postgres_test_database().await?;
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 194);
+    assert_eq!(database.schema_version().await?, 195);
+
+    let session_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'web_sessions'
+           AND column_name = 'device_id'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(session_columns, 1);
 
     let columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
@@ -327,6 +336,21 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
     .execute(database.pool())
     .await?;
     sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES (
+             'legacy-session', 'device-owner', decode('01', 'hex'),
+             decode('02', 'hex'), 9999999999
+         )",
+    )
+    .execute(database.pool())
+    .await?;
+    let legacy_device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(legacy_device_id, None);
+    sqlx::query(
         "INSERT INTO user_devices (
              user_id, device_id, client_name, first_seen_at, last_seen_at
          ) VALUES ('device-owner', 'browser-device', 'Lux Web', 10, 20)",
@@ -341,6 +365,73 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(cascaded_devices, 0);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let migration_dir = temp_dir.path().join("migrations-v194");
+    fs::create_dir(&migration_dir)?;
+    let source_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version = filename
+            .to_str()
+            .and_then(|name| name.split_once('_'))
+            .ok_or("invalid migration filename")?
+            .0
+            .parse::<i64>()?;
+        if version <= 194 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-session-owner', 'legacy-session-owner', 'Legacy Session', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES (
+             'legacy-session', 'legacy-session-owner', decode('01', 'hex'),
+             decode('02', 'hex'), 9999999999
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(device_id, None);
+    assert_eq!(database.schema_version().await?, 195);
 
     drop(database);
     drop_postgres_test_database(&database_name).await?;

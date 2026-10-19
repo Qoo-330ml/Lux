@@ -15706,6 +15706,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 的后续有效 Emby 请求未刷新旧设备时间；实现后 `cargo test --locked --test emby_auth -- --test-threads=1` 11/11 通过，覆盖活动时间/IP 更新、首次时间稳定、无设备 ID 跳过与设备更新失败仍返回 200。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。定向 Clippy 放行 7 类既有诊断后通过；严格 `cargo clippy --locked --test emby_auth -- -D warnings` 仍被未改文件的既有诊断阻断，本次修改文件无新增诊断。Cargo 输出目录在 Toshiba 挂载盘。
 
+#### LUX-750：为 Web 登录会话预留设备关联字段
+
+范围：为 `web_sessions` 增加可空 `device_id`，保存 Web 登录会话对应的客户端声明设备 ID。迁移必须从空库与现有库升级；既有会话保持 `NULL`，不回填猜测值。本任务仅更新 SQLite/PostgreSQL schema 和迁移验证，不在认证/API 写入或读取该字段，不改变 Web 会话行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0195_web_session_device_id.sql`、`migrations-postgres/0195_web_session_device_id.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 新旧 SQLite/PostgreSQL 数据库迁移后，`web_sessions.device_id` 可空且旧会话值为 `NULL`。
+- [x] PostgreSQL 与 SQLite schema 版本及 migration 对齐，空库迁移和既有 Web 会话升级回归通过。
+- [x] `storage` 相关目标、build、fmt、可用 Clippy 与 diff check 通过。
+
+短计划：先扩展 SQLite/PostgreSQL 设备清单迁移测试，断言新列存在且已有会话不回填；运行 SQLite migration 定向用例确认 RED；再添加版本 0195 双数据库 additive migration，最后运行存储与数据库迁移验证。
+
+结果（2026-10-20）：SQLite 与 PostgreSQL 均新增 `web_sessions.device_id TEXT NULL` migration 0195；旧会话保持 NULL，不推断设备关联。未在该任务接入认证写入或读取。
+
+验证：SQLite 空库迁移与既有 0194 会话升级分别通过；PostgreSQL 空库 migration 和旧会话升级两个真实本机测试均通过。`cargo build --locked`、`cargo fmt --all -- --check`、PostgreSQL 测试目标编译及 `git diff --check` 通过；`storage` 与 PostgreSQL 测试目标 Clippy 在放行 7 类既有诊断后通过。另一个宽泛 `storage migration_runs_from_an_empty_database` 过滤运行到 7 项，其中 5 项旧迁移测试仍因断言 schema 版本为 190/192 而失败；本任务新增与直接关联的迁移用例通过，这些历史版本断言尚未同步。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
