@@ -1,5 +1,13 @@
 use super::*;
 
+const MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER: &str =
+    "CREATE TRIGGER IF NOT EXISTS trg_media_items_content_restriction_index_invalidate_nfo
+     AFTER UPDATE OF nfo_metadata_json ON media_items
+     WHEN OLD.nfo_metadata_json IS NOT NEW.nfo_metadata_json
+     BEGIN
+         DELETE FROM media_content_restriction_index WHERE item_id = NEW.id;
+     END";
+
 pub(super) async fn migrate_sqlite_catalog_constraints(
     pool: &AnyPool,
     path: &Path,
@@ -69,6 +77,13 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             path: path.to_path_buf(),
             source,
         })?;
+        sqlx::query(MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER)
+            .execute(&mut *connection)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
         return Ok(());
     }
 
@@ -147,6 +162,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_update",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_delete",
             "DROP TRIGGER IF EXISTS trg_filesystem_entries_availability_update",
+            "DROP TRIGGER IF EXISTS trg_media_items_content_restriction_index_invalidate_nfo",
             "CREATE TABLE media_items_new (
                 id TEXT PRIMARY KEY NOT NULL,
                 library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -447,6 +463,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                      generation = collection_sync_outbox.generation + 1,
                      updated_at = excluded.updated_at;
              END",
+            MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER,
         ];
         for statement in statements {
             sqlx::query(statement)

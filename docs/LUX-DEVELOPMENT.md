@@ -14227,6 +14227,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：SQLite 与 PostgreSQL schema 191 建立 18 个固定分级目录项、仅有索引行才表示就绪的媒体条目索引、标签子表及分级/标签查询索引；约束拒绝未知等级与空标签，媒体删除及索引删除均级联清理。SQLite 空库迁移和 PostgreSQL 本地 bootstrap 专项各 1/1 通过，build、fmt 和 diff check 通过。定向 Clippy 对新增代码在豁免既有 `too_many_arguments` 与测试目标 `type_complexity` 后通过。测试中发现 SQLite 的兼容表重建会丢弃 migration 新建的条目触发器，因此 0191 只建 schema；NFO 变更失效合同移至 LUX-680 单独处理，避免把未经修复的触发器描述为有效。
 
+#### LUX-680：确保 SQLite 内容分类索引随 NFO 变更失效
+
+范围：NFO 缓存文本变化时删除条目的分级/标签索引，并保证现有 SQLite `media_items` 兼容表重建不会丢失失效触发器。本任务只处理 SQLite；PostgreSQL 对应行为由 LUX-681 验证。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0192_media_content_restriction_index_invalidation.sql`、`src/storage/migration.rs`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] NFO 缓存从旧值改为新值或清空时，SQLite 自动删除条目索引及其标签；无变化更新不影响已就绪索引。
+- [x] 新库与会触发 catalog 兼容表重建的 SQLite 启动路径都保留此触发器。
+- [x] 空库定向测试验证索引失效、级联清理和索引重新建立后的媒体删除路径。
+
+短计划：先把已通过 migration 的回归扩展为 NFO 更新/清空的失效断言并确认失败；再新增 0192 触发器 migration，并在 SQLite catalog 兼容重建后幂等恢复触发器；最后重跑空库定向测试、build、fmt 与 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage media_content_restriction_index_migration_runs_from_an_empty_database -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-679。
+
+结果（2026-10-19）：新增 SQLite migration 0192；NFO 认证元数据实际变化或清空时，触发删除条目分类索引并级联删除标签。SQLite catalog 兼容表重建后会幂等恢复该触发器；无变化更新保留索引。空库专项测试 1/1、build、fmt、diff 检查通过；测试目标 Clippy 在豁免既有 `too_many_arguments` 与 `type_complexity` 后通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
