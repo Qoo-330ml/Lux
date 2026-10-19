@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Ban, Check, KeyRound, Plus, RotateCcw, Search, ShieldCheck, Trash2, UserCheck, UserRound, X } from "lucide-react";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminUser, AdminUserListStatus, AdminUserPermissionPresetBatchErrorCode, AdminUserSortBy, AdminUserSortOrder, AdminUserStatusBatchErrorCode } from "../../lib/api/types";
+import { AdminUserPermissionCopyDialog } from "./AdminUserPermissionCopyDialog";
 import { AdminUserPreferenceCopyDialog } from "./AdminUserPreferenceCopyDialog";
 import "./user-management.css";
 
@@ -47,6 +48,10 @@ export function AdminUsersPage() {
   const [batchStatusResults, setBatchStatusResults] = useState<{ isDisabled: boolean; results: Array<{ userId: string; userName: string; success: boolean; errorCode: AdminUserStatusBatchErrorCode | null }> } | null>(null);
   const [batchStatusError, setBatchStatusError] = useState("");
   const [copyDialogOpen, setCopyDialogOpen] = useState(false);
+  const [permissionCopyDialogOpen, setPermissionCopyDialogOpen] = useState(false);
+  const anyCopyDialogOpen = copyDialogOpen || permissionCopyDialogOpen;
+  const permissionCopyButtonRef = useRef<HTMLButtonElement>(null);
+  const batchPanelHeadingRef = useRef<HTMLHeadingElement>(null);
   const items = users.data?.users ?? [];
   const totalCount = users.data?.totalCount ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
@@ -124,7 +129,7 @@ export function AdminUsersPage() {
   function confirmBatchPreset() {
     const preset = permissionPresets.data?.presets.find((candidate) => candidate.id === batchPresetId);
     const targets = selectedOnCurrentPage;
-    if (!preset || targets.length === 0 || applyBatchPreset.isPending) return;
+    if (!preset || targets.length === 0 || applyBatchPreset.isPending || anyCopyDialogOpen) return;
     const names = targets.map((user) => user.displayName || user.usernameNormalized).join("、");
     if (!window.confirm(`仅对当前页已选的 ${targets.length} 个用户应用权限预设“${preset.name}”吗？\n${names}`)) return;
     setBatchResults(null);
@@ -141,7 +146,7 @@ export function AdminUsersPage() {
 
   function confirmBatchUserStatus(isDisabled: boolean) {
     const targets = selectedOnCurrentPage;
-    if (targets.length === 0 || batchActionPending || copyDialogOpen) return;
+    if (targets.length === 0 || batchActionPending || anyCopyDialogOpen) return;
     const names = targets.map((user) => user.displayName || user.usernameNormalized).join("、");
     const action = isDisabled ? "禁用" : "启用";
     const effect = isDisabled
@@ -156,6 +161,14 @@ export function AdminUsersPage() {
       userIds: targets.map((user) => user.id),
       isDisabled,
       userNames: Object.fromEntries(targets.map((user) => [user.id, user.displayName || user.usernameNormalized])),
+    });
+  }
+
+  function closePermissionCopyDialog() {
+    setPermissionCopyDialogOpen(false);
+    window.requestAnimationFrame(() => {
+      if (permissionCopyButtonRef.current?.disabled) batchPanelHeadingRef.current?.focus();
+      else permissionCopyButtonRef.current?.focus();
     });
   }
 
@@ -188,18 +201,19 @@ export function AdminUsersPage() {
       {view === "users" ? <>
         <section className="lux-admin-panel lux-admin-create-panel"><div className="lux-admin-panel-heading"><div><h2>创建用户</h2></div><Plus size={20} className="lux-admin-panel-icon" /></div><form className="lux-admin-form lux-admin-user-create-form" onSubmit={submit}><label>用户名<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="off" /></label><label>显示名称<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label><label>初始密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" /></label><label className="lux-admin-toggle"><input type="checkbox" checked={form.isAdmin} onChange={(event) => setForm({ ...form, isAdmin: event.target.checked })} /><span>服务器管理员</span></label><button className="lux-button lux-button-primary" type="submit" disabled={create.isPending}><Plus size={16} /> {create.isPending ? "创建中…" : "创建用户"}</button></form>{formError ? <p className="lux-error-copy">{formError}</p> : null}</section>
         <section className="lux-admin-panel lux-admin-user-batch-panel" aria-labelledby="lux-admin-user-batch-title">
-          <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-batch-title">批量用户操作</h2><p>仅对当前页勾选的用户操作；换页或筛选后会清空选择，每批最多 100 人。</p></div></div>
+          <div className="lux-admin-panel-heading"><div><h2 ref={batchPanelHeadingRef} id="lux-admin-user-batch-title" tabIndex={-1}>批量用户操作</h2><p>仅对当前页勾选的用户操作；换页或筛选后会清空选择，每批最多 100 人。</p></div></div>
           <div className="lux-admin-user-batch-controls">
-            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label={allCurrentPageSelected ? "取消本页全选" : "全选本页"} onClick={toggleCurrentPageSelection} disabled={!items.length || batchActionPending || copyDialogOpen}>{allCurrentPageSelected ? "取消本页全选" : "全选本页"}</button>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label={allCurrentPageSelected ? "取消本页全选" : "全选本页"} onClick={toggleCurrentPageSelection} disabled={!items.length || batchActionPending || anyCopyDialogOpen}>{allCurrentPageSelected ? "取消本页全选" : "全选本页"}</button>
             <span aria-live="polite">当前页已选 {selectedOnCurrentPage.length} 人</span>
-            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量启用用户" onClick={() => confirmBatchUserStatus(false)} disabled={!selectedOnCurrentPage.length || batchActionPending || copyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === false ? "启用中…" : "批量启用"}</button>
-            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量禁用用户" onClick={() => confirmBatchUserStatus(true)} disabled={!selectedOnCurrentPage.length || batchActionPending || copyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === true ? "禁用中…" : "批量禁用"}</button>
-            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制偏好" onClick={() => setCopyDialogOpen(true)} disabled={!selectedOnCurrentPage.length || batchActionPending || copyDialogOpen}>复制偏好</button>
-            <label>权限预设<select aria-label="批量权限预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || batchActionPending}>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量启用用户" onClick={() => confirmBatchUserStatus(false)} disabled={!selectedOnCurrentPage.length || batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === false ? "启用中…" : "批量启用"}</button>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量禁用用户" onClick={() => confirmBatchUserStatus(true)} disabled={!selectedOnCurrentPage.length || batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === true ? "禁用中…" : "批量禁用"}</button>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制偏好" onClick={() => setCopyDialogOpen(true)} disabled={!selectedOnCurrentPage.length || batchActionPending || anyCopyDialogOpen}>复制偏好</button>
+            <button ref={permissionCopyButtonRef} className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制权限" onClick={() => setPermissionCopyDialogOpen(true)} disabled={!selectedOnCurrentPage.length || batchActionPending || anyCopyDialogOpen}>复制权限</button>
+            <label>权限预设<select aria-label="批量权限预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || batchActionPending || anyCopyDialogOpen}>
               <option value="">选择权限预设</option>
               {(permissionPresets.data?.presets ?? []).map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
             </select></label>
-            <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label="批量应用权限预设" onClick={confirmBatchPreset} disabled={!selectedOnCurrentPage.length || !batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || batchActionPending}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</button>
+            <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label="批量应用权限预设" onClick={confirmBatchPreset} disabled={!selectedOnCurrentPage.length || !batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || batchActionPending || anyCopyDialogOpen}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</button>
           </div>
           {selectedUserIds.length > 0 && permissionPresets.error ? <p className="lux-error-copy" role="alert">权限预设加载失败：{permissionPresets.error.message}</p> : null}
           {batchError ? <p className="lux-error-copy" role="alert">批量应用失败：{batchError}</p> : null}
@@ -215,12 +229,20 @@ export function AdminUsersPage() {
             void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
           }}
         /> : null}
+        {permissionCopyDialogOpen ? <AdminUserPermissionCopyDialog
+          targets={selectedOnCurrentPage.map((user) => ({ id: user.id, name: user.displayName || user.usernameNormalized }))}
+          onClose={closePermissionCopyDialog}
+          onApplied={() => {
+            setSelectedUserIds([]);
+            void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
+          }}
+        /> : null}
       </> : null}
       <section className="lux-admin-panel lux-admin-users-list-panel"><div className="lux-admin-panel-heading"><div><h2>{view === "deleted" ? "已删除用户" : "账户列表"}</h2></div><span className="lux-status-pill">共 {totalCount} 个账户</span></div>
         {users.error ? <p className="lux-error-copy" role="alert">列表更新失败：{users.error.message}</p> : null}
         {items.length ? <div className="lux-admin-user-list">{items.map((user) => view === "deleted"
           ? <DeletedUserRow key={user.id} user={user} />
-          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} selected={selectedUserIds.includes(user.id)} selectionDisabled={batchActionPending || copyDialogOpen} actionsDisabled={batchActionPending || copyDialogOpen} onSelectionChange={(selected) => toggleUserSelection(user.id, selected)} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
+          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} selected={selectedUserIds.includes(user.id)} selectionDisabled={batchActionPending || anyCopyDialogOpen} actionsDisabled={batchActionPending || anyCopyDialogOpen} onSelectionChange={(selected) => toggleUserSelection(user.id, selected)} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
         <div className="lux-admin-user-pagination" aria-label="用户列表分页"><span>{totalCount ? `显示 ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalCount)} 条，共 ${totalCount} 条` : "共 0 条"}</span><div><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button><span>第 {page} / {totalPages} 页</span><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button></div></div>
       </section>
       </>}

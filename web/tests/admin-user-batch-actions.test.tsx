@@ -7,7 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
-import type { AdminSettings, AdminUser, AdminUserPermissionPreset } from "../src/lib/api/types";
+import type { AdminLibrary, AdminSettings, AdminUser, AdminUserPermissionPreset } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -235,6 +235,136 @@ describe("AdminUsersPage batch user actions", () => {
 
     expect(container.textContent).toContain("当前页已选 0 人");
     expect(container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.checked).toBe(false);
+  });
+
+  it("previews selected permission groups and applies them only to selected current-page users", async () => {
+    const source = user("source", "source-user", "来源账号");
+    const alice = user("user-a", "alice", "爱丽丝");
+    const bob = user("user-b", "bob", "鲍勃");
+    const unselected = user("user-c", "charlie", "未选择用户");
+    const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [source, alice, bob, unselected], page: 1, pageSize: 20, totalCount: 4 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [{ id: "library-a", name: "电影", kind: "MOVIE" } as AdminLibrary] });
+    vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [preset] });
+    vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays: 7 } as AdminSettings);
+    const preview = vi.spyOn(api, "previewAdminUserPermissionCopy").mockResolvedValue({
+      sourceUserId: source.id,
+      sourceVersion: "a".repeat(64),
+      sourceSnapshot: {
+        library: { accessMode: "SELECTED", libraryIds: ["library-a"] },
+        playback: { canDownload: false, canPlay: true, maxSimultaneousPlaybacks: 2, allowRemux: true, allowAudioTranscode: false, allowVideoTranscode: false },
+      },
+      targets: [
+        { userId: alice.id, expectedVersion: "b".repeat(64) },
+        { userId: bob.id, expectedVersion: "c".repeat(64) },
+      ],
+      groups: { library: true, content: false, playback: true },
+    });
+    const apply = vi.spyOn(api, "copyAdminUserPermissionGroups").mockResolvedValue({
+      sourceUserId: source.id,
+      sourceVersion: "a".repeat(64),
+      results: [
+        { userId: alice.id, success: true, errorCode: null },
+        { userId: bob.id, success: false, errorCode: "VERSION_CONFLICT" },
+      ],
+    });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("未选择用户"));
+      container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
+      container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="复制权限"]')?.click();
+      await vi.waitFor(() => expect(container.querySelector('[role="dialog"][aria-label="权限复制"]')).toBeTruthy());
+    });
+
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="批量应用权限预设"]')?.disabled).toBe(true);
+    expect(container.textContent).toContain("目标账号 · 2 人");
+    expect(container.textContent).toContain("爱丽丝");
+    expect(container.textContent).toContain("鲍勃");
+    expect(container.querySelector('option[value="user-a"]')).toBeNull();
+    expect(container.querySelector('option[value="user-b"]')).toBeNull();
+    expect(container.querySelector('option[value="source"]')).toBeTruthy();
+
+    await act(async () => {
+      const sourceSelect = container.querySelector<HTMLSelectElement>('select[aria-label="权限复制来源"]');
+      if (sourceSelect) {
+        sourceSelect.value = source.id;
+        sourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      container.querySelector<HTMLInputElement>('input[aria-label="复制内容限制"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="预览权限复制"]')?.click();
+      await vi.waitFor(() => expect(preview).toHaveBeenCalledWith({
+        sourceUserId: source.id,
+        targetUserIds: [alice.id, bob.id],
+        groups: { library: true, content: false, playback: true },
+      }));
+    });
+
+    expect(container.textContent).toContain("最大同时播放 2 路");
+    expect(container.textContent).toContain("指定：电影");
+    expect(container.textContent).not.toContain("分级体系");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="应用权限复制"]')?.click();
+      await vi.waitFor(() => expect(apply).toHaveBeenCalledWith({
+        sourceUserId: source.id,
+        sourceVersion: "a".repeat(64),
+        targets: [
+          { userId: alice.id, expectedVersion: "b".repeat(64) },
+          { userId: bob.id, expectedVersion: "c".repeat(64) },
+        ],
+        groups: { library: true, content: false, playback: true },
+      }));
+      await vi.waitFor(() => expect(list.mock.calls.filter(([input]) => input?.pageSize === 20)).toHaveLength(2));
+    });
+
+    expect(container.textContent).toContain("爱丽丝：成功");
+    expect(container.textContent).toContain("鲍勃：权限已变化，请重新预览");
+    expect(container.textContent).toContain("当前页已选 0 人");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="关闭权限复制"]')?.click();
+      await vi.waitFor(() => expect(container.querySelector('[role="dialog"][aria-label="权限复制"]')).toBeNull());
+    });
+    await vi.waitFor(() => expect(document.activeElement).toBe(container.querySelector<HTMLHeadingElement>("#lux-admin-user-batch-title")));
+  });
+
+  it("invalidates a permission preview when the selected groups change", async () => {
+    const source = user("source", "source-user", "来源账号");
+    const target = user("user-a", "alice", "爱丽丝");
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [source, target], page: 1, pageSize: 20, totalCount: 2 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [preset] });
+    vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays: 7 } as AdminSettings);
+    const preview = vi.spyOn(api, "previewAdminUserPermissionCopy").mockResolvedValue({
+      sourceUserId: source.id,
+      sourceVersion: "a".repeat(64),
+      sourceSnapshot: { library: { accessMode: "ALL", libraryIds: [] } },
+      targets: [{ userId: target.id, expectedVersion: "b".repeat(64) }],
+      groups: { library: true, content: true, playback: true },
+    });
+    const apply = vi.spyOn(api, "copyAdminUserPermissionGroups");
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("爱丽丝"));
+      container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="复制权限"]')?.click();
+      await vi.waitFor(() => expect(container.querySelector('[role="dialog"][aria-label="权限复制"]')).toBeTruthy());
+      const sourceSelect = container.querySelector<HTMLSelectElement>('select[aria-label="权限复制来源"]');
+      if (sourceSelect) {
+        sourceSelect.value = source.id;
+        sourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      container.querySelector<HTMLButtonElement>('button[aria-label="预览权限复制"]')?.click();
+      await vi.waitFor(() => expect(preview).toHaveBeenCalledTimes(1));
+    });
+
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="应用权限复制"]')?.disabled).toBe(false);
+    await act(async () => {
+      container.querySelector<HTMLInputElement>('input[aria-label="复制播放权限"]')?.click();
+    });
+    expect(container.querySelector('[aria-label="权限复制预览"]')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="应用权限复制"]')).toBeNull();
+    expect(apply).not.toHaveBeenCalled();
   });
 
   function renderPage() {

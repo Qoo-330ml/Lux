@@ -14932,6 +14932,30 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：定向 `api-client.test.ts` 2/2、`pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。完整 `pnpm --dir web test` 为 721 passed、4 failed；失败仍为 `home-page.test.tsx`、`library-card.test.tsx` 两项及 `media-query-polling.test.tsx`，与既有记录的失败集合相同，本任务没有修改相关代码或测试。`git diff --check` 通过。
 
+#### LUX-713：在用户列表实现权限组复制预览与应用界面
+
+范围：在当前页已选择的用户列表操作区增加“预览并复制权限”流程，复用 LUX-712 客户端。管理员选择来源用户和 Library、Content、Playback 权限组后先预览；预览展示来源已选权限快照及每个目标的预览版本，确认后才应用，并逐用户显示结果。目标集合固定为打开对话框时本页明确勾选项；来源不可同时作为目标。来源或权限组改变后必须清除旧预览，应用仅能提交当前预览版本。成功后清除列表选择并刷新用户。账户偏好服务端持久化不在本任务范围内。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserPermissionCopyDialog.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-batch-actions.test.tsx`。
+
+验收标准：
+
+- [x] 列表只把当前页明确勾选用户传为目标；对话框展示固定目标、来源用户搜索/选择及三组权限复选项，来源不得是目标。
+- [x] 预览只展示选中权限组的来源快照与目标版本；空组、来源/组变更、加载或请求错误不能遗留可应用的旧预览。
+- [x] 仅在有效预览后可应用；逐用户呈现成功或稳定错误原因，成功后清空所选项并刷新列表。
+- [x] 对话框具备加载/错误状态、Escape 关闭、焦点管理、窄屏可用布局；应用中不可关闭或重复提交。
+- [x] 定向批量用户交互测试、Web build 和 diff check 通过；真实浏览器检查预览/应用关键交互与窄屏溢出。
+
+短计划：先在现有批量用户组件测试中补上权限复制交互用例并确认当前缺少入口而失败；再新增对话框、连接已完成的 LUX-712 客户端并补齐样式；最后运行定向 Vitest、Web build、Playwright 桌面与窄屏验证及 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-batch-actions.test.tsx`、`pnpm --dir web build`、Playwright 桌面与 390×844 检查、`git diff --check`。
+
+依赖：LUX-712。
+
+结果（2026-10-20）：用户列表新增独立的权限复制操作和预览/应用对话框。目标固定为当前页明确勾选账号，来源搜索排除目标；Library、Content、Playback 三组默认全选且可单独选择。仅在服务端预览成功后显示所选来源快照和逐目标版本，切换来源或组即清除预览；应用只提交预览返回的来源/目标版本，并对逐项目标结果映射稳定错误。成功后清空列表选择、刷新用户，同时在对话框保留结果。账户偏好服务端化仍按模块边界延后。
+
+验证：TDD 初始回归在入口缺失时失败；`tests/admin-user-batch-actions.test.tsx` 8/8、冻结依赖安装、Web build 和 `git diff --check` 通过。完整 `pnpm --dir web test` 为 723 passed、4 failed；失败是 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项、`media-query-polling.test.tsx` 1 项，与此前记录的失败集合相同，本任务没有改动相关代码。Playwright 使用模拟 API 在桌面 1280×900 和窄屏 390×844 检查预览/应用、逐项结果、权限组选项作废预览、Escape 关闭及焦点返回；窄屏文档宽 375px、滚动宽 375px，弹窗宽 359px、内容滚动宽 342px，无横向溢出，控制台错误 0。截图：`output/playwright/user-permission-copy-preview-desktop.png`、`output/playwright/user-permission-copy-preview-390.png`。首轮窄屏检查发现弹窗内溢出，经修复后复验通过。完整 Rust 门禁不属于本任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
