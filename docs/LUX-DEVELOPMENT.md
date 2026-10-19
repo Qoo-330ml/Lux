@@ -13783,6 +13783,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 `readStoredAccountSettings`，只返回指定用户键下可解析的设置对象；无记录、JSON 损坏、非对象数据或存储读取抛错均返回 `null`。现有 `readAccountSettings` 继续在无有效旧值时返回相同默认值。`account-settings.test.tsx` 25/25、diff check 通过。
 
+#### LUX-658：账户页使用服务端偏好并迁移旧本地值
+
+范围：将主题、强调色、首页区块、默认音轨/字幕语言和自动连播接入当前用户账户偏好 API。服务端已有正版本时以服务端为准；服务端版本 0 且用户确有本地旧设置时只导入一次。后续更改自动版本化保存并更新本地缓存；多次快速编辑顺序提交，遇到跨设备版本冲突时停止自动覆盖并提示用户刷新。媒体库顺序和播放完成比例继续使用原有接口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/account/AccountPage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/account-settings.test.tsx`。
+
+验收标准：
+
+- [x] 账户页读取并显示服务端账户偏好；已保存的本地主题等值不会覆盖服务端正版本。
+- [x] 服务端版本 0 时仅在有旧本地记录情况下首次导入，媒体库顺序不进入账户偏好 API。
+- [x] 后续设置自动按最新版本串行保存；成功更新本地缓存和首页状态，冲突时停止写入并给出刷新提示。
+- [x] 网络错误保留用户当前界面状态；加载失败时不把默认值写入服务端。
+- [x] `account-settings` 定向 Vitest、TypeScript、Web build 与 diff check 通过。
+
+短计划：先扩展账户设置组件回归覆盖服务端优先、一次性迁移、序列化保存、错误和冲突，再接入查询、迁移编排与有序 CAS 保存，最后运行定向 Vitest、Web build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/account-settings.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-655–657。
+
+结果（2026-10-19）：账户页已读取服务端偏好快照；正版本服务端设置覆盖旧浏览器值，版本 0 只迁移一次现存本地偏好且不提交媒体库顺序。更新通过 CAS 队列按返回版本串行保存，成功后更新本地缓存与首页查询；遇到版本冲突禁用偏好控件并提示刷新，普通网络错误保留当前选择且允许再次保存。初始读取失败时控件保持禁用并提供重试。账户设置回归 31/31、TypeScript 与 Web production build、diff check 通过。尚未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

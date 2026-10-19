@@ -7,9 +7,10 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountPage } from "../src/features/account/AccountPage";
 import { LuxShell } from "../src/components/layout/LuxShell";
-import { api } from "../src/lib/api/client";
+import { ApiError, api } from "../src/lib/api/client";
 import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings, readStoredAccountSettings } from "../src/features/account/account-settings";
 import { calculateAvatarCrop } from "../src/features/account/avatar-image";
+import type { AccountPreferences, AccountPreferencesUpdate } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -17,6 +18,18 @@ const user = {
   id: "user-1",
   usernameNormalized: "owner",
   displayName: "影院主人",
+};
+
+const defaultServerPreferences: AccountPreferences = {
+  theme: "dark",
+  accentColor: "silver",
+  showMediaLibraries: true,
+  showContinueWatching: true,
+  audioLanguage: "原始音轨",
+  subtitleLanguage: "简体中文",
+  autoPlayNextEpisode: true,
+  version: 0,
+  updatedAt: null,
 };
 
 function mockAvatarImageProcessing(width = 600, height = 900) {
@@ -64,6 +77,18 @@ describe("account settings", () => {
       ],
     });
     vi.spyOn(api, "userSettings").mockResolvedValue({ playedPercent: 95 });
+    vi.spyOn(api, "accountPreferences").mockResolvedValue({ ...defaultServerPreferences });
+    vi.spyOn(api, "updateAccountPreferences").mockImplementation(async (input) => ({
+      theme: input.theme,
+      accentColor: input.accentColor,
+      showMediaLibraries: input.showMediaLibraries,
+      showContinueWatching: input.showContinueWatching,
+      audioLanguage: input.audioLanguage,
+      subtitleLanguage: input.subtitleLanguage,
+      autoPlayNextEpisode: input.autoPlayNextEpisode,
+      version: input.expectedVersion + 1,
+      updatedAt: 1_792_382_400,
+    }));
     vi.spyOn(api, "libraryOrder").mockResolvedValue({ libraryOrder: [] });
     vi.spyOn(api, "updateLibraryOrder").mockImplementation(async (input) => input);
     container = document.createElement("div");
@@ -77,6 +102,48 @@ describe("account settings", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
+
+  async function waitForPreferencesLoaded() {
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const button = container.querySelector<HTMLButtonElement>('[aria-label="切换到深色模式"]');
+      if (button && !button.disabled) return;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    throw new Error("账户偏好未能在预期时间内加载");
+  }
+
+  async function waitForText(text: string) {
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      if (container.textContent?.includes(text)) return;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    throw new Error(`页面未显示预期内容：${text}`);
+  }
+
+  async function waitForPreferenceUpdateCalls(count: number) {
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      if (vi.mocked(api.updateAccountPreferences).mock.calls.length >= count) return;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    throw new Error(`账户偏好更新请求未达到 ${count} 次`);
+  }
+
+  async function waitForLocalAccent(accentColor: string) {
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const cached = localStorage.getItem(accountSettingsStorageKey(user.id));
+      if (cached && JSON.parse(cached).accentColor === accentColor) return;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+    }
+    throw new Error(`本地账户偏好缓存未更新为 ${accentColor}`);
+  }
 
   it("provides safe defaults and keeps the library order within its list", () => {
     expect(readAccountSettings()).toEqual(DEFAULT_ACCOUNT_SETTINGS);
@@ -159,6 +226,204 @@ describe("account settings", () => {
     } finally {
       themeColor.remove();
     }
+  });
+
+  it("uses saved server preferences instead of older local cache values", async () => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({
+      theme: "light",
+      accentColor: "berry",
+      showMediaLibraries: false,
+    }));
+    vi.mocked(api.accountPreferences).mockResolvedValueOnce({
+      ...defaultServerPreferences,
+      theme: "dark",
+      accentColor: "ocean",
+      showMediaLibraries: true,
+      version: 2,
+      updatedAt: 1_792_382_400,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="切换到深色模式"]')?.getAttribute("aria-pressed")).toBe("true");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 海蓝"]')?.getAttribute("aria-pressed")).toBe("true");
+    expect(api.updateAccountPreferences).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem(accountSettingsStorageKey(user.id)) ?? "{}")).toMatchObject({
+      theme: "dark",
+      accentColor: "ocean",
+    });
+  });
+
+  it("imports an existing local preference snapshot only when the server has no version", async () => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({
+      theme: "light",
+      accentColor: "ocean",
+      showMediaLibraries: false,
+      showContinueWatching: false,
+      audioLanguage: "日本語",
+      subtitleLanguage: "关闭字幕",
+      autoPlayNextEpisode: false,
+      libraryOrder: ["series", "movies"],
+    }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+
+    expect(api.updateAccountPreferences).toHaveBeenCalledTimes(1);
+    expect(api.updateAccountPreferences).toHaveBeenCalledWith({
+      expectedVersion: 0,
+      theme: "light",
+      accentColor: "ocean",
+      showMediaLibraries: false,
+      showContinueWatching: false,
+      audioLanguage: "日本語",
+      subtitleLanguage: "关闭字幕",
+      autoPlayNextEpisode: false,
+    });
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="切换到浅色模式"]')?.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("shows a conflict and stops sending preference updates after a stale version", async () => {
+    vi.mocked(api.updateAccountPreferences).mockRejectedValueOnce(
+      new ApiError("账户偏好已在其他页面更新", { code: "VERSION_CONFLICT", status: 409 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 海蓝"]')?.click();
+    });
+    await waitForText("偏好已在其他设备更新，请刷新账户设置后再保存");
+
+    expect(container.textContent).toContain("偏好已在其他设备更新，请刷新账户设置后再保存");
+    expect(api.updateAccountPreferences).toHaveBeenCalledTimes(1);
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 琥珀"]')?.disabled).toBe(true);
+  });
+
+  it("keeps the selected value after a network error and allows a later retry", async () => {
+    vi.mocked(api.updateAccountPreferences).mockRejectedValueOnce(new Error("网络暂不可用"));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 海蓝"]')?.click();
+    });
+    await waitForText("账户偏好保存失败：网络暂不可用");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 海蓝"]')?.getAttribute("aria-pressed")).toBe("true");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 琥珀"]')?.click();
+    });
+    await waitForPreferenceUpdateCalls(2);
+    await waitForLocalAccent("amber");
+    expect(vi.mocked(api.updateAccountPreferences).mock.calls[1]?.[0].expectedVersion).toBe(0);
+  });
+
+  it("serializes quick preference changes and uses the returned version for the next save", async () => {
+    let resolveFirst!: (preferences: AccountPreferences) => void;
+    vi.mocked(api.updateAccountPreferences).mockImplementationOnce((input: AccountPreferencesUpdate) => new Promise((resolve) => {
+      resolveFirst = (preferences) => resolve(preferences);
+      void input;
+    }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 海蓝"]')?.click();
+      container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 莓果"]')?.click();
+    });
+    expect(api.updateAccountPreferences).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api.updateAccountPreferences).mock.calls[0]?.[0].expectedVersion).toBe(0);
+
+    await act(async () => {
+      resolveFirst({
+        ...defaultServerPreferences,
+        accentColor: "ocean",
+        version: 1,
+        updatedAt: 1_792_382_400,
+      });
+    });
+    await waitForPreferenceUpdateCalls(2);
+    await waitForLocalAccent("berry");
+
+    expect(vi.mocked(api.updateAccountPreferences).mock.calls[1]?.[0]).toMatchObject({
+      expectedVersion: 1,
+      accentColor: "berry",
+    });
+  });
+
+  it("keeps account preference controls disabled after a load error until retry succeeds", async () => {
+    vi.mocked(api.accountPreferences).mockRejectedValueOnce(new Error("服务暂不可用"));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForText("账户偏好读取失败：服务暂不可用");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="切换到深色模式"]')?.disabled).toBe(true);
+    expect(api.updateAccountPreferences).not.toHaveBeenCalled();
+
+    await act(async () => {
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("重试"))
+        ?.click();
+    });
+    await waitForPreferencesLoaded();
   });
 
   it("persists the selected accent color for the current account", async () => {

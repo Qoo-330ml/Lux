@@ -15,9 +15,9 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "../../lib/api/client";
+import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AuthSession, Library, LuxUser } from "../../lib/api/types";
+import type { AccountPreferences, AccountPreferencesUpdate, AuthSession, Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
 import { useAvatar } from "../../components/layout/LuxShell";
 import { calculateAvatarCrop, cropAvatarImage, DEFAULT_AVATAR_CROP, type AvatarCrop } from "./avatar-image";
@@ -27,6 +27,7 @@ import {
   moveLibrary,
   orderLibraries,
   readAccountSettings,
+  readStoredAccountSettings,
   saveAccountSettings,
   type AccountSettings,
 } from "./account-settings";
@@ -35,11 +36,25 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const accountProfile = useQuery({ queryKey: queryKeys.accountProfile, queryFn: () => api.accountProfile() });
+  const accountPreferences = useQuery({
+    queryKey: queryKeys.accountPreferences(user.id),
+    queryFn: () => api.accountPreferences(),
+  });
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const playbackSettings = useQuery({ queryKey: queryKeys.userSettings, queryFn: () => api.userSettings() });
   const libraryOrder = useQuery({ queryKey: queryKeys.libraryOrder, queryFn: () => api.libraryOrder() });
   const { avatarUrl, setAvatarUrl } = useAvatar();
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
+  const settingsRef = useRef(settings);
+  const accountPreferencesVersion = useRef<number | null>(null);
+  const accountPreferencesInitialized = useRef(false);
+  const accountPreferencesWriteBlocked = useRef(false);
+  const accountPreferencesWriteQueue = useRef<Promise<void>>(Promise.resolve());
+  const pendingAccountPreferenceWrites = useRef(0);
+  const [accountPreferencesReady, setAccountPreferencesReady] = useState(false);
+  const [accountPreferencesSaving, setAccountPreferencesSaving] = useState(false);
+  const [accountPreferencesBlocked, setAccountPreferencesBlocked] = useState(false);
+  const [accountPreferencesNotice, setAccountPreferencesNotice] = useState<string | null>(null);
   const [pendingLibraryOrder, setPendingLibraryOrder] = useState<string[] | null>(null);
   const [draggedLibraryId, setDraggedLibraryId] = useState<string | null>(null);
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
@@ -62,6 +77,81 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
 
+  const queueAccountPreferencesSave = (snapshot: AccountSettings): Promise<AccountPreferences | null> => {
+    pendingAccountPreferenceWrites.current += 1;
+    setAccountPreferencesSaving(true);
+    setAccountPreferencesNotice(null);
+    const queuedWrite = accountPreferencesWriteQueue.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (accountPreferencesWriteBlocked.current) return null;
+        const expectedVersion = accountPreferencesVersion.current;
+        if (expectedVersion === null) throw new Error("账户偏好尚未加载");
+        const saved = await api.updateAccountPreferences(accountPreferencesUpdateFor(snapshot, expectedVersion));
+        accountPreferencesVersion.current = saved.version;
+        queryClient.setQueryData(queryKeys.accountPreferences(user.id), saved);
+        saveAccountSettings(accountSettingsFromPreferences(saved, settingsRef.current.libraryOrder), user.id);
+        void queryClient.invalidateQueries({ queryKey: queryKeys.home });
+        setAccountPreferencesNotice("账户偏好已同步到此账户");
+        return saved;
+      })
+      .catch((error: unknown) => {
+        if (error instanceof ApiError && error.code === "VERSION_CONFLICT") {
+          accountPreferencesWriteBlocked.current = true;
+          setAccountPreferencesBlocked(true);
+          setAccountPreferencesNotice("偏好已在其他设备更新，请刷新账户设置后再保存");
+          void accountPreferences.refetch();
+        } else {
+          setAccountPreferencesNotice(
+            error instanceof Error ? `账户偏好保存失败：${error.message}` : "账户偏好保存失败，请重试。",
+          );
+        }
+        return null;
+      })
+      .finally(() => {
+        pendingAccountPreferenceWrites.current = Math.max(0, pendingAccountPreferenceWrites.current - 1);
+        setAccountPreferencesSaving(pendingAccountPreferenceWrites.current > 0);
+      });
+    accountPreferencesWriteQueue.current = queuedWrite.then(() => undefined);
+    return queuedWrite;
+  };
+
+  useEffect(() => {
+    if (
+      !accountPreferences.isSuccess
+      || accountPreferences.isFetching
+      || !accountPreferences.data
+      || accountPreferencesInitialized.current
+    ) return;
+    accountPreferencesInitialized.current = true;
+    accountPreferencesVersion.current = accountPreferences.data.version;
+    const currentSettings = settingsRef.current;
+    if (accountPreferences.data.version > 0) {
+      const serverSettings = accountSettingsFromPreferences(accountPreferences.data, currentSettings.libraryOrder);
+      settingsRef.current = serverSettings;
+      setSettings(serverSettings);
+      saveAccountSettings(serverSettings, user.id);
+      setAccountPreferencesReady(true);
+      return;
+    }
+
+    const legacySettings = readStoredAccountSettings(user.id);
+    if (legacySettings) {
+      const migratedSettings = { ...currentSettings, ...legacySettings };
+      settingsRef.current = migratedSettings;
+      setSettings(migratedSettings);
+      void queueAccountPreferencesSave(migratedSettings).finally(() => {
+        setAccountPreferencesReady(true);
+      });
+      return;
+    }
+
+    const serverDefaults = accountSettingsFromPreferences(accountPreferences.data, currentSettings.libraryOrder);
+    settingsRef.current = serverDefaults;
+    setSettings(serverDefaults);
+    setAccountPreferencesReady(true);
+  }, [accountPreferences.data, accountPreferences.isFetching, accountPreferences.isSuccess, user.id]);
+
   useEffect(() => {
     if (playbackSettings.data) setPlayedPercent(String(playbackSettings.data.playedPercent));
   }, [playbackSettings.data]);
@@ -75,6 +165,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const useAdminLibraryOrder = playbackSettings.data?.useAdminLibraryOrder ?? true;
   const libraryOrderForced = playbackSettings.data?.libraryOrderForced ?? false;
   const libraryOrderLocked = libraryOrderForced || (!user.canManageServer && useAdminLibraryOrder);
+  const accountPreferencesDisabled = !accountPreferencesReady || accountPreferencesBlocked;
 
   useEffect(() => {
     if (!pendingLibraryOrder || !libraries.data?.libraries) return;
@@ -86,10 +177,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
   }, [libraries.data?.libraries, pendingLibraryOrder]);
 
   useEffect(() => {
+    if (!accountPreferencesReady) return;
     applyAccountTheme(settings.theme);
     applyAccountAccent(settings.accentColor);
-    saveAccountSettings(settings, user.id);
-  }, [settings, user.id]);
+  }, [accountPreferencesReady, settings.accentColor, settings.theme]);
 
   const logout = useMutation({
     mutationFn: () => api.logout(),
@@ -199,7 +290,16 @@ export function AccountPage({ user }: { user: LuxUser }) {
   }, [libraryOrder.data?.libraryOrder, libraryOrder.isSuccess, saveLibraryOrder, settings.libraryOrder, useAdminLibraryOrder, user.canManageServer]);
 
   const updateSettings = (patch: Partial<AccountSettings>) => {
-    setSettings((current) => ({ ...current, ...patch }));
+    const nextSettings = { ...settingsRef.current, ...patch };
+    settingsRef.current = nextSettings;
+    setSettings(nextSettings);
+    if (Object.keys(patch).every((key) => key === "libraryOrder")) {
+      saveAccountSettings(nextSettings, user.id);
+      return;
+    }
+    if (accountPreferencesReady && !accountPreferencesBlocked) {
+      void queueAccountPreferencesSave(nextSettings);
+    }
   };
 
   const persistLibraryOrder = (libraryOrder: string[]) => {
@@ -304,7 +404,14 @@ export function AccountPage({ user }: { user: LuxUser }) {
           <h1>账户设置</h1>
           <p>管理你的观影偏好，让 Lux 更贴合你的使用习惯。</p>
         </div>
-        <span className="lux-account-sync-status"><span aria-hidden="true" />设置自动保存 · 头像单独保存</span>
+        <span className="lux-account-sync-status">
+          <span aria-hidden="true" />
+          {accountPreferencesSaving
+            ? "正在同步账户偏好…"
+            : accountPreferencesReady
+              ? "账户偏好已同步 · 头像单独保存"
+              : "正在读取账户偏好…"}
+        </span>
       </div>
 
       <div className="lux-account-settings-grid">
@@ -335,11 +442,23 @@ export function AccountPage({ user }: { user: LuxUser }) {
         </aside>
 
         <div className="lux-account-settings-content">
+          {accountPreferences.error && !accountPreferencesReady ? (
+            <p className="lux-error-copy" role="alert">
+              账户偏好读取失败：{accountPreferences.error.message}{" "}
+              <button type="button" onClick={() => void accountPreferences.refetch()}>重试</button>
+            </p>
+          ) : null}
+          {accountPreferencesNotice ? (
+            <p className={accountPreferencesBlocked || accountPreferencesNotice.startsWith("账户偏好保存失败") ? "lux-error-copy" : "lux-account-notice"}
+              role={accountPreferencesBlocked || accountPreferencesNotice.startsWith("账户偏好保存失败") ? "alert" : "status"}>
+              {accountPreferencesNotice}
+            </p>
+          ) : null}
           <SettingsSection id="appearance" icon={<Palette size={18} />} title="主题">
             <div className="lux-setting-row lux-theme-row">
               <div>
                 <strong>界面主题</strong>
-                <p>选择 Lux 的显示方式，偏好会在这台设备上保留。</p>
+                <p>选择 Lux 的显示方式，此偏好会随账户同步。</p>
               </div>
               <div className="lux-theme-options" role="group" aria-label="界面主题">
                 <button
@@ -347,6 +466,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                   type="button"
                   aria-label="切换到浅色模式"
                   aria-pressed={settings.theme === "light"}
+                  disabled={accountPreferencesDisabled}
                   onClick={() => updateSettings({ theme: "light" })}
                 >
                   <Sun size={16} />浅色
@@ -356,6 +476,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                   type="button"
                   aria-label="切换到深色模式"
                   aria-pressed={settings.theme === "dark"}
+                  disabled={accountPreferencesDisabled}
                   onClick={() => updateSettings({ theme: "dark" })}
                 >
                   <Moon size={16} />深色
@@ -368,11 +489,11 @@ export function AccountPage({ user }: { user: LuxUser }) {
                 <p>用于按钮、进度和选中状态的界面色彩。</p>
               </div>
               <div className="lux-accent-options" role="group" aria-label="界面强调色">
-                <AccentOption color="silver" label="银灰" selected={settings.accentColor === "silver"} onSelect={() => updateSettings({ accentColor: "silver" })} />
-                <AccentOption color="berry" label="莓果" selected={settings.accentColor === "berry"} onSelect={() => updateSettings({ accentColor: "berry" })} />
-                <AccentOption color="ocean" label="海蓝" selected={settings.accentColor === "ocean"} onSelect={() => updateSettings({ accentColor: "ocean" })} />
-                <AccentOption color="amber" label="琥珀" selected={settings.accentColor === "amber"} onSelect={() => updateSettings({ accentColor: "amber" })} />
-                <AccentOption color="mint" label="薄荷" selected={settings.accentColor === "mint"} onSelect={() => updateSettings({ accentColor: "mint" })} />
+                <AccentOption color="silver" label="银灰" selected={settings.accentColor === "silver"} disabled={accountPreferencesDisabled} onSelect={() => updateSettings({ accentColor: "silver" })} />
+                <AccentOption color="berry" label="莓果" selected={settings.accentColor === "berry"} disabled={accountPreferencesDisabled} onSelect={() => updateSettings({ accentColor: "berry" })} />
+                <AccentOption color="ocean" label="海蓝" selected={settings.accentColor === "ocean"} disabled={accountPreferencesDisabled} onSelect={() => updateSettings({ accentColor: "ocean" })} />
+                <AccentOption color="amber" label="琥珀" selected={settings.accentColor === "amber"} disabled={accountPreferencesDisabled} onSelect={() => updateSettings({ accentColor: "amber" })} />
+                <AccentOption color="mint" label="薄荷" selected={settings.accentColor === "mint"} disabled={accountPreferencesDisabled} onSelect={() => updateSettings({ accentColor: "mint" })} />
               </div>
             </div>
           </SettingsSection>
@@ -429,8 +550,8 @@ export function AccountPage({ user }: { user: LuxUser }) {
               disabled={libraryOrderForced}
               onChange={(checked) => saveLibraryOrderPreference.mutate(checked)}
             />
-            <ToggleRow title="显示媒体库区块" description="在首页展示你有权限访问的媒体库。" checked={settings.showMediaLibraries} onChange={(checked) => updateSettings({ showMediaLibraries: checked })} />
-            <ToggleRow title="显示继续观看区块" description="在首页保留最近播放但尚未看完的内容。" checked={settings.showContinueWatching} onChange={(checked) => updateSettings({ showContinueWatching: checked })} />
+            <ToggleRow title="显示媒体库区块" description="在首页展示你有权限访问的媒体库。" checked={settings.showMediaLibraries} disabled={accountPreferencesDisabled} onChange={(checked) => updateSettings({ showMediaLibraries: checked })} />
+            <ToggleRow title="显示继续观看区块" description="在首页保留最近播放但尚未看完的内容。" checked={settings.showContinueWatching} disabled={accountPreferencesDisabled} onChange={(checked) => updateSettings({ showContinueWatching: checked })} />
           </SettingsSection>
 
           <SettingsSection id="playback" icon={<PlayCircle size={18} />} title="播放">
@@ -441,6 +562,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                   value={settings.audioLanguage}
                   options={["原始音轨", "简体中文", "English", "日本語"].map((language) => ({ value: language, label: language }))}
                   onChange={(audioLanguage) => updateSettings({ audioLanguage })}
+                  disabled={accountPreferencesDisabled}
                   aria-label="默认音轨语言"
                 />
                 <small>播放时优先选择匹配的音频轨道。</small>
@@ -451,13 +573,14 @@ export function AccountPage({ user }: { user: LuxUser }) {
                   value={settings.subtitleLanguage}
                   options={["关闭字幕", "简体中文", "繁體中文", "English"].map((language) => ({ value: language, label: language }))}
                   onChange={(subtitleLanguage) => updateSettings({ subtitleLanguage })}
+                  disabled={accountPreferencesDisabled}
                   aria-label="默认字幕语言"
                 />
                 <small>没有匹配轨道时由播放器决定回退策略。</small>
               </label>
             </div>
             <div className="lux-setting-divider" />
-            <ToggleRow title="自动播放下一集" description="一集结束后自动开始播放下一集。" checked={settings.autoPlayNextEpisode} onChange={(checked) => updateSettings({ autoPlayNextEpisode: checked })} />
+            <ToggleRow title="自动播放下一集" description="一集结束后自动开始播放下一集。" checked={settings.autoPlayNextEpisode} disabled={accountPreferencesDisabled} onChange={(checked) => updateSettings({ autoPlayNextEpisode: checked })} />
             <div className="lux-setting-divider" />
             <div className="lux-setting-row">
               <div>
@@ -623,14 +746,40 @@ function ToggleRow({ title, description, checked, disabled = false, onChange }: 
   );
 }
 
-function AccentOption({ color, label, selected, onSelect }: { color: string; label: string; selected: boolean; onSelect: () => void }) {
+function AccentOption({ color, label, selected, disabled = false, onSelect }: { color: string; label: string; selected: boolean; disabled?: boolean; onSelect: () => void }) {
   return (
-    <button className={`lux-accent-option is-${color}${selected ? " is-selected" : ""}`} type="button" aria-label={`选择强调色 ${label}`} aria-pressed={selected} onClick={onSelect}>
+    <button className={`lux-accent-option is-${color}${selected ? " is-selected" : ""}`} type="button" aria-label={`选择强调色 ${label}`} aria-pressed={selected} disabled={disabled} onClick={onSelect}>
       <span className="lux-accent-swatch" aria-hidden="true" />
       <span>{label}</span>
       {selected ? <Check size={12} aria-hidden="true" /> : null}
     </button>
   );
+}
+
+function accountPreferencesUpdateFor(settings: AccountSettings, expectedVersion: number): AccountPreferencesUpdate {
+  return {
+    expectedVersion,
+    theme: settings.theme,
+    accentColor: settings.accentColor,
+    showMediaLibraries: settings.showMediaLibraries,
+    showContinueWatching: settings.showContinueWatching,
+    audioLanguage: settings.audioLanguage,
+    subtitleLanguage: settings.subtitleLanguage,
+    autoPlayNextEpisode: settings.autoPlayNextEpisode,
+  };
+}
+
+function accountSettingsFromPreferences(preferences: AccountPreferences, libraryOrder: string[]): AccountSettings {
+  return {
+    theme: preferences.theme,
+    accentColor: preferences.accentColor,
+    libraryOrder,
+    showMediaLibraries: preferences.showMediaLibraries,
+    showContinueWatching: preferences.showContinueWatching,
+    audioLanguage: preferences.audioLanguage,
+    subtitleLanguage: preferences.subtitleLanguage,
+    autoPlayNextEpisode: preferences.autoPlayNextEpisode,
+  };
 }
 
 function libraryKindLabel(kind: Library["kind"]): string {
