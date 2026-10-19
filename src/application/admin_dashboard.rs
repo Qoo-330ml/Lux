@@ -140,6 +140,7 @@ pub(crate) async fn load_admin_dashboard(
         services.ip_location,
         &sessions,
         &users,
+        DASHBOARD_PLAYBACK_LIMIT,
     )
     .await?;
 
@@ -153,12 +154,13 @@ pub(crate) async fn load_admin_dashboard(
     })
 }
 
-async fn dashboard_playback_data(
+pub(crate) async fn dashboard_playback_data(
     database: &Database,
     catalog: Option<&CatalogService>,
     ip_location: Option<&IpLocationService>,
     sessions: &[StoredPlaybackSession],
     users: &[UserRecord],
+    result_limit: usize,
 ) -> Result<Vec<DashboardPlayback>, AdminDashboardError> {
     let Some(catalog) = catalog else {
         return Ok(Vec::new());
@@ -168,10 +170,7 @@ async fn dashboard_playback_data(
         .map(|user| (user.id.to_string(), user.display_name.clone()))
         .collect::<BTreeMap<_, _>>();
     let principal = crate::application::access::AccessPrincipal::new(UserId::new(), true);
-    let sessions = sessions
-        .iter()
-        .take(DASHBOARD_PLAYBACK_LIMIT)
-        .collect::<Vec<_>>();
+    let sessions = sessions.iter().take(result_limit).collect::<Vec<_>>();
     let web_play_session_ids = sessions
         .iter()
         .filter(|session| {

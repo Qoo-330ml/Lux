@@ -1,6 +1,6 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, setup::SetupService},
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
     auth::{
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
@@ -3485,6 +3485,271 @@ async fn admin_can_manage_user_content_restrictions() -> Result<(), Box<dyn std:
         .send()
         .await?;
     assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_view_and_stop_only_user_server_controlled_playback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "username": "playback-target", "password": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let user_id = created.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing playback target user id")?
+        .to_owned();
+    let target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "playback-target", "password": "target password" }))
+        .send()
+        .await?;
+    let target_cookie = cookie_pair(target_login.headers());
+
+    let library = LibraryService::new(database.clone())
+        .create_library("User playback", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Playback.Item.2024.mkv"), b"fixture").await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Playback Item' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let hls_playback_id = uuid::Uuid::now_v7().to_string();
+    let direct_playback_id = uuid::Uuid::now_v7().to_string();
+    let other_user_playback_id = uuid::Uuid::now_v7().to_string();
+    for (id, play_session_id, client_name, last_event_age) in [
+        (
+            hls_playback_id.as_str(),
+            "lux-web:web-hls-session",
+            "Web Player",
+            1_i64,
+        ),
+        (
+            direct_playback_id.as_str(),
+            "direct-play-session",
+            "External Player",
+            2_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                    id, user_id, item_id, play_session_id, device_id, client,
+                    device_name, state, position_ticks, duration_ticks, last_event_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PLAYING', 10000000, 100000000,
+                           unixepoch() - ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(&item_id)
+        .bind(play_session_id)
+        .bind(format!("device-{id}"))
+        .bind(client_name)
+        .bind(format!("{client_name} device"))
+        .bind(last_event_age)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO web_playback_sessions (
+                id, user_id, item_id, play_session_id, tier, plan, state, is_admin,
+                expires_at, last_heartbeat_at
+             ) VALUES (
+                'web-hls-session', ?, ?, 'lux-web:web-hls-session', 4,
+                'SERVER_HLS', 'ACTIVE', 0, unixepoch() + 900, unixepoch()
+             )",
+    )
+    .bind(&user_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO playback_admissions (
+                user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES (?, 'lux-web:web-hls-session', 'ACTIVE', unixepoch() - 5, unixepoch())",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO playback_sessions (
+                id, user_id, item_id, play_session_id, device_id, state, last_event_at
+             ) VALUES (?, ?, ?, 'other-user-session', 'admin-device', 'PLAYING', unixepoch())",
+    )
+    .bind(&other_user_playback_id)
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
+    let unauthenticated = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-sessions"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let forbidden = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-sessions"
+        ))
+        .header(COOKIE, &target_cookie)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let first_page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-sessions?page=1&pageSize=1"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(first_page.status(), reqwest::StatusCode::OK);
+    let first_body = first_page.json::<Value>().await?;
+    assert_eq!(first_body["totalCount"], 2);
+    assert_eq!(first_body["pageSize"], 1);
+    assert_eq!(first_body["sessions"][0]["id"], hls_playback_id);
+    assert_eq!(first_body["sessions"][0]["title"], "Playback Item");
+    assert_eq!(first_body["sessions"][0]["canStop"], true);
+    let second_page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-sessions?page=2&pageSize=1"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    let second_body = second_page.json::<Value>().await?;
+    assert_eq!(second_body["totalCount"], 2);
+    assert_eq!(second_body["sessions"][0]["id"], direct_playback_id);
+    assert_eq!(second_body["sessions"][0]["canStop"], false);
+
+    let other_user_stop = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-sessions/{other_user_playback_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(other_user_stop.status(), reqwest::StatusCode::NOT_FOUND);
+    let other_user_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+            .bind(&other_user_playback_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_user_state, "PLAYING");
+
+    let hls_url =
+        format!("{base_url}/api/v1/admin/users/{user_id}/playback-sessions/{hls_playback_id}");
+    let missing_csrf = client
+        .delete(&hls_url)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let direct_stop = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-sessions/{direct_playback_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(direct_stop.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        direct_stop.json::<Value>().await?["error"]["code"],
+        "INVALID_REQUEST"
+    );
+    let direct_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+            .bind(&direct_playback_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(direct_state, "PLAYING");
+
+    let stopped = client
+        .delete(&hls_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    let hls_state: String = sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+        .bind(&hls_playback_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(hls_state, "STOPPED");
+    let admission_state: String = sqlx::query_scalar(
+        "SELECT state FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = 'lux-web:web-hls-session'",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(admission_state, "RELEASED");
+    let web_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'web-hls-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(web_hls_state, "STOPPED");
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=50"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    assert!(
+        audit.json::<Value>().await?["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| {
+                event["eventType"] == "USER_PLAYBACK_STOPPED"
+                    && event["targetId"] == hls_playback_id
+            }))
+    );
 
     server.abort();
     Ok(())

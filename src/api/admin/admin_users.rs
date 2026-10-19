@@ -1018,6 +1018,198 @@ async fn admin_list_user_activity(
     }
 }
 
+async fn admin_list_user_playback_sessions(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let user = match users.find_admin_profile_by_id(&user_id).await {
+        Ok(Some(profile)) => profile.user,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = i64::from(query.page_size.unwrap_or(20).clamp(1, 100));
+    let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
+    let (sessions, total_count) = match database
+        .list_current_user_playback_sessions(&user_id, page_size, offset)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let playback_data = match crate::application::admin_dashboard::dashboard_playback_data(
+        database,
+        Some(catalog),
+        state.ip_location.as_ref(),
+        &sessions,
+        std::slice::from_ref(&user),
+        page_size as usize,
+    )
+    .await
+    {
+        Ok(playback_data) => playback_data,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let sessions = playback_data
+        .iter()
+        .map(|playback| {
+            let can_stop = playback
+                .web_session
+                .as_ref()
+                .is_some_and(|session| session.plan == "SERVER_HLS" && session.state == "ACTIVE");
+            let mut value =
+                crate::api::legacy::admin::admin_dashboard::dashboard_playback_item_json(
+                    &playback.session,
+                    &playback.item,
+                    playback.series.as_ref(),
+                    &playback.user_name,
+                    playback.remote_ip_location.as_ref(),
+                    playback.web_session.as_ref(),
+                );
+            value["canStop"] = json!(can_stop);
+            value
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "sessions": sessions,
+        "page": page,
+        "pageSize": page_size,
+        "totalCount": total_count,
+    }))
+    .into_response()
+}
+
+async fn admin_stop_user_playback_session(
+    headers: HeaderMap,
+    Path((user_id, playback_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Ok(playback_id) = playback_id.parse::<uuid::Uuid>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "播放会话 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let playback_id = playback_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let playback = match database.find_playback_session_by_id(&playback_id).await {
+        Ok(Some(playback)) if playback.user_id == user_id && playback.state != "STOPPED" => {
+            playback
+        }
+        Ok(_) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "当前播放会话不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let web_sessions = match database
+        .find_web_playback_sessions_for_playbacks(std::slice::from_ref(&playback.play_session_id))
+        .await
+    {
+        Ok(sessions) => sessions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(web_session) = web_sessions.into_iter().find(|session| {
+        session.user_id == user_id
+            && session.item_id == playback.item_id
+            && session.plan == "SERVER_HLS"
+            && session.state == "ACTIVE"
+    }) else {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "仅能停止 Lux 管理的服务端 HLS；直放或外部播放可能已交给播放器",
+        )
+        .into_response();
+    };
+    let Some(web_playback) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if web_playback.stop(&web_session.id, &user_id).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "USER_PLAYBACK_STOPPED",
+        Some("playback_session"),
+        Some(&playback_id),
+        &json!({ "userId": user_id }).to_string(),
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn admin_revoke_user_emby_login_session(
     headers: HeaderMap,
     Path((user_id, session_id)): Path<(String, String)>,
@@ -2448,6 +2640,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/activity",
             get(admin_list_user_activity),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/playback-sessions",
+            get(admin_list_user_playback_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/playback-sessions/{playback_id}",
+            delete(admin_stop_user_playback_session),
         )
         .route(
             "/api/v1/admin/users/{user_id}/emby-sessions/{session_id}",

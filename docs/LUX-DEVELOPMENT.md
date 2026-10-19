@@ -15421,6 +15421,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 回归先因分页查询方法缺失而编译失败；实现后 `user_current_playback_sessions_are_filtered_and_paginated` 1/1，覆盖用户隔离、90 秒边界、停止记录过滤、排序、总数、分页和 100 条上限。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 门禁仍被 9 项未改动代码告警阻断，涉及 `src/api/admin/admin_users.rs:554`、`src/api/media.rs:2837`、`src/application/playback/session.rs:397`、`src/application/user_permission_copy.rs:382,657`、`src/storage/users.rs:3161,3164` 及 `src/storage/repository_tests.rs:15587,23380`。
 
+#### LUX-736：开放管理员用户当前播放读取与 HLS 停止 API
+
+范围：将 LUX-735 的有界分页查询开放给用户详情管理 API，并复用管理仪表盘的媒体摘要。管理员可按用户分页查看最近 90 秒的播放会话；服务端仅允许停止与当前用户播放记录关联的 `SERVER_HLS` 会话。直放和外部 `.strm` 播放不可由 Lux 保证立即中断，停止请求返回冲突且不改变其会话。本任务不增加管理页面、黑名单或 migration。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/admin_dashboard.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员读取 API 返回有界分页、总数及媒体/设备/播放摘要；用户隔离、页大小默认 20 且最大 100，未认证和非管理员被拒绝。
+- [x] 管理员停止 API 需要 Web session 与 CSRF，只停止目标用户仍活跃的服务端 HLS，并释放相关会话/准入；审计记录不含凭证。
+- [x] 直放或外部播放停止返回稳定 `409 INVALID_REQUEST`，不会改变播放记录；用户不存在和其他用户会话不泄露信息。
+- [x] `tests/users` 定向回归、Rust build、fmt 与 diff check 通过，API 文档记录路由和响应。
+
+短计划：先在 `tests/users` 增加管理员权限、分页摘要、CSRF、HLS 停止和直放拒绝回归；再复用仪表盘摘要服务并接入两个管理 API；最后运行 `users` 定向目标、build、fmt 与 diff check。
+
+#### LUX-736 验证记录
+
+结果（2026-10-20）：新增用户当前播放分页读取和单会话停止 API。读取复用后台 Dashboard 的媒体/剧集摘要，返回进度、客户端、设备、来源 IP、播放计划及 `canStop`；仅活动服务端 HLS 标记可停止。停止接口要求管理员会话和 CSRF，验证播放记录归属、活动 HLS 关联后停止 HLS、更新播放记录并释放并发准入，最后写不含凭证的 `USER_PLAYBACK_STOPPED` 审计事件。直放和外部播放返回 409 `INVALID_REQUEST`，不改播放状态。`docs/API.md` 已登记两条路由；无 migration。
+
+验证：TDD RED 集成回归因新路由返回 404（预期未认证 401）而失败；最终串行运行 `tests/users -- --test-threads=1` 为 19/19，`tests/admin_dashboard` 为 1/1。一次并行运行 `tests/users` 为 18/19，其中既有 `admin_can_manage_users_and_last_manager_is_protected` 在并行时返回 503 而非预期 200；该测试单独重跑通过，具体原因尚未确认。新增回归覆盖分页顺序/总数、媒体摘要、`canStop`、未认证/非管理员、CSRF、目标用户隔离、直放拒绝、HLS 停止、并发准入释放和审计事件。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 仍被 9 项未改动代码错误阻断，位置与 LUX-735 记录相同；本任务涉及的 API 与应用文件未新增 Clippy 诊断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
