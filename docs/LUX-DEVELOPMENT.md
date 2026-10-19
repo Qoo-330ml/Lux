@@ -15358,6 +15358,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 集成回归先因 GET 缺少字段而失败；实现后 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost cargo test --locked --test admin_dashboard` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
 
+#### LUX-733：清理过期的用户活动索引
+
+范围：将 LUX-730 的有界删除接入现有用户清理后台循环，每次循环读取可配置保留天数并清理最多 1000 条严格早于截止时间的用户活动索引。失败只记录不含用户隐私的错误并由后续循环重试；不删除文件审计、播放进度、已看状态或收藏。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_cleanup.rs`。
+
+验收标准：
+
+- [x] 后台循环按当前 1–3650 天配置计算截止时间，并逐次执行最多 1000 条的删除批次。
+- [x] 截止时间边界及更新活动保留，活动清理错误不会终止用户清理 worker，后续循环可以继续。
+- [x] worker 定向库回归、Rust build、fmt 和 diff check 通过；活动清理不触及其它用户数据。
+
+短计划：先为清理批次写默认时间与配置边界的 worker 回归；再把一批过期活动清理接到现有后台循环；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-730、LUX-731、LUX-732。
+
+结果（2026-10-20）：现有每分钟用户清理循环读取当前活动保留设置，按 Unix 秒计算截止点并最多删除 1,000 条严格早于截止点的索引。失败只产生不带用户字段的错误日志，不影响 worker 后续循环；不会访问或删除 file audit、播放进度、已看状态及收藏。
+
+验证：`cargo test --locked --lib configured_activity_retention_prunes_one_bounded_batch_and_keeps_boundary` 1/1，覆盖 1,001 条过期活动分批清理和截止边界保留；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
