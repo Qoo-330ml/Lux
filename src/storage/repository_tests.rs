@@ -14513,6 +14513,168 @@ async fn user_library_access_mode_migration_preserves_legacy_semantics()
 }
 
 #[tokio::test]
+async fn account_preferences_use_compare_and_swap_versions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .insert_user(
+            "preferences-cas-user",
+            "preferences-cas-user",
+            "Preferences CAS",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+    assert!(
+        database
+            .user_account_preferences("preferences-cas-user")
+            .await?
+            .is_none()
+    );
+
+    let created = database
+        .compare_and_swap_user_account_preferences(
+            "preferences-cas-user",
+            0,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "berry",
+                show_media_libraries: true,
+                show_continue_watching: false,
+                audio_language: "日本語",
+                subtitle_language: "关闭",
+                auto_play_next_episode: false,
+            },
+        )
+        .await?;
+    let UserAccountPreferencesCasResult::Updated(created) = created else {
+        return Err("first account preference write should create version 1".into());
+    };
+    assert_eq!(created.version, 1);
+    assert_eq!(created.theme, "light");
+    assert_eq!(created.accent_color, "berry");
+    assert!(created.show_media_libraries);
+    assert!(!created.show_continue_watching);
+    assert_eq!(created.audio_language, "日本語");
+    assert_eq!(created.subtitle_language, "关闭");
+    assert!(!created.auto_play_next_episode);
+
+    let updated = database
+        .compare_and_swap_user_account_preferences(
+            "preferences-cas-user",
+            1,
+            NewUserAccountPreferences {
+                theme: "dark",
+                accent_color: "ocean",
+                show_media_libraries: false,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+            },
+        )
+        .await?;
+    let UserAccountPreferencesCasResult::Updated(updated) = updated else {
+        return Err("matching account preference version should update".into());
+    };
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.theme, "dark");
+    assert_eq!(updated.accent_color, "ocean");
+
+    let stale = database
+        .compare_and_swap_user_account_preferences(
+            "preferences-cas-user",
+            1,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "mint",
+                show_media_libraries: true,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+            },
+        )
+        .await?;
+    assert_eq!(stale, UserAccountPreferencesCasResult::Conflict);
+    assert_eq!(
+        database
+            .user_account_preferences("preferences-cas-user")
+            .await?
+            .map(|preferences| (preferences.version, preferences.accent_color)),
+        Some((2, "ocean".to_owned()))
+    );
+
+    assert!(
+        database
+            .compare_and_swap_user_account_preferences(
+                "preferences-cas-user",
+                2,
+                NewUserAccountPreferences {
+                    theme: "sepia",
+                    accent_color: "silver",
+                    show_media_libraries: true,
+                    show_continue_watching: true,
+                    audio_language: "原始音轨",
+                    subtitle_language: "简体中文",
+                    auto_play_next_episode: true,
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .soft_delete_user("preferences-cas-user")
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_account_preferences(
+                "preferences-cas-user",
+                2,
+                NewUserAccountPreferences {
+                    theme: "light",
+                    accent_color: "silver",
+                    show_media_libraries: true,
+                    show_continue_watching: true,
+                    audio_language: "原始音轨",
+                    subtitle_language: "简体中文",
+                    auto_play_next_episode: true,
+                },
+            )
+            .await?,
+        UserAccountPreferencesCasResult::UserUnavailable
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_account_preferences(
+                "missing-preferences-user",
+                0,
+                NewUserAccountPreferences {
+                    theme: "dark",
+                    accent_color: "silver",
+                    show_media_libraries: true,
+                    show_continue_watching: true,
+                    audio_language: "原始音轨",
+                    subtitle_language: "简体中文",
+                    auto_play_next_episode: true,
+                },
+            )
+            .await?,
+        UserAccountPreferencesCasResult::UserUnavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_library_access_modes_are_enforced_by_storage_queries()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -13683,6 +13683,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：所有当前 schema 断言同步到 189；旧库迁移仍从明确历史版本升级。PostgreSQL 16 空库 bootstrap 1/1，覆盖账户偏好默认值、无效主题/强调色/版本拒绝及用户删除级联；LUX-627 PostgreSQL 旧授权升级回归 1/1。SQLite `storage` target 串行运行 66/66，`scanner`、`scanning_jobs`、`danmaku` schema 定向用例各 1/1；PostgreSQL 格式与 diff 检查通过。`storage` 并行首跑中既有 cooldown 窗口测试 65/66，隔离复跑 1/1、串行复跑 66/66；不涉及本次迁移。
 
+#### LUX-653：实现账户偏好版本化存储
+
+范围：提供用户账户偏好的读取与版本比较并交换写入，首次写入要求版本 0 并创建版本 1；后续写入仅在客户端版本匹配时递增版本。偏好字段由存储约束校验，不允许修改已进入回收站的账号。本任务不接入 HTTP 或页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 无偏好记录返回空；有效用户首次 CAS 创建版本 1，后续匹配版本写入原子递增。
+- [x] 过期版本返回冲突且不覆盖当前值；不存在或已删除用户不能创建或更新偏好。
+- [x] 存储回归验证默认读取、CAS 冲突与无效字段拒绝；Rust 格式和 diff 检查通过。
+
+短计划：先添加首次写入、版本递增、陈旧版本、删除用户和非法值存储回归；再新增类型及 SQLite/PostgreSQL 共用 CAS 操作。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib account_preferences`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+结果（2026-10-19）：新增账户偏好读取和单语句 CAS 写入。版本 0 创建版本 1，匹配版本更新时递增，陈旧版本返回冲突且保留当前值；数据库约束拒绝无效主题，回收站和不存在账号不可写。`account_preferences_use_compare_and_swap_versions` 1/1、`cargo build --locked`、fmt check 与 diff check 通过。API 接线留给后续任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -1080,6 +1080,41 @@ pub(crate) struct NewStoredUser<'a> {
     pub(crate) email: Option<&'a str>,
 }
 
+// LUX-654 consumes this versioned contract in the account settings API.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserAccountPreferences {
+    pub(crate) theme: String,
+    pub(crate) accent_color: String,
+    pub(crate) show_media_libraries: bool,
+    pub(crate) show_continue_watching: bool,
+    pub(crate) audio_language: String,
+    pub(crate) subtitle_language: String,
+    pub(crate) auto_play_next_episode: bool,
+    pub(crate) version: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewUserAccountPreferences<'a> {
+    pub(crate) theme: &'a str,
+    pub(crate) accent_color: &'a str,
+    pub(crate) show_media_libraries: bool,
+    pub(crate) show_continue_watching: bool,
+    pub(crate) audio_language: &'a str,
+    pub(crate) subtitle_language: &'a str,
+    pub(crate) auto_play_next_episode: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserAccountPreferencesCasResult {
+    Updated(UserAccountPreferences),
+    Conflict,
+    UserUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminUserStatusFilter {
     All,

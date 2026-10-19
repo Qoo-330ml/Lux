@@ -1,6 +1,9 @@
 use super::*;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
-use crate::storage::{ApplyUserPermissionPreset, NewStoredUserPermissions, UserPlaybackPolicy};
+use crate::storage::{
+    ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserAccountPreferences,
+    UserAccountPreferences, UserAccountPreferencesCasResult, UserPlaybackPolicy,
+};
 
 use std::time::{Duration, Instant};
 
@@ -2524,6 +2527,127 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    // LUX-654 connects this storage contract to the authenticated settings API.
+    #[allow(dead_code)]
+    pub(crate) async fn user_account_preferences(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserAccountPreferences>, StorageError> {
+        let row = self
+            .query(
+                "SELECT theme, accent_color, show_media_libraries,
+                        show_continue_watching, audio_language, subtitle_language,
+                        auto_play_next_episode, version, updated_at
+                 FROM user_account_preferences WHERE user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.map(|row| UserAccountPreferences {
+            theme: row.get("theme"),
+            accent_color: row.get("accent_color"),
+            show_media_libraries: row.get::<i64, _>("show_media_libraries") != 0,
+            show_continue_watching: row.get::<i64, _>("show_continue_watching") != 0,
+            audio_language: row.get("audio_language"),
+            subtitle_language: row.get("subtitle_language"),
+            auto_play_next_episode: row.get::<i64, _>("auto_play_next_episode") != 0,
+            version: row.get("version"),
+            updated_at: row.get("updated_at"),
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn compare_and_swap_user_account_preferences(
+        &self,
+        user_id: &str,
+        expected_version: i64,
+        preferences: NewUserAccountPreferences<'_>,
+    ) -> Result<UserAccountPreferencesCasResult, StorageError> {
+        if expected_version < 0 {
+            return Ok(UserAccountPreferencesCasResult::Conflict);
+        }
+        let result = if expected_version == 0 {
+            self.query(
+                "INSERT INTO user_account_preferences (
+                    user_id, theme, accent_color, show_media_libraries,
+                    show_continue_watching, audio_language, subtitle_language,
+                    auto_play_next_episode, version, updated_at
+                 )
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch()
+                 WHERE EXISTS (
+                    SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                 )
+                 ON CONFLICT(user_id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(preferences.theme)
+            .bind(preferences.accent_color)
+            .bind(database_flag(preferences.show_media_libraries))
+            .bind(database_flag(preferences.show_continue_watching))
+            .bind(preferences.audio_language)
+            .bind(preferences.subtitle_language)
+            .bind(database_flag(preferences.auto_play_next_episode))
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+        } else {
+            self.query(
+                "UPDATE user_account_preferences
+                 SET theme = ?, accent_color = ?, show_media_libraries = ?,
+                     show_continue_watching = ?, audio_language = ?, subtitle_language = ?,
+                     auto_play_next_episode = ?, version = version + 1, updated_at = unixepoch()
+                 WHERE user_id = ? AND version = ?
+                   AND EXISTS (
+                       SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                   )",
+            )
+            .bind(preferences.theme)
+            .bind(preferences.accent_color)
+            .bind(database_flag(preferences.show_media_libraries))
+            .bind(database_flag(preferences.show_continue_watching))
+            .bind(preferences.audio_language)
+            .bind(preferences.subtitle_language)
+            .bind(database_flag(preferences.auto_play_next_episode))
+            .bind(user_id)
+            .bind(expected_version)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if result.rows_affected() == 0 {
+            let user_available: i64 = self
+                .query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                    )",
+                )
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(if user_available != 0 {
+                UserAccountPreferencesCasResult::Conflict
+            } else {
+                UserAccountPreferencesCasResult::UserUnavailable
+            });
+        }
+        let Some(updated) = self.user_account_preferences(user_id).await? else {
+            return Ok(UserAccountPreferencesCasResult::UserUnavailable);
+        };
+        Ok(UserAccountPreferencesCasResult::Updated(updated))
     }
 
     pub(crate) async fn set_user_uses_admin_library_order(
