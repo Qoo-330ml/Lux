@@ -1279,3 +1279,168 @@ async fn admin_can_apply_permission_preset_to_user_with_audit_and_guards()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_user_profile_api_normalizes_email_and_preserves_verification_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin_user = setup.complete("Admin", "Admin", "correct password").await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+
+    let legacy_profile = client
+        .get(format!("{base_url}/api/v1/admin/users/{}", admin_user.id))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(legacy_profile.status(), reqwest::StatusCode::OK);
+    let legacy_user = legacy_profile.json::<Value>().await?["user"].clone();
+    assert_eq!(legacy_user["email"], Value::Null);
+    assert_eq!(legacy_user["emailVerifiedAt"], Value::Null);
+    assert_eq!(legacy_user["isDisabled"], false);
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "profile-managed",
+            "displayName": "Profile Managed",
+            "password": "managed password",
+            "email": " Managed@Example.COM "
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let user_id = created.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing created user id")?
+        .to_owned();
+    let profile_url = format!("{base_url}/api/v1/admin/users/{user_id}/profile");
+
+    let initial_profile = client
+        .get(format!("{base_url}/api/v1/admin/users/{user_id}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(initial_profile.status(), reqwest::StatusCode::OK);
+    let initial_user = initial_profile.json::<Value>().await?["user"].clone();
+    assert_eq!(initial_user["email"], "managed@example.com");
+    assert_eq!(initial_user["emailVerifiedAt"], Value::Null);
+
+    sqlx::query("UPDATE users SET email_verified_at = 123 WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let missing_csrf = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .json(&json!({ "displayName": "Must Not Save" }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let display_update = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "displayName": "Managed Display" }))
+        .send()
+        .await?;
+    assert_eq!(display_update.status(), reqwest::StatusCode::OK);
+    let display_user = display_update.json::<Value>().await?["user"].clone();
+    assert_eq!(display_user["email"], "managed@example.com");
+    assert_eq!(display_user["emailVerifiedAt"], 123);
+
+    let email_update = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": " New@Example.COM " }))
+        .send()
+        .await?;
+    assert_eq!(email_update.status(), reqwest::StatusCode::OK);
+    let updated_user = email_update.json::<Value>().await?["user"].clone();
+    assert_eq!(updated_user["email"], "new@example.com");
+    assert_eq!(updated_user["emailVerifiedAt"], Value::Null);
+
+    sqlx::query("UPDATE users SET email_verified_at = 456 WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let same_email_update = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": "NEW@example.com" }))
+        .send()
+        .await?;
+    assert_eq!(same_email_update.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        same_email_update.json::<Value>().await?["user"]["emailVerifiedAt"],
+        456
+    );
+
+    let duplicate_email = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "profile-duplicate",
+            "displayName": "Duplicate Email",
+            "password": "duplicate password",
+            "email": "new@EXAMPLE.com"
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate_email.status(), reqwest::StatusCode::CONFLICT);
+
+    let invalid_email = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": "not-an-email" }))
+        .send()
+        .await?;
+    assert_eq!(invalid_email.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_body = invalid_email.text().await?;
+    assert!(!invalid_body.contains("sqlx"));
+    assert!(!invalid_body.contains("database"));
+    let unchanged_profile = client
+        .get(format!("{base_url}/api/v1/admin/users/{user_id}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    let unchanged_user = unchanged_profile.json::<Value>().await?["user"].clone();
+    assert_eq!(unchanged_user["email"], "new@example.com");
+    assert_eq!(unchanged_user["emailVerifiedAt"], 456);
+
+    server.abort();
+    Ok(())
+}
