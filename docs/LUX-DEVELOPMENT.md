@@ -12547,7 +12547,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 真实 Lucky、FNOS/x86_64 和第三方播放器尚未验证，本任务未推送或部署。请求头全部缺失时仍无法恢复客户端地址，兼容合同见 `docs/COMPATIBILITY.md`。
 #### LUX-593：用户管理页面结构
 
-范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码、活动记录和外挂字幕入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。
+范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码和活动记录入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。原外挂字幕权限模块不属于此导航范围。
 
 预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
 
@@ -13129,6 +13129,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 依赖：LUX-624。
 
 结果（2026-10-19）：共享签名资源授权在每次 Web/Emby HLS manifest、初始化文件或分片请求（HEAD 也包含）读取当前策略。撤销会话所需转码权限后，请求返回 403，HLS 会话停止、准入释放、临时目录清除；再次使用票据返回 410。Web 测试覆盖 tier 2 与 HEAD 拒绝，Emby 测试覆盖硬件/软件视频转码档撤权；定向 `web_playback` 1/1、`playback` 4/4 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过。Emby 策略拒绝及 HLS 票据失效响应合同已加入兼容性文档。未部署。
+
+#### LUX-626：取消用户外挂字幕权限模块
+
+范围：按项目所有者决定取消用户管理方案中的模块八。移除用户详情页外挂字幕占位和用户级字幕权限、上传/替换/删除字幕文件的规划；保留现有字幕播放、字幕元数据编辑、扫描与读取合同，不改变这些既有能力。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-profile-lifecycle.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情导航不再出现模块八或外挂字幕权限入口，模块一至七入口不变。
+- [x] 用户管理设计将模块八明确标为取消，并从默认值、服务接口、数据能力、阶段门和验收清单中移除用户级字幕权限及文件管理要求。
+- [x] 模块四的默认权限与复制范围不再包含用户级字幕权限。
+- [x] 明确现有字幕播放、管理字幕元数据、索引与扫描功能保持既有合同。
+
+短计划：先更新设计与任务规格，删去用户详情的已取消导航项，复查用户管理设计中的模块八引用；不修改字幕播放、元数据或扫描实现。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-profile-lifecycle.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-593。
+
+结果（2026-10-19）：新增导航回归先在原 8 项入口上失败（预期 7、实际 8），移除已取消的外挂字幕入口后，`admin-user-profile-lifecycle` 6/6 通过；Web production build 与 `git diff --check` 通过。用户管理方案和 LUX-593 页面结构同步移除用户级字幕权限；模块五仍约束已有字幕读取的媒体访问，现有字幕播放、元数据编辑与扫描能力未改。
 
 ## 29. 参考资料
 

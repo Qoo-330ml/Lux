@@ -106,6 +106,18 @@ describe("AdminUserDetailPage account lifecycle", () => {
     expect(purge).not.toHaveBeenCalled();
   });
 
+  it("omits the canceled user subtitle module while keeping the active detail sections", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const sections = [...container.querySelectorAll<HTMLButtonElement>(".lux-admin-user-section-nav button")];
+    const sectionLabels = sections.map((section) => section.textContent ?? "");
+    expect(sections).toHaveLength(7);
+    expect(sectionLabels.join(" ")).not.toContain("外挂字幕");
+    expect(sectionLabels.join(" ")).not.toContain("模块八");
+    expect(sectionLabels.join(" ")).toContain("活动记录");
+  });
+
   function renderDetail(user: AdminUser, userDeletionGraceDays = 7) {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user });
     vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays } as AdminSettings);

@@ -15,7 +15,6 @@ const detailSections = [
   { id: "devices", label: "设备与登录", module: "模块七", icon: Users },
   { id: "playback", label: "播放与转码", module: "模块六", icon: CircleDashed },
   { id: "activity", label: "活动记录", module: "模块七", icon: CircleDashed },
-  { id: "subtitles", label: "外挂字幕", module: "模块八", icon: CircleDashed },
 ] as const;
 
 const settingsSections = [
