@@ -16135,6 +16135,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因表不存在而在 schema 断言失败；增加双后端 migration 后，`emby_direct_playback_ticket_migration_creates_revocable_context_table` 1/1 通过，覆盖列、有效索引、空/负/倒置值拒绝、复合主键冲突和用户删除级联。空 SQLite 数据库成功应用完整 migration 集；`cargo build --locked`、fmt 与 `git diff --check` 通过。PostgreSQL migration 已编写但未运行 PostgreSQL runtime 验证；未改变直放授权行为。Cargo 使用 Toshiba target 目录。
 
+#### LUX-774：提供 Emby 直放票据上下文存储合同
+
+范围：为 LUX-773 表提供新票据上下文创建、按用户/播放会话读取、只写一次兼容旧票据上下文、撤销及有界过期清理 storage 合同。新记录只保存设备/客户端摘要，不保存签名、原始 token 或完整 URL；本任务不接入 API 或播放授权。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/sessions.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新票据按用户和播放会话复合键创建，支持精确用户范围读取，重复创建不得覆盖已有上下文。
+- [x] 兼容旧票据的空上下文只在记录缺失时插入；撤销时间只写一次，查询能区分已撤销票据。
+- [x] 过期记录清理接受硬上限 1–1000，不扫描或返回未过期票据；覆盖作用域、冲突、兼容插入、撤销与清理的 SQLite 存储回归通过。
+- [x] Rust build、fmt 与 diff check 通过；storage 不接收原始签名或认证凭证。
+
+短计划：先增加新建/读取、用户隔离、旧票据空上下文补写、不可覆盖、撤销一次性和有界清理回归并确认 storage 合同缺失；再新增类型与最小 SQL；最后运行指定库测试、build、fmt 与 diff check。
+
+验证：TDD RED 因缺少 `NewEmbyDirectPlaybackTicket` 类型而编译失败；实现后 `emby_direct_playback_ticket_storage_scopes_and_revokes_context` 1/1 通过，覆盖用户隔离、旧记录兼容写入不覆盖、撤销一次性和 1000 行清理硬上限。`cargo build --locked`、fmt 与 `git diff --check` 通过。storage 接口只接收设备/客户端上下文、用户/播放会话 ID 与时间，不接收 token、签名或 URL。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

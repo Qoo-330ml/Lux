@@ -2,10 +2,10 @@ use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
-    MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserAccessBlacklistRule,
-    NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation,
-    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, StoredUserActivityEvent,
-    UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
+    MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewStoredUserPermissions,
+    NewUserAccessBlacklistRule, NewUserActivityEvent, NewUserContentRestrictions,
+    NewUserDeviceObservation, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+    StoredUserActivityEvent, UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
     UserAccessBlacklistRuleScope, UserActivityEventQuery, UserContentRestrictionsCasResult,
     UserDevicePageQuery, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
 };
@@ -21034,6 +21034,156 @@ async fn emby_direct_playback_ticket_migration_creates_revocable_context_table()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_direct_playback_ticket_storage_scopes_and_revokes_context()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete(
+            "Direct Ticket Storage",
+            "Direct Ticket Storage",
+            "ticket password",
+        )
+        .await?;
+    let user_id = user.id.to_string();
+    database
+        .insert_emby_direct_playback_ticket(NewEmbyDirectPlaybackTicket {
+            user_id: &user_id,
+            play_session_id: "stored-ticket-session",
+            authorization_device_id: Some("device-1"),
+            authorization_client_name: Some("Client 1"),
+            expires_at: 500,
+            created_at: 100,
+        })
+        .await?;
+
+    let stored = database
+        .find_emby_direct_playback_ticket(&user_id, "stored-ticket-session")
+        .await?
+        .ok_or("stored Emby direct playback ticket was not found")?;
+    assert_eq!(stored.authorization_device_id.as_deref(), Some("device-1"));
+    assert_eq!(
+        stored.authorization_client_name.as_deref(),
+        Some("Client 1")
+    );
+    assert_eq!(stored.revoked_at, None);
+    assert!(
+        database
+            .find_emby_direct_playback_ticket("another-user", "stored-ticket-session")
+            .await?
+            .is_none()
+    );
+
+    assert!(
+        !database
+            .ensure_legacy_emby_direct_playback_ticket(&user_id, "stored-ticket-session", 500, 100,)
+            .await?
+    );
+    let unchanged = database
+        .find_emby_direct_playback_ticket(&user_id, "stored-ticket-session")
+        .await?
+        .ok_or("ticket disappeared after legacy ensure")?;
+    assert_eq!(
+        unchanged.authorization_device_id.as_deref(),
+        Some("device-1")
+    );
+
+    assert!(
+        database
+            .ensure_legacy_emby_direct_playback_ticket(&user_id, "legacy-ticket-session", 600, 100)
+            .await?
+    );
+    let legacy = database
+        .find_emby_direct_playback_ticket(&user_id, "legacy-ticket-session")
+        .await?
+        .ok_or("legacy ticket context was not created")?;
+    assert_eq!(legacy.authorization_device_id, None);
+    assert_eq!(legacy.authorization_client_name, None);
+
+    assert!(
+        database
+            .revoke_emby_direct_playback_ticket(&user_id, "stored-ticket-session", 200)
+            .await?
+    );
+    assert!(
+        !database
+            .revoke_emby_direct_playback_ticket(&user_id, "stored-ticket-session", 300)
+            .await?
+    );
+    assert_eq!(
+        database
+            .find_emby_direct_playback_ticket(&user_id, "stored-ticket-session")
+            .await?
+            .and_then(|ticket| ticket.revoked_at),
+        Some(200)
+    );
+
+    database
+        .insert_emby_direct_playback_ticket(NewEmbyDirectPlaybackTicket {
+            user_id: &user_id,
+            play_session_id: "expired-ticket-session",
+            authorization_device_id: None,
+            authorization_client_name: None,
+            expires_at: 150,
+            created_at: 100,
+        })
+        .await?;
+    assert_eq!(
+        database
+            .delete_expired_emby_direct_playback_tickets(151, 1)
+            .await?,
+        1
+    );
+    assert!(
+        database
+            .find_emby_direct_playback_ticket(&user_id, "expired-ticket-session")
+            .await?
+            .is_none()
+    );
+    sqlx::query(
+        "WITH RECURSIVE numbers(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM numbers WHERE value < 1001
+         )
+         INSERT INTO emby_direct_playback_tickets (
+             user_id, play_session_id, expires_at, created_at
+         )
+         SELECT ?, 'bounded-expired-' || value, 150, 100 FROM numbers",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(
+        database
+            .delete_expired_emby_direct_playback_tickets(151, 50_000)
+            .await?,
+        1_000
+    );
+    let remaining_expired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND expires_at < 151",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_expired, 1);
+    assert_eq!(
+        database
+            .delete_expired_emby_direct_playback_tickets(151, 0)
+            .await?,
+        1
+    );
     Ok(())
 }
 

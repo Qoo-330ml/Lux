@@ -980,6 +980,148 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)] // LUX-775 persists the context before returning direct URLs.
+    pub(crate) async fn insert_emby_direct_playback_ticket(
+        &self,
+        ticket: NewEmbyDirectPlaybackTicket<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, authorization_device_id,
+                 authorization_client_name, expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ticket.user_id)
+        .bind(ticket.play_session_id)
+        .bind(ticket.authorization_device_id)
+        .bind(ticket.authorization_client_name)
+        .bind(ticket.expires_at)
+        .bind(ticket.created_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-776 initializes context for pre-migration direct URLs.
+    pub(crate) async fn ensure_legacy_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        expires_at: i64,
+        created_at: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, authorization_device_id,
+                 authorization_client_name, expires_at, created_at
+             ) VALUES (?, ?, NULL, NULL, ?, ?)
+             ON CONFLICT(user_id, play_session_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(expires_at)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-776 uses this bounded point lookup for ticket authorization.
+    pub(crate) async fn find_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<Option<StoredEmbyDirectPlaybackTicket>, StorageError> {
+        self.query(
+            "SELECT user_id, play_session_id, authorization_device_id,
+                    authorization_client_name, expires_at, revoked_at, created_at
+             FROM emby_direct_playback_tickets
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredEmbyDirectPlaybackTicket {
+                user_id: row.get("user_id"),
+                play_session_id: row.get("play_session_id"),
+                authorization_device_id: row.get("authorization_device_id"),
+                authorization_client_name: row.get("authorization_client_name"),
+                expires_at: row.get("expires_at"),
+                revoked_at: row.get("revoked_at"),
+                created_at: row.get("created_at"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-776 persists a blacklist hit so a ticket cannot revive.
+    pub(crate) async fn revoke_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        revoked_at: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE emby_direct_playback_tickets
+             SET revoked_at = ?
+             WHERE user_id = ? AND play_session_id = ? AND revoked_at IS NULL
+               AND created_at <= ? AND expires_at >= ?",
+        )
+        .bind(revoked_at)
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(revoked_at)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-776 periodically drops expired direct-ticket contexts.
+    pub(crate) async fn delete_expired_emby_direct_playback_tickets(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<u64, StorageError> {
+        let limit = limit.clamp(1, 1_000);
+        self.query(
+            "DELETE FROM emby_direct_playback_tickets
+             WHERE (user_id, play_session_id) IN (
+                 SELECT user_id, play_session_id
+                 FROM emby_direct_playback_tickets
+                 WHERE expires_at < ?
+                 ORDER BY expires_at, user_id, play_session_id
+                 LIMIT ?
+             )",
+        )
+        .bind(now.max(0))
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_web_playback_transcoding_details(
         &self,
         session_id: &str,

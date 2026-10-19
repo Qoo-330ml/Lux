@@ -2906,6 +2906,29 @@ pub(crate) struct NewWebPlaybackSession<'a> {
     pub(crate) now: i64,
 }
 
+#[allow(dead_code)] // LUX-775 creates context before returning a signed direct ticket.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewEmbyDirectPlaybackTicket<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) play_session_id: &'a str,
+    pub(crate) authorization_device_id: Option<&'a str>,
+    pub(crate) authorization_client_name: Option<&'a str>,
+    pub(crate) expires_at: i64,
+    pub(crate) created_at: i64,
+}
+
+#[allow(dead_code)] // LUX-776 enforces blacklist rules using this stored context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyDirectPlaybackTicket {
+    pub(crate) user_id: String,
+    pub(crate) play_session_id: String,
+    pub(crate) authorization_device_id: Option<String>,
+    pub(crate) authorization_client_name: Option<String>,
+    pub(crate) expires_at: i64,
+    pub(crate) revoked_at: Option<i64>,
+    pub(crate) created_at: i64,
+}
+
 pub(crate) struct NewWebPlaybackEvent<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) user_id: &'a str,
