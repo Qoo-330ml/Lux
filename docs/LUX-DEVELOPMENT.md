@@ -16019,6 +16019,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因请求解析器和错误类型缺失而失败；实现后 `cargo test --locked --lib access_ip_` 5/5、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍报 13 项既有诊断，均位于未修改的管理员 API、播放、权限复制及存储测试代码；本任务文件没有新增诊断。Cargo 命令使用 Toshiba target 目录。Lucky 官方 Web 服务文档确认提供“追加客户端 IP”设置，但没有说明同名 Header 的合并/覆盖行为；当前部署版本和真实请求链仍未现场核验。
 
+#### LUX-767：在 Web 登录与会话检查中执行 IP/CIDR 黑名单
+
+范围：Web 登录创建会话前和现有 Web 会话认证时，使用 LUX-766 请求访问 IP 与 LUX-765 有界规则匹配检查启用的全站/用户 `IP_CIDR` 规则。命中时拒绝新登录；已有会话立即撤销后拒绝。缺少 peer 且存在活动 IP 规则时 fail closed；规则存储/解析异常返回服务不可用。仅接 Web 登录与 Web session 路径，不覆盖 Emby、播放票据或管理界面专属事件流。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/application/user_access_rules.rs`、`src/auth/sessions.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 命中用户或全站 IP/CIDR 时 Web 登录不签发会话；未命中地址可登录。
+- [x] 活动 Web session 在命中时被撤销；其他地址仍可使用未命中的会话；缺少 peer 且存在 IP 规则时拒绝并撤销。
+- [x] 规则超限、损坏值或 storage 错误不得绕过封禁，HTTP 返回服务不可用；直接客户端 IP 及可信代理来源均覆盖。
+- [x] users 定向集成目标、Rust build、fmt 与 diff check 通过；不接 Emby 或 playback ticket。
+
+短计划：先在 `tests/users.rs` 建立 Web 登录、现有会话命中、缺少 peer 和未命中地址回归并确认认证仍忽略 IP 规则；再在 `WebAuthService` 增加登录前及会话解析 IP 检查，API handler 注入 LUX-766 解析结果；最后运行 users 定向目标、build、fmt 与 diff check。
+
+验证：`cargo test --locked --test users -- --test-threads=1` 23/23、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍有 13 项既有诊断，位于未修改的管理员 API、媒体播放、权限复制及存储测试代码；本任务没有新增诊断。Cargo 命令使用 Toshiba target 目录。直接、可信代理、缺少 peer、已有会话撤销及超限 fail-closed 均由 Web 集成用例覆盖。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

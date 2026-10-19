@@ -1,15 +1,20 @@
+use std::net::IpAddr;
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::{
+    application::user_access_rules::{
+        MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST, ip_blacklist_rules_match_address,
+    },
     auth::{
         password::PasswordError,
         users::{UserRecord, UserStore, UserStoreError},
     },
     domain::ids::UserId,
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, UserAccessBlacklistIpRuleQuery},
 };
 
 const SESSION_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -42,11 +47,28 @@ impl WebAuthService {
         password: &str,
         device_id: Option<&str>,
     ) -> Result<Option<LoginSession>, WebAuthError> {
+        self.login_with_device_and_ip(username, password, device_id, None)
+            .await
+    }
+
+    pub async fn login_with_device_and_ip(
+        &self,
+        username: &str,
+        password: &str,
+        device_id: Option<&str>,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<LoginSession>, WebAuthError> {
         let Some(user) = self.users.authenticate(username, password).await? else {
             return Ok(None);
         };
         if self
             .is_user_access_blacklisted(&user.id.to_string(), device_id)
+            .await?
+        {
+            return Err(WebAuthError::AccessDenied);
+        }
+        if self
+            .is_user_ip_blacklisted(&user.id.to_string(), client_ip)
             .await?
         {
             return Err(WebAuthError::AccessDenied);
@@ -133,6 +155,23 @@ impl WebAuthService {
         &self,
         session_token: &str,
     ) -> Result<Option<AuthenticatedSession>, WebAuthError> {
+        self.resolve_internal(session_token, None, false).await
+    }
+
+    pub async fn resolve_with_ip(
+        &self,
+        session_token: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<AuthenticatedSession>, WebAuthError> {
+        self.resolve_internal(session_token, client_ip, true).await
+    }
+
+    async fn resolve_internal(
+        &self,
+        session_token: &str,
+        client_ip: Option<IpAddr>,
+        enforce_ip_rules: bool,
+    ) -> Result<Option<AuthenticatedSession>, WebAuthError> {
         let Some(stored) = self
             .database
             .find_web_session(&hash_token(session_token))
@@ -141,6 +180,14 @@ impl WebAuthService {
             return Ok(None);
         };
         if stored.is_disabled {
+            return Ok(None);
+        }
+        if enforce_ip_rules
+            && self
+                .is_user_ip_blacklisted(&stored.user_id, client_ip)
+                .await?
+        {
+            self.logout(session_token).await?;
             return Ok(None);
         }
         let id = stored
@@ -164,6 +211,31 @@ impl WebAuthService {
             csrf_token_hash: stored.csrf_token_hash,
             device_id: stored.device_id,
         }))
+    }
+
+    async fn is_user_ip_blacklisted(
+        &self,
+        user_id: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<bool, WebAuthError> {
+        let rules = self
+            .database
+            .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                user_id,
+                limit: 201,
+            })
+            .await?;
+        if rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            return Err(WebAuthError::AccessRulesUnavailable);
+        }
+        if rules.is_empty() {
+            return Ok(false);
+        }
+        let Some(client_ip) = client_ip else {
+            return Ok(true);
+        };
+        ip_blacklist_rules_match_address(client_ip, &rules)
+            .map_err(|_| WebAuthError::AccessRulesUnavailable)
     }
 
     pub async fn logout(&self, session_token: &str) -> Result<(), WebAuthError> {
@@ -292,6 +364,7 @@ fn hash_token(token: &str) -> Vec<u8> {
 #[derive(Debug)]
 pub enum WebAuthError {
     AccessDenied,
+    AccessRulesUnavailable,
     InvalidUserId(String),
     Password(PasswordError),
     Storage(StorageError),
@@ -321,6 +394,7 @@ impl std::fmt::Display for WebAuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AccessDenied => formatter.write_str("access denied by account policy"),
+            Self::AccessRulesUnavailable => formatter.write_str("access rules are unavailable"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::Password(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
@@ -336,7 +410,10 @@ impl std::error::Error for WebAuthError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::UserStore(error) => Some(error),
-            Self::AccessDenied | Self::InvalidUserId(_) | Self::TokenGeneration(_) => None,
+            Self::AccessDenied
+            | Self::AccessRulesUnavailable
+            | Self::InvalidUserId(_)
+            | Self::TokenGeneration(_) => None,
         }
     }
 }

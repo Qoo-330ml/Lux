@@ -3,7 +3,7 @@ use std::{fmt, net::IpAddr, str::FromStr};
 const MAX_USER_ACCESS_RULE_VALUE_BYTES: usize = 256;
 const MAX_FORWARDED_FOR_BYTES: usize = 8 * 1024;
 const MAX_FORWARDED_HOPS: usize = 64;
-const MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST: usize = 200;
+pub(crate) const MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST: usize = 200;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

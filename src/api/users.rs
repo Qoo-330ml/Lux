@@ -811,11 +811,24 @@ pub(super) async fn auth_login(
         )
         .into_response();
     }
+    let client_ip = match super::request_access_ip(&headers, &state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "登录暂时不可用",
+            )
+            .into_response();
+        }
+    };
     let mut session = match auth
-        .login_with_device(
+        .login_with_device_and_ip(
             &request.username,
             &request.password,
             login_device_id.as_deref(),
+            client_ip,
         )
         .await
     {
@@ -825,7 +838,7 @@ pub(super) async fn auth_login(
                 &headers,
                 StatusCode::FORBIDDEN,
                 lux::ApiErrorCode::PermissionDenied,
-                "当前设备或客户端已被禁止访问",
+                "当前设备、客户端或 IP 已被禁止访问",
             )
             .into_response();
         }
@@ -848,10 +861,11 @@ pub(super) async fn auth_login(
             .await
         {
             Ok(true) => match auth
-                .login_with_device(
+                .login_with_device_and_ip(
                     &request.username,
                     &request.password,
                     login_device_id.as_deref(),
+                    client_ip,
                 )
                 .await
             {
@@ -861,7 +875,7 @@ pub(super) async fn auth_login(
                         &headers,
                         StatusCode::FORBIDDEN,
                         lux::ApiErrorCode::PermissionDenied,
-                        "当前设备或客户端已被禁止访问",
+                        "当前设备、客户端或 IP 已被禁止访问",
                     )
                     .into_response();
                 }
@@ -1312,7 +1326,8 @@ async fn require_web_session_csrf(
         )
         .into_response());
     };
-    let session = match auth.resolve(&session_token).await {
+    let session = match resolve_web_session_for_request(headers, state, auth, &session_token).await
+    {
         Ok(Some(session)) => session,
         Ok(None) => {
             return Err(api_error(
@@ -2023,19 +2038,20 @@ pub(super) async fn auth_sessions(headers: HeaderMap, State(state): State<AppSta
         )
         .into_response();
     };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response();
-        }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let session =
+        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     match auth.list_sessions(&session.user.id, &session_token).await {
         Ok(sessions) => Json(json!({
             "sessions": sessions.iter().map(|session| json!({
@@ -2069,19 +2085,20 @@ pub(super) async fn auth_revoke_session(
         )
         .into_response();
     };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response();
-        }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let session =
+        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     let Some(csrf_token) = headers
         .get("x-csrf-token")
         .and_then(|value| value.to_str().ok())
@@ -2133,7 +2150,7 @@ pub(super) async fn auth_revoke_session(
 }
 
 pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth else {
+    let Some(auth) = state.auth.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2151,27 +2168,28 @@ pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState
         )
         .into_response();
     };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response();
-        }
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证暂时不可用",
-            )
-            .into_response();
-        }
-    };
+    let session =
+        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response();
+            }
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response();
+            }
+        };
     let Some(csrf_token) = headers
         .get("x-csrf-token")
         .and_then(|value| value.to_str().ok())
@@ -2228,6 +2246,18 @@ pub(super) async fn require_web_user(
         )
         .into_response()),
     }
+}
+
+async fn resolve_web_session_for_request(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &crate::auth::sessions::WebAuthService,
+    session_token: &str,
+) -> Result<Option<AuthenticatedSession>, crate::auth::sessions::WebAuthError> {
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| crate::auth::sessions::WebAuthError::AccessRulesUnavailable)?;
+    auth.resolve_with_ip(session_token, client_ip).await
 }
 
 pub(super) async fn require_web_principal(
@@ -2321,7 +2351,7 @@ pub(super) async fn require_web_principal(
         )
         .into_response());
     };
-    match auth.resolve(&session_token).await {
+    match resolve_web_session_for_request(headers, state, auth, &session_token).await {
         Ok(Some(session)) => {
             if state.remote_access.is_remote(
                 header_str(headers, "x-lux-peer-ip"),
@@ -2422,7 +2452,8 @@ pub(super) async fn require_web_csrf(
         )
         .into_response());
     };
-    let session = match auth.resolve(&session_token).await {
+    let session = match resolve_web_session_for_request(headers, state, auth, &session_token).await
+    {
         Ok(Some(session)) => session,
         Ok(None) => {
             return Err(api_error(

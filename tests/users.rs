@@ -4133,7 +4133,13 @@ async fn admin_can_manage_scoped_user_access_blacklist_rules()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder().no_proxy().build()?;
     let global_path = format!("{base_url}/api/v1/admin/access-blacklist/global");
@@ -4469,6 +4475,168 @@ async fn web_login_and_sessions_enforce_device_client_blacklists()
     assert_eq!(denied_by_client.status(), reqwest::StatusCode::FORBIDDEN);
     let denied_client_login = login(&device_b).send().await?;
     assert_eq!(denied_client_login.status(), reqwest::StatusCode::FORBIDDEN);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_login_and_existing_sessions_enforce_ip_blacklists_through_trusted_proxies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let target = UserStore::new(database.clone())?
+        .create_user("web-ip-target", "Web IP Target", "target password", false)
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth.clone(),
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    for (id, value) in [
+        ("web-ip-rule-a", "198.51.100.0/24"),
+        ("web-ip-rule-b", "203.0.113.0/24"),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by,
+                 created_at, updated_at
+             ) VALUES (?, ?, 'IP_CIDR', ?, 1, ?, unixepoch(), unixepoch())",
+        )
+        .bind(id)
+        .bind(target.id.to_string())
+        .bind(value)
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
+    }
+
+    let untrusted_header_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("X-Forwarded-For", "198.51.100.7")
+        .json(&json!({
+            "username": "web-ip-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(untrusted_header_login.status(), reqwest::StatusCode::OK);
+    let untrusted_session_cookie = cookie_pair(untrusted_header_login.headers());
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
+
+    assert!(matches!(
+        web_auth
+            .login_with_device_and_ip("web-ip-target", "target password", None, None)
+            .await,
+        Err(luxd::auth::sessions::WebAuthError::AccessDenied)
+    ));
+
+    let denied_ip_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("X-Forwarded-For", "198.51.100.7")
+        .json(&json!({
+            "username": "web-ip-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(denied_ip_login.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let allowed_ip_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("X-Forwarded-For", "192.0.2.7")
+        .json(&json!({
+            "username": "web-ip-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(allowed_ip_login.status(), reqwest::StatusCode::OK);
+    let allowed_session_cookie = cookie_pair(allowed_ip_login.headers());
+
+    let denied_existing_session = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &allowed_session_cookie)
+        .header("X-Forwarded-For", "203.0.113.9")
+        .send()
+        .await?;
+    assert_eq!(
+        denied_existing_session.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let revoked_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_sessions WHERE user_id = ? AND revoked_at IS NOT NULL",
+    )
+    .bind(target.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(revoked_sessions, 1);
+
+    let unblocked_existing_session = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &untrusted_session_cookie)
+        .header("X-Forwarded-For", "192.0.2.8")
+        .send()
+        .await?;
+    assert_eq!(unblocked_existing_session.status(), reqwest::StatusCode::OK);
+
+    for index in 0..199 {
+        let id = format!("web-ip-overflow-{index}");
+        let match_value = format!("10.0.0.{index}/32");
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by,
+                 created_at, updated_at
+             ) VALUES (?, ?, 'IP_CIDR', ?, 1, ?, unixepoch(), unixepoch())",
+        )
+        .bind(id)
+        .bind(target.id.to_string())
+        .bind(match_value)
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
+    }
+    let overflow_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("X-Forwarded-For", "192.0.2.9")
+        .json(&json!({
+            "username": "web-ip-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        overflow_login.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
 
     server.abort();
     Ok(())
