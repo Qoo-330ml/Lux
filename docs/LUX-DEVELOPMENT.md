@@ -14864,6 +14864,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-20）：新增单目标、单事务权限复制存储服务。Library、Content、Playback 三组分别比较预览快照，未选字段不变；目标内容策略版本保持单调递增，来源无策略时条件删除。所选库先批量校验仍为启用普通媒体库。PostgreSQL 按稳定 ID 顺序锁定来源与目标用户；现有媒体库授权与内容策略写入也获取相同用户锁，保证快照比较和复制串行化。管理员角色和预设来源从未进入复制字段。三项权限复制回归、既有媒体库事务与内容策略 CAS 回归通过；Rust build、fmt check 和 diff check 通过。
 
+#### LUX-710：提供版本安全的权限复制预览与应用服务
+
+范围：为 LUX-709 建立应用层预览/应用合同。预览返回选定组的来源快照以及来源和每个目标的不透明快照版本；应用先校验来源版本，再独立比较各目标版本并逐项执行存储事务。目标间允许部分成功，来源变化时整体拒绝。版本摘要只包含所选组，不暴露未选权限内容。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_permission_copy.rs`。
+
+验收标准：
+
+- [x] Library、Content、Playback 可任意组合；空组、自我复制、重复/无效 ID、空目标、超 100 目标及格式错误版本被拒绝。
+- [x] 预览仅序列化所选来源组；来源与目标版本均由确定性策略快照摘要生成，不包含管理角色或未选内容。
+- [x] 应用先检查来源版本；目标逐项返回用户不可用、版本冲突、无效策略或存储失败，目标冲突不阻断其他目标。
+- [x] application 定向回归、Rust build、fmt 与 diff check 通过。
+
+短计划：先为现有存储合同增加应用服务失败回归并确认模块不存在而失败；再增加严格输入、所选组快照摘要、预览 DTO 和逐目标应用服务；最后运行定向 application 测试、build、fmt 与 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_permission_copy`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-708、LUX-709。
+
+结果（2026-10-20）：增加权限复制预览与应用服务，校验所选权限组、来源及最多 100 个目标，并在任何读取前拒绝空组、自我/重复/无效 ID 和格式错误版本。来源及目标快照摘要包含规范账号 ID 和所选组；未选字段不输出。应用先校验来源版本，再独立比较每个目标版本并提交 LUX-709 单目标原子事务，返回部分成功结果；新增测试覆盖来源过期、目标冲突、显式空内容策略、无效请求和账号绑定版本。
+
+验证：`cargo test --locked --lib user_permission_copy` 8/8、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Build 有 25 条该新应用模块尚未接入 API 前的 dead-code warning；后续 API 任务接线后将消除。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
