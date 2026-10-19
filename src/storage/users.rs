@@ -2,12 +2,13 @@ use super::*;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 use crate::storage::{
     ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserAccountPreferences,
-    StoredEmbyLoginSessionSummary, UserAccountPreferences, UserAccountPreferencesCasResult,
-    UserPermissionCopyGroups, UserPermissionCopyResult, UserPermissionCopySnapshot,
-    UserPlaybackPolicy,
+    NewUserActivityEvent, StoredEmbyLoginSessionSummary, UserAccountPreferences,
+    UserAccountPreferencesCasResult, UserPermissionCopyGroups, UserPermissionCopyResult,
+    UserPermissionCopySnapshot, UserPlaybackPolicy,
 };
 
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -1613,6 +1614,41 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    // LUX-721 wires this persistence method into the activity event recorder.
+    #[allow(dead_code)]
+    pub(crate) async fn insert_user_activity_event(
+        &self,
+        event: NewUserActivityEvent<'_>,
+    ) -> Result<String, StorageError> {
+        let metadata = serde_json::from_str::<serde_json::Value>(event.metadata_json)
+            .map(crate::observability::logs::redact_sensitive_log_values)
+            .unwrap_or_else(|_| serde_json::json!({ "invalid": true }));
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        let event_id = Uuid::now_v7().to_string();
+
+        self.query(
+            "INSERT INTO user_activity_events (
+                 id, user_id, actor_user_id, event_type, target_type, target_id, metadata_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event_id)
+        .bind(event.user_id)
+        .bind(event.actor_user_id)
+        .bind(event.event_type)
+        .bind(event.target_type)
+        .bind(event.target_id)
+        .bind(metadata_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        Ok(event_id)
     }
 
     pub(crate) async fn list_activity_events(

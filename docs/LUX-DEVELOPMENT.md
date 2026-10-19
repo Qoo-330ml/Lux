@@ -15089,6 +15089,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-718。
 
+#### LUX-720：写入脱敏的用户活动索引
+
+范围：为用户活动索引增加存储写入合同，生成 UUIDv7 唯一记录 ID，并写入活动用户、可选操作者、事件类型、目标引用、元数据和发生时间。元数据必须在落库前复用日志敏感值脱敏规则；非法 JSON 以安全占位对象保存。允许活动记录在用户 ID 暂不可解析或账号已清理时独立保留。本任务不接入现有登录/播放事件写入点，不增加查询 API 或回填。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 存储方法生成并返回唯一活动 ID，保存用户、操作者、类型、目标和默认时间；不要求用户外键存在。
+- [x] 嵌套敏感键/完整 URL 在落库前按现有规则脱敏；非法 JSON 不原样保存。
+- [x] 存储回归读取数据库实值验证字段、脱敏、默认时间和不同调用的 ID 唯一。
+- [x] 定向 storage 回归、build、fmt 和 diff check 通过。
+
+短计划：先加存储回归并确认写入方法缺失时失败；再补存储 DTO、导出及脱敏写入；最后跑指定 repository 测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增内部 `NewUserActivityEvent` 与 `insert_user_activity_event`，使用 UUIDv7 作为记录 ID，数据库默认时间，并通过既有敏感值脱敏逻辑规范化元数据。非法 JSON 只保存 `{"invalid":true}`；用户/操作者 ID 不需要在 users 表中存在。接口暂由 LUX-721 接入活动写入流程。
+
+验证：TDD RED 因存储类型/方法不存在而编译失败；`user_activity_index_insert_redacts_metadata_and_keeps_independent_subjects` 1/1，通过对数据库实值检查用户、操作者、事件目标、默认时间、UUID 唯一性、嵌套凭证/URL 脱敏及非法 JSON 替换。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过；未使用警告由下一任务接入标注消除。
+
+依赖：LUX-719。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

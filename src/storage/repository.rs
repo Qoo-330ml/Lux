@@ -1297,6 +1297,17 @@ pub(crate) struct NewAuditEvent<'a> {
     pub(crate) metadata_json: &'a str,
 }
 
+// LUX-721 wires this persistence contract into the activity event recorder.
+#[allow(dead_code)]
+pub(crate) struct NewUserActivityEvent<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) actor_user_id: Option<&'a str>,
+    pub(crate) event_type: &'a str,
+    pub(crate) target_type: Option<&'a str>,
+    pub(crate) target_id: Option<&'a str>,
+    pub(crate) metadata_json: &'a str,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredActivityEvent {
     pub(crate) id: String,

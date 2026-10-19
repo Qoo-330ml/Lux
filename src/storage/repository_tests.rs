@@ -2,9 +2,10 @@ use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
-    MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserContentRestrictions,
-    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserContentRestrictionsCasResult,
-    UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
+    MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserActivityEvent,
+    NewUserContentRestrictions, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+    UserContentRestrictionsCasResult, UserPermissionCopyGroups, UserPermissionCopyResult,
+    UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -23235,6 +23236,82 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
     admin_pool.close().await;
     outcome??;
     drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subjects()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    let first_id = database
+        .insert_user_activity_event(NewUserActivityEvent {
+            user_id: "activity-index-subject",
+            actor_user_id: Some("activity-index-actor"),
+            event_type: "AUTH_LOGIN",
+            target_type: Some("media_item"),
+            target_id: Some("activity-index-item"),
+            metadata_json: r#"{
+                "remoteIp":"203.0.113.8",
+                "nested":{"accessToken":"do-not-store-this"},
+                "requestUrl":"https://private.example/path"
+            }"#,
+        })
+        .await?;
+    let second_id = database
+        .insert_user_activity_event(NewUserActivityEvent {
+            user_id: "activity-index-subject",
+            actor_user_id: None,
+            event_type: "AUTH_LOGIN",
+            target_type: None,
+            target_id: None,
+            metadata_json: "not json",
+        })
+        .await?;
+
+    assert_ne!(first_id, second_id);
+    let first_row: (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT id, user_id, actor_user_id, event_type, target_type, target_id,
+                metadata_json, occurred_at
+         FROM user_activity_events WHERE id = ?",
+    )
+    .bind(&first_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(first_row.0, first_id);
+    assert_eq!(first_row.1, "activity-index-subject");
+    assert_eq!(first_row.2.as_deref(), Some("activity-index-actor"));
+    assert_eq!(first_row.3, "AUTH_LOGIN");
+    assert_eq!(first_row.4.as_deref(), Some("media_item"));
+    assert_eq!(first_row.5.as_deref(), Some("activity-index-item"));
+    assert!(first_row.7 > 0);
+    assert!(!first_row.6.contains("do-not-store-this"));
+    assert!(!first_row.6.contains("private.example"));
+    let first_metadata: serde_json::Value = serde_json::from_str(&first_row.6)?;
+    assert_eq!(first_metadata["nested"]["accessToken"], "[REDACTED]");
+    assert_eq!(first_metadata["requestUrl"], "[REDACTED]");
+    assert_eq!(first_metadata["remoteIp"], "203.0.113.8");
+
+    let invalid_metadata: String =
+        sqlx::query_scalar("SELECT metadata_json FROM user_activity_events WHERE id = ?")
+            .bind(second_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(invalid_metadata, r#"{"invalid":true}"#);
     Ok(())
 }
 
