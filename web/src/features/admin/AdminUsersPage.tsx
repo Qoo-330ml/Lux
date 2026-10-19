@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminUser, AdminUserListStatus, AdminUserSortBy, AdminUserSortOrder } from "../../lib/api/types";
+import type { AdminUser, AdminUserListStatus, AdminUserPermissionPresetBatchErrorCode, AdminUserSortBy, AdminUserSortOrder } from "../../lib/api/types";
 import "./user-management.css";
 
 export function AdminUsersPage() {
@@ -31,17 +31,82 @@ export function AdminUsersPage() {
     enabled: view !== "pending",
   });
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
+  const permissionPresets = useQuery({
+    queryKey: ["admin", "user-permission-presets"],
+    queryFn: () => api.adminUserPermissionPresets(),
+    enabled: view === "users" && selectedUserIds.length > 0,
+  });
   const deletionGraceDays = settings.data?.userDeletionGraceDays;
   const [form, setForm] = useState({ username: "", displayName: "", password: "", isAdmin: false });
   const [formError, setFormError] = useState("");
-  const create = useMutation({ mutationFn: () => api.createAdminUser(form), onSuccess: () => { setForm({ username: "", displayName: "", password: "", isAdmin: false }); setFormError(""); void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); }, onError: (error) => setFormError(error.message) });
-
-  if (view !== "pending" && users.error && !users.data) return <AdminUserState label={users.error.message || "用户数据加载失败"} error />;
-  if (view !== "pending" && users.isPending) return <AdminUserState label="正在读取用户列表…" />;
+  const [batchPresetId, setBatchPresetId] = useState("");
+  const [batchResults, setBatchResults] = useState<{ presetName: string; results: Array<{ userId: string; userName: string; success: boolean; errorCode: AdminUserPermissionPresetBatchErrorCode | null }> } | null>(null);
+  const [batchError, setBatchError] = useState("");
   const items = users.data?.users ?? [];
   const totalCount = users.data?.totalCount ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const selectedOnCurrentPage = items.filter((user) => selectedUserIds.includes(user.id));
+  const allCurrentPageSelected = items.length > 0 && selectedOnCurrentPage.length === items.length;
+  const create = useMutation({ mutationFn: () => api.createAdminUser(form), onSuccess: () => { setForm({ username: "", displayName: "", password: "", isAdmin: false }); setFormError(""); void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); }, onError: (error) => setFormError(error.message) });
+  const applyBatchPreset = useMutation({
+    mutationFn: ({ userIds, presetId }: { userIds: string[]; presetId: string; presetName: string; userNames: Record<string, string> }) => api.applyAdminUserPermissionPresetBatch(userIds, presetId),
+    onSuccess: (response, variables) => {
+      setBatchResults({
+        presetName: variables.presetName,
+        results: response.results.map((result) => ({
+          ...result,
+          userName: variables.userNames[result.userId] ?? result.userId,
+        })),
+      });
+      setBatchError("");
+      setSelectedUserIds([]);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
+    },
+    onError: (error) => setBatchError(error.message),
+  });
+  useEffect(() => {
+    setSelectedUserIds([]);
+    setBatchResults(null);
+    setBatchError("");
+  }, [view, page, pageSize, searchInput, status, sortBy, sortOrder]);
+
+  if (view !== "pending" && users.error && !users.data) return <AdminUserState label={users.error.message || "用户数据加载失败"} error />;
+  if (view !== "pending" && users.isPending) return <AdminUserState label="正在读取用户列表…" />;
   function submit(event: FormEvent) { event.preventDefault(); if (!form.username.trim() || !form.password) { setFormError("用户名和密码不能为空"); return; } create.mutate(); }
+
+  function toggleUserSelection(userId: string, selected: boolean) {
+    setSelectedUserIds((current) => selected
+      ? current.includes(userId) ? current : [...current, userId]
+      : current.filter((id) => id !== userId));
+    setBatchError("");
+  }
+
+  function toggleCurrentPageSelection() {
+    if (allCurrentPageSelected) {
+      const pageIds = new Set(items.map((user) => user.id));
+      setSelectedUserIds((current) => current.filter((id) => !pageIds.has(id)));
+    } else {
+      setSelectedUserIds((current) => [...new Set([...current, ...items.map((user) => user.id)])]);
+    }
+    setBatchError("");
+  }
+
+  function confirmBatchPreset() {
+    const preset = permissionPresets.data?.presets.find((candidate) => candidate.id === batchPresetId);
+    const targets = selectedOnCurrentPage;
+    if (!preset || targets.length === 0 || applyBatchPreset.isPending) return;
+    const names = targets.map((user) => user.displayName || user.usernameNormalized).join("、");
+    if (!window.confirm(`仅对当前页已选的 ${targets.length} 个用户应用权限预设“${preset.name}”吗？\n${names}`)) return;
+    setBatchResults(null);
+    setBatchError("");
+    applyBatchPreset.mutate({
+      userIds: targets.map((user) => user.id),
+      presetId: preset.id,
+      presetName: preset.name,
+      userNames: Object.fromEntries(targets.map((user) => [user.id, user.displayName || user.usernameNormalized])),
+    });
+  }
 
   return (
     <div className="lux-admin-page">
@@ -71,12 +136,27 @@ export function AdminUsersPage() {
       </div>
       {view === "users" ? <>
         <section className="lux-admin-panel lux-admin-create-panel"><div className="lux-admin-panel-heading"><div><h2>创建用户</h2></div><Plus size={20} className="lux-admin-panel-icon" /></div><form className="lux-admin-form lux-admin-user-create-form" onSubmit={submit}><label>用户名<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="off" /></label><label>显示名称<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label><label>初始密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" /></label><label className="lux-admin-toggle"><input type="checkbox" checked={form.isAdmin} onChange={(event) => setForm({ ...form, isAdmin: event.target.checked })} /><span>服务器管理员</span></label><button className="lux-button lux-button-primary" type="submit" disabled={create.isPending}><Plus size={16} /> {create.isPending ? "创建中…" : "创建用户"}</button></form>{formError ? <p className="lux-error-copy">{formError}</p> : null}</section>
+        <section className="lux-admin-panel lux-admin-user-batch-panel" aria-labelledby="lux-admin-user-batch-title">
+          <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-batch-title">批量应用权限预设</h2><p>仅对当前页勾选的用户操作，换页或筛选后会清空选择；每批最多 100 人。</p></div></div>
+          <div className="lux-admin-user-batch-controls">
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label={allCurrentPageSelected ? "取消本页全选" : "全选本页"} onClick={toggleCurrentPageSelection} disabled={!items.length || applyBatchPreset.isPending}>{allCurrentPageSelected ? "取消本页全选" : "全选本页"}</button>
+            <span aria-live="polite">当前页已选 {selectedOnCurrentPage.length} 人</span>
+            <label>权限预设<select aria-label="批量权限预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || applyBatchPreset.isPending}>
+              <option value="">选择权限预设</option>
+              {(permissionPresets.data?.presets ?? []).map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
+            </select></label>
+            <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label="批量应用权限预设" onClick={confirmBatchPreset} disabled={!selectedOnCurrentPage.length || !batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || applyBatchPreset.isPending}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</button>
+          </div>
+          {selectedUserIds.length > 0 && permissionPresets.error ? <p className="lux-error-copy" role="alert">权限预设加载失败：{permissionPresets.error.message}</p> : null}
+          {batchError ? <p className="lux-error-copy" role="alert">批量应用失败：{batchError}</p> : null}
+          {batchResults ? <div className="lux-admin-user-batch-results" role="status" aria-label="批量应用结果"><strong>权限预设“{batchResults.presetName}”的应用结果</strong><ul>{batchResults.results.map((result) => <li key={result.userId} className={result.success ? "is-success" : "is-failure"}>{result.userName}：{result.success ? "成功" : batchPermissionPresetErrorMessage(result.errorCode)}</li>)}</ul></div> : null}
+        </section>
       </> : null}
       <section className="lux-admin-panel lux-admin-users-list-panel"><div className="lux-admin-panel-heading"><div><h2>{view === "deleted" ? "已删除用户" : "账户列表"}</h2></div><span className="lux-status-pill">共 {totalCount} 个账户</span></div>
         {users.error ? <p className="lux-error-copy" role="alert">列表更新失败：{users.error.message}</p> : null}
         {items.length ? <div className="lux-admin-user-list">{items.map((user) => view === "deleted"
           ? <DeletedUserRow key={user.id} user={user} />
-          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
+          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} selected={selectedUserIds.includes(user.id)} selectionDisabled={applyBatchPreset.isPending} onSelectionChange={(selected) => toggleUserSelection(user.id, selected)} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
         <div className="lux-admin-user-pagination" aria-label="用户列表分页"><span>{totalCount ? `显示 ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalCount)} 条，共 ${totalCount} 条` : "共 0 条"}</span><div><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button><span>第 {page} / {totalPages} 页</span><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button></div></div>
       </section>
       </>}
@@ -84,7 +164,7 @@ export function AdminUsersPage() {
   );
 }
 
-function UserAdminRow({ user, graceDays }: { user: AdminUser; graceDays?: number }) {
+function UserAdminRow({ user, graceDays, selected, selectionDisabled, onSelectionChange }: { user: AdminUser; graceDays?: number; selected: boolean; selectionDisabled: boolean; onSelectionChange: (selected: boolean) => void }) {
   const queryClient = useQueryClient();
   const [expanded, setExpanded] = useState(false);
   const [newPassword, setNewPassword] = useState("");
@@ -114,6 +194,7 @@ function UserAdminRow({ user, graceDays }: { user: AdminUser; graceDays?: number
   return (
     <article className={user.isDisabled ? "lux-admin-user-row is-disabled" : "lux-admin-user-row"}>
       <div className="lux-admin-user-summary">
+        <label className="lux-admin-user-select"><input type="checkbox" aria-label={`选择${user.displayName || user.usernameNormalized}`} checked={selected} disabled={selectionDisabled} onChange={(event) => onSelectionChange(event.target.checked)} /><span className="lux-visually-hidden">选择账户参与当前页批量操作</span></label>
         <AdminUserAvatar userId={user.id} />
         <div>
           <strong>{displayName}</strong>
@@ -256,6 +337,17 @@ function DeletedUserRow({ user }: { user: AdminUser }) {
 
 function PermissionToggle({ label, checked, onChange }: { label: string; checked?: boolean; onChange: (checked: boolean) => void }) { return <label className="lux-admin-permission-toggle"><input type="checkbox" checked={Boolean(checked)} onChange={(event) => onChange(event.target.checked)} /><span>{checked ? <Check size={13} /> : null}</span>{label}</label>; }
 function AdminUserState({ label, error = false }: { label: string; error?: boolean }) { return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "用户数据加载失败" : "正在加载用户"}</h1><p>{label}</p></section>; }
+
+function batchPermissionPresetErrorMessage(errorCode: AdminUserPermissionPresetBatchErrorCode | null) {
+  switch (errorCode) {
+    case "INVALID_USER_ID": return "用户标识无效";
+    case "USER_NOT_FOUND": return "用户不存在或已删除";
+    case "LAST_MANAGER": return "最后一个管理员不能失去管理权限";
+    case "INVALID_SNAPSHOT": return "预设权限快照无效";
+    case "STORAGE_UNAVAILABLE": return "保存失败，请稍后重试";
+    default: return "操作失败";
+  }
+}
 
 function formatUserTimestamp(timestamp?: number | null): string {
   return timestamp ? new Date(timestamp * 1000).toLocaleString() : "暂无";

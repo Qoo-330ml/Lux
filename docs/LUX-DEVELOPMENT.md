@@ -13957,6 +13957,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增批量响应与五种逐项错误码类型及 Web client POST 方法，统一请求层自动附加 CSRF。定向 API client 测试 1/1、Web build 与 diff check 通过；build 前临时使用提交版 `AdminDashboardNowPlaying.tsx`，构建后逐字节恢复用户当前未提交内容。当前工作区直接 build 仍被该文件的两个既有 unused helper 阻断。
 
+#### LUX-667：用户列表批量应用权限预设界面
+
+范围：在用户列表提供当前页用户的明确多选、全选当前页、权限预设选择、目标与变更确认及逐用户结果。换页或筛选变化时清空勾选；每次仅提交当前页选中的 1–100 个用户，不提供会把分页误当全量匹配结果的操作。本任务只完成“应用权限预设”批量动作。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-batch-actions.test.tsx`。
+
+验收标准：
+
+- [x] 选择范围和用户数量始终明确；当前页、筛选或视图变化会清空选择。
+- [x] 应用前展示选中目标和预设并要求确认；取消不发请求。
+- [x] 结果逐用户翻译稳定错误码并展示；网络错误可见，成功后刷新用户列表。
+- [x] 定向组件回归、Web build 与 diff check 通过。
+
+短计划：先为选择范围、取消确认、逐项结果和换页清选添加失败测试；再接入既有批量 API 和预设查询，最后验证组件及 Web 构建。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-batch-actions.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-665、LUX-666。
+
+结果（2026-10-19）：用户列表支持逐项选择或全选当前页、确认预设和完整目标、逐用户成功/错误结果；换页、筛选或切换视图清空选择，成功后刷新列表。批量功能按需加载预设，仅提交当前页明确选中的最多 100 个 ID。LUX-667 组件测试 4/4、用户管理组件回归 41/41、`pnpm --dir web install --frozen-lockfile` 和 Web build 通过。完整 `pnpm --dir web test` 为 699 passed、5 failed；失败在账号头像裁剪、首页媒体库预取、媒体库卡片预取/虚拟合集链接及媒体详情轮询四个未由本任务修改的测试文件，未据此声称为基线失败。`git diff --check` 通过。build 临时使用提交版 `AdminDashboardNowPlaying.tsx`，构建后逐字节还原用户未提交版本；由于本地服务已停止，没有使用真实账户数据做手工浏览器验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

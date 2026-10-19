@@ -78,6 +78,17 @@
 .lux-admin-users-list-panel { min-width: 0; }
 .lux-admin-user-row { grid-template-columns: minmax(240px, 1fr) minmax(120px, auto) auto; }
 .lux-admin-user-summary > div { min-width: 0; }
+.lux-admin-user-select { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.lux-admin-user-select input { width: 16px; height: 16px; margin: 0; accent-color: var(--lux-accent); }
+.lux-admin-user-batch-panel .lux-admin-panel-heading p { margin: 5px 0 0; color: var(--lux-muted); font-size: .72rem; }
+.lux-admin-user-batch-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; }
+.lux-admin-user-batch-controls > span { color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-user-batch-controls label { display: flex; align-items: center; gap: 8px; color: var(--lux-muted); font-size: .72rem; }
+.lux-admin-user-batch-controls select { min-width: 180px; min-height: 36px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); background: color-mix(in srgb, var(--lux-surface) 78%, transparent); font: inherit; }
+.lux-admin-user-batch-results { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-user-batch-results ul { display: grid; gap: 5px; margin: 8px 0 0; padding-left: 18px; }
+.lux-admin-user-batch-results .is-success { color: var(--lux-success, #64bd91); }
+.lux-admin-user-batch-results .is-failure { color: var(--lux-danger, #d86d6d); }
 .lux-admin-user-summary small + small { margin-top: 3px; }
 .lux-admin-users-empty { margin: 10px 0 22px; }
 .lux-admin-user-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
