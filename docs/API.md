@@ -213,7 +213,9 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/items/{itemId}/children?itemType=SEASON|EPISODE&seasonId=...`：Web 同源读取剧集季度/单集或合集成员，结果执行当前用户 ACL。媒体条目响应同时返回 `parentId`、`seriesId`、`parentIndexNumber`（季号）和 `indexNumber`（集号），用于保持剧集层级导航。
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
 - `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；`PATCH` 携带 `isDisabled: true` 只禁用账户并保留数据，`DELETE` 永久删除账户及关联数据并返回 204；最后一个启用的服务器管理账户受保护。
-- `GET /api/v1/admin/users/{userId}/libraries`：读取该用户显式选择的媒体库 ID，用于管理控制台展示 ACL；空列表表示未限定范围、可访问全部已启用媒体库；不返回服务器路径。
+- `GET /api/v1/admin/users/{userId}/libraries`：返回 `{ "libraryAccessMode": "ALL|SELECTED|NONE", "libraryIds": [...] }`；`ALL` 表示全部已启用普通媒体库，`SELECTED` 表示仅允许 `libraryIds` 中的库，`NONE` 表示无媒体库访问。不存在的用户返回 404，不返回服务器路径。
+- `PUT /api/v1/admin/users/{userId}/libraries`：管理员以 `{ "libraryAccessMode": "ALL|SELECTED|NONE", "libraryIds": [...] }` 原子替换媒体库访问范围，需要 CSRF。`SELECTED` 的 ID 必须是不重复且已启用的普通媒体库；空选择规范化为 `NONE`。`ALL` 和 `NONE` 会清空选择列表。无效模式或重复 ID 返回 400，不存在或未启用的媒体库返回 404，不存在的用户返回 404。
+- `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：兼容的逐库授权更新，需要 CSRF；至少存在一个正向授权时模式为 `SELECTED`，清除最后一个正向授权后恢复 `ALL`。需要无媒体库权限时使用上面的整组 PUT 设置 `NONE`。
 - `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计与近期登录/播放活动。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；LUX-316 启动迁移旧审计后，接口只读活动文件与保留归档。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。
