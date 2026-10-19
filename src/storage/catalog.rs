@@ -7772,14 +7772,28 @@ impl Database {
     #[allow(dead_code)]
     pub(crate) async fn media_content_restriction_index_candidates(
         &self,
+        after_item_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MediaContentRestrictionIndexCandidate>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let bounded_limit = limit.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT) as i64;
-        let rows: Vec<(String, Option<String>)> = self
-            .query_as(
+        let query = if after_item_id.is_some() {
+            self.query_as(
+                "SELECT item.id, item.nfo_metadata_json
+                 FROM media_items item
+                 LEFT JOIN media_content_restriction_index restriction_index
+                   ON restriction_index.item_id = item.id
+                 WHERE item.removed_at IS NULL
+                   AND restriction_index.item_id IS NULL
+                   AND item.id > ?
+                 ORDER BY item.id
+                 LIMIT ?",
+            )
+            .bind(after_item_id)
+        } else {
+            self.query_as(
                 "SELECT item.id, item.nfo_metadata_json
                  FROM media_items item
                  LEFT JOIN media_content_restriction_index restriction_index
@@ -7789,6 +7803,8 @@ impl Database {
                  ORDER BY item.id
                  LIMIT ?",
             )
+        };
+        let rows: Vec<(String, Option<String>)> = query
             .bind(bounded_limit)
             .fetch_all(&self.pool)
             .await

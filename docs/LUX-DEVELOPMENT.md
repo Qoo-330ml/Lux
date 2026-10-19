@@ -14309,6 +14309,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：存储层现在以 ID 顺序读取未删除且缺少索引的缓存条目，硬上限 100，空 NFO 作为可索引的未分级快照。SQLite 立即写事务与 PostgreSQL 媒体行锁保护快照比较；只有未删除条目的 NFO JSON 完全匹配才会事务性替换索引和标签。SQLite/PostgreSQL 共用回归各 1/1 通过，覆盖已就绪/删除过滤、批次上限、陈旧快照、空 NFO 与写标签约束失败回滚；`cargo build --locked`、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。后台 worker 尚未接入。
 
+#### LUX-684：从缓存 NFO 分批建立内容分类索引
+
+范围：增加 application 层批处理器，从数据库候选读取的缓存 NFO JSON 派生认证与类型标签投影，使用 LUX-683 的快照写入合同落索引。支持可选 ID 游标，坏缓存或变化中的条目不会挡住后续批次；空缓存登记为已处理的未分级项。此任务不从磁盘读取 NFO、不启动常驻 worker、不改变媒体访问。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/content_restriction_index.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 存储候选查询支持 ID 游标，边界批次稳定且不会重复查询游标之前的未处理条目。
+- [x] application 批处理只解析 NFO 缓存、不触碰文件；坏 JSON/非法标签不标记就绪，并仍返回游标推进到后续条目。
+- [x] 有效缓存中的认证与类型标签进入索引；无 NFO 缓存可以登记为未分级就绪；陈旧快照不写入。
+- [x] Rust 定向回归、build、fmt 与 diff check 通过。
+
+短计划：先增加存储游标及 application 批处理回归并确认接口/实现缺失时失败；再添加可选游标查询与缓存投影处理；最后运行定向 Rust 测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::content_restriction_index::tests::index_batches_use_cached_nfo_and_advance_past_invalid_entries -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-682、LUX-683。
+
+结果（2026-10-19）：application 批处理器逐条消费缓存 NFO JSON，通过领域投影和 LUX-683 快照 CAS 写入；缓存不存在会登记为未分级就绪，坏 JSON/超界标签保留未就绪但游标仍向后推进。SQLite application 回归 1/1、SQLite/PostgreSQL 存储游标回归各 1/1、build、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。处理器还未由后台生命周期启动，准备在 LUX-685 接入。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

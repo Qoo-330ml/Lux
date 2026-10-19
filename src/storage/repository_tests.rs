@@ -15034,7 +15034,7 @@ async fn assert_media_content_restriction_index_storage(
         .await?;
 
     let candidates = database
-        .media_content_restriction_index_candidates(1)
+        .media_content_restriction_index_candidates(None, 1)
         .await?;
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].item_id, "restriction-index-a");
@@ -15042,9 +15042,20 @@ async fn assert_media_content_restriction_index_storage(
         candidates[0].nfo_metadata_json.as_deref(),
         Some(original_nfo)
     );
+    let after_first = database
+        .media_content_restriction_index_candidates(Some("restriction-index-a"), 1)
+        .await?;
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(after_first[0].item_id, "restriction-index-b");
     assert!(
         database
-            .media_content_restriction_index_candidates(0)
+            .media_content_restriction_index_candidates(Some("restriction-index-b"), 10)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        database
+            .media_content_restriction_index_candidates(None, 0)
             .await?
             .is_empty()
     );
@@ -15107,7 +15118,7 @@ async fn assert_media_content_restriction_index_storage(
             .await?
     );
     let pending = database
-        .media_content_restriction_index_candidates(10)
+        .media_content_restriction_index_candidates(None, 10)
         .await?;
     assert_eq!(
         pending,
@@ -15189,7 +15200,7 @@ async fn assert_media_content_restriction_index_storage(
     assert_eq!(ready_unrated_tags, 0);
     assert!(
         database
-            .media_content_restriction_index_candidates(10)
+            .media_content_restriction_index_candidates(None, 10)
             .await?
             .is_empty()
     );
@@ -15210,7 +15221,7 @@ async fn assert_media_content_restriction_index_storage(
             .await?;
     }
     let bounded = database
-        .media_content_restriction_index_candidates(usize::MAX)
+        .media_content_restriction_index_candidates(None, usize::MAX)
         .await?;
     assert_eq!(bounded.len(), CONTENT_RESTRICTION_INDEX_BATCH_LIMIT);
     assert_eq!(
