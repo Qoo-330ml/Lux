@@ -890,15 +890,13 @@ fn choose_plan_for_policy(
             ServerTier::AudioTranscode,
         ),
         (
-            capabilities.hardware_transcode
-                && (capabilities.audio_copy_to_fmp4 || policy.allow_audio_transcode),
-            policy.allow_video_transcode,
+            capabilities.hardware_transcode,
+            policy.allow_video_transcode && policy.allow_audio_transcode,
             ServerTier::HardwareTranscode,
         ),
         (
-            capabilities.software_transcode
-                && (capabilities.audio_copy_to_fmp4 || policy.allow_audio_transcode),
-            policy.allow_video_transcode,
+            capabilities.software_transcode,
+            policy.allow_video_transcode && policy.allow_audio_transcode,
             ServerTier::SoftwareTranscode,
         ),
     ];
@@ -1108,7 +1106,7 @@ mod tests {
                 capabilities: PlaybackCapabilities {
                     direct_play: false,
                     hls: true,
-                    video_copy_to_fmp4: true,
+                    video_copy_to_fmp4: false,
                     audio_copy_to_fmp4: true,
                     hardware_transcode: true,
                     software_transcode: true,
@@ -1118,7 +1116,7 @@ mod tests {
                 can_play: true,
                 max_simultaneous_playbacks: 2,
                 allow_remux: false,
-                allow_audio_transcode: false,
+                allow_audio_transcode: true,
                 allow_video_transcode: true,
             },
         );
@@ -1203,6 +1201,24 @@ mod tests {
             ),
             Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
         ));
+        assert!(
+            matches!(
+                choose_plan_for_policy(
+                    PlaybackDecisionInput {
+                        source_kind: PlaybackSourceKind::LocalFile,
+                        capabilities,
+                    },
+                    UserPlaybackPolicy {
+                        allow_remux: false,
+                        allow_audio_transcode: false,
+                        allow_video_transcode: true,
+                        ..policy
+                    },
+                ),
+                Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+            ),
+            "video transcoding cannot be allowed when the current HLS output also transcodes audio"
+        );
     }
 
     #[cfg(unix)]

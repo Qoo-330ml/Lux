@@ -13093,7 +13093,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 #### LUX-624：按用户策略筛选服务端播放档位
 
-范围：Web 与 Emby 创建本地媒体 HLS 会话时，按当前用户 `allow_remux`、`allow_audio_transcode`、`allow_video_transcode` 与服务端可用能力共同选择最低允许档位。直放不受转码权限影响；STRM 始终只允许外部直放。客户端请求了服务端播放但其可用档位全部被用户策略禁止时，拒绝请求且不创建 HLS 会话。
+范围：Web 与 Emby 创建本地媒体 HLS 会话时，按当前用户 `allow_remux`、`allow_audio_transcode`、`allow_video_transcode` 与服务端可用能力共同选择最低允许档位。当前硬件/软件视频转码输出同时转码音频，因此必须同时允许音频与视频转码。直放不受转码权限影响；STRM 始终只允许外部直放。客户端请求了服务端播放但其可用档位全部被用户策略禁止时，拒绝请求且不创建 HLS 会话。
 
 预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
 
@@ -13108,7 +13108,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-614、LUX-615、LUX-617、LUX-620、LUX-623。
 
-结果（2026-10-19）：Web 与 Emby 共用的会话服务按用户策略和服务器能力选择最低允许 HLS 档位；转码权限全部关闭时，在写入会话或启动 HLS 前返回 403。直放及 STRM 的外部直放决策保持原样。策略单元测试 3/3、`web_playback` 1/1、`playback` 4/4 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --all-targets --all-features -- -D warnings` 被两个既有 `clippy::too_many_arguments` 报错阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`，本任务未修改这两个函数签名。未部署。
+结果（2026-10-19）：Web 与 Emby 共用的会话服务按用户策略和服务器能力选择最低允许 HLS 档位；硬件/软件视频转码还要求音频转码许可，因为当前 FFmpeg 输出同时转码音频。所有可用转码档位被禁用时，在写入会话或启动 HLS 前返回 403。直放及 STRM 的外部直放决策保持原样。策略单元测试 3/3、`web_playback` 1/1、`playback` 4/4 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --all-targets --all-features -- -D warnings` 被两个既有 `clippy::too_many_arguments` 报错阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`，本任务未修改这两个函数签名。未部署。
 
 ## 29. 参考资料
 
