@@ -41,9 +41,11 @@
 - Never commit passwords, user tokens, cookies, real `.strm` URLs, or user data. The project owner has explicitly approved the fixed third-party TMDb fallback key embedded in the built-in TMDb implementation; it must never be returned by an API or written to logs.
 - Never log credentials, access tokens, cookies, full query strings, or complete external URLs.
 - Validate every external input, canonicalize media paths, and enforce the configured library root.
-- Lux intentionally trusts valid `X-Forwarded-For` and `X-Forwarded-Proto` headers without a
-  configured proxy allowlist; these headers are display/transport metadata only and must not be
-  used as authentication, authorization, or ACL decisions.
+- Lux may use `X-Forwarded-For` for IP/CIDR blacklist decisions only through the access-IP
+  resolver: it starts from the connection peer attached by server middleware, consults explicitly
+  configured trusted-proxy CIDRs, and walks the complete chain from right to left. Raw forwarded
+  values and untrusted peers must never be used for ACL decisions. `X-Forwarded-Proto` remains
+  display/transport metadata only and must not be used for authentication, authorization, or ACLs.
 - Do not use `unwrap`, `expect`, or `panic` in production paths without a task-specific justification.
 - Do not execute blocking filesystem or process work on Tokio core workers.
 - Do not scan a whole library, call TMDb, parse NFO, or run `ffprobe` in a user request.

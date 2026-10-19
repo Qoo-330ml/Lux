@@ -488,10 +488,8 @@ pub(crate) async fn read_trusted_proxy_cidrs(database: &Database) -> Result<Vec<
     let Some(stored) = stored else {
         return Ok(Vec::new());
     };
-    let Ok(values) = serde_json::from_str::<Vec<String>>(&stored) else {
-        return Ok(Vec::new());
-    };
-    Ok(normalize_trusted_proxy_cidrs(values).unwrap_or_default())
+    let values = serde_json::from_str::<Vec<String>>(&stored).map_err(|_| ())?;
+    normalize_trusted_proxy_cidrs(values).map_err(|_| ())
 }
 
 fn normalize_trusted_proxy_cidrs(values: Vec<String>) -> Result<Vec<String>, AdminSettingsError> {

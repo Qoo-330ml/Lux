@@ -16000,6 +16000,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因缺少规则查询类型和方法而失败；实现后应用层规则/代理测试 11/11、Storage 作用域与启用状态回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过；严格全目标 Clippy 仍报 13 条已有问题，位于未修改的管理员 API、播放、权限复制及存储测试代码，本任务没有新增 Clippy 诊断。Cargo 命令使用 Toshiba target 目录。
 
+#### LUX-766：从可信代理链解析请求访问 IP
+
+范围：封装请求访问 IP 解析，使用 server middleware 注入的真实连接 peer 和完整 `X-Forwarded-For` 多值；可信代理 CIDR 从管理员设置读取并严格校验。没有真实 peer 时返回 `None` 供调用方 fail closed；代理配置损坏、peer 无效或可信 peer 的转发链无效均返回错误。本任务不接入登录、token 或播放授权检查。
+
+预计修改文件（4 个）：`AGENTS.md`、`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/api/legacy.rs`。
+
+验收标准：
+
+- [x] 未配置可信代理时忽略转发头，直接使用实际 peer；可信代理按完整重复头链从右向左剥离。
+- [x] 损坏的可信代理设置、无效 peer 和可信 peer 的畸形转发链均返回错误；缺失 peer 不伪造客户端地址。
+- [x] 更新 `AGENTS.md`，只允许访问 IP 解析器在上述可信边界内为 IP/CIDR 黑名单使用转发头；尚不改变授权行为。
+- [x] 请求 IP 定向测试、Rust build、fmt 与 diff check 通过。
+
+短计划：先添加 HTTP 层可信/不可信 peer、重复转发头、损坏配置和缺失 peer 回归并确认解析入口缺失；再让可信代理设置读取对损坏值严格报错，新增 request access-IP resolver 并修订 `AGENTS.md`；最后运行定向 lib 测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：`request_access_ip` 只以 middleware 注入的 peer 起算，读取并严格验证全局可信代理 CIDR，消费全部 `X-Forwarded-For` 字段值并复用 LUX-761 的从右向左链解析；无 peer 返回 `None`，无效 peer、可信配置或可信代理链返回错误。可信代理配置损坏不再被误当作空白配置。更新 `AGENTS.md`：只有 IP/CIDR 黑名单解析器可在该边界内参考 XFF，XFP 仍只用于传输元数据。本任务未将解析器接入授权检查。
+
+验证：TDD RED 因请求解析器和错误类型缺失而失败；实现后 `cargo test --locked --lib access_ip_` 5/5、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍报 13 项既有诊断，均位于未修改的管理员 API、播放、权限复制及存储测试代码；本任务文件没有新增诊断。Cargo 命令使用 Toshiba target 目录。Lucky 官方 Web 服务文档确认提供“追加客户端 IP”设置，但没有说明同名 Header 的合并/覆盖行为；当前部署版本和真实请求链仍未现场核验。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
