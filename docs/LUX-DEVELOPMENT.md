@@ -14455,6 +14455,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：增加内容限制策略/更新输入/响应类型，并实现按编码用户 ID 读取和整组 PUT 的客户端方法；PUT 沿用请求层 CSRF 注入。API 客户端回归 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。页面配置留给 LUX-691。
 
+#### LUX-691：在用户详情配置内容限制策略
+
+范围：在模块五用户详情中读取、编辑并保存分级体系、最高等级、未分级规则、允许标签和禁止标签；未配置策略使用不限内容的表单默认值，使用已读取版本提交 CAS。显示读取/保存/冲突状态，并保留索引进度及“访问拦截尚未接入”提示。回收站账号只读；本任务不应用媒体访问过滤。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-content-restriction.test.tsx`。
+
+验收标准：
+
+- [x] 管理员可配置三类分级体系、该体系的有效最高等级、未分级规则及两组标签；切换体系不会保留不兼容等级。
+- [x] 未配置策略显示为不限内容，保存新策略提交版本 0；成功后展示服务端规范化结果和新版本。
+- [x] 加载、错误重试、保存中、成功和版本冲突均清楚可访问；回收站不可编辑。
+- [x] 页面继续明确说明媒体访问拦截尚未接入；定向组件测试、Web build、窄屏浏览器检查和 diff check 通过。
+
+短计划：先扩展模块五组件测试覆盖默认、已保存策略、输入编辑、CAS 版本与错误状态并确认策略表单不存在；再接 LUX-690 客户端实现表单和响应式样式；最后运行组件测试、Web build、窄屏浏览器验证与 diff 检查。
+
+验证：运行 `pnpm --dir web exec vitest run tests/admin-user-content-restriction.test.tsx`、`pnpm --dir web build`、Playwright Chromium 窄屏浏览器检查及 `git diff --check`。
+
+依赖：LUX-690。
+
+结果（2026-10-19）：模块五用户详情加入分级体系/最大等级、未分级开关和逐行允许/禁止标签表单；未配置策略以默认不限制状态呈现，创建提交版本 0，保存后用服务端规范化结果更新表单。切换体系会清除不兼容等级；CAS 冲突禁用再次提交并提供重新读取操作。错误可重试，回收站只读；页面说明保存的策略还未用于媒体访问过滤。模块五组件测试 9/9、播放策略回归 3/3、冻结依赖安装、Web build、diff check 通过。Playwright Chromium 390×844 检查显示文档宽 390px、策略卡宽 366px、表单单列且无横向溢出；mock API 后控制台错误 0，截图为 `output/playwright/user-content-policy-390.png`。完整 Web 套件 716 passed、4 failed；失败为既有 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项、`media-query-polling.test.tsx` 1 项，本次未改这些文件，未验证它们的干净基线。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

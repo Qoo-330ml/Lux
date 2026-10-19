@@ -153,9 +153,21 @@
 .lux-admin-user-session-revoke:hover { border-color: color-mix(in srgb, var(--lux-danger, #d86d6d) 55%, transparent); }
 .lux-admin-user-session-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
 .lux-admin-user-session-pagination > div { display: flex; gap: 8px; }
-.lux-admin-user-content-index { display: grid; gap: 12px; max-width: 760px; padding: 18px 20px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: color-mix(in srgb, var(--lux-surface) 65%, transparent); }
+.lux-admin-user-content-section { display: grid; gap: 16px; min-width: 0; max-width: 760px; }
+.lux-admin-user-content-policy, .lux-admin-user-content-index { display: grid; gap: 12px; min-width: 0; padding: 18px 20px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: color-mix(in srgb, var(--lux-surface) 65%, transparent); }
+.lux-admin-user-content-policy .lux-admin-panel-heading, .lux-admin-user-content-index .lux-admin-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; }
+.lux-admin-user-content-policy h2, .lux-admin-user-content-index h2 { margin: 4px 0 0; color: var(--lux-text); font-size: .95rem; }
+.lux-admin-user-content-policy-form { display: grid; gap: 14px; min-width: 0; }
+.lux-admin-user-content-policy-form .lux-admin-muted, .lux-admin-user-content-policy-default, .lux-admin-user-content-policy-version { margin: 0; line-height: 1.55; }
+.lux-admin-user-content-policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; min-width: 0; }
+.lux-admin-user-content-policy-form textarea { width: 100%; min-width: 0; min-height: 96px; box-sizing: border-box; padding: 9px 11px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; resize: vertical; color: var(--lux-text); background: color-mix(in srgb, var(--lux-surface) 88%, transparent); font: inherit; font-size: .78rem; line-height: 1.5; }
+.lux-admin-user-content-policy-form textarea:focus { border-color: color-mix(in srgb, var(--lux-accent) 65%, var(--lux-line)); }
+.lux-admin-user-content-policy-form textarea:disabled { opacity: .62; }
+.lux-admin-user-content-policy-toggle { display: flex !important; align-items: center; gap: 9px !important; min-height: 28px; color: var(--lux-text) !important; }
+.lux-admin-user-content-policy-toggle input { flex: 0 0 auto; width: 16px; min-height: 16px; margin: 0; accent-color: var(--lux-accent); }
+.lux-admin-user-content-policy-form .lux-admin-user-profile-actions { margin-top: 2px; }
+.lux-admin-user-content-index { gap: 12px; }
 .lux-admin-user-content-index .lux-admin-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; }
-.lux-admin-user-content-index h2 { margin: 4px 0 0; color: var(--lux-text); font-size: .95rem; }
 .lux-admin-user-content-index-progress { display: grid; gap: 8px; min-width: 0; font-size: .76rem; }
 .lux-admin-user-content-index-progress > div { display: flex; justify-content: space-between; gap: 12px; color: var(--lux-muted); }
 .lux-admin-user-content-index-progress strong { color: var(--lux-text); font-variant-numeric: tabular-nums; }
@@ -163,3 +175,7 @@
 .lux-admin-user-content-index progress::-webkit-progress-bar { border-radius: inherit; background: var(--lux-line-soft); }
 .lux-admin-user-content-index progress::-webkit-progress-value { border-radius: inherit; background: var(--lux-accent); }
 .lux-admin-user-content-index-progress .lux-admin-muted, .lux-admin-user-content-index-note { margin: 0; line-height: 1.55; }
+@media (max-width: 600px) {
+  .lux-admin-user-content-policy, .lux-admin-user-content-index { padding: 16px; }
+  .lux-admin-user-content-policy-grid { grid-template-columns: minmax(0, 1fr); }
+}

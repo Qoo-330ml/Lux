@@ -2,9 +2,9 @@ import { ArrowLeft, CircleDashed, ShieldCheck, SlidersHorizontal, UserRound, Use
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api } from "../../lib/api/client";
+import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminSettings, AdminUser, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserWebSession, NewUserPermissions } from "../../lib/api/types";
+import type { AdminSettings, AdminUser, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserWebSession, NewUserPermissions } from "../../lib/api/types";
 import "./user-management.css";
 
 const detailSections = [
@@ -26,6 +26,20 @@ const settingsSections = [
   { id: "retention", label: "删除与活动保留", module: "模块一 / 七" },
   { id: "proxy", label: "可信代理", module: "模块七" },
 ] as const;
+
+const contentRatingLevels = {
+  MPA: ["G", "PG", "PG-13", "R", "NC-17"],
+  TVPG: ["TV-Y", "TV-G", "TV-Y7", "TV-PG", "TV-14", "TV-MA"],
+  BBFC: ["U", "PG", "12", "12A", "15", "18", "R18"],
+} as const;
+
+type ContentRestrictionFormDraft = Pick<
+  AdminUserContentRestrictionPolicy,
+  "ratingSystem" | "maximumRating" | "allowUnrated"
+> & {
+  allowedTagsText: string;
+  blockedTagsText: string;
+};
 
 export function AdminUserDetailPage() {
   const { userId = "" } = useParams();
@@ -73,7 +87,7 @@ export function AdminUserDetailPage() {
       ) : section.id === "permissions" ? (
         <AdminUserPermissionsSection key={user.id} user={user} />
       ) : section.id === "content" ? (
-        <AdminUserContentRestrictionSection />
+        <AdminUserContentRestrictionSection user={user} />
       ) : section.id === "playback" ? (
         <AdminUserPlaybackPolicySection key={user.id} user={user} />
       ) : section.id === "devices" ? (
@@ -92,7 +106,223 @@ export function AdminUserDetailPage() {
   );
 }
 
-function AdminUserContentRestrictionSection() {
+function AdminUserContentRestrictionSection({ user }: { user: AdminUser }) {
+  return (
+    <div className="lux-admin-user-content-section">
+      <AdminUserContentRestrictionEditor key={user.id} user={user} />
+      <AdminUserContentIndexStatus />
+    </div>
+  );
+}
+
+function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
+  const queryClient = useQueryClient();
+  const queryKey = ["admin", "user", user.id, "content-restrictions"];
+  const policyQuery = useQuery({
+    queryKey,
+    queryFn: () => api.adminUserContentRestrictions(user.id),
+    enabled: user.deletedAt == null,
+  });
+  const [draft, setDraft] = useState<ContentRestrictionFormDraft | null>(null);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [versionConflict, setVersionConflict] = useState(false);
+  const currentPolicy = policyQuery.data?.policy ?? null;
+  const baselineDraft = contentRestrictionFormDraft(currentPolicy);
+  const currentDraft = draft ?? baselineDraft;
+  const hasChanges = !sameContentRestrictionDraft(currentDraft, baselineDraft);
+  const save = useMutation({
+    mutationFn: (input: AdminUserContentRestrictionUpdateInput) =>
+      api.updateAdminUserContentRestrictions(user.id, input),
+    onSuccess: ({ policy }) => {
+      setDraft(contentRestrictionFormDraft(policy));
+      setError("");
+      setVersionConflict(false);
+      setNotice("内容限制已保存。");
+      queryClient.setQueryData(queryKey, { policy });
+    },
+    onError: (cause) => {
+      setNotice("");
+      if (cause instanceof ApiError && cause.status === 409) {
+        setVersionConflict(true);
+        setError("策略已被其他管理员更改。请重新读取最新策略后再保存。");
+        return;
+      }
+      setError(cause.message || "内容限制保存失败，请重试。");
+    },
+  });
+
+  if (user.deletedAt != null) {
+    return (
+      <section className="lux-admin-panel lux-admin-user-content-policy" aria-labelledby="lux-admin-user-content-policy-title">
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div></div>
+        <p className="lux-admin-muted" role="status">回收站中的账号内容限制为只读，恢复后可修改。</p>
+      </section>
+    );
+  }
+
+  if (policyQuery.isPending) {
+    return (
+      <section className="lux-admin-panel lux-admin-user-content-policy" aria-busy="true" aria-labelledby="lux-admin-user-content-policy-title">
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div></div>
+        <p className="lux-admin-muted" role="status">正在读取用户内容限制…</p>
+      </section>
+    );
+  }
+
+  if (policyQuery.error || !policyQuery.data) {
+    return (
+      <section className="lux-admin-panel lux-admin-user-content-policy" aria-labelledby="lux-admin-user-content-policy-title">
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div></div>
+        <p className="lux-error-copy" role="alert">读取用户内容限制失败：{policyQuery.error?.message || "没有收到策略数据"}</p>
+        <button className="lux-button lux-button-secondary" type="button" onClick={() => void policyQuery.refetch()}>重试</button>
+      </section>
+    );
+  }
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!hasChanges || versionConflict) return;
+    setError("");
+    setNotice("");
+    save.mutate({
+      expectedVersion: currentPolicy?.version ?? 0,
+      ratingSystem: currentDraft.ratingSystem,
+      maximumRating: currentDraft.maximumRating,
+      allowUnrated: currentDraft.allowUnrated,
+      allowedTags: parseContentRestrictionTags(currentDraft.allowedTagsText),
+      blockedTags: parseContentRestrictionTags(currentDraft.blockedTagsText),
+    });
+  }
+
+  function reloadLatestPolicy() {
+    setError("");
+    setNotice("");
+    void policyQuery.refetch().then((result) => {
+      if (result.error || !result.data) {
+        setError(`重新读取策略失败：${result.error?.message || "没有收到策略数据"}`);
+        return;
+      }
+      setDraft(contentRestrictionFormDraft(result.data.policy));
+      setVersionConflict(false);
+      setNotice("已载入最新策略，请检查后再保存。");
+    });
+  }
+
+  return (
+    <section className="lux-admin-panel lux-admin-user-content-policy" aria-labelledby="lux-admin-user-content-policy-title">
+      <div className="lux-admin-panel-heading">
+        <div><span className="lux-admin-eyebrow">模块五</span><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div>
+        <span className={`lux-user-badge ${currentPolicy ? "is-ok" : ""}`}>{currentPolicy ? "已配置" : "未配置"}</span>
+      </div>
+      {currentPolicy ? (
+        <p className="lux-admin-muted lux-admin-user-content-policy-version">当前版本 {currentPolicy.version}</p>
+      ) : (
+        <p className="lux-admin-muted lux-admin-user-content-policy-default" role="status">当前没有已保存的限制；默认不限制分级和标签，并允许未分级内容。</p>
+      )}
+      <form className="lux-admin-form lux-admin-user-content-policy-form" onSubmit={submit}>
+        <div className="lux-admin-user-content-policy-grid">
+          <label>
+            分级体系
+            <select
+              aria-label="分级体系"
+              value={currentDraft.ratingSystem}
+              disabled={save.isPending || versionConflict}
+              onChange={(event) => setDraft({
+                ...currentDraft,
+                ratingSystem: event.currentTarget.value as AdminUserContentRestrictionPolicy["ratingSystem"],
+                maximumRating: null,
+              })}
+            >
+              <option value="MPA">MPA 电影分级</option>
+              <option value="TVPG">TV 家长指引</option>
+              <option value="BBFC">BBFC 英国分级</option>
+            </select>
+          </label>
+          <label>
+            最高允许等级
+            <select
+              aria-label="最高允许等级"
+              value={currentDraft.maximumRating ?? ""}
+              disabled={save.isPending || versionConflict}
+              onChange={(event) => setDraft({ ...currentDraft, maximumRating: event.currentTarget.value || null })}
+            >
+              <option value="">不限制</option>
+              {contentRatingLevels[currentDraft.ratingSystem].map((rating) => <option key={rating} value={rating}>{rating}</option>)}
+            </select>
+          </label>
+        </div>
+        <label className="lux-admin-user-content-policy-toggle">
+          <input
+            type="checkbox"
+            aria-label="允许未分级内容"
+            checked={currentDraft.allowUnrated}
+            disabled={save.isPending || versionConflict}
+            onChange={(event) => setDraft({ ...currentDraft, allowUnrated: event.currentTarget.checked })}
+          />
+          <span>允许未分级内容</span>
+        </label>
+        <div className="lux-admin-user-content-policy-grid">
+          <label>
+            允许标签（每行一项）
+            <textarea
+              aria-label="允许标签"
+              rows={4}
+              value={currentDraft.allowedTagsText}
+              disabled={save.isPending || versionConflict}
+              onChange={(event) => setDraft({ ...currentDraft, allowedTagsText: event.currentTarget.value })}
+            />
+            <span className="lux-admin-muted">填写后，内容至少要命中一个允许标签。</span>
+          </label>
+          <label>
+            禁止标签（每行一项）
+            <textarea
+              aria-label="禁止标签"
+              rows={4}
+              value={currentDraft.blockedTagsText}
+              disabled={save.isPending || versionConflict}
+              onChange={(event) => setDraft({ ...currentDraft, blockedTagsText: event.currentTarget.value })}
+            />
+            <span className="lux-admin-muted">禁止标签优先，命中后拒绝访问。</span>
+          </label>
+        </div>
+        <p className="lux-admin-muted">标签按媒体分类索引匹配；每组最多 100 项。保存后策略已存储，但媒体访问拦截尚未接入。</p>
+        <div className="lux-admin-user-profile-actions">
+          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || save.isPending || versionConflict}>
+            {save.isPending ? "保存中…" : "保存内容限制"}
+          </button>
+          {versionConflict ? <button className="lux-button lux-button-secondary" type="button" onClick={reloadLatestPolicy}>重新读取策略</button> : null}
+          {error ? <span role="alert">{error}</span> : null}
+          {notice ? <span role="status">{notice}</span> : null}
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function contentRestrictionFormDraft(policy: AdminUserContentRestrictionPolicy | null): ContentRestrictionFormDraft {
+  return {
+    ratingSystem: policy?.ratingSystem ?? "MPA",
+    maximumRating: policy?.maximumRating ?? null,
+    allowUnrated: policy?.allowUnrated ?? true,
+    allowedTagsText: policy?.allowedTags.join("\n") ?? "",
+    blockedTagsText: policy?.blockedTags.join("\n") ?? "",
+  };
+}
+
+function sameContentRestrictionDraft(left: ContentRestrictionFormDraft, right: ContentRestrictionFormDraft) {
+  return left.ratingSystem === right.ratingSystem
+    && left.maximumRating === right.maximumRating
+    && left.allowUnrated === right.allowUnrated
+    && left.allowedTagsText === right.allowedTagsText
+    && left.blockedTagsText === right.blockedTagsText;
+}
+
+function parseContentRestrictionTags(value: string) {
+  return value.split(/\r?\n/).map((tag) => tag.trim()).filter(Boolean);
+}
+
+function AdminUserContentIndexStatus() {
   const readiness = useQuery({
     queryKey: ["admin", "content-restriction-index"],
     queryFn: () => api.adminContentRestrictionIndexStatus(),
@@ -138,7 +368,7 @@ function AdminUserContentRestrictionSection() {
           <p className="lux-admin-muted">待就绪 {pendingItems.toLocaleString()} 条。索引会在后台分批更新。</p>
         </div>
       )}
-      <p className="lux-admin-muted lux-admin-user-content-index-note">此页目前只展示索引回填状态；用户限制配置与媒体访问拦截尚未接入。</p>
+      <p className="lux-admin-muted lux-admin-user-content-index-note">此页可保存用户限制并展示索引回填状态；媒体访问拦截尚未接入，策略目前不会过滤媒体。</p>
     </section>
   );
 }
