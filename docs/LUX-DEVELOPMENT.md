@@ -13121,14 +13121,14 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - [x] 每次 HLS manifest/初始化文件/分片请求（包含 HEAD）使用当前策略校验会话档位；权限已撤销时不返回 HLS 资源。
 - [x] 权限撤销时会话停止、准入名额释放、HLS 临时目录清理；原票据后续重用仍被拒绝。
 - [x] Web 与 Emby 集成回归覆盖已签发链接被撤权后的取流行为；直放和 STRM 仍遵守现有边界。
-- [ ] 在兼容性文档记录 Emby 策略拒绝与撤权后签名 HLS 链接的响应合同。
+- [x] 在兼容性文档记录 Emby 策略拒绝与撤权后签名 HLS 链接的响应合同。
 - [x] 定向 `web_playback` 与 `playback` 测试、Rust 格式检查和 `git diff --check` 通过。
 
 验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
 
 依赖：LUX-624。
 
-结果（2026-10-19）：共享签名资源授权在每次 Web/Emby HLS manifest、初始化文件或分片请求（HEAD 也包含）读取当前策略。撤销会话所需转码权限后，请求返回 403，HLS 会话停止、准入释放、临时目录清除；再次使用票据返回 410。Web 测试覆盖 tier 2 与 HEAD 拒绝，Emby 测试覆盖硬件/软件视频转码档撤权；定向 `web_playback` 1/1、`playback` 4/4 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过。未部署。
+结果（2026-10-19）：共享签名资源授权在每次 Web/Emby HLS manifest、初始化文件或分片请求（HEAD 也包含）读取当前策略。撤销会话所需转码权限后，请求返回 403，HLS 会话停止、准入释放、临时目录清除；再次使用票据返回 410。Web 测试覆盖 tier 2 与 HEAD 拒绝，Emby 测试覆盖硬件/软件视频转码档撤权；定向 `web_playback` 1/1、`playback` 4/4 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过。Emby 策略拒绝及 HLS 票据失效响应合同已加入兼容性文档。未部署。
 
 ## 29. 参考资料
 
