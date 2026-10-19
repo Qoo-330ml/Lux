@@ -598,6 +598,27 @@ export type AdminContentRestrictionIndexStatus = {
   pendingItems: number;
 };
 
+export type AdminUserContentRestrictionPolicy = {
+  ratingSystem: "MPA" | "TVPG" | "BBFC";
+  maximumRating: string | null;
+  allowUnrated: boolean;
+  allowedTags: string[];
+  blockedTags: string[];
+  version: number;
+  updatedAt: number;
+};
+
+export type AdminUserContentRestrictionUpdateInput = Omit<
+  AdminUserContentRestrictionPolicy,
+  "version" | "updatedAt"
+> & {
+  expectedVersion: number;
+};
+
+export type AdminUserContentRestrictionsResponse = {
+  policy: AdminUserContentRestrictionPolicy | null;
+};
+
 export type AdminUserPermissionPresetSourceDetails = {
   id: string;
   name: string;

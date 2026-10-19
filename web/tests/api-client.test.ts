@@ -132,6 +132,45 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
   });
 
+  it("reads and updates admin user content restrictions", async () => {
+    const input = {
+      expectedVersion: 0,
+      ratingSystem: "MPA" as const,
+      maximumRating: "PG-13",
+      allowUnrated: false,
+      allowedTags: ["action"],
+      blockedTags: ["horror"],
+    };
+    const policy = {
+      ratingSystem: input.ratingSystem,
+      maximumRating: input.maximumRating,
+      allowUnrated: input.allowUnrated,
+      allowedTags: input.allowedTags,
+      blockedTags: input.blockedTags,
+      version: 1,
+      updatedAt: 1_792_382_400,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
+      expect(String(request)).toBe("/api/v1/admin/users/user%2F1/content-restrictions");
+      if (init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual(input);
+        expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(JSON.stringify({ policy }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ policy: null }), { status: 200 });
+    });
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserContentRestrictions("user/1")).resolves.toEqual({ policy: null });
+      await expect(client.updateAdminUserContentRestrictions("user/1", input)).resolves.toEqual({ policy });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("reads and replaces explicit admin library access modes", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(String(input)).toBe("/api/v1/admin/users/user-1/libraries");

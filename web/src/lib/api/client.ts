@@ -36,6 +36,8 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminContentRestrictionIndexStatus,
+  AdminUserContentRestrictionsResponse,
+  AdminUserContentRestrictionUpdateInput,
   AdminUser,
   AdminUserWebSessionPage,
   AdminUserPermissionPreset,
@@ -1191,6 +1193,19 @@ export class LuxApiClient {
   adminContentRestrictionIndexStatus() {
     return this.request<AdminContentRestrictionIndexStatus>(
       "/api/v1/admin/content-restriction-index",
+    );
+  }
+
+  adminUserContentRestrictions(userId: string) {
+    return this.request<AdminUserContentRestrictionsResponse>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/content-restrictions`,
+    );
+  }
+
+  updateAdminUserContentRestrictions(userId: string, input: AdminUserContentRestrictionUpdateInput) {
+    return this.request<AdminUserContentRestrictionsResponse>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/content-restrictions`,
+      { method: "PUT", body: JSON.stringify(input) },
     );
   }
 

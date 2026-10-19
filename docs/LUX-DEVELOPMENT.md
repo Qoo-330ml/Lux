@@ -14435,6 +14435,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：应用层提供策略读取/更新和规则校验；管理员 GET 对未配置策略返回 `null`，PUT 使用版本 CAS 原子替换分类字段和两组标签。仅管理员可读，写操作通过 CSRF；审计只写分级体系、是否有最大等级、标签数量及版本，不写标签值。分级体系与等级需匹配；标签规范化与媒体索引一致，并拒绝控制字符、空值、超长、重复及每组超过 100 项。HTTP 回归 1/1、应用层回归 2/2、`cargo build --locked`、fmt check 和 diff check 通过。策略配置尚未接 Web 客户端/UI，媒体读取路径也尚未应用限制。
 
+#### LUX-690：为管理员用户内容限制 API 增加 Web 客户端合同
+
+范围：新增单用户内容限制策略的 Web 类型、只读 GET 和版本化整组 PUT 客户端方法。客户端使用 LUX-689 的管理员路由与字段合同，写入沿用统一请求层的 CSRF 注入；不修改用户详情页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 类型涵盖未配置策略的 `null`、全部策略字段及版本化更新输入。
+- [x] GET/PUT 路径、序列化请求、响应解码和 CSRF 注入均有客户端回归。
+- [x] 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先加入未配置读取与版本化保存客户端合同并确认类型/方法不存在时失败；再添加策略类型和 GET/PUT 方法；最后运行 API 客户端定向测试、Web build 与 diff 检查。
+
+验证：运行 `pnpm --dir web exec vitest run tests/api-client.test.ts -t "reads and updates admin user content restrictions"`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-689。
+
+结果（2026-10-19）：增加内容限制策略/更新输入/响应类型，并实现按编码用户 ID 读取和整组 PUT 的客户端方法；PUT 沿用请求层 CSRF 注入。API 客户端回归 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。页面配置留给 LUX-691。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
