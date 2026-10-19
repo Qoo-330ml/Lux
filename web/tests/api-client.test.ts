@@ -483,6 +483,37 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("updates admin user status in a batch with the CSRF-protected per-user result contract", async () => {
+    const statusResult = {
+      isDisabled: true,
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "bad-id", success: false, errorCode: "INVALID_USER_ID" },
+        { userId: "missing-user", success: false, errorCode: "USER_NOT_FOUND" },
+        { userId: "last-admin", success: false, errorCode: "LAST_MANAGER" },
+        { userId: "storage-failure", success: false, errorCode: "STORAGE_UNAVAILABLE" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(statusResult), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(
+        new LuxApiClient().updateAdminUserStatusBatch(["user-1", "user-2"], true),
+      ).resolves.toEqual(statusResult);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/batch/status");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify({ userIds: ["user-1", "user-2"], isDisabled: true }));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("previews selected admin account preference groups with source and target versions", async () => {
     const request = {
       sourceUserId: "source-1",

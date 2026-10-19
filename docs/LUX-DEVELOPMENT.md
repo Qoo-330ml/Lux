@@ -14782,6 +14782,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`tests/users.rs` 11/11、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。本任务未运行全量 Rust 门禁。
 
+#### LUX-706：增加批量账号状态 Web API 合同
+
+范围：为 LUX-705 管理端点定义批量启用/禁用请求、逐项稳定错误码和响应类型，并在 Web API 客户端公开方法。请求继续使用统一客户端的 JSON、CSRF 与错误处理。不在本任务修改页面或执行全量 Web 套件。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] TypeScript 类型覆盖批量状态和无效 ID、用户不存在、最后管理员、存储失败四种逐项结果。
+- [x] API 客户端 POST 到 `/api/v1/admin/users/batch/status`，发送精确用户 ID 列表及目标状态，并由统一请求层注入 CSRF。
+- [x] 定向 API 客户端回归和 Web build、`git diff --check` 通过。
+
+短计划：先在 API 客户端回归中断言批量禁用请求的 URL、JSON、方法和 CSRF，并确认目标方法不存在而失败；再添加类型和统一客户端方法；最后跑 `api-client.test.ts`、Web build 与 diff check。
+
+验证：运行 `pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build` 和 `git diff --check`。
+
+结果（2026-10-19）：增加批量账号状态逐项结果类型和 `updateAdminUserStatusBatch` 客户端方法，准确发送 `userIds` / `isDisabled` 并经统一请求层注入 CSRF。定向回归覆盖全部稳定结果码和请求合同。
+
+验证：`tests/api-client.test.ts` 72/72、`pnpm --dir web build` 和 `git diff --check` 通过；未运行完整 Web 测试套件。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

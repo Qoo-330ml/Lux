@@ -1278,6 +1278,21 @@ export type AdminUserPermissionPresetBatchResponse = {
   }>;
 };
 
+export type AdminUserStatusBatchErrorCode =
+  | "INVALID_USER_ID"
+  | "USER_NOT_FOUND"
+  | "LAST_MANAGER"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminUserStatusBatchResponse = {
+  isDisabled: boolean;
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminUserStatusBatchErrorCode | null;
+  }>;
+};
+
 export type AdminAccountPreferenceCopyGroups = {
   appearance: boolean;
   home: boolean;

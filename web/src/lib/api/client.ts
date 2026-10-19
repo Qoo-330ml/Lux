@@ -43,6 +43,7 @@ import type {
   AdminUserPermissionPreset,
   AdminUserPermissionPresetBatchResponse,
   AdminUserPermissionPresetInput,
+  AdminUserStatusBatchResponse,
   AdminAccountPreferenceCopyApplyInput,
   AdminAccountPreferenceCopyBatchResponse,
   AdminAccountPreferenceCopyPreview,
@@ -1167,6 +1168,13 @@ export class LuxApiClient {
     return this.request<AdminUserPermissionPresetBatchResponse>(
       "/api/v1/admin/users/batch/permission-preset",
       { method: "POST", body: JSON.stringify({ userIds, presetId }) },
+    );
+  }
+
+  updateAdminUserStatusBatch(userIds: string[], isDisabled: boolean) {
+    return this.request<AdminUserStatusBatchResponse>(
+      "/api/v1/admin/users/batch/status",
+      { method: "POST", body: JSON.stringify({ userIds, isDisabled }) },
     );
   }
 
