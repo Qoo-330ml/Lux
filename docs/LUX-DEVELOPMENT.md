@@ -15964,6 +15964,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 先因 GET 字段缺失而失败；实现后 `admin_dashboard_returns_server_playback_and_activity_data` 1/1 通过，覆盖默认、存储回读、canonical IPv4/IPv6、清除、部分更新、非法输入、CSRF 和失败后保留原值。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。严格 `cargo clippy --locked --all-targets --all-features -- -D warnings` 仍报 13 项既有诊断（相关位置均不在本次新增代码；完整 Rust 门禁尚未通过）。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
 
+#### LUX-764：增加 Web 黑名单 API 客户端合同
+
+范围：增加全站和用户级黑名单规则的 TypeScript DTO、分页读取、创建、启停、删除方法；管理员设置 DTO 增加 `trustedProxyCidrs`。所有 ID 路径参数 URL 编码，写请求复用统一 CSRF/错误处理层。本任务只提供客户端合同，不修改管理界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 全站和用户范围的 CRUD URL、分页参数与请求体符合 LUX-757 API。
+- [x] 写操作通过统一客户端附带 CSRF；类型不包含认证凭证或敏感内部字段。
+- [x] `api-client.test.ts` 定向回归与 Web build 通过；不修改页面或样式。
+
+短计划：先为全站/用户范围 API 方法增加 URL、分页、CSRF 与 payload 回归并确认方法缺失；再增加 DTO 和 client 方法；最后跑 API client 定向测试、Web build 和 diff check。
+
+结果（2026-10-20）：新增全站及用户级黑名单规则分页 DTO、创建输入 DTO 和 CRUD 客户端方法，启停使用既有 `PATCH /{ruleId}` 合同；所有用户/规则 ID 均 URL 编码。`AdminSettings` 现包含 `trustedProxyCidrs`。未修改页面。
+
+验证：TDD RED 先因客户端方法不存在而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 81/81 通过，`pnpm --dir web build` 通过，`pnpm --dir web install --frozen-lockfile` 通过。Web 全套为 746/750，4 项失败与已有基线相同：首页预取 1 项、媒体库卡片 2 项、详情轮询 1 项；与本任务无关。`git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -1793,6 +1793,77 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("lists and manages global and user access blacklist rules through scoped APIs", async () => {
+    const rule = {
+      id: "rule/1",
+      userId: null,
+      ruleType: "CLIENT",
+      matchValue: "test client",
+      isEnabled: true,
+      createdBy: "admin-1",
+      createdAt: 1_700_000_000,
+      updatedAt: 1_700_000_000,
+    };
+    const page = { rules: [rule], page: 2, pageSize: 25, totalCount: 26 };
+    const expectedRequests = [
+      ["GET", "/api/v1/admin/access-blacklist/global?page=2&pageSize=25"],
+      ["POST", "/api/v1/admin/access-blacklist/global"],
+      ["PATCH", "/api/v1/admin/access-blacklist/global/rule%2F1"],
+      ["DELETE", "/api/v1/admin/access-blacklist/global/rule%2F1"],
+      ["GET", "/api/v1/admin/users/user%2F1/access-blacklist?page=2&pageSize=25"],
+      ["POST", "/api/v1/admin/users/user%2F1/access-blacklist"],
+      ["PATCH", "/api/v1/admin/users/user%2F1/access-blacklist/rule%2F1"],
+      ["DELETE", "/api/v1/admin/users/user%2F1/access-blacklist/rule%2F1"],
+    ];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const [method, path] = expectedRequests.shift() ?? [];
+      expect(String(input)).toBe(path);
+      expect(init?.method ?? "GET").toBe(method);
+      if (method !== "GET") {
+        expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      }
+      if (method === "POST") {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          ruleType: "CLIENT",
+          matchValue: " Test Client ",
+          isEnabled: true,
+        });
+      }
+      if (method === "PATCH") {
+        expect(JSON.parse(String(init?.body))).toEqual({ isEnabled: false });
+        return new Response(JSON.stringify({ id: rule.id, isEnabled: false }), { status: 200 });
+      }
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "POST") return new Response(JSON.stringify(rule), { status: 201 });
+      return new Response(JSON.stringify(page), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminGlobalAccessBlacklistRules(2, 25)).resolves.toEqual(page);
+    await client.createAdminGlobalAccessBlacklistRule({
+      ruleType: "CLIENT",
+      matchValue: " Test Client ",
+      isEnabled: true,
+    });
+    await client.setAdminGlobalAccessBlacklistRuleEnabled(rule.id, false);
+    await client.deleteAdminGlobalAccessBlacklistRule(rule.id);
+    await expect(client.adminUserAccessBlacklistRules("user/1", 2, 25)).resolves.toEqual(page);
+    await client.createAdminUserAccessBlacklistRule("user/1", {
+      ruleType: "CLIENT",
+      matchValue: " Test Client ",
+      isEnabled: true,
+    });
+    await client.setAdminUserAccessBlacklistRuleEnabled("user/1", rule.id, false);
+    await client.deleteAdminUserAccessBlacklistRule("user/1", rule.id);
+
+    expect(expectedRequests).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+  });
+
   it("exposes the paginated plugin catalog and installs a store plugin with CSRF", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

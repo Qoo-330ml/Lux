@@ -40,6 +40,9 @@ import type {
   AdminUserContentRestrictionUpdateInput,
   AdminUserActivityPage,
   AdminUserActivityQuery,
+  AdminUserAccessBlacklistRulesPage,
+  AdminUserAccessBlacklistRule,
+  CreateAdminUserAccessBlacklistRuleInput,
   AdminUser,
   AdminUserDevicePage,
   AdminUserEmbySessionPage,
@@ -1332,6 +1335,62 @@ export class LuxApiClient {
     const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
     return this.request<AdminUserDevicePage>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/devices?${params.toString()}`,
+    );
+  }
+
+  adminGlobalAccessBlacklistRules(page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserAccessBlacklistRulesPage>(
+      `/api/v1/admin/access-blacklist/global?${params.toString()}`,
+    );
+  }
+
+  createAdminGlobalAccessBlacklistRule(input: CreateAdminUserAccessBlacklistRuleInput) {
+    return this.request<AdminUserAccessBlacklistRule>("/api/v1/admin/access-blacklist/global", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  setAdminGlobalAccessBlacklistRuleEnabled(ruleId: string, isEnabled: boolean) {
+    return this.request<{ id: string; isEnabled: boolean }>(
+      `/api/v1/admin/access-blacklist/global/${encodeURIComponent(ruleId)}`,
+      { method: "PATCH", body: JSON.stringify({ isEnabled }) },
+    );
+  }
+
+  deleteAdminGlobalAccessBlacklistRule(ruleId: string) {
+    return this.request<void>(
+      `/api/v1/admin/access-blacklist/global/${encodeURIComponent(ruleId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserAccessBlacklistRules(userId: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserAccessBlacklistRulesPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist?${params.toString()}`,
+    );
+  }
+
+  createAdminUserAccessBlacklistRule(userId: string, input: CreateAdminUserAccessBlacklistRuleInput) {
+    return this.request<AdminUserAccessBlacklistRule>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  setAdminUserAccessBlacklistRuleEnabled(userId: string, ruleId: string, isEnabled: boolean) {
+    return this.request<{ id: string; isEnabled: boolean }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist/${encodeURIComponent(ruleId)}`,
+      { method: "PATCH", body: JSON.stringify({ isEnabled }) },
+    );
+  }
+
+  deleteAdminUserAccessBlacklistRule(userId: string, ruleId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist/${encodeURIComponent(ruleId)}`,
+      { method: "DELETE" },
     );
   }
 

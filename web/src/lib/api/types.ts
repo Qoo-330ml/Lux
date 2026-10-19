@@ -634,6 +634,32 @@ export type AdminUserDevicePage = {
   totalCount: number;
 };
 
+export type AdminUserAccessBlacklistRuleType = "DEVICE" | "CLIENT" | "IP_CIDR";
+
+export type AdminUserAccessBlacklistRule = {
+  id: string;
+  userId: string | null;
+  ruleType: AdminUserAccessBlacklistRuleType;
+  matchValue: string;
+  isEnabled: boolean;
+  createdBy: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AdminUserAccessBlacklistRulesPage = {
+  rules: AdminUserAccessBlacklistRule[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type CreateAdminUserAccessBlacklistRuleInput = {
+  ruleType: AdminUserAccessBlacklistRuleType;
+  matchValue: string;
+  isEnabled?: boolean;
+};
+
 export type AdminUserActivityEvent = {
   id: string;
   userId: string;
@@ -1274,6 +1300,7 @@ export type AdminSettings = {
   forceAdminLibraryOrder?: boolean;
   userDeletionGraceDays?: number;
   userActivityRetentionDays?: number;
+  trustedProxyCidrs?: string[];
   newUserPermissions?: NewUserPermissions;
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
