@@ -13252,6 +13252,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 `AdminUserLibraryAccessMode` 与 GET/PUT 请求响应类型，客户端 PUT 方法发送显式模式和选择；旧逐库 PATCH 方法保持不变。新增 fetch mock 验证路由、请求体和 CSRF。`api-client.test.ts` 63/63 通过，`pnpm --dir web build` 通过。
 
+#### LUX-632：在用户详情管理显式媒体库权限
+
+范围：将用户媒体库权限编辑放入用户详情“权限”模块，允许管理员选择全部媒体库、指定媒体库或无媒体库权限；指定模式仅列出已启用媒体库，使用显式保存，不再把空复选框解释为“全部”。回收站账号只读。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-users-access.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情权限页读取并显示服务端三态模式；选择 `SELECTED` 时仅展示启用媒体库。
+- [x] 管理员可草拟模式/库选择并显式保存；空指定项按 `NONE` 显示，保存错误保留草稿并给出提示。
+- [x] 用户列表不再存在空选择即全部的旧控件；回收站账号只读，加载失败不展示默认权限假象。
+- [x] 定向 Vitest 与 Web build 通过。
+
+短计划：先将现有 UI 回归改为详情页三态和保存行为；把 API 读写接入权限模块，再从列表移除含糊的逐库复选框；补充可访问的单选控件、指定库复选框、保存状态与错误提示。
+
+验证：`pnpm --dir web exec vitest run tests/admin-users-access.test.tsx`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-593、LUX-631。
+
+结果（2026-10-19）：详情页权限区改为显式三态和保存，指定范围只列已启用媒体库，空选择保存为 `NONE`；列表移除原先逐库权限编辑控件，回收站权限只读。定向 `admin-users-access`、用户资料生命周期和播放策略 Vitest 共 15/15 通过，`pnpm --dir web build` 与 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

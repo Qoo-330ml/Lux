@@ -25,6 +25,21 @@
 .lux-admin-user-profile-form .lux-admin-muted { margin: 0; line-height: 1.55; }
 .lux-admin-user-playback-form { display: grid; gap: 14px; max-width: 620px; }
 .lux-admin-user-playback-form .lux-admin-muted { margin: 0; line-height: 1.55; }
+.lux-admin-user-permissions { max-width: 760px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: color-mix(in srgb, var(--lux-surface) 65%, transparent); }
+.lux-admin-user-access-form { display: grid; gap: 14px; max-width: 680px; }
+.lux-admin-user-access-form .lux-admin-muted { margin: 0; line-height: 1.55; }
+.lux-admin-user-access-modes { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.lux-admin-user-access-modes legend { margin-bottom: 2px; color: var(--lux-muted); font-size: .76rem; }
+.lux-admin-user-access-modes label { display: flex; align-items: flex-start; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); cursor: pointer; }
+.lux-admin-user-access-modes label:has(input:checked) { border-color: color-mix(in srgb, var(--lux-accent) 42%, transparent); background: color-mix(in srgb, var(--lux-accent) 7%, transparent); }
+.lux-admin-user-access-modes input { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--lux-accent); }
+.lux-admin-user-access-modes span { display: grid; gap: 3px; min-width: 0; }
+.lux-admin-user-access-modes strong { font-size: .76rem; font-weight: 600; }
+.lux-admin-user-access-modes small { color: var(--lux-muted); font-size: .7rem; line-height: 1.45; }
+.lux-admin-user-access-form .lux-admin-library-access { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.lux-admin-user-access-form .lux-admin-library-access label { min-height: 40px; padding: 8px 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; }
+.lux-admin-user-access-form .lux-admin-library-access input { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; }
+.lux-admin-user-access-form .lux-admin-user-profile-actions { margin-top: 2px; }
 .lux-admin-user-playback-options { display: grid; gap: 11px; min-width: 0; margin: 0; padding: 0; border: 0; }
 .lux-admin-user-playback-options legend { margin-bottom: 2px; }
 .lux-admin-user-playback-form label.lux-admin-user-playback-toggle { display: flex; align-items: center; gap: 10px; min-width: 0; color: var(--lux-text); }
@@ -72,6 +87,7 @@
   .lux-admin-user-pagination { align-items: flex-start; flex-direction: column; }
   .lux-admin-user-pagination > div { width: 100%; justify-content: space-between; }
   .lux-admin-user-row, .lux-admin-deleted-user-row { grid-template-columns: 1fr; }
+  .lux-admin-user-access-form .lux-admin-library-access { grid-template-columns: 1fr; }
   .lux-admin-user-section-nav { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 1px; scrollbar-width: thin; }
   .lux-admin-user-section-nav button { flex: 0 0 auto; }
   .lux-admin-user-module-placeholder { min-height: 180px; padding: 18px; }

@@ -32,7 +32,6 @@ export function AdminUsersPage() {
   });
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
   const deletionGraceDays = settings.data?.userDeletionGraceDays;
-  const libraries = useQuery({ queryKey: queryKeys.adminLibraries, queryFn: () => api.adminLibraries(), enabled: view === "users" });
   const [form, setForm] = useState({ username: "", displayName: "", password: "", isAdmin: false });
   const [formError, setFormError] = useState("");
   const create = useMutation({ mutationFn: () => api.createAdminUser(form), onSuccess: () => { setForm({ username: "", displayName: "", password: "", isAdmin: false }); setFormError(""); void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); }, onError: (error) => setFormError(error.message) });
@@ -42,7 +41,6 @@ export function AdminUsersPage() {
   const items = users.data?.users ?? [];
   const totalCount = users.data?.totalCount ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
-  const availableLibraries = libraries.data?.libraries ?? [];
   function submit(event: FormEvent) { event.preventDefault(); if (!form.username.trim() || !form.password) { setFormError("用户名和密码不能为空"); return; } create.mutate(); }
 
   return (
@@ -72,15 +70,13 @@ export function AdminUsersPage() {
         <label><span>每页</span><select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}><option value={20}>20 条</option><option value={50}>50 条</option><option value={100}>100 条</option></select></label>
       </div>
       {view === "users" ? <>
-        {libraries.isPending ? <p className="lux-admin-muted" role="status">用户列表已加载，正在读取媒体库权限选项…</p> : null}
-        {libraries.error ? <p className="lux-error-copy" role="alert">媒体库权限选项加载失败：{libraries.error.message}</p> : null}
         <section className="lux-admin-panel lux-admin-create-panel"><div className="lux-admin-panel-heading"><div><h2>创建用户</h2></div><Plus size={20} className="lux-admin-panel-icon" /></div><form className="lux-admin-form lux-admin-user-create-form" onSubmit={submit}><label>用户名<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="off" /></label><label>显示名称<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label><label>初始密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" /></label><label className="lux-admin-toggle"><input type="checkbox" checked={form.isAdmin} onChange={(event) => setForm({ ...form, isAdmin: event.target.checked })} /><span>服务器管理员</span></label><button className="lux-button lux-button-primary" type="submit" disabled={create.isPending}><Plus size={16} /> {create.isPending ? "创建中…" : "创建用户"}</button></form>{formError ? <p className="lux-error-copy">{formError}</p> : null}</section>
       </> : null}
       <section className="lux-admin-panel lux-admin-users-list-panel"><div className="lux-admin-panel-heading"><div><h2>{view === "deleted" ? "已删除用户" : "账户列表"}</h2></div><span className="lux-status-pill">共 {totalCount} 个账户</span></div>
         {users.error ? <p className="lux-error-copy" role="alert">列表更新失败：{users.error.message}</p> : null}
         {items.length ? <div className="lux-admin-user-list">{items.map((user) => view === "deleted"
           ? <DeletedUserRow key={user.id} user={user} />
-          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} libraryIds={availableLibraries.map((library) => library.id)} libraryNames={new Map(availableLibraries.map((library) => [library.id, library.name]))} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
+          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
         <div className="lux-admin-user-pagination" aria-label="用户列表分页"><span>{totalCount ? `显示 ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalCount)} 条，共 ${totalCount} 条` : "共 0 条"}</span><div><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button><span>第 {page} / {totalPages} 页</span><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button></div></div>
       </section>
       </>}
@@ -88,17 +84,14 @@ export function AdminUsersPage() {
   );
 }
 
-function UserAdminRow({ user, graceDays, libraryIds, libraryNames }: { user: AdminUser; graceDays?: number; libraryIds: string[]; libraryNames: Map<string, string> }) {
+function UserAdminRow({ user, graceDays }: { user: AdminUser; graceDays?: number }) {
   const queryClient = useQueryClient();
   const [expanded, setExpanded] = useState(false);
   const [newPassword, setNewPassword] = useState("");
-  const access = useQuery({ queryKey: ["admin", "user-access", user.id], queryFn: () => api.adminUserLibraryAccess(user.id), enabled: expanded });
   const update = useMutation({ mutationFn: (input: Record<string, unknown>) => api.updateAdminUser(user.id, input), onSuccess: () => { setNewPassword(""); void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); } });
   const disable = useMutation({ mutationFn: () => api.disableAdminUser(user.id), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }) });
   const enable = useMutation({ mutationFn: () => api.updateAdminUser(user.id, { isDisabled: false }), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }) });
   const remove = useMutation({ mutationFn: () => api.deleteAdminUser(user.id), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }) });
-  const setAccess = useMutation({ mutationFn: ({ libraryId, canView }: { libraryId: string; canView: boolean }) => api.setAdminUserLibraryAccess(user.id, libraryId, canView), onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "user-access", user.id] }) });
-  const enabledLibraryIds = new Set(access.data?.libraryIds ?? []);
   const displayName = user.displayName || user.usernameNormalized;
   const actionPending = disable.isPending || enable.isPending || remove.isPending;
 
@@ -197,29 +190,8 @@ function UserAdminRow({ user, graceDays, libraryIds, libraryNames }: { user: Adm
           </div>
           <div className="lux-admin-access-block">
             <div className="lux-admin-subpanel-heading"><strong>媒体库访问</strong></div>
-            {access.isPending ? (
-              <p className="lux-admin-muted" role="status">正在读取媒体库权限…</p>
-            ) : access.error ? (
-              <p className="lux-error-copy" role="alert">读取媒体库权限失败：{access.error.message}</p>
-            ) : libraryIds.length === 0 ? (
-              <p className="lux-admin-muted">暂无媒体库。</p>
-            ) : (
-              <>
-                <p className="lux-admin-muted">未勾选任何媒体库表示可访问全部已启用媒体库；勾选后仅可访问所选媒体库。</p>
-                <div className="lux-admin-library-access">
-                  {libraryIds.map((libraryId) => (
-                    <label key={libraryId}>
-                      <input
-                        type="checkbox"
-                        checked={enabledLibraryIds.has(libraryId)}
-                        onChange={(event) => setAccess.mutate({ libraryId, canView: event.target.checked })}
-                      />
-                      <span>{libraryNames.get(libraryId) ?? libraryId}</span>
-                    </label>
-                  ))}
-                </div>
-              </>
-            )}
+            <p className="lux-admin-muted">权限范围支持全部、指定和无访问。请在用户详情的权限模块中设置。</p>
+            <Link className="lux-button lux-button-compact lux-button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}?section=permissions`}>设置媒体库权限</Link>
           </div>
           <div className="lux-admin-password-row">
             <label>
