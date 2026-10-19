@@ -14040,6 +14040,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增偏好复制预览和应用的 Web 输入/响应类型及客户端方法，复用自动 CSRF 和统一错误处理。两项新测试验证精确路径、JSON 请求体、类型化响应及 CSRF；`pnpm --dir web exec vitest run tests/api-client.test.ts` 69/69 通过。Web build 在临时替换为提交版 `AdminDashboardNowPlaying.tsx` 后通过，退出前逐字节恢复工作区文件；该用户未提交文件本身含未使用 helper，仍未纳入本任务。
 
+#### LUX-671：在用户列表预览并复制账户偏好
+
+范围：用户列表的当前页显式选择增加偏好复制入口。管理员搜索一个未被选为目标的来源账号，选择 Appearance/Home/Playback 组，预览所选组快照和每个目标版本，再按预览版本应用。复制结果逐账号显示；成功后清空父列表选择。媒体库排序和播放完成比例由后续任务加入服务端版本合同后再扩展。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserPreferenceCopyDialog.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-preference-copy.test.tsx`。
+
+验收标准：
+
+- [x] 只复制当前页明确选中的 1–100 个目标；来源不得同时是目标，筛选、换页和视图变化仍清空选择。
+- [x] 来源搜索、偏好组选择、预览值/目标版本与应用均可用；未预览或预览条件变更时不能应用。
+- [x] 加载、无结果、错误、逐目标成功/失败及关闭状态清楚且可键盘操作；成功后清空列表选择并刷新数据。
+- [x] 组件交互定向测试和 Web production build 通过。
+
+短计划：先写目标选择、来源和预览、版本化应用、逐项目结果的失败交互测试；再实现独立对话框与用户列表入口，运行定向 Vitest、build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-preference-copy.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-667、LUX-670。
+
+结果（2026-10-19）：新增用户列表偏好复制对话框，按当前页选中用户固定目标快照；来源查询排除目标账号，预览显示选中偏好和来源/目标版本，应用使用预览的版本条件并逐账号显示结果。新增交互测试覆盖选择、预览、版本冲突、清空选择、条件变更和失败后重预览。`pnpm --dir web exec vitest run tests/admin-user-preference-copy.test.tsx tests/admin-user-batch-actions.test.tsx tests/admin-users-delete.test.tsx` 12/12 通过；`pnpm --dir web build` 通过。构建期间临时使用已提交版 `AdminDashboardNowPlaying.tsx` 并在退出时逐字节恢复用户未提交内容；`git diff --check` 通过。模块四的媒体库顺序和播放完成比例仍由后续服务端版本合同任务补齐。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

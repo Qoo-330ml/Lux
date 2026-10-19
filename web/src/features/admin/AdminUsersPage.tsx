@@ -5,6 +5,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminUser, AdminUserListStatus, AdminUserPermissionPresetBatchErrorCode, AdminUserSortBy, AdminUserSortOrder } from "../../lib/api/types";
+import { AdminUserPreferenceCopyDialog } from "./AdminUserPreferenceCopyDialog";
 import "./user-management.css";
 
 export function AdminUsersPage() {
@@ -43,6 +44,7 @@ export function AdminUsersPage() {
   const [batchPresetId, setBatchPresetId] = useState("");
   const [batchResults, setBatchResults] = useState<{ presetName: string; results: Array<{ userId: string; userName: string; success: boolean; errorCode: AdminUserPermissionPresetBatchErrorCode | null }> } | null>(null);
   const [batchError, setBatchError] = useState("");
+  const [copyDialogOpen, setCopyDialogOpen] = useState(false);
   const items = users.data?.users ?? [];
   const totalCount = users.data?.totalCount ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
@@ -139,8 +141,9 @@ export function AdminUsersPage() {
         <section className="lux-admin-panel lux-admin-user-batch-panel" aria-labelledby="lux-admin-user-batch-title">
           <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-batch-title">批量应用权限预设</h2><p>仅对当前页勾选的用户操作，换页或筛选后会清空选择；每批最多 100 人。</p></div></div>
           <div className="lux-admin-user-batch-controls">
-            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label={allCurrentPageSelected ? "取消本页全选" : "全选本页"} onClick={toggleCurrentPageSelection} disabled={!items.length || applyBatchPreset.isPending}>{allCurrentPageSelected ? "取消本页全选" : "全选本页"}</button>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label={allCurrentPageSelected ? "取消本页全选" : "全选本页"} onClick={toggleCurrentPageSelection} disabled={!items.length || applyBatchPreset.isPending || copyDialogOpen}>{allCurrentPageSelected ? "取消本页全选" : "全选本页"}</button>
             <span aria-live="polite">当前页已选 {selectedOnCurrentPage.length} 人</span>
+            <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制偏好" onClick={() => setCopyDialogOpen(true)} disabled={!selectedOnCurrentPage.length || copyDialogOpen}>复制偏好</button>
             <label>权限预设<select aria-label="批量权限预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || applyBatchPreset.isPending}>
               <option value="">选择权限预设</option>
               {(permissionPresets.data?.presets ?? []).map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
@@ -151,12 +154,20 @@ export function AdminUsersPage() {
           {batchError ? <p className="lux-error-copy" role="alert">批量应用失败：{batchError}</p> : null}
           {batchResults ? <div className="lux-admin-user-batch-results" role="status" aria-label="批量应用结果"><strong>权限预设“{batchResults.presetName}”的应用结果</strong><ul>{batchResults.results.map((result) => <li key={result.userId} className={result.success ? "is-success" : "is-failure"}>{result.userName}：{result.success ? "成功" : batchPermissionPresetErrorMessage(result.errorCode)}</li>)}</ul></div> : null}
         </section>
+        {copyDialogOpen ? <AdminUserPreferenceCopyDialog
+          targets={selectedOnCurrentPage.map((user) => ({ id: user.id, name: user.displayName || user.usernameNormalized }))}
+          onClose={() => setCopyDialogOpen(false)}
+          onApplied={() => {
+            setSelectedUserIds([]);
+            void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers });
+          }}
+        /> : null}
       </> : null}
       <section className="lux-admin-panel lux-admin-users-list-panel"><div className="lux-admin-panel-heading"><div><h2>{view === "deleted" ? "已删除用户" : "账户列表"}</h2></div><span className="lux-status-pill">共 {totalCount} 个账户</span></div>
         {users.error ? <p className="lux-error-copy" role="alert">列表更新失败：{users.error.message}</p> : null}
         {items.length ? <div className="lux-admin-user-list">{items.map((user) => view === "deleted"
           ? <DeletedUserRow key={user.id} user={user} />
-          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} selected={selectedUserIds.includes(user.id)} selectionDisabled={applyBatchPreset.isPending} onSelectionChange={(selected) => toggleUserSelection(user.id, selected)} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
+          : <UserAdminRow key={user.id} user={user} graceDays={deletionGraceDays} selected={selectedUserIds.includes(user.id)} selectionDisabled={applyBatchPreset.isPending || copyDialogOpen} onSelectionChange={(selected) => toggleUserSelection(user.id, selected)} />)}</div> : <p className="lux-admin-muted lux-admin-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>}
         <div className="lux-admin-user-pagination" aria-label="用户列表分页"><span>{totalCount ? `显示 ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalCount)} 条，共 ${totalCount} 条` : "共 0 条"}</span><div><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button><span>第 {page} / {totalPages} 页</span><button className="lux-button lux-button-compact lux-button-secondary" type="button" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button></div></div>
       </section>
       </>}

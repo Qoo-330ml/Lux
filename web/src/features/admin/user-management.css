@@ -89,6 +89,34 @@
 .lux-admin-user-batch-results ul { display: grid; gap: 5px; margin: 8px 0 0; padding-left: 18px; }
 .lux-admin-user-batch-results .is-success { color: var(--lux-success, #64bd91); }
 .lux-admin-user-batch-results .is-failure { color: var(--lux-danger, #d86d6d); }
+.lux-admin-user-preference-copy-backdrop { position: fixed; z-index: 60; inset: 0; display: grid; place-items: center; padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); background: rgba(0,0,0,.68); backdrop-filter: blur(6px); }
+.lux-admin-user-preference-copy { display: grid; gap: 16px; width: min(640px, 100%); max-height: min(88dvh, 820px); overflow: auto; padding: clamp(16px, 3vw, 24px); border: 1px solid var(--lux-line-soft); border-radius: 15px; color: var(--lux-text); background: var(--lux-panel); box-shadow: 0 20px 60px rgba(0,0,0,.38); }
+.lux-admin-user-preference-copy-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.lux-admin-user-preference-copy-heading h2 { margin: 4px 0 0; font-size: 1.15rem; }
+.lux-admin-user-preference-copy-heading p, .lux-admin-user-preference-copy-form > p, .lux-admin-user-preference-copy-preview > p { margin: 6px 0 0; color: var(--lux-muted); font-size: .76rem; line-height: 1.5; }
+.lux-admin-user-preference-copy-targets { padding: 12px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: color-mix(in srgb, var(--lux-surface) 58%, transparent); }
+.lux-admin-user-preference-copy-targets strong { font-size: .8rem; }
+.lux-admin-user-preference-copy-targets ul { display: flex; flex-wrap: wrap; gap: 6px; max-height: 78px; overflow: auto; margin: 8px 0 0; padding: 0; list-style: none; }
+.lux-admin-user-preference-copy-targets li { padding: 4px 8px; border: 1px solid var(--lux-line-soft); border-radius: 6px; color: var(--lux-muted); font-size: .72rem; }
+.lux-admin-user-preference-copy-form { display: grid; gap: 12px; }
+.lux-admin-user-preference-copy-form > label { display: grid; gap: 6px; color: var(--lux-muted); font-size: .75rem; }
+.lux-admin-user-preference-copy-form input[type="search"], .lux-admin-user-preference-copy-form select { width: 100%; min-width: 0; min-height: 38px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-text); background: color-mix(in srgb, var(--lux-surface) 78%, transparent); font: inherit; }
+.lux-admin-user-preference-copy-form fieldset { display: flex; flex-wrap: wrap; gap: 10px 16px; margin: 0; padding: 10px 12px 12px; border: 1px solid var(--lux-line-soft); border-radius: 9px; }
+.lux-admin-user-preference-copy-form legend { padding: 0 5px; color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-user-preference-copy-form fieldset label { display: flex; align-items: center; gap: 7px; color: var(--lux-text); font-size: .76rem; }
+.lux-admin-user-preference-copy-form fieldset input { accent-color: var(--lux-accent); }
+.lux-admin-user-preference-copy-preview, .lux-admin-user-preference-copy-results { display: grid; gap: 9px; padding-top: 14px; border-top: 1px solid var(--lux-line-soft); }
+.lux-admin-user-preference-copy-preview h3, .lux-admin-user-preference-copy-results h3 { margin: 0; font-size: .86rem; }
+.lux-admin-user-preference-copy-snapshot { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 6px 12px; margin: 0; font-size: .75rem; }
+.lux-admin-user-preference-copy-snapshot dt { color: var(--lux-muted); }
+.lux-admin-user-preference-copy-snapshot dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.lux-admin-user-preference-copy-versions, .lux-admin-user-preference-copy-results ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.lux-admin-user-preference-copy-versions li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 9px; border-radius: 7px; background: color-mix(in srgb, var(--lux-surface) 58%, transparent); font-size: .73rem; }
+.lux-admin-user-preference-copy-versions li span:last-child { color: var(--lux-muted); white-space: nowrap; }
+.lux-admin-user-preference-copy-results { font-size: .75rem; }
+.lux-admin-user-preference-copy-results li.is-success { color: var(--lux-success, #64bd91); }
+.lux-admin-user-preference-copy-results li.is-failure { color: var(--lux-danger, #d86d6d); }
+.lux-admin-user-preference-copy-footer { display: flex; justify-content: flex-end; padding-top: 4px; }
 .lux-admin-user-summary small + small { margin-top: 3px; }
 .lux-admin-users-empty { margin: 10px 0 22px; }
 .lux-admin-user-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
