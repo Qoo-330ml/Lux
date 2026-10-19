@@ -15193,6 +15193,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：先添加合同测试并确认因客户端方法缺失而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user activity"` 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。测试覆盖过滤值、用户 ID 编码、默认分页和 GET 请求方式。
 
+#### LUX-725：在用户详情展示活动时间线
+
+范围：将模块七活动记录页接入 LUX-723 API 和 LUX-724 客户端合同，显示按时间倒序返回的活动、事件类型与时间筛选以及有界分页。活动条目只展示脱敏元数据中的已知设备、客户端、状态和 IP 字段，不渲染原始 JSON。提供读取、错误重试、空结果和筛选校验状态；本任务不补活动事件生产或设备管理规则。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-activity.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情的“活动记录”页读取该用户活动，不读取其他用户或归档日志。
+- [x] 支持按事件类型、起止本地时间筛选；反向时间范围在提交前提示；更改筛选回到第一页。
+- [x] 展示活动类型、发生时间、可用目标和安全元数据；凭证/原始 JSON 不进入页面。
+- [x] 具备加载、错误重试、空结果、总数和上一页/下一页；分页使用服务端总数。
+- [x] 组件定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先为详情页加载活动、筛选分页及错误/空状态增加组件回归并确认现页仍是占位；再增加时间线查询与安全元数据展示、样式；最后运行定向 Vitest、Web build 和 diff check。
+
+依赖：LUX-723、LUX-724。
+
+结果（2026-10-20）：用户详情的活动页接入活动索引分页 API，提供事件类型、本地起止日期时间筛选、清除筛选、服务端总数和分页。结束时间将分钟边界扩至该分钟的第 59 秒，保持用户选择时间粒度下的包含端点语义；反向/无效范围提交前拒绝。列表白名单展示设备、客户端、版本、播放状态和 IP，不渲染原始 JSON 或未知元数据字段。
+
+验证：TDD RED 的组件回归确认该页仍是占位；实现后 `pnpm --dir web exec vitest run tests/admin-user-activity.test.tsx tests/admin-user-sessions.test.tsx` 11/11、`pnpm --dir web build` 和 `git diff --check` 通过。Playwright 使用合成 API 数据验证活动读取、筛选查询、翻页、敏感字段不显示；390px 视口的活动面板/筛选区无水平溢出，浏览器控制台无错误。截图保存于 `output/playwright/admin-user-activity-20261020-mobile.png`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -224,3 +224,37 @@
   .lux-admin-user-sessions > .lux-admin-panel-heading { align-items: flex-start; flex-direction: column; }
   .lux-admin-user-session-revoke-all { width: 100%; }
 }
+.lux-admin-user-activity { display: grid; gap: 14px; min-width: 0; max-width: 1180px; }
+.lux-admin-user-activity > .lux-admin-panel-heading { margin: 0; }
+.lux-admin-user-activity h2 { margin: 4px 0 0; color: var(--lux-text); font-size: .95rem; }
+.lux-admin-user-activity-summary { margin: 7px 0 0; color: var(--lux-muted); font-size: .74rem; }
+.lux-admin-user-activity-filters { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(170px, 1fr) minmax(170px, 1fr) auto; align-items: end; gap: 10px; min-width: 0; }
+.lux-admin-user-activity-filters > label { display: grid; gap: 6px; min-width: 0; color: var(--lux-muted); font-size: .7rem; }
+.lux-admin-user-activity-filters input, .lux-admin-user-activity-filters select { width: 100%; min-width: 0; min-height: 38px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: color-mix(in srgb, var(--lux-surface) 78%, transparent); font: inherit; font-size: .74rem; }
+.lux-admin-user-activity-filters input:focus, .lux-admin-user-activity-filters select:focus { border-color: color-mix(in srgb, var(--lux-accent) 65%, var(--lux-line)); }
+.lux-admin-user-activity-filter-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.lux-admin-user-activity-state { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.lux-admin-user-activity-state p { margin: 0; }
+.lux-admin-user-activity-table-wrap { min-width: 0; overflow-x: auto; }
+.lux-admin-user-activity-table { width: 100%; min-width: 760px; border-collapse: collapse; color: var(--lux-text); font-size: .74rem; text-align: left; }
+.lux-admin-user-activity-table th, .lux-admin-user-activity-table td { padding: 12px 13px; border-bottom: 1px solid var(--lux-line-soft); vertical-align: top; }
+.lux-admin-user-activity-table thead th { color: var(--lux-subtle); font-size: .67rem; font-weight: 600; white-space: nowrap; }
+.lux-admin-user-activity-table tbody th { min-width: 130px; font-weight: 550; }
+.lux-admin-user-activity-table tbody tr:last-child th, .lux-admin-user-activity-table tbody tr:last-child td { border-bottom: 0; }
+.lux-admin-user-activity-event-type { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .64rem; font-weight: 400; }
+.lux-admin-user-activity-table td:nth-child(3) { max-width: 240px; overflow-wrap: anywhere; }
+.lux-admin-user-activity-metadata { display: grid; gap: 4px; min-width: 150px; margin: 0; padding: 0; list-style: none; }
+.lux-admin-user-activity-metadata li { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 8px; }
+.lux-admin-user-activity-metadata li span:first-child { color: var(--lux-muted); }
+.lux-admin-user-activity-metadata li span:last-child { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .lux-admin-user-activity-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lux-admin-user-activity-filter-actions { grid-column: 1 / -1; }
+}
+@media (max-width: 480px) {
+  .lux-admin-user-activity-filters { grid-template-columns: minmax(0, 1fr); }
+  .lux-admin-user-activity-filter-actions { grid-column: auto; }
+  .lux-admin-user-activity-filter-actions > button { flex: 1 1 auto; }
+  .lux-admin-user-activity .lux-admin-user-session-pagination { align-items: flex-start; flex-direction: column; }
+  .lux-admin-user-activity .lux-admin-user-session-pagination > div { width: 100%; justify-content: space-between; }
+}
