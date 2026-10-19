@@ -3,7 +3,8 @@ use std::fmt;
 
 use crate::{
     application::settings::NewUserPermissions,
-    storage::{Database, StorageError},
+    domain::ids::UserId,
+    storage::{ApplyUserPermissionPreset, Database, StorageError},
 };
 
 const PRESETS_SETTING_KEY: &str = "user_permission_presets";
@@ -70,6 +71,41 @@ impl fmt::Display for UserPermissionPresetError {
 impl std::error::Error for UserPermissionPresetError {}
 
 impl From<StorageError> for UserPermissionPresetError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+// LUX-646 exposes this result through the administrator API.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum UserPermissionPresetApplicationError {
+    InvalidUserId,
+    InvalidSnapshot,
+    LastManager,
+    NotFound,
+    PresetNotFound,
+    Storage(StorageError),
+}
+
+impl fmt::Display for UserPermissionPresetApplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUserId => formatter.write_str("user ID is invalid"),
+            Self::InvalidSnapshot => formatter.write_str("permission preset snapshot is invalid"),
+            Self::LastManager => {
+                formatter.write_str("at least one active server manager is required")
+            }
+            Self::NotFound => formatter.write_str("user was not found"),
+            Self::PresetNotFound => formatter.write_str("permission preset was not found"),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for UserPermissionPresetApplicationError {}
+
+impl From<StorageError> for UserPermissionPresetApplicationError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
@@ -163,6 +199,64 @@ pub(crate) async fn delete_user_permission_preset(
     }
     presets.remove(index);
     write_custom_presets(database, expected.as_deref(), &presets).await
+}
+
+// LUX-646 connects the preset application service to the administrator route.
+#[allow(dead_code)]
+pub(crate) async fn apply_user_permission_preset(
+    database: &Database,
+    user_id: &str,
+    preset_id: &str,
+) -> Result<UserPermissionPreset, UserPermissionPresetApplicationError> {
+    if user_id.parse::<UserId>().is_err() {
+        return Err(UserPermissionPresetApplicationError::InvalidUserId);
+    }
+    let mut preset = list_user_permission_presets(database)
+        .await
+        .map_err(|error| match error {
+            UserPermissionPresetError::Storage(error) => {
+                UserPermissionPresetApplicationError::Storage(error)
+            }
+            _ => UserPermissionPresetApplicationError::InvalidSnapshot,
+        })?
+        .into_iter()
+        .find(|preset| preset.id == preset_id)
+        .ok_or(UserPermissionPresetApplicationError::PresetNotFound)?;
+
+    preset.permissions.normalize_empty_selection();
+    if !preset.permissions.has_valid_shape()
+        || (preset.permissions.library_access_mode == "SELECTED"
+            && !database
+                .are_enabled_regular_libraries(&preset.permissions.library_ids)
+                .await?)
+    {
+        return Err(UserPermissionPresetApplicationError::InvalidSnapshot);
+    }
+    let preset_version = i64::try_from(preset.version)
+        .map_err(|_| UserPermissionPresetApplicationError::InvalidSnapshot)?;
+    let permissions = preset.permissions.stored_snapshot();
+    match database
+        .apply_user_permission_preset(
+            user_id,
+            ApplyUserPermissionPreset {
+                preset_id: &preset.id,
+                preset_name: &preset.name,
+                preset_version,
+                is_admin: preset.is_admin,
+                can_manage_server: preset.can_manage_server,
+                permissions,
+            },
+        )
+        .await
+    {
+        Ok(true) => Ok(preset),
+        Ok(false) => Err(UserPermissionPresetApplicationError::NotFound),
+        Err(StorageError::LastManager) => Err(UserPermissionPresetApplicationError::LastManager),
+        Err(StorageError::Conflict(_)) => {
+            Err(UserPermissionPresetApplicationError::InvalidSnapshot)
+        }
+        Err(error) => Err(UserPermissionPresetApplicationError::Storage(error)),
+    }
 }
 
 fn built_in_presets() -> Vec<UserPermissionPreset> {
@@ -295,7 +389,13 @@ async fn write_custom_presets(
 
 #[cfg(test)]
 mod tests {
-    use crate::{application::settings::NewUserPermissions, config::Config, storage::Database};
+    use crate::{
+        application::{libraries::LibraryService, settings::NewUserPermissions},
+        config::Config,
+        domain::ids::UserId,
+        library::LibraryKind,
+        storage::Database,
+    };
 
     use super::*;
 
@@ -416,6 +516,143 @@ mod tests {
 
         assert_eq!(created.permissions.library_access_mode, "NONE");
         assert!(created.permissions.library_ids.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applies_permission_snapshot_and_keeps_source_after_preset_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Applied preset library", LibraryKind::Movie, false)
+            .await?;
+        let mut input = preset_input("Family");
+        input.permissions.library_access_mode = "SELECTED".to_owned();
+        input.permissions.library_ids = vec![library.id.to_string()];
+        input.permissions.can_download = true;
+        input.permissions.can_play = false;
+        input.permissions.max_simultaneous_playbacks = 5;
+        input.permissions.allow_video_transcode = false;
+        let preset = create_user_permission_preset(&database, input).await?;
+        let user_id = UserId::new().to_string();
+        database
+            .insert_user(
+                &user_id,
+                &user_id,
+                "Preset Target",
+                "test-hash",
+                false,
+                true,
+            )
+            .await?;
+
+        let applied = apply_user_permission_preset(&database, &user_id, &preset.id).await?;
+
+        assert_eq!(applied.id, preset.id);
+        assert_eq!(applied.version, 1);
+        assert_eq!(
+            database.list_accessible_library_ids(&user_id).await?,
+            vec![library.id.to_string()]
+        );
+        let playback_policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("user exists");
+        assert!(!playback_policy.can_play);
+        assert_eq!(playback_policy.max_simultaneous_playbacks, 5);
+        assert!(!playback_policy.allow_video_transcode);
+
+        delete_user_permission_preset(&database, &preset.id, 1).await?;
+        let source: (String, String, i64) = sqlx::query_as(
+            "SELECT preset_id, preset_name, preset_version
+             FROM user_permission_preset_sources WHERE user_id = ?",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(source, (preset.id, "Family".to_owned(), 1));
+        assert_eq!(
+            database.list_accessible_library_ids(&user_id).await?,
+            vec![library.id.to_string()]
+        );
+        let builtin = apply_user_permission_preset(&database, &user_id, "builtin-user").await?;
+        assert!(builtin.is_builtin);
+        assert_eq!(builtin.id, "builtin-user");
+        assert!(
+            database
+                .list_accessible_library_ids(&user_id)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_targets_expired_library_snapshots_and_last_manager_demotion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        assert!(matches!(
+            apply_user_permission_preset(&database, "not-a-uuid", "builtin-user").await,
+            Err(UserPermissionPresetApplicationError::InvalidUserId)
+        ));
+        let missing_user_id = UserId::new().to_string();
+        assert!(matches!(
+            apply_user_permission_preset(&database, &missing_user_id, "builtin-user").await,
+            Err(UserPermissionPresetApplicationError::NotFound)
+        ));
+        let missing_preset_user_id = UserId::new().to_string();
+        database
+            .insert_user(
+                &missing_preset_user_id,
+                &missing_preset_user_id,
+                "Missing Preset Target",
+                "test-hash",
+                false,
+                true,
+            )
+            .await?;
+        assert!(matches!(
+            apply_user_permission_preset(&database, &missing_preset_user_id, "missing-preset")
+                .await,
+            Err(UserPermissionPresetApplicationError::PresetNotFound)
+        ));
+
+        let library = LibraryService::new(database.clone())
+            .create_library("Disabled preset library", LibraryKind::Movie, false)
+            .await?;
+        let mut input = preset_input("Enabled library only");
+        input.permissions.library_access_mode = "SELECTED".to_owned();
+        input.permissions.library_ids = vec![library.id.to_string()];
+        let preset = create_user_permission_preset(&database, input).await?;
+        sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        assert!(matches!(
+            apply_user_permission_preset(&database, &missing_preset_user_id, &preset.id).await,
+            Err(UserPermissionPresetApplicationError::InvalidSnapshot)
+        ));
+        let mode: String = sqlx::query_scalar("SELECT library_access_mode FROM users WHERE id = ?")
+            .bind(&missing_preset_user_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(mode, "ALL");
+
+        let manager_id = UserId::new().to_string();
+        database
+            .insert_user(
+                &manager_id,
+                &manager_id,
+                "Only Manager",
+                "test-hash",
+                true,
+                true,
+            )
+            .await?;
+        assert!(matches!(
+            apply_user_permission_preset(&database, &manager_id, "builtin-user").await,
+            Err(UserPermissionPresetApplicationError::LastManager)
+        ));
         Ok(())
     }
 

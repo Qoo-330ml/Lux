@@ -13525,6 +13525,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增存储事务一次性应用角色、下载、播放/转码、媒体库访问与来源快照；`SELECTED` 仅接受启用的普通媒体库，`ALL`/`NONE` 清除旧选择。事务失败回滚全部变更，已删除/不存在用户拒绝操作，单管理员保护并防止并发降权共同移除最后管理员。`apply_user_permission_preset` 定向回归 3/3、Rust build、fmt check、diff check 通过；SQLite 并发回归通过，PostgreSQL 行锁逻辑已编译但未接运行时验证。
 
+#### LUX-645：解析并校验用户权限预设应用服务
+
+范围：在 application 层按预设 ID 读取内置或自定义预设，检查目标用户和当前有效的媒体库快照，再调用 LUX-644 原子存储操作。自定义预设之后可删除，用户已应用的权限与来源快照不受影响。本任务不暴露 HTTP 接口。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_presets.rs`。
+
+验收标准：
+
+- [x] 管理员与自定义预设都能按当前快照应用；未知预设、无效用户 ID 和已删除用户返回明确业务结果。
+- [x] 媒体库已停用或权限快照失效时拒绝应用；最后管理员保护错误保留为稳定业务错误。
+- [x] application 定向回归、Rust build、fmt 与 diff check 通过。
+
+短计划：先增加服务成功、过期媒体库、缺失目标及最后管理员回归；再实现预设解析、快照校验和存储错误映射。
+
+验证：`cargo test --locked --lib user_presets`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639、LUX-640、LUX-644。
+
+结果（2026-10-19）：application 服务可应用内置或自定义预设快照，校验用户 UUID、预设存在性和当前启用媒体库，并映射最后管理员与存储冲突错误。删除已应用的自定义预设不会改变用户权限或来源记录。`user_presets` 定向回归 7/7、Rust build、fmt check 和 diff check 通过；PostgreSQL 行锁仍未运行时验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
