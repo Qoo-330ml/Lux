@@ -13855,6 +13855,408 @@ async fn configured_user_deletion_grace_period_sets_purge_deadline()
 }
 
 #[tokio::test]
+async fn disable_and_soft_delete_user_revoke_credentials_and_stop_playback_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("User deletion", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title,
+            identification_status, has_available_source
+         ) VALUES ('user-deletion-item', ?, 'MOVIE', 'Deletion', 'deletion',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    for (user_id, is_disabled) in [("deletion-target", 0), ("deletion-other", 0)] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash,
+                can_download, is_disabled
+             ) VALUES (?, ?, ?, 'test', 1, ?)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(is_disabled)
+        .execute(database.pool())
+        .await?;
+    }
+    for (session_id, user_id, hash) in [
+        ("delete-web-session", "deletion-target", vec![1_u8; 32]),
+        ("other-web-session", "deletion-other", vec![2_u8; 32]),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_sessions (
+                id, user_id, session_token_hash, csrf_token_hash, expires_at
+             ) VALUES (?, ?, ?, ?, unixepoch() + 3600)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(&hash)
+        .bind(vec![3_u8; 32])
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO access_tokens (
+            id, token_hash, user_id, device_id, client_name, device_name, client_version
+         ) VALUES ('delete-access-token', ?, 'deletion-target', 'device', 'client', 'device', '1')",
+    )
+    .bind(vec![4_u8; 32])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+            id, token_hash, user_id, device_id, client_name, device_name, client_version
+         ) VALUES ('other-access-token', ?, 'deletion-other', 'device', 'client', 'device', '1')",
+    )
+    .bind(vec![5_u8; 32])
+    .execute(database.pool())
+    .await?;
+    for (session_id, user_id, play_session_id, state) in [
+        ("delete-playing", "deletion-target", "playing", "PLAYING"),
+        ("delete-paused", "deletion-target", "paused", "PAUSED"),
+        ("other-playing", "deletion-other", "other", "PLAYING"),
+    ] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                id, user_id, item_id, play_session_id, device_id, state
+             ) VALUES (?, ?, 'user-deletion-item', ?, 'device', ?)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(state)
+        .execute(database.pool())
+        .await?;
+    }
+    for (session_id, plan) in [
+        ("delete-web-direct", "DIRECT"),
+        ("delete-web-hls", "SERVER_HLS"),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (
+                id, user_id, item_id, play_session_id, tier, plan, state,
+                expires_at, last_heartbeat_at
+             ) VALUES (?, 'deletion-target', 'user-deletion-item', ?, 0, ?, 'ACTIVE',
+                       unixepoch() + 3600, unixepoch())",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .bind(plan)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO web_playback_sessions (
+            id, user_id, item_id, play_session_id, tier, plan, state,
+            expires_at, last_heartbeat_at
+         ) VALUES ('other-web-active', 'deletion-other', 'user-deletion-item',
+                   'other-web-active', 0, 'DIRECT', 'ACTIVE', unixepoch() + 3600, unixepoch())",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_playback_sessions (
+            id, user_id, item_id, play_session_id, tier, plan, state,
+            expires_at, last_heartbeat_at
+         ) VALUES ('other-web-hls', 'deletion-other', 'user-deletion-item',
+                   'other-web-hls', 0, 'SERVER_HLS', 'ACTIVE', unixepoch() + 3600, unixepoch())",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(
+        database.soft_delete_user("deletion-target").await?,
+        Some(vec!["delete-web-hls".to_owned()])
+    );
+    let deleted: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT is_disabled, is_disabled_before_delete, can_download,
+                deleted_at, deletion_purge_at
+         FROM users WHERE id = 'deletion-target'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(deleted.0, 1);
+    assert_eq!(deleted.1, 0);
+    assert_eq!(deleted.2, 1, "permissions remain available for recovery");
+    assert_eq!(deleted.4 - deleted.3, 7 * 86_400);
+    let web_session_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'delete-web-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(web_session_revoked.is_some());
+    let access_token_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'delete-access-token'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(access_token_revoked.is_some());
+    let playback_states: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT id, state, is_paused FROM playback_sessions
+         WHERE user_id = 'deletion-target' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        playback_states,
+        vec![
+            ("delete-paused".to_owned(), "STOPPED".to_owned(), 0),
+            ("delete-playing".to_owned(), "STOPPED".to_owned(), 0),
+        ]
+    );
+    let web_playback_states: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, state FROM web_playback_sessions
+         WHERE user_id = 'deletion-target' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        web_playback_states,
+        vec![
+            ("delete-web-direct".to_owned(), "STOPPED".to_owned()),
+            ("delete-web-hls".to_owned(), "STOPPED".to_owned()),
+        ]
+    );
+    let other_session_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'other-web-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(other_session_revoked.is_none());
+    let other_playback_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = 'other-playing'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_playback_state, "PLAYING");
+    let other_web_playback_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'other-web-active'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_web_playback_state, "ACTIVE");
+
+    let (_, disabled_hls_ids) = database
+        .update_user_with_hls_session_ids(
+            "deletion-other",
+            UpdateUser {
+                display_name: None,
+                password_hash: None,
+                has_password: None,
+                is_disabled: Some(true),
+                is_admin: None,
+                can_manage_server: None,
+                can_remote_access: None,
+                can_download: None,
+            },
+        )
+        .await?
+        .ok_or("other user should be disabled")?;
+    assert_eq!(disabled_hls_ids, ["other-web-hls"]);
+    let other_web_session_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'other-web-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(other_web_session_revoked.is_some());
+    let other_access_token_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'other-access-token'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(other_access_token_revoked.is_some());
+    let disabled_playback_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = 'other-playing'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(disabled_playback_state, "STOPPED");
+    let disabled_web_playback_states: Vec<String> = sqlx::query_scalar(
+        "SELECT state FROM web_playback_sessions
+         WHERE user_id = 'deletion-other' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(disabled_web_playback_states, ["STOPPED", "STOPPED"]);
+
+    assert!(
+        database
+            .soft_delete_user("deletion-target")
+            .await?
+            .is_none()
+    );
+    let after_repeat: (i64, i64) = sqlx::query_as(
+        "SELECT deleted_at, deletion_purge_at FROM users WHERE id = 'deletion-target'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!((after_repeat.0, after_repeat.1), (deleted.3, deleted.4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_deleted_user_restores_disabled_state_without_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (user_id, is_disabled) in [("restore-enabled", 0_i64), ("restore-disabled", 1_i64)] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash, is_disabled, can_download
+             ) VALUES (?, ?, ?, 'test', ?, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(is_disabled)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO web_sessions (
+                id, user_id, session_token_hash, csrf_token_hash, expires_at
+             ) VALUES (?, ?, ?, ?, unixepoch() + 3600)",
+        )
+        .bind(format!("{user_id}-session"))
+        .bind(user_id)
+        .bind(format!("{user_id}-session-token").into_bytes())
+        .bind(format!("{user_id}-csrf-token").into_bytes())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name, client_version
+             ) VALUES (?, ?, ?, 'device', 'client', 'device', '1')",
+        )
+        .bind(format!("{user_id}-access-token"))
+        .bind(format!("{user_id}-access-token-hash").into_bytes())
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+        assert!(database.soft_delete_user(user_id).await?.is_some());
+    }
+
+    for (user_id, expected_disabled) in [("restore-enabled", 0_i64), ("restore-disabled", 1_i64)] {
+        assert!(database.restore_deleted_user(user_id).await?);
+        let restored: (i64, i64, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT is_disabled, is_disabled_before_delete, can_download,
+                    deleted_at, deletion_purge_at
+             FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(restored.0, expected_disabled);
+        assert_eq!(restored.1, 0);
+        assert_eq!(restored.2, 1);
+        assert!(restored.3.is_none());
+        assert!(restored.4.is_none());
+        let revoked_at: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = ?")
+                .bind(format!("{user_id}-session"))
+                .fetch_one(database.pool())
+                .await?;
+        assert!(revoked_at.is_some());
+        let access_token_revoked_at: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = ?")
+                .bind(format!("{user_id}-access-token"))
+                .fetch_one(database.pool())
+                .await?;
+        assert!(access_token_revoked_at.is_some());
+        assert!(
+            !database.restore_deleted_user(user_id).await?,
+            "a second restore must not alter the restored account"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_deletion_protects_last_manager_and_only_purges_deleted_users()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in ["purge-manager-one", "purge-manager-two"] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash,
+                is_admin, can_manage_server
+             ) VALUES (?, ?, ?, 'test', 1, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('purge-active-user', 'purge-active-user', 'Active', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert!(!database.purge_deleted_user("purge-active-user").await?);
+    assert!(
+        database
+            .soft_delete_user("purge-manager-one")
+            .await?
+            .is_some()
+    );
+    assert!(matches!(
+        database.soft_delete_user("purge-manager-two").await,
+        Err(StorageError::LastManager)
+    ));
+    let last_manager_deleted_at: Option<i64> =
+        sqlx::query_scalar("SELECT deleted_at FROM users WHERE id = 'purge-manager-two'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(last_manager_deleted_at.is_none());
+    assert!(database.purge_deleted_user("purge-manager-one").await?);
+    assert!(!database.purge_deleted_user("purge-manager-one").await?);
+    assert!(!database.purge_deleted_user("missing-purge-user").await?);
+
+    assert!(
+        database
+            .soft_delete_user("purge-active-user")
+            .await?
+            .is_some()
+    );
+    let purge_at: i64 =
+        sqlx::query_scalar("SELECT deletion_purge_at FROM users WHERE id = 'purge-active-user'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        database
+            .purge_expired_deleted_users(purge_at - 1, 50)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        database.purge_expired_deleted_users(purge_at, 50).await?,
+        ["purge-active-user"]
+    );
+    assert!(
+        database
+            .purge_expired_deleted_users(purge_at, 50)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_playback_policy_migration_defaults_keep_existing_playback_compatible()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
