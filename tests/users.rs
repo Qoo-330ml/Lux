@@ -1472,6 +1472,279 @@ async fn admin_can_batch_apply_permission_presets_with_per_user_results()
 }
 
 #[tokio::test]
+async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let preview_url = format!("{base_url}/api/v1/admin/users/account-preferences/copy/preview");
+
+    let preview_request = json!({
+        "sourceUserId": "00000000-0000-4000-8000-000000000001",
+        "targetUserIds": ["00000000-0000-4000-8000-000000000002"],
+        "groups": { "appearance": true, "home": false, "playback": false }
+    });
+    let unauthenticated = client
+        .post(&preview_url)
+        .json(&preview_request)
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+    let create_user = |username: &'static str| {
+        client
+            .post(format!("{base_url}/api/v1/admin/users"))
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&json!({ "username": username, "password": "target password" }))
+    };
+    let source = create_user("preferences-copy-source")
+        .send()
+        .await?
+        .json::<Value>()
+        .await?["user"]["id"]
+        .as_str()
+        .ok_or("missing source user ID")?
+        .to_owned();
+    let target = create_user("preferences-copy-target")
+        .send()
+        .await?
+        .json::<Value>()
+        .await?["user"]["id"]
+        .as_str()
+        .ok_or("missing target user ID")?
+        .to_owned();
+    let conflict_target = create_user("preferences-copy-conflict")
+        .send()
+        .await?
+        .json::<Value>()
+        .await?["user"]["id"]
+        .as_str()
+        .ok_or("missing conflict target ID")?
+        .to_owned();
+    create_user("preferences-copy-non-admin").send().await?;
+    sqlx::query(
+        "INSERT INTO user_account_preferences
+         (user_id, theme, accent_color, show_media_libraries, show_continue_watching,
+          audio_language, subtitle_language, auto_play_next_episode, version)
+         VALUES (?, 'light', 'berry', 0, 1, 'Japanese', 'English', 0, 3),
+                (?, 'dark', 'ocean', 1, 0, 'Chinese', 'Chinese', 1, 4),
+                (?, 'dark', 'mint', 1, 1, 'French', 'French', 0, 2)",
+    )
+    .bind(&source)
+    .bind(&target)
+    .bind(&conflict_target)
+    .execute(database.pool())
+    .await?;
+
+    let unavailable_target = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": source,
+            "targetUserIds": ["00000000-0000-4000-8000-000000000099"],
+            "groups": { "appearance": true, "home": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    assert_eq!(unavailable_target.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let non_admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "preferences-copy-non-admin",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(non_admin_login.status(), reqwest::StatusCode::OK);
+    let non_admin = client
+        .post(&preview_url)
+        .header(COOKIE, cookie_pair(non_admin_login.headers()))
+        .json(&json!({
+            "sourceUserId": source,
+            "targetUserIds": [target],
+            "groups": { "appearance": true, "home": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    assert_eq!(non_admin.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let empty_groups = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": source,
+            "targetUserIds": [target],
+            "groups": { "appearance": false, "home": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_groups.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let duplicate_targets = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": source,
+            "targetUserIds": [target, target],
+            "groups": { "appearance": true, "home": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate_targets.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let invalid_user_id = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": "not-a-user-id",
+            "targetUserIds": [target],
+            "groups": { "appearance": true, "home": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_user_id.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let preview = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": source,
+            "targetUserIds": [target, conflict_target],
+            "groups": { "appearance": true, "home": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    let preview_status = preview.status();
+    let preview_body = preview.text().await?;
+    assert_eq!(preview_status, reqwest::StatusCode::OK, "{preview_body}");
+    let preview = serde_json::from_str::<Value>(&preview_body)?;
+    assert_eq!(preview["sourceVersion"], 3);
+    assert_eq!(preview["sourceSnapshot"]["appearance"]["theme"], "light");
+    assert!(preview["sourceSnapshot"].get("home").is_none());
+    assert!(preview["sourceSnapshot"].get("playback").is_none());
+    assert_eq!(preview["targets"][0]["expectedVersion"], 4);
+    assert_eq!(preview["targets"][1]["expectedVersion"], 2);
+    sqlx::query("UPDATE user_account_preferences SET version = version + 1 WHERE user_id = ?")
+        .bind(&conflict_target)
+        .execute(database.pool())
+        .await?;
+
+    let apply_url = format!("{base_url}/api/v1/admin/users/account-preferences/copy");
+    let apply_request = json!({
+        "sourceUserId": source,
+        "sourceExpectedVersion": preview["sourceVersion"],
+        "targets": preview["targets"],
+        "groups": { "appearance": true, "home": false, "playback": false }
+    });
+    let missing_csrf = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&apply_request)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let applied = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&apply_request)
+        .send()
+        .await?;
+    let applied_status = applied.status();
+    let applied_body = applied.text().await?;
+    assert_eq!(applied_status, reqwest::StatusCode::OK, "{applied_body}");
+    let applied = serde_json::from_str::<Value>(&applied_body)?;
+    assert_eq!(applied["results"][0]["success"], true);
+    assert_eq!(applied["results"][1]["success"], false);
+    assert_eq!(applied["results"][1]["errorCode"], "VERSION_CONFLICT");
+    assert!(!applied_body.to_ascii_lowercase().contains("cookie"));
+    assert!(!applied_body.to_ascii_lowercase().contains("token"));
+
+    let stored: (String, String, i64, String) = sqlx::query_as(
+        "SELECT theme, accent_color, show_media_libraries, audio_language
+         FROM user_account_preferences WHERE user_id = ?",
+    )
+    .bind(&target)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored.0, "light");
+    assert_eq!(stored.1, "berry");
+    assert_eq!(stored.2, 1);
+    assert_eq!(stored.3, "Chinese");
+
+    sqlx::query("UPDATE user_account_preferences SET version = version + 1 WHERE user_id = ?")
+        .bind(&source)
+        .execute(database.pool())
+        .await?;
+    let stale_source = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&apply_request)
+        .send()
+        .await?;
+    assert_eq!(stale_source.status(), reqwest::StatusCode::CONFLICT);
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let events = audit.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing audit events")?;
+    let copy_event = events
+        .iter()
+        .find(|event| {
+            event["eventType"] == "USER_ACCOUNT_PREFERENCES_COPIED" && event["targetId"] == target
+        })
+        .ok_or("missing account preferences copy audit event")?;
+    assert_eq!(copy_event["metadata"]["sourceUserId"], source);
+    assert_eq!(copy_event["metadata"]["groups"]["appearance"], true);
+    assert_eq!(copy_event["metadata"]["groups"]["home"], false);
+    assert!(!copy_event["metadata"].to_string().contains("light"));
+    assert!(
+        !copy_event["metadata"]
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("token")
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_user_profile_api_normalizes_email_and_preserves_verification_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

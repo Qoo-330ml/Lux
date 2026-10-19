@@ -269,6 +269,158 @@ async fn admin_batch_apply_user_permission_preset(
     }
 }
 
+async fn admin_preview_account_preferences_copy(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(mut request): Json<
+        crate::application::user_account_preferences::PreviewAccountPreferencesCopyInput,
+    >,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(source_user_id) = canonical_user_id(&request.source_user_id) else {
+        return invalid_account_preferences_copy_request(&headers);
+    };
+    request.source_user_id = source_user_id;
+    let Some(target_user_ids) = request
+        .target_user_ids
+        .iter()
+        .map(|user_id| canonical_user_id(user_id))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return invalid_account_preferences_copy_request(&headers);
+    };
+    request.target_user_ids = target_user_ids;
+    match crate::application::user_account_preferences::preview_account_preferences_copy(
+        database, request,
+    )
+    .await
+    {
+        Ok(preview) => Json(preview).into_response(),
+        Err(error) => account_preferences_copy_error(&headers, error),
+    }
+}
+
+async fn admin_copy_account_preferences(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(mut request): Json<
+        crate::application::user_account_preferences::CopyAccountPreferencesInput,
+    >,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(source_user_id) = canonical_user_id(&request.source_user_id) else {
+        return invalid_account_preferences_copy_request(&headers);
+    };
+    request.source_user_id = source_user_id;
+    let Some(target_user_ids) = request
+        .targets
+        .iter()
+        .map(|target| {
+            canonical_user_id(&target.user_id).map(|user_id| {
+                crate::application::user_account_preferences::CopyAccountPreferencesTarget {
+                    user_id,
+                    expected_version: target.expected_version,
+                }
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return invalid_account_preferences_copy_request(&headers);
+    };
+    request.targets = target_user_ids;
+    let groups = request.groups;
+    match crate::application::user_account_preferences::copy_account_preferences_batch(
+        database, request,
+    )
+    .await
+    {
+        Ok(result) => {
+            for item in result.results.iter().filter(|item| item.success) {
+                record_audit_event(
+                    &state,
+                    &headers,
+                    "USER_ACCOUNT_PREFERENCES_COPIED",
+                    Some("user"),
+                    Some(&item.user_id),
+                    &json!({
+                        "sourceUserId": result.source_user_id,
+                        "groups": {
+                            "appearance": groups.appearance,
+                            "home": groups.home,
+                            "playback": groups.playback
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+            }
+            Json(result).into_response()
+        }
+        Err(error) => account_preferences_copy_error(&headers, error),
+    }
+}
+
+fn canonical_user_id(value: &str) -> Option<String> {
+    value
+        .parse::<crate::domain::ids::UserId>()
+        .ok()
+        .map(|user_id| user_id.to_string())
+}
+
+fn invalid_account_preferences_copy_request(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::BAD_REQUEST,
+        lux::ApiErrorCode::InvalidRequest,
+        "账户偏好复制请求无效",
+    )
+    .into_response()
+}
+
+fn account_preferences_copy_error(
+    headers: &HeaderMap,
+    error: crate::application::user_account_preferences::AccountPreferencesCopyError,
+) -> Response {
+    use crate::application::user_account_preferences::AccountPreferencesCopyError as CopyError;
+    match error {
+        CopyError::InvalidRequest | CopyError::InvalidPreferences => {
+            invalid_account_preferences_copy_request(headers)
+        }
+        CopyError::SourceUnavailable | CopyError::UserUnavailable => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "源账号或目标账号不存在",
+        )
+        .into_response(),
+        CopyError::SourceVersionConflict => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "源账号偏好已变更，请重新预览",
+        )
+        .into_response(),
+        CopyError::VersionConflict => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "账户偏好版本已变更",
+        )
+        .into_response(),
+        CopyError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 fn has_duplicate_user_ids(user_ids: &[String]) -> bool {
     let mut unique_ids = std::collections::HashSet::with_capacity(user_ids.len());
     user_ids.iter().any(|user_id| {
@@ -1561,6 +1713,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/batch/permission-preset",
             post(admin_batch_apply_user_permission_preset),
+        )
+        .route(
+            "/api/v1/admin/users/account-preferences/copy/preview",
+            post(admin_preview_account_preferences_copy),
+        )
+        .route(
+            "/api/v1/admin/users/account-preferences/copy",
+            post(admin_copy_account_preferences),
         )
         .route(
             "/api/v1/admin/users/{user_id}",

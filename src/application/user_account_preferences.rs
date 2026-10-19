@@ -7,10 +7,8 @@ use crate::storage::{
 };
 
 const MAX_LANGUAGE_PREFERENCE_CHARS: usize = 64;
-#[allow(dead_code)]
 pub(crate) const MAX_BATCH_ACCOUNT_PREFERENCE_TARGETS: usize = 100;
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountPreferences {
@@ -41,7 +39,6 @@ impl Default for AccountPreferences {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct UpdateAccountPreferences {
@@ -55,7 +52,6 @@ pub(crate) struct UpdateAccountPreferences {
     pub(crate) auto_play_next_episode: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CopyAccountPreferencesInput {
@@ -65,16 +61,22 @@ pub(crate) struct CopyAccountPreferencesInput {
     pub(crate) groups: CopyAccountPreferenceGroups,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CopyAccountPreferencesTarget {
     pub(crate) user_id: String,
     pub(crate) expected_version: i64,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PreviewAccountPreferencesCopyInput {
+    pub(crate) source_user_id: String,
+    pub(crate) target_user_ids: Vec<String>,
+    pub(crate) groups: CopyAccountPreferenceGroups,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CopyAccountPreferenceGroups {
     pub(crate) appearance: bool,
@@ -82,14 +84,12 @@ pub(crate) struct CopyAccountPreferenceGroups {
     pub(crate) playback: bool,
 }
 
-#[allow(dead_code)]
 impl CopyAccountPreferenceGroups {
     fn is_empty(self) -> bool {
         !self.appearance && !self.home && !self.playback
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum AccountPreferencesCopyErrorCode {
@@ -99,7 +99,6 @@ pub(crate) enum AccountPreferencesCopyErrorCode {
     StorageUnavailable,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountPreferencesCopyTargetResult {
@@ -108,13 +107,55 @@ pub(crate) struct AccountPreferencesCopyTargetResult {
     pub(crate) error_code: Option<AccountPreferencesCopyErrorCode>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountPreferencesCopyBatchResult {
     pub(crate) source_user_id: String,
     pub(crate) source_version: i64,
     pub(crate) results: Vec<AccountPreferencesCopyTargetResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesCopyPreview {
+    pub(crate) source_user_id: String,
+    pub(crate) source_version: i64,
+    pub(crate) source_snapshot: AccountPreferencesCopySnapshot,
+    pub(crate) targets: Vec<CopyAccountPreferencesTarget>,
+    pub(crate) groups: CopyAccountPreferenceGroups,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesCopySnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) appearance: Option<AccountPreferencesAppearanceSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) home: Option<AccountPreferencesHomeSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) playback: Option<AccountPreferencesPlaybackSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesAppearanceSnapshot {
+    pub(crate) theme: String,
+    pub(crate) accent_color: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesHomeSnapshot {
+    pub(crate) show_media_libraries: bool,
+    pub(crate) show_continue_watching: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesPlaybackSnapshot {
+    pub(crate) audio_language: String,
+    pub(crate) subtitle_language: String,
+    pub(crate) auto_play_next_episode: bool,
 }
 
 #[derive(Debug)]
@@ -138,7 +179,6 @@ impl fmt::Display for AccountPreferencesError {
 
 impl std::error::Error for AccountPreferencesError {}
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum AccountPreferencesCopyError {
     InvalidRequest,
@@ -187,7 +227,6 @@ impl From<StorageError> for AccountPreferencesError {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) async fn get_account_preferences(
     database: &Database,
     user_id: &str,
@@ -199,7 +238,6 @@ pub(crate) async fn get_account_preferences(
         .unwrap_or_default())
 }
 
-#[allow(dead_code)]
 pub(crate) async fn update_account_preferences(
     database: &Database,
     user_id: &str,
@@ -230,7 +268,81 @@ pub(crate) async fn update_account_preferences(
     }
 }
 
-#[allow(dead_code)]
+pub(crate) async fn preview_account_preferences_copy(
+    database: &Database,
+    input: PreviewAccountPreferencesCopyInput,
+) -> Result<AccountPreferencesCopyPreview, AccountPreferencesCopyError> {
+    let mut targets = input
+        .target_user_ids
+        .iter()
+        .map(|user_id| CopyAccountPreferencesTarget {
+            user_id: user_id.clone(),
+            expected_version: 0,
+        })
+        .collect::<Vec<_>>();
+    validate_copy_input(&CopyAccountPreferencesInput {
+        source_user_id: input.source_user_id.clone(),
+        source_expected_version: 0,
+        targets: targets.clone(),
+        groups: input.groups,
+    })?;
+
+    let source_user = database
+        .find_user_by_id(&input.source_user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or(AccountPreferencesCopyError::SourceUnavailable)?;
+    let source_preferences = database
+        .user_account_preferences(&source_user.id)
+        .await?
+        .map(AccountPreferences::from)
+        .unwrap_or_default();
+
+    for target in &mut targets {
+        let user = database
+            .find_user_by_id(&target.user_id)
+            .await?
+            .filter(|user| user.deleted_at.is_none())
+            .ok_or(AccountPreferencesCopyError::UserUnavailable)?;
+        target.expected_version = database
+            .user_account_preferences(&user.id)
+            .await?
+            .map(|preferences| preferences.version)
+            .unwrap_or_default();
+    }
+
+    Ok(AccountPreferencesCopyPreview {
+        source_user_id: source_user.id,
+        source_version: source_preferences.version,
+        source_snapshot: copy_snapshot(&source_preferences, input.groups),
+        targets,
+        groups: input.groups,
+    })
+}
+
+fn copy_snapshot(
+    preferences: &AccountPreferences,
+    groups: CopyAccountPreferenceGroups,
+) -> AccountPreferencesCopySnapshot {
+    AccountPreferencesCopySnapshot {
+        appearance: groups
+            .appearance
+            .then(|| AccountPreferencesAppearanceSnapshot {
+                theme: preferences.theme.clone(),
+                accent_color: preferences.accent_color.clone(),
+            }),
+        home: groups.home.then_some(AccountPreferencesHomeSnapshot {
+            show_media_libraries: preferences.show_media_libraries,
+            show_continue_watching: preferences.show_continue_watching,
+        }),
+        playback: groups.playback.then(|| AccountPreferencesPlaybackSnapshot {
+            audio_language: preferences.audio_language.clone(),
+            subtitle_language: preferences.subtitle_language.clone(),
+            auto_play_next_episode: preferences.auto_play_next_episode,
+        }),
+    }
+}
+
 pub(crate) async fn copy_account_preferences_batch(
     database: &Database,
     input: CopyAccountPreferencesInput,
@@ -290,7 +402,6 @@ pub(crate) async fn copy_account_preferences_batch(
     })
 }
 
-#[allow(dead_code)]
 async fn copy_preferences_to_target(
     database: &Database,
     target: &CopyAccountPreferencesTarget,
@@ -369,7 +480,6 @@ async fn copy_preferences_to_target(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_copy_input(
     input: &CopyAccountPreferencesInput,
 ) -> Result<(), AccountPreferencesCopyError> {
@@ -647,6 +757,64 @@ mod tests {
         assert_eq!(target.subtitle_language, "关闭");
         assert_eq!(target.auto_play_next_episode, source.auto_play_next_episode);
         assert_eq!(target.version, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn previews_only_selected_groups_and_captures_source_and_target_versions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        for user_id in ["preview-source", "preview-target"] {
+            database
+                .insert_user(user_id, user_id, user_id, "test", false, true)
+                .await?;
+        }
+        update_account_preferences(&database, "preview-source", valid_update(0)).await?;
+
+        let preview = preview_account_preferences_copy(
+            &database,
+            PreviewAccountPreferencesCopyInput {
+                source_user_id: "preview-source".to_owned(),
+                target_user_ids: vec!["preview-target".to_owned()],
+                groups: CopyAccountPreferenceGroups {
+                    appearance: true,
+                    home: false,
+                    playback: true,
+                },
+            },
+        )
+        .await?;
+
+        assert_eq!(preview.source_user_id, "preview-source");
+        assert_eq!(preview.source_version, 1);
+        assert_eq!(
+            preview
+                .source_snapshot
+                .appearance
+                .as_ref()
+                .map(|value| value.theme.as_str()),
+            Some("light")
+        );
+        assert_eq!(
+            preview
+                .source_snapshot
+                .appearance
+                .as_ref()
+                .map(|value| value.accent_color.as_str()),
+            Some("berry")
+        );
+        assert_eq!(preview.source_snapshot.home, None);
+        assert_eq!(
+            preview
+                .source_snapshot
+                .playback
+                .as_ref()
+                .map(|value| value.audio_language.as_str()),
+            Some("日本語")
+        );
+        assert_eq!(preview.targets.len(), 1);
+        assert_eq!(preview.targets[0].user_id, "preview-target");
+        assert_eq!(preview.targets[0].expected_version, 0);
         Ok(())
     }
 

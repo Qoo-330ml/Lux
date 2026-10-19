@@ -13999,6 +13999,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增外观、首页和播放三类账户偏好组复制服务。来源账号版本过期或来源不可用时不开始写入；每个有效目标按目标版本 CAS 独立更新，缺失/删除、版本冲突和注入的单目标写入错误作为逐项结果返回。7 个 `user_account_preferences::tests` 通过，`cargo build --locked`、fmt、`git diff --check` 和放行仓库已知 `too_many_arguments` lint 的定向 Clippy 通过。服务尚未接 HTTP，临时 `dead_code` 许可用于 LUX-669 接线前的中间层。
 
+#### LUX-669：开放管理员账户偏好复制预览与应用 API
+
+范围：增加管理员偏好复制预览和应用端点。预览校验来源、目标和所选偏好组，返回所选组的来源值与来源/目标版本；应用提交预览版本并逐目标执行 LUX-668 CAS。应用需要管理员 Web 会话及 CSRF；预览只读但仍限管理员。成功目标逐项写审计，不记录偏好值、凭证或 Cookie。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_account_preferences.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 预览只返回所选偏好组；来源/目标不可用、空组、空/重复/超限目标及自我复制被拒绝。
+- [x] 应用要求管理员和 CSRF；来源过期整体冲突，目标过期逐项返回 `VERSION_CONFLICT`，成功目标不受其他目标失败影响。
+- [x] 响应不含未选择的偏好、凭证或敏感存储值；审计仅记来源、目标和组名。
+- [x] users 集成回归、application 定向回归、Rust build/fmt 与 diff check 通过。
+
+短计划：先补预览快照和版本合同的 application/API 失败测试；再实现管理员预览与 CAS 应用端点，更新 API 文档并跑定向集成验证。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_preview_and_copy_account_preferences`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-655、LUX-668。
+
+结果（2026-10-19）：增加管理员偏好复制预览与应用 API。预览仅返回选择的外观/首页/播放快照、来源版本和目标版本；应用检查来源版本并为每个目标独立 CAS，逐项报告版本冲突，同时对成功目标写入仅包含来源 ID 和组标志的审计。覆盖非管理员拒绝、预览不需 CSRF、应用需 CSRF、空组拒绝、重复/无效 ID 拒绝、未选组不出现在响应、目标并发冲突、来源过期和审计脱敏。`user_account_preferences::tests` 8/8、`cargo test --locked --test users` 8/8 和 `cargo build --locked` 通过；`cargo clippy --locked --lib -- -D warnings -A clippy::too_many_arguments`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
