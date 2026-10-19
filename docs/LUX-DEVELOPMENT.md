@@ -14167,6 +14167,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：PostgreSQL 空库启动通过，策略字段与标签表可创建，非法布尔值/标签类别/空标签/重复标签均被约束拒绝，删除策略及用户可级联清理关联行。`scanner` 18/18、`danmaku` 7/7、扫描任务排除基线失败后的 90/90、PostgreSQL bootstrap 1/1、Rust build、fmt 与 diff check 通过。完整 `scanning_jobs` 目标中 `manifest_discovery_reopens_and_retries_persisted_frontier_idempotently` 在第 7311 行因检查点实数为 1、预期 2 而失败；该失败在未包含 LUX-675 的干净提交 `a3173c1d` 上以同名定向测试原样复现，未纳入本任务改动。
 
+#### LUX-677：为用户内容限制提供版本化存储读写
+
+范围：为用户内容限制策略提供读取与乐观锁写入。未配置的用户仍返回 `None`；写入策略和整组替换允许/禁止标签必须在同一数据库事务中完成。只校验存储边界和输入数量，不解释分级映射或执行媒体授权。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 在单条 SQL 快照中读回分级体系、最高等级、未分级规则和稳定排序的允许/禁止标签；缺少策略行返回 `None`。
+- [x] 版本 0 创建、匹配版本更新并原子替换标签；陈旧版本、已删除/不存在账号、非法字段和重复规范化标签不产生部分写入。
+- [x] SQLite 存储回归、构建、fmt 与 diff check 通过。
+
+短计划：先加入缺省读取、CAS 版本冲突、规范化标签替换和事务失败回滚测试并确认失败；再定义存储合同和 SQLite/PostgreSQL 通用事务实现；最后运行定向测试与构建。本任务不接入 API/UI，也不改变访问判定。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_content_restrictions_storage`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。
+
+依赖：LUX-675、LUX-676。
+
+结果（2026-10-19）：存储层增加用户策略读取和 CAS 写入，策略与标签通过一条 JOIN 读取，避免并发更新时读到不同版本；允许/禁止标签先 trim、统一小写并以 Rust 顺序排序，每类最多 100 个，空值、超长值和规范化后重复项拒绝。策略版本与标签整组替换位于同一事务，注入标签写失败后版本及原标签保持不变。缺少策略行返回 `None`。存储定向用例 1/1、build、fmt 与 diff check 通过；严格 Clippy 仍被未修改的 `serve_emby_media_file` 与 `verify_emby_direct_stream` 两个既有 `too_many_arguments` 阻挡，按现有基线豁免该 lint 后 Clippy 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

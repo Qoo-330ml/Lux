@@ -1,7 +1,8 @@
 use super::*;
 use crate::storage::{
-    ApplyUserPermissionPreset, NewStoredUserPermissions, PlaybackAdmissionDecision,
-    PlaybackAdmissionDenialReason, UserPlaybackPolicy,
+    ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserContentRestrictions,
+    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserContentRestrictionsCasResult,
+    UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -14731,6 +14732,254 @@ async fn account_preferences_use_compare_and_swap_versions()
             )
             .await?,
         UserAccountPreferencesCasResult::UserUnavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_content_restrictions_storage_uses_atomic_versioned_tag_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .insert_user(
+            "content-policy-cas-user",
+            "content-policy-cas-user",
+            "Content Policy",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+    assert!(
+        database
+            .user_content_restrictions("content-policy-cas-user")
+            .await?
+            .is_none()
+    );
+
+    let allowed = vec!["Family".to_owned(), "Animation".to_owned()];
+    let blocked = vec!["Horror".to_owned()];
+    let created = database
+        .compare_and_swap_user_content_restrictions(
+            "content-policy-cas-user",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed,
+                blocked_tags: &blocked,
+            },
+        )
+        .await?;
+    let UserContentRestrictionsCasResult::Updated(created) = created else {
+        return Err("first content restriction write should create version 1".into());
+    };
+    assert_eq!(created.version, 1);
+    assert_eq!(created.rating_system, "MPAA");
+    assert_eq!(created.maximum_rating.as_deref(), Some("PG-13"));
+    assert!(!created.allow_unrated);
+    assert_eq!(created.allowed_tags, ["animation", "family"]);
+    assert_eq!(created.blocked_tags, ["horror"]);
+
+    let next_allowed = vec!["Documentary".to_owned()];
+    let next_blocked = vec!["Violence".to_owned()];
+    let updated = database
+        .compare_and_swap_user_content_restrictions(
+            "content-policy-cas-user",
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: None,
+                allow_unrated: true,
+                allowed_tags: &next_allowed,
+                blocked_tags: &next_blocked,
+            },
+        )
+        .await?;
+    let UserContentRestrictionsCasResult::Updated(updated) = updated else {
+        return Err("matching content restriction version should update".into());
+    };
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.maximum_rating, None);
+    assert!(updated.allow_unrated);
+    assert_eq!(updated.allowed_tags, ["documentary"]);
+    assert_eq!(updated.blocked_tags, ["violence"]);
+
+    let stale = database
+        .compare_and_swap_user_content_restrictions(
+            "content-policy-cas-user",
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("G"),
+                allow_unrated: false,
+                allowed_tags: &allowed,
+                blocked_tags: &blocked,
+            },
+        )
+        .await?;
+    assert_eq!(stale, UserContentRestrictionsCasResult::Conflict);
+    let unchanged = database
+        .user_content_restrictions("content-policy-cas-user")
+        .await?
+        .ok_or("updated content restriction should be readable")?;
+    assert_eq!(unchanged, updated);
+
+    let duplicate_tags = vec!["Family".to_owned(), " family ".to_owned()];
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &duplicate_tags,
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .is_err()
+    );
+    let too_many_tags = vec!["family".to_owned(); 101];
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &too_many_tags,
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .is_err()
+    );
+    for (rating_system, maximum_rating) in [("  ", None), ("MPAA", Some(" \t "))] {
+        assert!(
+            database
+                .compare_and_swap_user_content_restrictions(
+                    "content-policy-cas-user",
+                    2,
+                    NewUserContentRestrictions {
+                        rating_system,
+                        maximum_rating,
+                        allow_unrated: true,
+                        allowed_tags: &[],
+                        blocked_tags: &[],
+                    },
+                )
+                .await
+                .is_err()
+        );
+    }
+    let too_long_tag = vec!["x".repeat(129)];
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &too_long_tag,
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                -1,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?,
+        UserContentRestrictionsCasResult::Conflict
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_content_restriction_tag_write
+         BEFORE INSERT ON user_content_restriction_tags
+         BEGIN SELECT RAISE(ABORT, 'injected content restriction tag failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: Some("PG"),
+                    allow_unrated: false,
+                    allowed_tags: &allowed,
+                    blocked_tags: &blocked,
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .user_content_restrictions("content-policy-cas-user")
+            .await?
+            .ok_or("content restriction should survive a failed tag write")?,
+        updated,
+        "policy version and tags must roll back together"
+    );
+    database.soft_delete_user("content-policy-cas-user").await?;
+    assert_eq!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?,
+        UserContentRestrictionsCasResult::UserUnavailable
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "missing-content-policy-user",
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?,
+        UserContentRestrictionsCasResult::UserUnavailable
     );
     Ok(())
 }

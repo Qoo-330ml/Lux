@@ -13,12 +13,46 @@ const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
+const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
 
 fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
     value
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|days| (1..=MAX_USER_DELETION_GRACE_DAYS).contains(days))
         .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS)
+}
+
+fn normalize_user_content_restriction_tags(tags: &[String]) -> Result<Vec<String>, StorageError> {
+    if tags.len() > MAX_USER_CONTENT_RESTRICTION_TAGS {
+        return Err(StorageError::Conflict(
+            "too many user content restriction tags".to_owned(),
+        ));
+    }
+    let mut seen = HashSet::with_capacity(tags.len());
+    let mut normalized = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.chars().count() > 128 {
+            return Err(StorageError::Conflict(
+                "user content restriction tag length is invalid".to_owned(),
+            ));
+        }
+        let tag = tag.to_lowercase();
+        let tag_length = tag.chars().count();
+        if !(1..=128).contains(&tag_length) {
+            return Err(StorageError::Conflict(
+                "user content restriction tag length is invalid".to_owned(),
+            ));
+        }
+        if !seen.insert(tag.clone()) {
+            return Err(StorageError::Conflict(
+                "duplicate user content restriction tag".to_owned(),
+            ));
+        }
+        normalized.push(tag);
+    }
+    normalized.sort_unstable();
+    Ok(normalized)
 }
 
 impl Database {
@@ -2527,6 +2561,212 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    // LUX-677 creates the persistent content restriction contract.
+    #[allow(dead_code)]
+    pub(crate) async fn user_content_restrictions(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserContentRestrictions>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT restrictions.rating_system, restrictions.maximum_rating,
+                        restrictions.allow_unrated, restrictions.version, restrictions.updated_at,
+                        tags.tag_kind, tags.tag
+                 FROM user_content_restrictions restrictions
+                 LEFT JOIN user_content_restriction_tags tags
+                   ON tags.user_id = restrictions.user_id
+                 WHERE restrictions.user_id = ?
+                 ORDER BY tags.tag_kind, tags.tag",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+
+        let mut allowed_tags = Vec::new();
+        let mut blocked_tags = Vec::new();
+        for tag_row in &rows {
+            let tag_kind: Option<String> = tag_row.get("tag_kind");
+            let tag: Option<String> = tag_row.get("tag");
+            match (tag_kind.as_deref(), tag) {
+                (None, None) => {}
+                (Some("ALLOW"), Some(tag)) => allowed_tags.push(tag),
+                (Some("BLOCK"), Some(tag)) => blocked_tags.push(tag),
+                _ => {
+                    return Err(StorageError::Serialization(
+                        "invalid user content restriction tag row".to_owned(),
+                    ));
+                }
+            }
+        }
+        allowed_tags.sort_unstable();
+        blocked_tags.sort_unstable();
+
+        Ok(Some(UserContentRestrictions {
+            rating_system: row.get("rating_system"),
+            maximum_rating: row.get("maximum_rating"),
+            allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
+            allowed_tags,
+            blocked_tags,
+            version: row.get("version"),
+            updated_at: row.get("updated_at"),
+        }))
+    }
+
+    // LUX-677 keeps the policy version and both tag groups in one CAS transaction.
+    #[allow(dead_code)]
+    pub(crate) async fn compare_and_swap_user_content_restrictions(
+        &self,
+        user_id: &str,
+        expected_version: i64,
+        restrictions: NewUserContentRestrictions<'_>,
+    ) -> Result<UserContentRestrictionsCasResult, StorageError> {
+        if expected_version < 0 {
+            return Ok(UserContentRestrictionsCasResult::Conflict);
+        }
+        let rating_system = restrictions.rating_system.trim();
+        if !(1..=64).contains(&rating_system.chars().count()) {
+            return Err(StorageError::Conflict(
+                "user content restriction rating system is invalid".to_owned(),
+            ));
+        }
+        let maximum_rating = restrictions.maximum_rating.map(str::trim);
+        if maximum_rating.is_some_and(|rating| !(1..=64).contains(&rating.chars().count())) {
+            return Err(StorageError::Conflict(
+                "user content restriction maximum rating is invalid".to_owned(),
+            ));
+        }
+        let allowed_tags = normalize_user_content_restriction_tags(restrictions.allowed_tags)?;
+        let blocked_tags = normalize_user_content_restriction_tags(restrictions.blocked_tags)?;
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let result = if expected_version == 0 {
+            self.query(
+                "INSERT INTO user_content_restrictions (
+                    user_id, rating_system, maximum_rating, allow_unrated, version, updated_at
+                 )
+                 SELECT ?, ?, ?, ?, 1, unixepoch()
+                 WHERE EXISTS (
+                    SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                 )
+                 ON CONFLICT(user_id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(rating_system)
+            .bind(maximum_rating)
+            .bind(database_flag(restrictions.allow_unrated))
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+        } else {
+            self.query(
+                "UPDATE user_content_restrictions
+                 SET rating_system = ?, maximum_rating = ?, allow_unrated = ?,
+                     version = version + 1, updated_at = unixepoch()
+                 WHERE user_id = ? AND version = ?
+                   AND EXISTS (
+                       SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                   )",
+            )
+            .bind(rating_system)
+            .bind(maximum_rating)
+            .bind(database_flag(restrictions.allow_unrated))
+            .bind(user_id)
+            .bind(expected_version)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if result.rows_affected() == 0 {
+            let user_available: i64 = self
+                .query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                    )",
+                )
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(if user_available != 0 {
+                UserContentRestrictionsCasResult::Conflict
+            } else {
+                UserContentRestrictionsCasResult::UserUnavailable
+            });
+        }
+
+        self.query("DELETE FROM user_content_restriction_tags WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for (tag_kind, tags) in [
+            ("ALLOW", allowed_tags.as_slice()),
+            ("BLOCK", blocked_tags.as_slice()),
+        ] {
+            for tag in tags {
+                if let Err(source) = self
+                    .query(
+                        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(user_id)
+                    .bind(tag_kind)
+                    .bind(tag)
+                    .execute(&mut *transaction)
+                    .await
+                {
+                    let _ = transaction.rollback().await;
+                    return Err(StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(updated) = self.user_content_restrictions(user_id).await? else {
+            return Ok(UserContentRestrictionsCasResult::UserUnavailable);
+        };
+        Ok(UserContentRestrictionsCasResult::Updated(updated))
     }
 
     // LUX-654 connects this storage contract to the authenticated settings API.

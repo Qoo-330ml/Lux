@@ -1119,6 +1119,36 @@ pub(crate) enum UserAccountPreferencesCasResult {
     UserUnavailable,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserContentRestrictions {
+    pub(crate) rating_system: String,
+    pub(crate) maximum_rating: Option<String>,
+    pub(crate) allow_unrated: bool,
+    pub(crate) allowed_tags: Vec<String>,
+    pub(crate) blocked_tags: Vec<String>,
+    pub(crate) version: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewUserContentRestrictions<'a> {
+    pub(crate) rating_system: &'a str,
+    pub(crate) maximum_rating: Option<&'a str>,
+    pub(crate) allow_unrated: bool,
+    pub(crate) allowed_tags: &'a [String],
+    pub(crate) blocked_tags: &'a [String],
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserContentRestrictionsCasResult {
+    Updated(UserContentRestrictions),
+    Conflict,
+    UserUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminUserStatusFilter {
     All,
