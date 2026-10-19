@@ -14208,6 +14208,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：域层定义稳定体系键 `MPA`、`TVPG`、`BBFC`，只识别各自正式等级代码并兼容 `Rated ` 前缀；未知文本、地域前缀和数值评分均保持未分级。应用内最高等级顺序与方案一致，其中 BBFC `12`/`12A` 同级；TV 指引官方列出六类而未定义数值序列，方案明确登记 Lux 自身比较顺序。纯分类回归 3/3 通过；过滤既有 `too_many_arguments` 基线后 Clippy、fmt 和 diff 检查通过。官方定义核对：[MPA](https://www.filmratings.com/ratings-guide/)、[TV Parental Guidelines](https://www.tvguidelines.org/aboutUs.html)、[BBFC](https://www.bbfc.co.uk/our-age-ratings)。
 
+#### LUX-679：建立可失效的媒体内容分类索引
+
+范围：新增分类等级目录及逐媒体条目的分级/标签索引。索引行存在表示该条目已被处理；缺行表示尚未就绪。只改数据库 schema 与 migration 回归，不接入索引 worker、NFO 失效触发器或用户授权查询。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0191_media_content_restriction_index.sql`、`migrations-postgres/0191_media_content_restriction_index.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite/PostgreSQL 都创建 MPA、TVPG、BBFC 等级目录，排序与 LUX-678 一致；逐媒体索引行、标签子表和查询索引使用外键/级联约束。
+- [x] SQLite 从空库启动回归覆盖等级数据、非法等级/标签、索引就绪行及条目/索引级联删除；PostgreSQL bootstrap 回归覆盖相同 schema 合同。
+
+短计划：先扩展 SQLite 和 PostgreSQL migration 回归并确认 schema/table 缺失时失败；再创建两份 0191 migration 及等级种子数据；最后运行 SQLite 定向用例、PostgreSQL migration 用例、Rust fmt 与 diff 检查。NFO 失效触发器因 SQLite 兼容表重建会移除新建触发器，留给后续独立任务处理。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage media_content_restriction_index_migration_runs_from_an_empty_database -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_media_content_restriction_index_migration -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-678。
+
+结果（2026-10-19）：SQLite 与 PostgreSQL schema 191 建立 18 个固定分级目录项、仅有索引行才表示就绪的媒体条目索引、标签子表及分级/标签查询索引；约束拒绝未知等级与空标签，媒体删除及索引删除均级联清理。SQLite 空库迁移和 PostgreSQL 本地 bootstrap 专项各 1/1 通过，build、fmt 和 diff check 通过。定向 Clippy 对新增代码在豁免既有 `too_many_arguments` 与测试目标 `type_complexity` 后通过。测试中发现 SQLite 的兼容表重建会丢弃 migration 新建的条目触发器，因此 0191 只建 schema；NFO 变更失效合同移至 LUX-680 单独处理，避免把未经修复的触发器描述为有效。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

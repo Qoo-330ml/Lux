@@ -109,6 +109,105 @@ async fn advance_postgres_manifest_to_applying(
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_content_restriction_index_migration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let level_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_rating_levels")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(level_count, 18);
+    let tv_levels: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT rating_code, rating_order FROM content_rating_levels
+         WHERE rating_system = 'TVPG' ORDER BY rating_order",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        tv_levels,
+        [
+            ("TV-Y".to_owned(), 0),
+            ("TV-G".to_owned(), 1),
+            ("TV-Y7".to_owned(), 2),
+            ("TV-PG".to_owned(), 3),
+            ("TV-14".to_owned(), 4),
+            ("TV-MA".to_owned(), 5),
+        ]
+    );
+    let restriction_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema() AND indexname IN (
+             'idx_media_content_restriction_index_certification',
+             'idx_media_content_restriction_tags_tag'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_indexes, 2);
+    assert!(
+        sqlx::query(
+            "INSERT INTO content_rating_levels (rating_system, rating_code, rating_order)
+             VALUES ('MPA', 'UNKNOWN', 5)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('restriction-index-library', 'Restrictions', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items
+            (id, library_id, item_type, title, sort_title, identification_status, nfo_metadata_json)
+         VALUES ('restriction-index-item', 'restriction-index-library', 'MOVIE',
+                 'Restriction', 'restriction', 'LOCAL_CONFIRMED', '{\"certification\":\"PG-13\"}')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'PG-13')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM media_items WHERE id = 'restriction-index-item'")
+        .execute(database.pool())
+        .await?;
+
+    let stale_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let stale_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_index_rows, 0);
+    assert_eq!(stale_tag_rows, 0);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

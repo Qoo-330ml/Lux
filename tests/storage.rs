@@ -313,6 +313,127 @@ async fn user_content_restrictions_migration_runs_from_an_empty_database()
 }
 
 #[tokio::test]
+async fn media_content_restriction_index_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert_eq!(database.schema_version().await?, 191);
+
+    let levels: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT rating_system, rating_code, rating_order
+         FROM content_rating_levels ORDER BY rating_system, rating_order, rating_code",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(levels.len(), 18);
+    assert_eq!(
+        levels,
+        [
+            ("BBFC".to_owned(), "U".to_owned(), 0),
+            ("BBFC".to_owned(), "PG".to_owned(), 1),
+            ("BBFC".to_owned(), "12".to_owned(), 2),
+            ("BBFC".to_owned(), "12A".to_owned(), 2),
+            ("BBFC".to_owned(), "15".to_owned(), 3),
+            ("BBFC".to_owned(), "18".to_owned(), 4),
+            ("BBFC".to_owned(), "R18".to_owned(), 5),
+            ("MPA".to_owned(), "G".to_owned(), 0),
+            ("MPA".to_owned(), "PG".to_owned(), 1),
+            ("MPA".to_owned(), "PG-13".to_owned(), 2),
+            ("MPA".to_owned(), "R".to_owned(), 3),
+            ("MPA".to_owned(), "NC-17".to_owned(), 4),
+            ("TVPG".to_owned(), "TV-Y".to_owned(), 0),
+            ("TVPG".to_owned(), "TV-G".to_owned(), 1),
+            ("TVPG".to_owned(), "TV-Y7".to_owned(), 2),
+            ("TVPG".to_owned(), "TV-PG".to_owned(), 3),
+            ("TVPG".to_owned(), "TV-14".to_owned(), 4),
+            ("TVPG".to_owned(), "TV-MA".to_owned(), 5),
+        ]
+    );
+    let restriction_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_media_content_restriction_index_certification',
+             'idx_media_content_restriction_tags_tag'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_indexes, 2);
+    assert!(
+        sqlx::query(
+            "INSERT INTO content_rating_levels (rating_system, rating_code, rating_order)
+             VALUES ('MPA', 'UNKNOWN', 5)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('restriction-index-library', 'Restrictions', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items
+            (id, library_id, item_type, title, sort_title, identification_status, nfo_metadata_json)
+         VALUES ('restriction-index-item', 'restriction-index-library', 'MOVIE',
+                 'Restriction', 'restriction', 'LOCAL_CONFIRMED', '{\"certification\":\"PG-13\"}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let unindexed_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unindexed_rows, 0, "no row means the item is not ready");
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'PG-13')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('restriction-index-item', '   ')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'restriction-index-item'")
+        .execute(database.pool())
+        .await?;
+    let stale_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let stale_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_index_rows, 0, "media deletion cascades to the index");
+    assert_eq!(stale_tag_rows, 0, "index deletion cascades to indexed tags");
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_profile_migration_preserves_existing_accounts_and_email_uniqueness()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
