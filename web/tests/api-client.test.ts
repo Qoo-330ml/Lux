@@ -432,6 +432,80 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("previews selected admin account preference groups with source and target versions", async () => {
+    const request = {
+      sourceUserId: "source-1",
+      targetUserIds: ["user-1", "user-2"],
+      groups: { appearance: true, home: false, playback: true },
+    };
+    const preview = {
+      sourceUserId: "source-1",
+      sourceVersion: 4,
+      sourceSnapshot: {
+        appearance: { theme: "dark", accentColor: "berry" },
+        playback: {
+          audioLanguage: "Japanese",
+          subtitleLanguage: "English",
+          autoPlayNextEpisode: false,
+        },
+      },
+      targets: [
+        { userId: "user-1", expectedVersion: 2 },
+        { userId: "user-2", expectedVersion: 0 },
+      ],
+      groups: request.groups,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(preview), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().previewAdminAccountPreferencesCopy(request)).resolves.toEqual(preview);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/account-preferences/copy/preview");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify(request));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("applies the reviewed admin account preference copy and returns per-target results", async () => {
+    const request = {
+      sourceUserId: "source-1",
+      sourceExpectedVersion: 4,
+      targets: [{ userId: "user-1", expectedVersion: 2 }],
+      groups: { appearance: true, home: false, playback: false },
+    };
+    const result = {
+      sourceUserId: "source-1",
+      sourceVersion: 4,
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "user-2", success: false, errorCode: "VERSION_CONFLICT" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(result), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().copyAdminAccountPreferences(request)).resolves.toEqual(result);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/account-preferences/copy");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify(request));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("uses the session-only password change contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
 

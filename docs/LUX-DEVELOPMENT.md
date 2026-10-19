@@ -14020,6 +14020,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：增加管理员偏好复制预览与应用 API。预览仅返回选择的外观/首页/播放快照、来源版本和目标版本；应用检查来源版本并为每个目标独立 CAS，逐项报告版本冲突，同时对成功目标写入仅包含来源 ID 和组标志的审计。覆盖非管理员拒绝、预览不需 CSRF、应用需 CSRF、空组拒绝、重复/无效 ID 拒绝、未选组不出现在响应、目标并发冲突、来源过期和审计脱敏。`user_account_preferences::tests` 8/8、`cargo test --locked --test users` 8/8 和 `cargo build --locked` 通过；`cargo clippy --locked --lib -- -D warnings -A clippy::too_many_arguments`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 
+#### LUX-670：为偏好复制预览与应用接入 Web API 客户端
+
+范围：为 LUX-669 的管理员偏好复制预览与应用 API 增加有类型的客户端输入/输出和方法。客户端保留现有请求层的 CSRF 注入及错误处理；本任务不修改用户界面，也不扩展尚未版本化的媒体库顺序和播放完成比例。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 输入和响应类型与 LUX-669 的 JSON camelCase 合同一致，只允许 Appearance/Home/Playback 三组。
+- [x] 预览方法使用预览路径并返回源快照和目标版本；应用方法使用 CSRF 保护路径并返回逐目标结果。
+- [x] API client 定向测试覆盖请求路径、请求体、类型化响应及 CSRF，Web production build 通过。
+
+短计划：先写两个客户端方法的失败测试；再添加窄类型和方法实现，运行 API client 定向 Vitest 与 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-669。
+
+结果（2026-10-19）：新增偏好复制预览和应用的 Web 输入/响应类型及客户端方法，复用自动 CSRF 和统一错误处理。两项新测试验证精确路径、JSON 请求体、类型化响应及 CSRF；`pnpm --dir web exec vitest run tests/api-client.test.ts` 69/69 通过。Web build 在临时替换为提交版 `AdminDashboardNowPlaying.tsx` 后通过，退出前逐字节恢复工作区文件；该用户未提交文件本身含未使用 helper，仍未纳入本任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

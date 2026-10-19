@@ -40,6 +40,10 @@ import type {
   AdminUserPermissionPreset,
   AdminUserPermissionPresetBatchResponse,
   AdminUserPermissionPresetInput,
+  AdminAccountPreferenceCopyApplyInput,
+  AdminAccountPreferenceCopyBatchResponse,
+  AdminAccountPreferenceCopyPreview,
+  AdminAccountPreferenceCopyPreviewInput,
   AdminUserLibraryAccess,
   AdminUserLibraryAccessUpdateResult,
   AdminUserPlaybackPolicy,
@@ -1158,6 +1162,20 @@ export class LuxApiClient {
     return this.request<AdminUserPermissionPresetBatchResponse>(
       "/api/v1/admin/users/batch/permission-preset",
       { method: "POST", body: JSON.stringify({ userIds, presetId }) },
+    );
+  }
+
+  previewAdminAccountPreferencesCopy(input: AdminAccountPreferenceCopyPreviewInput) {
+    return this.request<AdminAccountPreferenceCopyPreview>(
+      "/api/v1/admin/users/account-preferences/copy/preview",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  copyAdminAccountPreferences(input: AdminAccountPreferenceCopyApplyInput) {
+    return this.request<AdminAccountPreferenceCopyBatchResponse>(
+      "/api/v1/admin/users/account-preferences/copy",
+      { method: "POST", body: JSON.stringify(input) },
     );
   }
 

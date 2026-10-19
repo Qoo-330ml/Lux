@@ -1239,6 +1239,57 @@ export type AdminUserPermissionPresetBatchResponse = {
   }>;
 };
 
+export type AdminAccountPreferenceCopyGroups = {
+  appearance: boolean;
+  home: boolean;
+  playback: boolean;
+};
+
+export type AdminAccountPreferenceCopyPreviewInput = {
+  sourceUserId: string;
+  targetUserIds: string[];
+  groups: AdminAccountPreferenceCopyGroups;
+};
+
+export type AdminAccountPreferenceCopyApplyInput = {
+  sourceUserId: string;
+  sourceExpectedVersion: number;
+  targets: Array<{ userId: string; expectedVersion: number }>;
+  groups: AdminAccountPreferenceCopyGroups;
+};
+
+export type AdminAccountPreferenceCopyPreview = {
+  sourceUserId: string;
+  sourceVersion: number;
+  sourceSnapshot: {
+    appearance?: { theme: string; accentColor: string };
+    home?: { showMediaLibraries: boolean; showContinueWatching: boolean };
+    playback?: {
+      audioLanguage: string;
+      subtitleLanguage: string;
+      autoPlayNextEpisode: boolean;
+    };
+  };
+  targets: Array<{ userId: string; expectedVersion: number }>;
+  groups: AdminAccountPreferenceCopyGroups;
+};
+
+export type AdminAccountPreferenceCopyErrorCode =
+  | "USER_UNAVAILABLE"
+  | "VERSION_CONFLICT"
+  | "INVALID_PREFERENCES"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminAccountPreferenceCopyBatchResponse = {
+  sourceUserId: string;
+  sourceVersion: number;
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminAccountPreferenceCopyErrorCode | null;
+  }>;
+};
+
 export type MediaStrategySettings = {
   metadataLanguage: string;
   imageLanguage: string;
