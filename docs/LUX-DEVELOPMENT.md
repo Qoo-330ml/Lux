@@ -14476,6 +14476,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：模块五用户详情加入分级体系/最大等级、未分级开关和逐行允许/禁止标签表单；未配置策略以默认不限制状态呈现，创建提交版本 0，保存后用服务端规范化结果更新表单。切换体系会清除不兼容等级；CAS 冲突禁用再次提交并提供重新读取操作。错误可重试，回收站只读；页面说明保存的策略还未用于媒体访问过滤。模块五组件测试 9/9、播放策略回归 3/3、冻结依赖安装、Web build、diff check 通过。Playwright Chromium 390×844 检查显示文档宽 390px、策略卡宽 366px、表单单列且无横向溢出；mock API 后控制台错误 0，截图为 `output/playwright/user-content-policy-390.png`。完整 Web 套件 716 passed、4 failed；失败为既有 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项、`media-query-polling.test.tsx` 1 项，本次未改这些文件，未验证它们的干净基线。
 
+#### LUX-692：在库内容分页前应用用户内容限制
+
+范围：让 Lux 与 Emby 共用的媒体库过滤列表在 SQL 分页前执行已保存的内容限制，匹配总数同步过滤。有效分级/标签策略下，条目或其剧集/季度上级缺少分类索引时拒绝展示；管理员及未配置或完全不收紧的策略维持原结果。限制生效版本进入库页缓存键，更新策略后不得复用旧权限页。本任务不覆盖搜索、首页推荐、详情、图片、字幕、下载或播放入口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 管理员、无策略和完全不收紧策略不改变列表结果；有效策略按分级/未分级、允许标签及优先的禁止标签过滤。
+- [x] 媒体条目、剧集、季度和单集的列表遵守自身与对应上级限制；索引缺失时限制策略 fail closed。
+- [x] SQL 在 `LIMIT/OFFSET` 前过滤；总数与可见条目一致，策略版本区分缓存项。
+- [x] SQLite 存储回归验证规则组合、父级约束、缺少索引和过滤后分页；相关 library page/API 定向测试、Rust build、fmt 和 diff check 通过。
+
+短计划：先在存储回归建立含分级、标签、父级和缺失索引的 fixture，并断言过滤后的计数/分页失败；再将策略谓词加入通用 catalog filter，将非管理员用户策略及版本带入缓存请求；最后运行存储与库列表定向回归、Rust build、fmt 和 diff check。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions_filter_catalog_rows_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib library_page_applies_user_policy_and_uses_policy_version_in_cache_key`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-691。
+
+结果（2026-10-19）：Lux 与 Emby 共用的分页查询现在从选中条目、父级季度和系列检查分级与标签策略；索引缺行按不允许访问处理，允许标签需至少命中一项，禁止标签优先。过滤条件进入 SQL 的计数和分页子查询，查询发生在 LIMIT/OFFSET 之前。策略版本加入 library page cache key；管理员不应用用户策略，无策略和完全不收紧策略与既有列表一致。存储回归 1/1、策略更新与缓存版本应用回归 1/1、`tests/catalog.rs` 3/3、`cargo build --locked`、fmt 与 diff check 通过。本任务只覆盖通用媒体库过滤列表；搜索、首页/推荐、详情、图片、字幕、下载和播放仍待实施。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

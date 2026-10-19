@@ -10194,6 +10194,7 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         min_date_last_saved: None,
         metadata_pending: false,
         parent_id_scope: None,
+        content_restrictions: None,
         sort_by: CatalogSort::DateCreated,
         descending: true,
         offset: 0,
@@ -10227,6 +10228,196 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
             .any(|detail| detail.contains("idx_user_item_state_favorites")),
         "favorite query did not use the favorite state index: {plan:?}"
     );
+}
+
+#[tokio::test]
+async fn content_restrictions_filter_catalog_rows_before_pagination()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::UserContentRestrictions;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Content restriction filter", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+
+    let items = [
+        ("01-allowed", "MOVIE", None, None),
+        ("02-too-high", "MOVIE", None, None),
+        ("03-not-allowed", "MOVIE", None, None),
+        ("04-blocked", "MOVIE", None, None),
+        ("05-unrated", "MOVIE", None, None),
+        ("06-unindexed", "MOVIE", None, None),
+        ("07-restricted-series", "SERIES", None, None),
+        (
+            "08-parent-season",
+            "SEASON",
+            Some("07-restricted-series"),
+            Some("07-restricted-series"),
+        ),
+        (
+            "09-inherited",
+            "EPISODE",
+            Some("08-parent-season"),
+            Some("07-restricted-series"),
+        ),
+        ("10-allowed", "MOVIE", None, None),
+    ];
+    for (item_id, item_type, parent_id, series_id) in items {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id,
+                     title, sort_title, identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    for (item_id, certification) in [
+        ("01-allowed", Some("PG-13")),
+        ("02-too-high", Some("R")),
+        ("03-not-allowed", Some("PG")),
+        ("04-blocked", Some("PG")),
+        ("05-unrated", None),
+        ("07-restricted-series", Some("R")),
+        ("08-parent-season", Some("G")),
+        ("09-inherited", Some("G")),
+        ("10-allowed", Some("G")),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+    }
+    for item_id in [
+        "01-allowed",
+        "02-too-high",
+        "04-blocked",
+        "05-unrated",
+        "09-inherited",
+        "10-allowed",
+    ] {
+        database
+            .query("INSERT INTO media_content_restriction_tags (item_id, tag) VALUES (?, 'action')")
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    database
+        .query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag) VALUES ('03-not-allowed', 'family')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('04-blocked', 'violent')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let restrictions = UserContentRestrictions {
+        rating_system: "MPA".to_owned(),
+        maximum_rating: Some("PG-13".to_owned()),
+        allow_unrated: false,
+        allowed_tags: vec!["action".to_owned()],
+        blocked_tags: vec!["violent".to_owned()],
+        version: 4,
+        updated_at: 1,
+    };
+    let library_ids = vec![library_id];
+    let empty_item_types = Vec::new();
+    let empty_excluded_item_types = Vec::new();
+    let empty_years = Vec::new();
+    let make_filter = |offset, limit| CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "policy-user",
+        item_types: &empty_item_types,
+        excluded_item_types: &empty_excluded_item_types,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &empty_years,
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: Some(&restrictions),
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset,
+        limit,
+    };
+
+    let unrestricted_query = CatalogFilterQuery {
+        content_restrictions: None,
+        ..make_filter(0, 20)
+    };
+    let (_, baseline_total) = database
+        .list_filtered_catalog_rows(&unrestricted_query)
+        .await?;
+    assert_eq!(baseline_total, 10, "fixture exposes every inserted item");
+
+    let (first_page, total) = database
+        .list_filtered_catalog_rows(&make_filter(0, 1))
+        .await?;
+    assert_eq!(total, 2, "only policy-eligible items contribute to total");
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].item_id, "01-allowed");
+    let (second_page, second_total) = database
+        .list_filtered_catalog_rows(&make_filter(1, 1))
+        .await?;
+    assert_eq!(second_total, total);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].item_id, "10-allowed");
+    let (past_end, third_total) = database
+        .list_filtered_catalog_rows(&make_filter(2, 1))
+        .await?;
+    assert_eq!(third_total, total);
+    assert!(past_end.is_empty());
+
+    let unrestricted = UserContentRestrictions {
+        rating_system: "MPA".to_owned(),
+        maximum_rating: None,
+        allow_unrated: true,
+        allowed_tags: Vec::new(),
+        blocked_tags: Vec::new(),
+        version: 1,
+        updated_at: 1,
+    };
+    let unrestricted_filter = CatalogFilterQuery {
+        content_restrictions: Some(&unrestricted),
+        ..make_filter(0, 20)
+    };
+    let (_, unrestricted_total) = database
+        .list_filtered_catalog_rows(&unrestricted_filter)
+        .await?;
+    assert_eq!(unrestricted_total, 10, "a non-restrictive row is a no-op");
+
+    database.close().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -11853,6 +12044,7 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
+            content_restrictions: None,
             sort_by,
             descending,
             offset: 0,
@@ -11926,6 +12118,7 @@ async fn catalog_filter_parent_scope_applies_before_pagination() {
         offset: 0,
         limit: 1,
         parent_id_scope: Some(None),
+        content_restrictions: None,
     };
 
     let (root_page, root_total) = database
@@ -12087,6 +12280,7 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
+            content_restrictions: None,
             sort_by: CatalogSort::PremiereDate,
             descending,
             offset: 0,

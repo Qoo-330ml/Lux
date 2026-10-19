@@ -3064,6 +3064,11 @@ fn catalog_filter_where_clause<'a>(
     } else {
         where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
     }
+    append_content_restriction_predicate(
+        &mut where_clause,
+        &mut binds,
+        filter.content_restrictions,
+    );
     let mut id_predicates = Vec::new();
     if let Some(item_ids) = item_ids
         && !item_ids.is_empty()
@@ -3264,6 +3269,138 @@ fn catalog_filter_where_clause<'a>(
     (where_clause, binds)
 }
 
+fn content_rating_order_expression(rating_system: &str) -> Option<&'static str> {
+    match rating_system {
+        "MPA" => Some(
+            "CASE restriction_index.certification_code
+                 WHEN 'G' THEN 0 WHEN 'PG' THEN 1 WHEN 'PG-13' THEN 2
+                 WHEN 'R' THEN 3 WHEN 'NC-17' THEN 4 ELSE NULL END",
+        ),
+        "TVPG" => Some(
+            "CASE restriction_index.certification_code
+                 WHEN 'TV-Y' THEN 0 WHEN 'TV-G' THEN 1 WHEN 'TV-Y7' THEN 2
+                 WHEN 'TV-PG' THEN 3 WHEN 'TV-14' THEN 4 WHEN 'TV-MA' THEN 5
+                 ELSE NULL END",
+        ),
+        "BBFC" => Some(
+            "CASE restriction_index.certification_code
+                 WHEN 'U' THEN 0 WHEN 'PG' THEN 1 WHEN '12' THEN 2
+                 WHEN '12A' THEN 2 WHEN '15' THEN 3 WHEN '18' THEN 4
+                 WHEN 'R18' THEN 5 ELSE NULL END",
+        ),
+        _ => None,
+    }
+}
+
+fn content_rating_order(rating_system: &str, rating: &str) -> Option<i64> {
+    let levels: &[&str] = match rating_system {
+        "MPA" => &["G", "PG", "PG-13", "R", "NC-17"],
+        "TVPG" => &["TV-Y", "TV-G", "TV-Y7", "TV-PG", "TV-14", "TV-MA"],
+        "BBFC" => &["U", "PG", "12", "12A", "15", "18", "R18"],
+        _ => return None,
+    };
+    if rating_system == "BBFC" && rating.eq_ignore_ascii_case("12A") {
+        return Some(2);
+    }
+    levels
+        .iter()
+        .position(|level| level.eq_ignore_ascii_case(rating))
+        .map(|order| order as i64)
+}
+
+fn append_content_restriction_predicate<'a>(
+    where_clause: &mut String,
+    binds: &mut Vec<CatalogBind<'a>>,
+    restrictions: Option<&'a UserContentRestrictions>,
+) {
+    let Some(restrictions) = restrictions else {
+        return;
+    };
+    let has_restrictions = restrictions.maximum_rating.is_some()
+        || !restrictions.allow_unrated
+        || !restrictions.allowed_tags.is_empty()
+        || !restrictions.blocked_tags.is_empty();
+    if !has_restrictions {
+        return;
+    }
+
+    let mut violations = vec!["restriction_index.item_id IS NULL".to_owned()];
+    if restrictions.maximum_rating.is_some() || !restrictions.allow_unrated {
+        let Some(rating_order_expression) =
+            content_rating_order_expression(&restrictions.rating_system)
+        else {
+            where_clause.push_str(" AND 1 = 0");
+            return;
+        };
+        if let Some(maximum_rating) = restrictions.maximum_rating.as_deref() {
+            let Some(maximum_order) =
+                content_rating_order(&restrictions.rating_system, maximum_rating)
+            else {
+                where_clause.push_str(" AND 1 = 0");
+                return;
+            };
+            let unrated_disallowed = !restrictions.allow_unrated;
+            violations.push(format!(
+                "(({rating_order_expression}) IS NOT NULL
+                    AND ({rating_order_expression}) > {maximum_order})
+                 OR (({rating_order_expression}) IS NULL AND {unrated_disallowed})"
+            ));
+        } else {
+            violations.push(format!("({rating_order_expression}) IS NULL"));
+        }
+    }
+
+    if !restrictions.blocked_tags.is_empty() {
+        let placeholders = std::iter::repeat_n("?", restrictions.blocked_tags.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "EXISTS (
+                SELECT 1 FROM media_content_restriction_tags blocked_tag
+                WHERE blocked_tag.item_id = restriction_item.id
+                  AND blocked_tag.tag IN ({placeholders})
+            )"
+        ));
+        binds.extend(
+            restrictions
+                .blocked_tags
+                .iter()
+                .map(|tag| CatalogBind::Text(tag)),
+        );
+    }
+    if !restrictions.allowed_tags.is_empty() {
+        let placeholders = std::iter::repeat_n("?", restrictions.allowed_tags.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "NOT EXISTS (
+                SELECT 1 FROM media_content_restriction_tags allowed_tag
+                WHERE allowed_tag.item_id = restriction_item.id
+                  AND allowed_tag.tag IN ({placeholders})
+            )"
+        ));
+        binds.extend(
+            restrictions
+                .allowed_tags
+                .iter()
+                .map(|tag| CatalogBind::Text(tag)),
+        );
+    }
+
+    where_clause.push_str(
+        " AND NOT EXISTS (
+             SELECT 1
+             FROM media_items restriction_item
+             LEFT JOIN media_content_restriction_index restriction_index
+               ON restriction_index.item_id = restriction_item.id
+             WHERE restriction_item.id IN (mi.id, mi.parent_id, mi.series_id)
+               AND restriction_item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+               AND (",
+    );
+    where_clause.push_str(&violations.join(" OR "));
+    where_clause.push_str("))");
+}
+
 pub(crate) fn movie_parent_folder_identity(
     library_root_id: &str,
     relative_path: &str,
@@ -3429,6 +3566,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) parent_id_scope: Option<Option<&'a str>>,
+    pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,

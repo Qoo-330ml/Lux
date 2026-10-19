@@ -20,7 +20,7 @@ use crate::{
     storage::{
         CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database,
         GLOBAL_COLLECTION_LIBRARY_ID, ResumeItemsQuery, StorageError, StoredCatalogDetail,
-        StoredCatalogRow, StoredMediaChapter,
+        StoredCatalogRow, StoredMediaChapter, UserContentRestrictions,
     },
 };
 
@@ -178,6 +178,7 @@ struct LibraryPageCacheKey {
     parent_scope: Option<CatalogParentScope>,
     offset: i64,
     limit: i64,
+    content_restriction_version: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -188,6 +189,7 @@ struct LibraryPageRequest {
     parent_scope: Option<CatalogParentScope>,
     offset: i64,
     limit: i64,
+    content_restrictions: Option<UserContentRestrictions>,
 }
 
 struct CachedLibraryPage {
@@ -296,6 +298,10 @@ impl LibraryPageCache {
             parent_scope: request.parent_scope.clone(),
             offset: request.offset,
             limit: request.limit,
+            content_restriction_version: request
+                .content_restrictions
+                .as_ref()
+                .map(|restrictions| restrictions.version),
         };
         let entry = self.entry(key, request).await;
         *entry.last_accessed_at.lock().await = Instant::now();
@@ -864,6 +870,13 @@ impl CatalogService {
         if !self.access.can_view_library(principal, library_id).await? {
             return Err(CatalogError::AccessDenied);
         }
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database
+                .user_content_restrictions(&principal.user_id_string())
+                .await?
+        };
         let request = LibraryPageRequest {
             principal,
             library_id: library_id.to_owned(),
@@ -871,6 +884,7 @@ impl CatalogService {
             parent_scope,
             offset,
             limit,
+            content_restrictions,
         };
         return self.library_page_cache.get_or_load(self, request).await;
     }
@@ -900,6 +914,7 @@ impl CatalogService {
                 CatalogParentScope::Root => None,
                 CatalogParentScope::Item(item_id) => Some(item_id.as_str()),
             }),
+            content_restrictions: request.content_restrictions.as_ref(),
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
                 CatalogSort::SortName => StorageCatalogSort::SortName,
@@ -933,6 +948,11 @@ impl CatalogService {
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
         let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -948,6 +968,7 @@ impl CatalogService {
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
                 CatalogSort::SortName => StorageCatalogSort::SortName,
@@ -3087,6 +3108,117 @@ mod tests {
             detailed_members.members[0].sources[0].item_id,
             "catalog-visible-movie"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_page_applies_user_policy_and_uses_policy_version_in_cache_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("policy-viewer", "Policy Viewer", "test password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Restricted movies", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        for item_id in ["policy-visible", "policy-blocked-after-update"] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, 'PG')",
+            )
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('policy-visible', 'family'),
+                    ('policy-blocked-after-update', 'violent')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let initial = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            initial,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let filter = super::CatalogFilter::default();
+        let initial_page = catalog
+            .list_library_items_filtered(principal, &library_id, &filter, 0, 10)
+            .await?;
+        assert_eq!(initial_page.total, 2);
+
+        let updated = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                1,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &["violent".to_owned()],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            updated,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let updated_page = catalog
+            .list_library_items_filtered(principal, &library_id, &filter, 0, 10)
+            .await?;
+        assert_eq!(updated_page.total, 1);
+        assert_eq!(updated_page.items[0].id, "policy-visible");
         Ok(())
     }
 }
