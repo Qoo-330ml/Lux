@@ -13114,13 +13114,14 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：每次授权 Web 或 Emby 的签名 HLS manifest、初始化文件、媒体分片前，重新读取该用户当前播放策略，并按会话已存档位判断是否仍允许。Remux 需要 `allow_remux`，音频转码需要 `allow_audio_transcode`，硬件/软件视频转码需要同时允许视频和音频转码（当前 HLS 输出会转码两者）。策略变更撤销了当前会话所需权限时，拒绝本次资源请求，停止 HLS、释放播放准入并删除临时资源。仅检查 HLS 会话，不改变直放与 STRM 外部交接合同。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`、`src/application/playback/session.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
 
 验收标准：
 
 - [x] 每次 HLS manifest/初始化文件/分片请求（包含 HEAD）使用当前策略校验会话档位；权限已撤销时不返回 HLS 资源。
 - [x] 权限撤销时会话停止、准入名额释放、HLS 临时目录清理；原票据后续重用仍被拒绝。
 - [x] Web 与 Emby 集成回归覆盖已签发链接被撤权后的取流行为；直放和 STRM 仍遵守现有边界。
+- [ ] 在兼容性文档记录 Emby 策略拒绝与撤权后签名 HLS 链接的响应合同。
 - [x] 定向 `web_playback` 与 `playback` 测试、Rust 格式检查和 `git diff --check` 通过。
 
 验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
