@@ -1,6 +1,6 @@
 use super::*;
-use crate::storage::UserPlaybackPolicy;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
+use crate::storage::{NewStoredUserPermissions, UserPlaybackPolicy};
 
 use std::time::{Duration, Instant};
 
@@ -122,6 +122,76 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn insert_user_with_email_and_permissions(
+        &self,
+        user: NewStoredUser<'_>,
+        permissions: NewStoredUserPermissions<'_>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash,
+                is_admin, can_manage_server, has_password, email,
+                can_download, can_play, max_simultaneous_playbacks,
+                allow_remux, allow_audio_transcode, allow_video_transcode,
+                library_access_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user.id)
+        .bind(user.username_normalized)
+        .bind(user.display_name)
+        .bind(user.password_hash)
+        .bind(database_flag(user.is_admin))
+        .bind(database_flag(user.is_admin))
+        .bind(database_flag(user.has_password))
+        .bind(user.email)
+        .bind(database_flag(permissions.can_download))
+        .bind(database_flag(permissions.can_play))
+        .bind(permissions.max_simultaneous_playbacks)
+        .bind(database_flag(permissions.allow_remux))
+        .bind(database_flag(permissions.allow_audio_transcode))
+        .bind(database_flag(permissions.allow_video_transcode))
+        .bind(permissions.library_access_mode)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        if permissions.library_access_mode == "SELECTED" {
+            for library_id in permissions.library_ids {
+                self.query(
+                    "INSERT INTO user_library_access (user_id, library_id, can_view)
+                     VALUES (?, ?, 1)",
+                )
+                .bind(user.id)
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn get_user_playback_policy(

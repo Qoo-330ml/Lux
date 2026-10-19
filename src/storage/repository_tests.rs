@@ -1,6 +1,7 @@
 use super::*;
 use crate::storage::{
-    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserPlaybackPolicy,
+    NewStoredUserPermissions, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+    UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -14228,6 +14229,113 @@ async fn user_library_access_modes_are_enforced_by_storage_queries()
             .is_empty()
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_permission_snapshot_is_inserted_with_selected_library_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Default snapshot", LibraryKind::Movie, false)
+        .await?;
+    let user = NewStoredUser {
+        id: "new-user-snapshot",
+        username_normalized: "snapshot-user",
+        display_name: "Snapshot User",
+        password_hash: "test-hash",
+        is_admin: false,
+        has_password: true,
+        email: None,
+    };
+    let library_ids = [library.id.to_string()];
+    let permissions = NewStoredUserPermissions {
+        library_access_mode: "SELECTED",
+        library_ids: &library_ids,
+        can_download: true,
+        can_play: false,
+        max_simultaneous_playbacks: 4,
+        allow_remux: false,
+        allow_audio_transcode: true,
+        allow_video_transcode: false,
+    };
+
+    database
+        .insert_user_with_email_and_permissions(user, permissions)
+        .await?;
+
+    let stored: (i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT can_download, can_play, max_simultaneous_playbacks,
+                allow_remux, allow_audio_transcode, allow_video_transcode,
+                library_access_mode
+         FROM users WHERE id = 'new-user-snapshot'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored, (1, 0, 4, 0, 1, 0, "SELECTED".to_owned()));
+    assert_eq!(
+        database
+            .list_accessible_library_ids("new-user-snapshot")
+            .await?,
+        library_ids
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_permission_snapshot_rolls_back_user_when_library_grant_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Failing default snapshot", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_new_user_permission_grant
+         BEFORE INSERT ON user_library_access
+         BEGIN SELECT RAISE(ABORT, 'grant rejected'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let library_ids = [library.id.to_string()];
+    let result = database
+        .insert_user_with_email_and_permissions(
+            NewStoredUser {
+                id: "new-user-snapshot-rollback",
+                username_normalized: "snapshot-rollback",
+                display_name: "Snapshot Rollback",
+                password_hash: "test-hash",
+                is_admin: false,
+                has_password: true,
+                email: None,
+            },
+            NewStoredUserPermissions {
+                library_access_mode: "SELECTED",
+                library_ids: &library_ids,
+                can_download: false,
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    let user_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'new-user-snapshot-rollback'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(user_count, 0);
     Ok(())
 }
 

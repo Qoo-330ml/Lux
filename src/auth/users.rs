@@ -2,8 +2,9 @@ use crate::{
     auth::password::{PasswordError, PasswordService},
     domain::ids::UserId,
     storage::{
-        AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser, StorageError,
-        StoredAdminUserListItem, UpdateUser, UserPlaybackPolicy,
+        AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser,
+        NewStoredUserPermissions, StorageError, StoredAdminUserListItem, UpdateUser,
+        UserPlaybackPolicy,
     },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,10 +137,11 @@ impl UserStore {
         let email = email.map(normalize_email).transpose()?;
         let password_hash = self.passwords.hash_password(password)?;
         let id = UserId::new();
+        let id_string = id.to_string();
 
         self.database
             .insert_user_with_email(NewStoredUser {
-                id: &id.to_string(),
+                id: &id_string,
                 username_normalized: &username_normalized,
                 display_name: &display_name,
                 password_hash: &password_hash,
@@ -159,6 +161,54 @@ impl UserStore {
             can_manage_server: is_admin,
             can_remote_access: false,
             can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
+        })
+    }
+
+    // LUX-637 wires administrator user creation to this permission snapshot.
+    #[allow(dead_code)]
+    pub(crate) async fn create_user_with_email_and_permission_snapshot(
+        &self,
+        username: &str,
+        display_name: &str,
+        password: &str,
+        is_admin: bool,
+        email: Option<&str>,
+        permissions: NewStoredUserPermissions<'_>,
+    ) -> Result<UserRecord, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let display_name = normalized_display_name(display_name, &username_normalized);
+        let email = email.map(normalize_email).transpose()?;
+        let password_hash = self.passwords.hash_password(password)?;
+        let id = UserId::new();
+        let id_string = id.to_string();
+
+        self.database
+            .insert_user_with_email_and_permissions(
+                NewStoredUser {
+                    id: &id_string,
+                    username_normalized: &username_normalized,
+                    display_name: &display_name,
+                    password_hash: &password_hash,
+                    is_admin,
+                    has_password: true,
+                    email: email.as_deref(),
+                },
+                permissions,
+            )
+            .await?;
+
+        Ok(UserRecord {
+            id,
+            username_normalized,
+            display_name,
+            has_password: true,
+            is_disabled: false,
+            is_admin,
+            can_manage_server: is_admin,
+            can_remote_access: false,
+            can_download: permissions.can_download,
             last_login_at: None,
             last_activity_at: None,
         })
@@ -197,6 +247,52 @@ impl UserStore {
             can_manage_server: is_admin,
             can_remote_access: false,
             can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
+        })
+    }
+
+    // LUX-637 wires administrator Emby user creation to this permission snapshot.
+    #[allow(dead_code)]
+    pub(crate) async fn create_user_without_password_with_permission_snapshot(
+        &self,
+        username: &str,
+        display_name: &str,
+        is_admin: bool,
+        permissions: NewStoredUserPermissions<'_>,
+    ) -> Result<UserRecord, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let display_name = normalized_display_name(display_name, &username_normalized);
+        let placeholder = format!("lux-unset-password-{}", UserId::new());
+        let password_hash = self.passwords.hash_password(&placeholder)?;
+        let id = UserId::new();
+        let id_string = id.to_string();
+
+        self.database
+            .insert_user_with_email_and_permissions(
+                NewStoredUser {
+                    id: &id_string,
+                    username_normalized: &username_normalized,
+                    display_name: &display_name,
+                    password_hash: &password_hash,
+                    is_admin,
+                    has_password: false,
+                    email: None,
+                },
+                permissions,
+            )
+            .await?;
+
+        Ok(UserRecord {
+            id,
+            username_normalized,
+            display_name,
+            has_password: false,
+            is_disabled: false,
+            is_admin,
+            can_manage_server: is_admin,
+            can_remote_access: false,
+            can_download: permissions.can_download,
             last_login_at: None,
             last_activity_at: None,
         })

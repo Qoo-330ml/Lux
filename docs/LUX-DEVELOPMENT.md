@@ -13336,6 +13336,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：全局“新用户默认权限”页接入三态媒体库模式、已启用媒体库选项、下载与播放/转码策略及非负并发上限；空指定集合提示为无媒体库权限，错误时草稿保留，成功刷新设置缓存。定向 Vitest 7/7、Web build 和 diff check 通过。Playwright 使用本机临时 SQLite 服务完成保存并刷新恢复；390px 视口文档宽度 375px、无页面横向溢出，控制台无错误。桌面与窄屏截图保存于 `output/playwright/user-default-permissions/.playwright-cli/`。默认值应用至新账号仍由后续任务实现。
 
+#### LUX-636：原子创建带权限快照的账号
+
+范围：为用户存储层增加带初始权限快照的创建路径，在同一数据库事务中写入账号字段和指定媒体库授权；保留现有创建方法行为。应用层后续负责读取并传入已验证的新用户默认权限。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/users.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新的账号创建入口将下载、播放、并发、转码和媒体库模式写入账号记录。
+- [x] 指定媒体库授权与账号插入处于同一事务，任一写入失败时不留下半创建账号。
+- [x] 旧的账号插入调用保持原默认行为。
+- [x] 定向 Rust 回归、fmt 和 diff check 通过。
+
+短计划：先为指定媒体库快照与权限字段写存储回归，再增加存储快照类型、事务插入实现及 auth 创建入口；验证已有创建路径不变。
+
+验证：`cargo test --locked --lib <新存储回归过滤器>`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-627、LUX-628、LUX-620、LUX-633。
+
+结果（2026-10-19）：存储新增初始用户权限快照，账号字段和指定媒体库授权在单个事务写入；正向保存和授权插入触发失败回滚的定向回归 2/2 通过，旧插入路径未改。`cargo build --locked`、fmt check 与 diff check 通过。全量 `cargo test --locked --all-targets` 为 985 passed、5 failed、25 ignored；失败为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`。全量 Clippy 被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。管理员和 Emby 创建入口接入默认快照由 LUX-637 完成。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

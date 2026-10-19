@@ -19,6 +19,18 @@ pub(crate) struct UserPlaybackPolicy {
     pub(crate) allow_video_transcode: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewStoredUserPermissions<'a> {
+    pub(crate) library_access_mode: &'a str,
+    pub(crate) library_ids: &'a [String],
+    pub(crate) can_download: bool,
+    pub(crate) can_play: bool,
+    pub(crate) max_simultaneous_playbacks: i64,
+    pub(crate) allow_remux: bool,
+    pub(crate) allow_audio_transcode: bool,
+    pub(crate) allow_video_transcode: bool,
+}
+
 // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
