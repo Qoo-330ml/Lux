@@ -14645,7 +14645,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：HomeService 将首页统一读取的策略快照传入聚合最近新增；直接 CatalogService 入口按当前 principal 读取策略。存储层对可用与不可用父条目分支的 count/list SQL 都在分页前使用同一谓词，按 SQL 分支顺序重复绑定允许/屏蔽标签。应用回归覆盖较新的 R 内容、缺索引项、R 分级系列及其较低分级分集、较旧的允许内容及允许/屏蔽标签；首项和总数只返回允许内容。
 
-验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅因未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
+验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1，覆盖管理员旁路、无策略和全允许策略仍返回原总数；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅因未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
 
 ## 29. 参考资料
 

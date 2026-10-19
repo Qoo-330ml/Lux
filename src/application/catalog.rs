@@ -3977,12 +3977,58 @@ mod tests {
         assert_eq!(recent.items.len(), 1);
         assert_eq!(recent.items[0].id, "recent-policy-visible");
 
-        let home =
-            crate::application::home::HomeService::new(catalog, LibraryService::new(database));
-        let snapshot = home.snapshot(principal, vec![library_id]).await?;
+        let home = crate::application::home::HomeService::new(
+            catalog.clone(),
+            LibraryService::new(database.clone()),
+        );
+        let snapshot = home.snapshot(principal, vec![library_id.clone()]).await?;
         assert_eq!(snapshot.recently_added.total, 1);
         assert_eq!(snapshot.recently_added.items.len(), 1);
         assert_eq!(snapshot.recently_added.items[0].id, "recent-policy-visible");
+
+        let admin_page = catalog
+            .list_recently_added(AccessPrincipal::new(user.id, true), 0, 1)
+            .await?;
+        assert_eq!(admin_page.total, 5);
+
+        let unconfigured_user = UserStore::new(database.clone())?
+            .create_user(
+                "recent-policy-unconfigured",
+                "Recent Policy Unconfigured",
+                "test password",
+                false,
+            )
+            .await?;
+        database
+            .set_user_library_access(&unconfigured_user.id.to_string(), &library_id, true)
+            .await?;
+        let unconfigured_principal = AccessPrincipal::new(unconfigured_user.id, false);
+        let unconfigured_page = catalog
+            .list_recently_added(unconfigured_principal, 0, 1)
+            .await?;
+        assert_eq!(unconfigured_page.total, 5);
+
+        let unrestricted_policy = database
+            .compare_and_swap_user_content_restrictions(
+                &unconfigured_user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            unrestricted_policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let unrestricted_page = catalog
+            .list_recently_added(unconfigured_principal, 0, 1)
+            .await?;
+        assert_eq!(unrestricted_page.total, 5);
         Ok(())
     }
 }
