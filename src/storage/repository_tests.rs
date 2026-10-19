@@ -20121,6 +20121,108 @@ async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
 }
 
 #[tokio::test]
+async fn user_current_playback_sessions_are_filtered_and_paginated()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let user_id = "playback-page-user";
+    database
+        .insert_user(
+            user_id,
+            "playback-page-user",
+            "Playback User",
+            "hash",
+            false,
+            true,
+        )
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback page", LibraryKind::Movie, false)
+        .await?;
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback page', 'playback page', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    for (id, session_user_id, state, last_event_at) in [
+        ("target-newest", user_id, "PLAYING", now - 1),
+        ("target-older", user_id, "PAUSED", now - 2),
+        ("target-stale", user_id, "PLAYING", now - 91),
+        ("target-stopped", user_id, "STOPPED", now - 1),
+        ("other-current", admin_id.as_str(), "PLAYING", now - 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                    id, user_id, item_id, play_session_id, device_id, state, last_event_at
+                 ) VALUES (?, ?, ?, ?, 'test-device', ?, ?)",
+        )
+        .bind(id)
+        .bind(session_user_id)
+        .bind(&item_id)
+        .bind(format!("play-{id}"))
+        .bind(state)
+        .bind(last_event_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first_page, first_total) = database
+        .list_current_user_playback_sessions(user_id, 1, 0)
+        .await?;
+    assert_eq!(first_total, 2);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, "target-newest");
+
+    let (second_page, second_total) = database
+        .list_current_user_playback_sessions(user_id, 1, 1)
+        .await?;
+    assert_eq!(second_total, 2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, "target-older");
+
+    for index in 0..101 {
+        let id = format!("target-page-{index:03}");
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                    id, user_id, item_id, play_session_id, device_id, state, last_event_at
+                 ) VALUES (?, ?, ?, ?, 'test-device', 'PLAYING', ?)",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(&item_id)
+        .bind(format!("play-{id}"))
+        .bind(now - 3)
+        .execute(database.pool())
+        .await?;
+    }
+    let (capped_page, capped_total) = database
+        .list_current_user_playback_sessions(user_id, 1_000, -1)
+        .await?;
+    assert_eq!(capped_total, 103);
+    assert_eq!(capped_page.len(), 100);
+    assert_eq!(capped_page[0].id, "target-newest");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

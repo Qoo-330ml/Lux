@@ -15401,6 +15401,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 全量 `pnpm --dir web test` 的 148 个 Node 测试通过，Vitest 为 734 通过、4 失败。失败是 `home-page.test.tsx` 的首页预取 1 项、`library-card.test.tsx` 两项和 `media-query-polling.test.tsx` 1 项；单独重跑这三个目标仍复现，相关代码不在本任务修改范围内。
 
+#### LUX-735：提供有界用户当前播放读取
+
+范围：为模块七用户详情当前播放管理提供指定用户的有界存储查询。仅读取播放记录中最近 90 秒内且尚未停止的会话，支持服务端总数与稳定倒序分页；每页限制 1–100 条，负偏移归零。只增加 storage 合同，不接管理员 API、停止操作或 Web 页面，不新增 migration。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/sessions.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 查询只返回指定用户最近活动且未停止的播放会话，按最近活动倒序并以 ID 稳定排序；其他用户、过期和已停止会话不返回。
+- [x] 返回的匹配总数不受分页影响；页大小强制限制为 1–100，偏移非负，查询结果有界。
+- [x] storage 定向回归、Rust build、fmt 与 diff check 通过；无 migration。
+
+短计划：先添加 SQLite storage 回归并确认分页方法缺失；再实现匹配总数和限量查询；最后运行定向库测试、build、fmt 与 diff check。API、HLS 停止和界面留给后续 LUX 任务。
+
+#### LUX-735 验证记录
+
+结果（2026-10-20）：新增指定用户当前播放 storage 查询，沿用后台播放卡片的 90 秒活跃窗口，排除已停止记录；结果按最近事件倒序、ID 正序分页，并在同一筛选条件下返回总数。页大小限制为 1–100，负偏移归零；未新增 migration。LUX-736 将接入管理员 API。
+
+验证：TDD RED 回归先因分页查询方法缺失而编译失败；实现后 `user_current_playback_sessions_are_filtered_and_paginated` 1/1，覆盖用户隔离、90 秒边界、停止记录过滤、排序、总数、分页和 100 条上限。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 门禁仍被 9 项未改动代码告警阻断，涉及 `src/api/admin/admin_users.rs:554`、`src/api/media.rs:2837`、`src/application/playback/session.rs:397`、`src/application/user_permission_copy.rs:382,657`、`src/storage/users.rs:3161,3164` 及 `src/storage/repository_tests.rs:15587,23380`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
