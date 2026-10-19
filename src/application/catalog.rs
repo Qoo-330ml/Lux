@@ -1428,18 +1428,31 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        self.list_recently_added_for_library_ids(&library_ids, offset, limit)
-            .await
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        self.list_recently_added_for_library_ids(
+            &library_ids,
+            content_restrictions.as_ref(),
+            offset,
+            limit,
+        )
+        .await
     }
 
     pub(crate) async fn list_recently_added_for_library_ids(
         &self,
         library_ids: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        self.list_recently_added_for_library_ids_with_filter(library_ids, offset, limit, false)
-            .await
+        self.list_recently_added_for_library_ids_with_filter(
+            library_ids,
+            content_restrictions,
+            offset,
+            limit,
+            false,
+        )
+        .await
     }
 
     pub(crate) async fn list_recently_added_movies_and_series_for_library_ids(
@@ -1448,20 +1461,27 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        self.list_recently_added_for_library_ids_with_filter(library_ids, offset, limit, true)
+        self.list_recently_added_for_library_ids_with_filter(library_ids, None, offset, limit, true)
             .await
     }
 
     async fn list_recently_added_for_library_ids_with_filter(
         &self,
         library_ids: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
         media_only: bool,
     ) -> Result<CatalogPage, CatalogError> {
         let (item_ids, total) = self
             .database
-            .list_recent_catalog_item_ids(library_ids, offset, limit, media_only)
+            .list_recent_catalog_item_ids(
+                library_ids,
+                offset,
+                limit,
+                media_only,
+                content_restrictions,
+            )
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let mut items = assemble_items(rows);
@@ -3812,6 +3832,157 @@ mod tests {
                 .map(|item| &item.id)
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn home_recently_added_applies_content_restrictions_before_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "recent-policy-viewer",
+                "Recent Policy Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Recent policy", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        for (item_id, certification, added_at) in [
+            ("recent-policy-hidden", Some("R"), 30_i64),
+            ("recent-policy-unindexed", None, 20_i64),
+            ("recent-policy-visible", Some("PG"), 10_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     identification_status, has_available_source, added_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1, ?)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(added_at)
+            .execute(database.pool())
+            .await?;
+            if let Some(certification) = certification {
+                sqlx::query(
+                    "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                     VALUES (?, ?)",
+                )
+                .bind(item_id)
+                .bind(certification)
+                .execute(database.pool())
+                .await?;
+            }
+        }
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source, added_at
+             ) VALUES (
+                 'recent-policy-blocked-series', ?, 'SERIES',
+                 'Blocked Series', 'blocked series', 'LOCAL_CONFIRMED', 0, 40
+             )",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id,
+                 title, sort_title, identification_status, has_available_source, added_at
+             ) VALUES (
+                 'recent-policy-blocked-episode', ?, 'EPISODE',
+                 'recent-policy-blocked-series', 'recent-policy-blocked-series',
+                 'Blocked Episode', 'blocked episode', 'LOCAL_CONFIRMED', 1, 50
+             )",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        for (item_id, certification) in [
+            ("recent-policy-blocked-series", "R"),
+            ("recent-policy-blocked-episode", "PG"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+        }
+        for (item_id, tag) in [
+            ("recent-policy-hidden", "violent"),
+            ("recent-policy-visible", "family"),
+            ("recent-policy-blocked-series", "family"),
+            ("recent-policy-blocked-episode", "family"),
+        ] {
+            sqlx::query("INSERT INTO media_content_restriction_tags (item_id, tag) VALUES (?, ?)")
+                .bind(item_id)
+                .bind(tag)
+                .execute(database.pool())
+                .await?;
+        }
+        let allowed_tags = vec!["family".to_owned()];
+        let blocked_tags = vec!["violent".to_owned()];
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &allowed_tags,
+                    blocked_tags: &blocked_tags,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let recent = catalog.list_recently_added(principal, 0, 1).await?;
+        assert_eq!(recent.total, 1);
+        assert_eq!(recent.items.len(), 1);
+        assert_eq!(recent.items[0].id, "recent-policy-visible");
+
+        let home =
+            crate::application::home::HomeService::new(catalog, LibraryService::new(database));
+        let snapshot = home.snapshot(principal, vec![library_id]).await?;
+        assert_eq!(snapshot.recently_added.total, 1);
+        assert_eq!(snapshot.recently_added.items.len(), 1);
+        assert_eq!(snapshot.recently_added.items[0].id, "recent-policy-visible");
         Ok(())
     }
 }

@@ -1162,6 +1162,7 @@ impl Database {
         offset: i64,
         limit: i64,
         media_only: bool,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<(Vec<String>, i64), StorageError> {
         if library_ids.is_empty() {
             return Ok((Vec::new(), 0));
@@ -1179,6 +1180,13 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let count_query = format!(
             "SELECT CAST(COALESCE(SUM(item_count), 0) AS BIGINT)
              FROM (
@@ -1188,7 +1196,7 @@ impl Database {
                  WHERE mi.removed_at IS NULL
                    AND {available_item_types}
                    AND mi.has_available_source = 1
-                   AND mi.library_id IN ({placeholders})
+                   AND mi.library_id IN ({placeholders}){content_restriction_predicate}
                  UNION ALL
                  SELECT COUNT(*) AS item_count
                  FROM media_items mi
@@ -1196,7 +1204,7 @@ impl Database {
                  WHERE mi.removed_at IS NULL
                    AND {unavailable_item_types}
                    AND mi.has_available_source = 0
-                   AND mi.library_id IN ({placeholders})
+                   AND mi.library_id IN ({placeholders}){content_restriction_predicate}
                    AND (
                        EXISTS (
                            SELECT 1
@@ -1223,8 +1231,22 @@ impl Database {
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
         }
+        for bind in &content_restriction_binds {
+            count_statement = match bind {
+                CatalogBind::Text(value) => count_statement.bind(*value),
+                CatalogBind::Integer(value) => count_statement.bind(*value),
+                CatalogBind::Real(value) => count_statement.bind(*value),
+            };
+        }
         for library_id in library_ids {
             count_statement = count_statement.bind(library_id);
+        }
+        for bind in &content_restriction_binds {
+            count_statement = match bind {
+                CatalogBind::Text(value) => count_statement.bind(*value),
+                CatalogBind::Integer(value) => count_statement.bind(*value),
+                CatalogBind::Real(value) => count_statement.bind(*value),
+            };
         }
         let list_query = format!(
             "WITH visible_catalog AS (
@@ -1234,7 +1256,7 @@ impl Database {
                  WHERE mi.removed_at IS NULL
                    AND {available_item_types}
                    AND mi.has_available_source = 1
-                   AND mi.library_id IN ({placeholders})
+                   AND mi.library_id IN ({placeholders}){content_restriction_predicate}
                  UNION ALL
                  SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
                  FROM media_items mi
@@ -1242,7 +1264,7 @@ impl Database {
                  WHERE mi.removed_at IS NULL
                    AND {unavailable_item_types}
                    AND mi.has_available_source = 0
-                   AND mi.library_id IN ({placeholders})
+                   AND mi.library_id IN ({placeholders}){content_restriction_predicate}
                    AND (
                        EXISTS (
                            SELECT 1
@@ -1273,8 +1295,22 @@ impl Database {
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
+        for bind in &content_restriction_binds {
+            list_statement = match bind {
+                CatalogBind::Text(value) => list_statement.bind(*value),
+                CatalogBind::Integer(value) => list_statement.bind(*value),
+                CatalogBind::Real(value) => list_statement.bind(*value),
+            };
+        }
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
+        }
+        for bind in &content_restriction_binds {
+            list_statement = match bind {
+                CatalogBind::Text(value) => list_statement.bind(*value),
+                CatalogBind::Integer(value) => list_statement.bind(*value),
+                CatalogBind::Real(value) => list_statement.bind(*value),
+            };
         }
         let count_future = async {
             count_statement

@@ -14624,6 +14624,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`cargo test --locked --lib content_restriction` 21 passed、1 ignored（PostgreSQL 专用）；加强后的推荐回归 1/1；`carousel_cache_isolated_by_content_restriction_version` 1/1；继续观看策略回归 1/1；`tests/catalog.rs` 3/3；`tests/resume_favorites.rs` 中 `home_continue_watching_advances_to_next_unplayed_episode_after_completion` 1/1；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅被未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
 
+#### LUX-699：首页最近新增列表应用用户内容限制
+
+范围：`/api/v1/home` 的聚合最近新增列表及对应 CatalogService 查询，在总数计算和分页之前应用当前用户的统一内容限制谓词。过滤条目不得占用页位或计入总数；管理员、无策略和无收紧策略保持既有结果。本任务不处理按库分组的最新条目、合集卡片或目录子项。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/application/home.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] HomeService 将同一版本的用户策略传入最近新增列表；直接 CatalogService 入口按 principal 加载策略。
+- [x] 自身、系列和季度限制及未就绪索引 fail closed；计数与分页使用相同谓词。
+- [x] 管理员、无策略和完全不收紧策略不改变既有结果。
+- [x] 回归证明较新的被限条目不会占据首个分页位置，过滤后总数准确；相关 catalog、build、fmt 和 diff check 通过。
+
+短计划：先增加带允许、拒绝和缺失索引条目的应用回归，确认当前首页最近新增泄漏并污染分页总数；再将策略快照传入 storage 并在计数/分页 SQL 中使用统一谓词；最后跑内容策略、目录集成、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib home_recently_added_applies_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-698。
+
+结果（2026-10-19）：HomeService 将首页统一读取的策略快照传入聚合最近新增；直接 CatalogService 入口按当前 principal 读取策略。存储层对可用与不可用父条目分支的 count/list SQL 都在分页前使用同一谓词，按 SQL 分支顺序重复绑定允许/屏蔽标签。应用回归覆盖较新的 R 内容、缺索引项、R 分级系列及其较低分级分集、较旧的允许内容及允许/屏蔽标签；首项和总数只返回允许内容。
+
+验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅因未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
