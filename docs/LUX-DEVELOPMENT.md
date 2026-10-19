@@ -15068,6 +15068,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：测试文件 admin-user-sessions.test.tsx 为 9/9，pnpm --dir web build 和 git diff --check 通过。Playwright 使用本地模拟 API 验证桌面 1200px 页面及全部撤销确认/DELETE/结果提示；390×844 CSS 视口下页面宽 375px，无页面级横向溢出，两张 760px 表格均在各自 310px 横向滚动区内。控制台 0 错误。截图：output/playwright/user-emby-sessions-desktop.png、output/playwright/user-emby-sessions-390.png。浏览器检查为本地模拟 API，不代表真实 FNOS 或生产环境验证。
 
+#### LUX-719：建立用户活动有界索引表
+
+范围：为模块七新增用户活动索引的 SQLite 与 PostgreSQL 迁移，保存活动所属用户、可选操作者、事件类型、目标引用、脱敏元数据 JSON 和发生时间。索引支持按用户/时间及用户/事件类型/时间倒序查询，并支持按发生时间清理过期索引。活动用户 ID 不加用户外键，避免账号彻底删除时绕过设计规定的活动保留期。本任务只建立 schema，不写入活动、不提供 API 或页面，也不回填旧归档。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0193_user_activity_events.sql`、`migrations-postgres/0193_user_activity_events.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] 空 SQLite 数据库迁移后存在用户活动索引表、用户/时间索引、用户/类型/时间索引和保留期清理索引。
+- [x] SQLite 与 PostgreSQL schema 字段及约束语义一致，支持无操作者/目标的登录等事件。
+- [x] 活动记录不依赖用户外键；新增迁移不改变现有表或历史记录。
+- [x] storage 定向迁移测试与 diff check 通过。
+
+短计划：先写空数据库迁移回归并确认索引表缺失而失败；再新增两种后端迁移及必要索引；最后运行指定 storage 回归和 diff check。
+
+结果（2026-10-20）：新增 `user_activity_events` 索引表，保存活动用户、可选操作者、类型、目标引用、元数据 JSON 和 Unix 时间；以三组索引支持用户时间线倒序分页、按类型筛选和保留期清理。活动用户 ID 不设外键，允许账号清理后索引按保留策略独立过期。没有回填归档或接入写入路径。
+
+验证：TDD RED 在空库中确认索引表缺失（0 行）；迁移后 `user_activity_events_migration_runs_from_an_empty_database` 1/1，通过字段/索引/外键/无操作者和目标插入检查。PostgreSQL 迁移做了结构合同检查，未连接真实 PostgreSQL 实例。`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+依赖：LUX-718。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

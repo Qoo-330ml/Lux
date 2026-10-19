@@ -14,6 +14,85 @@ use sqlx::{
 };
 
 #[tokio::test]
+async fn user_activity_events_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 193);
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'user_activity_events'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+
+    let required_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_activity_events')
+         WHERE name IN (
+             'id', 'user_id', 'actor_user_id', 'event_type', 'target_type',
+             'target_id', 'metadata_json', 'occurred_at'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(required_columns, 8);
+
+    for index_name in [
+        "idx_user_activity_events_user_time",
+        "idx_user_activity_events_user_type_time",
+        "idx_user_activity_events_retention",
+    ] {
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .bind(index_name)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(index_count, 1, "missing index {index_name}");
+    }
+
+    let foreign_key_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('user_activity_events')")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(foreign_key_count, 0);
+
+    sqlx::query(
+        "INSERT INTO user_activity_events (id, user_id, event_type)
+         VALUES ('activity-migration-login', 'deleted-user', 'AUTH_LOGIN')",
+    )
+    .execute(database.pool())
+    .await?;
+    let (actor_user_id, target_id, occurred_at): (Option<String>, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT actor_user_id, target_id, occurred_at
+             FROM user_activity_events WHERE id = 'activity-migration-login'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(actor_user_id, None);
+    assert_eq!(target_id, None);
+    assert!(occurred_at > 0);
+
+    let postgres_migration = include_str!("../migrations-postgres/0193_user_activity_events.sql");
+    assert!(postgres_migration.contains("user_id TEXT NOT NULL"));
+    assert!(postgres_migration.contains("actor_user_id TEXT"));
+    assert!(postgres_migration.contains("occurred_at BIGINT NOT NULL"));
+    assert!(postgres_migration.contains("idx_user_activity_events_user_time"));
+    assert!(postgres_migration.contains("idx_user_activity_events_user_type_time"));
+    assert!(postgres_migration.contains("idx_user_activity_events_retention"));
+    assert!(!postgres_migration.contains("REFERENCES users"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
