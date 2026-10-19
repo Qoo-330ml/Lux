@@ -1373,6 +1373,7 @@ impl Database {
         Ok(rows)
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_recommended_catalog_rows(
         &self,
         user_id: &str,
@@ -1380,12 +1381,37 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        self.list_recommended_catalog_rows_with_restrictions(
+            user_id,
+            library_ids,
+            offset,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_recommended_catalog_rows_with_restrictions(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
         let max_function = self.scalar_max_function();
         let min_function = self.scalar_min_function();
         let median_rating = self.recommendation_rating_median(library_ids).await?;
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let catalog_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -1414,7 +1440,7 @@ impl Database {
                    ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                    AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.library_id IN ({catalog_placeholders})
+                   AND mi.library_id IN ({catalog_placeholders}){content_restriction_predicate}
              ),
              playback_top AS (
                  SELECT scored.*
@@ -1474,10 +1500,11 @@ impl Database {
              ORDER BY ranked.recommendation_score DESC, mi.added_at DESC,
                       mi.sort_title, mi.id, ms.id, mt.stream_index"
         );
-        let mut binds = Vec::with_capacity(library_ids.len() * 2 + 4);
+        let mut binds = Vec::with_capacity(library_ids.len() + content_restriction_binds.len() + 4);
         binds.push(CatalogBind::Real(median_rating));
         binds.push(CatalogBind::Text(user_id));
         binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        binds.extend(content_restriction_binds);
         binds.push(CatalogBind::Integer(limit));
         binds.push(CatalogBind::Integer(offset));
         self.fetch_catalog_rows(&query, &binds).await

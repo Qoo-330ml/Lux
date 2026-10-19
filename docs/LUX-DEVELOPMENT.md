@@ -14601,6 +14601,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-695。
 
+#### LUX-698：在主页继续观看与推荐缓存中执行内容限制
+
+范围：主页继续观看列表通过统一分类策略过滤已保存进度和下一集候选。推荐候选在打分、候选池截取和每日批次写入前应用同一策略；用户策略版本区分主页缓存和每日推荐批次，策略更新后不返回旧推荐。本任务不覆盖最近新增、每库分组、合集或目录子项。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/application/home.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] `/api/v1/home` 的继续观看列表遵守自身/系列/季度限制，缺失索引 fail closed，并保持原分页总数行为。
+- [x] 推荐 SQL 在打分候选进入 TOP/limit 前应用策略；限制版本变更后创建独立每日批次，不能重用旧策略 ID 列表。
+- [x] 管理员和未配置策略保持既有结果；无收紧配置不阻断条目。
+- [x] 推荐策略回归、主页策略版本缓存回归、相关目录/home 测试、build、fmt 与 diff check 通过。
+
+短计划：先用主页/推荐回归确认未限制版本仍会缓存并返回高分级候选；再将策略传递到主页继续观看和推荐候选查询，并把策略版本纳入 HomeCacheKey 与每日批次 scope；最后运行应用、主页和存储推荐回归及构建检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib recommendations_apply_content_restrictions_before_candidate_pool`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib carousel_cache_isolated_by_content_restriction_version`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-696。
+
+结果（2026-10-19）：主页继续观看沿用统一内容限制谓词，继续观看计数与分页前候选一致。推荐查询在评分、TOP 候选及每日 ID 批次写入之前过滤；策略版本分别隔离主页缓存和持久化推荐批次。回归用 60 条受限条目和 1 条可见条目证明可见项不会被未过滤候选池挤掉，并覆盖管理员旁路、无策略和无收紧策略。
+
+验证：`cargo test --locked --lib content_restriction` 21 passed、1 ignored（PostgreSQL 专用）；加强后的推荐回归 1/1；`carousel_cache_isolated_by_content_restriction_version` 1/1；继续观看策略回归 1/1；`tests/catalog.rs` 3/3；`tests/resume_favorites.rs` 中 `home_continue_watching_advances_to_next_unplayed_episode_after_completion` 1/1；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅被未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

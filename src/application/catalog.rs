@@ -1330,6 +1330,7 @@ impl CatalogService {
         &self,
         library_ids: &[String],
         user_id: &str,
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
@@ -1339,9 +1340,22 @@ impl CatalogService {
             offset,
             limit,
             true,
-            None,
+            content_restrictions,
         )
         .await
+    }
+
+    pub(crate) async fn content_restrictions_for_principal(
+        &self,
+        principal: AccessPrincipal,
+    ) -> Result<Option<UserContentRestrictions>, CatalogError> {
+        if principal.is_admin {
+            return Ok(None);
+        }
+        Ok(self
+            .database
+            .user_content_restrictions(&principal.user_id_string())
+            .await?)
     }
 
     async fn list_continue_watching_for_library_ids_with_grouping(
@@ -1504,21 +1518,45 @@ impl CatalogService {
         limit: i64,
     ) -> Result<Vec<CatalogItem>, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        self.list_recommended_for_library_ids(&library_ids, user_id, limit)
-            .await
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        self.list_recommended_for_library_ids_with_policy(
+            &library_ids,
+            user_id,
+            content_restrictions.as_ref(),
+            limit,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_recommended_for_library_ids(
         &self,
         library_ids: &[String],
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<CatalogItem>, CatalogError> {
+        self.list_recommended_for_library_ids_with_policy(library_ids, user_id, None, limit)
+            .await
+    }
+
+    pub(crate) async fn list_recommended_for_library_ids_with_policy(
+        &self,
+        library_ids: &[String],
+        user_id: &str,
+        content_restrictions: Option<&UserContentRestrictions>,
+        limit: i64,
+    ) -> Result<Vec<CatalogItem>, CatalogError> {
         if library_ids.is_empty() {
             return Ok(Vec::new());
         }
         let batch_key = current_recommendation_batch_key();
-        let library_scope_key = recommendation_library_scope_key(library_ids);
+        let mut library_scope_key = recommendation_library_scope_key(library_ids);
+        if let Some(restrictions) = content_restrictions {
+            library_scope_key.push_str(&format!(
+                "\u{001e}content-policy-version={}",
+                restrictions.version
+            ));
+        }
         if let Some(item_ids) = self
             .database
             .find_recommendation_daily_batch(user_id, &library_scope_key, batch_key)
@@ -1537,7 +1575,13 @@ impl CatalogService {
         }
 
         let item_ids = self
-            .compute_recommendation_daily_batch(user_id, library_ids, &library_scope_key, batch_key)
+            .compute_recommendation_daily_batch(
+                user_id,
+                library_ids,
+                &library_scope_key,
+                batch_key,
+                content_restrictions.cloned(),
+            )
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let mut items = reorder_catalog_items(assemble_items(rows), &item_ids);
@@ -1567,6 +1611,7 @@ impl CatalogService {
         library_ids: &[String],
         library_scope_key: &str,
         batch_key: i64,
+        content_restrictions: Option<UserContentRestrictions>,
     ) -> Result<Vec<String>, CatalogError> {
         let service = self.clone();
         let user_id = user_id.to_owned();
@@ -1587,11 +1632,12 @@ impl CatalogService {
             // full refresh transaction while a migration or scan is writing to the database.
             let rows = service
                 .database
-                .list_recommended_catalog_rows(
+                .list_recommended_catalog_rows_with_restrictions(
                     &user_id,
                     &library_ids,
                     0,
                     RECOMMENDATION_CANDIDATE_POOL,
+                    content_restrictions.as_ref(),
                 )
                 .await?;
             let items = daily_recommendation_items(
@@ -3602,12 +3648,170 @@ mod tests {
                 .iter()
                 .any(|item| item.id == "resume-policy-open-episode-2")
         );
+        let home = crate::application::home::HomeService::new(
+            catalog.clone(),
+            LibraryService::new(database.clone()),
+        );
+        let snapshot = home.snapshot(principal, vec![library_id.clone()]).await?;
+        assert_eq!(snapshot.continue_watching.total, 2);
+        assert!(snapshot.continue_watching.items.iter().all(|item| {
+            item.id != "resume-policy-hidden-movie"
+                && item.id != "resume-policy-unindexed-movie"
+                && item.id != "resume-policy-blocked-episode-2"
+        }));
         let second_page = catalog
             .list_continue_watching(principal, &user_id, 1, 1)
             .await?;
         assert_eq!(second_page.total, 2);
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].id, "resume-policy-open-episode-2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recommendations_apply_content_restrictions_before_candidate_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "recommendation-policy-viewer",
+                "Recommendation Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Recommendation policy", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        let mut candidates = (0..60)
+            .map(|index| {
+                (
+                    format!("recommendation-policy-hidden-{index:02}"),
+                    "R",
+                    1_000_000_000_i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.push(("recommendation-policy-visible".to_owned(), "PG", 0));
+        for (item_id, certification, added_at) in candidates {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     identification_status, has_available_source, added_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1, ?)",
+            )
+            .bind(&item_id)
+            .bind(&library_id)
+            .bind(&item_id)
+            .bind(&item_id)
+            .bind(added_at)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(&item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+        }
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let before_policy = catalog.list_recommended(principal, &user_id, 10).await?;
+        assert_eq!(before_policy.len(), 10);
+        assert!(
+            before_policy
+                .iter()
+                .all(|item| item.id != "recommendation-policy-visible")
+        );
+
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let restricted = catalog.list_recommended(principal, &user_id, 10).await?;
+        assert_eq!(restricted.len(), 1);
+        assert_eq!(restricted[0].id, "recommendation-policy-visible");
+
+        let admin = AccessPrincipal::new(user.id, true);
+        let admin_recommendations = catalog.list_recommended(admin, &user_id, 10).await?;
+        assert_eq!(admin_recommendations.len(), 10);
+        assert_eq!(
+            admin_recommendations
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>(),
+            before_policy
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>()
+        );
+
+        let unrestricted_policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                1,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            unrestricted_policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let unrestricted_recommendations =
+            catalog.list_recommended(principal, &user_id, 10).await?;
+        assert_eq!(unrestricted_recommendations.len(), 10);
+        assert_eq!(
+            unrestricted_recommendations
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>(),
+            before_policy
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 }
