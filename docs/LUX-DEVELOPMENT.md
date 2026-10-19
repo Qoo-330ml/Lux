@@ -13665,6 +13665,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 SQLite/PostgreSQL 账户偏好表迁移，保存主题、强调色、首页区块、音轨/字幕语言、自动连播、版本和更新时间；约束限定可选主题/强调色、布尔值及正版本，用户删除级联清理。SQLite 空库回归先以 schema 版本 188/预期 189 失败，迁移后 1/1 通过，覆盖字段默认值、非法值拒绝和级联删除。PostgreSQL 运行时与当前 schema 断言由 LUX-652 接续。
 
+#### LUX-652：验证账户偏好 PostgreSQL 迁移并同步 schema 版本
+
+范围：将 SQLite/PostgreSQL 当前 schema 版本断言同步至 189，并补充 PostgreSQL 16 空库迁移后的账户偏好默认值、约束和级联删除运行时验证。旧库迁移仍保持其明确的历史版本起点。本任务不修改运行时代码或迁移。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`tests/storage.rs`、`tests/scanner.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 所有当前 schema 断言为 189，明确测试历史迁移的断言仍为其源版本。
+- [x] PostgreSQL 空库创建偏好表，运行验证默认值、非法主题/强调色/版本拒绝及用户级联删除。
+- [x] 受影响迁移 target、PostgreSQL 迁移回归、Rust 格式检查与 diff check 通过。
+
+短计划：先搜索全部当前版本断言并区分历史升级起点；更新断言与 PostgreSQL bootstrap 运行时回归，再运行受影响 targets。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage`、相关 `scanner` / `scanning_jobs` / `danmaku` schema 迁移用例、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_bootstrap_runs_migrations_and_persists_core_state -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_user_library_access_mode_migration_preserves_legacy_semantics -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：所有当前 schema 断言同步到 189；旧库迁移仍从明确历史版本升级。PostgreSQL 16 空库 bootstrap 1/1，覆盖账户偏好默认值、无效主题/强调色/版本拒绝及用户删除级联；LUX-627 PostgreSQL 旧授权升级回归 1/1。SQLite `storage` target 串行运行 66/66，`scanner`、`scanning_jobs`、`danmaku` schema 定向用例各 1/1；PostgreSQL 格式与 diff 检查通过。`storage` 并行首跑中既有 cooldown 窗口测试 65/66，隔离复跑 1/1、串行复跑 66/66；不涉及本次迁移。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

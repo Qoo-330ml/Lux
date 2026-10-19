@@ -135,11 +135,98 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 188);
+    assert_eq!(database.schema_version().await?, 189);
     let setup = SetupService::new(database.clone())?;
     setup
         .complete("postgres-admin", "PostgreSQL Admin", "test-password")
         .await?;
+    let postgres_admin_id: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE username_normalized = 'postgres-admin'")
+            .fetch_one(database.pool())
+            .await?;
+    let preference_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_account_preferences'
+           AND column_name IN (
+               'user_id', 'theme', 'accent_color', 'show_media_libraries',
+               'show_continue_watching', 'audio_language', 'subtitle_language',
+               'auto_play_next_episode', 'version', 'updated_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preference_columns, 10);
+    sqlx::query("INSERT INTO user_account_preferences (user_id) VALUES ($1)")
+        .bind(&postgres_admin_id)
+        .execute(database.pool())
+        .await?;
+    let preference_defaults: (String, String, i64, i64, String, String, i64, i64) = sqlx::query_as(
+        "SELECT theme, accent_color, show_media_libraries, show_continue_watching,
+                    audio_language, subtitle_language, auto_play_next_episode, version
+             FROM user_account_preferences WHERE user_id = $1",
+    )
+    .bind(&postgres_admin_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        preference_defaults,
+        (
+            "dark".to_owned(),
+            "silver".to_owned(),
+            1,
+            1,
+            "原始音轨".to_owned(),
+            "简体中文".to_owned(),
+            1,
+            1,
+        )
+    );
+    assert!(
+        sqlx::query("UPDATE user_account_preferences SET theme = 'sepia' WHERE user_id = $1",)
+            .bind(&postgres_admin_id)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET accent_color = 'ultraviolet' WHERE user_id = $1",
+        )
+        .bind(&postgres_admin_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE user_account_preferences SET version = 0 WHERE user_id = $1",)
+            .bind(&postgres_admin_id)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('postgres-pref-cascade', 'postgres-pref-cascade', 'Cascade', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_account_preferences (user_id)
+         VALUES ('postgres-pref-cascade')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'postgres-pref-cascade'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_preferences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_account_preferences
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cascaded_preferences, 0);
     sqlx::query(
         "INSERT INTO users (id, username_normalized, display_name, password_hash)
          VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
@@ -842,7 +929,7 @@ async fn postgres_account_profile_migration_preserves_existing_accounts()
         pool.close().await;
 
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(database.schema_version().await?, 188);
+        assert_eq!(database.schema_version().await?, 189);
         let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> =
             sqlx::query_as(
                 "SELECT id, email, email_verified_at, deletion_purge_at,
@@ -939,7 +1026,7 @@ async fn postgres_user_library_access_mode_migration_preserves_legacy_semantics(
         pool.close().await;
 
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(database.schema_version().await?, 188);
+        assert_eq!(database.schema_version().await?, 189);
         let modes: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
         )
@@ -1176,7 +1263,7 @@ async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
                     ),
                 ]
             );
-            assert_eq!(database.schema_version().await?, 188);
+            assert_eq!(database.schema_version().await?, 189);
             let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
                 "SELECT version, checksum FROM _sqlx_migrations
                  WHERE version <= $1 ORDER BY version",
@@ -1305,7 +1392,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 188);
+        assert_eq!(upgraded_database.schema_version().await?, 189);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -1426,7 +1513,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 188);
+    assert_eq!(database.schema_version().await?, 189);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2801,7 +2888,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 188);
+    assert_eq!(database.schema_version().await?, 189);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
