@@ -15281,18 +15281,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：在 Emby 按用户名和按用户 ID 登录均被允许尝试且认证失败后，使用 LUX-728 的目标账号解析调用 LUX-726 安全记录器。未知/非法账号、数据库或迁移错误以及入口限流直接拒绝不记录；保持 Emby 状态码、响应体和频率限制合同，不记录客户端凭证或请求内容。
 
-预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin.rs`、`src/api/emby_handlers.rs`、`src/auth/emby.rs`、`tests/users.rs`。
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/emby_handlers.rs`、`tests/users.rs`。
 
 验收标准：
 
-- [ ] 已知用户名或用户 ID 的密码错误、禁用账号写入 `AUTH_LOGIN_FAILED`，actor 为空并关联目标用户。
-- [ ] 未知/非法目标、认证错误和限流直接拒绝不写用户活动；失败元数据不含用户名、密码、token 或完整 URL。
-- [ ] Emby 失败 HTTP 合同、速率限制和成功认证事件不变，既有审计记录仍产生。
-- [ ] `users` 定向回归、Rust build、fmt 和 diff check 通过。
+- [x] 已知用户名或用户 ID 的密码错误、禁用账号写入 `AUTH_LOGIN_FAILED`，actor 为空并关联目标用户。
+- [x] 未知/非法目标、认证错误和限流直接拒绝不写用户活动；失败元数据不含用户名、密码、token 或完整 URL。
+- [x] Emby 失败 HTTP 合同、速率限制和成功认证事件不变，既有审计记录仍产生。
+- [x] `users` 定向回归、Rust build、fmt 和 diff check 通过。
 
 短计划：先为 Emby 用户名/ID 认证失败及限流写集成回归并确认活动缺失；再仅在认证返回明确失败的分支查询已知目标并接入记录器；最后运行 `users` 集成目标、build、fmt 和 diff check。
 
 依赖：LUX-726、LUX-728。
+
+结果（2026-10-20）：Emby `AuthenticateByName` 和按用户 ID 认证在入口未被限流、认证明确返回失败后，分别用 LUX-728 的相同账号解析和安全 ID 查询定位现有账号并写 `AUTH_LOGIN_FAILED`。固定客户端标记为 `LUX_EMBY`，actor 为空；认证错误、未知/非法目标及入口限流不产生个人失败活动。HTTP 状态与响应体保持既有合同。
+
+验证：TDD RED 集成回归先得到 0 条失败事件（预期 7 条）；实现后 `cargo test --locked --test users` 18/18、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。回归覆盖用户名、唯一显示名称、已知用户 ID、禁用账号、未知/非法目标、速率限制，以及活动和审计元数据不包含账号名或凭证。
 
 ## 29. 参考资料
 

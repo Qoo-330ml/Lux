@@ -2132,6 +2132,19 @@ pub(super) async fn emby_authenticate(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            if let Ok(Some(user_id)) = auth
+                .find_failed_authentication_user_id(&request.username)
+                .await
+            {
+                record_failed_authentication_event(
+                    state.database.as_ref(),
+                    &state.admin_events,
+                    &user_id,
+                    "LUX_EMBY",
+                    request_client_ip(&headers, &state.remote_access),
+                )
+                .await;
+            }
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -2165,6 +2178,16 @@ pub(super) async fn emby_authenticate_user_id(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            if let Ok(Some(user)) = auth.user_by_id(&user_id).await {
+                record_failed_authentication_event(
+                    state.database.as_ref(),
+                    &state.admin_events,
+                    &user.id.to_string(),
+                    "LUX_EMBY",
+                    request_client_ip(&headers, &state.remote_access),
+                )
+                .await;
+            }
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
