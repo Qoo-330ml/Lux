@@ -1473,6 +1473,215 @@ async fn admin_can_batch_apply_permission_presets_with_per_user_results()
 }
 
 #[tokio::test]
+async fn admin_can_batch_enable_and_disable_users_with_per_user_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin_user = setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let batch_url = format!("{base_url}/api/v1/admin/users/batch/status");
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+
+    let unauthenticated = client
+        .post(&batch_url)
+        .json(&json!({ "userIds": [], "isDisabled": true }))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let missing_csrf = client
+        .post(&batch_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({ "userIds": [], "isDisabled": true }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let target_created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "username": "batch-status-target", "password": "target password" }))
+        .send()
+        .await?;
+    let target_status = target_created.status();
+    let target_body = target_created.json::<Value>().await?;
+    assert_eq!(target_status, reqwest::StatusCode::CREATED, "{target_body}");
+    let target_id = target_body["user"]["id"]
+        .as_str()
+        .ok_or("missing batch status target ID")?
+        .to_owned();
+    let failed_target_created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "username": "batch-status-failure",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    let failed_target_body = failed_target_created.json::<Value>().await?;
+    let failed_target_id = failed_target_body["user"]["id"]
+        .as_str()
+        .ok_or("missing failed batch status target ID")?
+        .to_owned();
+    sqlx::query(
+        "CREATE TRIGGER fail_batch_user_status_update
+         BEFORE UPDATE OF is_disabled ON users
+         WHEN OLD.username_normalized = 'batch-status-failure'
+         BEGIN SELECT RAISE(ABORT, 'injected batch status failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "batch-status-target", "password": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(target_login.status(), reqwest::StatusCode::OK);
+    let target_cookie = cookie_pair(target_login.headers());
+
+    for invalid_ids in [
+        Vec::<String>::new(),
+        vec![target_id.clone(), target_id.clone()],
+        (0..101).map(|index| format!("invalid-{index}")).collect(),
+    ] {
+        let invalid = client
+            .post(&batch_url)
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&json!({ "userIds": invalid_ids, "isDisabled": true }))
+            .send()
+            .await?;
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    let missing_user_id = "00000000-0000-4000-8000-000000000000";
+    let disabled = client
+        .post(&batch_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "userIds": [
+                "not-a-user-id",
+                missing_user_id,
+                failed_target_id,
+                target_id,
+                admin_user.id.to_string()
+            ],
+            "isDisabled": true
+        }))
+        .send()
+        .await?;
+    let disabled_status = disabled.status();
+    let disabled_body = disabled.text().await?;
+    assert_eq!(disabled_status, reqwest::StatusCode::OK, "{disabled_body}");
+    assert!(!disabled_body.to_ascii_lowercase().contains("cookie"));
+    assert!(!disabled_body.to_ascii_lowercase().contains("token"));
+    let disabled_results = serde_json::from_str::<Value>(&disabled_body)?["results"]
+        .as_array()
+        .cloned()
+        .ok_or("missing batch status results")?;
+    assert_eq!(disabled_results.len(), 5);
+    assert_eq!(disabled_results[0]["errorCode"], "INVALID_USER_ID");
+    assert_eq!(disabled_results[1]["errorCode"], "USER_NOT_FOUND");
+    assert_eq!(disabled_results[2]["userId"], failed_target_id);
+    assert_eq!(disabled_results[2]["errorCode"], "STORAGE_UNAVAILABLE");
+    assert_eq!(disabled_results[3]["userId"], target_id);
+    assert_eq!(disabled_results[3]["success"], true);
+    assert_eq!(disabled_results[4]["userId"], admin_user.id.to_string());
+    assert_eq!(disabled_results[4]["errorCode"], "LAST_MANAGER");
+
+    let revoked_session = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &target_cookie)
+        .send()
+        .await?;
+    assert_eq!(revoked_session.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let disabled_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "batch-status-target", "password": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(disabled_login.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let enabled = client
+        .post(&batch_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "userIds": [target_id], "isDisabled": false }))
+        .send()
+        .await?;
+    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        enabled.json::<Value>().await?["results"][0]["success"],
+        true
+    );
+    let enabled_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "batch-status-target", "password": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(enabled_login.status(), reqwest::StatusCode::OK);
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let events = audit.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing audit events")?;
+    for event_type in ["USER_DISABLED", "USER_ENABLED"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["eventType"] == event_type && event["targetId"] == target_id
+                })
+                .count(),
+            1
+        );
+    }
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "USER_DISABLED" && event["targetId"] == admin_user.id.to_string()
+    }));
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "USER_DISABLED" && event["targetId"] == failed_target_id
+    }));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

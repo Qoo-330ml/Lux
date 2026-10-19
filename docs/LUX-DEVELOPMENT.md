@@ -14761,6 +14761,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`content_restricted_catalog_counts_and_episode_counts_match_visible_items` 1/1；`content_restriction` 24 passed、1 ignored（PostgreSQL 专用）；`tests/emby_counts.rs` 1/1；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
 
+#### LUX-705：提供批量启用与禁用用户 API
+
+范围：新增管理员批量账号状态端点，接受明确勾选的 1–100 个用户 ID 和目标启用状态，拒绝重复目标；逐项复用单用户状态更新、最后管理员保护与禁用时的凭证撤销，并为每项目标返回稳定结果码。API 在禁用成功后停止对应服务端 HLS 会话并逐用户记审计事件。本任务不加入列表页面控件，也不支持“全部筛选结果”隐式扩展目标。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_user_lifecycle.rs`、`src/application/mod.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员端点要求 CSRF；空列表、超过 100 个 ID 和重复 ID 在执行前拒绝。
+- [x] 每个有效目标逐项成功/失败；无效 ID、不存在用户、最后有效管理员及存储错误有稳定结果码，其他目标继续处理。
+- [x] 禁用复用既有事务，撤销登录凭证并停止该用户服务端 HLS 会话；启用不恢复旧凭证。
+- [x] API 集成回归覆盖未认证、缺 CSRF、输入边界、部分成功、最后管理员保护、禁用后拒绝登录及重新启用后的新登录；users、build、fmt 和 diff check 通过。
+
+短计划：先在 `tests/users.rs` 为当前不存在的批量状态路由增加认证、部分成功和登录失效回归并确认失败；再添加逐用户应用服务，复用 `UserStore::update_user_with_hls_session_ids` 以及现有 HLS 停止路径，加入管理员端点和稳定 DTO；最后运行 `tests/users.rs`、build、fmt 与 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+结果（2026-10-19）：新增管理员批量账号状态应用服务和 `/api/v1/admin/users/batch/status`。请求必须是 1–100 个去重 ID；响应逐项返回 `INVALID_USER_ID`、`USER_NOT_FOUND`、`LAST_MANAGER` 或 `STORAGE_UNAVAILABLE`。每个状态变更单独复用既有事务和最后管理员保护；成功禁用后撤销登录凭证、停止返回的服务端 HLS 会话并写入 `USER_DISABLED` 审计事件，启用写入 `USER_ENABLED` 且不恢复旧登录。回归包含触发器注入的单用户存储失败，证明后续目标仍能成功；同时确认禁用使旧 Web 会话和密码登录失效，重新启用后可创建新会话。
+
+验证：`tests/users.rs` 11/11、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。本任务未运行全量 Rust 门禁。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

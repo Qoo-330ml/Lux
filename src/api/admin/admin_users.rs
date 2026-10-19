@@ -85,6 +85,13 @@ struct BatchApplyUserPermissionPresetRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BatchUserStatusRequest {
+    user_ids: Vec<String>,
+    is_disabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AdminUserSessionsQuery {
     page: Option<u32>,
     page_size: Option<u32>,
@@ -294,6 +301,66 @@ async fn admin_batch_apply_user_permission_preset(
         }
         Err(error) => user_permission_preset_application_error(&headers, error),
     }
+}
+
+async fn admin_batch_update_user_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<BatchUserStatusRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request.user_ids.is_empty()
+        || request.user_ids.len()
+            > crate::application::admin_user_lifecycle::MAX_BATCH_USER_STATUS_TARGETS
+        || has_duplicate_user_ids(&request.user_ids)
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "批量账号状态请求无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let result = crate::application::admin_user_lifecycle::update_users_disabled_status(
+        &users,
+        &request.user_ids,
+        request.is_disabled,
+    )
+    .await;
+    for item in result.results.iter().filter(|item| item.success) {
+        if request.is_disabled
+            && let Some(web_playback) = state.web_playback.as_ref()
+        {
+            web_playback
+                .stop_server_hls_sessions(&item.hls_session_ids)
+                .await;
+        }
+        let event_type = if request.is_disabled {
+            "USER_DISABLED"
+        } else {
+            "USER_ENABLED"
+        };
+        record_audit_event(
+            &state,
+            &headers,
+            event_type,
+            Some("user"),
+            Some(&item.user_id),
+            &json!({ "batch": true, "isDisabled": request.is_disabled }).to_string(),
+        )
+        .await;
+    }
+    Json(result).into_response()
 }
 
 async fn admin_preview_account_preferences_copy(
@@ -1875,6 +1942,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/batch/permission-preset",
             post(admin_batch_apply_user_permission_preset),
+        )
+        .route(
+            "/api/v1/admin/users/batch/status",
+            post(admin_batch_update_user_status),
         )
         .route(
             "/api/v1/admin/users/account-preferences/copy/preview",
