@@ -15908,6 +15908,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 先证明加入设备规则后旧 token 仍可访问；实现后 `emby_login_and_existing_tokens_enforce_device_client_blacklists` 通过，覆盖 token 撤销、同设备拒绝、其他设备继续登录及全局客户端规则规范化。`cargo test --locked --test emby_auth -- --test-threads=1` 绕过本地回环代理后 12/12 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 使用 Toshiba target 目录；播放链接与 IP/CIDR 仍由后续任务处理。
 
+#### LUX-761：解析显式可信代理后的客户端 IP
+
+范围：增加独立领域解析器，接收真实连接 peer、完整 `X-Forwarded-For` 字段值及显式可信代理 CIDR。peer 不可信时完全忽略转发头并返回 peer；peer 可信时校验完整转发链，从靠近 Lux 的一端向左逐跳剥离可信代理，返回首个不可信地址。IPv4-mapped IPv6 统一为 IPv4。可信 peer 缺少头时返回 peer；提供了空值或无效链时返回错误，调用方不得静默退回展示 IP。本任务只提供纯解析逻辑及单元测试，不读取配置、不接 HTTP/认证、不改变访问行为。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`。
+
+验收标准：
+
+- [x] 不可信 peer 即使收到伪造或格式错误的转发头，解析结果仍为连接 peer。
+- [x] 可信 peer 按完整多值链从右向左跳过可信代理；左侧伪造前缀不会覆盖首个非可信地址。
+- [x] IPv4、IPv6、IPv4-mapped IPv6、缺失头、空值和无效地址均有单元覆盖。
+- [x] 仅用户访问规则库定向测试、Rust build、fmt 与 diff check 通过；本任务不执行封禁。
+
+短计划：先为可信 peer、非可信 peer、伪造左前缀、多字段及畸形输入添加领域单测并确认解析器缺失；再实现纯 CIDR 链解析；最后运行指定库测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：新增纯 trusted-proxy 解析器；将 IPv4-mapped IPv6 规范化为 IPv4，不可信 peer 忽略全部转发头，可信 peer 限制最多 64 跳/8 KiB 并从右侧跳过可信代理。缺失头返回 peer；空字段、非法地址、超长或过多 hop 返回错误。未接入请求、配置或授权。
+
+验证：TDD RED 因解析函数及错误类型缺失而编译失败；实现后 `cargo test --locked --lib application::user_access_rules::tests` 9/9 通过。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

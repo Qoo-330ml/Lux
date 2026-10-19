@@ -1,6 +1,8 @@
 use std::{fmt, net::IpAddr, str::FromStr};
 
 const MAX_USER_ACCESS_RULE_VALUE_BYTES: usize = 256;
+const MAX_FORWARDED_FOR_BYTES: usize = 8 * 1024;
+const MAX_FORWARDED_HOPS: usize = 64;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +136,73 @@ impl IpCidr {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrustedIpResolutionError {
+    MalformedForwardedFor,
+    ForwardedForTooLong,
+    TooManyForwardedHops,
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_client_ip_from_trusted_proxies(
+    peer: IpAddr,
+    forwarded_for_values: &[&str],
+    trusted_proxies: &[IpCidr],
+) -> Result<IpAddr, TrustedIpResolutionError> {
+    let peer = normalize_mapped_ipv4(peer);
+    if !is_trusted_proxy(peer, trusted_proxies) || forwarded_for_values.is_empty() {
+        return Ok(peer);
+    }
+
+    let mut total_bytes = 0usize;
+    let mut forwarded_hops = Vec::new();
+    for header in forwarded_for_values {
+        total_bytes = total_bytes.saturating_add(header.len());
+        if total_bytes > MAX_FORWARDED_FOR_BYTES {
+            return Err(TrustedIpResolutionError::ForwardedForTooLong);
+        }
+        for value in header.split(',') {
+            if forwarded_hops.len() >= MAX_FORWARDED_HOPS {
+                return Err(TrustedIpResolutionError::TooManyForwardedHops);
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(TrustedIpResolutionError::MalformedForwardedFor);
+            }
+            let hop = value
+                .parse::<IpAddr>()
+                .map_err(|_| TrustedIpResolutionError::MalformedForwardedFor)?;
+            forwarded_hops.push(normalize_mapped_ipv4(hop));
+        }
+    }
+
+    let mut client_ip = peer;
+    for hop in forwarded_hops.into_iter().rev() {
+        if !is_trusted_proxy(client_ip, trusted_proxies) {
+            break;
+        }
+        client_ip = hop;
+    }
+    Ok(client_ip)
+}
+
+fn normalize_mapped_ipv4(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+}
+
+fn is_trusted_proxy(address: IpAddr, trusted_proxies: &[IpCidr]) -> bool {
+    trusted_proxies
+        .iter()
+        .any(|network| network.contains(address))
+}
+
+#[allow(dead_code)]
 impl fmt::Display for IpCidr {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}/{}", self.network, self.prefix)
@@ -179,8 +248,9 @@ fn network_address(address: IpAddr, prefix: u8) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::{
-        IpCidr, UserAccessBlacklistRuleType, UserAccessBlacklistRuleValidationError,
-        normalize_user_access_blacklist_value,
+        IpCidr, TrustedIpResolutionError, UserAccessBlacklistRuleType,
+        UserAccessBlacklistRuleValidationError, normalize_user_access_blacklist_value,
+        resolve_client_ip_from_trusted_proxies,
     };
     use std::net::IpAddr;
 
@@ -290,6 +360,72 @@ mod tests {
                 &"1".repeat(257),
             ),
             Err(UserAccessBlacklistRuleValidationError::TooLong)
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_forwarded_values_entirely() {
+        let peer = "203.0.113.9".parse::<IpAddr>().unwrap();
+        let trusted = [IpCidr::parse("10.0.0.0/8").unwrap()];
+
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(peer, &["198.51.100.7, invalid"], &trusted),
+            Ok(peer)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_chain_returns_first_untrusted_hop_from_the_right() {
+        let peer = "10.0.0.9".parse::<IpAddr>().unwrap();
+        let trusted = [IpCidr::parse("10.0.0.0/8").unwrap()];
+
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(
+                peer,
+                &["192.0.2.66, 198.51.100.24", "10.0.0.8"],
+                &trusted,
+            ),
+            Ok("198.51.100.24".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_resolution_handles_ipv6_and_ipv4_mapped_peers() {
+        let ipv6_peer = "2001:db8:ffff::2".parse::<IpAddr>().unwrap();
+        let ipv6_proxies = [IpCidr::parse("2001:db8:ffff::/48").unwrap()];
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(ipv6_peer, &["2001:db8::7"], &ipv6_proxies),
+            Ok("2001:db8::7".parse::<IpAddr>().unwrap())
+        );
+
+        let mapped_peer = "::ffff:10.0.0.9".parse::<IpAddr>().unwrap();
+        let ipv4_proxies = [IpCidr::parse("10.0.0.0/8").unwrap()];
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(
+                mapped_peer,
+                &["::ffff:198.51.100.2"],
+                &ipv4_proxies
+            ),
+            Ok("198.51.100.2".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn missing_trusted_header_uses_peer_but_malformed_chain_is_an_error() {
+        let peer = "10.0.0.9".parse::<IpAddr>().unwrap();
+        let trusted = [IpCidr::parse("10.0.0.0/8").unwrap()];
+
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(peer, &[], &trusted),
+            Ok(peer)
+        );
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(peer, &["198.51.100.1, invalid"], &trusted),
+            Err(TrustedIpResolutionError::MalformedForwardedFor)
+        );
+        assert_eq!(
+            resolve_client_ip_from_trusted_proxies(peer, &[""], &trusted),
+            Err(TrustedIpResolutionError::MalformedForwardedFor)
         );
     }
 }
