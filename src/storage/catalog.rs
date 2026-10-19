@@ -930,7 +930,8 @@ impl Database {
         let fts_query = format!(
             "SELECT mi.id FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN libraries l ON l.id = mi.library_id
+                               AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE media_search MATCH ? AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
@@ -961,7 +962,8 @@ impl Database {
 
         let like_query_sql = format!(
             "SELECT mi.id FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN libraries l ON l.id = mi.library_id
+                               AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
@@ -1040,7 +1042,8 @@ impl Database {
         let like_query_sql = format!(
             "SELECT mi.id FROM media_search ms
              JOIN media_items mi ON mi.id = ms.item_id
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN libraries l ON l.id = mi.library_id
+                               AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
                     OR ms.aliases ILIKE ? ESCAPE '\\')
                AND mi.removed_at IS NULL

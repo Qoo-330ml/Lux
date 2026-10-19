@@ -740,6 +740,38 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .execute(database.pool())
     .await?;
 
+    let collections_library_id: String =
+        sqlx::query_scalar("SELECT id FROM libraries WHERE system_kind = 'COLLECTIONS'")
+            .fetch_one(database.pool())
+            .await?;
+    let logical_work_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title,
+            identification_status, identity_key, has_available_source
+         ) VALUES ($1, $2, 'MOVIE', '银河搜索电影', '银河搜索电影',
+                   'ONLINE_CONFIRMED', 'global-work:tmdb:postgres-search-test', 1)",
+    )
+    .bind(&logical_work_id)
+    .bind(&collections_library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_work_items (work_item_id, movie_provider, movie_provider_id)
+         VALUES ($1, 'tmdb', 'postgres-search-test')",
+    )
+    .bind(&logical_work_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO collection_work_sources (work_item_id, source_item_id, sort_order)
+         VALUES ($1, $2, 0)",
+    )
+    .bind(&logical_work_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
     let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
     let page = catalog
         .search_items(
