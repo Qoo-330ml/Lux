@@ -121,6 +121,14 @@ pub(super) async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
+    let Some(admission_service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if let Err(response) =
+        check_web_playback_admission(&headers, admission_service, &user.id.to_string()).await
+    {
+        return response;
+    }
     let runtime_ticks = sources.first().and_then(|(source_item, source)| {
         super::emby_catalog::emby_source_runtime_ticks(source_item, source)
     });
@@ -1623,6 +1631,22 @@ pub(super) async fn handle_emby_playback_event(
                 .is_err()
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if let Some(service) = state.web_playback.as_ref() {
+                let admission_update = if state_name == "STOPPED" {
+                    service
+                        .release_playback_session_admission(&user_id, &play_session_id)
+                        .await
+                        .map(|_| ())
+                } else {
+                    service
+                        .renew_playback_session_admission(&user_id, &play_session_id)
+                        .await
+                        .map(|_| ())
+                };
+                if let Err(error) = admission_update {
+                    return web_playback_error(&headers, error);
+                }
             }
             state.user_events.publish_home_coalesced().await;
             if state_name != "STOPPED"
@@ -3278,6 +3302,26 @@ async fn check_web_playback_admission(
 ) -> Result<(), Response> {
     let result = service
         .check_playback_admission(user_id)
+        .await
+        .map_err(|error| web_playback_error(headers, error))?
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    if let Some(response) = playback_admission_error(headers, &result) {
+        return Err(response);
+    }
+    Ok(())
+}
+
+pub(super) async fn admit_emby_direct_playback(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: &str,
+    play_session_id: &str,
+) -> Result<(), Response> {
+    let Some(service) = state.web_playback.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let result = service
+        .admit_playback_session(user_id, play_session_id)
         .await
         .map_err(|error| web_playback_error(headers, error))?
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;

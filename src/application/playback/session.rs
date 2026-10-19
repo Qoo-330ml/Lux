@@ -236,6 +236,17 @@ impl WebPlaybackSessionService {
             .await?)
     }
 
+    pub(crate) async fn release_playback_session_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<bool, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .release_playback_admission(user_id, play_session_id, unix_timestamp())
+            .await?)
+    }
+
     pub(crate) async fn create(
         &self,
         input: CreateWebPlaybackSession<'_>,

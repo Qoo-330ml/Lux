@@ -2467,6 +2467,25 @@ pub(super) fn emby_stream_query_has_playback_ticket(query: &EmbyStreamQuery) -> 
         || query.playback_signature.is_some()
 }
 
+fn emby_direct_admission_session_id(
+    headers: &HeaderMap,
+    query: &EmbyStreamQuery,
+    item_id: &str,
+) -> String {
+    if emby_stream_query_has_playback_ticket(query)
+        && let Some(play_session_id) = query.play_session_id.as_deref()
+    {
+        return play_session_id.to_owned();
+    }
+    let device_id = super::emby_handlers::emby_device_info_from_headers(headers).device_id;
+    let device_id = if device_id.trim().is_empty() {
+        "unknown"
+    } else {
+        device_id.as_str()
+    };
+    format!("{item_id}:{device_id}")
+}
+
 pub(super) fn emby_stream_query_from_path(
     mut query: EmbyStreamQuery,
     container: &str,
@@ -2580,6 +2599,7 @@ pub(super) async fn emby_stream(
         &method,
         &item_id,
         query.media_source_id.as_deref(),
+        &emby_direct_admission_session_id(&headers, &query, &item_id),
         None,
     )
     .await
@@ -2614,6 +2634,7 @@ pub(super) async fn emby_stream_with_container(
         &method,
         &item_id,
         query.media_source_id.as_deref(),
+        &emby_direct_admission_session_id(&headers, &query, &item_id),
         Some(&container),
     )
     .await
@@ -2642,6 +2663,7 @@ pub(super) async fn emby_stream_with_source(
         &method,
         &item_id,
         Some(&media_source_id),
+        &emby_direct_admission_session_id(&headers, &query, &item_id),
         None,
     )
     .await
@@ -2671,6 +2693,7 @@ pub(super) async fn emby_stream_with_source_and_container(
         &method,
         &item_id,
         Some(&media_source_id),
+        &emby_direct_admission_session_id(&headers, &query, &item_id),
         Some(&container),
     )
     .await
@@ -2767,6 +2790,7 @@ pub(super) fn percent_encode_filename(value: &str) -> String {
 struct MediaFileRequest<'a> {
     item_id: &'a str,
     media_source_id: Option<&'a str>,
+    play_session_id: Option<&'a str>,
     pass_through_external_url: bool,
 }
 
@@ -2787,6 +2811,7 @@ pub(super) async fn serve_media_file(
         MediaFileRequest {
             item_id,
             media_source_id,
+            play_session_id: None,
             pass_through_external_url: false,
         },
     )
@@ -2800,6 +2825,7 @@ pub(super) async fn serve_emby_media_file(
     method: &Method,
     item_id: &str,
     media_source_id: Option<&str>,
+    play_session_id: &str,
     _requested_container: Option<&str>,
 ) -> Response {
     // Emby is also the handoff boundary for external proxies. Once Lux has
@@ -2814,6 +2840,7 @@ pub(super) async fn serve_emby_media_file(
         MediaFileRequest {
             item_id,
             media_source_id,
+            play_session_id: Some(play_session_id),
             pass_through_external_url: true,
         },
     )
@@ -2847,7 +2874,16 @@ async fn serve_media_file_internal(
                 if request.pass_through_external_url {
                     // Do not consume a load-balanced redirect with Lux's
                     // server-side Range: bytes=0-0 probe.
-                    return redirect_emby_strm_playback(&external_url);
+                    let response = redirect_emby_strm_playback(&external_url);
+                    return admit_emby_media_response(
+                        headers,
+                        state,
+                        principal,
+                        method,
+                        request.play_session_id,
+                        response,
+                    )
+                    .await;
                 }
                 let Some(resolver) = state.strm_playback.as_ref() else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -2862,7 +2898,16 @@ async fn serve_media_file_internal(
                     }
                     Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
                 };
-                return redirect_strm_playback(location.as_str());
+                let response = redirect_strm_playback(location.as_str());
+                return admit_emby_media_response(
+                    headers,
+                    state,
+                    principal,
+                    method,
+                    request.play_session_id,
+                    response,
+                )
+                .await;
             }
             StrmTargetKind::Path => {
                 let path = match canonical_local_strm_target(
@@ -2887,7 +2932,16 @@ async fn serve_media_file_internal(
                 {
                     return StatusCode::NOT_IMPLEMENTED.into_response();
                 }
-                return serve_media_path(headers, method, &path).await;
+                let response = serve_media_path(headers, method, &path).await;
+                return admit_emby_media_response(
+                    headers,
+                    state,
+                    principal,
+                    method,
+                    request.play_session_id,
+                    response,
+                )
+                .await;
             }
             StrmTargetKind::Smb | StrmTargetKind::Ftp => {}
             StrmTargetKind::Empty | StrmTargetKind::Unsupported => {
@@ -2905,7 +2959,16 @@ async fn serve_media_file_internal(
             }
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-        return redirect_strm_playback(&location);
+        let response = redirect_strm_playback(&location);
+        return admit_emby_media_response(
+            headers,
+            state,
+            principal,
+            method,
+            request.play_session_id,
+            response,
+        )
+        .await;
     }
     if source.source_kind != "LOCAL_FILE" {
         return StatusCode::NOT_IMPLEMENTED.into_response();
@@ -2915,7 +2978,44 @@ async fn serve_media_file_internal(
         Err(LocalPathError::Missing) => return StatusCode::NOT_FOUND.into_response(),
         Err(LocalPathError::Forbidden) => return StatusCode::FORBIDDEN.into_response(),
     };
-    serve_media_path(headers, method, &path).await
+    let response = serve_media_path(headers, method, &path).await;
+    admit_emby_media_response(
+        headers,
+        state,
+        principal,
+        method,
+        request.play_session_id,
+        response,
+    )
+    .await
+}
+
+async fn admit_emby_media_response(
+    headers: &HeaderMap,
+    state: &AppState,
+    principal: AccessPrincipal,
+    method: &Method,
+    play_session_id: Option<&str>,
+    response: Response,
+) -> Response {
+    if *method != Method::GET
+        || !(response.status().is_success() || response.status().is_redirection())
+    {
+        return response;
+    }
+    let Some(play_session_id) = play_session_id else {
+        return response;
+    };
+    let user_id = principal.user_id_string();
+    if user_id.is_empty() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Err(response) =
+        super::playback::admit_emby_direct_playback(headers, state, &user_id, play_session_id).await
+    {
+        return response;
+    }
+    response
 }
 
 pub(super) fn redirect_strm_playback(location: &str) -> Response {

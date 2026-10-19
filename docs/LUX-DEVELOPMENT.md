@@ -13055,20 +13055,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 #### LUX-622：接入 Emby 直放准入
 
-范围：Emby `PlaybackInfo` 签发媒体链接前只读检查 `can_play` 与当前并发额度；额度不足时返回包含当前播放数和上限的错误，且不创建 HLS 会话。Emby 直放链接的实际 GET（含 Range）及 STRM 外部 URL 交接时，按 `PlaySessionId` 原子准入；HEAD 不占位，同一会话重复取流复用名额。Emby `PLAYING`/`PAUSED` 回调只续租已有有效占位，`STOPPED` 回调停止并释放相同会话；回调不能创建或复活过期占位。兼容未带 Lux 签名票据的旧直放请求，并使用 Emby 回调共享的稳定会话身份，不接受客户端任意更换 ID 拆分并发计数。本任务不接入 Emby HLS 实际分片准入。
+范围：Emby `PlaybackInfo` 签发媒体链接前只读检查 `can_play` 与当前并发额度；额度不足时返回包含当前播放数和上限的错误，且不创建 HLS 会话。Emby 直放链接的实际 GET（含 Range）及 STRM 外部 URL 交接时，按 `PlaySessionId` 原子准入；HEAD 不占位，同一会话重复取流复用名额。Emby `PLAYING`/`PAUSED` 回调只续租已有且未过期的准入占位，不创建准入占位；`STOPPED` 回调停止并释放相同会话。兼容未带 Lux 签名票据的旧直放请求，并使用 Emby 回调共享的稳定会话身份，不接受客户端任意更换 ID 拆分并发计数。本任务不接入 Emby HLS 实际分片准入。
 
 预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`src/api/media.rs`、`tests/playback.rs`。
 
 验收标准：
 
-- [ ] `PlaybackInfo` 额度预检不占位；达到上限或禁止播放时返回当前播放数和上限，不创建 HLS 会话。
-- [ ] 直放/STRM 首次 GET 原子占位，HEAD 不占位；Range 与同一 `PlaySessionId` 的重复 GET 复用名额，超额新会话被拒绝且不影响已有会话。
-- [ ] 有效 `PLAYING`/`PAUSED` 回调续租，`STOPPED` 释放；迟到回调不能复活已过期占位。
-- [ ] Emby playback 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
+- [x] `PlaybackInfo` 额度预检不占位；达到上限或禁止播放时返回当前播放数和上限，不创建 HLS 会话。
+- [x] 直放/STRM 首次 GET 原子占位，HEAD 不占位；Range 与同一 `PlaySessionId` 的重复 GET 复用名额，超额新会话被拒绝且不影响已有会话。
+- [x] 有效 `PLAYING`/`PAUSED` 回调续租，`STOPPED` 释放；没有有效占位的回调不新建准入记录。
+- [x] Emby playback 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
 
-验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback emby_direct_playback_admission`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback` 通过（4/4）；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 前确认 Toshiba 已挂载。
 
 依赖：LUX-619、LUX-621。
+
+结果（2026-10-19）：PlaybackInfo 仅做准入预检，满额时拒绝 direct 与强制转码请求，未创建 HLS 会话。签名直放 GET 和 STRM 302 交接均按会话占位；HEAD 不占位，Range 复用占位，管理员并发上限从 1 到达后新会话被拒绝，原会话保留。PAUSED 续租、STOPPED 释放已验证；无播放 GET 的回调不创建占位。旧式直放使用条目/设备稳定会话 ID，STOPPED 无 PlaySessionId 时可释放。未部署。
 
 ## 29. 参考资料
 
