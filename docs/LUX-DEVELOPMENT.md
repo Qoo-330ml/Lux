@@ -13110,6 +13110,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：Web 与 Emby 共用的会话服务按用户策略和服务器能力选择最低允许 HLS 档位；硬件/软件视频转码还要求音频转码许可，因为当前 FFmpeg 输出同时转码音频。所有可用转码档位被禁用时，在写入会话或启动 HLS 前返回 403。直放及 STRM 的外部直放决策保持原样。策略单元测试 3/3、`web_playback` 1/1、`playback` 4/4 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --all-targets --all-features -- -D warnings` 被两个既有 `clippy::too_many_arguments` 报错阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`，本任务未修改这两个函数签名。未部署。
 
+#### LUX-625：复核已签发 HLS 链接的转码权限
+
+范围：每次授权 Web 或 Emby 的签名 HLS manifest、初始化文件、媒体分片前，重新读取该用户当前播放策略，并按会话已存档位判断是否仍允许。Remux 需要 `allow_remux`，音频转码需要 `allow_audio_transcode`，硬件/软件视频转码需要同时允许视频和音频转码（当前 HLS 输出会转码两者）。策略变更撤销了当前会话所需权限时，拒绝本次资源请求，停止 HLS、释放播放准入并删除临时资源。仅检查 HLS 会话，不改变直放与 STRM 外部交接合同。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`tests/web_playback.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [ ] 每次 HLS manifest/初始化文件/分片请求（包含 HEAD）使用当前策略校验会话档位；权限已撤销时不返回 HLS 资源。
+- [ ] 权限撤销时会话停止、准入名额释放、HLS 临时目录清理；原票据后续重用仍被拒绝。
+- [ ] Web 与 Emby 集成回归覆盖已签发链接被撤权后的取流行为；直放和 STRM 仍遵守现有边界。
+- [ ] 定向 `web_playback` 与 `playback` 测试、Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-624。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
