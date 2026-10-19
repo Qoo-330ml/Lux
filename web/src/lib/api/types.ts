@@ -592,6 +592,12 @@ export type AdminUserWebSessionPage = {
   totalCount: number;
 };
 
+export type AdminContentRestrictionIndexStatus = {
+  totalItems: number;
+  indexedItems: number;
+  pendingItems: number;
+};
+
 export type AdminUserPermissionPresetSourceDetails = {
   id: string;
   name: string;

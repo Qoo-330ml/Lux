@@ -35,6 +35,7 @@ import type {
   AdminEmbyMigrationUserLink,
   AdminApiKey,
   NetworkProxyDiagnostics,
+  AdminContentRestrictionIndexStatus,
   AdminUser,
   AdminUserWebSessionPage,
   AdminUserPermissionPreset,
@@ -1184,6 +1185,12 @@ export class LuxApiClient {
   adminUser(userId: string) {
     return this.request<{ user?: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  adminContentRestrictionIndexStatus() {
+    return this.request<AdminContentRestrictionIndexStatus>(
+      "/api/v1/admin/content-restriction-index",
     );
   }
 

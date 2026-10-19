@@ -14372,6 +14372,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：存储层用单条 LEFT JOIN 聚合活跃条目总数与已有索引数，已移除媒体不计入，待处理数由两者差值生成。只读端点 `/api/v1/admin/content-restriction-index` 要求管理员会话，响应仅含 `totalItems`、`indexedItems`、`pendingItems`。SQLite 与本地 PostgreSQL 存储回归各 1/1、管理员 HTTP 回归 1/1、`cargo build --locked`、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。UI 展示由后续独立任务接入。
 
+#### LUX-687：为内容限制索引状态增加 Web API 客户端
+
+范围：为 LUX-686 的只读管理员端点增加 TypeScript 状态类型和客户端方法，沿用现有请求层、camelCase 字段和错误处理。不在本任务修改页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] Web 类型准确描述活跃总数、已索引数与待就绪数。
+- [x] 客户端使用管理员就绪度路径发起只读 GET，并解码响应。
+- [x] API 客户端定向测试、Web typecheck/build 与 diff check 通过。
+
+短计划：先加客户端合同测试并确认方法缺失时失败；再增加类型和 GET 方法；最后运行定向 Vitest、格式与 diff 检查。
+
+验证：运行 `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web exec vitest run tests/api-client.test.ts -t "reads content restriction index readiness"`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-686。
+
+结果（2026-10-19）：新增 `AdminContentRestrictionIndexStatus` 类型和 `adminContentRestrictionIndexStatus()` GET 客户端方法；定向 API 客户端回归 1/1、冻结安装和 Web typecheck/build 通过。完整 `pnpm --dir web test` 为 706 passed、4 failed；失败分布于未改动的 `home-page.test.tsx`、`library-card.test.tsx`（2 项）和 `media-query-polling.test.tsx`，本任务未复现这些失败的基线状态。仓库未配置 Prettier 脚本或依赖，`git diff --check` 作为文本格式检查通过。页面展示留待 LUX-688。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

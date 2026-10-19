@@ -120,6 +120,18 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("reads content restriction index readiness from the admin endpoint", async () => {
+    const status = { totalItems: 12, indexedItems: 10, pendingItems: 2 };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(status), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().adminContentRestrictionIndexStatus()).resolves.toEqual(status);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/content-restriction-index");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+  });
+
   it("reads and replaces explicit admin library access modes", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       expect(String(input)).toBe("/api/v1/admin/users/user-1/libraries");
