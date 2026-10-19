@@ -777,6 +777,7 @@ impl Database {
         library_ids: &[String],
         user_id: &str,
         is_favorite: Option<bool>,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<StoredCatalogItemCounts, StorageError> {
         if library_ids.is_empty() {
             return Ok(StoredCatalogItemCounts::default());
@@ -794,6 +795,48 @@ impl Database {
             ) = ?"
                 .to_owned()
         });
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
+        let mut visible_collection_predicate = String::new();
+        let mut visible_collection_library_ids = Vec::new();
+        let mut visible_collection_content_binds = Vec::new();
+        if !content_restriction_predicate.is_empty() {
+            let collection_library_placeholders = std::iter::repeat_n("?", library_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut visible_member_content_predicate = String::new();
+            append_content_restriction_predicate_for_item_alias(
+                &mut visible_member_content_predicate,
+                &mut visible_collection_content_binds,
+                content_restrictions,
+                "visible_member",
+            );
+            let visible_member_catalog_predicate =
+                CATALOG_VISIBLE_PREDICATE.replace("mi.", "visible_member.");
+            visible_collection_predicate = format!(
+                " AND (mi.item_type <> 'BOX_SET' OR EXISTS (
+                    SELECT 1
+                    FROM collections visible_collection
+                    JOIN collection_items visible_collection_item
+                      ON visible_collection_item.collection_id = visible_collection.id
+                    JOIN media_items visible_member
+                      ON visible_member.id = visible_collection_item.item_id
+                    JOIN libraries visible_member_library
+                      ON visible_member_library.id = visible_member.library_id
+                     AND visible_member_library.is_enabled = 1
+                    WHERE visible_collection.item_id = mi.id
+                      AND visible_member.library_id IN ({collection_library_placeholders})
+                      {visible_member_catalog_predicate}
+                      {visible_member_content_predicate}
+                ))"
+            );
+            visible_collection_library_ids.extend_from_slice(library_ids);
+        }
         let query = format!(
             "SELECT
                 COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
@@ -807,11 +850,30 @@ impl Database {
                AND mi.library_id IN ({library_placeholders})
                AND mi.item_type <> 'FOLDER'
                {CATALOG_VISIBLE_PREDICATE}
+               {content_restriction_predicate}
+               {visible_collection_predicate}
                {favorite_filter}"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
         for library_id in library_ids {
             statement = statement.bind(library_id);
+        }
+        for bind in content_restriction_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(value),
+                CatalogBind::Integer(value) => statement.bind(value),
+                CatalogBind::Real(value) => statement.bind(value),
+            };
+        }
+        for library_id in visible_collection_library_ids {
+            statement = statement.bind(library_id);
+        }
+        for bind in visible_collection_content_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(value),
+                CatalogBind::Integer(value) => statement.bind(value),
+                CatalogBind::Real(value) => statement.bind(value),
+            };
         }
         if let Some(is_favorite) = is_favorite {
             statement = statement.bind(user_id).bind(database_flag(is_favorite));
@@ -1656,10 +1718,19 @@ impl Database {
     pub(crate) async fn list_episode_counts(
         &self,
         item_ids: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<HashMap<String, i64>, StorageError> {
         if item_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate_for_item_alias(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+            "child",
+        );
         let placeholders = std::iter::repeat_n("?", item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -1684,13 +1755,20 @@ impl Database {
                     ON child_entry.id = child_source.filesystem_entry_id
                   WHERE child_source.item_id = child.id
                     AND child_entry.is_missing = 0
-              )
+              ){content_restriction_predicate}
              WHERE parent.id IN ({placeholders})
                AND parent.item_type IN ('SERIES', 'SEASON')
                AND parent.removed_at IS NULL
              GROUP BY parent.id"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for bind in content_restriction_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(value),
+                CatalogBind::Integer(value) => statement.bind(value),
+                CatalogBind::Real(value) => statement.bind(value),
+            };
+        }
         for item_id in item_ids {
             statement = statement.bind(item_id);
         }

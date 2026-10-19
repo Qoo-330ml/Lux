@@ -779,11 +779,16 @@ impl CatalogService {
         is_favorite: Option<bool>,
     ) -> Result<CatalogItemCounts, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let counts = self
             .database
-            .count_catalog_item_types(&library_ids, user_id, is_favorite)
+            .count_catalog_item_types(
+                &library_ids,
+                user_id,
+                is_favorite,
+                content_restrictions.as_ref(),
+            )
             .await?;
-        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let global_collection_count = self
             .database
             .count_visible_global_collections_with_restrictions(
@@ -860,7 +865,9 @@ impl CatalogService {
                 .list_catalog_rows(Some(library_id), offset, limit),
         )?;
         let mut items = assemble_items(rows);
-        self.populate_episode_counts(&mut items).await?;
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        self.populate_episode_counts(&mut items, content_restrictions.as_ref())
+            .await?;
         Ok(CatalogPage {
             items,
             total,
@@ -958,8 +965,11 @@ impl CatalogService {
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
-        self.populate_item_details_and_episode_counts(&mut items)
-            .await?;
+        self.populate_item_details_and_episode_counts(
+            &mut items,
+            request.content_restrictions.as_ref(),
+        )
+        .await?;
         Ok(CatalogPage {
             items,
             total,
@@ -1012,7 +1022,7 @@ impl CatalogService {
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
         let mut items = assemble_items(rows);
-        self.populate_item_details_and_episode_counts(&mut items)
+        self.populate_item_details_and_episode_counts(&mut items, content_restrictions.as_ref())
             .await?;
         Ok(CatalogPage {
             items,
@@ -1088,10 +1098,14 @@ impl CatalogService {
             .await?;
         let mut items = assemble_items(rows);
         if matches!(item_types, "SEASON" | "EPISODE") {
-            self.populate_item_details_and_episode_counts(&mut items)
-                .await?;
+            self.populate_item_details_and_episode_counts(
+                &mut items,
+                content_restrictions.as_ref(),
+            )
+            .await?;
         } else {
-            self.populate_episode_counts(&mut items).await?;
+            self.populate_episode_counts(&mut items, content_restrictions.as_ref())
+                .await?;
         }
         Ok(CatalogPage {
             items,
@@ -1581,7 +1595,8 @@ impl CatalogService {
             )
             .await?;
         let mut items = assemble_items(rows);
-        self.populate_episode_counts(&mut items).await?;
+        self.populate_episode_counts(&mut items, content_restrictions)
+            .await?;
         let mut grouped = BTreeMap::<String, Vec<CatalogItem>>::new();
         for item in items {
             grouped
@@ -1650,7 +1665,8 @@ impl CatalogService {
                     .iter()
                     .any(|library_id| library_id == &item.library_id)
             });
-            self.populate_episode_counts(&mut items).await?;
+            self.populate_episode_counts(&mut items, content_restrictions)
+                .await?;
             items.truncate(usize::try_from(limit).unwrap_or(0));
             return Ok(items);
         }
@@ -1671,7 +1687,8 @@ impl CatalogService {
                 .iter()
                 .any(|library_id| library_id == &item.library_id)
         });
-        self.populate_episode_counts(&mut items).await?;
+        self.populate_episode_counts(&mut items, content_restrictions)
+            .await?;
         Ok(items
             .into_iter()
             .take(usize::try_from(limit).unwrap_or(0))
@@ -1749,13 +1766,20 @@ impl CatalogService {
         })?
     }
 
-    async fn populate_episode_counts(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
+    async fn populate_episode_counts(
+        &self,
+        items: &mut [CatalogItem],
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<(), CatalogError> {
         let item_ids = items
             .iter()
             .filter(|item| item.item_type == "SERIES" || item.item_type == "SEASON")
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
-        let episode_counts = self.database.list_episode_counts(&item_ids).await?;
+        let episode_counts = self
+            .database
+            .list_episode_counts(&item_ids, content_restrictions)
+            .await?;
         let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
         for item in &mut *items {
             if let Some(detail) = details.get(&item.id) {
@@ -1770,6 +1794,7 @@ impl CatalogService {
     async fn populate_item_details_and_episode_counts(
         &self,
         items: &mut [CatalogItem],
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<(), CatalogError> {
         let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
         let episode_item_ids = items
@@ -1779,7 +1804,8 @@ impl CatalogService {
             .collect::<Vec<_>>();
         let (details, episode_counts) = tokio::try_join!(
             self.database.list_catalog_details_by_ids(&item_ids),
-            self.database.list_episode_counts(&episode_item_ids),
+            self.database
+                .list_episode_counts(&episode_item_ids, content_restrictions),
         )?;
         for item in &mut *items {
             if let Some(detail) = details.get(&item.id) {
@@ -1876,6 +1902,17 @@ impl CatalogService {
         }
         if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
             apply_catalog_detail(&mut item, &detail);
+        }
+        if matches!(item.item_type.as_str(), "SERIES" | "SEASON") {
+            let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+            let episode_counts = self
+                .database
+                .list_episode_counts(
+                    std::slice::from_ref(&item.id),
+                    content_restrictions.as_ref(),
+                )
+                .await?;
+            item.episode_count = episode_counts.get(&item.id).copied();
         }
         self.populate_chapters(std::slice::from_mut(&mut item))
             .await?;
@@ -3958,6 +3995,286 @@ mod tests {
             )
             .await?;
         assert_eq!(admin_episodes.total, 3);
+
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn content_restricted_catalog_counts_and_episode_counts_match_visible_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Content Count", LibraryKind::Series, false)
+            .await?;
+        let root_path = directory.path().join("media-root");
+        tokio::fs::create_dir_all(&root_path).await?;
+        libraries
+            .add_root(library.id, root_path.to_str().ok_or("non-utf8 path")?)
+            .await?;
+        let root_id: String =
+            sqlx::query_scalar("SELECT id FROM library_roots WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        let restricted_user = UserStore::new(database.clone())?
+            .create_user("content-count-viewer", "Viewer", "test password", false)
+            .await?;
+        let open_user = UserStore::new(database.clone())?
+            .create_user("content-count-open", "Open Viewer", "test password", false)
+            .await?;
+        for user_id in [restricted_user.id, open_user.id] {
+            database
+                .set_user_library_access(&user_id.to_string(), &library.id.to_string(), true)
+                .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES ('content-count-series', ?, 'SERIES', 'Series', 'series',
+                       'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, season_number,
+                 title, sort_title, identification_status, has_available_source
+             ) VALUES ('content-count-season', ?, 'SEASON', 'content-count-series',
+                       'content-count-series', 1, 'Season', 'season', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        for (item_id, episode_number) in [
+            ("content-count-restricted", 1_i64),
+            ("content-count-unindexed", 2_i64),
+            ("content-count-visible", 3_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, season_number,
+                     episode_number, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES (?, ?, 'EPISODE', 'content-count-season', 'content-count-series',
+                           1, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(episode_number)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+            let entry_id = format!("entry-{item_id}");
+            let source_id = format!("source-{item_id}");
+            sqlx::query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES (?, ?, ?, 'FILE', 1, 1, 'content-count-generation')",
+            )
+            .bind(&entry_id)
+            .bind(&root_id)
+            .bind(format!("{item_id}.mkv"))
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+                 ) VALUES (?, ?, 'LOCAL_FILE', ?, 1, 'READY')",
+            )
+            .bind(&source_id)
+            .bind(item_id)
+            .bind(&entry_id)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('content-count-series', 'PG'),
+                    ('content-count-season', 'PG'),
+                    ('content-count-restricted', 'R'),
+                    ('content-count-visible', 'PG')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('content-count-series', 'family'),
+                    ('content-count-season', 'family'),
+                    ('content-count-restricted', 'family'),
+                    ('content-count-restricted', 'violent'),
+                    ('content-count-visible', 'family')",
+        )
+        .execute(database.pool())
+        .await?;
+        for (collection_id, item_id, title, member_id) in [
+            (
+                "content-count-box-visible",
+                "content-count-box-visible-item",
+                "Visible Collection",
+                "content-count-visible",
+            ),
+            (
+                "content-count-box-hidden",
+                "content-count-box-hidden-item",
+                "Restricted Collection",
+                "content-count-restricted",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES (?, ?, 'BOX_SET', ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO collections (id, item_id, library_id, provider, provider_id, title)
+                 VALUES (?, ?, ?, 'manual', ?, ?)",
+            )
+            .bind(collection_id)
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(collection_id)
+            .bind(title)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO collection_items (collection_id, item_id, sort_order)
+                 VALUES (?, ?, 0)",
+            )
+            .bind(collection_id)
+            .bind(member_id)
+            .execute(database.pool())
+            .await?;
+        }
+        database
+            .compare_and_swap_user_content_restrictions(
+                &restricted_user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &["family".to_owned()],
+                    blocked_tags: &["violent".to_owned()],
+                },
+            )
+            .await?;
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let restricted_principal = AccessPrincipal::new(restricted_user.id, false);
+        let restricted_counts = catalog
+            .count_item_types(restricted_principal, &restricted_user.id.to_string(), None)
+            .await?;
+        assert_eq!(restricted_counts.series_count, 1);
+        assert_eq!(restricted_counts.episode_count, 1);
+        assert_eq!(restricted_counts.box_set_count, 1);
+        assert_eq!(restricted_counts.item_count, 4);
+        let seasons = catalog
+            .list_children(
+                restricted_principal,
+                "content-count-series",
+                "SEASON",
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(seasons.items[0].episode_count, Some(1));
+        let library_items = catalog
+            .list_library_items_filtered(
+                restricted_principal,
+                &library.id.to_string(),
+                &super::CatalogFilter::default(),
+                0,
+                10,
+            )
+            .await?;
+        let series_card = library_items
+            .items
+            .iter()
+            .find(|item| item.id == "content-count-series")
+            .ok_or("visible series card should remain in the library page")?;
+        assert_eq!(series_card.episode_count, Some(1));
+        let series = catalog
+            .find_item(restricted_principal, "content-count-series")
+            .await?
+            .ok_or("visible series should remain accessible")?;
+        assert_eq!(series.episode_count, Some(1));
+        let season = catalog
+            .find_item(restricted_principal, "content-count-season")
+            .await?
+            .ok_or("visible season should remain accessible")?;
+        assert_eq!(season.episode_count, Some(1));
+
+        let open_principal = AccessPrincipal::new(open_user.id, false);
+        let open_counts = catalog
+            .count_item_types(open_principal, &open_user.id.to_string(), None)
+            .await?;
+        assert_eq!(open_counts.episode_count, 3);
+        assert_eq!(open_counts.box_set_count, 2);
+        assert_eq!(open_counts.item_count, 7);
+        let admin_counts = catalog
+            .count_item_types(
+                AccessPrincipal::new(restricted_user.id, true),
+                &restricted_user.id.to_string(),
+                None,
+            )
+            .await?;
+        assert_eq!(admin_counts.episode_count, 3);
+        assert_eq!(admin_counts.box_set_count, 2);
+        assert_eq!(admin_counts.item_count, 7);
+
+        let open_policy = database
+            .compare_and_swap_user_content_restrictions(
+                &open_user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            open_policy,
+            crate::storage::UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let open_policy_counts = catalog
+            .count_item_types(open_principal, &open_user.id.to_string(), None)
+            .await?;
+        assert_eq!(open_policy_counts.episode_count, 3);
+        assert_eq!(open_policy_counts.box_set_count, 2);
+        assert_eq!(open_policy_counts.item_count, 7);
 
         database.close().await;
         Ok(())

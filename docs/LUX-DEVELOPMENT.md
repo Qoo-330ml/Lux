@@ -14738,6 +14738,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-702。
 
+#### LUX-704：使媒体汇总与剧集数量遵守用户内容限制
+
+范围：让 Emby `/Items/Counts` 的物理媒体汇总，以及目录条目携带的 series/season episode count，使用当前用户的可见媒体集合。内容策略在 SQL 聚合前过滤；管理员、无策略和无收紧策略保持既有数量。本任务不改变观看进度统计、管理员库诊断计数或 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] `/Items/Counts` 中影片、剧集、分集、合集和总数均排除受限条目，并保留收藏过滤语义。
+- [x] 系列/季度 `episode_count` 在详情和各目录卡片中仅统计自身、季度/系列父级及索引都允许且存在有效来源的分集。
+- [x] 无策略、全开放策略及管理员仍得到原计数；SQL 标签参数顺序正确。
+- [x] 应用回归覆盖内容策略、父级、缺索引和汇总；定向统计、Emby counts、build、fmt 与 diff check 通过。
+
+短计划：先在 hierarchy CatalogService 回归中为所有分集建立有效来源，并断言受限用户的 `/Items/Counts` 与可见季度分集数；确认当前汇总仍计入 R、父级受限和缺索引内容；再让物理统计与 episode count 共用内容谓词，并将当前请求策略传入详情/目录计数填充；最后跑定向回归、内容策略、Emby counts、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restricted_catalog_counts_and_episode_counts_match_visible_items`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test emby_counts`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-703。
+
+结果（2026-10-19）：Emby `/Items/Counts` 的物理影片、剧集、分集、手动合集和总数在聚合前应用当前用户策略；严格策略下手动合集只有存在至少一个通过内容、父级、可用来源和媒体库访问检查的成员才计入。既有虚拟合集数量继续走 LUX-701 的可见成员谓词。系列/季度 episode count 统一按分集自身及季度/系列父级策略和有效来源统计，覆盖详情、媒体库页及层级子项卡片。回归覆盖 PG/R、禁止标签、父级继承、缺失索引、可见/全受限合集成员，以及管理员、无策略和全开放策略；SQL 中主项策略、合集成员库 ID、成员策略与收藏参数按占位顺序绑定。
+
+验证：`content_restricted_catalog_counts_and_episode_counts_match_visible_items` 1/1；`content_restriction` 24 passed、1 ignored（PostgreSQL 专用）；`tests/emby_counts.rs` 1/1；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
