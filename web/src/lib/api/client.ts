@@ -38,6 +38,8 @@ import type {
   AdminContentRestrictionIndexStatus,
   AdminUserContentRestrictionsResponse,
   AdminUserContentRestrictionUpdateInput,
+  AdminUserActivityPage,
+  AdminUserActivityQuery,
   AdminUser,
   AdminUserEmbySessionPage,
   AdminUserEmbySessionRevokeAllResponse,
@@ -1269,6 +1271,19 @@ export class LuxApiClient {
     return this.request<AdminUserEmbySessionRevokeAllResponse>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions`,
       { method: "DELETE" },
+    );
+  }
+
+  adminUserActivity(userId: string, query: AdminUserActivityQuery = {}) {
+    const params = new URLSearchParams({
+      page: String(query.page ?? 1),
+      pageSize: String(query.pageSize ?? 20),
+    });
+    if (query.eventType !== undefined) params.set("eventType", query.eventType);
+    if (query.from !== undefined) params.set("from", String(query.from));
+    if (query.to !== undefined) params.set("to", String(query.to));
+    return this.request<AdminUserActivityPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/activity?${params.toString()}`,
     );
   }
 

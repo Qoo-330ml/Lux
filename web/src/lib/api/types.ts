@@ -615,6 +615,32 @@ export type AdminUserEmbySessionRevokeAllResponse = {
   revokedCount: number;
 };
 
+export type AdminUserActivityEvent = {
+  id: string;
+  userId: string;
+  actorUserId: string | null;
+  eventType: string;
+  targetType: string | null;
+  targetId: string | null;
+  metadata: Record<string, unknown>;
+  occurredAt: number;
+};
+
+export type AdminUserActivityPage = {
+  events: AdminUserActivityEvent[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserActivityQuery = {
+  page?: number;
+  pageSize?: number;
+  eventType?: string;
+  from?: number;
+  to?: number;
+};
+
 export type AdminContentRestrictionIndexStatus = {
   totalItems: number;
   indexedItems: number;

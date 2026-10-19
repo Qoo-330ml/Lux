@@ -15172,6 +15172,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-722、LUX-660。
 
+#### LUX-724：增加管理员用户活动时间线 Web API 客户端合同
+
+范围：为 LUX-723 的用户活动分页 API 增加 TypeScript 活动项与分页响应类型，以及按用户读取活动的方法。客户端支持页码、页大小、事件类型和包含端点的起止 Unix 秒筛选，查询参数必须正确编码；读取沿用统一 GET 请求层。本任务不修改用户管理页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 活动项类型覆盖 API 的活动 ID、用户/操作者、事件类型、目标引用、脱敏元数据和发生时间；不包含凭证或原始 JSON 字段。
+- [x] 分页响应包含活动列表、页码、页大小和匹配总数；客户端默认第 1 页、每页 20 条。
+- [x] 可选事件类型与时间范围经 `URLSearchParams` 编码，页码筛选准确进入 URL；读取使用 GET，不带写操作 CSRF。
+- [x] 定向 API client Vitest、Web build 和 diff check 通过。
+
+短计划：先为时间线响应、默认分页、事件类型/时间筛选、用户 ID 与查询值编码增加失败合同测试；再加入 DTO 和客户端方法；最后运行定向 Vitest、Web build 和 diff check。
+
+依赖：LUX-723。
+
+结果（2026-10-20）：增加 `AdminUserActivityEvent`、分页响应与筛选查询类型，以及 `adminUserActivity` GET 方法。方法默认第 1 页、每页 20 条，通过 `URLSearchParams` 编码事件类型和 Unix 时间边界，并复用用户 ID 路径编码。活动 DTO 不含任何凭证字段。
+
+验证：先添加合同测试并确认因客户端方法缺失而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user activity"` 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。测试覆盖过滤值、用户 ID 编码、默认分页和 GET 请求方式。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

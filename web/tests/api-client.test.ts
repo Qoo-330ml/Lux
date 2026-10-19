@@ -486,6 +486,48 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("reads paginated admin user activity with encoded filters", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        events: [{
+          id: "event-1",
+          userId: "user-1",
+          actorUserId: "user-1",
+          eventType: "AUTH_LOGIN",
+          targetType: null,
+          targetId: null,
+          metadata: { remoteIp: "192.0.2.1" },
+          occurredAt: 1_500,
+        }],
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: [], page: 1, pageSize: 20, totalCount: 0 }), { status: 200 }));
+    const client = new LuxApiClient();
+
+    await expect(client.adminUserActivity("user /1", {
+      page: 2,
+      pageSize: 10,
+      eventType: "AUTH LOGIN",
+      from: 1_000,
+      to: 2_000,
+    })).resolves.toMatchObject({
+      events: [{ id: "event-1", eventType: "AUTH_LOGIN", metadata: { remoteIp: "192.0.2.1" } }],
+      page: 2,
+      pageSize: 10,
+      totalCount: 11,
+    });
+    await expect(client.adminUserActivity("user-2")).resolves.toMatchObject({ page: 1, pageSize: 20 });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/users/user%20%2F1/activity?page=2&pageSize=10&eventType=AUTH+LOGIN&from=1000&to=2000",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/users/user-2/activity?page=1&pageSize=20");
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
+  });
+
   it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     const cookie = installCookieDocument("lux_csrf=csrf-token");
