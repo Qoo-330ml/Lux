@@ -93,6 +93,15 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
+    let unauthenticated_retention_update = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .json(&json!({ "userActivityRetentionDays": 30 }))
+        .send()
+        .await?;
+    assert_eq!(
+        unauthenticated_retention_update.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -184,6 +193,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(initial_settings["userDeletionGraceDays"], 7);
+    assert_eq!(initial_settings["userActivityRetentionDays"], 90);
     assert_eq!(
         initial_settings["newUserPermissions"]["libraryAccessMode"],
         "NONE"
@@ -363,6 +373,42 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(settings_after_rejection["userDeletionGraceDays"], 30);
+
+    let activity_retention = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({ "userActivityRetentionDays": 180 }))
+        .send()
+        .await?;
+    assert_eq!(activity_retention.status(), reqwest::StatusCode::OK);
+    let activity_retention_body: Value = activity_retention.json().await?;
+    assert_eq!(activity_retention_body["userActivityRetentionDays"], 180);
+
+    for invalid_days in [0, -1, 3_651] {
+        let invalid_activity_retention = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "userActivityRetentionDays": invalid_days }))
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_activity_retention.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+    let activity_retention_after_rejection: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        activity_retention_after_rejection["userActivityRetentionDays"],
+        180
+    );
 
     for _ in 0..24 {
         let repeated_login = client

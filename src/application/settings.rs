@@ -179,6 +179,7 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) resume_min_ticks: i64,
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
+    pub(crate) user_activity_retention_days: i64,
     pub(crate) new_user_permissions: NewUserPermissions,
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
@@ -198,6 +199,7 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) user_deletion_grace_days: Option<i64>,
+    pub(crate) user_activity_retention_days: Option<i64>,
     pub(crate) new_user_permissions: Option<NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
@@ -212,6 +214,7 @@ pub(crate) enum AdminSettingsError {
     InvalidServerName,
     InvalidGlobalSettings,
     InvalidUserDeletionGraceDays,
+    InvalidUserActivityRetentionDays,
     InvalidNewUserPermissions,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
@@ -224,6 +227,7 @@ struct StoredAdminSettings {
     resume_min_ticks: i64,
     force_admin_library_order: bool,
     user_deletion_grace_days: i64,
+    user_activity_retention_days: i64,
     new_user_permissions: NewUserPermissions,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
@@ -239,6 +243,10 @@ pub(crate) async fn read_admin_settings(
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
     let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
+    let user_activity_retention_days = database
+        .user_activity_retention_days()
+        .await
+        .map_err(|_| ())?;
     let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
@@ -257,6 +265,7 @@ pub(crate) async fn read_admin_settings(
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        user_activity_retention_days,
         new_user_permissions,
         login_background_source,
         login_background_source_status,
@@ -316,6 +325,12 @@ pub(crate) async fn update_admin_settings(
         .unwrap_or(current.user_deletion_grace_days);
     if !(1..=3_650).contains(&user_deletion_grace_days) {
         return Err(AdminSettingsError::InvalidUserDeletionGraceDays);
+    }
+    let user_activity_retention_days = update
+        .user_activity_retention_days
+        .unwrap_or(current.user_activity_retention_days);
+    if !(1..=3_650).contains(&user_activity_retention_days) {
+        return Err(AdminSettingsError::InvalidUserActivityRetentionDays);
     }
     let mut new_user_permissions = update
         .new_user_permissions
@@ -391,6 +406,7 @@ pub(crate) async fn update_admin_settings(
             media_strategy_json: &media_strategy_json,
             force_admin_library_order,
             user_deletion_grace_days,
+            user_activity_retention_days,
             new_user_permissions_json: &new_user_permissions_json,
             login_background_source: &login_background_source,
             server_name: &server_name,
@@ -409,6 +425,7 @@ pub(crate) async fn update_admin_settings(
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        user_activity_retention_days,
         new_user_permissions,
         login_background_source,
         login_background_source_status,
@@ -423,6 +440,10 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
     let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
+    let user_activity_retention_days = database
+        .user_activity_retention_days()
+        .await
+        .map_err(|_| ())?;
     let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
@@ -438,6 +459,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        user_activity_retention_days,
         new_user_permissions,
         login_background_source,
         media_strategy,
@@ -668,6 +690,7 @@ pub(crate) struct AdminSettingsWrite<'a> {
     pub(crate) media_strategy_json: &'a str,
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
+    pub(crate) user_activity_retention_days: i64,
     pub(crate) new_user_permissions_json: &'a str,
     pub(crate) login_background_source: &'a str,
     pub(crate) server_name: &'a str,
@@ -692,6 +715,10 @@ pub(crate) async fn write_admin_settings(
         .map_err(|_| ())?;
     database
         .set_user_deletion_grace_days(settings.user_deletion_grace_days)
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_user_activity_retention_days(settings.user_activity_retention_days)
         .await
         .map_err(|_| ())?;
     database

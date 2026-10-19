@@ -15338,6 +15338,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 回归先因读写方法缺失而编译失败；实现后 `cargo test --locked --lib user_activity_retention_setting_defaults_validates_and_recovers_invalid_values` 1/1、`cargo build --locked`（无新增 warning）、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
 
+#### LUX-732：接入活动记录保留期管理 API
+
+范围：在管理员全局设置读写合同中暴露用户活动索引保留天数，沿用 storage 默认值 90 和 1–3650 的校验；读取旧配置并返回 camelCase 字段，PATCH 可独立更新该值且拒绝非法输入。本任务只增加应用/API 合同，不增加 worker 或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] 管理员设置 GET 返回 `userActivityRetentionDays`，缺省为 90。
+- [x] PATCH 可单独保存有效保留天数；拒绝 0、负数和大于 3650 的输入，非法值不覆盖已有值。
+- [x] 非管理员不能通过该合同更改设置；`admin_dashboard` 定向集成回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先扩展现有管理员设置集成回归并确认字段缺失；再贯通 settings snapshot/update/write 与 HTTP JSON；最后运行 `admin_dashboard` 集成目标、build、fmt 和 diff check。
+
+依赖：LUX-731。
+
+结果（2026-10-20）：管理员 settings snapshot、PATCH 更新和 HTTP JSON 已新增 `userActivityRetentionDays`，使用 LUX-731 storage 读写并保持未提交字段时原值不变。输入范围为 1–3650；非法设置返回 400，未认证请求仍返回 401。无 migration。
+
+验证：TDD RED 集成回归先因 GET 缺少字段而失败；实现后 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost cargo test --locked --test admin_dashboard` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
