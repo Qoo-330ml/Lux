@@ -2284,6 +2284,287 @@ async fn admin_can_read_content_restriction_index_readiness()
 }
 
 #[tokio::test]
+async fn admin_can_preview_and_apply_user_permission_groups()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let users = UserStore::new(database.clone())?;
+    let source_id = users
+        .create_user(
+            "permission-source",
+            "Permission Source",
+            "user password",
+            false,
+        )
+        .await?
+        .id
+        .to_string();
+    let success_target_id = users
+        .create_user(
+            "permission-target",
+            "Permission Target",
+            "user password",
+            false,
+        )
+        .await?
+        .id
+        .to_string();
+    let stale_target_id = users
+        .create_user(
+            "permission-stale-target",
+            "Permission Stale Target",
+            "user password",
+            false,
+        )
+        .await?
+        .id
+        .to_string();
+    let source_stale_target_id = users
+        .create_user(
+            "permission-source-stale-target",
+            "Permission Source Stale Target",
+            "user password",
+            false,
+        )
+        .await?
+        .id
+        .to_string();
+    let _reader_id = users
+        .create_user(
+            "permission-reader",
+            "Permission Reader",
+            "user password",
+            false,
+        )
+        .await?
+        .id
+        .to_string();
+
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+    for target_id in [
+        &success_target_id,
+        &stale_target_id,
+        &source_stale_target_id,
+    ] {
+        sqlx::query("UPDATE users SET library_access_mode = 'ALL' WHERE id = ?")
+            .bind(target_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let preview_url = format!("{base_url}/api/v1/admin/users/permission-copy/preview");
+    let apply_url = format!("{base_url}/api/v1/admin/users/permission-copy");
+    let preview_request = json!({
+        "sourceUserId": source_id,
+        "targetUserIds": [&success_target_id, &stale_target_id],
+        "groups": { "library": true, "content": false, "playback": false }
+    });
+
+    let anonymous_preview = client
+        .post(&preview_url)
+        .json(&preview_request)
+        .send()
+        .await?;
+    assert_eq!(
+        anonymous_preview.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let reader_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "permission-reader", "password": "user password" }))
+        .send()
+        .await?;
+    assert_eq!(reader_login.status(), reqwest::StatusCode::OK);
+    let non_admin_preview = client
+        .post(&preview_url)
+        .header(COOKIE, cookie_pair(reader_login.headers()))
+        .json(&preview_request)
+        .send()
+        .await?;
+    assert_eq!(non_admin_preview.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let invalid_preview = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": source_id,
+            "targetUserIds": [&success_target_id],
+            "groups": { "library": false, "content": false, "playback": false }
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_preview.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let mut unknown_field_request = preview_request.clone();
+    unknown_field_request["unexpected"] = json!(true);
+    let unknown_field_preview = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&unknown_field_request)
+        .send()
+        .await?;
+    assert_eq!(
+        unknown_field_preview.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        unknown_field_preview.json::<Value>().await?["error"]["code"],
+        "INVALID_REQUEST"
+    );
+
+    let preview_response = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&preview_request)
+        .send()
+        .await?;
+    let preview_status = preview_response.status();
+    let preview_body = preview_response.text().await?;
+    assert_eq!(preview_status, reqwest::StatusCode::OK, "{preview_body}");
+    let preview = serde_json::from_str::<Value>(&preview_body)?;
+    assert_eq!(preview["groups"]["library"], true);
+    assert_eq!(preview["sourceSnapshot"]["library"]["accessMode"], "NONE");
+    assert!(preview["sourceSnapshot"].get("content").is_none());
+    assert!(preview["sourceSnapshot"].get("playback").is_none());
+    assert!(preview["sourceSnapshot"].get("isAdmin").is_none());
+
+    let apply_request = json!({
+        "sourceUserId": source_id,
+        "sourceVersion": preview["sourceVersion"],
+        "targets": preview["targets"],
+        "groups": preview["groups"]
+    });
+    let missing_csrf = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&apply_request)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")
+        .bind(&stale_target_id)
+        .execute(database.pool())
+        .await?;
+    let applied = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&apply_request)
+        .send()
+        .await?;
+    let applied_status = applied.status();
+    let applied_body = applied.text().await?;
+    assert_eq!(applied_status, reqwest::StatusCode::OK, "{applied_body}");
+    let applied = serde_json::from_str::<Value>(&applied_body)?;
+    assert_eq!(applied["results"][0]["success"], true);
+    assert!(applied["results"][0]["errorCode"].is_null());
+    assert_eq!(applied["results"][1]["success"], false);
+    assert_eq!(applied["results"][1]["errorCode"], "VERSION_CONFLICT");
+
+    let successful_target_mode: String =
+        sqlx::query_scalar("SELECT library_access_mode FROM users WHERE id = ?")
+            .bind(&success_target_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(successful_target_mode, "NONE");
+    assert!(!applied_body.to_ascii_lowercase().contains("cookie"));
+    assert!(!applied_body.to_ascii_lowercase().contains("token"));
+
+    let source_stale_preview = client
+        .post(&preview_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({
+            "sourceUserId": source_id,
+            "targetUserIds": [&source_stale_target_id],
+            "groups": { "library": true, "content": false, "playback": false }
+        }))
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let source_stale_apply_request = json!({
+        "sourceUserId": source_id,
+        "sourceVersion": source_stale_preview["sourceVersion"],
+        "targets": source_stale_preview["targets"],
+        "groups": source_stale_preview["groups"]
+    });
+    sqlx::query("UPDATE users SET library_access_mode = 'ALL' WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+    let source_stale_apply = client
+        .post(&apply_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&source_stale_apply_request)
+        .send()
+        .await?;
+    assert_eq!(source_stale_apply.status(), reqwest::StatusCode::CONFLICT);
+    let unchanged_source_stale_target_mode: String =
+        sqlx::query_scalar("SELECT library_access_mode FROM users WHERE id = ?")
+            .bind(&source_stale_target_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(unchanged_source_stale_target_mode, "ALL");
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let events = audit.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing audit events")?;
+    let copy_event = events
+        .iter()
+        .find(|event| {
+            event["eventType"] == "USER_PERMISSION_GROUPS_COPIED"
+                && event["targetId"] == success_target_id
+        })
+        .ok_or("missing permission copy audit event")?;
+    assert_eq!(copy_event["metadata"]["sourceUserId"], source_id);
+    assert_eq!(copy_event["metadata"]["groups"]["library"], true);
+    assert_eq!(copy_event["metadata"]["groups"]["content"], false);
+    assert_eq!(copy_event["metadata"]["groups"]["playback"], false);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_manage_user_content_restrictions() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {

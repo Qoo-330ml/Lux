@@ -14887,6 +14887,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`cargo test --locked --lib user_permission_copy` 8/8、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Build 有 25 条该新应用模块尚未接入 API 前的 dead-code warning；后续 API 任务接线后将消除。
 
+#### LUX-711：开放管理员用户权限组复制预览与应用 API
+
+范围：为 LUX-710 应用服务增加管理员预览和应用端点。预览只要求管理员认证；应用要求管理员 Web session 和 CSRF。预览响应只包含选择的 Library、Content、Playback 来源快照、来源不透明版本和逐目标预期版本；应用按来源版本做整体冲突检查，再返回逐目标结果。仅对成功目标写脱敏审计，不记录权限值。本任务不加入 Web 客户端或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 预览和应用路由使用严格 JSON 输入、camelCase DTO、管理员授权；应用强制 CSRF，预览保持只读无 CSRF。
+- [x] HTTP 回归覆盖未认证/非管理员、无 CSRF、非法请求、所选组隐私、来源版本整体冲突、目标部分成功和逐目标稳定错误码。
+- [x] 每个成功目标有一条只含来源 ID 与组标志的审计事件；API 文档记录精确请求、响应和错误合同。
+- [x] `tests/users` 定向回归、Rust build/fmt 与 diff check 通过。
+
+短计划：先为权限复制预览与应用路由增加失败的 `users` 集成回归；再按偏好复制 API 的认证/CSRF 边界接入 LUX-710 服务、逐目标审计及错误映射；最后更新 API 文档并运行定向集成测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_preview_and_apply_user_permission_groups -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-710。
+
+结果（2026-10-20）：增加管理员权限复制预览和应用端点。预览仅需管理员认证且无 CSRF；应用使用管理员 Web session 与 CSRF。HTTP 回归覆盖匿名/非管理员拒绝、空权限组、未选择内容策略不出现在响应、来源过期返回 409 且不写目标、单目标冲突与另一目标成功、稳定错误码和成功目标审计脱敏。
+
+验证：`tests/users::admin_can_preview_and_apply_user_permission_groups` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

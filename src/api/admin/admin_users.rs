@@ -465,6 +465,146 @@ async fn admin_copy_account_preferences(
     }
 }
 
+async fn admin_preview_user_permission_copy(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let request = match parse_user_permission_copy_request::<
+        crate::application::user_permission_copy::PreviewUserPermissionCopyInput,
+    >(&headers, &body)
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_permission_copy::preview_user_permission_copy(database, request)
+        .await
+    {
+        Ok(preview) => Json(preview).into_response(),
+        Err(error) => user_permission_copy_error(&headers, error),
+    }
+}
+
+async fn admin_apply_user_permission_copy(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let request = match parse_user_permission_copy_request::<
+        crate::application::user_permission_copy::ApplyUserPermissionCopyInput,
+    >(&headers, &body)
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let groups = request.groups;
+    match crate::application::user_permission_copy::apply_user_permission_copy(database, request)
+        .await
+    {
+        Ok(result) => {
+            for item in result.results.iter().filter(|item| item.success) {
+                record_audit_event(
+                    &state,
+                    &headers,
+                    "USER_PERMISSION_GROUPS_COPIED",
+                    Some("user"),
+                    Some(&item.user_id),
+                    &json!({
+                        "sourceUserId": result.source_user_id,
+                        "groups": {
+                            "library": groups.library,
+                            "content": groups.content,
+                            "playback": groups.playback
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+            }
+            Json(result).into_response()
+        }
+        Err(error) => user_permission_copy_error(&headers, error),
+    }
+}
+
+fn parse_user_permission_copy_request<T>(headers: &HeaderMap, body: &Bytes) -> Result<T, Response>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(invalid_user_permission_copy_request(headers));
+    }
+    serde_json::from_slice(body).map_err(|_| invalid_user_permission_copy_request(headers))
+}
+
+fn invalid_user_permission_copy_request(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::BAD_REQUEST,
+        lux::ApiErrorCode::InvalidRequest,
+        "权限复制请求无效",
+    )
+    .into_response()
+}
+
+fn user_permission_copy_error(
+    headers: &HeaderMap,
+    error: crate::application::user_permission_copy::PermissionCopyApplicationError,
+) -> Response {
+    use crate::application::user_permission_copy::PermissionCopyApplicationError as CopyError;
+
+    match error {
+        CopyError::InvalidRequest | CopyError::InvalidSnapshot => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "权限复制请求或来源策略无效",
+        )
+        .into_response(),
+        CopyError::SourceUnavailable | CopyError::UserUnavailable => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "源账号或目标账号不存在",
+        )
+        .into_response(),
+        CopyError::SourceVersionConflict => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "源账号权限已变化，请重新预览",
+        )
+        .into_response(),
+        CopyError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "权限复制暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
 fn canonical_user_id(value: &str) -> Option<String> {
     value
         .parse::<crate::domain::ids::UserId>()
@@ -1954,6 +2094,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/account-preferences/copy",
             post(admin_copy_account_preferences),
+        )
+        .route(
+            "/api/v1/admin/users/permission-copy/preview",
+            post(admin_preview_user_permission_copy),
+        )
+        .route(
+            "/api/v1/admin/users/permission-copy",
+            post(admin_apply_user_permission_copy),
         )
         .route(
             "/api/v1/admin/users/{user_id}",
