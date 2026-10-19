@@ -42,7 +42,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
   });
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const playbackSettings = useQuery({ queryKey: queryKeys.userSettings, queryFn: () => api.userSettings() });
-  const libraryOrder = useQuery({ queryKey: queryKeys.libraryOrder, queryFn: () => api.libraryOrder() });
   const { avatarUrl, setAvatarUrl } = useAvatar();
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
   const settingsRef = useRef(settings);
@@ -67,7 +66,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
   const [passwordNotice, setPasswordNotice] = useState<string | null>(null);
   const [libraryOrderNotice, setLibraryOrderNotice] = useState<string | null>(null);
-  const legacyLibraryOrderMigrationAttempted = useRef(false);
   const [playedPercent, setPlayedPercent] = useState("95");
   const [playedPercentNotice, setPlayedPercentNotice] = useState<string | null>(null);
   const [profileName, setProfileName] = useState(user.displayName || user.usernameNormalized);
@@ -90,7 +88,11 @@ export function AccountPage({ user }: { user: LuxUser }) {
         const saved = await api.updateAccountPreferences(accountPreferencesUpdateFor(snapshot, expectedVersion));
         accountPreferencesVersion.current = saved.version;
         queryClient.setQueryData(queryKeys.accountPreferences(user.id), saved);
-        saveAccountSettings(accountSettingsFromPreferences(saved, settingsRef.current.libraryOrder), user.id);
+        const syncedSettings = accountSettingsFromPreferences(saved);
+        settingsRef.current = syncedSettings;
+        setSettings(syncedSettings);
+        setPlayedPercent(String(saved.playedPercent));
+        saveAccountSettings(syncedSettings, user.id);
         void queryClient.invalidateQueries({ queryKey: queryKeys.home });
         setAccountPreferencesNotice("账户偏好已同步到此账户");
         return saved;
@@ -125,9 +127,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
     ) return;
     accountPreferencesInitialized.current = true;
     accountPreferencesVersion.current = accountPreferences.data.version;
+    setPlayedPercent(String(accountPreferences.data.playedPercent));
     const currentSettings = settingsRef.current;
     if (accountPreferences.data.version > 0) {
-      const serverSettings = accountSettingsFromPreferences(accountPreferences.data, currentSettings.libraryOrder);
+      const serverSettings = accountSettingsFromPreferences(accountPreferences.data);
       settingsRef.current = serverSettings;
       setSettings(serverSettings);
       saveAccountSettings(serverSettings, user.id);
@@ -137,7 +140,14 @@ export function AccountPage({ user }: { user: LuxUser }) {
 
     const legacySettings = readStoredAccountSettings(user.id);
     if (legacySettings) {
-      const migratedSettings = { ...currentSettings, ...legacySettings };
+      const migratedSettings = {
+        ...currentSettings,
+        ...legacySettings,
+        libraryOrder: accountPreferences.data.libraryOrder.length
+          ? accountPreferences.data.libraryOrder
+          : legacySettings.libraryOrder,
+        playedPercent: accountPreferences.data.playedPercent,
+      };
       settingsRef.current = migratedSettings;
       setSettings(migratedSettings);
       void queueAccountPreferencesSave(migratedSettings).finally(() => {
@@ -146,7 +156,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
       return;
     }
 
-    const serverDefaults = accountSettingsFromPreferences(accountPreferences.data, currentSettings.libraryOrder);
+    const serverDefaults = accountSettingsFromPreferences(accountPreferences.data);
     settingsRef.current = serverDefaults;
     setSettings(serverDefaults);
     setAccountPreferencesReady(true);
@@ -205,27 +215,53 @@ export function AccountPage({ user }: { user: LuxUser }) {
   });
 
   const savePlaybackSettings = useMutation({
-    mutationFn: () => api.updateUserSettings({ playedPercent: Number(playedPercent) }),
+    mutationFn: () => api.updateUserSettings({ playedPercent: Number(playedPercent), expectedVersion: accountPreferencesVersion.current ?? 0 }),
     onSuccess: (data) => {
       setPlayedPercent(String(data.playedPercent));
+      if (typeof data.preferencesVersion === "number") accountPreferencesVersion.current = data.preferencesVersion;
+      const nextSettings = { ...settingsRef.current, playedPercent: data.playedPercent };
+      settingsRef.current = nextSettings;
+      setSettings(nextSettings);
+      saveAccountSettings(nextSettings, user.id);
+      queryClient.setQueryData<AccountPreferences>(queryKeys.accountPreferences(user.id), (current) => current
+        ? { ...current, playedPercent: data.playedPercent, version: data.preferencesVersion ?? current.version }
+        : current);
       setPlayedPercentNotice("播放阈值已保存");
       void queryClient.invalidateQueries({ queryKey: queryKeys.userSettings });
     },
-    onError: (error) => setPlayedPercentNotice(error instanceof Error ? error.message : "播放阈值保存失败，请重试。"),
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === "VERSION_CONFLICT") {
+        accountPreferencesWriteBlocked.current = true;
+        setAccountPreferencesBlocked(true);
+        setPlayedPercentNotice("偏好已在其他设备更新，请刷新账户设置后再保存");
+        return;
+      }
+      setPlayedPercentNotice(error instanceof Error ? error.message : "播放阈值保存失败，请重试。");
+    },
   });
 
   const saveLibraryOrder = useMutation({
-    mutationFn: (libraryOrder: string[]) => api.updateLibraryOrder({ libraryOrder }),
+    mutationFn: (libraryOrder: string[]) => api.updateLibraryOrder({ libraryOrder, expectedVersion: accountPreferencesVersion.current ?? 0 }),
     onSuccess: (data) => {
       setPendingLibraryOrder(data.libraryOrder);
+      if (typeof data.preferencesVersion === "number") accountPreferencesVersion.current = data.preferencesVersion;
       updateSettings({ libraryOrder: data.libraryOrder });
       setLibraryOrderNotice("媒体库顺序已保存");
       queryClient.setQueryData(queryKeys.libraryOrder, data);
+      queryClient.setQueryData<AccountPreferences>(queryKeys.accountPreferences(user.id), (current) => current
+        ? { ...current, libraryOrder: data.libraryOrder, version: data.preferencesVersion ?? current.version }
+        : current);
       void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
       void queryClient.invalidateQueries({ queryKey: queryKeys.home });
     },
     onError: (error) => {
       setPendingLibraryOrder(null);
+      if (error instanceof ApiError && error.code === "VERSION_CONFLICT") {
+        accountPreferencesWriteBlocked.current = true;
+        setAccountPreferencesBlocked(true);
+        setLibraryOrderNotice("偏好已在其他设备更新，请刷新账户设置后再保存");
+        return;
+      }
       setLibraryOrderNotice(error instanceof Error ? `媒体库顺序保存失败：${error.message}` : "媒体库顺序保存失败，请重试。");
     },
   });
@@ -276,19 +312,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
     setProfileEmail(profileUser.email ?? "");
   }, [accountProfile.data?.user]);
 
-  useEffect(() => {
-    if (
-      legacyLibraryOrderMigrationAttempted.current
-      || !libraryOrder.isSuccess
-      || (libraryOrder.data?.libraryOrder.length ?? 0)
-      || !settings.libraryOrder.length
-      || (!user.canManageServer && useAdminLibraryOrder)
-    ) return;
-    legacyLibraryOrderMigrationAttempted.current = true;
-    setPendingLibraryOrder(settings.libraryOrder);
-    saveLibraryOrder.mutate(settings.libraryOrder);
-  }, [libraryOrder.data?.libraryOrder, libraryOrder.isSuccess, saveLibraryOrder, settings.libraryOrder, useAdminLibraryOrder, user.canManageServer]);
-
   const updateSettings = (patch: Partial<AccountSettings>) => {
     const nextSettings = { ...settingsRef.current, ...patch };
     settingsRef.current = nextSettings;
@@ -303,7 +326,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   };
 
   const persistLibraryOrder = (libraryOrder: string[]) => {
-    if (libraryOrderLocked) return;
+    if (libraryOrderLocked || accountPreferencesDisabled || saveLibraryOrder.isPending) return;
     setLibraryOrderNotice(null);
     setPendingLibraryOrder(libraryOrder);
     updateSettings({ libraryOrder });
@@ -521,18 +544,18 @@ export function AccountPage({ user }: { user: LuxUser }) {
                       className="lux-account-library-row"
                       key={library.id}
                       role="listitem"
-                      draggable={!libraryOrderLocked}
-                      onDragStart={() => { if (!libraryOrderLocked) setDraggedLibraryId(library.id); }}
+                      draggable={!libraryOrderLocked && !accountPreferencesDisabled && !saveLibraryOrder.isPending}
+                      onDragStart={() => { if (!libraryOrderLocked && !accountPreferencesDisabled && !saveLibraryOrder.isPending) setDraggedLibraryId(library.id); }}
                       onDragEnd={() => setDraggedLibraryId(null)}
                       onDragOver={(event) => event.preventDefault()}
-                      onDrop={() => { if (!libraryOrderLocked) dropLibrary(library.id); }}
+                      onDrop={() => { if (!libraryOrderLocked && !accountPreferencesDisabled && !saveLibraryOrder.isPending) dropLibrary(library.id); }}
                     >
                       <GripVertical className="lux-drag-handle" size={17} aria-hidden="true" />
                       <div className="lux-account-library-index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</div>
                       <div className="lux-account-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span></div>
                       <div className="lux-account-library-actions">
-                        <button type="button" aria-label={`上移媒体库 ${library.name}`} disabled={libraryOrderLocked || index === 0} onClick={() => reorderLibrary(library.id, "up")}><ChevronUp size={16} /></button>
-                        <button type="button" aria-label={`下移媒体库 ${library.name}`} disabled={libraryOrderLocked || index === orderedLibraries.length - 1} onClick={() => reorderLibrary(library.id, "down")}><ChevronDown size={16} /></button>
+                        <button type="button" aria-label={`上移媒体库 ${library.name}`} disabled={libraryOrderLocked || accountPreferencesDisabled || saveLibraryOrder.isPending || index === 0} onClick={() => reorderLibrary(library.id, "up")}><ChevronUp size={16} /></button>
+                        <button type="button" aria-label={`下移媒体库 ${library.name}`} disabled={libraryOrderLocked || accountPreferencesDisabled || saveLibraryOrder.isPending || index === orderedLibraries.length - 1} onClick={() => reorderLibrary(library.id, "down")}><ChevronDown size={16} /></button>
                       </div>
                     </div>
                   ))}
@@ -589,10 +612,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
               </div>
               <form className="lux-account-playback-threshold" onSubmit={(event) => { event.preventDefault(); setPlayedPercentNotice(null); savePlaybackSettings.mutate(); }}>
                 <div className="lux-admin-input-with-suffix">
-                  <input aria-label="自动标记已看百分比" type="number" min="1" max="100" value={playedPercent} onChange={(event) => { setPlayedPercentNotice(null); setPlayedPercent(event.target.value); }} />
+                  <input aria-label="自动标记已看百分比" type="number" min="1" max="100" value={playedPercent} disabled={accountPreferencesDisabled || savePlaybackSettings.isPending} onChange={(event) => { setPlayedPercentNotice(null); setPlayedPercent(event.target.value); }} />
                   <em>%</em>
                 </div>
-                <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={savePlaybackSettings.isPending || playbackSettings.isPending}>
+                <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={accountPreferencesDisabled || accountPreferencesSaving || savePlaybackSettings.isPending || playbackSettings.isPending}>
                   {savePlaybackSettings.isPending ? "保存中…" : "保存"}
                 </button>
                 {playedPercentNotice ? <span role="status">{playedPercentNotice}</span> : null}
@@ -766,19 +789,22 @@ function accountPreferencesUpdateFor(settings: AccountSettings, expectedVersion:
     audioLanguage: settings.audioLanguage,
     subtitleLanguage: settings.subtitleLanguage,
     autoPlayNextEpisode: settings.autoPlayNextEpisode,
+    libraryOrder: settings.libraryOrder,
+    playedPercent: settings.playedPercent,
   };
 }
 
-function accountSettingsFromPreferences(preferences: AccountPreferences, libraryOrder: string[]): AccountSettings {
+function accountSettingsFromPreferences(preferences: AccountPreferences): AccountSettings {
   return {
     theme: preferences.theme,
     accentColor: preferences.accentColor,
-    libraryOrder,
+    libraryOrder: preferences.libraryOrder,
     showMediaLibraries: preferences.showMediaLibraries,
     showContinueWatching: preferences.showContinueWatching,
     audioLanguage: preferences.audioLanguage,
     subtitleLanguage: preferences.subtitleLanguage,
     autoPlayNextEpisode: preferences.autoPlayNextEpisode,
+    playedPercent: preferences.playedPercent,
   };
 }
 

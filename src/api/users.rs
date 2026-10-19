@@ -1373,9 +1373,9 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let played_percent = match database.user_played_percent(&user.id.to_string()).await {
-        Ok(played_percent) => played_percent,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
     };
     let (use_admin_library_order, library_order_forced) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
@@ -1385,7 +1385,8 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(json!({
-        "playedPercent": played_percent,
+        "playedPercent": preferences.played_percent,
+        "preferencesVersion": preferences.version,
         "useAdminLibraryOrder": use_admin_library_order,
         "libraryOrderForced": library_order_forced,
     }))
@@ -1403,16 +1404,29 @@ pub(super) async fn auth_account_preferences(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match get_account_preferences(database, &user.id.to_string()).await {
-        Ok(preferences) => Json(preferences).into_response(),
-        Err(error) => account_preferences_error(&headers, error),
-    }
+    let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
+    let accessible_library_ids = match library_order_access_scope(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(status) => return status.into_response(),
+    };
+    preferences
+        .library_order
+        .retain(|library_id| accessible_library_ids.contains(library_id));
+    Json(preferences).into_response()
 }
 
 pub(super) async fn auth_update_account_preferences(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<UpdateAccountPreferences>,
+    Json(mut request): Json<UpdateAccountPreferences>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
@@ -1424,8 +1438,41 @@ pub(super) async fn auth_update_account_preferences(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let accessible_library_ids = match library_order_access_scope(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(status) => return status.into_response(),
+    };
+    if let Some(requested_order) = request.library_order.as_deref() {
+        let Some(libraries) = state.libraries.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        match libraries
+            .normalize_library_order(requested_order, &accessible_library_ids)
+            .await
+        {
+            Ok(order) => request.library_order = Some(order),
+            Err(LibraryServiceError::InvalidLibraryOrder(message)) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    &message,
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
     match update_account_preferences(database, &user.id.to_string(), request).await {
-        Ok(preferences) => {
+        Ok(mut preferences) => {
+            preferences
+                .library_order
+                .retain(|library_id| accessible_library_ids.contains(library_id));
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
@@ -1467,6 +1514,7 @@ fn account_preferences_error(headers: &HeaderMap, error: AccountPreferencesError
 pub(super) struct AuthSettingsPatch {
     played_percent: Option<i64>,
     use_admin_library_order: Option<bool>,
+    expected_version: Option<i64>,
 }
 
 pub(super) async fn auth_update_settings(
@@ -1496,13 +1544,37 @@ pub(super) async fn auth_update_settings(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
+    if request
+        .expected_version
+        .is_some_and(|expected| expected != preferences.version)
+    {
+        return account_preferences_error(&headers, AccountPreferencesError::VersionConflict);
+    }
     if let Some(played_percent) = request.played_percent {
-        if database
-            .set_user_played_percent(&user.id.to_string(), played_percent)
-            .await
-            .is_err()
+        match update_account_preferences(
+            database,
+            &user.id.to_string(),
+            UpdateAccountPreferences {
+                expected_version: request.expected_version.unwrap_or(preferences.version),
+                theme: preferences.theme.clone(),
+                accent_color: preferences.accent_color.clone(),
+                show_media_libraries: preferences.show_media_libraries,
+                show_continue_watching: preferences.show_continue_watching,
+                audio_language: preferences.audio_language.clone(),
+                subtitle_language: preferences.subtitle_language.clone(),
+                auto_play_next_episode: preferences.auto_play_next_episode,
+                library_order: None,
+                played_percent: Some(played_percent),
+            },
+        )
+        .await
         {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            Ok(updated) => preferences = updated,
+            Err(error) => return account_preferences_error(&headers, error),
         }
     }
     if let Some(use_admin_library_order) = request.use_admin_library_order {
@@ -1521,10 +1593,6 @@ pub(super) async fn auth_update_settings(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let played_percent = match database.user_played_percent(&user.id.to_string()).await {
-        Ok(played_percent) => played_percent,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let (use_admin_library_order, library_order_forced) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
         .await
@@ -1533,7 +1601,8 @@ pub(super) async fn auth_update_settings(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(json!({
-        "playedPercent": played_percent,
+        "playedPercent": preferences.played_percent,
+        "preferencesVersion": preferences.version,
         "useAdminLibraryOrder": use_admin_library_order,
         "libraryOrderForced": library_order_forced,
     }))
@@ -1600,8 +1669,12 @@ pub(super) async fn auth_update_password(
     }
 }
 
-fn user_library_order_response(library_order: Vec<String>) -> Response {
-    Json(json!({ "libraryOrder": library_order })).into_response()
+fn user_library_order_response(library_order: Vec<String>, preferences_version: i64) -> Response {
+    Json(json!({
+        "libraryOrder": library_order,
+        "preferencesVersion": preferences_version,
+    }))
+    .into_response()
 }
 
 async fn effective_library_order(
@@ -1652,6 +1725,13 @@ pub(super) async fn auth_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
@@ -1665,7 +1745,7 @@ pub(super) async fn auth_library_order(
     )
     .await
     {
-        Ok(library_order) => user_library_order_response(library_order),
+        Ok(library_order) => user_library_order_response(library_order, preferences.version),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -1674,6 +1754,7 @@ pub(super) async fn auth_library_order(
 #[serde(rename_all = "camelCase")]
 pub(super) struct LibraryOrderPatch {
     library_order: Vec<String>,
+    expected_version: Option<i64>,
 }
 
 pub(super) async fn auth_update_library_order(
@@ -1700,6 +1781,19 @@ pub(super) async fn auth_update_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
+    if request
+        .expected_version
+        .is_some_and(|expected| expected != preferences.version)
+    {
+        return account_preferences_error(&headers, AccountPreferencesError::VersionConflict);
+    }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
@@ -1721,33 +1815,54 @@ pub(super) async fn auth_update_library_order(
         )
         .await
         {
-            Ok(library_order) => user_library_order_response(library_order),
+            Ok(library_order) => user_library_order_response(library_order, preferences.version),
             Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
     }
-    match libraries
-        .set_library_order(
-            &user.id.to_string(),
-            &request.library_order,
-            &accessible_library_ids,
-        )
+    let library_order = match libraries
+        .normalize_library_order(&request.library_order, &accessible_library_ids)
         .await
     {
-        Ok(library_order) => {
+        Ok(order) => order,
+        Err(LibraryServiceError::InvalidLibraryOrder(message)) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                &message,
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match update_account_preferences(
+        database,
+        &user.id.to_string(),
+        UpdateAccountPreferences {
+            expected_version: request.expected_version.unwrap_or(preferences.version),
+            theme: preferences.theme,
+            accent_color: preferences.accent_color,
+            show_media_libraries: preferences.show_media_libraries,
+            show_continue_watching: preferences.show_continue_watching,
+            audio_language: preferences.audio_language,
+            subtitle_language: preferences.subtitle_language,
+            auto_play_next_episode: preferences.auto_play_next_episode,
+            library_order: Some(library_order),
+            played_percent: None,
+        },
+    )
+    .await
+    {
+        Ok(updated) => {
+            let library_order = updated.library_order;
+            let preferences_version = updated.version;
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
             state.user_events.publish_home_coalesced().await;
-            Json(json!({ "libraryOrder": library_order })).into_response()
+            user_library_order_response(library_order, preferences_version)
         }
-        Err(LibraryServiceError::InvalidLibraryOrder(message)) => api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            &message,
-        )
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => account_preferences_error(&headers, error),
     }
 }
 

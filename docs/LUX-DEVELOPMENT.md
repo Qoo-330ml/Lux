@@ -14082,6 +14082,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：账户偏好服务快照现在包含旧服务端表中的媒体库顺序与 1–100 播放阈值；版本 0 读取旧值但不写入偏好行。CAS 使用单个数据库事务更新偏好版本和被显式提供的旧表值，字段省略时保留原设置；无效媒体库 ID 触发整笔回滚。`account_preferences_use_compare_and_swap_versions` 1/1、`user_account_preferences::tests` 9/9、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。此切片仅建立一致的服务端 CAS 写入合同，旧设置路由将在 LUX-673 接入合同。
 
+#### LUX-673：账户设置 API 共用偏好版本
+
+范围：账户偏好 API 读写媒体库顺序与播放阈值；原 `/settings` 和 `/library-order` 入口保留兼容，但对这两类数据也使用账户偏好 CAS 并返回版本。用户个人排序在验证可访问范围后规范化，API 响应不泄漏不可访问媒体库 ID。管理强制排序开关仍独立于可复制的个人排序。
+
+预计修改文件（13 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_account_preferences.rs`、`src/application/libraries.rs`、`src/api/users.rs`、`src/storage/users.rs`、`tests/user_settings.rs`、`tests/library_order.rs`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/account/AccountPage.tsx`、`web/tests/account-settings.test.tsx`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 账户偏好 GET/PATCH 含已看阈值和媒体库顺序；全量偏好保存与旧阈值/排序路由都会推进同一版本。
+- [x] 旧路由省略版本时兼容地 CAS 最新读到的版本；带陈旧版本时返回 VERSION_CONFLICT，不能覆盖另一入口的更新。
+- [x] 排序只接受目标账号可访问的媒体库，并继续尊重管理员强制排序；不泄漏被禁止访问的 ID。
+- [x] Account 页面读取服务器全量快照，保存各偏好时携带当前版本；浏览器旧值仅在服务端版本为 0 时迁移。
+- [x] API/Web 定向测试、Web build、Rust build、fmt 通过。
+
+短计划：先扩展账户偏好与旧入口的 API 回归测试和 Web 客户端类型测试；再为排序验证增加只规范化不写入的服务方法，将两条兼容路由改为 CAS 更新，并让账户页提交/迁移完整偏好快照。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test user_settings`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test library_order`、Web 账户设置/API client 定向 Vitest、Web build、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 和 `git diff --check`。
+
+依赖：LUX-654、LUX-672。
+
+结果（2026-10-19）：`user_settings` 2/2、`library_order` 1/1、`account_preferences_use_compare_and_swap_versions` 1/1、`user_account_preferences::tests` 9/9、Web 账户设置/API client 定向测试 101/101 通过；Rust build、fmt、Web build 与 `git diff --check` 通过。Web build 临时用 HEAD 版本覆盖用户未提交的 `AdminDashboardNowPlaying.tsx`，完成后已校验恢复原文件。Cargo 网络测试使用 `NO_PROXY=127.0.0.1,localhost` 避免本机请求经过代理。API 合同已同步到 `docs/API.md`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

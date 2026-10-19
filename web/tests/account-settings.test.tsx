@@ -28,6 +28,8 @@ const defaultServerPreferences: AccountPreferences = {
   audioLanguage: "原始音轨",
   subtitleLanguage: "简体中文",
   autoPlayNextEpisode: true,
+  libraryOrder: [],
+  playedPercent: 95,
   version: 0,
   updatedAt: null,
 };
@@ -86,6 +88,8 @@ describe("account settings", () => {
       audioLanguage: input.audioLanguage,
       subtitleLanguage: input.subtitleLanguage,
       autoPlayNextEpisode: input.autoPlayNextEpisode,
+      libraryOrder: input.libraryOrder,
+      playedPercent: input.playedPercent,
       version: input.expectedVersion + 1,
       updatedAt: 1_792_382_400,
     }));
@@ -178,6 +182,7 @@ describe("account settings", () => {
       accentColor: "ocean",
       showContinueWatching: false,
       libraryOrder: ["movies"],
+      playedPercent: 95,
     });
   });
 
@@ -274,6 +279,7 @@ describe("account settings", () => {
       subtitleLanguage: "关闭字幕",
       autoPlayNextEpisode: false,
       libraryOrder: ["series", "movies"],
+      playedPercent: 95,
     }));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
@@ -298,6 +304,8 @@ describe("account settings", () => {
       audioLanguage: "日本語",
       subtitleLanguage: "关闭字幕",
       autoPlayNextEpisode: false,
+      libraryOrder: ["series", "movies"],
+      playedPercent: 95,
     });
     expect(container.querySelector<HTMLButtonElement>('[aria-label="切换到浅色模式"]')?.getAttribute("aria-pressed")).toBe("true");
   });
@@ -627,7 +635,7 @@ describe("account settings", () => {
   });
 
   it("saves the personal automatic watched threshold", async () => {
-    const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({ playedPercent: 82 });
+    const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({ playedPercent: 82, preferencesVersion: 1 });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     await act(async () => {
@@ -654,8 +662,33 @@ describe("account settings", () => {
       [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "保存")?.click();
     });
 
-    expect(update).toHaveBeenCalledWith({ playedPercent: 82 });
+    expect(update).toHaveBeenCalledWith({ playedPercent: 82, expectedVersion: 0 });
     expect(container.textContent).toContain("播放阈值已保存");
+  });
+
+  it("blocks further account preference writes after a stale threshold version", async () => {
+    const update = vi.spyOn(api, "updateUserSettings").mockRejectedValue(
+      new ApiError("账户偏好已在其他页面更新", { code: "VERSION_CONFLICT", status: 409 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "保存")?.click();
+    });
+
+    expect(update).toHaveBeenCalledWith({ playedPercent: 95, expectedVersion: 0 });
+    expect(container.textContent).toContain("偏好已在其他设备更新，请刷新账户设置后再保存");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="选择强调色 海蓝"]')?.disabled).toBe(true);
   });
 
   it("uploads an avatar to the server only after the user explicitly saves it", async () => {
@@ -836,6 +869,7 @@ describe("account settings", () => {
 
     expect(api.updateLibraryOrder).toHaveBeenCalledWith({
       libraryOrder: ["movies", collectionsLibraryId, "series"],
+      expectedVersion: 0,
     });
     expect(container.textContent).toContain("媒体库顺序已保存");
   });

@@ -38,8 +38,13 @@ export type LuxUser = {
 
 export type UserPlaybackSettings = {
   playedPercent: number;
+  preferencesVersion?: number;
   useAdminLibraryOrder?: boolean;
   libraryOrderForced?: boolean;
+};
+
+export type UserPlaybackSettingsUpdate = Partial<Pick<UserPlaybackSettings, "playedPercent" | "useAdminLibraryOrder">> & {
+  expectedVersion?: number;
 };
 
 export type AccountPreferences = {
@@ -50,6 +55,8 @@ export type AccountPreferences = {
   audioLanguage: string;
   subtitleLanguage: string;
   autoPlayNextEpisode: boolean;
+  libraryOrder: string[];
+  playedPercent: number;
   version: number;
   updatedAt: number | null;
 };
@@ -60,6 +67,11 @@ export type AccountPreferencesUpdate = Omit<AccountPreferences, "version" | "upd
 
 export type UserLibraryOrder = {
   libraryOrder: string[];
+  preferencesVersion?: number;
+};
+
+export type UserLibraryOrderUpdate = Pick<UserLibraryOrder, "libraryOrder"> & {
+  expectedVersion?: number;
 };
 
 export type UserPasswordChangeInput = {

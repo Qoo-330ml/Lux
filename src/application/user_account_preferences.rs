@@ -54,6 +54,8 @@ pub(crate) struct UpdateAccountPreferences {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
+    pub(crate) library_order: Option<Vec<String>>,
+    pub(crate) played_percent: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -265,8 +267,8 @@ pub(crate) async fn update_account_preferences(
                 audio_language: &input.audio_language,
                 subtitle_language: &input.subtitle_language,
                 auto_play_next_episode: input.auto_play_next_episode,
-                library_order: None,
-                played_percent: None,
+                library_order: input.library_order.as_deref(),
+                played_percent: input.played_percent,
             },
         )
         .await?
@@ -473,6 +475,8 @@ async fn copy_preferences_to_target(
         } else {
             current.auto_play_next_episode
         },
+        library_order: None,
+        played_percent: None,
     };
     update_account_preferences(database, &target.user_id, input)
         .await
@@ -525,10 +529,22 @@ fn validate_preferences(input: &UpdateAccountPreferences) -> Result<(), AccountP
         )
         || !valid_language(&input.audio_language)
         || !valid_language(&input.subtitle_language)
+        || input
+            .played_percent
+            .is_some_and(|played_percent| !(1..=100).contains(&played_percent))
+        || input
+            .library_order
+            .as_ref()
+            .is_some_and(|order| order.len() > 1024 || has_duplicates(order))
     {
         return Err(AccountPreferencesError::InvalidPreferences);
     }
     Ok(())
+}
+
+fn has_duplicates(values: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    values.iter().any(|value| !seen.insert(value))
 }
 
 fn valid_language(value: &str) -> bool {
@@ -582,6 +598,8 @@ mod tests {
             audio_language: "日本語".to_owned(),
             subtitle_language: "关闭".to_owned(),
             auto_play_next_episode: false,
+            library_order: None,
+            played_percent: None,
         }
     }
 
@@ -733,6 +751,20 @@ mod tests {
 
         let mut input = valid_update(0);
         input.subtitle_language = "简体\n中文".to_owned();
+        assert!(matches!(
+            update_account_preferences(&database, "preferences-validation-user", input).await,
+            Err(AccountPreferencesError::InvalidPreferences)
+        ));
+
+        let mut input = valid_update(0);
+        input.played_percent = Some(101);
+        assert!(matches!(
+            update_account_preferences(&database, "preferences-validation-user", input).await,
+            Err(AccountPreferencesError::InvalidPreferences)
+        ));
+
+        let mut input = valid_update(0);
+        input.library_order = Some(vec!["duplicate".to_owned(), "duplicate".to_owned()]);
         assert!(matches!(
             update_account_preferences(&database, "preferences-validation-user", input).await,
             Err(AccountPreferencesError::InvalidPreferences)

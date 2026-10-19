@@ -49,6 +49,7 @@ async fn user_playback_threshold_defaults_to_95_and_is_csrf_protected()
     assert_eq!(defaults["playedPercent"], 95);
     assert_eq!(defaults["useAdminLibraryOrder"], true);
     assert_eq!(defaults["libraryOrderForced"], false);
+    assert_eq!(defaults["preferencesVersion"], 0);
 
     let missing_csrf = client
         .patch(format!("{base_url}/api/v1/auth/settings"))
@@ -66,7 +67,22 @@ async fn user_playback_threshold_defaults_to_95_and_is_csrf_protected()
         .send()
         .await?;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
-    assert_eq!(updated.json::<Value>().await?["playedPercent"], 80);
+    let updated = updated.json::<Value>().await?;
+    assert_eq!(updated["playedPercent"], 80);
+    assert_eq!(updated["preferencesVersion"], 1);
+
+    let stale = client
+        .patch(format!("{base_url}/api/v1/auth/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "playedPercent": 65, "expectedVersion": 0 }))
+        .send()
+        .await?;
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        stale.json::<Value>().await?["error"]["code"],
+        "VERSION_CONFLICT"
+    );
 
     let invalid = client
         .patch(format!("{base_url}/api/v1/auth/settings"))
@@ -137,6 +153,8 @@ async fn account_preferences_api_is_authenticated_versioned_and_csrf_protected()
     assert_eq!(defaults["audioLanguage"], "原始音轨");
     assert_eq!(defaults["subtitleLanguage"], "简体中文");
     assert_eq!(defaults["autoPlayNextEpisode"], true);
+    assert_eq!(defaults["playedPercent"], 95);
+    assert_eq!(defaults["libraryOrder"], json!([]));
     assert_eq!(defaults["version"], 0);
     assert!(defaults["updatedAt"].is_null());
 
@@ -148,7 +166,9 @@ async fn account_preferences_api_is_authenticated_versioned_and_csrf_protected()
         "showContinueWatching": true,
         "audioLanguage": "日本語",
         "subtitleLanguage": "关闭",
-        "autoPlayNextEpisode": false
+        "autoPlayNextEpisode": false,
+        "playedPercent": 84,
+        "libraryOrder": []
     });
     let missing_csrf = client
         .patch(format!("{base_url}/api/v1/auth/account-preferences"))
@@ -170,7 +190,31 @@ async fn account_preferences_api_is_authenticated_versioned_and_csrf_protected()
     assert_eq!(created["theme"], "light");
     assert_eq!(created["accentColor"], "berry");
     assert_eq!(created["version"], 1);
+    assert_eq!(created["playedPercent"], 84);
+    assert_eq!(created["libraryOrder"], json!([]));
     assert!(created["updatedAt"].as_i64().is_some());
+
+    let playback_update = client
+        .patch(format!("{base_url}/api/v1/auth/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "playedPercent": 82, "expectedVersion": 1 }))
+        .send()
+        .await?;
+    assert_eq!(playback_update.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        playback_update.json::<Value>().await?["preferencesVersion"],
+        2
+    );
+    let refreshed = client
+        .get(format!("{base_url}/api/v1/auth/account-preferences"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(refreshed["version"], 2);
+    assert_eq!(refreshed["playedPercent"], 82);
 
     let stale = client
         .patch(format!("{base_url}/api/v1/auth/account-preferences"))

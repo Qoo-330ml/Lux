@@ -2748,6 +2748,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_user_played_percent(
         &self,
         user_id: &str,

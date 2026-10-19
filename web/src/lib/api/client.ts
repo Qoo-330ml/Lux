@@ -67,6 +67,7 @@ import type {
   HomeLatestLibrariesResponse,
   HomeResponse,
   UserLibraryOrder,
+  UserLibraryOrderUpdate,
   UserPasswordChangeInput,
   LibrariesResponse,
   LuxUser,
@@ -91,6 +92,7 @@ import type {
   SetupDatabaseStatus,
   MetadataRefreshMode,
   UserPlaybackSettings,
+  UserPlaybackSettingsUpdate,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
@@ -359,7 +361,7 @@ export class LuxApiClient {
     return this.request<UserPlaybackSettings>("/api/v1/auth/settings");
   }
 
-  updateUserSettings(input: Partial<UserPlaybackSettings>) {
+  updateUserSettings(input: UserPlaybackSettingsUpdate) {
     return this.request<UserPlaybackSettings>("/api/v1/auth/settings", {
       method: "PATCH",
       body: JSON.stringify(input),
@@ -377,7 +379,7 @@ export class LuxApiClient {
     return this.request<UserLibraryOrder>("/api/v1/auth/library-order");
   }
 
-  updateLibraryOrder(input: UserLibraryOrder) {
+  updateLibraryOrder(input: UserLibraryOrderUpdate) {
     return this.request<UserLibraryOrder>("/api/v1/auth/library-order", {
       method: "PATCH",
       body: JSON.stringify(input),

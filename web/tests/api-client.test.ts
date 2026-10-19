@@ -598,6 +598,8 @@ describe("LuxApiClient", () => {
       audioLanguage: "原始音轨",
       subtitleLanguage: "简体中文",
       autoPlayNextEpisode: true,
+      libraryOrder: [],
+      playedPercent: 95,
       version: 0,
       updatedAt: null,
     };
@@ -610,6 +612,8 @@ describe("LuxApiClient", () => {
       audioLanguage: "日本語",
       subtitleLanguage: "关闭",
       autoPlayNextEpisode: false,
+      libraryOrder: [],
+      playedPercent: 95,
     };
     const saved = { ...input, version: 1, updatedAt: 1_792_382_400 };
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
@@ -634,12 +638,12 @@ describe("LuxApiClient", () => {
   it("reads and updates the current user's playback threshold", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (!init?.method) {
-        return new Response(JSON.stringify({ playedPercent: 95 }), { status: 200 });
+        return new Response(JSON.stringify({ playedPercent: 95, preferencesVersion: 0 }), { status: 200 });
       }
       expect(String(input)).toBe("/api/v1/auth/settings");
       expect(init.method).toBe("PATCH");
-      expect(JSON.parse(String(init.body))).toEqual({ playedPercent: 80 });
-      return new Response(JSON.stringify({ playedPercent: 80 }), { status: 200 });
+      expect(JSON.parse(String(init.body))).toEqual({ playedPercent: 80, expectedVersion: 0 });
+      return new Response(JSON.stringify({ playedPercent: 80, preferencesVersion: 1 }), { status: 200 });
     });
     Object.defineProperty(globalThis, "document", {
       configurable: true,
@@ -647,20 +651,23 @@ describe("LuxApiClient", () => {
     });
 
     const client = new LuxApiClient();
-    await expect(client.userSettings()).resolves.toEqual({ playedPercent: 95 });
-    await expect(client.updateUserSettings({ playedPercent: 80 })).resolves.toEqual({ playedPercent: 80 });
+    await expect(client.userSettings()).resolves.toEqual({ playedPercent: 95, preferencesVersion: 0 });
+    await expect(client.updateUserSettings({ playedPercent: 80, expectedVersion: 0 })).resolves.toEqual({
+      playedPercent: 80,
+      preferencesVersion: 1,
+    });
     expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });
 
   it("reads and updates the current user's library order", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (!init?.method) {
-        return new Response(JSON.stringify({ libraryOrder: ["movies", "series"] }), { status: 200 });
+        return new Response(JSON.stringify({ libraryOrder: ["movies", "series"], preferencesVersion: 3 }), { status: 200 });
       }
       expect(String(input)).toBe("/api/v1/auth/library-order");
       expect(init.method).toBe("PATCH");
-      expect(JSON.parse(String(init.body))).toEqual({ libraryOrder: ["series", "movies"] });
-      return new Response(JSON.stringify({ libraryOrder: ["series", "movies"] }), { status: 200 });
+      expect(JSON.parse(String(init.body))).toEqual({ libraryOrder: ["series", "movies"], expectedVersion: 3 });
+      return new Response(JSON.stringify({ libraryOrder: ["series", "movies"], preferencesVersion: 4 }), { status: 200 });
     });
     Object.defineProperty(globalThis, "document", {
       configurable: true,
@@ -668,9 +675,10 @@ describe("LuxApiClient", () => {
     });
 
     const client = new LuxApiClient();
-    await expect(client.libraryOrder()).resolves.toEqual({ libraryOrder: ["movies", "series"] });
-    await expect(client.updateLibraryOrder({ libraryOrder: ["series", "movies"] })).resolves.toEqual({
+    await expect(client.libraryOrder()).resolves.toEqual({ libraryOrder: ["movies", "series"], preferencesVersion: 3 });
+    await expect(client.updateLibraryOrder({ libraryOrder: ["series", "movies"], expectedVersion: 3 })).resolves.toEqual({
       libraryOrder: ["series", "movies"],
+      preferencesVersion: 4,
     });
     expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });

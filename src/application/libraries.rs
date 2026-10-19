@@ -312,6 +312,20 @@ impl LibraryService {
         requested_library_ids: &[String],
         accessible_library_ids: &[String],
     ) -> Result<Vec<String>, LibraryServiceError> {
+        let ordered = self
+            .normalize_library_order(requested_library_ids, accessible_library_ids)
+            .await?;
+        self.database
+            .replace_user_library_order(user_id, &ordered)
+            .await?;
+        Ok(ordered)
+    }
+
+    pub async fn normalize_library_order(
+        &self,
+        requested_library_ids: &[String],
+        accessible_library_ids: &[String],
+    ) -> Result<Vec<String>, LibraryServiceError> {
         let accessible = accessible_library_ids
             .iter()
             .cloned()
@@ -343,9 +357,6 @@ impl LibraryService {
         {
             ordered.push(global_collections_id);
         }
-        self.database
-            .replace_user_library_order(user_id, &ordered)
-            .await?;
         Ok(ordered)
     }
 
