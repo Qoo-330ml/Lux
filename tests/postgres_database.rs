@@ -135,7 +135,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 185);
+    assert_eq!(database.schema_version().await?, 186);
     sqlx::query(
         "INSERT INTO users (id, username_normalized, display_name, password_hash)
          VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
@@ -150,6 +150,48 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(playback_policy, (1, 0, 1, 1, 1));
+    let playback_admission_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'playback_admissions'
+           AND column_name IN (
+               'user_id', 'play_session_id', 'state', 'admitted_at', 'last_seen_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(playback_admission_columns, 5);
+    let playback_admission_constraints: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint
+         WHERE conrelid = 'playback_admissions'::regclass
+           AND conname IN (
+               'pk_playback_admissions', 'fk_playback_admissions_user',
+               'chk_playback_admissions_state', 'chk_playback_admissions_timestamps'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(playback_admission_constraints, 4);
+    let playback_admission_index: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('idx_playback_admissions_active')::text")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        playback_admission_index.as_deref(),
+        Some("idx_playback_admissions_active")
+    );
+    let playback_admission_index_columns: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_playback_admissions_active'",
+    )
+    .fetch_optional(database.pool())
+    .await?;
+    assert!(
+        playback_admission_index_columns
+            .as_deref()
+            .is_some_and(|definition| definition.contains("(user_id, state, last_seen_at)"))
+    );
     let reconciliation_index: Option<String> = sqlx::query_scalar(
         "SELECT to_regclass('idx_media_items_nfo_collection_reference_pending')::text",
     )

@@ -12980,6 +12980,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：用户详情的“播放与转码”读取并保存五项策略，非法并发数禁止提交且保存失败保留草稿；回收站账号不请求策略 API。页面说明 `0` 表示不限并标明准入逻辑待后续任务接入。定向 Vitest 3/3、Web 构建通过；Playwright 本地真实浏览器在接口 mock 下完成桌面和 390px 窄屏检查、保存交互及 PUT 载荷确认，无页面横向溢出或控制台错误。未部署。
 
+#### LUX-618：为共享播放准入建立数据表
+
+范围：为后续共享播放准入保存每位用户、播放会话的占位状态及准入/续租时间。SQLite 与 PostgreSQL 均迁移；本任务只建立 schema 与升级回归，不接入存储操作或播放路由。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0186_user_playback_admissions.sql`、`migrations-postgres/0186_user_playback_admissions.sql`、`src/storage/repository_tests.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 两种数据库都建立用户外键、`(user_id, play_session_id)` 主键、有效状态与时间约束，以及状态/续租时间索引。
+- [x] SQLite 从空库应用迁移及从旧 schema 升级均通过；既有播放记录保留。
+- [x] PostgreSQL bootstrap 回归加入占位表字段、约束和索引断言。
+- [x] SQLite 定向迁移测试、PostgreSQL 集成目标编译和 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_playback_admission_migration`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-617。
+
+结果（2026-10-19）：SQLite 定向迁移回归 1/1 通过，覆盖新库 schema、复合主键、用户外键、状态与时间约束，以及旧播放记录保留。PostgreSQL 集成目标成功编译；19 个测试因需要本地 PostgreSQL 全部 ignored，因此 bootstrap 断言尚未运行时验证。Rust 格式检查与 `git diff --check` 通过。此任务只建立 schema，未实现准入逻辑。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

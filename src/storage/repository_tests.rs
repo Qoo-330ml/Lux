@@ -13919,6 +13919,131 @@ async fn user_playback_policy_migration_defaults_keep_existing_playback_compatib
 }
 
 #[tokio::test]
+async fn user_playback_admission_migration_creates_constrained_ledger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'playback_admissions'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        table_exists, 1,
+        "fresh SQLite databases need the admission ledger"
+    );
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('admission-ledger-user', 'admission-ledger-user', 'Admission Ledger', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO playback_admissions (
+             user_id, play_session_id, state, admitted_at, last_seen_at
+         ) VALUES ('admission-ledger-user', 'play-session-1', 'ACTIVE', 100, 100)",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('admission-ledger-user', 'play-session-1', 'ACTIVE', 101, 101)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "a user cannot have duplicate rows for one playback session"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('missing-admission-user', 'play-session-2', 'ACTIVE', 100, 100)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "admissions must reference an existing user"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('admission-ledger-user', 'play-session-3', 'UNKNOWN', 100, 100)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "admission state must be constrained"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO playback_admissions (
+                 user_id, play_session_id, state, admitted_at, last_seen_at
+             ) VALUES ('admission-ledger-user', 'play-session-4', 'ACTIVE', 100, 99)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err(),
+        "last-seen time cannot precede admission time"
+    );
+
+    let legacy_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE users (id TEXT PRIMARY KEY);
+         INSERT INTO users (id) VALUES ('legacy-admission-user');
+         CREATE TABLE playback_sessions (
+             id TEXT PRIMARY KEY,
+             user_id TEXT NOT NULL,
+             play_session_id TEXT NOT NULL
+         );
+         INSERT INTO playback_sessions (id, user_id, play_session_id)
+         VALUES ('legacy-playback', 'legacy-admission-user', 'legacy-session');",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0186_user_playback_admissions.sql"
+    ))
+    .execute(&legacy_pool)
+    .await?;
+    let legacy_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'playback_admissions'
+         )",
+    )
+    .fetch_one(&legacy_pool)
+    .await?;
+    assert_eq!(
+        legacy_table_exists, 1,
+        "existing SQLite databases need the ledger migration"
+    );
+    let legacy_playback_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM playback_sessions WHERE id = 'legacy-playback'")
+            .fetch_one(&legacy_pool)
+            .await?;
+    assert_eq!(
+        legacy_playback_count, 1,
+        "migration must preserve old playback records"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn new_user_playback_policy_defaults_to_two_and_updates()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
