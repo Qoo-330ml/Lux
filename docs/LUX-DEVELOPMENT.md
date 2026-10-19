@@ -13294,6 +13294,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：管理员设置新增默认权限快照，首次返回 `NONE` 媒体库范围、禁止下载、允许播放且并发上限 2；`server_settings` 以单个 JSON 项持久化，无需迁移。空指定项归一为 `NONE`，重复/停用库、非空 `ALL/NONE` 和负并发上限均拒绝，失败不覆盖已保存值。`admin_dashboard` 1/1、fmt 与 diff check 通过。公开 API 文档同步由 LUX-634 完成。
 
+#### LUX-634：记录新用户默认权限设置 API
+
+范围：在 `docs/API.md` 记录管理员设置响应/请求中的 `newUserPermissions` 形状、初始默认值、媒体库模式校验和 CSRF 边界。明确该接口当前只配置快照，实际应用至新账号由后续任务接入。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`。
+
+验收标准：
+
+- [x] API 文档包含全部媒体库、下载与五项播放策略字段及默认值。
+- [x] 文档说明空指定集合归一为 `NONE`、`ALL/NONE` 禁止媒体库 ID、无效请求返回 400。
+- [x] 文档明确管理员 Web session + CSRF 和新账号应用仍待后续实现。
+- [x] `git diff --check` 通过。
+
+短计划：核对已实现 DTO 和集成回归后，将该资源契约补充到管理员设置 API 条目；不改代码或接口行为。
+
+验证：`git diff --check`。
+
+依赖：LUX-633。
+
+结果（2026-10-19）：`docs/API.md` 记录 `newUserPermissions` 全字段、默认值、完整快照更新、媒体库模式归一/拒绝规则、管理员 session + CSRF 和“尚未应用于新账号创建”的边界；`git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
