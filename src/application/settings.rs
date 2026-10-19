@@ -148,6 +148,19 @@ impl NewUserPermissions {
             self.library_access_mode = "NONE".to_owned();
         }
     }
+
+    pub(crate) fn stored_snapshot(&self) -> crate::storage::NewStoredUserPermissions<'_> {
+        crate::storage::NewStoredUserPermissions {
+            library_access_mode: &self.library_access_mode,
+            library_ids: &self.library_ids,
+            can_download: self.can_download,
+            can_play: self.can_play,
+            max_simultaneous_playbacks: self.max_simultaneous_playbacks,
+            allow_remux: self.allow_remux,
+            allow_audio_transcode: self.allow_audio_transcode,
+            allow_video_transcode: self.allow_video_transcode,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -431,7 +444,9 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
     })
 }
 
-async fn read_new_user_permissions(database: &Database) -> Result<NewUserPermissions, ()> {
+pub(crate) async fn read_new_user_permissions(
+    database: &Database,
+) -> Result<NewUserPermissions, ()> {
     let stored = database.new_user_permissions_json().await.map_err(|_| ())?;
     let Some(stored) = stored else {
         return Ok(NewUserPermissions::default());

@@ -13355,7 +13355,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-627、LUX-628、LUX-620、LUX-633。
 
-结果（2026-10-19）：存储新增初始用户权限快照，账号字段和指定媒体库授权在单个事务写入；正向保存和授权插入触发失败回滚的定向回归 2/2 通过，旧插入路径未改。`cargo build --locked`、fmt check 与 diff check 通过。全量 `cargo test --locked --all-targets` 为 985 passed、5 failed、25 ignored；失败为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`。全量 Clippy 被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。管理员和 Emby 创建入口接入默认快照由 LUX-637 完成。
+结果（2026-10-19）：存储新增初始用户权限快照，账号字段和指定媒体库授权在单个事务写入；正向保存和授权插入触发失败回滚的定向回归 2/2 通过，旧插入路径未改。`cargo build --locked`、fmt check 与 diff check 通过。全量 `cargo test --locked --all-targets` 为 985 passed、5 failed、25 ignored；失败为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`。全量 Clippy 被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。管理员直建由 LUX-637 接入默认快照，Emby 管理员建号由 LUX-638 接入。
+
+#### LUX-637：管理员直建账号应用默认权限快照
+
+范围：管理员通过 Lux API 创建普通账号时，读取已保存的新用户默认权限并传入原子创建路径；账号资料响应及后续权限查询反映实际快照。设置读取失败时不创建账号。本任务不改 Emby 创建和用户权限复制。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 新建普通账号完整取得配置的媒体库、下载和播放/转码快照。
+- [x] 创建响应中的下载权限与存储一致，播放策略和媒体库模式查询均返回配置值。
+- [x] 默认设置读取失败时返回服务不可用，不留下账号。
+- [x] 定向 `users` 集成回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加管理员设置保存后创建账号的失败回归；暴露只读默认值读取与快照映射，再让管理员创建 handler 调用权限快照创建方法。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-633、LUX-636。
+
+结果（2026-10-19）：管理员直建读取服务端默认快照并使用原子创建；返回的 `canDownload`、播放策略及媒体库模式均与设置一致。定向 `users` 集成测试 2/2、Rust build、fmt check 与 diff check 通过。删除设置表模拟读取故障时 API 返回 503，账号未写入。Emby 创建入口仍由 LUX-638 实施。
 
 ## 29. 参考资料
 

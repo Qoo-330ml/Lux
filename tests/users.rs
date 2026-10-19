@@ -656,3 +656,129 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
         })
         .unwrap_or_default()
 }
+
+#[tokio::test]
+async fn admin_user_creation_applies_configured_permission_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let defaults = json!({
+        "libraryAccessMode": "NONE",
+        "libraryIds": [],
+        "canDownload": true,
+        "canPlay": false,
+        "maxSimultaneousPlaybacks": 5,
+        "allowRemux": false,
+        "allowAudioTranscode": true,
+        "allowVideoTranscode": false,
+    });
+    let settings = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "newUserPermissions": defaults }))
+        .send()
+        .await?;
+    assert_eq!(settings.status(), reqwest::StatusCode::OK);
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "snapshot-user",
+            "password": "snapshot password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let user = created.json::<Value>().await?["user"].clone();
+    assert_eq!(user["canDownload"], true);
+    let user_id = user["id"].as_str().ok_or("missing user id")?;
+
+    let playback = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{user_id}/playback-policy"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(playback.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        playback.json::<Value>().await?["policy"],
+        json!({
+            "canPlay": false,
+            "maxSimultaneousPlaybacks": 5,
+            "allowRemux": false,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": false,
+        })
+    );
+
+    let libraries = client
+        .get(format!("{base_url}/api/v1/admin/users/{user_id}/libraries"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(libraries.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        libraries.json::<Value>().await?["libraryAccessMode"],
+        "NONE"
+    );
+
+    sqlx::query("DROP TABLE server_settings")
+        .execute(database.pool())
+        .await?;
+    let settings_unavailable = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "settings-unavailable",
+            "password": "snapshot password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        settings_unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let missing_user_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE username_normalized = 'settings-unavailable'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing_user_count, 0);
+
+    server.abort();
+    Ok(())
+}

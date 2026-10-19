@@ -166,8 +166,6 @@ impl UserStore {
         })
     }
 
-    // LUX-637 wires administrator user creation to this permission snapshot.
-    #[allow(dead_code)]
     pub(crate) async fn create_user_with_email_and_permission_snapshot(
         &self,
         username: &str,

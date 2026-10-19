@@ -505,13 +505,19 @@ pub(crate) async fn admin_create_user(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let permissions = match crate::application::settings::read_new_user_permissions(database).await
+    {
+        Ok(permissions) => permissions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     match users
-        .create_user_with_email(
+        .create_user_with_email_and_permission_snapshot(
             &request.username,
             &request.display_name,
             &request.password,
             request.is_admin,
             request.email.as_deref(),
+            permissions.stored_snapshot(),
         )
         .await
     {
