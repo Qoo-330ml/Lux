@@ -15,6 +15,74 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 #[tokio::test]
+async fn successful_login_is_written_to_the_user_activity_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let user = setup
+        .complete("activity-user", "Activity User", "correct password")
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let response = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "activity-user",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let user_id = user.id.to_string();
+    let (event_count, actor_user_id, metadata_json): (i64, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT COUNT(*), MAX(actor_user_id), MAX(metadata_json)
+         FROM user_activity_events WHERE user_id = ? AND event_type = 'AUTH_LOGIN'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(event_count, 1);
+    assert_eq!(actor_user_id.as_deref(), Some(user_id.as_str()));
+    let metadata_json = metadata_json.ok_or("missing login activity metadata")?;
+    assert!(!metadata_json.contains("correct password"));
+
+    let cookie = cookie_pair(response.headers());
+    let audit = client
+        .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
+        .header(COOKIE, cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    assert!(
+        audit.json::<Value>().await?["events"]
+            .as_array()
+            .is_some_and(|events| events
+                .iter()
+                .any(|event| event["eventType"] == "AUTH_LOGIN"))
+    );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_manage_users_and_last_manager_is_protected()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

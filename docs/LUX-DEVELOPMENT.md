@@ -15110,6 +15110,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-719。
 
+#### LUX-721：接入登录与播放活动事件索引
+
+范围：将现有 `record_activity_event` 记录的成功认证和播放状态变化写入用户活动索引，活动用户与操作者标识当前发起事件的账号。保留已有文件审计日志和 Dashboard 失效通知；索引写入失败不得丢弃已有审计日志，不记录错误正文、凭证或完整 URL。本任务不记录认证失败，不增加活动查询 API 或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_logs_events.rs`、`tests/users.rs`、`tests/web_playback.rs`。
+
+验收标准：
+
+- [x] Web 成功登录及 Web 播放状态变化写入对应用户的 `AUTH_LOGIN`/`PLAYBACK_*` 索引事件，actor 与活动用户一致。
+- [x] 索引写入复用已有脱敏存储合同；已有文件审计记录及 Dashboard 通知继续正常。
+- [x] 定向认证与播放集成回归和原用户 API 回归、build、fmt、diff check 通过。
+
+短计划：先为成功登录增加 API 回归并确认索引无记录；再在统一活动记录器写入索引并保留文件审计；最后跑用户/播放 API 定向回归、build、fmt 和 diff check。
+
+结果（2026-10-20）：统一 `record_activity_event` 现在先将活动写入用户索引，再追加原文件审计记录；索引写入失败只发出不含用户/请求内容的事件类型告警，不阻断文件日志或 dashboard 通知。现有 Web/Emby 成功认证、Emby/Web/legacy 播放状态调用点因此共用此索引路径。
+
+验证：TDD RED 的成功登录 API 已写入用户但索引数为 0；接线后 `successful_login_is_written_to_the_user_activity_index` 1/1。`web_playback_uses_signed_direct_urls_and_monotonic_events` 1/1 验证 `PLAYBACK_STARTED` 索引及原文件审计；`admin_can_manage_users_and_last_manager_is_protected` 1/1、`activity_events_publish_dashboard_invalidations` 1/1。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。登录失败仍未入索引，筛选/分页 API 与页面留待后续任务。
+
+依赖：LUX-720。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

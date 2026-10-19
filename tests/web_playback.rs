@@ -453,6 +453,15 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .find(|event| event.event_type == "PLAYBACK_STARTED")
         .ok_or("missing file-backed playback audit event")?;
     assert_eq!(playback_event.target_id.as_deref(), Some(item_id.as_str()));
+    let indexed_playback_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_activity_events
+         WHERE user_id = ? AND event_type = 'PLAYBACK_STARTED' AND target_id = ?",
+    )
+    .bind(&admin_id)
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_playback_count, 1);
     let duplicate = event("event-1", 1, "PLAYING", 100).send().await?;
     assert_eq!(duplicate.json::<Value>().await?["duplicate"], true);
     let stale = event("event-2", 0, "PAUSED", 0).send().await?;

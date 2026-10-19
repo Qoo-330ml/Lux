@@ -129,6 +129,20 @@ pub(crate) async fn record_activity_event(
         Err(_) => return,
     };
     if database
+        .insert_user_activity_event(crate::storage::NewUserActivityEvent {
+            user_id,
+            actor_user_id: Some(user_id),
+            event_type,
+            target_type: target_id.map(|_| "media_item"),
+            target_id,
+            metadata_json: &metadata_json,
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!(event_type, "failed to write user activity index event");
+    }
+    if database
         .insert_audit_event(crate::storage::NewAuditEvent {
             actor_user_id: Some(user_id),
             event_type,
