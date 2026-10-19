@@ -56,6 +56,17 @@ impl WebAuthService {
         }))
     }
 
+    pub(crate) async fn find_user_id_by_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<String>, WebAuthError> {
+        Ok(self
+            .users
+            .find_by_username(username)
+            .await?
+            .map(|user| user.id.to_string()))
+    }
+
     pub async fn change_password(
         &self,
         user_id: &UserId,

@@ -789,6 +789,7 @@ pub(super) async fn auth_login(
             .into_response();
         }
     };
+    let mut migration_auth_failed = false;
     if session.is_none()
         && let Some(migration) = state.emby_migration.clone()
     {
@@ -809,11 +810,23 @@ pub(super) async fn auth_login(
                 }
             },
             Ok(false) => {}
-            Err(_) => {}
+            Err(_) => migration_auth_failed = true,
         }
     }
     let Some(session) = session else {
         state.login_rate_limiter.record_failure(&login_key).await;
+        if !migration_auth_failed
+            && let Ok(Some(user_id)) = auth.find_user_id_by_username(&request.username).await
+        {
+            record_failed_authentication_event(
+                state.database.as_ref(),
+                &state.admin_events,
+                &user_id,
+                "LUX_WEB",
+                request_client_ip(&headers, &state.remote_access),
+            )
+            .await;
+        }
         return api_error(
             &headers,
             StatusCode::UNAUTHORIZED,

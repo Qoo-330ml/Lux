@@ -83,6 +83,165 @@ async fn successful_login_is_written_to_the_user_activity_index()
 }
 
 #[tokio::test]
+async fn failed_web_logins_are_indexed_only_for_known_users_and_not_rate_limited_attempts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let known_user = setup
+        .complete("failure-known", "Failure Known", "correct password")
+        .await?;
+    let disabled_user = UserStore::new(database.clone())?
+        .create_user(
+            "failure-disabled",
+            "Failure Disabled",
+            "disabled password",
+            false,
+        )
+        .await?;
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(disabled_user.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let admin_login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "failure-known",
+            "password": "correct password",
+        }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(admin_login.headers());
+
+    for attempt in 0..6 {
+        let response = client
+            .post(format!("http://{address}/api/v1/auth/login"))
+            .json(&json!({
+                "username": "failure-known",
+                "password": format!("wrong password {attempt}"),
+            }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let disabled_response = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "failure-disabled",
+            "password": "disabled password",
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        disabled_response.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let unknown_response = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "failure-unknown",
+            "password": "unknown password",
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown_response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let invalid_username_response = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({ "username": "", "password": "invalid username password" }))
+        .send()
+        .await?;
+    assert_ne!(invalid_username_response.status(), reqwest::StatusCode::OK);
+
+    let events: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT event_type, user_id, actor_user_id, target_type, target_id, metadata_json
+         FROM user_activity_events WHERE event_type = 'AUTH_LOGIN_FAILED'",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        events.len(),
+        6,
+        "the sixth known-user attempt is rate limited"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.1 == known_user.id.to_string())
+            .count(),
+        5
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.1 == disabled_user.id.to_string())
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|event| {
+        event.0 == "AUTH_LOGIN_FAILED"
+            && event.2.is_none()
+            && event.3.as_deref() == Some("user")
+            && event.4.as_deref() == Some(event.1.as_str())
+            && event.5.contains("LUX_WEB")
+            && !event.5.contains("wrong password")
+            && !event.5.contains("correct password")
+            && !event.5.contains("disabled password")
+            && !event.5.contains("failure-known")
+            && !event.5.contains("failure-disabled")
+    }));
+    let audit = client
+        .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
+        .header(COOKIE, admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit_body = audit.json::<Value>().await?;
+    let audit_events = audit_body["events"]
+        .as_array()
+        .ok_or("missing audit events")?;
+    let failed_audit_events: Vec<_> = audit_events
+        .iter()
+        .filter(|event| event["eventType"] == "AUTH_LOGIN_FAILED")
+        .collect();
+    assert_eq!(failed_audit_events.len(), 6);
+    let audit_json = serde_json::to_string(&failed_audit_events)?;
+    assert!(!audit_json.contains("wrong password"));
+    assert!(!audit_json.contains("unknown password"));
+    assert!(!audit_json.contains("disabled password"));
+    assert!(!audit_json.contains("failure-known"));
+    assert!(!audit_json.contains("failure-disabled"));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_filter_and_page_user_activity_events() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

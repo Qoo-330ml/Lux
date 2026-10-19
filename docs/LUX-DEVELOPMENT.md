@@ -15244,14 +15244,18 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] 已知账号密码错误或账号被禁用时记录一条 `AUTH_LOGIN_FAILED`，活动用户为目标账号且 actor 为空。
-- [ ] 未知/非法用户名、数据库错误和限流直接拒绝不写入用户活动索引；失败元数据不含用户名、密码、凭证或完整 URL。
-- [ ] 认证 HTTP 状态、频率限制与成功登录事件保持不变；审计记录仍产生。
-- [ ] `users` 定向集成回归、Rust build、fmt 和 diff check 通过。
+- [x] 已知账号密码错误或账号被禁用时记录 `AUTH_LOGIN_FAILED`，活动用户为目标账号且 actor 为空。
+- [x] 未知/非法用户名、数据库错误和限流直接拒绝不写入用户活动索引；失败元数据不含用户名、密码、凭证或完整 URL。
+- [x] 认证 HTTP 状态、频率限制与成功登录事件保持不变；失败审计记录仍产生。
+- [x] `users` 定向集成回归、Rust build、fmt 和 diff check 通过。
 
 短计划：先添加已知/未知账号失败尝试集成回归并确认个人活动缺失；再在 Web 认证服务提供安全用户名到用户 ID 查询，并仅在正确失败分支接入 LUX-726；最后运行定向 `users` 测试、build、fmt 和 diff check。
 
 依赖：LUX-726、LUX-720。
+
+结果（2026-10-20）：`WebAuthService` 增加沿用认证用户名规范化规则的账号 ID 查询；Web 登录在认证与可选迁移回退均结束为失败、且该请求未被限流时，仅为已有账号调用 LUX-726 安全记录器。禁用账号也会记录；未知/非法账号、认证数据库错误、迁移认证错误及入口限流不写个人失败活动。登录状态码、速率限制、成功登录记录维持现状。
+
+验证：TDD RED 的集成回归先以 0 条活动失败（预期 6 条）；实现后 `cargo test --locked --test users` 16/16、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --test users --all-features -- -D warnings` 被现有 6 项未修改代码告警阻断，位置为 `src/api/admin/admin_users.rs`、`src/api/media.rs`、`src/application/playback/session.rs`、`src/application/user_permission_copy.rs` 和 `src/storage/users.rs`；本任务未改动这些文件。
 
 ## 29. 参考资料
 
