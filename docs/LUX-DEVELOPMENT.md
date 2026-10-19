@@ -15584,6 +15584,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 集成回归先因设备行缺失而 `RowNotFound`；实现后 `cargo test --locked --test emby_auth -- --test-threads=1` 为 10/10，覆盖用户名登录、指定用户登录、同 ID 更新、展示 IP、缺失/空白/过长 ID 和注入设备存储失败时仍返回 200。测试使用项目真实 `ConnectInfo` 服务模式；本机 localhost 请求显式设 `NO_PROXY=127.0.0.1,localhost`。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许此前记录 9 类既有 Clippy 诊断类别的全目标 Clippy 通过。未修改 Emby token 合同、后续请求活动、设备查询 API/UI 或 ACL；完整严格 Clippy 仍有前序记录的 9 条未改代码诊断。
 
+#### LUX-744：增加有界用户设备清单查询
+
+范围：增加 storage 层按指定用户查询设备清单的稳定分页合同，返回设备标识、名称、类型、客户端、版本、首次/最近活动时间与最近展示 IP，并返回筛选总数。结果按最近活动倒序、设备 ID 正序稳定排序；页大小限制为 1–100，负偏移归零。仅增加查询模型、storage 方法和测试，不增加 HTTP API、Web 页面、活动接线或黑名单。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 查询仅返回目标用户设备，所有设备摘要字段与匹配总数正确。
+- [x] 最近活动倒序并以设备 ID 稳定排序；页码偏移、空页与相邻页正确。
+- [x] 页大小服务端限制为 1–100、负偏移归零，查询无全表扫描用户集合以外的数据。
+- [x] storage 定向回归、Rust build、fmt 与 diff check 通过；无 migration 或 API 变化。
+
+短计划：先添加 `repository_tests` 分页/隔离回归并确认查询合同不存在；再增加设备摘要 DTO 与有界 count/page 查询；最后运行最窄 storage 测试、build、fmt 与 diff check。
+
+#### LUX-744 验证记录
+
+结果（2026-10-20）：storage 提供指定用户设备清单的 count + page 查询，字段包括设备 ID/名称/类型、客户端/版本、首次/最近活动和展示 IP。排序为最近活动倒序、设备 ID 正序；页大小夹在 1–100，负偏移归零。无 migration，查询未暴露到 API。
+
+验证：TDD RED 因 `UserDevicePageQuery` 与分页方法缺失而编译失败；实现后 `cargo test --locked --lib user_device_` 2/2，覆盖目标用户隔离、所有摘要字段、同时间稳定排序、总数、连续/空页、负偏移和 100 条上限。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许已知 9 类既有诊断类别的全目标 Clippy 通过。严格全量 Clippy 仍受前序记录的 9 条未修改代码诊断阻断；无 schema 或 API 改动。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

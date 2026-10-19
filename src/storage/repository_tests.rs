@@ -5,8 +5,8 @@ use crate::storage::{
     MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserActivityEvent,
     NewUserContentRestrictions, NewUserDeviceObservation, PlaybackAdmissionDecision,
     PlaybackAdmissionDenialReason, StoredUserActivityEvent, UserActivityEventQuery,
-    UserContentRestrictionsCasResult, UserPermissionCopyGroups, UserPermissionCopyResult,
-    UserPlaybackPolicy,
+    UserContentRestrictionsCasResult, UserDevicePageQuery, UserPermissionCopyGroups,
+    UserPermissionCopyResult, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -23533,6 +23533,152 @@ async fn user_device_observations_merge_monotonically_and_are_user_scoped()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(user_scoped_devices, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_listing_is_scoped_stable_and_bounded() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, normalized) in [
+        ("device-list-owner", "device-list-owner"),
+        ("device-list-other", "device-list-other"),
+    ] {
+        database
+            .query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES (?, ?, ?, 'test-hash')",
+            )
+            .bind(user_id)
+            .bind(normalized)
+            .bind(user_id)
+            .execute(database.pool())
+            .await?;
+    }
+    for (user_id, device_id, device_name, client_name, seen_at) in [
+        (
+            "device-list-owner",
+            "device-b",
+            Some("Phone B"),
+            "Infuse",
+            300_i64,
+        ),
+        (
+            "device-list-owner",
+            "device-a",
+            Some("Phone A"),
+            "Lux Web",
+            300_i64,
+        ),
+        ("device-list-owner", "device-c", None, "Kodi", 200_i64),
+        (
+            "device-list-other",
+            "other-device",
+            Some("Other User Device"),
+            "Other Client",
+            999_i64,
+        ),
+    ] {
+        database
+            .upsert_user_device(NewUserDeviceObservation {
+                user_id,
+                device_id,
+                device_name,
+                device_type: Some("TEST"),
+                client_name,
+                client_version: Some("1.2.3"),
+                last_remote_ip: Some("203.0.113.10"),
+                seen_at,
+            })
+            .await?;
+    }
+
+    let (first_page, total_count) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 0,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(total_count, 3);
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["device-a", "device-b"]
+    );
+    assert_eq!(first_page[0].device_name.as_deref(), Some("Phone A"));
+    assert_eq!(first_page[0].device_type.as_deref(), Some("TEST"));
+    assert_eq!(first_page[0].client_name, "Lux Web");
+    assert_eq!(first_page[0].client_version.as_deref(), Some("1.2.3"));
+    assert_eq!(first_page[0].first_seen_at, 300);
+    assert_eq!(first_page[0].last_seen_at, 300);
+    assert_eq!(
+        first_page[0].last_remote_ip.as_deref(),
+        Some("203.0.113.10")
+    );
+
+    let (second_page, second_total) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 2,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(second_total, 3);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].device_id, "device-c");
+
+    let (empty_page, empty_total) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 100,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(empty_total, 3);
+    assert!(empty_page.is_empty());
+
+    let (negative_offset_page, _) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: -1,
+            limit: 0,
+        })
+        .await?;
+    assert_eq!(negative_offset_page.len(), 1);
+    assert_eq!(negative_offset_page[0].device_id, "device-a");
+
+    for index in 0..101_i64 {
+        let device_id = format!("overflow-{index:03}");
+        database
+            .upsert_user_device(NewUserDeviceObservation {
+                user_id: "device-list-owner",
+                device_id: &device_id,
+                device_name: None,
+                device_type: Some("TEST"),
+                client_name: "Client",
+                client_version: None,
+                last_remote_ip: None,
+                seen_at: 1000 + index,
+            })
+            .await?;
+    }
+    let (bounded_page, bounded_total) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 0,
+            limit: 101,
+        })
+        .await?;
+    assert_eq!(bounded_total, 104);
+    assert_eq!(bounded_page.len(), 100);
     Ok(())
 }
 

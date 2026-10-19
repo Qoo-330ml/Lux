@@ -1749,6 +1749,58 @@ impl Database {
         Ok(())
     }
 
+    // LUX-745 consumes this bounded inventory page in the administrator user API.
+    #[allow(dead_code)]
+    pub(crate) async fn list_user_devices_page(
+        &self,
+        query: UserDevicePageQuery<'_>,
+    ) -> Result<(Vec<StoredUserDevice>, i64), StorageError> {
+        let total_count = self
+            .query("SELECT COUNT(*) AS total_count FROM user_devices WHERE user_id = ?")
+            .bind(query.user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| row.get::<i64, _>("total_count"))
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let rows = self
+            .query(
+                "SELECT device_id, device_name, device_type, client_name, client_version,
+                        first_seen_at, last_seen_at, last_remote_ip
+                 FROM user_devices
+                 WHERE user_id = ?
+                 ORDER BY last_seen_at DESC, device_id ASC
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(query.user_id)
+            .bind(query.limit.clamp(1, 100))
+            .bind(query.offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let devices = rows
+            .into_iter()
+            .map(|row| StoredUserDevice {
+                device_id: row.get("device_id"),
+                device_name: row.get("device_name"),
+                device_type: row.get("device_type"),
+                client_name: row.get("client_name"),
+                client_version: row.get("client_version"),
+                first_seen_at: row.get("first_seen_at"),
+                last_seen_at: row.get("last_seen_at"),
+                last_remote_ip: row.get("last_remote_ip"),
+            })
+            .collect();
+
+        Ok((devices, total_count))
+    }
+
     // LUX-723 wires this storage contract into the administrator activity API.
     #[allow(dead_code)]
     pub(crate) async fn list_user_activity_events(

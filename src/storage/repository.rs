@@ -1308,7 +1308,7 @@ pub(crate) struct NewUserActivityEvent<'a> {
     pub(crate) metadata_json: &'a str,
 }
 
-// LUX-741 connects this device observation contract to successful authentication and activity.
+// LUX-742 and LUX-743 connect this device observation contract to successful authentication.
 #[allow(dead_code)]
 pub(crate) struct NewUserDeviceObservation<'a> {
     pub(crate) user_id: &'a str,
@@ -1319,6 +1319,27 @@ pub(crate) struct NewUserDeviceObservation<'a> {
     pub(crate) client_version: Option<&'a str>,
     pub(crate) last_remote_ip: Option<&'a str>,
     pub(crate) seen_at: i64,
+}
+
+// LUX-745 connects this bounded device page to the administrator user API.
+#[allow(dead_code)]
+pub(crate) struct UserDevicePageQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct StoredUserDevice {
+    pub(crate) device_id: String,
+    pub(crate) device_name: Option<String>,
+    pub(crate) device_type: Option<String>,
+    pub(crate) client_name: String,
+    pub(crate) client_version: Option<String>,
+    pub(crate) first_seen_at: i64,
+    pub(crate) last_seen_at: i64,
+    pub(crate) last_remote_ip: Option<String>,
 }
 
 // LUX-723 consumes this bounded query contract in the administrator activity API.
