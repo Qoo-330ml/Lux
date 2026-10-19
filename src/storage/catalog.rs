@@ -1605,6 +1605,7 @@ impl Database {
         &self,
         parent_id: &str,
         item_types: &str,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<i64, StorageError> {
         let item_types = item_types
             .split(',')
@@ -1617,17 +1618,31 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", item_types.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
-               {CATALOG_VISIBLE_PREDICATE}"
+               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}"
         );
         let mut statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(query))
             .bind(parent_id);
         for item_type in item_types {
             statement = statement.bind(item_type);
+        }
+        for bind in content_restriction_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(value),
+                CatalogBind::Integer(value) => statement.bind(value),
+                CatalogBind::Real(value) => statement.bind(value),
+            };
         }
         statement
             .fetch_one(&self.pool)
@@ -1759,6 +1774,7 @@ impl Database {
         parent_id: &str,
         item_types: &str,
         sort: Option<(CatalogSort, bool)>,
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
@@ -1776,6 +1792,13 @@ impl Database {
         let item_order = sort
             .map(|(sort_by, descending)| catalog_item_order(sort_by, descending))
             .unwrap_or("mi.season_number, mi.episode_number, mi.sort_title, mi.id");
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -1811,13 +1834,14 @@ impl Database {
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
-               {CATALOG_VISIBLE_PREDICATE}
+               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
              ORDER BY {item_order}, ms.id, mt.stream_index
              LIMIT ? OFFSET ?"
         );
-        let mut binds = Vec::with_capacity(item_types.len() + 3);
+        let mut binds = Vec::with_capacity(item_types.len() + content_restriction_binds.len() + 3);
         binds.push(CatalogBind::Text(parent_id));
         binds.extend(item_types.into_iter().map(CatalogBind::Text));
+        binds.extend(content_restriction_binds);
         binds.push(CatalogBind::Integer(limit));
         binds.push(CatalogBind::Integer(offset));
         self.fetch_catalog_rows(&query, &binds).await
@@ -1827,9 +1851,17 @@ impl Database {
         &self,
         series_id: &str,
         season_id: Option<&str>,
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let season_filter = if season_id.is_some() {
             " AND mi.parent_id = ?"
         } else {
@@ -1841,13 +1873,20 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.series_id = ? AND mi.item_type = 'EPISODE'
                AND mi.removed_at IS NULL{season_filter}
-               {CATALOG_VISIBLE_PREDICATE}"
+               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}"
         );
         let mut count_statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql))
             .bind(series_id);
         if let Some(season_id) = season_id {
             count_statement = count_statement.bind(season_id);
+        }
+        for bind in &content_restriction_binds {
+            count_statement = match bind {
+                CatalogBind::Text(value) => count_statement.bind(*value),
+                CatalogBind::Integer(value) => count_statement.bind(*value),
+                CatalogBind::Real(value) => count_statement.bind(*value),
+            };
         }
         let total = count_statement
             .fetch_one(&self.pool)
@@ -1862,13 +1901,20 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.series_id = ? AND mi.item_type = 'EPISODE'
                AND mi.removed_at IS NULL{season_filter}
-               {CATALOG_VISIBLE_PREDICATE}
+               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
              ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id
              LIMIT ? OFFSET ?"
         );
         let mut list_statement = self.query(sqlx::AssertSqlSafe(list_sql)).bind(series_id);
         if let Some(season_id) = season_id {
             list_statement = list_statement.bind(season_id);
+        }
+        for bind in &content_restriction_binds {
+            list_statement = match bind {
+                CatalogBind::Text(value) => list_statement.bind(*value),
+                CatalogBind::Integer(value) => list_statement.bind(*value),
+                CatalogBind::Real(value) => list_statement.bind(*value),
+            };
         }
         let rows = list_statement
             .bind(limit)

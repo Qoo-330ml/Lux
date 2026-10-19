@@ -1059,9 +1059,10 @@ impl CatalogService {
         if !self.access.can_view_item(principal, parent_id).await? {
             return Err(CatalogError::AccessDenied);
         }
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let total = self
             .database
-            .count_catalog_children(parent_id, item_types)
+            .count_catalog_children(parent_id, item_types, content_restrictions.as_ref())
             .await?;
         let storage_sort = sort.map(|(sort_by, descending)| {
             let sort_by = match sort_by {
@@ -1076,7 +1077,14 @@ impl CatalogService {
         });
         let rows = self
             .database
-            .list_catalog_children(parent_id, item_types, storage_sort, offset, limit)
+            .list_catalog_children(
+                parent_id,
+                item_types,
+                storage_sort,
+                content_restrictions.as_ref(),
+                offset,
+                limit,
+            )
             .await?;
         let mut items = assemble_items(rows);
         if matches!(item_types, "SEASON" | "EPISODE") {
@@ -1104,6 +1112,7 @@ impl CatalogService {
         if !self.access.can_view_item(principal, series_id).await? {
             return Err(CatalogError::AccessDenied);
         }
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         // A few Emby clients (including Yamby) use the selected season ID in
         // the `/Shows/{id}/Episodes` path, even though the protocol names
         // that path parameter `seriesId`. Resolve that compatibility shape to
@@ -1142,6 +1151,7 @@ impl CatalogService {
             .list_series_episode_ids(
                 &resolved_series_id,
                 resolved_season_id.as_deref(),
+                content_restrictions.as_ref(),
                 offset,
                 limit,
             )
@@ -3722,6 +3732,232 @@ mod tests {
             .await?;
         assert_eq!(admin_page.total, 4);
         assert_eq!(admin_page.items.len(), 4);
+
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hierarchy_child_lists_apply_content_restrictions_before_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Hierarchy Restrictions", LibraryKind::Series, false)
+            .await?;
+        let restricted_user = UserStore::new(database.clone())?
+            .create_user(
+                "hierarchy-restriction-viewer",
+                "Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let unrestricted_user = UserStore::new(database.clone())?
+            .create_user(
+                "hierarchy-open-viewer",
+                "Open Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        for user_id in [restricted_user.id, unrestricted_user.id] {
+            database
+                .set_user_library_access(&user_id.to_string(), &library.id.to_string(), true)
+                .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES ('hierarchy-series', ?, 'SERIES', 'Series', 'series',
+                       'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        for (season_id, season_number, title) in [
+            ("hierarchy-visible-season", 1_i64, "Visible season"),
+            ("hierarchy-restricted-season", 2_i64, "Restricted season"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, season_number,
+                     title, sort_title, identification_status, has_available_source
+                 ) VALUES (?, ?, 'SEASON', 'hierarchy-series', 'hierarchy-series', ?, ?, ?,
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(season_id)
+            .bind(library.id.to_string())
+            .bind(season_number)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await?;
+        }
+        for (episode_id, season_id, season_number, episode_number) in [
+            (
+                "hierarchy-restricted-episode",
+                "hierarchy-visible-season",
+                1_i64,
+                1_i64,
+            ),
+            (
+                "hierarchy-unindexed-episode",
+                "hierarchy-visible-season",
+                1,
+                2,
+            ),
+            (
+                "hierarchy-visible-episode",
+                "hierarchy-visible-season",
+                1,
+                3,
+            ),
+            (
+                "hierarchy-parent-restricted-episode",
+                "hierarchy-restricted-season",
+                2,
+                1,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, season_number,
+                     episode_number, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES (?, ?, 'EPISODE', ?, 'hierarchy-series', ?, ?, ?, ?,
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(episode_id)
+            .bind(library.id.to_string())
+            .bind(season_id)
+            .bind(season_number)
+            .bind(episode_number)
+            .bind(episode_id)
+            .bind(episode_id)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('hierarchy-series', 'PG'),
+                    ('hierarchy-visible-season', 'PG'),
+                    ('hierarchy-restricted-season', 'R'),
+                    ('hierarchy-restricted-episode', 'R'),
+                    ('hierarchy-visible-episode', 'PG'),
+                    ('hierarchy-parent-restricted-episode', 'PG')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('hierarchy-series', 'family'),
+                    ('hierarchy-visible-season', 'family'),
+                    ('hierarchy-restricted-season', 'family'),
+                    ('hierarchy-restricted-episode', 'family'),
+                    ('hierarchy-restricted-episode', 'violent'),
+                    ('hierarchy-visible-episode', 'family'),
+                    ('hierarchy-parent-restricted-episode', 'family')",
+        )
+        .execute(database.pool())
+        .await?;
+        database
+            .compare_and_swap_user_content_restrictions(
+                &restricted_user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &["family".to_owned()],
+                    blocked_tags: &["violent".to_owned()],
+                },
+            )
+            .await?;
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let restricted_principal = AccessPrincipal::new(restricted_user.id, false);
+        let seasons = catalog
+            .list_children(restricted_principal, "hierarchy-series", "SEASON", 0, 10)
+            .await?;
+        assert_eq!(seasons.total, 1);
+        assert_eq!(seasons.items[0].id, "hierarchy-visible-season");
+        let children = catalog
+            .list_children(
+                restricted_principal,
+                "hierarchy-visible-season",
+                "EPISODE",
+                0,
+                1,
+            )
+            .await?;
+        assert_eq!(children.total, 1);
+        assert_eq!(children.items[0].id, "hierarchy-visible-episode");
+        let series_episodes = catalog
+            .list_series_episodes(
+                restricted_principal,
+                "hierarchy-series",
+                Some("hierarchy-visible-season"),
+                0,
+                1,
+            )
+            .await?;
+        assert_eq!(series_episodes.total, 1);
+        assert_eq!(series_episodes.items[0].id, "hierarchy-visible-episode");
+        let parent_restricted = catalog
+            .list_series_episodes(
+                restricted_principal,
+                "hierarchy-series",
+                Some("hierarchy-restricted-season"),
+                0,
+                1,
+            )
+            .await?;
+        assert_eq!(parent_restricted.total, 0);
+        assert!(parent_restricted.items.is_empty());
+
+        let unrestricted_principal = AccessPrincipal::new(unrestricted_user.id, false);
+        let unrestricted_seasons = catalog
+            .list_children(unrestricted_principal, "hierarchy-series", "SEASON", 0, 10)
+            .await?;
+        assert_eq!(unrestricted_seasons.total, 2);
+        let unrestricted_episodes = catalog
+            .list_series_episodes(
+                unrestricted_principal,
+                "hierarchy-series",
+                Some("hierarchy-visible-season"),
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(unrestricted_episodes.total, 3);
+        let admin_episodes = catalog
+            .list_series_episodes(
+                AccessPrincipal::new(restricted_user.id, true),
+                "hierarchy-series",
+                Some("hierarchy-visible-season"),
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(admin_episodes.total, 3);
 
         database.close().await;
         Ok(())

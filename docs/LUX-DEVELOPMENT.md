@@ -14715,6 +14715,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-701。
 
+#### LUX-703：在剧集与通用层级子项分页前应用用户内容限制
+
+范围：为 CatalogService 的通用层级子项列表和剧集/季度集数列表，在 SQL 总数与 LIMIT/OFFSET 前执行当前用户内容策略。包含季条目自身、分集自身、季度与系列父级继承以及缺索引 fail closed；保留父级直接访问检查、媒体库 ACL 和现有排序。Lux 与 Emby 继续共享同一服务合同，不改 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] 通用子项、`/Shows/{id}/Episodes` 和季度兼容路径都在计数与分页前过滤内容策略。
+- [x] 分集自身、季度/系列父级和未就绪索引规则一致；受限条目不占页位。
+- [x] 管理员、无策略和无收紧策略保留结果与排序；父级 ACL/访问检查不变。
+- [x] CatalogService 回归覆盖系列/季度继承、条目分级、缺索引和过滤后总数；定向测试、catalog、build、fmt 和 diff check 通过。
+
+短计划：先增加 CatalogService 回归，放入允许分集、受限分集、缺索引分集以及受限季度下的允许分集，确认通用子项和剧集列表泄漏或污染分页；再将同一内容策略谓词加入两组 SQL 的 count/list 查询，并从应用层传入当前 principal 策略；最后跑定向策略和 catalog 测试、build、fmt 与 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib hierarchy_child_lists_apply_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+结果（2026-10-19）：通用层级子项与剧集/季度集数查询统一在计数和分页 SQL 中执行当前用户内容谓词。分集包含自身索引、季度及系列索引的继承判断；缺索引条目 fail closed。应用层保持父级 ACL 及直接访问检查，严格策略用户只有在选定系列/季度下有可见候选时获得相应结果。
+
+验证：`hierarchy_child_lists_apply_content_restrictions_before_pagination` 1/1，覆盖受限季度、受限分集、缺索引分集及过滤后的总数/首位分页，并确认管理员和无策略结果；`content_restriction` 24 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
+
+依赖：LUX-702。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
