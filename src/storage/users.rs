@@ -18,6 +18,10 @@ const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
+#[allow(dead_code)] // LUX-732 exposes this default through the admin service.
+const DEFAULT_USER_ACTIVITY_RETENTION_DAYS: i64 = 90;
+#[allow(dead_code)] // LUX-732 exposes this range through the admin service.
+const MAX_USER_ACTIVITY_RETENTION_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
 const MAX_PERMISSION_COPY_USER_IDS: usize = 101;
@@ -28,6 +32,14 @@ fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|days| (1..=MAX_USER_DELETION_GRACE_DAYS).contains(days))
         .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS)
+}
+
+#[allow(dead_code)] // LUX-732 wires the stored value into the admin service.
+fn normalize_user_activity_retention_days(value: Option<String>) -> i64 {
+    value
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| (1..=MAX_USER_ACTIVITY_RETENTION_DAYS).contains(days))
+        .unwrap_or(DEFAULT_USER_ACTIVITY_RETENTION_DAYS)
 }
 
 fn normalize_user_content_restriction_tags(tags: &[String]) -> Result<Vec<String>, StorageError> {
@@ -2704,6 +2716,48 @@ impl Database {
         self.query(
             "INSERT INTO server_settings (key, value)
              VALUES ('user_deletion_grace_days', ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(days.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // LUX-732 exposes the stored value through the admin service.
+    pub(crate) async fn user_activity_retention_days(&self) -> Result<i64, StorageError> {
+        let value: Option<String> = self
+            .query_scalar(
+                "SELECT value FROM server_settings
+                 WHERE key = 'user_activity_retention_days'",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(normalize_user_activity_retention_days(value))
+    }
+
+    #[allow(dead_code)] // LUX-732 exposes the stored value through the admin service.
+    pub(crate) async fn set_user_activity_retention_days(
+        &self,
+        days: i64,
+    ) -> Result<(), StorageError> {
+        if !(1..=MAX_USER_ACTIVITY_RETENTION_DAYS).contains(&days) {
+            return Err(StorageError::Serialization(
+                "user activity retention period is outside the allowed range".to_owned(),
+            ));
+        }
+        self.query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('user_activity_retention_days', ?)
              ON CONFLICT(key) DO UPDATE SET
                  value = excluded.value, updated_at = unixepoch()",
         )

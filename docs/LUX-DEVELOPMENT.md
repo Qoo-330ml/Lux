@@ -15318,6 +15318,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 库回归因清理方法不存在而失败；实现后 `cargo test --locked --lib user_activity_index_retention_deletes_old_events_in_bounded_batches` 1/1、`cargo build --locked`（无新增 warning）、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
 
+#### LUX-731：持久化用户活动保留天数
+
+范围：在现有 `server_settings` 设置键中保存用户活动索引保留天数，默认 90 天；有效范围为 1–3650 天。损坏或旧配置读取为默认值，非法写入拒绝且不覆盖原值。本任务只提供 storage 读写，不增加管理 API、页面或清理 worker。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空配置默认读取 90 天；有效值持久化并可重读，损坏/越界旧值安全回退至 90 天。
+- [x] 新设置写入拒绝 0、负数和大于 3650 的值，拒绝时保留原设置；不新增 migration。
+- [x] 定向 storage 库回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加默认、有效与非法值存储回归并确认接口缺失；再用 `server_settings` 新键实现有界读取与校验写入；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-730。
+
+结果（2026-10-20）：storage 通过 `server_settings` 的 `user_activity_retention_days` 键持久化天数，默认 90、范围 1–3650；非法旧配置回退默认值，非法新值在写入前拒绝。没有新增 migration。管理 API 接线由 LUX-732 完成。
+
+验证：TDD RED 回归先因读写方法缺失而编译失败；实现后 `cargo test --locked --lib user_activity_retention_setting_defaults_validates_and_recovers_invalid_values` 1/1、`cargo build --locked`（无新增 warning）、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

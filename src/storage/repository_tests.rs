@@ -23496,6 +23496,46 @@ async fn user_activity_index_retention_deletes_old_events_in_bounded_batches()
 }
 
 #[tokio::test]
+async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    assert_eq!(database.user_activity_retention_days().await?, 90);
+    database.set_user_activity_retention_days(180).await?;
+    assert_eq!(database.user_activity_retention_days().await?, 180);
+    assert!(database.set_user_activity_retention_days(0).await.is_err());
+    assert!(database.set_user_activity_retention_days(-1).await.is_err());
+    assert!(
+        database
+            .set_user_activity_retention_days(3_651)
+            .await
+            .is_err()
+    );
+    assert_eq!(database.user_activity_retention_days().await?, 180);
+
+    sqlx::query(
+        "UPDATE server_settings SET value = 'not-a-number'
+         WHERE key = 'user_activity_retention_days'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.user_activity_retention_days().await?, 90);
+    sqlx::query(
+        "UPDATE server_settings SET value = '0'
+         WHERE key = 'user_activity_retention_days'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.user_activity_retention_days().await?, 90);
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_emby_login_session_page_is_bounded_and_excludes_revoked_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
