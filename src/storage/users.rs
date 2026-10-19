@@ -2067,6 +2067,73 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn new_user_permissions_json(&self) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'new_user_permissions'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_new_user_permissions_json(
+        &self,
+        value: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('new_user_permissions', ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn are_enabled_regular_libraries(
+        &self,
+        library_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        if library_ids.len() > 100
+            || library_ids
+                .iter()
+                .enumerate()
+                .any(|(index, id)| library_ids[..index].contains(id))
+        {
+            return Ok(false);
+        }
+        for library_id in library_ids {
+            let enabled: i64 = self
+                .query_scalar(
+                    "SELECT CASE WHEN EXISTS (
+                         SELECT 1 FROM libraries
+                         WHERE id = ? AND is_enabled = 1 AND system_kind IS NULL
+                     ) THEN 1 ELSE 0 END",
+                )
+                .bind(library_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if enabled == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) async fn user_uses_admin_library_order(
         &self,
         user_id: &str,

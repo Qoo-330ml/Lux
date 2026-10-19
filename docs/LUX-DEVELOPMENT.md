@@ -13273,6 +13273,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：详情页权限区改为显式三态和保存，指定范围只列已启用媒体库，空选择保存为 `NONE`；列表移除原先逐库权限编辑控件，回收站权限只读。定向 `admin-users-access`、用户资料生命周期和播放策略 Vitest 共 15/15 通过，`pnpm --dir web build` 与 `git diff --check` 通过。
 
+#### LUX-633：存储新用户默认权限设置
+
+范围：在管理员全局设置中增加新用户权限快照配置与持久化，包含显式媒体库模式/媒体库 ID、下载权限和模块六的五项播放策略。默认媒体库为指定空集合（即无权限），新用户默认允许播放、同时播放 2 路、允许当前服务器支持范围内的封装/音频/视频转换，并默认禁止下载。只增加设置读写，不改变用户创建、邀请或预设行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] 管理员 GET 可读默认快照；首次读取返回明确、安全的设计默认值。
+- [x] CSRF 保护的 PATCH 可保存完整默认快照；空 `SELECTED` 规范化为 `NONE`，`ALL/NONE` 不接受媒体库 ID。
+- [x] 仅接受已启用普通媒体库、唯一 ID、非负播放上限；无效请求返回 400 且不改变已保存值。
+- [x] 定向 `admin_dashboard` Rust 集成测试、格式检查和差异检查通过。
+
+短计划：先扩展管理员设置集成回归，验证默认值、保存、空选择规范化和非法快照拒绝；再在 storage 用 `server_settings` 键持久化 JSON，在 application 层验证和归一化，最后扩展设置 DTO 与错误映射。不改用户创建路径。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test admin_dashboard`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-614–625、LUX-627–632。
+
+结果（2026-10-19）：管理员设置新增默认权限快照，首次返回 `NONE` 媒体库范围、禁止下载、允许播放且并发上限 2；`server_settings` 以单个 JSON 项持久化，无需迁移。空指定项归一为 `NONE`，重复/停用库、非空 `ALL/NONE` 和负并发上限均拒绝，失败不覆盖已保存值。`admin_dashboard` 1/1、fmt 与 diff check 通过。公开 API 文档同步由 LUX-634 完成。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

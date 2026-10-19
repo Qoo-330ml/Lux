@@ -46,6 +46,13 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let library = libraries
         .create_library("Shows", LibraryKind::Series, false)
         .await?;
+    let disabled_library = libraries
+        .create_library("Disabled", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(disabled_library.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Shows");
     let season_dir = root.join("九门/Season 01");
     tokio::fs::create_dir_all(&season_dir).await?;
@@ -177,6 +184,154 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(initial_settings["userDeletionGraceDays"], 7);
+    assert_eq!(
+        initial_settings["newUserPermissions"]["libraryAccessMode"],
+        "NONE"
+    );
+    assert_eq!(
+        initial_settings["newUserPermissions"]["libraryIds"],
+        json!([])
+    );
+    assert_eq!(
+        initial_settings["newUserPermissions"]["maxSimultaneousPlaybacks"],
+        2
+    );
+
+    let selected_defaults = json!({
+        "libraryAccessMode": "SELECTED",
+        "libraryIds": [library.id.to_string()],
+        "canDownload": true,
+        "canPlay": false,
+        "maxSimultaneousPlaybacks": 4,
+        "allowRemux": false,
+        "allowAudioTranscode": false,
+        "allowVideoTranscode": true,
+    });
+    let updated_defaults = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({ "newUserPermissions": selected_defaults }))
+        .send()
+        .await?;
+    assert_eq!(updated_defaults.status(), reqwest::StatusCode::OK);
+    let updated_defaults_body: Value = updated_defaults.json().await?;
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["libraryAccessMode"],
+        "SELECTED"
+    );
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["libraryIds"],
+        json!([library.id.to_string()])
+    );
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["canDownload"],
+        true
+    );
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["maxSimultaneousPlaybacks"],
+        4
+    );
+
+    for invalid_defaults in [
+        json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": -1,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+        json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [disabled_library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+        json!({
+            "libraryAccessMode": "ALL",
+            "libraryIds": [library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+        json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [library.id.to_string(), library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+    ] {
+        let invalid_defaults_response = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "newUserPermissions": invalid_defaults }))
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_defaults_response.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+
+    let defaults_after_rejection: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        defaults_after_rejection["newUserPermissions"]["libraryAccessMode"],
+        "SELECTED"
+    );
+    assert_eq!(
+        defaults_after_rejection["newUserPermissions"]["libraryIds"],
+        json!([library.id.to_string()])
+    );
+
+    let empty_selection = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({
+            "newUserPermissions": {
+                "libraryAccessMode": "SELECTED",
+                "libraryIds": [],
+                "canDownload": false,
+                "canPlay": true,
+                "maxSimultaneousPlaybacks": 2,
+                "allowRemux": true,
+                "allowAudioTranscode": true,
+                "allowVideoTranscode": true,
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_selection.status(), reqwest::StatusCode::OK);
+    let empty_selection_body: Value = empty_selection.json().await?;
+    assert_eq!(
+        empty_selection_body["newUserPermissions"]["libraryAccessMode"],
+        "NONE"
+    );
+    assert_eq!(
+        empty_selection_body["newUserPermissions"]["libraryIds"],
+        json!([])
+    );
 
     let settings = client
         .patch(format!("{base_url}/api/v1/admin/settings"))

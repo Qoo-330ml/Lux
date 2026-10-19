@@ -40,6 +40,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "resumeMinTicks": settings.resume_min_ticks,
         "forceAdminLibraryOrder": settings.force_admin_library_order,
         "userDeletionGraceDays": settings.user_deletion_grace_days,
+        "newUserPermissions": settings.new_user_permissions,
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
@@ -143,6 +144,7 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) user_deletion_grace_days: Option<i64>,
+    pub(crate) new_user_permissions: Option<crate::application::settings::NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     #[serde(flatten)]
@@ -257,6 +259,7 @@ pub(crate) async fn admin_update_settings(
             resume_min_ticks: request.resume_min_ticks,
             force_admin_library_order: request.force_admin_library_order,
             user_deletion_grace_days: request.user_deletion_grace_days,
+            new_user_permissions: request.new_user_permissions,
             login_background_source: request.login_background_source,
             media_strategy: request.media_strategy,
             network_proxy,
@@ -307,6 +310,15 @@ pub(crate) async fn admin_update_settings(
             )
             .into_response();
         }
+        Err(crate::application::settings::AdminSettingsError::InvalidNewUserPermissions) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "新用户权限设置无效",
+            )
+            .into_response();
+        }
         Err(crate::application::settings::AdminSettingsError::InvalidNetworkProxy) => {
             return api_error(
                 &headers,
@@ -344,6 +356,7 @@ pub(crate) async fn admin_update_settings(
         "resumeMinTicks": settings.resume_min_ticks,
         "forceAdminLibraryOrder": settings.force_admin_library_order,
         "userDeletionGraceDays": settings.user_deletion_grace_days,
+        "newUserPermissions": settings.new_user_permissions,
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,

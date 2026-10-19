@@ -100,6 +100,56 @@ impl Default for MediaStrategySettings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NewUserPermissions {
+    pub(crate) library_access_mode: String,
+    pub(crate) library_ids: Vec<String>,
+    pub(crate) can_download: bool,
+    pub(crate) can_play: bool,
+    pub(crate) max_simultaneous_playbacks: i64,
+    pub(crate) allow_remux: bool,
+    pub(crate) allow_audio_transcode: bool,
+    pub(crate) allow_video_transcode: bool,
+}
+
+impl Default for NewUserPermissions {
+    fn default() -> Self {
+        Self {
+            library_access_mode: "NONE".to_owned(),
+            library_ids: Vec::new(),
+            can_download: false,
+            can_play: true,
+            max_simultaneous_playbacks: 2,
+            allow_remux: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+        }
+    }
+}
+
+impl NewUserPermissions {
+    fn has_valid_shape(&self) -> bool {
+        self.max_simultaneous_playbacks >= 0
+            && self.library_ids.len() <= 100
+            && match self.library_access_mode.as_str() {
+                "ALL" | "NONE" => self.library_ids.is_empty(),
+                "SELECTED" => !self
+                    .library_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, id)| self.library_ids[..index].contains(id)),
+                _ => false,
+            }
+    }
+
+    fn normalize_empty_selection(&mut self) {
+        if self.library_access_mode == "SELECTED" && self.library_ids.is_empty() {
+            self.library_access_mode = "NONE".to_owned();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NetworkProxySettings {
@@ -116,6 +166,7 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) resume_min_ticks: i64,
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
+    pub(crate) new_user_permissions: NewUserPermissions,
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
     pub(crate) media_strategy: MediaStrategySettings,
@@ -134,6 +185,7 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) user_deletion_grace_days: Option<i64>,
+    pub(crate) new_user_permissions: Option<NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     pub(crate) network_proxy: NetworkProxyChange,
@@ -147,6 +199,7 @@ pub(crate) enum AdminSettingsError {
     InvalidServerName,
     InvalidGlobalSettings,
     InvalidUserDeletionGraceDays,
+    InvalidNewUserPermissions,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
     Plugin(PluginServiceError),
@@ -158,6 +211,7 @@ struct StoredAdminSettings {
     resume_min_ticks: i64,
     force_admin_library_order: bool,
     user_deletion_grace_days: i64,
+    new_user_permissions: NewUserPermissions,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
 }
@@ -172,6 +226,7 @@ pub(crate) async fn read_admin_settings(
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
     let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
+    let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
         _ => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -189,6 +244,7 @@ pub(crate) async fn read_admin_settings(
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        new_user_permissions,
         login_background_source,
         login_background_source_status,
         media_strategy,
@@ -248,6 +304,21 @@ pub(crate) async fn update_admin_settings(
     if !(1..=3_650).contains(&user_deletion_grace_days) {
         return Err(AdminSettingsError::InvalidUserDeletionGraceDays);
     }
+    let mut new_user_permissions = update
+        .new_user_permissions
+        .unwrap_or(current.new_user_permissions);
+    new_user_permissions.normalize_empty_selection();
+    if !new_user_permissions.has_valid_shape()
+        || (new_user_permissions.library_access_mode == "SELECTED"
+            && !database
+                .are_enabled_regular_libraries(&new_user_permissions.library_ids)
+                .await
+                .map_err(|_| AdminSettingsError::Unavailable)?)
+    {
+        return Err(AdminSettingsError::InvalidNewUserPermissions);
+    }
+    let new_user_permissions_json = serde_json::to_string(&new_user_permissions)
+        .map_err(|_| AdminSettingsError::Unavailable)?;
     if !(1..=100).contains(&resume_played_percent)
         || resume_min_ticks < 0
         || !validate_media_strategy(&media_strategy)
@@ -307,6 +378,7 @@ pub(crate) async fn update_admin_settings(
             media_strategy_json: &media_strategy_json,
             force_admin_library_order,
             user_deletion_grace_days,
+            new_user_permissions_json: &new_user_permissions_json,
             login_background_source: &login_background_source,
             server_name: &server_name,
             refresh_login_background: login_background_source_changed
@@ -324,6 +396,7 @@ pub(crate) async fn update_admin_settings(
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        new_user_permissions,
         login_background_source,
         login_background_source_status,
         media_strategy,
@@ -337,6 +410,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
     let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
+    let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
         _ => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -351,9 +425,26 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        new_user_permissions,
         login_background_source,
         media_strategy,
     })
+}
+
+async fn read_new_user_permissions(database: &Database) -> Result<NewUserPermissions, ()> {
+    let stored = database.new_user_permissions_json().await.map_err(|_| ())?;
+    let Some(stored) = stored else {
+        return Ok(NewUserPermissions::default());
+    };
+    let Ok(mut permissions) = serde_json::from_str::<NewUserPermissions>(&stored) else {
+        return Ok(NewUserPermissions::default());
+    };
+    permissions.normalize_empty_selection();
+    if permissions.has_valid_shape() {
+        Ok(permissions)
+    } else {
+        Ok(NewUserPermissions::default())
+    }
 }
 
 async fn login_background_source_status(plugins: Option<&PluginService>, source: &str) -> String {
@@ -562,6 +653,7 @@ pub(crate) struct AdminSettingsWrite<'a> {
     pub(crate) media_strategy_json: &'a str,
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
+    pub(crate) new_user_permissions_json: &'a str,
     pub(crate) login_background_source: &'a str,
     pub(crate) server_name: &'a str,
     pub(crate) refresh_login_background: bool,
@@ -585,6 +677,10 @@ pub(crate) async fn write_admin_settings(
         .map_err(|_| ())?;
     database
         .set_user_deletion_grace_days(settings.user_deletion_grace_days)
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_new_user_permissions_json(settings.new_user_permissions_json)
         .await
         .map_err(|_| ())?;
     if settings.refresh_login_background
