@@ -13018,6 +13018,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：`playback_admission` 定向存储测试 3/3 通过，覆盖同用户并发争抢、续租复用、停止释放、旧播放记录去重、暂停计数、额度下调、不限额、禁播和 90 秒过期回收。PostgreSQL 集成目标编译通过，但 19 个测试均因需要本地 PostgreSQL 而 ignored；PostgreSQL 行锁逻辑尚未运行时验证。Rust 格式检查与 `git diff --check` 通过。播放入口接入留给后续任务。
 
+#### LUX-620：Web 播放入口接入准入占位
+
+范围：Web 创建播放会话/Bootstrap 时只检查当前策略与额度，不占用名额；Web 直放、STRM Range 与服务端 HLS 的实际 GET 请求原子准入。同一会话后续分片、Range、播放回调及已准入心跳复用名额；暂停保留名额，停止、删除、失败时释放。HEAD 和被动信息查询不占名额。拒绝响应需明确说明当前播放数与上限。本任务不接入 Emby PlaybackInfo/视频取流接口。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/sessions.rs`、`src/application/playback/session.rs`、`src/api/playback.rs`、`tests/web_playback.rs`。
+
+验收标准：
+
+- [x] Web 发链接只预检；只有实际媒体 GET 才创建准入记录，重复访问同一会话不重复占用。
+- [x] 活跃心跳续租，暂停仍计数；停止、删除和失败会话释放名额，失效心跳不创建新名额。
+- [x] 达到上限或禁止播放时返回包含当前播放数与策略上限的错误；竞争发生在发链接之后时，实际取流仍再次原子拒绝。
+- [x] Web playback 定向集成测试及 Rust 格式检查通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-619。
+
+结果（2026-10-19）：Web playback 定向集成测试 1/1 通过，覆盖直放、STRM Range 与服务端 HLS 的发链接预检和实际取流准入；HEAD 不占位，重复请求复用会话名额。测试也验证了播放上限/禁播错误详情、暂停计数、活跃心跳续租、失效心跳不续占、STOPPED/删除/取流失败释放名额。`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成测试访问 localhost 时设置 `NO_PROXY=127.0.0.1,localhost`，避免开发机代理截获本地请求。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

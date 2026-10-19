@@ -4,6 +4,53 @@ use crate::storage::{
 };
 
 impl Database {
+    pub(crate) async fn check_playback_admission(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Option<PlaybackAdmissionResult>, StorageError> {
+        let Some(policy) = self.get_user_playback_policy(user_id).await? else {
+            return Ok(None);
+        };
+        let stale_before = now
+            .max(0)
+            .saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        let active_playback_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM (
+                     SELECT play_session_id FROM playback_admissions
+                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
+                     UNION
+                     SELECT play_session_id FROM playback_sessions
+                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
+                 ) active_playbacks",
+            )
+            .bind(user_id)
+            .bind(stale_before)
+            .bind(user_id)
+            .bind(stale_before)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let decision = if !policy.can_play {
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::PlaybackDisabled)
+        } else if policy.max_simultaneous_playbacks > 0
+            && active_playback_count >= policy.max_simultaneous_playbacks
+        {
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+        } else {
+            PlaybackAdmissionDecision::Admitted
+        };
+        Ok(Some(PlaybackAdmissionResult {
+            decision,
+            active_playback_count,
+            max_simultaneous_playbacks: policy.max_simultaneous_playbacks,
+        }))
+    }
+
     // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
     #[allow(dead_code)]
     pub(crate) async fn reserve_playback_admission(
@@ -165,6 +212,36 @@ impl Database {
             active_playback_count,
             max_simultaneous_playbacks: limit,
         }))
+    }
+
+    pub(crate) async fn renew_existing_playback_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let max_function = self.scalar_max_function();
+        let stale_before = now
+            .max(0)
+            .saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        let query = format!(
+            "UPDATE playback_admissions
+             SET last_seen_at = {max_function}(last_seen_at, ?)
+             WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'
+               AND last_seen_at > ?"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(now.max(0))
+            .bind(user_id)
+            .bind(play_session_id)
+            .bind(stale_before)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     // LUX-620 calls this after playback stop, failure, or expiry.

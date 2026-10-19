@@ -9,7 +9,10 @@ use crate::application::playback::{
     hls::{HlsSegmentContainer, HlsStartOptions},
     session::{CreatedWebPlaybackSession, WebPlaybackPlan},
 };
-use crate::storage::{MAX_PLAYBACK_SESSION_WINDOW_SECONDS, WebPlaybackTranscodingDetails};
+use crate::storage::{
+    MAX_PLAYBACK_SESSION_WINDOW_SECONDS, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+    PlaybackAdmissionResult, StoredWebPlaybackSession, WebPlaybackTranscodingDetails,
+};
 
 pub(super) async fn emby_playback_info(
     headers: HeaderMap,
@@ -3237,6 +3240,70 @@ fn is_emby_logical_init_asset(asset: &str) -> bool {
     value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn playback_admission_error(
+    headers: &HeaderMap,
+    result: &PlaybackAdmissionResult,
+) -> Option<Response> {
+    let limit = if result.max_simultaneous_playbacks == 0 {
+        "不限".to_owned()
+    } else {
+        format!("{} 路", result.max_simultaneous_playbacks)
+    };
+    let (status, code, message) = match result.decision {
+        PlaybackAdmissionDecision::Admitted => return None,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::PlaybackDisabled) => (
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            format!(
+                "当前账户不允许播放（当前 {} 路，策略上限 {}）",
+                result.active_playback_count, limit
+            ),
+        ),
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            lux::ApiErrorCode::RateLimited,
+            format!(
+                "同时播放数已达上限（当前 {} 路，上限 {}）",
+                result.active_playback_count, limit
+            ),
+        ),
+    };
+    Some(api_error(headers, status, code, &message).into_response())
+}
+
+async fn check_web_playback_admission(
+    headers: &HeaderMap,
+    service: &crate::application::playback::session::WebPlaybackSessionService,
+    user_id: &str,
+) -> Result<(), Response> {
+    let result = service
+        .check_playback_admission(user_id)
+        .await
+        .map_err(|error| web_playback_error(headers, error))?
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    if let Some(response) = playback_admission_error(headers, &result) {
+        return Err(response);
+    }
+    Ok(())
+}
+
+async fn admit_web_playback_request(
+    headers: &HeaderMap,
+    service: &crate::application::playback::session::WebPlaybackSessionService,
+    session: &StoredWebPlaybackSession,
+) -> Result<(), Response> {
+    let result = service
+        .admit_playback_session(&session.user_id, &session.play_session_id)
+        .await
+        .map_err(|error| web_playback_error(headers, error))?
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    if let Some(response) = playback_admission_error(headers, &result) {
+        let _ = service.stop(&session.id, &session.user_id).await;
+        return Err(response);
+    }
+    Ok(())
+}
+
 async fn create_web_playback_session_json(
     headers: &HeaderMap,
     state: &AppState,
@@ -3254,6 +3321,7 @@ async fn create_web_playback_session_json(
     let Some(service) = state.web_playback.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
+    check_web_playback_admission(headers, service, &user.id.to_string()).await?;
     if source_kind == PlaybackSourceKind::LocalFile && audio_stream_index.is_some() {
         // Direct Play cannot select a non-first source audio stream. Reuse
         // the existing HLS plan so the selected track is fixed in the
@@ -3579,10 +3647,15 @@ pub(super) async fn lux_web_playback_direct(
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if method == Method::GET
+        && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+    {
+        return response;
+    }
     let Ok(user_id) = session.user_id.parse::<crate::domain::ids::UserId>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_media_file(
+    let response = serve_media_file(
         &state,
         AccessPrincipal::new(user_id, session.is_admin),
         &headers,
@@ -3591,7 +3664,11 @@ pub(super) async fn lux_web_playback_direct(
         session.media_source_id.as_deref(),
         None,
     )
-    .await
+    .await;
+    if method == Method::GET && !response.status().is_success() {
+        let _ = service.stop(&session_id, &session.user_id).await;
+    }
+    response
 }
 
 pub(super) async fn lux_web_playback_range(
@@ -3647,20 +3724,28 @@ pub(super) async fn lux_web_playback_range(
     let Some(resolver) = state.strm_playback.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    if let Err(response) = admit_web_playback_request(&headers, service, &session).await {
+        return response;
+    }
     let user_agent = headers
         .get("user-agent")
         .and_then(|value| value.to_str().ok());
     let result = match resolver.fetch_range(external_url, range, user_agent).await {
         Ok(result) => result,
         Err(crate::application::strm_playback::StrmPlaybackError::InvalidRange) => {
+            let _ = service.stop(&session_id, &session.user_id).await;
             return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
         }
         Err(crate::application::strm_playback::StrmPlaybackError::UnsupportedStatus(status))
             if status == 401 || status == 403 =>
         {
+            let _ = service.stop(&session_id, &session.user_id).await;
             return StatusCode::UNAUTHORIZED.into_response();
         }
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(_) => {
+            let _ = service.stop(&session_id, &session.user_id).await;
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
     };
     let mut response = Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
@@ -3706,16 +3791,30 @@ pub(super) async fn lux_web_playback_hls(
             Err(error) => return web_playback_error(&headers, error),
         };
         let Ok(bytes) = fs::read(path).await else {
+            if method == Method::GET {
+                let _ = service.stop(&session_id, &session.user_id).await;
+            }
             return StatusCode::NOT_FOUND.into_response();
         };
         let Ok(manifest) = String::from_utf8(bytes) else {
+            if method == Method::GET {
+                let _ = service.stop(&session_id, &session.user_id).await;
+            }
             return StatusCode::BAD_GATEWAY.into_response();
         };
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
             web_playback_hls_url(service, &session_id, asset, session.expires_at)
         }) else {
+            if method == Method::GET {
+                let _ = service.stop(&session_id, &session.user_id).await;
+            }
             return StatusCode::BAD_GATEWAY.into_response();
         };
+        if method == Method::GET
+            && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+        {
+            return response;
+        }
         return Response::builder()
             .status(StatusCode::OK)
             .header("Cache-Control", "private, no-store")
@@ -3730,7 +3829,12 @@ pub(super) async fn lux_web_playback_hls(
     }
     let path = match service.hls_asset_path(&session_id, &asset).await {
         Ok(path) => path,
-        Err(error) => return web_playback_error(&headers, error),
+        Err(error) => {
+            if method == Method::GET {
+                let _ = service.stop(&session_id, &session.user_id).await;
+            }
+            return web_playback_error(&headers, error);
+        }
     };
     match service.hls_within_quota(&session_id).await {
         Ok(true) => {}
@@ -3742,8 +3846,18 @@ pub(super) async fn lux_web_playback_hls(
     }
     let metadata = match fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => metadata,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => {
+            if method == Method::GET {
+                let _ = service.stop(&session_id, &session.user_id).await;
+            }
+            return StatusCode::NOT_FOUND.into_response();
+        }
     };
+    if method == Method::GET
+        && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+    {
+        return response;
+    }
     let content_type = if asset.ends_with(".m4s") || asset.ends_with(".mp4") {
         "video/mp4"
     } else {
@@ -3753,6 +3867,7 @@ pub(super) async fn lux_web_playback_hls(
         Body::empty()
     } else {
         let Ok(file) = fs::File::open(path).await else {
+            let _ = service.stop(&session_id, &session.user_id).await;
             return StatusCode::NOT_FOUND.into_response();
         };
         Body::from_stream(tokio_util::io::ReaderStream::new(file))
@@ -3944,6 +4059,22 @@ pub(super) async fn lux_web_playback_event(
                 resumed,
             )
             .await;
+        }
+    }
+    if matches!(
+        claim,
+        WebPlaybackEventClaim::Accepted | WebPlaybackEventClaim::Duplicate
+    ) {
+        let admission_result = if matches!(request.state, LuxPlaybackState::Stopped) {
+            service.stop(&session.id, &session.user_id).await
+        } else {
+            service
+                .renew_playback_session_admission(&session.user_id, &session.play_session_id)
+                .await
+                .map(|_| ())
+        };
+        if let Err(error) = admission_result {
+            return web_playback_error(&headers, error);
         }
     }
     Json(json!({

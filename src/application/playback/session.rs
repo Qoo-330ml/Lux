@@ -12,8 +12,8 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::storage::{
-    Database, NewWebPlaybackEvent, NewWebPlaybackSession, StorageError, StoredWebPlaybackSession,
-    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    Database, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
+    StoredWebPlaybackSession, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
 };
 
 use super::decision::{
@@ -202,6 +202,38 @@ impl WebPlaybackSessionService {
             .hls
             .with_executable(executable.to_string_lossy().into_owned());
         self
+    }
+
+    pub(crate) async fn check_playback_admission(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .check_playback_admission(user_id, unix_timestamp())
+            .await?)
+    }
+
+    pub(crate) async fn admit_playback_session(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .reserve_playback_admission(user_id, play_session_id, unix_timestamp())
+            .await?)
+    }
+
+    pub(crate) async fn renew_playback_session_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<bool, WebPlaybackSessionError> {
+        Ok(self
+            .database
+            .renew_existing_playback_admission(user_id, play_session_id, unix_timestamp())
+            .await?)
     }
 
     pub(crate) async fn create(
@@ -590,6 +622,12 @@ impl WebPlaybackSessionService {
         {
             return Err(WebPlaybackSessionError::NotFound);
         }
+        if let Some(session) = self.database.find_web_playback_session(session_id).await? {
+            let _ = self
+                .database
+                .renew_existing_playback_admission(user_id, &session.play_session_id, now)
+                .await?;
+        }
         Ok(expires_at)
     }
 
@@ -610,11 +648,26 @@ impl WebPlaybackSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<(), WebPlaybackSessionError> {
+        let session = self.database.find_web_playback_session(session_id).await?;
         let _ = self.hls.stop(session_id).await;
         let now = unix_timestamp();
         self.database
             .stop_web_playback_session(session_id, user_id, "STOPPED", now)
             .await?;
+        if let Some(session) = session.filter(|session| session.user_id == user_id) {
+            if let Some(playback) = self
+                .database
+                .find_playback_session(user_id, &session.play_session_id)
+                .await?
+            {
+                self.database
+                    .stop_playback_session(&playback.id, now)
+                    .await?;
+            }
+            self.database
+                .release_playback_admission(user_id, &session.play_session_id, now)
+                .await?;
+        }
         Ok(())
     }
 
@@ -704,6 +757,45 @@ impl WebPlaybackSessionService {
                 session_id = %session_id,
                 %error,
                 "failed to mark HLS session"
+            );
+            return;
+        }
+        if let Some(playback) = match self
+            .database
+            .find_playback_session(&session.user_id, &session.play_session_id)
+            .await
+        {
+            Ok(playback) => playback,
+            Err(error) => {
+                tracing::warn!(
+                    event = "web_hls_failed_session_cleanup",
+                    session_id = %session_id,
+                    %error,
+                    "failed to load failed HLS playback record"
+                );
+                return;
+            }
+        } {
+            if let Err(error) = self.database.stop_playback_session(&playback.id, now).await {
+                tracing::warn!(
+                    event = "web_hls_failed_session_cleanup",
+                    session_id = %session_id,
+                    %error,
+                    "failed to stop failed HLS playback record"
+                );
+                return;
+            }
+        }
+        if let Err(error) = self
+            .database
+            .release_playback_admission(&session.user_id, &session.play_session_id, now)
+            .await
+        {
+            tracing::warn!(
+                event = "web_hls_failed_session_cleanup",
+                session_id = %session_id,
+                %error,
+                "failed to release failed HLS playback admission"
             );
         }
     }
