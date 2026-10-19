@@ -160,6 +160,18 @@ impl WebAuthService {
         ))
     }
 
+    pub async fn is_current_session_for_admin(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        current_session_token: &str,
+    ) -> Result<bool, WebAuthError> {
+        Ok(self
+            .database
+            .is_active_web_session_token(user_id, session_id, &hash_token(current_session_token))
+            .await?)
+    }
+
     pub async fn revoke_session(
         &self,
         user_id: &UserId,

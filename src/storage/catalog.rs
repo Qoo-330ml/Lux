@@ -9082,7 +9082,8 @@ impl Database {
         self.query(
             "UPDATE web_sessions
              SET revoked_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+             WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+               AND expires_at > unixepoch()",
         )
         .bind(session_id)
         .bind(user_id)

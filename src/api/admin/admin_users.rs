@@ -283,6 +283,96 @@ async fn admin_list_user_sessions(
     }
 }
 
+async fn admin_revoke_user_session(
+    headers: HeaderMap,
+    Path((user_id, session_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Ok(session_id) = session_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "会话 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id_string = user_id.to_string();
+    let session_id_string = session_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id_string).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(auth) = state.auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if let Some(current_token) = request_cookie(&headers, "lux_session") {
+        match auth
+            .is_current_session_for_admin(&user_id_string, &session_id_string, &current_token)
+            .await
+        {
+            Ok(true) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "不能撤销当前会话，请使用退出登录",
+                )
+                .into_response();
+            }
+            Ok(false) => {}
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+
+    match auth.revoke_session(&user_id, &session_id_string).await {
+        Ok(true) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_SESSION_REVOKED",
+                Some("web_session"),
+                Some(&session_id_string),
+                &json!({ "userId": user_id_string }).to_string(),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "活动会话不存在",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 fn invalid_user_permission_preset_request(headers: &HeaderMap) -> Response {
     api_error(
         headers,
@@ -1415,6 +1505,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/sessions",
             get(admin_list_user_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/sessions/{session_id}",
+            delete(admin_revoke_user_session),
         )
         .route(
             "/api/v1/admin/users/{user_id}/permission-preset",

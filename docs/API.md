@@ -218,6 +218,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；`POST` 创建账号时原子应用当前 `newUserPermissions` 快照并返回 201，`email` 可选；`PATCH` 携带 `isDisabled: true` 只禁用账户并保留数据，`DELETE` 永久删除账户及关联数据并返回 204；最后一个启用的服务器管理账户受保护。
 - `GET /api/v1/admin/users/{userId}`：返回单个账号详情，包括 `email`、`emailVerifiedAt`、删除状态字段和预设来源快照；旧账号未设置邮箱时 `email` 为 `null`。
 - `GET /api/v1/admin/users/{userId}/sessions?page=1&pageSize=50`：管理员分页读取该用户未撤销且未过期的 Web 会话摘要，响应包含 `sessions`、`page`、`pageSize` 和 `totalCount`；页大小默认为 50，服务端最大 100。会话项仅返回 ID、创建/更新时间、过期时间、最近活动时间和 `isCurrent`，不返回 Cookie、session token 或 CSRF token。无效用户 ID 返回 400，目标账号不存在返回 404。
+- `DELETE /api/v1/admin/users/{userId}/sessions/{sessionId}`：管理员使用 Web 会话和 CSRF 撤销目标用户的一条有效 Web 会话，成功返回 204 并记录审计事件。不能撤销当前管理员会话（400）；会话 ID/用户 ID 格式错误返回 400，未知用户、非目标用户会话、已撤销或过期会话返回 404。其余会话保持有效。
 - `PATCH /api/v1/admin/users/{userId}/profile`：管理员以 `{ "displayName": "...", "email": "..." }` 更新资料，需要管理员 Web session 和 CSRF。字段可省略；空邮箱清除邮箱。邮箱会去除首尾空白并归一化为小写，格式错误返回 400，重复邮箱（忽略大小写）返回 409。邮箱实际变更会清除 `emailVerifiedAt`；只更新显示名称或提交等价邮箱不会伪造或丢失验证状态。
 - 用户列表项和 `GET /api/v1/admin/users/{userId}` 详情中的 `presetSource` 为最近应用的预设名称；`presetSourceDetails` 返回 `{ "id", "name", "version", "appliedAt" }` 来源快照。未应用预设时两字段为 `null`；删除自定义预设不会删除用户已有来源记录。
 - `GET /api/v1/admin/users/{userId}/libraries`：返回 `{ "libraryAccessMode": "ALL|SELECTED|NONE", "libraryIds": [...] }`；`ALL` 表示全部已启用普通媒体库，`SELECTED` 表示仅允许 `libraryIds` 中的库，`NONE` 表示无媒体库访问。不存在的用户返回 404，不返回服务器路径。

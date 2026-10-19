@@ -13858,6 +13858,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增单条 EXISTS 存储检查，只有用户、会话 ID、token 摘要完全匹配且会话未撤销/未过期时返回 true。回归覆盖错用户、错会话、错摘要、过期和撤销，`admin_current_web_session_guard` 1/1、fmt check 与 diff check 通过。管理员撤销 API 将在 LUX-662 使用此检查。
 
+#### LUX-662：开放管理员撤销用户 Web 会话 API
+
+范围：新增 `DELETE /api/v1/admin/users/{user_id}/sessions/{session_id}`，撤销指定用户的一条活动 Web 会话。要求管理员权限与 CSRF；拒绝撤销当前管理员 Web 会话。目标会话必须属于路径用户且未过期/未撤销；成功返回 204，未知、过期、已撤销或用户不匹配返回 404。撤销不会影响该用户的其他 Web 会话。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/auth/sessions.rs`、`src/storage/catalog.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 缺少认证或 CSRF 请求被拒绝；错误用户/会话、过期和已撤销会话返回 404。
+- [x] 当前管理员会话返回 400 不撤销；成功撤销返回 204，目标登录失效且其他目标会话仍可用。
+- [x] `users` 集成 target、API 文档、Rust 格式和 diff check 通过。
+
+短计划：先补 CSRF、当前会话保护、目标归属、过期会话、成功撤销及其他登录保留的集成回归；再连接 LUX-661 精确身份检查与仅撤销仍有效会话的原子存储操作，最后记录合同与审计事件。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_revoke_user_web_sessions -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：新增管理员单会话撤销 DELETE API，管理员 Web 登录需通过 CSRF；当前会话使用 user/session/token 摘要精确匹配保护。存储更新原子要求目标未撤销且未过期；错误归属、过期、重复撤销返回 404，撤销后只使目标 Cookie 失效并记录安全审计事件。撤销回归 1/1，串行 `users` target 6/6、Rust fmt check 与 diff check 通过。默认并发 `users` target 曾有一个既有用户管理测试收到 503；该测试单独及串行 target 重跑通过，暂未查明并发失败原因。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

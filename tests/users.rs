@@ -1593,3 +1593,225 @@ async fn admin_can_list_user_web_sessions_without_exposing_tokens()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_revoke_user_web_sessions_without_affecting_other_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let admin_sessions = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/sessions",
+            admin.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let admin_session_id = admin_sessions["sessions"]
+        .as_array()
+        .and_then(|sessions| sessions.iter().find(|session| session["isCurrent"] == true))
+        .and_then(|session| session["id"].as_str())
+        .ok_or("missing current admin session")?
+        .to_owned();
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "username": "revoke-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let target_id = created.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing target user id")?
+        .to_owned();
+
+    let mut target_cookies = Vec::new();
+    for _ in 0..3 {
+        let login = client
+            .post(format!("{base_url}/api/v1/auth/login"))
+            .json(&json!({ "username": "revoke-target", "password": "target password" }))
+            .send()
+            .await?;
+        assert_eq!(login.status(), reqwest::StatusCode::OK);
+        target_cookies.push(cookie_pair(login.headers()));
+    }
+
+    let mut target_session_ids = Vec::new();
+    for target_cookie in &target_cookies {
+        let sessions = client
+            .get(format!("{base_url}/api/v1/auth/sessions"))
+            .header(COOKIE, target_cookie)
+            .send()
+            .await?;
+        assert_eq!(sessions.status(), reqwest::StatusCode::OK);
+        let sessions_body = sessions.json::<Value>().await?;
+        let current_id = sessions_body["sessions"]
+            .as_array()
+            .and_then(|sessions| sessions.iter().find(|session| session["isCurrent"] == true))
+            .and_then(|session| session["id"].as_str())
+            .ok_or("missing current target session")?;
+        target_session_ids.push(current_id.to_owned());
+    }
+
+    let list_url = format!("{base_url}/api/v1/admin/users/{target_id}/sessions?pageSize=100");
+    let active = client
+        .get(&list_url)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(active.status(), reqwest::StatusCode::OK);
+    let active_sessions = active.json::<Value>().await?["sessions"]
+        .as_array()
+        .cloned()
+        .ok_or("missing active target sessions")?;
+    assert_eq!(active_sessions.len(), 3);
+    let expired_session_id = &target_session_ids[0];
+    let revoke_session_id = &target_session_ids[1];
+
+    let unauthenticated = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions/{revoke_session_id}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let missing_csrf = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions/{revoke_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let wrong_owner = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions/{admin_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(wrong_owner.status(), reqwest::StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE web_sessions SET expires_at = unixepoch() - 1 WHERE id = ?")
+        .bind(expired_session_id)
+        .execute(database.pool())
+        .await?;
+    let expired = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions/{expired_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(expired.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let current_admin = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{}/sessions/{admin_session_id}",
+            admin.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(current_admin.status(), reqwest::StatusCode::BAD_REQUEST);
+    let admin_still_authenticated = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(admin_still_authenticated.status(), reqwest::StatusCode::OK);
+
+    let revoked = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions/{revoke_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(revoked.status(), reqwest::StatusCode::NO_CONTENT);
+    let revoked_login = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &target_cookies[1])
+        .send()
+        .await?;
+    assert_eq!(revoked_login.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let other_login = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &target_cookies[2])
+        .send()
+        .await?;
+    assert_eq!(other_login.status(), reqwest::StatusCode::OK);
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit_body = audit.json::<Value>().await?;
+    let audit_events = audit_body["events"]
+        .as_array()
+        .ok_or("missing audit events")?;
+    assert!(audit_events.iter().any(|event| {
+        event["eventType"] == "USER_SESSION_REVOKED"
+            && event["targetType"] == "web_session"
+            && event["targetId"].as_str() == Some(revoke_session_id.as_str())
+            && event["metadata"]["userId"].as_str() == Some(target_id.as_str())
+    }));
+    let audit_json = audit_body.to_string();
+    assert!(!audit_json.contains(&target_cookies[1]));
+    assert!(!audit_json.contains(&admin_cookie));
+
+    let repeated = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions/{revoke_session_id}"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(repeated.status(), reqwest::StatusCode::NOT_FOUND);
+    server.abort();
+    Ok(())
+}
