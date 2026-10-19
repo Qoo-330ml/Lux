@@ -2211,6 +2211,30 @@ async fn emby_authentication_success_response(
     }
     state.login_rate_limiter.record_success(login_key).await;
     let user_id = result.user.id.to_string();
+    if let Some(device_id) = bounded_emby_device_field(&result.device.device_id) {
+        if let Some(database) = state.database.as_ref() {
+            let device_name = bounded_emby_device_field(&result.device.device);
+            let client_name = bounded_emby_device_field(&result.device.client);
+            let client_version = bounded_emby_device_field(&result.device.version);
+            let remote_ip = request_client_ip(headers, &state.remote_access);
+            let seen_at = super::playback::current_unix_timestamp();
+            if let Err(error) = database
+                .upsert_user_device(NewUserDeviceObservation {
+                    user_id: &user_id,
+                    device_id: &device_id,
+                    device_name: device_name.as_deref(),
+                    device_type: Some("EMBY"),
+                    client_name: client_name.as_deref().unwrap_or("Unknown"),
+                    client_version: client_version.as_deref(),
+                    last_remote_ip: remote_ip.as_deref(),
+                    seen_at,
+                })
+                .await
+            {
+                tracing::warn!(%error, "failed to update Emby user device inventory");
+            }
+        }
+    }
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -2241,6 +2265,12 @@ async fn emby_authentication_success_response(
         "ServerId": state.server_id
     }))
     .into_response()
+}
+
+fn bounded_emby_device_field(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
 }
 
 fn parse_emby_authenticate_user_request(

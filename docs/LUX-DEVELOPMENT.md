@@ -15563,6 +15563,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`users` 目标串行运行 19/19；集成回归覆盖有效 ID 入库、无效 ID 登录仍成功且不新增设备、设备存储注入失败时登录仍返回 200。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许此前记录的 9 条 Clippy 诊断类别的全目标 Clippy 通过。未放行的全量 Clippy 仍受同一组未修改代码诊断阻断；没有变更 Emby 认证或 ACL。
 
+#### LUX-743：记录 Emby 用户成功登录设备
+
+范围：Emby 用户名登录和指定用户登录通过远程访问策略后，将有效的客户端声明设备 ID 写入 LUX-739 用户设备清单。Emby 设备 ID 保持客户端提供的任意字符串形式，不要求 UUID；空白或超过 256 字节的 ID 不登记，但不影响成功登录。记录 Emby 客户端名、设备名、版本及可用展示 IP；设备登记失败不得撤销成功登录，并且告警不得包含用户或设备字段。本任务不更新后续请求活动、不增加查询 API、页面或 ACL。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/emby_handlers.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] 两种 Emby 密码登录共用成功接线；只有通过远程访问检查后才写入设备观察。
+- [x] 合法设备 ID 记录客户端、设备名、版本、EMBY 类型及可用展示 IP；同一 ID 的后续登录更新同一用户设备记录。
+- [x] 缺少、空白或过长设备 ID 不阻断认证且不产生设备记录；存储失败不改变成功认证结果。
+- [x] `emby_auth` 定向集成回归、Rust build、fmt 与 diff check 通过；不改 Emby 令牌合同或 ACL。
+
+短计划：先扩展 `tests/emby_auth` 覆盖正常、缺失/越界 ID 和设备存储失败，并确认设备行不存在；再在共用成功响应中、远程访问检查之后增加有界设备观察 upsert；最后运行 `emby_auth` 目标、build、fmt 和 diff check。
+
+#### LUX-743 验证记录
+
+结果（2026-10-20）：Emby 用户名和指定用户密码登录共用成功响应路径；通过既有远程访问检查后，有效的客户端设备 ID（非空、至多 256 字节）会 upsert 到用户设备清单，保存 `EMBY` 类型、客户端、设备名、版本、时间及可用展示 IP。Emby ID 不要求 UUID；无效 ID 跳过设备登记但保留登录成功。设备写入错误只记录存储错误，不返回用户或设备字段，也不撤销认证。
+
+验证：TDD RED 集成回归先因设备行缺失而 `RowNotFound`；实现后 `cargo test --locked --test emby_auth -- --test-threads=1` 为 10/10，覆盖用户名登录、指定用户登录、同 ID 更新、展示 IP、缺失/空白/过长 ID 和注入设备存储失败时仍返回 200。测试使用项目真实 `ConnectInfo` 服务模式；本机 localhost 请求显式设 `NO_PROXY=127.0.0.1,localhost`。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许此前记录 9 类既有 Clippy 诊断类别的全目标 Clippy 通过。未修改 Emby token 合同、后续请求活动、设备查询 API/UI 或 ACL；完整严格 Clippy 仍有前序记录的 9 条未改代码诊断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

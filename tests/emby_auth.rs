@@ -15,7 +15,7 @@ use luxd::{
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::io::Cursor;
+use std::{io::Cursor, net::SocketAddr};
 use tokio::net::TcpListener;
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -1118,6 +1118,147 @@ fn emby_device_info_parser_keeps_only_expected_fields() {
     assert_eq!(info.version, "1.2.3");
     assert_eq!(info.user_id.as_deref(), Some("user-1"));
     assert!(!format!("{info:?}").contains("token"));
+}
+
+#[tokio::test]
+async fn emby_password_logins_update_device_inventory_without_blocking_auth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    }));
+    let client = reqwest::Client::new();
+    let device_id = "emby-shared-device";
+    let remote_ip = "203.0.113.10";
+
+    let first_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="iPhone", DeviceId="emby-shared-device", Version="1.2.3""#,
+        )
+        .header("x-forwarded-for", remote_ip)
+        .json(&json!({ "Username": "Admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(first_login.status(), reqwest::StatusCode::OK);
+
+    let first_row: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT device_id, device_name, device_type, client_name, client_version,
+                first_seen_at, last_seen_at
+         FROM user_devices WHERE user_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(first_row.0, device_id);
+    assert_eq!(first_row.1.as_deref(), Some("iPhone"));
+    assert_eq!(first_row.2.as_deref(), Some("EMBY"));
+    assert_eq!(first_row.3.as_deref(), Some("Infuse"));
+    assert_eq!(first_row.4.as_deref(), Some("1.2.3"));
+    assert!(first_row.5 > 0);
+    assert!(first_row.6 >= first_row.5);
+    let (stored_ip,): (Option<String>,) = sqlx::query_as(
+        "SELECT last_remote_ip FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(device_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_ip.as_deref(), Some(remote_ip));
+
+    let second_login = client
+        .post(format!("http://{address}/Users/{}/Authenticate", admin.id))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="SenPlayer", Device="iPad", DeviceId="emby-shared-device", Version="2.0""#,
+        )
+        .json(&json!({ "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(second_login.status(), reqwest::StatusCode::OK);
+    let updated_row: (i64, String, String, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(client_name), MAX(device_name), MAX(client_version)
+         FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(device_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(updated_row.0, 1);
+    assert_eq!(updated_row.1, "SenPlayer");
+    assert_eq!(updated_row.2, "iPad");
+    assert_eq!(updated_row.3, "2.0");
+
+    for device_header in [
+        r#"Emby Client="MissingId""#,
+        r#"Emby Client="BlankId", DeviceId="   ""#,
+        &format!("Emby Client=\"LongId\", DeviceId=\"{}\"", "d".repeat(257)),
+    ] {
+        let response = client
+            .post(format!("http://{address}/Users/AuthenticateByName"))
+            .header(AUTHORIZATION, device_header)
+            .json(&json!({ "Username": "Admin", "Pw": "correct password" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+    let count_before_storage_failure: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = ?")
+            .bind(admin.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(count_before_storage_failure, 1);
+
+    sqlx::query(
+        "CREATE TRIGGER fail_emby_user_device_insert
+         BEFORE INSERT ON user_devices
+         BEGIN SELECT RAISE(ABORT, 'device inventory unavailable'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let storage_failure_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="Apple TV", DeviceId="another-device", Version="1.0""#,
+        )
+        .json(&json!({ "Username": "Admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(storage_failure_login.status(), reqwest::StatusCode::OK);
+
+    Ok(())
 }
 
 #[tokio::test]
