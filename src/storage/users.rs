@@ -2549,7 +2549,12 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(row.map(|row| UserAccountPreferences {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let library_order = self.user_library_order(user_id).await?;
+        let played_percent = self.user_played_percent(user_id).await?;
+        Ok(Some(UserAccountPreferences {
             theme: row.get("theme"),
             accent_color: row.get("accent_color"),
             show_media_libraries: row.get::<i64, _>("show_media_libraries") != 0,
@@ -2557,6 +2562,8 @@ impl Database {
             audio_language: row.get("audio_language"),
             subtitle_language: row.get("subtitle_language"),
             auto_play_next_episode: row.get::<i64, _>("auto_play_next_episode") != 0,
+            library_order,
+            played_percent,
             version: row.get("version"),
             updated_at: row.get("updated_at"),
         }))
@@ -2572,6 +2579,14 @@ impl Database {
         if expected_version < 0 {
             return Ok(UserAccountPreferencesCasResult::Conflict);
         }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         let result = if expected_version == 0 {
             self.query(
                 "INSERT INTO user_account_preferences (
@@ -2594,7 +2609,7 @@ impl Database {
             .bind(preferences.subtitle_language)
             .bind(database_flag(preferences.auto_play_next_episode))
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
         } else {
             self.query(
@@ -2617,7 +2632,7 @@ impl Database {
             .bind(user_id)
             .bind(expected_version)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
         }
         .map_err(|source| StorageError::Sqlx {
@@ -2632,7 +2647,14 @@ impl Database {
                     )",
                 )
                 .bind(user_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            transaction
+                .rollback()
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -2644,6 +2666,44 @@ impl Database {
                 UserAccountPreferencesCasResult::UserUnavailable
             });
         }
+
+        if let Some(played_percent) = preferences.played_percent {
+            if let Err(source) = self
+                .query(
+                    "INSERT INTO user_playback_settings (user_id, played_percent)
+                     VALUES (?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                         played_percent = excluded.played_percent,
+                         updated_at = unixepoch()",
+                )
+                .bind(user_id)
+                .bind(played_percent)
+                .execute(&mut *transaction)
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        }
+        if let Some(library_order) = preferences.library_order {
+            if let Err(error) = self
+                .replace_user_library_order_in_transaction(user_id, library_order, &mut transaction)
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         let Some(updated) = self.user_account_preferences(user_id).await? else {
             return Ok(UserAccountPreferencesCasResult::UserUnavailable);
         };
@@ -2742,9 +2802,26 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        self.replace_user_library_order_in_transaction(user_id, library_ids, &mut transaction)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    async fn replace_user_library_order_in_transaction(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), StorageError> {
         self.query("DELETE FROM user_library_order WHERE user_id = ?")
             .bind(user_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -2769,20 +2846,14 @@ impl Database {
                 );
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(())
     }
 
     pub(crate) async fn set_server_settings(

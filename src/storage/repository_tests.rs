@@ -14531,6 +14531,24 @@ async fn account_preferences_use_compare_and_swap_versions()
             true,
         )
         .await?;
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library_one = libraries
+        .create_library(
+            "Preference order one",
+            crate::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let library_two = libraries
+        .create_library(
+            "Preference order two",
+            crate::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let initial_library_order = vec![library_two.id.to_string(), library_one.id.to_string()];
+    let stale_library_order = vec![library_one.id.to_string()];
+    let invalid_library_order = vec!["missing-library".to_owned()];
     assert!(
         database
             .user_account_preferences("preferences-cas-user")
@@ -14550,6 +14568,8 @@ async fn account_preferences_use_compare_and_swap_versions()
                 audio_language: "日本語",
                 subtitle_language: "关闭",
                 auto_play_next_episode: false,
+                library_order: Some(&initial_library_order),
+                played_percent: Some(73),
             },
         )
         .await?;
@@ -14564,6 +14584,15 @@ async fn account_preferences_use_compare_and_swap_versions()
     assert_eq!(created.audio_language, "日本語");
     assert_eq!(created.subtitle_language, "关闭");
     assert!(!created.auto_play_next_episode);
+    assert_eq!(
+        created.library_order,
+        [library_two.id.to_string(), library_one.id.to_string()]
+    );
+    assert_eq!(created.played_percent, 73);
+    assert_eq!(
+        database.user_played_percent("preferences-cas-user").await?,
+        73
+    );
 
     let updated = database
         .compare_and_swap_user_account_preferences(
@@ -14577,6 +14606,8 @@ async fn account_preferences_use_compare_and_swap_versions()
                 audio_language: "原始音轨",
                 subtitle_language: "简体中文",
                 auto_play_next_episode: true,
+                library_order: None,
+                played_percent: None,
             },
         )
         .await?;
@@ -14586,6 +14617,8 @@ async fn account_preferences_use_compare_and_swap_versions()
     assert_eq!(updated.version, 2);
     assert_eq!(updated.theme, "dark");
     assert_eq!(updated.accent_color, "ocean");
+    assert_eq!(updated.library_order, created.library_order);
+    assert_eq!(updated.played_percent, 73);
 
     let stale = database
         .compare_and_swap_user_account_preferences(
@@ -14599,10 +14632,16 @@ async fn account_preferences_use_compare_and_swap_versions()
                 audio_language: "原始音轨",
                 subtitle_language: "简体中文",
                 auto_play_next_episode: true,
+                library_order: Some(&stale_library_order),
+                played_percent: Some(49),
             },
         )
         .await?;
     assert_eq!(stale, UserAccountPreferencesCasResult::Conflict);
+    assert_eq!(
+        database.user_played_percent("preferences-cas-user").await?,
+        73
+    );
     assert_eq!(
         database
             .user_account_preferences("preferences-cas-user")
@@ -14624,10 +14663,28 @@ async fn account_preferences_use_compare_and_swap_versions()
                     audio_language: "原始音轨",
                     subtitle_language: "简体中文",
                     auto_play_next_episode: true,
+                    library_order: Some(&invalid_library_order),
+                    played_percent: Some(41),
                 },
             )
             .await
             .is_err()
+    );
+    assert_eq!(
+        database
+            .user_account_preferences("preferences-cas-user")
+            .await?
+            .map(|preferences| preferences.version),
+        Some(2),
+        "failed mirror writes must roll back the preference version"
+    );
+    assert_eq!(
+        database.user_played_percent("preferences-cas-user").await?,
+        73
+    );
+    assert_eq!(
+        database.user_library_order("preferences-cas-user").await?,
+        created.library_order
     );
     assert!(
         database
@@ -14648,6 +14705,8 @@ async fn account_preferences_use_compare_and_swap_versions()
                     audio_language: "原始音轨",
                     subtitle_language: "简体中文",
                     auto_play_next_episode: true,
+                    library_order: None,
+                    played_percent: None,
                 },
             )
             .await?,
@@ -14666,6 +14725,8 @@ async fn account_preferences_use_compare_and_swap_versions()
                     audio_language: "原始音轨",
                     subtitle_language: "简体中文",
                     auto_play_next_episode: true,
+                    library_order: None,
+                    played_percent: None,
                 },
             )
             .await?,

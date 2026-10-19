@@ -14061,6 +14061,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增用户列表偏好复制对话框，按当前页选中用户固定目标快照；来源查询排除目标账号，预览显示选中偏好和来源/目标版本，应用使用预览的版本条件并逐账号显示结果。新增交互测试覆盖选择、预览、版本冲突、清空选择、条件变更和失败后重预览。`pnpm --dir web exec vitest run tests/admin-user-preference-copy.test.tsx tests/admin-user-batch-actions.test.tsx tests/admin-users-delete.test.tsx` 12/12 通过；`pnpm --dir web build` 通过。构建期间临时使用已提交版 `AdminDashboardNowPlaying.tsx` 并在退出时逐字节恢复用户未提交内容；`git diff --check` 通过。模块四的媒体库顺序和播放完成比例仍由后续服务端版本合同任务补齐。
 
+#### LUX-672：扩展版本化账户偏好存储合同
+
+范围：把个人媒体库顺序和自动标记已看阈值纳入账户偏好快照。已有 `user_library_order` 与 `user_playback_settings` 仍为读取兼容数据源；CAS 写入可选择同步其中任一值，并与偏好版本更新处于同一事务。未提供的字段保持旧值，以便后续 API 分组更新只修改明确选择的配置。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`src/application/user_account_preferences.rs`。
+
+验收标准：
+
+- [x] 服务端偏好快照包含媒体库顺序和已看阈值；尚无版本化偏好行的账号仍能读到旧服务端值与版本 0。
+- [x] 匹配版本的 CAS 可同步写入个人排序和已看阈值；省略某字段时不改动其旧值。
+- [x] 过期版本、删除账号或任何同步存储失败均不留下部分写入。
+- [x] 存储与服务层定向测试、构建、格式检查通过。
+
+短计划：先增加覆盖旧值加载、同一事务写入、可选字段保留和冲突隔离的测试，再扩展偏好快照/CAS 的存储与 application 合同；不新增迁移，复用已存在的排序和播放设置表。
+
+验证：确认 Toshiba 已挂载后，运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib account_preferences_use_compare_and_swap_versions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和 `git diff --check`。
+
+依赖：LUX-662、LUX-667、LUX-669。
+
+结果（2026-10-19）：账户偏好服务快照现在包含旧服务端表中的媒体库顺序与 1–100 播放阈值；版本 0 读取旧值但不写入偏好行。CAS 使用单个数据库事务更新偏好版本和被显式提供的旧表值，字段省略时保留原设置；无效媒体库 ID 触发整笔回滚。`account_preferences_use_compare_and_swap_versions` 1/1、`user_account_preferences::tests` 9/9、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。此切片仅建立一致的服务端 CAS 写入合同，旧设置路由将在 LUX-673 接入合同。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

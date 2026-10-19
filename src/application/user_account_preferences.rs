@@ -19,6 +19,8 @@ pub(crate) struct AccountPreferences {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
+    pub(crate) library_order: Vec<String>,
+    pub(crate) played_percent: i64,
     pub(crate) version: i64,
     pub(crate) updated_at: Option<i64>,
 }
@@ -33,6 +35,8 @@ impl Default for AccountPreferences {
             audio_language: "原始音轨".to_owned(),
             subtitle_language: "简体中文".to_owned(),
             auto_play_next_episode: true,
+            library_order: Vec::new(),
+            played_percent: 95,
             version: 0,
             updated_at: None,
         }
@@ -231,11 +235,16 @@ pub(crate) async fn get_account_preferences(
     database: &Database,
     user_id: &str,
 ) -> Result<AccountPreferences, AccountPreferencesError> {
-    Ok(database
+    let mut preferences = database
         .user_account_preferences(user_id)
         .await?
         .map(AccountPreferences::from)
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if preferences.version == 0 {
+        preferences.library_order = database.user_library_order(user_id).await?;
+        preferences.played_percent = database.user_played_percent(user_id).await?;
+    }
+    Ok(preferences)
 }
 
 pub(crate) async fn update_account_preferences(
@@ -256,6 +265,8 @@ pub(crate) async fn update_account_preferences(
                 audio_language: &input.audio_language,
                 subtitle_language: &input.subtitle_language,
                 auto_play_next_episode: input.auto_play_next_episode,
+                library_order: None,
+                played_percent: None,
             },
         )
         .await?
@@ -534,6 +545,8 @@ impl From<StoredPreferences> for AccountPreferences {
             audio_language: preferences.audio_language,
             subtitle_language: preferences.subtitle_language,
             auto_play_next_episode: preferences.auto_play_next_episode,
+            library_order: preferences.library_order,
+            played_percent: preferences.played_percent,
             version: preferences.version,
             updated_at: Some(preferences.updated_at),
         }
@@ -542,7 +555,10 @@ impl From<StoredPreferences> for AccountPreferences {
 
 #[cfg(test)]
 mod tests {
-    use crate::{config::Config, storage::Database};
+    use crate::{
+        application::libraries::LibraryService, config::Config, library::LibraryKind,
+        storage::Database,
+    };
 
     use super::*;
 
@@ -595,6 +611,42 @@ mod tests {
         assert!(preferences.auto_play_next_episode);
         assert_eq!(preferences.version, 0);
         assert_eq!(preferences.updated_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn version_zero_snapshot_includes_existing_server_library_order_and_played_percent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user(
+                "preferences-legacy-snapshot-user",
+                "preferences-legacy-snapshot-user",
+                "Legacy snapshot",
+                "test",
+                false,
+                true,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Legacy preference library", LibraryKind::Movie, false)
+            .await?;
+        database
+            .replace_user_library_order(
+                "preferences-legacy-snapshot-user",
+                &[library.id.to_string()],
+            )
+            .await?;
+        database
+            .set_user_played_percent("preferences-legacy-snapshot-user", 81)
+            .await?;
+
+        let preferences =
+            get_account_preferences(&database, "preferences-legacy-snapshot-user").await?;
+
+        assert_eq!(preferences.version, 0);
+        assert_eq!(preferences.library_order, [library.id.to_string()]);
+        assert_eq!(preferences.played_percent, 81);
         Ok(())
     }
 
