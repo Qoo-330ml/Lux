@@ -38,6 +38,7 @@ import type {
   AdminUser,
   AdminUserWebSessionPage,
   AdminUserPermissionPreset,
+  AdminUserPermissionPresetBatchResponse,
   AdminUserPermissionPresetInput,
   AdminUserLibraryAccess,
   AdminUserLibraryAccessUpdateResult,
@@ -1150,6 +1151,13 @@ export class LuxApiClient {
     return this.request<void>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/permission-preset`,
       { method: "POST", body: JSON.stringify({ presetId }) },
+    );
+  }
+
+  applyAdminUserPermissionPresetBatch(userIds: string[], presetId: string) {
+    return this.request<AdminUserPermissionPresetBatchResponse>(
+      "/api/v1/admin/users/batch/permission-preset",
+      { method: "POST", body: JSON.stringify({ userIds, presetId }) },
     );
   }
 

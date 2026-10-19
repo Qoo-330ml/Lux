@@ -13937,6 +13937,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：批量 API 对 1–100 个不同目标逐项执行同一份已校验预设快照，每项单独提交并按输入顺序返回稳定结果码；最后管理员、无效/不存在 ID 和注入的单项存储失败不影响其余目标，成功项各自写入脱敏审计事件。`admin_can_batch_apply_permission_presets_with_per_user_results` 1/1、Rust fmt check、定向 Clippy（仅放行仓库已知的 `too_many_arguments` lint）和 diff check 通过。未豁免的定向 Clippy 仍被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处同一 lint 阻断。API 文档同步完成。
 
+#### LUX-666：Web 批量应用权限预设客户端合同
+
+范围：为 LUX-665 管理员批量应用预设 API 增加有类型的 Web 客户端方法，发送明确用户 ID 列表和预设 ID，并返回预设摘要与逐用户成功/失败码。POST 复用统一请求层的 CSRF 处理；不修改列表 UI。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 类型覆盖批量响应和所有稳定失败码，不含任何会话凭证字段。
+- [x] 客户端使用固定批量端点、正确 JSON body，并自动附加 CSRF 头。
+- [x] 定向 API client Vitest、Web build 和 diff check 通过。
+
+短计划：先添加批量 POST URL、body、逐项结果解码与 CSRF 的失败客户端回归；再新增类型及方法，最后运行定向测试和 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "batch-applies admin permission preset"`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-665。
+
+结果（2026-10-19）：新增批量响应与五种逐项错误码类型及 Web client POST 方法，统一请求层自动附加 CSRF。定向 API client 测试 1/1、Web build 与 diff check 通过；build 前临时使用提交版 `AdminDashboardNowPlaying.tsx`，构建后逐字节恢复用户当前未提交内容。当前工作区直接 build 仍被该文件的两个既有 unused helper 阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

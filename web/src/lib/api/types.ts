@@ -1219,6 +1219,26 @@ export type AdminUserPermissionPresetInput = {
   permissions: NewUserPermissions;
 };
 
+export type AdminUserPermissionPresetBatchErrorCode =
+  | "INVALID_USER_ID"
+  | "USER_NOT_FOUND"
+  | "LAST_MANAGER"
+  | "INVALID_SNAPSHOT"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminUserPermissionPresetBatchResponse = {
+  preset: {
+    id: string;
+    name: string;
+    version: number;
+  };
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminUserPermissionPresetBatchErrorCode | null;
+  }>;
+};
+
 export type MediaStrategySettings = {
   metadataLanguage: string;
   imageLanguage: string;

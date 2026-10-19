@@ -404,6 +404,34 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("batch-applies admin permission preset and returns per-user results", async () => {
+    const batchResult = {
+      preset: { id: "preset-1", name: "家庭用户", version: 3 },
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "user-2", success: false, errorCode: "LAST_MANAGER" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(batchResult), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(
+        new LuxApiClient().applyAdminUserPermissionPresetBatch(["user-1", "user-2"], "preset/1"),
+      ).resolves.toEqual(batchResult);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/batch/permission-preset");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify({ userIds: ["user-1", "user-2"], presetId: "preset/1" }));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("uses the session-only password change contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
 
