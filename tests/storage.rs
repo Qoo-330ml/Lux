@@ -22,7 +22,7 @@ async fn user_activity_events_migration_runs_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 193);
+    assert_eq!(database.schema_version().await?, 194);
 
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master
@@ -89,6 +89,269 @@ async fn user_activity_events_migration_runs_from_an_empty_database()
     assert!(postgres_migration.contains("idx_user_activity_events_retention"));
     assert!(!postgres_migration.contains("REFERENCES users"));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_inventory_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 194);
+
+    let required_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_devices')
+         WHERE name IN (
+             'user_id', 'device_id', 'device_name', 'device_type', 'client_name',
+             'client_version', 'first_seen_at', 'last_seen_at', 'last_remote_ip'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(required_columns, 9);
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_user_devices_user_activity'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 1);
+
+    let foreign_key_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_devices')
+         WHERE \"table\" = 'users' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(foreign_key_count, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('device-owner', 'device-owner', 'Device Owner', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('device-owner', 'browser-device', 'Lux Web', 10, 20)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'device-owner'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_devices: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = 'device-owner'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cascaded_devices, 0);
+
+    let postgres_migration = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres/0194_user_devices.sql"),
+    )?;
+    for expected in [
+        "CREATE TABLE user_devices",
+        "REFERENCES users(id) ON DELETE CASCADE",
+        "idx_user_devices_user_activity",
+        "INSERT INTO user_devices",
+        "last_remote_ip",
+    ] {
+        assert!(postgres_migration.contains(expected), "missing {expected}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_inventory_migration_backfills_legacy_emby_device_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?;
+        if version.is_some_and(|version| version <= 193) {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration filename")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("devices-upgrade.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(schema_version, 193);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('device-owner', 'device-owner', 'Device Owner', 'test-hash'),
+                ('other-owner', 'other-owner', 'Other Owner', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    for (
+        id,
+        token_hash,
+        user_id,
+        device_id,
+        client_name,
+        device_name,
+        version,
+        created_at,
+        last_seen_at,
+        revoked_at,
+    ) in [
+        (
+            "token-old",
+            vec![1_u8],
+            "device-owner",
+            "shared-device",
+            "Old Client",
+            "Old Name",
+            "1.0",
+            100_i64,
+            Some(120_i64),
+            None,
+        ),
+        (
+            "token-latest",
+            vec![2_u8],
+            "device-owner",
+            "shared-device",
+            "Current Client",
+            "Current Name",
+            "2.0",
+            110_i64,
+            Some(150_i64),
+            None,
+        ),
+        (
+            "token-revoked",
+            vec![3_u8],
+            "device-owner",
+            "shared-device",
+            "Revoked Client",
+            "Revoked Name",
+            "0.9",
+            90_i64,
+            Some(95_i64),
+            Some(300_i64),
+        ),
+        (
+            "token-other-user",
+            vec![4_u8],
+            "other-owner",
+            "shared-device",
+            "Other Client",
+            "Other Device",
+            "3.0",
+            200_i64,
+            Some(220_i64),
+            None,
+        ),
+        (
+            "token-empty-device",
+            vec![5_u8],
+            "device-owner",
+            "",
+            "Unknown Client",
+            "Unknown Device",
+            "0.1",
+            50_i64,
+            Some(60_i64),
+            None,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                 id, token_hash, user_id, device_id, client_name, device_name,
+                 client_version, created_at, updated_at, last_seen_at, revoked_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(device_id)
+        .bind(client_name)
+        .bind(device_name)
+        .bind(version)
+        .bind(created_at)
+        .bind(created_at + 10)
+        .bind(last_seen_at)
+        .bind(revoked_at)
+        .execute(&pool)
+        .await?;
+    }
+
+    fs::copy(
+        source_dir.join("0194_user_devices.sql"),
+        migration_dir.join("0194_user_devices.sql"),
+    )?;
+    Migrator::new(migration_dir).await?.run(&pool).await?;
+
+    let (
+        device_name,
+        device_type,
+        client_name,
+        client_version,
+        first_seen_at,
+        last_seen_at,
+        last_remote_ip,
+    ): (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT device_name, device_type, client_name, client_version,
+                first_seen_at, last_seen_at, last_remote_ip
+         FROM user_devices WHERE user_id = 'device-owner' AND device_id = 'shared-device'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(device_name.as_deref(), Some("Current Name"));
+    assert_eq!(device_type, None);
+    assert_eq!(client_name, "Current Client");
+    assert_eq!(client_version.as_deref(), Some("2.0"));
+    assert_eq!(first_seen_at, 90);
+    assert_eq!(last_seen_at, 150);
+    assert_eq!(last_remote_ip, None);
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_devices")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 2);
+    pool.close().await;
     Ok(())
 }
 

@@ -15480,6 +15480,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 回归在面板缺失时失败；最终 `tests/admin-user-sessions.test.tsx` 11/11、冻结依赖安装、`pnpm --dir web build` 和 `git diff --check` 通过。完整 `pnpm --dir web test` 为 738 passed、4 failed；仍是此前已记录且不涉及本任务文件的 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项和 `media-query-polling.test.tsx` 1 项。Playwright 用本地模拟 API 验证 1280×900 桌面与 390×844 窄屏：桌面内容区 809px 时播放表格和停止操作完整可见；窄屏文档宽 375px、表格视口 310px，通过表格内横滑访问操作列，页面无横向溢出。确认对话框确认后发送 DELETE 204 并显示成功状态；`canStop=false` 的 STRM 行没有停止按钮；浏览器控制台错误 0。截图：`output/playwright/user-current-playback-desktop.png`、`output/playwright/user-current-playback-390.png`、`output/playwright/user-current-playback-390-actions.png`。此验证使用模拟 API，不代表真实 FNOS 或生产数据验证。
 
+#### LUX-739：建立用户设备清单存储结构
+
+范围：新增 SQLite/PostgreSQL 用户设备清单表，以 `(user_id, device_id)` 标识单个用户声明的设备，保存客户端名称/版本、设备名称/类型、首次出现、最近活动和可空的最近来源 IP。迁移从现存 Emby `access_tokens` 回填可识别的设备记录；已有令牌中的设备与客户端字段按声明信息处理，来源 IP 不推断或伪造。本任务只新增 schema 和可信旧数据回填，不接入登录/请求写入、查询 API、页面、黑名单或 IP ACL。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0194_user_devices.sql`、`migrations-postgres/0194_user_devices.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 空库迁移建立用户设备清单、级联删除和按用户/最近活动读取索引；迁移不生成可空来源 IP。
+- [x] SQLite 从 schema 193 升级时，以成功签发的历史 Emby 凭证为证据，按用户和设备合并记录，保留首次/最近活动及最新设备摘要。
+- [x] PostgreSQL 提供等价迁移和空库运行回归；两种数据库 schema 和索引一致。
+- [x] 定向 migration 测试、Rust build、fmt 与 diff check 通过；不改认证或访问控制行为。
+
+短计划：先增加 SQLite 空库与 193→194 升级测试、PostgreSQL 迁移验证并确认失败；再新增两种数据库迁移与旧凭证回填；最后运行最窄 migration targets、build、fmt 与 diff check。
+
+#### LUX-739 验证记录
+
+结果（2026-10-20）：SQLite/PostgreSQL 新增 `user_devices`，以用户和客户端声明设备 ID 作为复合主键，外键级联清理，按用户及最近活动建立查询索引。迁移将已有 Emby 凭证按用户/设备合并；首次出现取最早凭证签发时间，最近活动取最大 `last_seen_at`（缺失时回退签发时间），摘要取最近活动凭证的客户端/设备字段。撤销时间不视为最近活动；空设备 ID 被跳过；旧记录没有可证实的 IP，故保持 NULL。未改认证、登录会话或访问控制行为。
+
+验证：TDD RED 空库回归先因 schema 实际为 193（预期 194）而失败；实现后 `tests/storage` 设备清单 migration 回归 2/2、活动索引最新 schema 回归 1/1、PostgreSQL 16 空库 migration 回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许已知 lint 类别的全目标 Clippy 通过。未放行的全量 Clippy 仍有 9 条既有诊断，位于 `src/api/admin/admin_users.rs:554`、`src/api/media.rs:2837`、`src/application/playback/session.rs:397, src/application/user_permission_copy.rs:382,657`、`src/storage/users.rs:3161,3164` 和 `src/storage/repository_tests.rs:15587,23380`；本任务未修改这些文件。旧凭证回填行为在 SQLite schema 193 升级回归覆盖；PostgreSQL 本地运行回归覆盖空库迁移和级联清理。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

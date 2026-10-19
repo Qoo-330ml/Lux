@@ -288,6 +288,67 @@ async fn postgres_media_content_restriction_index_migration()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    assert_eq!(database.schema_version().await?, 194);
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'user_devices'
+           AND column_name IN (
+               'user_id', 'device_id', 'device_name', 'device_type', 'client_name',
+               'client_version', 'first_seen_at', 'last_seen_at', 'last_remote_ip'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 9);
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_user_devices_user_activity'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('device-owner', 'device-owner', 'Device Owner', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('device-owner', 'browser-device', 'Lux Web', 10, 20)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'device-owner'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_devices: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = 'device-owner'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cascaded_devices, 0);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
