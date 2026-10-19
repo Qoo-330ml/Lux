@@ -157,9 +157,76 @@ pub fn rating_is_at_or_below(
     Some(certification_order <= maximum_order)
 }
 
+const MAX_CONTENT_RESTRICTION_TAGS: usize = 100;
+const MAX_CONTENT_RESTRICTION_TAG_CHARACTERS: usize = 128;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentRestrictionIndexProjection {
+    pub certification_code: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentRestrictionIndexProjectionError {
+    TooManyTags,
+    InvalidTag,
+}
+
+pub fn project_content_restriction_index(
+    certification: Option<&str>,
+    genres: &[String],
+) -> Result<ContentRestrictionIndexProjection, ContentRestrictionIndexProjectionError> {
+    let certification_code = certification
+        .and_then(|value| {
+            [
+                ContentRatingSystem::Mpa,
+                ContentRatingSystem::TvParentalGuidelines,
+                ContentRatingSystem::Bbfc,
+            ]
+            .into_iter()
+            .find_map(|system| normalize_rating_code(system, value))
+        })
+        .map(str::to_owned);
+
+    let mut tags = std::collections::BTreeSet::new();
+    for genre in genres {
+        if genre
+            .chars()
+            .any(|character| character.is_control() && !character.is_whitespace())
+        {
+            return Err(ContentRestrictionIndexProjectionError::InvalidTag);
+        }
+
+        let normalized = genre
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized.chars().count() > MAX_CONTENT_RESTRICTION_TAG_CHARACTERS {
+            return Err(ContentRestrictionIndexProjectionError::InvalidTag);
+        }
+
+        tags.insert(normalized);
+        if tags.len() > MAX_CONTENT_RESTRICTION_TAGS {
+            return Err(ContentRestrictionIndexProjectionError::TooManyTags);
+        }
+    }
+
+    Ok(ContentRestrictionIndexProjection {
+        certification_code,
+        tags: tags.into_iter().collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ContentRatingSystem, normalize_rating_code, rating_is_at_or_below};
+    use super::{
+        ContentRatingSystem, normalize_rating_code, project_content_restriction_index,
+        rating_is_at_or_below,
+    };
 
     #[test]
     fn rating_system_keys_are_stable_and_case_insensitive() {
@@ -245,5 +312,42 @@ mod tests {
             rating_is_at_or_below(ContentRatingSystem::Mpa, "PG", "unrated"),
             None
         );
+    }
+
+    #[test]
+    fn content_index_projection_normalizes_certification_and_genre_tags() {
+        let projection = project_content_restriction_index(
+            Some(" Rated pg-13 "),
+            &[
+                "  Science   Fiction ".to_owned(),
+                "Drama".to_owned(),
+                "SCIENCE FICTION".to_owned(),
+                " ".to_owned(),
+            ],
+        )
+        .expect("valid NFO genres should be indexable");
+
+        assert_eq!(projection.certification_code.as_deref(), Some("PG-13"));
+        assert_eq!(projection.tags, ["drama", "science fiction"]);
+    }
+
+    #[test]
+    fn content_index_projection_keeps_unknown_certification_unrated() {
+        let projection = project_content_restriction_index(Some("8.2"), &["Édition".to_owned()])
+            .expect("valid NFO genres should be indexable");
+
+        assert_eq!(projection.certification_code, None);
+        assert_eq!(projection.tags, ["édition"]);
+    }
+
+    #[test]
+    fn content_index_projection_rejects_invalid_or_excessive_genre_tags() {
+        let too_many = (0..=100)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        assert!(project_content_restriction_index(None, &too_many).is_err());
+
+        assert!(project_content_restriction_index(None, &["x".repeat(129)]).is_err());
+        assert!(project_content_restriction_index(None, &["bad\0tag".to_owned()]).is_err());
     }
 }

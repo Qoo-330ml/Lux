@@ -14267,6 +14267,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：PostgreSQL schema 192 使用 `AFTER UPDATE OF nfo_metadata_json` 行级触发器，并以 `OLD ... IS DISTINCT FROM NEW ...` 条件仅对真实变化失效索引；认证变化与清空均会级联删除标签，无变化更新保留索引。PostgreSQL migration/行为专项 1/1、build、fmt、diff 和过滤既有测试 lint 后的 Clippy 通过。实现依据 PostgreSQL 16 的 [CREATE TRIGGER](https://www.postgresql.org/docs/16/sql-createtrigger.html) 和 [PL/pgSQL Trigger Functions](https://www.postgresql.org/docs/16/plpgsql-trigger.html) 说明。
 
+#### LUX-682：规范化 NFO 内容索引投影
+
+范围：将已缓存 NFO 的认证文本和类型标签转换为有界内容索引投影。认证只接受 MPA、TVPG、BBFC 已知代码的并集；具体限制仍按用户选择的分级体系解释。类型标签去除首尾空白、折叠内部空白、统一小写、去重并排序。未知认证按未分级处理；标签超过索引合同边界时拒绝整个投影，不截断标签，以免漏掉禁止标签。此任务只增加域层纯函数，不读取文件或改变授权。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/domain/content_restrictions.rs`。
+
+验收标准：
+
+- [x] 已知认证代码可规范化；未知或数值评分保持未分级，认证不推断来源体系。
+- [x] 标签以稳定顺序规范化、去重；空标签忽略，非法/超界标签数据拒绝整个投影。
+- [x] 域层回归覆盖规范化、未知认证、多语言标签、非法标签和超过上限的标签组。
+- [x] 定向 Rust 测试、fmt 与 diff check 通过。
+
+短计划：先加入域层投影回归并运行 `content_restrictions` library 测试确认缺少实现；再实现认证并集规范化和有界标签投影；最后运行定向测试、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-678、LUX-679。
+
+结果（2026-10-19）：域层现从认证代码并集规范化已知等级（后续仍由所选体系解释），将 NFO 类型标签折叠空白、统一小写、去重并稳定排序；未知/数值认证按未分级处理，空标签忽略，控制字符、超长标签或超过 100 个不同标签会拒绝整个投影，避免截断漏掉禁止标签。`cargo test --locked --lib content_restrictions` 7/7、fmt 与 diff check 通过。严格库 Clippy 仍被未修改的 `serve_emby_media_file` 与 `verify_emby_direct_stream` 两个 `too_many_arguments` 报错阻挡；豁免此既有 lint 后通过。无文件读取或授权行为变更。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
