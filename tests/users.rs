@@ -237,12 +237,148 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .send()
         .await?;
     assert_eq!(access_list.status(), reqwest::StatusCode::OK);
+    let access_list_body = access_list.json::<Value>().await?;
     assert_eq!(
-        access_list.json::<Value>().await?["libraryIds"]
-            .as_array()
-            .map(Vec::len),
+        access_list_body["libraryIds"].as_array().map(Vec::len),
         Some(1)
     );
+    assert_eq!(access_list_body["libraryAccessMode"], "SELECTED");
+
+    let set_none = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "libraryAccessMode": "NONE" }))
+        .send()
+        .await?;
+    assert_eq!(set_none.status(), reqwest::StatusCode::OK);
+    let set_none_body = set_none.json::<Value>().await?;
+    assert_eq!(set_none_body["libraryAccessMode"], "NONE");
+    assert_eq!(
+        set_none_body["libraryIds"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let empty_selected = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_selected.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        empty_selected.json::<Value>().await?["libraryAccessMode"],
+        "NONE"
+    );
+
+    let invalid_mode = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "libraryAccessMode": "INVALID" }))
+        .send()
+        .await?;
+    assert_eq!(invalid_mode.status(), reqwest::StatusCode::BAD_REQUEST);
+    let duplicate_selection = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [library_id, library_id]
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        duplicate_selection.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let missing_csrf = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .json(&json!({ "libraryAccessMode": "ALL" }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let invalid_selection = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": ["00000000-0000-0000-0000-000000000000"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_selection.status(), reqwest::StatusCode::NOT_FOUND);
+    let unchanged_access = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        unchanged_access.json::<Value>().await?["libraryAccessMode"],
+        "NONE"
+    );
+
+    let selected = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [library_id]
+        }))
+        .send()
+        .await?;
+    assert_eq!(selected.status(), reqwest::StatusCode::OK);
+    let selected_body = selected.json::<Value>().await?;
+    assert_eq!(selected_body["libraryAccessMode"], "SELECTED");
+    assert_eq!(
+        selected_body["libraryIds"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let set_all = client
+        .put(format!(
+            "{base_url}/api/v1/admin/users/{created_id}/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "libraryAccessMode": "ALL" }))
+        .send()
+        .await?;
+    assert_eq!(set_all.status(), reqwest::StatusCode::OK);
+    assert_eq!(set_all.json::<Value>().await?["libraryAccessMode"], "ALL");
+    let missing_access = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/00000000-0000-0000-0000-000000000000/libraries"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_access.status(), reqwest::StatusCode::NOT_FOUND);
 
     let regular = client
         .post(format!("{base_url}/api/v1/admin/users"))
@@ -369,8 +505,15 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .header("x-csrf-token", &manager_csrf)
         .send()
         .await?;
-    assert_eq!(deleted_regular.status(), reqwest::StatusCode::OK);
-    let deleted_regular_user = deleted_regular.json::<Value>().await?["user"].clone();
+    let deleted_regular_status = deleted_regular.status();
+    let deleted_regular_body = deleted_regular.text().await?;
+    assert_eq!(
+        deleted_regular_status,
+        reqwest::StatusCode::OK,
+        "{deleted_regular_body}"
+    );
+    let deleted_regular_user =
+        serde_json::from_str::<Value>(&deleted_regular_body)?["user"].clone();
     assert!(deleted_regular_user["deletedAt"].as_i64().is_some());
     assert!(deleted_regular_user["deletionPurgeAt"].as_i64().is_some());
     let deleted_policy_update = client

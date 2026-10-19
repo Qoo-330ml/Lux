@@ -13193,6 +13193,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：存储授权和合集/播放 SQL 已按显式模式过滤；旧单条、批量写入在事务内同步为 `SELECTED` 或 `ALL`。`ALL` / `SELECTED` / `NONE`（包括 `NONE` 覆盖既有正向授权）、新启用媒体库、未知用户及清空选择回归通过；全局合集和直接播放 `NONE` 拒绝回归通过。相关 `catalog`、`collections`、`search`、`playback`、`resume_favorites`、`emby_counts`、`series_api`、`remote`、`emby_global_collection_playback`、`subtitles`、`people_api` 目标及存储批量写入回归均通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。PostgreSQL 运行时仍因本机服务不可用而未验证；未部署。
 
+#### LUX-629：管理员显式设置用户媒体库访问模式
+
+范围：为现有用户媒体库管理接口返回明确的 `ALL` / `SELECTED` / `NONE` 模式，并新增整组替换接口。`SELECTED` 接受启用的普通媒体库 ID；空选择规范化为 `NONE`。`ALL` 与 `NONE` 清除旧选择行并保存明确模式。既有逐库 PATCH 接口保持 LUX-628 的兼容行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/admin_user_access.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 查询返回明确模式；不存在用户返回 404。
+- [x] 整组更新原子替换模式与选择；`SELECTED` 空列表变成 `NONE`，库 ID 必须存在、启用且不能重复。
+- [x] 旧逐库 PATCH 与已有权限行为兼容，输入无效时不产生部分更新。
+
+短计划：先在用户 HTTP 集成测试覆盖明确模式查询、三种模式更新和无效输入；再增加存储整组替换事务，接入 application 校验与管理员 GET/PUT；最后运行 users 定向目标、相关存储回归、格式与 diff 检查。
+
+验证：确认 Toshiba 挂载状态后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_users_and_last_manager_is_protected -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_modes_are_enforced_by_storage_queries`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-627、LUX-628。
+
+结果（2026-10-19）：管理员媒体库权限 GET 返回显式模式和选择列表；新增 CSRF 保护的 PUT 整组替换，校验用户、模式、启用媒体库和重复 ID，并将 `SELECTED` 空选择规范化为 `NONE`。存储事务回归确认中途插入失败会回滚旧选择与模式；HTTP 集成回归覆盖三种模式、无效输入、CSRF 和旧 PATCH 路径。users 定向测试、存储回滚测试、格式与 diff 检查通过。一次首跑在后续既有账号删除断言收到 503，设置本地代理绕行后的复跑通过；该瞬态未能再次复现。未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -1521,6 +1521,81 @@ impl Database {
             })
     }
 
+    pub(crate) async fn user_library_access_mode(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar("SELECT library_access_mode FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn replace_user_library_access_mode(
+        &self,
+        user_id: &str,
+        mode: &str,
+        library_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query("DELETE FROM user_library_access WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if mode == "SELECTED" {
+            for library_id in library_ids {
+                self.query(
+                    "INSERT INTO user_library_access (user_id, library_id, can_view)
+                     VALUES (?, ?, 1)",
+                )
+                .bind(user_id)
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+        let updated = self
+            .query("UPDATE users SET library_access_mode = ? WHERE id = ?")
+            .bind(mode)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn has_user_library_access(
         &self,
         user_id: &str,
@@ -2624,6 +2699,46 @@ mod tests {
             database
                 .has_user_library_access(&user_id, &second_library_id)
                 .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_user_library_access_mode_rolls_back_partial_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let user_id = Uuid::now_v7().to_string();
+        let library_id = Uuid::now_v7().to_string();
+        let missing_library_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&user_id, "access-mode-rollback", "Access Mode", "hash")
+            .await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(&library_id)
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+
+        assert!(
+            database
+                .replace_user_library_access_mode(
+                    &user_id,
+                    "SELECTED",
+                    &[library_id.clone(), missing_library_id],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            database.user_library_access_mode(&user_id).await?,
+            Some("SELECTED".to_owned())
+        );
+        assert_eq!(
+            database.list_selected_library_ids(&user_id).await?,
+            vec![library_id]
         );
         Ok(())
     }

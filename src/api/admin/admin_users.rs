@@ -6,6 +6,14 @@ pub(crate) struct SetLibraryAccessRequest {
     pub(crate) can_view: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplaceLibraryAccessRequest {
+    pub(crate) library_access_mode: String,
+    #[serde(default)]
+    pub(crate) library_ids: Vec<String>,
+}
+
 pub(crate) async fn admin_list_users(
     headers: HeaderMap,
     Query(query): Query<AdminUsersQuery>,
@@ -324,13 +332,148 @@ pub(crate) async fn admin_list_user_library_access(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    // The editor needs explicit selections; an empty list represents the all-libraries default.
-    match database
-        .list_selected_library_ids(&user_id.to_string())
-        .await
+    let user_id = user_id.to_string();
+    let mode = match database.user_library_access_mode(&user_id).await {
+        Ok(Some(mode)) => mode,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let library_ids = if mode == "SELECTED" {
+        match database.list_selected_library_ids(&user_id).await {
+            Ok(library_ids) => library_ids,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        Vec::new()
+    };
+    Json(json!({
+        "libraryAccessMode": mode,
+        "libraryIds": library_ids,
+    }))
+    .into_response()
+}
+
+pub(crate) async fn admin_replace_user_library_access(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ReplaceLibraryAccessRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let user_id = match user_id.parse::<crate::domain::ids::UserId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let mut library_ids = Vec::with_capacity(request.library_ids.len());
+    for library_id in request.library_ids {
+        match library_id.parse::<crate::domain::ids::LibraryId>() {
+            Ok(id) => library_ids.push(id.to_string()),
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "媒体库 ID 无效",
+                )
+                .into_response();
+            }
+        }
+    }
+    let Some(database) = state.database.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match crate::application::admin_user_access::replace_library_access(
+        database,
+        state.home.as_ref(),
+        &user_id,
+        &request.library_access_mode,
+        &library_ids,
+    )
+    .await
     {
-        Ok(library_ids) => Json(json!({ "libraryIds": library_ids })).into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok((mode, library_ids)) => {
+            let metadata = json!({
+                "libraryAccessMode": mode,
+                "libraryIds": library_ids,
+            })
+            .to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "LIBRARY_ACCESS_MODE_UPDATED",
+                Some("user_library_access"),
+                Some(&user_id),
+                &metadata,
+            )
+            .await;
+            Json(json!({
+                "userId": user_id,
+                "libraryAccessMode": mode,
+                "libraryIds": library_ids,
+            }))
+            .into_response()
+        }
+        Err(crate::application::admin_user_access::ReplaceLibraryAccessError::UserNotFound) => {
+            api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response()
+        }
+        Err(crate::application::admin_user_access::ReplaceLibraryAccessError::LibraryNotFound) => {
+            api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在或未启用",
+            )
+            .into_response()
+        }
+        Err(crate::application::admin_user_access::ReplaceLibraryAccessError::InvalidMode)
+        | Err(crate::application::admin_user_access::ReplaceLibraryAccessError::DuplicateLibrary) => {
+            api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库权限模式或选择无效",
+            )
+            .into_response()
+        }
+        Err(crate::application::admin_user_access::ReplaceLibraryAccessError::Storage) => {
+            api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库暂时不可用",
+            )
+            .into_response()
+        }
     }
 }
 
@@ -901,7 +1044,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/users/{user_id}/libraries",
-            get(admin_list_user_library_access),
+            get(admin_list_user_library_access).put(admin_replace_user_library_access),
         )
         .route(
             "/api/v1/admin/users/{user_id}/libraries/{library_id}",
