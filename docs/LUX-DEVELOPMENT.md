@@ -14581,6 +14581,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-695。
 
+#### LUX-697：整理搜索策略查询参数合同
+
+范围：将 LUX-695 搜索应用层与存储层传递的查询参数收敛为单个内部请求结构，消除新增的 Clippy 参数数目告警；保持 FTS/LIKE 分支、策略版本并发键、绑定顺序和查询结果不变。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/mod.rs`。
+
+验收标准：
+
+- [x] 搜索应用层与存储层均通过具名查询合同传递检索词、类型、媒体库、分页和用户策略。
+- [x] SQLite FTS/LIKE/deep union、PostgreSQL LIKE 以及策略版本并发键行为保持不变。
+- [x] 搜索定向测试、`tests/catalog.rs`、Rust build、fmt 和 diff check 通过；Clippy 不再报告这两个搜索函数参数数目告警。
+
+短计划：先确认搜索测试与两个新告警的触发位置；再定义存储模块内部搜索参数结构并改为单参数传递；最后运行搜索、目录测试、build、fmt、diff check 与 Clippy。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib library_search_applies_content_restrictions_before_pagination`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check` 与 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo clippy --locked --lib -- -D warnings`。
+
+结果（2026-10-19）：应用与存储共用具名 `CatalogSearchQuery` 传递搜索字段与策略，移除了 LUX-695 两个搜索方法的参数数量告警。策略版本并发键与 FTS、LIKE、深页 union 和 PostgreSQL LIKE 绑定保持不变。搜索回归 1/1、`tests/catalog.rs` 3/3、Rust build、fmt 和 diff check 通过。Clippy 仍被两处未改动的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 参数数量告警阻断。
+
+依赖：LUX-695。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

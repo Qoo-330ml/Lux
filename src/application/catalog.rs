@@ -18,7 +18,7 @@ use crate::{
         daily_recommendation_items, recommendation_library_scope_key,
     },
     storage::{
-        CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database,
+        CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
         GLOBAL_COLLECTION_LIBRARY_ID, ResumeItemsQuery, StorageError, StoredCatalogDetail,
         StoredCatalogRow, StoredMediaChapter, UserContentRestrictions,
     },
@@ -1991,15 +1991,15 @@ impl CatalogService {
                 let task_content_restrictions = content_restrictions.clone();
                 let task = tokio::spawn(async move {
                     let result = service
-                        .search_items_uncached(
-                            &task_query,
-                            &task_like_query,
-                            task_library_ids.as_deref(),
-                            &task_item_types,
-                            task_content_restrictions.as_ref(),
+                        .search_items_uncached(CatalogSearchQuery {
+                            query: &task_query,
+                            like_query: &task_like_query,
+                            item_types: &task_item_types,
+                            library_ids: task_library_ids.as_deref(),
                             offset,
                             limit,
-                        )
+                            content_restrictions: task_content_restrictions.as_ref(),
+                        })
                         .await;
                     let page = result.as_ref().ok().map(|page| Arc::new(page.clone()));
                     registry.finish(&task_key, &task_flight, page).await;
@@ -2019,27 +2019,27 @@ impl CatalogService {
                 if let Some(page) = flight.wait().await {
                     return Ok((*page).clone());
                 }
-                self.search_items_uncached(
+                self.search_items_uncached(CatalogSearchQuery {
                     query,
                     like_query,
-                    library_ids.as_deref(),
-                    &item_types,
-                    content_restrictions.as_ref(),
+                    item_types: &item_types,
+                    library_ids: library_ids.as_deref(),
                     offset,
                     limit,
-                )
+                    content_restrictions: content_restrictions.as_ref(),
+                })
                 .await
             }
             SearchFlightHandle::Bypass => {
-                self.search_items_uncached(
+                self.search_items_uncached(CatalogSearchQuery {
                     query,
                     like_query,
-                    library_ids.as_deref(),
-                    &item_types,
-                    content_restrictions.as_ref(),
+                    item_types: &item_types,
+                    library_ids: library_ids.as_deref(),
                     offset,
                     limit,
-                )
+                    content_restrictions: content_restrictions.as_ref(),
+                })
                 .await
             }
         }
@@ -2047,26 +2047,9 @@ impl CatalogService {
 
     async fn search_items_uncached(
         &self,
-        query: &str,
-        like_query: &str,
-        library_ids: Option<&[String]>,
-        item_types: &[String],
-        content_restrictions: Option<&UserContentRestrictions>,
-        offset: i64,
-        limit: i64,
+        search: CatalogSearchQuery<'_>,
     ) -> Result<CatalogPage, CatalogError> {
-        let (ids, total) = self
-            .database
-            .search_catalog_item_ids(
-                query,
-                like_query,
-                item_types,
-                library_ids,
-                offset,
-                limit,
-                content_restrictions,
-            )
-            .await?;
+        let (ids, total) = self.database.search_catalog_item_ids(&search).await?;
         let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
         let items_by_id = assemble_items(rows)
             .into_iter()
@@ -2086,8 +2069,8 @@ impl CatalogService {
         Ok(CatalogPage {
             items,
             total,
-            offset,
-            limit,
+            offset: search.offset,
+            limit: search.limit,
         })
     }
 }

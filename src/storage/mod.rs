@@ -1,4 +1,15 @@
 mod repository;
+
+pub(crate) struct CatalogSearchQuery<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) like_query: &'a str,
+    pub(crate) item_types: &'a [String],
+    pub(crate) library_ids: Option<&'a [String]>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+    pub(crate) content_restrictions: Option<&'a repository::UserContentRestrictions>,
+}
+
 // LUX-564 lands the cache foundation before S3a adds its first production caller.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod sql_templates;

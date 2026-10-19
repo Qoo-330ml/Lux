@@ -1,6 +1,6 @@
 use super::*;
 use crate::storage::{
-    GlobalMovieCollectionReference, GlobalMovieCollectionReferenceUpdate,
+    CatalogSearchQuery, GlobalMovieCollectionReference, GlobalMovieCollectionReferenceUpdate,
     StoredMovieNfoCollectionReferenceReconciliation, global_collection_title_fallback,
     global_collection_title_is_placeholder,
 };
@@ -906,28 +906,19 @@ impl Database {
 
     pub(crate) async fn search_catalog_item_ids(
         &self,
-        query: &str,
-        like_query: &str,
-        item_types: &[String],
-        library_ids: Option<&[String]>,
-        offset: i64,
-        limit: i64,
-        content_restrictions: Option<&UserContentRestrictions>,
+        search: &CatalogSearchQuery<'_>,
     ) -> Result<(Vec<String>, i64), StorageError> {
+        let query = search.query;
+        let like_query = search.like_query;
+        let item_types = search.item_types;
+        let library_ids = search.library_ids;
+        let offset = search.offset;
+        let limit = search.limit;
         if item_types.is_empty() {
             return Ok((Vec::new(), 0));
         }
         if self.backend == DatabaseBackend::Postgres {
-            return self
-                .search_catalog_item_ids_postgres(
-                    like_query,
-                    item_types,
-                    library_ids,
-                    offset,
-                    limit,
-                    content_restrictions,
-                )
-                .await;
+            return self.search_catalog_item_ids_postgres(search).await;
         }
 
         if let Some(library_ids) = library_ids
@@ -954,7 +945,7 @@ impl Database {
         append_content_restriction_predicate(
             &mut content_restriction_predicate,
             &mut content_restriction_binds,
-            content_restrictions,
+            search.content_restrictions,
         );
         let fts_query = format!(
             "SELECT mi.id FROM media_search
@@ -1046,13 +1037,13 @@ impl Database {
 
     async fn search_catalog_item_ids_postgres(
         &self,
-        like_query: &str,
-        item_types: &[String],
-        library_ids: Option<&[String]>,
-        offset: i64,
-        limit: i64,
-        content_restrictions: Option<&UserContentRestrictions>,
+        search: &CatalogSearchQuery<'_>,
     ) -> Result<(Vec<String>, i64), StorageError> {
+        let like_query = search.like_query;
+        let item_types = search.item_types;
+        let library_ids = search.library_ids;
+        let offset = search.offset;
+        let limit = search.limit;
         if let Some(library_ids) = library_ids
             && library_ids.is_empty()
         {
@@ -1077,7 +1068,7 @@ impl Database {
         append_content_restriction_predicate(
             &mut content_restriction_predicate,
             &mut content_restriction_binds,
-            content_restrictions,
+            search.content_restrictions,
         );
         let like_query_sql = format!(
             "SELECT mi.id FROM media_search ms
