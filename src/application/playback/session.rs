@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -13,8 +14,14 @@ use uuid::Uuid;
 
 use crate::storage::{
     Database, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
-    StoredWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim,
-    WebPlaybackTranscodingDetails,
+    StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+    UserPlaybackPolicy, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+};
+
+use crate::application::user_access_rules::{
+    IpBlacklistEvaluationError, MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST,
+    UserAccessBlacklistRuleType, ip_blacklist_rules_match_address,
+    normalize_user_access_blacklist_value,
 };
 
 use super::decision::{
@@ -109,6 +116,7 @@ pub(crate) enum WebPlaybackSessionError {
     NotFound,
     Expired,
     NotActive,
+    AccessRulesUnavailable,
     Hls(HlsError),
     Storage(StorageError),
 }
@@ -123,6 +131,9 @@ impl fmt::Display for WebPlaybackSessionError {
             Self::NotFound => formatter.write_str("web playback session not found"),
             Self::Expired => formatter.write_str("web playback session expired"),
             Self::NotActive => formatter.write_str("web playback session is not active"),
+            Self::AccessRulesUnavailable => {
+                formatter.write_str("user access rules are unavailable")
+            }
             Self::Hls(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
@@ -137,7 +148,8 @@ impl std::error::Error for WebPlaybackSessionError {
             | Self::PlaybackPolicyDenied
             | Self::NotFound
             | Self::Expired
-            | Self::NotActive => None,
+            | Self::NotActive
+            | Self::AccessRulesUnavailable => None,
             Self::Hls(error) => Some(error),
         }
     }
@@ -360,6 +372,29 @@ impl WebPlaybackSessionService {
         Ok(())
     }
 
+    pub(crate) async fn set_authorization_context(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        device_id: Option<&str>,
+        client_name: Option<&str>,
+    ) -> Result<(), WebPlaybackSessionError> {
+        if !self
+            .database
+            .set_web_playback_access_context(
+                session_id,
+                user_id,
+                device_id,
+                client_name,
+                unix_timestamp(),
+            )
+            .await?
+        {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        Ok(())
+    }
+
     pub(crate) fn sign_resource(
         &self,
         session_id: &str,
@@ -370,6 +405,26 @@ impl WebPlaybackSessionService {
             expires_at,
             signature: self.signer.sign(session_id, resource, expires_at)?,
         })
+    }
+
+    pub(crate) fn verify_resource_signature(
+        &self,
+        session_id: &str,
+        resource: &str,
+        expires_at: i64,
+        signature: &str,
+    ) -> Result<(), WebPlaybackSessionError> {
+        if self.signer.verify(
+            session_id,
+            resource,
+            expires_at,
+            signature,
+            unix_timestamp(),
+        ) {
+            Ok(())
+        } else {
+            Err(WebPlaybackSessionError::NotFound)
+        }
     }
 
     pub(crate) fn sign_emby_direct_stream(
@@ -426,13 +481,20 @@ impl WebPlaybackSessionService {
         expires_at: i64,
         signature: &str,
     ) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+        self.authorize_resource_with_ip(session_id, resource, expires_at, signature, None)
+            .await
+    }
+
+    pub(crate) async fn authorize_resource_with_ip(
+        &self,
+        session_id: &str,
+        resource: &str,
+        expires_at: i64,
+        signature: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+        self.verify_resource_signature(session_id, resource, expires_at, signature)?;
         let now = unix_timestamp();
-        if !self
-            .signer
-            .verify(session_id, resource, expires_at, signature, now)
-        {
-            return Err(WebPlaybackSessionError::NotFound);
-        }
         let Some(session) = self.database.find_web_playback_session(session_id).await? else {
             return Err(WebPlaybackSessionError::NotFound);
         };
@@ -442,6 +504,10 @@ impl WebPlaybackSessionService {
         if session.expires_at < now {
             let _ = self.hls.stop(session_id).await;
             return Err(WebPlaybackSessionError::Expired);
+        }
+        if session.play_session_id.starts_with("lux-web:") {
+            self.enforce_playback_access_rules(&session, client_ip)
+                .await?;
         }
         if session.plan == "SERVER_HLS" {
             let policy = self
@@ -461,6 +527,101 @@ impl WebPlaybackSessionService {
             }
         }
         Ok(session)
+    }
+
+    async fn enforce_playback_access_rules(
+        &self,
+        session: &StoredWebPlaybackSession,
+        client_ip: Option<IpAddr>,
+    ) -> Result<(), WebPlaybackSessionError> {
+        let context = self
+            .database
+            .find_web_playback_access_context(&session.id)
+            .await?
+            .ok_or(WebPlaybackSessionError::NotActive)?;
+        if context.user_id != session.user_id {
+            return Err(WebPlaybackSessionError::AccessRulesUnavailable);
+        }
+
+        let device_id = context.device_id.as_deref().map(|value| {
+            normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Device, value)
+                .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
+        });
+        let device_id = device_id.transpose()?;
+        let client_name = context.client_name.as_deref().map(|value| {
+            normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Client, value)
+                .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
+        });
+        let client_name = client_name.transpose()?;
+
+        if device_id.is_none() || client_name.is_none() {
+            let (device_rules_active, client_rules_active) = self
+                .database
+                .active_user_access_device_client_blacklist_rules(&session.user_id)
+                .await?;
+            if (device_id.is_none() && device_rules_active)
+                || (client_name.is_none() && client_rules_active)
+            {
+                self.stop_after_access_rule_rejection(session).await;
+                return Err(WebPlaybackSessionError::NotActive);
+            }
+        }
+
+        let device_id = device_id.as_deref();
+        let client_name = client_name.as_deref();
+        if self
+            .database
+            .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                user_id: &session.user_id,
+                device_id,
+                client_name,
+            })
+            .await?
+        {
+            self.stop_after_access_rule_rejection(session).await;
+            return Err(WebPlaybackSessionError::NotActive);
+        }
+
+        let ip_rules = self
+            .database
+            .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                user_id: &session.user_id,
+                limit: MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST as i64 + 1,
+            })
+            .await
+            .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
+        if ip_rules.is_empty() {
+            return Ok(());
+        }
+        let Some(client_ip) = client_ip else {
+            self.stop_after_access_rule_rejection(session).await;
+            return Err(WebPlaybackSessionError::AccessRulesUnavailable);
+        };
+        let matched = match ip_blacklist_rules_match_address(client_ip, &ip_rules) {
+            Ok(matched) => matched,
+            Err(
+                IpBlacklistEvaluationError::InvalidStoredRule
+                | IpBlacklistEvaluationError::TooManyRules,
+            ) => {
+                self.stop_after_access_rule_rejection(session).await;
+                return Err(WebPlaybackSessionError::AccessRulesUnavailable);
+            }
+        };
+        if matched {
+            self.stop_after_access_rule_rejection(session).await;
+            return Err(WebPlaybackSessionError::NotActive);
+        }
+        Ok(())
+    }
+
+    async fn stop_after_access_rule_rejection(&self, session: &StoredWebPlaybackSession) {
+        if let Err(error) = self.stop(&session.id, &session.user_id).await {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "failed to stop playback session after access rule rejection"
+            );
+        }
     }
 
     #[cfg(test)]

@@ -16085,6 +16085,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因上下文存取合同缺失而编译失败；新增 `web_playback_access_context_is_scoped_to_active_session` 1/1 通过，并在空 SQLite 数据库上应用完整 migration 集。`cargo build --locked`、fmt 与 diff check 通过。PostgreSQL migration 为对应的可空文本列；本任务没有 PostgreSQL runtime 验证。Cargo 使用 Toshiba target 目录。
 
+#### LUX-771：在已签发播放票据上执行访问黑名单
+
+范围：Lux Web 创建播放会话时，持久化经认证 Web 会话绑定的设备 ID 与 `Lux Web` 客户端名；只有历史空设备关联会话才回退到本次经过 UUID v4 校验的请求设备 ID。通过 Emby 用户 token 访问时，从已认证 token 读取设备/客户端，不接受请求头替换。每次访问 Lux Web 签名直放、Range 或 HLS 票据时，按会话保存的设备/客户端上下文及当前可信代理解析出的来源 IP 检查启用的全站/用户黑名单。命中后停止播放会话、释放准入并使该票据失效；未知设备/客户端但对应规则已启用、缺少 peer 但有活动 IP 规则时 fail closed。损坏、超限规则以及规则或可信代理读取错误返回服务不可用，不得放行。Emby HLS/转码资源和无状态直放签名 URL 不在本任务范围。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`src/storage/users.rs`、`tests/web_playback.rs`。
+
+验收标准：
+
+- [x] Lux Web 新签发的直放/HLS 票据保存认证会话绑定的设备与客户端上下文；请求头不能替换已绑定设备，只有历史 NULL 会话允许使用有效请求设备头；上下文写入失败时停止新会话且不返回票据。
+- [x] 每次 Lux Web 签名播放资源请求均检查会话签发时的设备/客户端规则和本次请求的可信来源 IP；命中撤销会话并返回已结束状态。
+- [x] 缺失设备/客户端上下文但存在相应规则、缺少 peer 但存在 IP 规则、损坏/超限规则均 fail closed；规则存储或可信代理读取错误返回 503。
+- [x] 覆盖设备、客户端、IP 命中、无 peer、坏规则与超限规则；`web_playback` 定向集成目标、Rust build、fmt 与 diff check 通过。
+
+短计划：先在 `tests/web_playback.rs` 建立多个已签发 Lux Web 票据在新增设备/客户端/IP 规则后的命中、撤销与 fail-closed 回归，并确认当前签名链接仍可用；再为新 Lux Web 会话写入校验后的上下文、在票据授权中检查规则并处理可信请求 IP；最后运行 `web_playback` 定向目标、build、fmt 与 diff check。
+
+验证：先确认已签发票据在新增设备规则后仍返回 200（TDD RED），并确认伪报设备回归在绑定设备被请求头替换时失败；修复后 `cargo test --locked --test web_playback` 1/1、`NO_PROXY=127.0.0.1,localhost cargo test --locked --test playback` 4/4、`cargo build --locked`、fmt 与 `git diff --check` 通过。完整 Rust all-targets 门禁为 1079 通过、4 失败、26 忽略：三项 fill-missing dispatch/retry 测试已在干净基线复现；`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 在未改动的 metadata 代码中单独复现。严格 Clippy 仍有 13 项既存诊断，均不在本任务新增代码。所有 Cargo 检查使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -53,6 +53,69 @@ async fn active_admission_count(
     .await
 }
 
+async fn create_direct_ticket(
+    client: &reqwest::Client,
+    base_url: &str,
+    cookies: &str,
+    csrf_cookie: &str,
+    item_id: &str,
+    source_id: &str,
+    device_id: Option<&str>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let mut request = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, cookies)
+        .header("x-csrf-token", csrf_cookie)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }));
+    if let Some(device_id) = device_id {
+        request = request.header("x-lux-device-id", device_id);
+    }
+    let response = request.send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.json::<Value>().await?;
+    Ok((
+        body["sessionId"]
+            .as_str()
+            .ok_or("missing test playback session id")?
+            .to_owned(),
+        body["plan"]["url"]
+            .as_str()
+            .ok_or("missing test playback resource URL")?
+            .to_owned(),
+    ))
+}
+
+async fn insert_global_access_rule(
+    database: &Database,
+    rule_id: &str,
+    rule_type: &str,
+    match_value: &str,
+    created_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by
+         ) VALUES (?, NULL, ?, ?, 1, ?)",
+    )
+    .bind(rule_id)
+    .bind(rule_type)
+    .bind(match_value)
+    .bind(created_by)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -223,16 +286,27 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth)
-            .with_hls_executable(fake_ffmpeg)
-            .with_strm_playback_resolver(strm_resolver),
-    );
+    let state = AppState::ready(config, database.clone(), setup, auth, emby_auth)
+        .with_hls_executable(fake_ffmpeg)
+        .with_strm_playback_resolver(strm_resolver);
+    let app = app_with_state(state.clone());
+    let peer_app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
+    let peer_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let peer_address = peer_listener.local_addr()?;
+    let peer_server = tokio::spawn(async move {
+        axum::serve(
+            peer_listener,
+            peer_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let peer_base_url = format!("http://{peer_address}");
+    let peer_client = reqwest::Client::new();
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -1026,7 +1100,419 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
             )
     );
 
+    sqlx::query("UPDATE users SET can_play = 1, max_simultaneous_playbacks = 0 WHERE id = ?")
+        .bind(&admin_id)
+        .execute(database.pool())
+        .await?;
+    let device_ids = (0..6)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    let mut tickets = Vec::new();
+    for device_id in &device_ids {
+        tickets.push(
+            create_direct_ticket(
+                &client,
+                &base_url,
+                &cookies,
+                &csrf_cookie,
+                &item_id,
+                &source_id,
+                Some(device_id),
+            )
+            .await?,
+        );
+    }
+    for (index, (session_id, _)) in tickets.iter().enumerate() {
+        let access_context: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT authorization_device_id, authorization_client_name
+             FROM web_playback_sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            access_context.0.as_deref(),
+            Some(device_ids[index].as_str())
+        );
+        assert_eq!(access_context.1.as_deref(), Some("Lux Web"));
+    }
+    let missing_device_ticket = create_direct_ticket(
+        &client,
+        &base_url,
+        &cookies,
+        &csrf_cookie,
+        &item_id,
+        &source_id,
+        None,
+    )
+    .await?;
+    let missing_client_ticket = create_direct_ticket(
+        &client,
+        &base_url,
+        &cookies,
+        &csrf_cookie,
+        &item_id,
+        &source_id,
+        Some(&uuid::Uuid::new_v4().to_string()),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE web_playback_sessions SET authorization_device_id = NULL
+         WHERE id = ?",
+    )
+    .bind(&missing_device_ticket.0)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE web_playback_sessions
+         SET authorization_device_id = NULL, authorization_client_name = NULL
+         WHERE id = ?",
+    )
+    .bind(&missing_client_ticket.0)
+    .execute(database.pool())
+    .await?;
+
+    insert_global_access_rule(
+        &database,
+        "web-playback-device-rule",
+        "DEVICE",
+        &device_ids[0],
+        &admin_id,
+    )
+    .await?;
+    let blocked_device = client
+        .get(format!("{base_url}{}", tickets[0].1))
+        .send()
+        .await?;
+    assert_eq!(blocked_device.status(), reqwest::StatusCode::GONE);
+    let blocked_device_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(&tickets[0].0)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(blocked_device_state, "STOPPED");
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-device-rule")
+        .execute(database.pool())
+        .await?;
+
+    insert_global_access_rule(
+        &database,
+        "web-playback-unknown-device-rule",
+        "DEVICE",
+        "unknown-device-that-cannot-match",
+        &admin_id,
+    )
+    .await?;
+    let unknown_device = client
+        .get(format!("{base_url}{}", missing_device_ticket.1))
+        .send()
+        .await?;
+    assert_eq!(unknown_device.status(), reqwest::StatusCode::GONE);
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-unknown-device-rule")
+        .execute(database.pool())
+        .await?;
+
+    insert_global_access_rule(
+        &database,
+        "web-playback-client-rule",
+        "CLIENT",
+        "lux web",
+        &admin_id,
+    )
+    .await?;
+    let blocked_client = client
+        .get(format!("{base_url}{}", tickets[1].1))
+        .send()
+        .await?;
+    assert_eq!(blocked_client.status(), reqwest::StatusCode::GONE);
+    let unknown_client = client
+        .get(format!("{base_url}{}", missing_client_ticket.1))
+        .send()
+        .await?;
+    assert_eq!(unknown_client.status(), reqwest::StatusCode::GONE);
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-client-rule")
+        .execute(database.pool())
+        .await?;
+
+    insert_global_access_rule(
+        &database,
+        "web-playback-ip-rule",
+        "IP_CIDR",
+        "127.0.0.1/32",
+        &admin_id,
+    )
+    .await?;
+    let blocked_ip = peer_client
+        .get(format!("{peer_base_url}{}", tickets[2].1))
+        .send()
+        .await?;
+    assert_eq!(blocked_ip.status(), reqwest::StatusCode::GONE);
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-ip-rule")
+        .execute(database.pool())
+        .await?;
+
+    insert_global_access_rule(
+        &database,
+        "web-playback-missing-peer-rule",
+        "IP_CIDR",
+        "0.0.0.0/0",
+        &admin_id,
+    )
+    .await?;
+    let missing_peer = client
+        .get(format!("{base_url}{}", tickets[3].1))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_peer.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-missing-peer-rule")
+        .execute(database.pool())
+        .await?;
+
+    insert_global_access_rule(
+        &database,
+        "web-playback-corrupt-ip-rule",
+        "IP_CIDR",
+        "not-a-cidr",
+        &admin_id,
+    )
+    .await?;
+    let corrupt_rule = peer_client
+        .get(format!("{peer_base_url}{}", tickets[4].1))
+        .send()
+        .await?;
+    assert_eq!(
+        corrupt_rule.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-corrupt-ip-rule")
+        .execute(database.pool())
+        .await?;
+
+    for index in 0..201_u32 {
+        let address = std::net::Ipv4Addr::from(0x0a00_0000_u32 + index);
+        insert_global_access_rule(
+            &database,
+            &format!("web-playback-overflow-ip-rule-{index}"),
+            "IP_CIDR",
+            &format!("{address}/32"),
+            &admin_id,
+        )
+        .await?;
+    }
+    let overflow_rules = peer_client
+        .get(format!("{peer_base_url}{}", tickets[5].1))
+        .send()
+        .await?;
+    assert_eq!(
+        overflow_rules.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    sqlx::query(
+        "DELETE FROM user_access_blacklist_rules
+         WHERE id LIKE 'web-playback-overflow-ip-rule-%'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "UPDATE users SET can_play = 1, max_simultaneous_playbacks = 0,
+             allow_remux = 0, allow_audio_transcode = 1, allow_video_transcode = 0
+         WHERE id = ?",
+    )
+    .bind(&admin_id)
+    .execute(database.pool())
+    .await?;
+    let hls_device_id = uuid::Uuid::new_v4().to_string();
+    let hls_ticket = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .header("x-lux-device-id", &hls_device_id)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(hls_ticket.status(), reqwest::StatusCode::OK);
+    let hls_ticket = hls_ticket.json::<Value>().await?;
+    let hls_ticket_id = hls_ticket["sessionId"]
+        .as_str()
+        .ok_or("missing blacklisted HLS session id")?;
+    let hls_manifest_url = hls_ticket["plan"]["manifestUrl"]
+        .as_str()
+        .ok_or("missing blacklisted HLS manifest URL")?;
+    insert_global_access_rule(
+        &database,
+        "web-playback-hls-client-rule",
+        "CLIENT",
+        "lux web",
+        &admin_id,
+    )
+    .await?;
+    let blocked_hls = peer_client
+        .get(format!("{peer_base_url}{hls_manifest_url}"))
+        .send()
+        .await?;
+    assert_eq!(blocked_hls.status(), reqwest::StatusCode::GONE);
+    let blocked_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(hls_ticket_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(blocked_hls_state, "STOPPED");
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-hls-client-rule")
+        .execute(database.pool())
+        .await?;
+
+    let range_device_id = uuid::Uuid::new_v4().to_string();
+    let range_ticket = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .header("x-lux-device-id", &range_device_id)
+        .json(&json!({
+            "itemId": strm_item_id,
+            "sourceId": strm_source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(range_ticket.status(), reqwest::StatusCode::OK);
+    let range_ticket = range_ticket.json::<Value>().await?;
+    let range_session_id = range_ticket["sessionId"]
+        .as_str()
+        .ok_or("missing blacklisted range session id")?;
+    let range_url = range_ticket["plan"]["rangeUrl"]
+        .as_str()
+        .ok_or("missing blacklisted range URL")?;
+    insert_global_access_rule(
+        &database,
+        "web-playback-range-client-rule",
+        "CLIENT",
+        "lux web",
+        &admin_id,
+    )
+    .await?;
+    let blocked_range = peer_client
+        .get(format!("{peer_base_url}{range_url}"))
+        .header("Range", "bytes=0-3")
+        .send()
+        .await?;
+    assert_eq!(blocked_range.status(), reqwest::StatusCode::GONE);
+    let blocked_range_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(range_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(blocked_range_state, "STOPPED");
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-range-client-rule")
+        .execute(database.pool())
+        .await?;
+
+    let bound_device_id = uuid::Uuid::new_v4().to_string();
+    let bound_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("x-lux-device-id", &bound_device_id)
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(bound_login.status(), reqwest::StatusCode::OK);
+    let bound_session_cookie =
+        cookie_value(bound_login.headers(), "lux_session").ok_or("missing bound session")?;
+    let bound_csrf_cookie =
+        cookie_value(bound_login.headers(), "lux_csrf").ok_or("missing bound csrf")?;
+    let bound_cookies = format!("lux_session={bound_session_cookie}; lux_csrf={bound_csrf_cookie}");
+    let spoofed_device_id = uuid::Uuid::new_v4().to_string();
+    let bound_ticket = create_direct_ticket(
+        &client,
+        &base_url,
+        &bound_cookies,
+        &bound_csrf_cookie,
+        &item_id,
+        &source_id,
+        Some(&spoofed_device_id),
+    )
+    .await?;
+    let bound_context: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT authorization_device_id, authorization_client_name
+         FROM web_playback_sessions WHERE id = ?",
+    )
+    .bind(&bound_ticket.0)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(bound_context.0.as_deref(), Some(bound_device_id.as_str()));
+    assert_eq!(bound_context.1.as_deref(), Some("Lux Web"));
+    insert_global_access_rule(
+        &database,
+        "web-playback-bound-device-rule",
+        "DEVICE",
+        &bound_device_id,
+        &admin_id,
+    )
+    .await?;
+    let bound_device_rejected = client
+        .get(format!("{base_url}{}", bound_ticket.1))
+        .send()
+        .await?;
+    assert_eq!(bound_device_rejected.status(), reqwest::StatusCode::GONE);
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("web-playback-bound-device-rule")
+        .execute(database.pool())
+        .await?;
+
+    let proxy_context_ticket = create_direct_ticket(
+        &client,
+        &base_url,
+        &cookies,
+        &csrf_cookie,
+        &item_id,
+        &source_id,
+        Some(&uuid::Uuid::new_v4().to_string()),
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('trusted_proxy_cidrs', 'invalid-json')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await?;
+    let proxy_settings_error = peer_client
+        .get(format!("{peer_base_url}{}", proxy_context_ticket.1))
+        .send()
+        .await?;
+    assert_eq!(
+        proxy_settings_error.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+
     server.abort();
+    peer_server.abort();
     receiver_server.abort();
     strm_proxy.await?;
     Ok(())

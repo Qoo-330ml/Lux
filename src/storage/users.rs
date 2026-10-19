@@ -1941,6 +1941,41 @@ impl Database {
         })
     }
 
+    pub(crate) async fn active_user_access_device_client_blacklist_rules(
+        &self,
+        user_id: &str,
+    ) -> Result<(bool, bool), StorageError> {
+        self.query(
+            "SELECT
+                 EXISTS (
+                     SELECT 1 FROM user_access_blacklist_rules
+                     WHERE is_enabled = 1
+                       AND rule_type = 'DEVICE'
+                       AND (user_id IS NULL OR user_id = ?)
+                 ) AS has_device_rules,
+                 EXISTS (
+                     SELECT 1 FROM user_access_blacklist_rules
+                     WHERE is_enabled = 1
+                       AND rule_type = 'CLIENT'
+                       AND (user_id IS NULL OR user_id = ?)
+                 ) AS has_client_rules",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|row| {
+            (
+                row.get::<i64, _>("has_device_rules") != 0,
+                row.get::<i64, _>("has_client_rules") != 0,
+            )
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     // LUX-765 loads at most 201 active global and user IP rules so callers can
     // fail closed if the supported per-request evaluation bound is exceeded.
     #[allow(dead_code)]

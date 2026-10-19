@@ -1100,6 +1100,7 @@ fn emby_playback_session_error_status(error: WebPlaybackSessionError) -> StatusC
         WebPlaybackSessionError::PlaybackPolicyDenied => StatusCode::FORBIDDEN,
         WebPlaybackSessionError::NotFound => StatusCode::NOT_FOUND,
         WebPlaybackSessionError::Expired | WebPlaybackSessionError::NotActive => StatusCode::GONE,
+        WebPlaybackSessionError::AccessRulesUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         WebPlaybackSessionError::Hls(_) => StatusCode::BAD_GATEWAY,
         WebPlaybackSessionError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
@@ -2577,6 +2578,11 @@ pub(super) fn web_playback_error(headers: &HeaderMap, error: WebPlaybackSessionE
             lux::ApiErrorCode::NotFound,
             "播放会话已结束".to_owned(),
         ),
+        WebPlaybackSessionError::AccessRulesUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "播放授权暂时不可用".to_owned(),
+        ),
         WebPlaybackSessionError::Hls(_) => (
             StatusCode::BAD_GATEWAY,
             lux::ApiErrorCode::Internal,
@@ -2589,6 +2595,96 @@ pub(super) fn web_playback_error(headers: &HeaderMap, error: WebPlaybackSessionE
         ),
     };
     api_error(headers, status, code, &message).into_response()
+}
+
+async fn authorize_web_playback_resource(
+    headers: &HeaderMap,
+    state: &AppState,
+    service: &WebPlaybackSessionService,
+    session_id: &str,
+    resource: &str,
+    expires_at: i64,
+    signature: &str,
+) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+    service.verify_resource_signature(session_id, resource, expires_at, signature)?;
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
+    service
+        .authorize_resource_with_ip(session_id, resource, expires_at, signature, client_ip)
+        .await
+}
+
+fn web_playback_device_id(headers: &HeaderMap) -> Option<String> {
+    let device_id = headers
+        .get("x-lux-device-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())?;
+    (device_id.get_version_num() == 4).then(|| device_id.to_string())
+}
+
+async fn web_playback_authorization_context(
+    headers: &HeaderMap,
+    state: &AppState,
+    expected_user_id: &str,
+) -> Result<(Option<String>, Option<String>), WebPlaybackSessionError> {
+    if let Some(session_token) = super::request_cookie(headers, "lux_session") {
+        let auth = state
+            .auth
+            .as_ref()
+            .ok_or(WebPlaybackSessionError::AccessRulesUnavailable)?;
+        let client_ip = super::request_access_ip(headers, state)
+            .await
+            .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
+        let session = auth
+            .resolve_with_ip(&session_token, client_ip)
+            .await
+            .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?
+            .ok_or(WebPlaybackSessionError::NotFound)?;
+        if session.user.id.to_string() != expected_user_id {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        let device_id = session
+            .device_id
+            .or_else(|| web_playback_device_id(headers));
+        return Ok((device_id, Some("Lux Web".to_owned())));
+    }
+
+    let token = emby_token_from_headers(headers).or_else(|| {
+        headers
+            .get("X-Lux-Token")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .map(|value| value.strip_prefix("Bearer ").unwrap_or(value).trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let Some(token) = token else {
+        return Err(WebPlaybackSessionError::NotFound);
+    };
+    let auth = state
+        .emby_auth
+        .as_ref()
+        .ok_or(WebPlaybackSessionError::AccessRulesUnavailable)?;
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
+    let user = auth
+        .resolve_token_with_ip(&token, client_ip)
+        .await
+        .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?
+        .ok_or(WebPlaybackSessionError::NotFound)?;
+    if user.id.to_string() != expected_user_id {
+        return Err(WebPlaybackSessionError::NotFound);
+    }
+    let device = auth
+        .device_info(&token)
+        .await
+        .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?
+        .ok_or(WebPlaybackSessionError::NotFound)?;
+    let device_id = (!device.device_id.trim().is_empty()).then_some(device.device_id);
+    let client_name = (!device.client.trim().is_empty()).then_some(device.client);
+    Ok((device_id, client_name))
 }
 
 pub(super) fn web_playback_resource_url(
@@ -3392,9 +3488,10 @@ async fn create_web_playback_session_json(
         // server-side playback session.
         capabilities.direct_play = false;
     }
+    let user_id = user.id.to_string();
     let created = service
         .create(CreateWebPlaybackSession {
-            user_id: &user.id.to_string(),
+            user_id: &user_id,
             is_admin: user.is_admin,
             item_id,
             media_source_id: &source.source_id,
@@ -3404,20 +3501,42 @@ async fn create_web_playback_session_json(
         })
         .await
         .map_err(|error| web_playback_error(headers, error))?;
+    if !created.id.is_empty() {
+        let (device_id, client_name) =
+            match web_playback_authorization_context(headers, state, &user_id).await {
+                Ok(context) => context,
+                Err(error) => {
+                    let _ = service.stop(&created.id, &user_id).await;
+                    return Err(web_playback_error(headers, error));
+                }
+            };
+        if let Err(error) = service
+            .set_authorization_context(
+                &created.id,
+                &user_id,
+                device_id.as_deref(),
+                client_name.as_deref(),
+            )
+            .await
+        {
+            let _ = service.stop(&created.id, &user_id).await;
+            return Err(web_playback_error(headers, error));
+        }
+    }
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
         if source.source_kind != "LOCAL_FILE" {
-            let _ = service.stop(&created.id, &user.id.to_string()).await;
+            let _ = service.stop(&created.id, &user_id).await;
             return Err(StatusCode::NOT_IMPLEMENTED.into_response());
         }
         let input = match canonical_local_media_path(&source.root_path, &source.relative_path).await
         {
             Ok(path) => path,
             Err(LocalPathError::Missing) => {
-                let _ = service.stop(&created.id, &user.id.to_string()).await;
+                let _ = service.stop(&created.id, &user_id).await;
                 return Err(StatusCode::NOT_FOUND.into_response());
             }
             Err(LocalPathError::Forbidden) => {
-                let _ = service.stop(&created.id, &user.id.to_string()).await;
+                let _ = service.stop(&created.id, &user_id).await;
                 return Err(StatusCode::FORBIDDEN.into_response());
             }
         };
@@ -3425,7 +3544,7 @@ async fn create_web_playback_session_json(
             .start_hls_with_audio(&created.id, *tier, &input, None, None, audio_stream_index)
             .await
         {
-            let _ = service.stop(&created.id, &user.id.to_string()).await;
+            let _ = service.stop(&created.id, &user_id).await;
             return Err(web_playback_error(headers, error));
         }
     }
@@ -3701,9 +3820,16 @@ pub(super) async fn lux_web_playback_direct(
     let Some(service) = state.web_playback.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let session = match service
-        .authorize_resource(&session_id, "direct", query.expires, &query.signature)
-        .await
+    let session = match authorize_web_playback_resource(
+        &headers,
+        &state,
+        service,
+        &session_id,
+        "direct",
+        query.expires,
+        &query.signature,
+    )
+    .await
     {
         Ok(session) => session,
         Err(error) => return web_playback_error(&headers, error),
@@ -3744,9 +3870,16 @@ pub(super) async fn lux_web_playback_range(
     let Some(service) = state.web_playback.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let session = match service
-        .authorize_resource(&session_id, "range", query.expires, &query.signature)
-        .await
+    let session = match authorize_web_playback_resource(
+        &headers,
+        &state,
+        service,
+        &session_id,
+        "range",
+        query.expires,
+        &query.signature,
+    )
+    .await
     {
         Ok(session) => session,
         Err(error) => return web_playback_error(&headers, error),
@@ -3839,9 +3972,16 @@ pub(super) async fn lux_web_playback_hls(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let resource = format!("hls:{asset}");
-    let session = match service
-        .authorize_resource(&session_id, &resource, query.expires, &query.signature)
-        .await
+    let session = match authorize_web_playback_resource(
+        &headers,
+        &state,
+        service,
+        &session_id,
+        &resource,
+        query.expires,
+        &query.signature,
+    )
+    .await
     {
         Ok(session) => session,
         Err(error) => return web_playback_error(&headers, error),
