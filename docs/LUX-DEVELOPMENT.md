@@ -13722,6 +13722,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增账户偏好 application 服务，缺少服务端记录时返回 dark/silver、首页区块开启、原始音轨/简体中文、自动连播、版本 0 和空更新时间；写入校验主题、强调色、非负版本和最长 64 字符且无控制字符的语言值，再调用版本 CAS。新增默认读取、成功写入、过期版本、无效字段及回收站用户回归，`user_account_preferences` 4/4 通过；`cargo build --locked`、fmt check 与 diff check 通过。全目标 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断；以 `-A clippy::too_many_arguments` 排除这两项后，lib/all-features Clippy 通过。全目标测试为 1004 passed、5 failed、25 ignored；失败项 `stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`local_metadata_worker_dispatches_fill_missing_without_blocking_scan`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost` 均在先前任务的全目标门禁中记录过，本次与账户偏好无关联。
 
+#### LUX-655：开放当前用户账户偏好 API
+
+范围：新增当前用户账户偏好的 GET/PATCH API，GET 返回服务层默认值或已保存快照，PATCH 接收完整偏好和 `expectedVersion`，要求用户会话与 CSRF，并将非法偏好、版本冲突、不可用账号和数据库故障映射为稳定 HTTP 错误。不修改现有播放阈值与媒体库排序设置 API，也不接 Web 客户端。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`src/api/lux/mod.rs`、`tests/user_settings.rs`。
+
+验收标准：
+
+- [x] `GET /api/v1/auth/account-preferences` 返回当前用户完整偏好、版本和更新时间。
+- [x] `PATCH /api/v1/auth/account-preferences` 要求 CSRF，版本 0 可首次写入，匹配版本更新成功；陈旧版本返回 `VERSION_CONFLICT`。
+- [x] 非法字段返回 400、账号不可用返回 404、数据库错误返回 503；未认证与缺少 CSRF 请求被拒绝。
+- [x] `user_settings` 集成 target、API 文档、Rust build、格式和 diff check 通过。
+
+短计划：先添加默认读取、首次写入、冲突、非法值、CSRF 和认证回归并确认端点缺失；再接入 application 服务和稳定错误映射，最后同步 API 文档。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test user_settings`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-654。
+
+结果（2026-10-19）：新增当前用户账户偏好 GET/PATCH 端点，GET 返回应用服务快照；PATCH 要求当前用户和 CSRF，通过完整字段及 `expectedVersion` 写入并在成功后失效首页缓存。错误映射为 400、404、503 或 409 `VERSION_CONFLICT`，新增稳定 API 错误码。`user_settings` 2/2、Rust build、fmt check 和 diff check 通过；测试覆盖未认证、默认值、缺少 CSRF、首次写入、陈旧版本、无效主题及数据库故障。全目标 Clippy 仍被未修改的两个 `too_many_arguments` 函数阻断；允许该既有 lint 后的 lib/all-features Clippy 通过。公开合同已加入 `docs/API.md`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

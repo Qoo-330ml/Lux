@@ -6,6 +6,10 @@ use crate::{
         DEFAULT_LOGIN_BACKGROUND_SOURCE, RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE,
         is_valid_login_background_source, login_background_plugin_id,
     },
+    application::user_account_preferences::{
+        AccountPreferencesError, UpdateAccountPreferences, get_account_preferences,
+        update_account_preferences,
+    },
     auth::sessions::AuthenticatedSession,
     security::{
         DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
@@ -1388,6 +1392,76 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
     .into_response()
 }
 
+pub(super) async fn auth_account_preferences(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => Json(preferences).into_response(),
+        Err(error) => account_preferences_error(&headers, error),
+    }
+}
+
+pub(super) async fn auth_update_account_preferences(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAccountPreferences>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match update_account_preferences(database, &user.id.to_string(), request).await {
+        Ok(preferences) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
+            state.user_events.publish_home_coalesced().await;
+            Json(preferences).into_response()
+        }
+        Err(error) => account_preferences_error(&headers, error),
+    }
+}
+
+fn account_preferences_error(headers: &HeaderMap, error: AccountPreferencesError) -> Response {
+    let (status, code, message) = match error {
+        AccountPreferencesError::InvalidPreferences => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "账户偏好设置无效",
+        ),
+        AccountPreferencesError::VersionConflict => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "账户偏好已在其他页面更新，请重新加载后重试",
+        ),
+        AccountPreferencesError::UserUnavailable => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "账户不可用",
+        ),
+        AccountPreferencesError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "账户偏好暂时不可用",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AuthSettingsPatch {
@@ -2229,6 +2303,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/settings",
             get(users::auth_settings).patch(users::auth_update_settings),
+        )
+        .route(
+            "/api/v1/auth/account-preferences",
+            get(users::auth_account_preferences).patch(users::auth_update_account_preferences),
         )
         .route("/api/v1/auth/password", patch(users::auth_update_password))
         .route(
