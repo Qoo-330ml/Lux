@@ -2,8 +2,8 @@ use super::*;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 use crate::storage::{
     ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserAccountPreferences,
-    UserAccountPreferences, UserAccountPreferencesCasResult, UserPermissionCopySnapshot,
-    UserPlaybackPolicy,
+    UserAccountPreferences, UserAccountPreferencesCasResult, UserPermissionCopyGroups,
+    UserPermissionCopyResult, UserPermissionCopySnapshot, UserPlaybackPolicy,
 };
 
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
 const MAX_PERMISSION_COPY_USER_IDS: usize = 101;
+const PERMISSION_COPY_LIBRARY_QUERY_CHUNK_SIZE: usize = 500;
 
 fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
     value
@@ -1905,6 +1906,29 @@ impl Database {
         library_ids: &[String],
     ) -> Result<bool, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let updated = self
+            .query(
+                "UPDATE users SET library_access_mode = ?, updated_at = unixepoch()
+                 WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(mode)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
         self.query("DELETE FROM user_library_access WHERE user_id = ?")
             .bind(user_id)
             .execute(&mut *transaction)
@@ -1928,26 +1952,6 @@ impl Database {
                     source,
                 })?;
             }
-        }
-        let updated = self
-            .query("UPDATE users SET library_access_mode = ? WHERE id = ?")
-            .bind(mode)
-            .bind(user_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if updated.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(false);
         }
         transaction
             .commit()
@@ -2657,7 +2661,24 @@ impl Database {
                     source,
                 })?;
         }
+        let snapshots = self
+            .user_permission_copy_snapshots_in_transaction(user_ids, &mut transaction)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(snapshots)
+    }
 
+    async fn user_permission_copy_snapshots_in_transaction(
+        &self,
+        user_ids: &[String],
+        transaction: &mut sqlx::Transaction<'_, Any>,
+    ) -> Result<HashMap<String, UserPermissionCopySnapshot>, StorageError> {
         let placeholders = vec!["?"; user_ids.len()].join(", ");
         let user_sql = format!(
             "SELECT id, library_access_mode, can_download, can_play,
@@ -2670,7 +2691,7 @@ impl Database {
             user_query = user_query.bind(user_id);
         }
         let user_rows = user_query
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -2701,7 +2722,8 @@ impl Database {
             "SELECT access.user_id, access.library_id
              FROM user_library_access access
              INNER JOIN users ON users.id = access.user_id AND users.deleted_at IS NULL
-             WHERE access.can_view = 1 AND access.user_id IN ({placeholders})
+             WHERE access.can_view = 1 AND users.library_access_mode = 'SELECTED'
+               AND access.user_id IN ({placeholders})
              ORDER BY access.user_id, access.library_id"
         );
         let mut library_query = self.query(sqlx::AssertSqlSafe(library_sql));
@@ -2709,7 +2731,7 @@ impl Database {
             library_query = library_query.bind(user_id);
         }
         for row in library_query
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -2741,7 +2763,7 @@ impl Database {
         }
         let mut restrictions_by_user = HashMap::<String, UserContentRestrictions>::new();
         for row in restrictions_query
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -2780,6 +2802,185 @@ impl Database {
             }
         }
 
+        Ok(snapshots)
+    }
+
+    // LUX-709 writes one target's selected permission groups as a compare-and-swap transaction.
+    #[allow(dead_code)]
+    pub(crate) async fn copy_user_permission_groups(
+        &self,
+        source_user_id: &str,
+        expected_source: &UserPermissionCopySnapshot,
+        target_user_id: &str,
+        expected_target: &UserPermissionCopySnapshot,
+        groups: UserPermissionCopyGroups,
+    ) -> Result<UserPermissionCopyResult, StorageError> {
+        if groups.is_empty() || source_user_id == target_user_id {
+            return Ok(UserPermissionCopyResult::InvalidSnapshot);
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        if self.backend() == crate::config::DatabaseBackend::Postgres {
+            let mut lock_ids = vec![source_user_id.to_owned(), target_user_id.to_owned()];
+            lock_ids.sort_unstable();
+            let lock_sql =
+                format!("SELECT id FROM users WHERE id IN (?, ?) ORDER BY id FOR UPDATE");
+            let lock_query = self
+                .query(sqlx::AssertSqlSafe(lock_sql))
+                .bind(&lock_ids[0])
+                .bind(&lock_ids[1]);
+            lock_query
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let user_ids = vec![source_user_id.to_owned(), target_user_id.to_owned()];
+        let mut snapshots = self
+            .user_permission_copy_snapshots_in_transaction(&user_ids, &mut transaction)
+            .await?;
+        let Some(source) = snapshots.remove(source_user_id) else {
+            return Ok(UserPermissionCopyResult::UserUnavailable);
+        };
+        let Some(target) = snapshots.remove(target_user_id) else {
+            return Ok(UserPermissionCopyResult::UserUnavailable);
+        };
+        if !permission_copy_groups_match(&source, expected_source, groups)
+            || !permission_copy_groups_match(&target, expected_target, groups)
+        {
+            return Ok(UserPermissionCopyResult::Conflict);
+        }
+
+        if groups.library {
+            let library_access_is_valid = match source.library_access_mode.as_str() {
+                "ALL" | "NONE" => source.library_ids.is_empty(),
+                "SELECTED" => {
+                    !source.library_ids.is_empty()
+                        && source.library_ids.iter().collect::<HashSet<_>>().len()
+                            == source.library_ids.len()
+                }
+                _ => false,
+            };
+            if !library_access_is_valid {
+                return Ok(UserPermissionCopyResult::InvalidSnapshot);
+            }
+            if source.library_access_mode == "SELECTED" {
+                let mut available = 0_i64;
+                for library_chunk in source
+                    .library_ids
+                    .chunks(PERMISSION_COPY_LIBRARY_QUERY_CHUNK_SIZE)
+                {
+                    let placeholders = vec!["?"; library_chunk.len()].join(", ");
+                    let library_sql = format!(
+                        "SELECT COUNT(*) FROM libraries
+                         WHERE id IN ({placeholders}) AND is_enabled = 1
+                           AND system_kind IS NULL
+                           AND kind IN ('MOVIE', 'SERIES', 'MIXED', 'HOMEVIDEOS')"
+                    );
+                    let mut library_query =
+                        self.query_scalar::<i64>(sqlx::AssertSqlSafe(library_sql));
+                    for library_id in library_chunk {
+                        library_query = library_query.bind(library_id);
+                    }
+                    available +=
+                        library_query
+                            .fetch_one(&mut *transaction)
+                            .await
+                            .map_err(|source| StorageError::Sqlx {
+                                path: self.path.clone(),
+                                source,
+                            })?;
+                }
+                if available != source.library_ids.len() as i64 {
+                    return Ok(UserPermissionCopyResult::InvalidSnapshot);
+                }
+            }
+
+            let updated = self
+                .query(
+                    "UPDATE users SET library_access_mode = ?, updated_at = unixepoch()
+                     WHERE id = ? AND deleted_at IS NULL",
+                )
+                .bind(&source.library_access_mode)
+                .bind(target_user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() != 1 {
+                return Ok(UserPermissionCopyResult::UserUnavailable);
+            }
+            self.query("DELETE FROM user_library_access WHERE user_id = ?")
+                .bind(target_user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if source.library_access_mode == "SELECTED" {
+                for library_id in &source.library_ids {
+                    self.query(
+                        "INSERT INTO user_library_access (user_id, library_id, can_view)
+                         VALUES (?, ?, 1)",
+                    )
+                    .bind(target_user_id)
+                    .bind(library_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                }
+            }
+        }
+
+        if groups.playback {
+            let updated = self
+                .query(
+                    "UPDATE users
+                     SET can_download = ?, can_play = ?, max_simultaneous_playbacks = ?,
+                         allow_remux = ?, allow_audio_transcode = ?, allow_video_transcode = ?,
+                         updated_at = unixepoch()
+                     WHERE id = ? AND deleted_at IS NULL",
+                )
+                .bind(database_flag(source.can_download))
+                .bind(database_flag(source.playback_policy.can_play))
+                .bind(source.playback_policy.max_simultaneous_playbacks)
+                .bind(database_flag(source.playback_policy.allow_remux))
+                .bind(database_flag(source.playback_policy.allow_audio_transcode))
+                .bind(database_flag(source.playback_policy.allow_video_transcode))
+                .bind(target_user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() != 1 {
+                return Ok(UserPermissionCopyResult::UserUnavailable);
+            }
+        }
+
+        if groups.content
+            && !self
+                .copy_user_content_restrictions_in_transaction(
+                    target_user_id,
+                    target.content_restrictions.as_ref(),
+                    source.content_restrictions.as_ref(),
+                    &mut transaction,
+                )
+                .await?
+        {
+            return Ok(UserPermissionCopyResult::Conflict);
+        }
+
         transaction
             .commit()
             .await
@@ -2787,7 +2988,118 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(snapshots)
+        Ok(UserPermissionCopyResult::Updated)
+    }
+
+    async fn copy_user_content_restrictions_in_transaction(
+        &self,
+        target_user_id: &str,
+        target: Option<&UserContentRestrictions>,
+        source: Option<&UserContentRestrictions>,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+    ) -> Result<bool, StorageError> {
+        match source {
+            Some(source) => {
+                let next_version = match target {
+                    Some(target) => target.version.checked_add(1),
+                    None => Some(1),
+                }
+                .ok_or_else(|| {
+                    StorageError::Conflict(
+                        "user content restriction version is exhausted".to_owned(),
+                    )
+                })?;
+                let result = if let Some(target) = target {
+                    self.query(
+                        "UPDATE user_content_restrictions
+                         SET rating_system = ?, maximum_rating = ?, allow_unrated = ?,
+                             version = ?, updated_at = unixepoch()
+                         WHERE user_id = ? AND version = ?",
+                    )
+                    .bind(&source.rating_system)
+                    .bind(&source.maximum_rating)
+                    .bind(database_flag(source.allow_unrated))
+                    .bind(next_version)
+                    .bind(target_user_id)
+                    .bind(target.version)
+                    .execute(&mut **transaction)
+                    .await
+                } else {
+                    self.query(
+                        "INSERT INTO user_content_restrictions (
+                            user_id, rating_system, maximum_rating, allow_unrated, version, updated_at
+                         )
+                         SELECT ?, ?, ?, ?, 1, unixepoch()
+                         WHERE EXISTS (
+                            SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
+                         )",
+                    )
+                    .bind(target_user_id)
+                    .bind(&source.rating_system)
+                    .bind(&source.maximum_rating)
+                    .bind(database_flag(source.allow_unrated))
+                    .bind(target_user_id)
+                    .execute(&mut **transaction)
+                    .await
+                }
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                if result.rows_affected() != 1 {
+                    return Ok(false);
+                }
+
+                self.query("DELETE FROM user_content_restriction_tags WHERE user_id = ?")
+                    .bind(target_user_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                for (tag_kind, tags) in [
+                    ("ALLOW", source.allowed_tags.as_slice()),
+                    ("BLOCK", source.blocked_tags.as_slice()),
+                ] {
+                    for tag in tags {
+                        self.query(
+                            "INSERT INTO user_content_restriction_tags
+                             (user_id, tag_kind, tag) VALUES (?, ?, ?)",
+                        )
+                        .bind(target_user_id)
+                        .bind(tag_kind)
+                        .bind(tag)
+                        .execute(&mut **transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    }
+                }
+                Ok(true)
+            }
+            None => {
+                let Some(target) = target else {
+                    return Ok(true);
+                };
+                let deleted = self
+                    .query(
+                        "DELETE FROM user_content_restrictions
+                         WHERE user_id = ? AND version = ?",
+                    )
+                    .bind(target_user_id)
+                    .bind(target.version)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                Ok(deleted.rows_affected() == 1)
+            }
+        }
     }
 
     // LUX-677 keeps the policy version and both tag groups in one CAS transaction.
@@ -2824,6 +3136,27 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        if self.backend() == crate::config::DatabaseBackend::Postgres {
+            let active_user: Option<String> = self
+                .query_scalar("SELECT id FROM users WHERE id = ? AND deleted_at IS NULL FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if active_user.is_none() {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                return Ok(UserContentRestrictionsCasResult::UserUnavailable);
+            }
+        }
         let result = if expected_version == 0 {
             self.query(
                 "INSERT INTO user_content_restrictions (
@@ -3587,6 +3920,20 @@ impl Database {
             source,
         })
     }
+}
+
+fn permission_copy_groups_match(
+    current: &UserPermissionCopySnapshot,
+    expected: &UserPermissionCopySnapshot,
+    groups: UserPermissionCopyGroups,
+) -> bool {
+    (!groups.library
+        || (current.library_access_mode == expected.library_access_mode
+            && current.library_ids == expected.library_ids))
+        && (!groups.content || current.content_restrictions == expected.content_restrictions)
+        && (!groups.playback
+            || (current.can_download == expected.can_download
+                && current.playback_policy == expected.playback_policy))
 }
 
 fn is_sqlite_lock_error(error: &StorageError) -> bool {

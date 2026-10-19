@@ -14843,6 +14843,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增按最多 101 个明确账号 ID（1 个来源 + 100 个目标）批量读取权限快照的存储合同。三条有界查询在单个一致性事务中读取用户权限、已选媒体库与完整内容限制；PostgreSQL 使用可重复读，SQLite 保持事务快照。无权限记录与无效目标明确区分，媒体库 ID 与限制标签稳定排序。定向存储回归 1/1、Rust build、fmt check 和 diff check 通过。
 
+#### LUX-709：原子复制指定用户权限组
+
+范围：在单目标事务中复制来源用户的媒体库、内容限制、播放/下载/转码三组权限，调用方提交预览得到的来源与目标快照用于变更检测。只更新明确选择的组；不复制服务器管理员/管理控制台角色、预设来源、账号资料、偏好或用户数据。来源指定媒体库失效时拒绝整个目标变更。批量逐项结果和 API 留待后续任务。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] Library、Content、Playback 三组可独立选择并在一个目标事务中应用；未选择组保持原值，管理角色与预设来源不变。
+- [x] 来源/目标所选组快照变化时返回冲突；缺失或已删除账号返回不可用，不留下部分写入。
+- [x] 内容限制按目标版本单调递增复制或清除；库选择仅接受仍启用的普通媒体库。
+- [x] SQLite 回归覆盖组隔离、CAS 冲突、复制/清除内容策略和失败回滚；Rust build、fmt、diff check 通过。
+
+短计划：先补单目标复制存储回归并确认接口不存在而失败；再将 LUX-708 快照读取抽成事务内查询，增加 selected-groups CAS 写入和内容策略版本处理；最后跑定向存储测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_permission_copy`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-708。
+
+结果（2026-10-20）：新增单目标、单事务权限复制存储服务。Library、Content、Playback 三组分别比较预览快照，未选字段不变；目标内容策略版本保持单调递增，来源无策略时条件删除。所选库先批量校验仍为启用普通媒体库。PostgreSQL 按稳定 ID 顺序锁定来源与目标用户；现有媒体库授权与内容策略写入也获取相同用户锁，保证快照比较和复制串行化。管理员角色和预设来源从未进入复制字段。三项权限复制回归、既有媒体库事务与内容策略 CAS 回归通过；Rust build、fmt check 和 diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

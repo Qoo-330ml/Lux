@@ -59,6 +59,27 @@ pub(crate) struct UserPermissionCopySnapshot {
     pub(crate) content_restrictions: Option<repository::UserContentRestrictions>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserPermissionCopyGroups {
+    pub(crate) library: bool,
+    pub(crate) content: bool,
+    pub(crate) playback: bool,
+}
+
+impl UserPermissionCopyGroups {
+    pub(crate) fn is_empty(self) -> bool {
+        !self.library && !self.content && !self.playback
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserPermissionCopyResult {
+    Updated,
+    Conflict,
+    UserUnavailable,
+    InvalidSnapshot,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewStoredUserPermissions<'a> {
     pub(crate) library_access_mode: &'a str,

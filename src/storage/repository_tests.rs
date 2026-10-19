@@ -4,7 +4,7 @@ use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
     MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserContentRestrictions,
     PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserContentRestrictionsCasResult,
-    UserPlaybackPolicy,
+    UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -15412,6 +15412,453 @@ async fn user_permission_copy_snapshots_read_bounded_complete_snapshots()
             .is_empty()
     );
     assert_eq!(database.query_count(), 0, "empty reads should not query");
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_copy_applies_selected_groups_with_snapshot_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for id in [
+        "permission-write-source",
+        "permission-write-target",
+        "permission-write-empty-source",
+    ] {
+        database
+            .insert_user(id, id, id, "test", false, true)
+            .await?;
+    }
+    let library = LibraryService::new(database.clone())
+        .create_library("Permission Write", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .replace_user_library_access_mode(
+            "permission-write-source",
+            "SELECTED",
+            std::slice::from_ref(&library_id),
+        )
+        .await?;
+    database
+        .replace_user_library_access_mode("permission-write-target", "NONE", &[])
+        .await?;
+    database
+        .query(
+            "UPDATE users SET can_download = 1, is_admin = 1, can_manage_server = 1
+             WHERE id = 'permission-write-source'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE users SET can_download = 0, can_play = 0,
+                max_simultaneous_playbacks = 1, allow_remux = 0,
+                allow_audio_transcode = 0, allow_video_transcode = 0,
+                is_admin = 0, can_manage_server = 0
+             WHERE id = 'permission-write-target'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .update_user_playback_policy(
+            "permission-write-source",
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 4,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    let allowed_tags = vec!["Family".to_owned()];
+    let blocked_tags = vec!["Horror".to_owned()];
+    let source_policy = database
+        .compare_and_swap_user_content_restrictions(
+            "permission-write-source",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed_tags,
+                blocked_tags: &blocked_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        source_policy,
+        UserContentRestrictionsCasResult::Updated(_)
+    ));
+    let target_allowed_tags = vec!["Documentary".to_owned()];
+    let target_blocked_tags = vec!["Violence".to_owned()];
+    let target_policy = database
+        .compare_and_swap_user_content_restrictions(
+            "permission-write-target",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "BBFC",
+                maximum_rating: Some("12"),
+                allow_unrated: true,
+                allowed_tags: &target_allowed_tags,
+                blocked_tags: &target_blocked_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        target_policy,
+        UserContentRestrictionsCasResult::Updated(_)
+    ));
+
+    let snapshots = database
+        .user_permission_copy_snapshots(&[
+            "permission-write-source".to_owned(),
+            "permission-write-target".to_owned(),
+            "permission-write-empty-source".to_owned(),
+        ])
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                &snapshots["permission-write-source"],
+                "permission-write-target",
+                &snapshots["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: false,
+                    content: false,
+                    playback: true,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Updated
+    );
+    let playback_only = database
+        .user_permission_copy_snapshots(&[
+            "permission-write-source".to_owned(),
+            "permission-write-target".to_owned(),
+        ])
+        .await?;
+    let target = &playback_only["permission-write-target"];
+    assert_eq!(target.library_access_mode, "NONE");
+    assert!(target.library_ids.is_empty());
+    assert!(target.can_download);
+    assert!(target.playback_policy.can_play);
+    assert_eq!(target.playback_policy.max_simultaneous_playbacks, 4);
+    assert_eq!(
+        target
+            .content_restrictions
+            .as_ref()
+            .map(|policy| policy.rating_system.as_str()),
+        Some("BBFC")
+    );
+
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                &playback_only["permission-write-source"],
+                "permission-write-target",
+                &playback_only["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: true,
+                    playback: false,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Updated
+    );
+    let copied = database
+        .user_permission_copy_snapshots(&[
+            "permission-write-source".to_owned(),
+            "permission-write-target".to_owned(),
+        ])
+        .await?;
+    let source = &copied["permission-write-source"];
+    let target = &copied["permission-write-target"];
+    assert_eq!(target.library_access_mode, "SELECTED");
+    assert_eq!(target.library_ids, [library_id.clone()]);
+    assert!(target.can_download);
+    let copied_content = target
+        .content_restrictions
+        .as_ref()
+        .ok_or("target content restriction snapshot missing")?;
+    let source_content = source
+        .content_restrictions
+        .as_ref()
+        .ok_or("source content restriction snapshot missing")?;
+    assert_eq!(copied_content.version, 2);
+    assert_eq!(copied_content.rating_system, source_content.rating_system);
+    assert_eq!(copied_content.maximum_rating, source_content.maximum_rating);
+    assert_eq!(copied_content.allow_unrated, source_content.allow_unrated);
+    assert_eq!(copied_content.allowed_tags, source_content.allowed_tags);
+    assert_eq!(copied_content.blocked_tags, source_content.blocked_tags);
+    let target_admin: (i64, i64) = sqlx::query_as(
+        "SELECT is_admin, can_manage_server FROM users WHERE id = 'permission-write-target'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        target_admin,
+        (0, 0),
+        "copy must not grant management rights"
+    );
+
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-empty-source",
+                &snapshots["permission-write-empty-source"],
+                "permission-write-target",
+                target,
+                UserPermissionCopyGroups {
+                    library: false,
+                    content: true,
+                    playback: false,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Updated
+    );
+    let cleared = database
+        .user_permission_copy_snapshots(&["permission-write-target".to_owned()])
+        .await?;
+    assert!(
+        cleared["permission-write-target"]
+            .content_restrictions
+            .is_none()
+    );
+
+    let stale_target = copied["permission-write-target"].clone();
+    database
+        .update_user_playback_policy(
+            "permission-write-target",
+            UserPlaybackPolicy {
+                can_play: false,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: false,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                source,
+                "permission-write-target",
+                &stale_target,
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: false,
+                    playback: true,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Conflict
+    );
+    let after_conflict = database
+        .user_permission_copy_snapshots(&["permission-write-target".to_owned()])
+        .await?;
+    assert_eq!(
+        after_conflict["permission-write-target"].library_access_mode, "SELECTED",
+        "stale playback snapshot must not partially copy the library group"
+    );
+    database
+        .update_user_playback_policy(
+            "permission-write-source",
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 6,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                source,
+                "permission-write-target",
+                &after_conflict["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: false,
+                    content: false,
+                    playback: true,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Conflict,
+        "stale source snapshot must not overwrite the target"
+    );
+    database
+        .query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                source,
+                "permission-write-target",
+                &after_conflict["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: false,
+                    playback: false,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::InvalidSnapshot
+    );
+    let after_invalid_library = database
+        .user_permission_copy_snapshots(&["permission-write-target".to_owned()])
+        .await?;
+    assert_eq!(
+        after_invalid_library["permission-write-target"].library_access_mode, "SELECTED",
+        "unavailable source library must not alter target permissions"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_copy_rolls_back_all_selected_groups_on_content_write_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for id in ["permission-rollback-source", "permission-rollback-target"] {
+        database
+            .insert_user(id, id, id, "test", false, true)
+            .await?;
+    }
+    let library = LibraryService::new(database.clone())
+        .create_library("Permission Rollback", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .replace_user_library_access_mode(
+            "permission-rollback-source",
+            "SELECTED",
+            std::slice::from_ref(&library_id),
+        )
+        .await?;
+    database
+        .replace_user_library_access_mode("permission-rollback-target", "NONE", &[])
+        .await?;
+    database
+        .update_user_playback_policy(
+            "permission-rollback-source",
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 5,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    database
+        .update_user_playback_policy(
+            "permission-rollback-target",
+            UserPlaybackPolicy {
+                can_play: false,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: false,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    let source_tags = vec!["Family".to_owned()];
+    let no_tags: Vec<String> = Vec::new();
+    for (user_id, expected_version, rating_system) in [
+        ("permission-rollback-source", 0, "MPA"),
+        ("permission-rollback-target", 0, "BBFC"),
+    ] {
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                user_id,
+                expected_version,
+                NewUserContentRestrictions {
+                    rating_system,
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: if user_id == "permission-rollback-source" {
+                        &source_tags
+                    } else {
+                        &no_tags
+                    },
+                    blocked_tags: &no_tags,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+    }
+    database
+        .query(
+            "CREATE TRIGGER fail_permission_copy_content_tag
+             BEFORE INSERT ON user_content_restriction_tags
+             WHEN NEW.user_id = 'permission-rollback-target'
+             BEGIN SELECT RAISE(ABORT, 'forced permission copy failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+    let snapshots = database
+        .user_permission_copy_snapshots(&[
+            "permission-rollback-source".to_owned(),
+            "permission-rollback-target".to_owned(),
+        ])
+        .await?;
+
+    assert!(
+        database
+            .copy_user_permission_groups(
+                "permission-rollback-source",
+                &snapshots["permission-rollback-source"],
+                "permission-rollback-target",
+                &snapshots["permission-rollback-target"],
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: true,
+                    playback: true,
+                },
+            )
+            .await
+            .is_err()
+    );
+
+    let after_failure = database
+        .user_permission_copy_snapshots(&["permission-rollback-target".to_owned()])
+        .await?;
+    let target = &after_failure["permission-rollback-target"];
+    assert_eq!(target.library_access_mode, "NONE");
+    assert!(target.library_ids.is_empty());
+    assert!(!target.playback_policy.can_play);
+    assert_eq!(target.playback_policy.max_simultaneous_playbacks, 2);
+    let retained_content = target
+        .content_restrictions
+        .as_ref()
+        .ok_or("failed copy removed target content policy")?;
+    assert_eq!(retained_content.version, 1);
+    assert_eq!(retained_content.rating_system, "BBFC");
+    assert!(retained_content.allowed_tags.is_empty());
     Ok(())
 }
 
