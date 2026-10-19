@@ -1347,6 +1347,72 @@ export type AdminAccountPreferenceCopyBatchResponse = {
   }>;
 };
 
+export type AdminUserPermissionCopyGroups = {
+  library: boolean;
+  content: boolean;
+  playback: boolean;
+};
+
+export type AdminUserPermissionCopyPreviewInput = {
+  sourceUserId: string;
+  targetUserIds: string[];
+  groups: AdminUserPermissionCopyGroups;
+};
+
+export type AdminUserPermissionCopyApplyInput = {
+  sourceUserId: string;
+  sourceVersion: string;
+  targets: Array<{ userId: string; expectedVersion: string }>;
+  groups: AdminUserPermissionCopyGroups;
+};
+
+export type AdminUserPermissionCopySnapshot = {
+  library?: {
+    accessMode: AdminUserLibraryAccessMode;
+    libraryIds: string[];
+  };
+  content?: {
+    ratingSystem: string;
+    maximumRating: string | null;
+    allowUnrated: boolean;
+    allowedTags: string[];
+    blockedTags: string[];
+    version: number;
+  } | null;
+  playback?: {
+    canDownload: boolean;
+    canPlay: boolean;
+    maxSimultaneousPlaybacks: number;
+    allowRemux: boolean;
+    allowAudioTranscode: boolean;
+    allowVideoTranscode: boolean;
+  };
+};
+
+export type AdminUserPermissionCopyPreview = {
+  sourceUserId: string;
+  sourceVersion: string;
+  sourceSnapshot: AdminUserPermissionCopySnapshot;
+  targets: Array<{ userId: string; expectedVersion: string }>;
+  groups: AdminUserPermissionCopyGroups;
+};
+
+export type AdminUserPermissionCopyErrorCode =
+  | "USER_UNAVAILABLE"
+  | "VERSION_CONFLICT"
+  | "INVALID_SNAPSHOT"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminUserPermissionCopyBatchResponse = {
+  sourceUserId: string;
+  sourceVersion: string;
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminUserPermissionCopyErrorCode | null;
+  }>;
+};
+
 export type MediaStrategySettings = {
   metadataLanguage: string;
   imageLanguage: string;

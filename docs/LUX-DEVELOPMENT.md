@@ -14910,6 +14910,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`tests/users::admin_can_preview_and_apply_user_permission_groups` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
 
+#### LUX-712：为用户权限复制增加 Web API 客户端合同
+
+范围：为 LUX-711 权限组复制预览和应用 API 增加严格的 TypeScript 请求、响应及逐目标错误码类型，并提供客户端方法。两种 POST 继续使用统一 JSON、CSRF 和错误处理请求层；本任务不修改用户管理界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 类型覆盖三组选择、Library/Content/Playback 快照、64 位版本令牌和所有稳定逐目标错误码。
+- [x] 预览及应用方法使用精确路径和请求体，并复用统一请求层的 CSRF 与错误处理。
+- [x] API client 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先为两条新方法的路径、请求体、类型化响应及 CSRF 添加失败客户端回归；再增加类型和方法，运行定向 Vitest、Web build 与 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user permission copy"`、`pnpm --dir web build` 和 `git diff --check`。
+
+依赖：LUX-711。
+
+结果（2026-10-20）：新增权限复制的 TypeScript 输入、预览快照、应用结果及稳定逐目标错误码，并接入预览/应用客户端方法。两项 API client 合同测试验证精确 endpoint、JSON 请求、类型化响应与自动 CSRF。
+
+验证：定向 `api-client.test.ts` 2/2、`pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。完整 `pnpm --dir web test` 为 721 passed、4 failed；失败仍为 `home-page.test.tsx`、`library-card.test.tsx` 两项及 `media-query-polling.test.tsx`，与既有记录的失败集合相同，本任务没有修改相关代码或测试。`git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
