@@ -13626,6 +13626,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：为管理员用户类型增加可空预设来源详情，并新增应用预设 POST 客户端方法。`api-client.test.ts` 64/64、Web build 通过。`pnpm --dir web test -- api-client` 在运行 Node 布局断言阶段先失败（详情页 lazy import、Hero 标题行高、移动端媒体卡片宽度、触控卡片操作），未执行 Vitest；直接 Vitest target 已独立通过。Hero 行高断言也受工作区既有 `web/src/react.css` 修改影响，该文件未纳入任务提交。
 
+#### LUX-650：在用户详情应用权限预设
+
+范围：在用户详情的权限页展示用户当前已应用的预设来源，并允许管理员选择现有内置或自定义预设应用到该用户。应用前说明会替换当前权限快照并请求确认；应用成功后刷新用户详情和列表缓存。本任务不实现批量应用或权限复制。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-users-access.test.tsx`。
+
+验收标准：
+
+- [x] 权限页显示来源快照；自定义预设删除后仍显示已保存的来源名称、版本和时间。
+- [x] 可选择现存预设；确认后调用应用 API，成功刷新详情、列表、媒体库范围和播放策略缓存并显示结果。
+- [x] 取消确认不发送请求；预设加载或应用失败时给出可读反馈；回收站用户保持只读。
+- [x] 页面定向回归、Web build、diff check 和真实浏览器交互验证通过。
+
+短计划：先为预设来源、确认/取消、成功缓存刷新和错误反馈补页面回归并确认失败；再将预设选择与来源展示接入权限页，最后运行定向 Vitest、Web build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-users-access.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-649。
+
+结果（2026-10-19）：权限页展示应用时保存的预设名称、版本和时间，即使来源自定义预设已经删除；可确认应用内置或自定义预设。成功后刷新用户详情、分页用户列表、媒体库访问和播放策略缓存；取消确认不提交，加载/应用错误可读且允许重试，回收站用户仍只读。`admin-users-access.test.tsx` 10/10、TypeScript 与 Web production build、diff check 通过。Playwright 使用模拟 API 验证 204 应用、详情来源重读及确认交互；1280px 和 390px viewport 均无横向溢出。浏览器验证不代表真实服务端或部署验证；本地模拟 EventSource 曾返回一条 MIME 错误，不影响预设请求链路。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
