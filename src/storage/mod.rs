@@ -31,6 +31,18 @@ pub(crate) struct NewStoredUserPermissions<'a> {
     pub(crate) allow_video_transcode: bool,
 }
 
+// LUX-645 consumes this contract in the preset application service.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ApplyUserPermissionPreset<'a> {
+    pub(crate) preset_id: &'a str,
+    pub(crate) preset_name: &'a str,
+    pub(crate) preset_version: i64,
+    pub(crate) is_admin: bool,
+    pub(crate) can_manage_server: bool,
+    pub(crate) permissions: NewStoredUserPermissions<'a>,
+}
+
 // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

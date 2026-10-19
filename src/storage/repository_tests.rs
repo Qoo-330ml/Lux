@@ -1,7 +1,7 @@
 use super::*;
 use crate::storage::{
-    NewStoredUserPermissions, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
-    UserPlaybackPolicy,
+    ApplyUserPermissionPreset, NewStoredUserPermissions, PlaybackAdmissionDecision,
+    PlaybackAdmissionDenialReason, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -14336,6 +14336,370 @@ async fn new_user_permission_snapshot_rolls_back_user_when_library_grant_fails()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(user_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_user_permission_preset_replaces_snapshot_and_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("Preset source first", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Preset source second", LibraryKind::Movie, false)
+        .await?;
+    let first_library_ids = [first_library.id.to_string()];
+    database
+        .insert_user_with_email_and_permissions(
+            NewStoredUser {
+                id: "preset-apply-user",
+                username_normalized: "preset-apply-user",
+                display_name: "Preset Apply User",
+                password_hash: "test-hash",
+                is_admin: false,
+                has_password: true,
+                email: None,
+            },
+            NewStoredUserPermissions {
+                library_access_mode: "SELECTED",
+                library_ids: &first_library_ids,
+                can_download: false,
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    database
+        .insert_user(
+            "preset-apply-secondary-manager",
+            "preset-apply-secondary-manager",
+            "Preset Apply Secondary Manager",
+            "test-hash",
+            true,
+            true,
+        )
+        .await?;
+
+    let second_library_ids = [second_library.id.to_string()];
+    assert!(
+        database
+            .apply_user_permission_preset(
+                "preset-apply-user",
+                ApplyUserPermissionPreset {
+                    preset_id: "preset-family",
+                    preset_name: "Family",
+                    preset_version: 2,
+                    is_admin: false,
+                    can_manage_server: false,
+                    permissions: NewStoredUserPermissions {
+                        library_access_mode: "SELECTED",
+                        library_ids: &second_library_ids,
+                        can_download: true,
+                        can_play: false,
+                        max_simultaneous_playbacks: 4,
+                        allow_remux: false,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                },
+            )
+            .await?
+    );
+
+    let stored: (i64, i64, i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT is_admin, can_manage_server, can_download, can_play,
+                max_simultaneous_playbacks, allow_remux, allow_audio_transcode,
+                allow_video_transcode,
+                library_access_mode
+         FROM users WHERE id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored, (0, 0, 1, 0, 4, 0, 1, 0, "SELECTED".to_owned()));
+    assert_eq!(
+        database
+            .list_accessible_library_ids("preset-apply-user")
+            .await?,
+        second_library_ids
+    );
+    let source: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version, applied_at
+         FROM user_permission_preset_sources WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source.0, "preset-family");
+    assert_eq!(source.1, "Family");
+    assert_eq!(source.2, 2);
+    assert!(source.3 > 0);
+
+    assert!(
+        database
+            .apply_user_permission_preset(
+                "preset-apply-user",
+                ApplyUserPermissionPreset {
+                    preset_id: "builtin-admin",
+                    preset_name: "管理员",
+                    preset_version: 1,
+                    is_admin: true,
+                    can_manage_server: true,
+                    permissions: NewStoredUserPermissions {
+                        library_access_mode: "ALL",
+                        library_ids: &[],
+                        can_download: true,
+                        can_play: true,
+                        max_simultaneous_playbacks: 0,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: true,
+                    },
+                },
+            )
+            .await?
+    );
+    let remaining_access: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_library_access WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_access, 0);
+    assert!(
+        database
+            .has_user_library_access("preset-apply-user", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .has_user_library_access("preset-apply-user", &second_library.id.to_string())
+            .await?
+    );
+
+    assert!(
+        database
+            .apply_user_permission_preset(
+                "preset-apply-user",
+                ApplyUserPermissionPreset {
+                    preset_id: "builtin-user",
+                    preset_name: "普通用户",
+                    preset_version: 1,
+                    is_admin: false,
+                    can_manage_server: false,
+                    permissions: NewStoredUserPermissions {
+                        library_access_mode: "NONE",
+                        library_ids: &[],
+                        can_download: false,
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: true,
+                    },
+                },
+            )
+            .await?
+    );
+    let remaining_access: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_library_access WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_access, 0);
+    assert!(
+        !database
+            .has_user_library_access("preset-apply-user", &first_library.id.to_string())
+            .await?
+    );
+    let updated_source: (String, String, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version
+         FROM user_permission_preset_sources WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        updated_source,
+        ("builtin-user".to_owned(), "普通用户".to_owned(), 1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_user_permission_preset_protects_last_manager_and_ignores_deleted_users()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .insert_user(
+            "only-manager",
+            "only-manager",
+            "Only Manager",
+            "test-hash",
+            true,
+            true,
+        )
+        .await?;
+    let regular_preset = ApplyUserPermissionPreset {
+        preset_id: "builtin-user",
+        preset_name: "普通用户",
+        preset_version: 1,
+        is_admin: false,
+        can_manage_server: false,
+        permissions: NewStoredUserPermissions {
+            library_access_mode: "NONE",
+            library_ids: &[],
+            can_download: false,
+            can_play: true,
+            max_simultaneous_playbacks: 2,
+            allow_remux: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+        },
+    };
+    assert!(matches!(
+        database
+            .apply_user_permission_preset("only-manager", regular_preset)
+            .await,
+        Err(StorageError::LastManager)
+    ));
+    assert!(
+        !database
+            .apply_user_permission_preset("missing-preset-user", regular_preset)
+            .await?
+    );
+
+    database
+        .insert_user(
+            "second-preset-manager",
+            "second-preset-manager",
+            "Second Preset Manager",
+            "test-hash",
+            true,
+            true,
+        )
+        .await?;
+    let (first_demotion, second_demotion) = tokio::join!(
+        database.apply_user_permission_preset("only-manager", regular_preset),
+        database.apply_user_permission_preset("second-preset-manager", regular_preset),
+    );
+    assert_eq!(
+        (matches!(&first_demotion, Ok(true)) as usize)
+            + (matches!(&second_demotion, Ok(true)) as usize),
+        1
+    );
+    assert!(
+        matches!(&first_demotion, Err(StorageError::LastManager))
+            || matches!(&second_demotion, Err(StorageError::LastManager))
+    );
+    let active_manager_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users
+         WHERE can_manage_server = 1 AND is_disabled = 0 AND deleted_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(active_manager_count, 1);
+
+    database
+        .insert_user(
+            "deleted-preset-user",
+            "deleted-preset-user",
+            "Deleted Preset User",
+            "test-hash",
+            false,
+            true,
+        )
+        .await?;
+    sqlx::query("UPDATE users SET deleted_at = unixepoch() WHERE id = 'deleted-preset-user'")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .apply_user_permission_preset("deleted-preset-user", regular_preset)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_user_permission_preset_rolls_back_when_library_write_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Preset rollback", LibraryKind::Movie, false)
+        .await?;
+    database
+        .insert_user(
+            "preset-rollback-user",
+            "preset-rollback-user",
+            "Preset Rollback User",
+            "test-hash",
+            false,
+            true,
+        )
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_user_permission_preset_grant
+         BEFORE INSERT ON user_library_access
+         BEGIN SELECT RAISE(ABORT, 'grant rejected'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let library_ids = [library.id.to_string()];
+    let result = database
+        .apply_user_permission_preset(
+            "preset-rollback-user",
+            ApplyUserPermissionPreset {
+                preset_id: "preset-family",
+                preset_name: "Family",
+                preset_version: 1,
+                is_admin: true,
+                can_manage_server: true,
+                permissions: NewStoredUserPermissions {
+                    library_access_mode: "SELECTED",
+                    library_ids: &library_ids,
+                    can_download: true,
+                    can_play: false,
+                    max_simultaneous_playbacks: 5,
+                    allow_remux: false,
+                    allow_audio_transcode: false,
+                    allow_video_transcode: false,
+                },
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    let stored: (i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT is_admin, can_manage_server, can_download, max_simultaneous_playbacks,
+                library_access_mode
+         FROM users WHERE id = 'preset-rollback-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored, (0, 0, 0, 2, "ALL".to_owned()));
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_permission_preset_sources
+         WHERE user_id = 'preset-rollback-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source_count, 0);
     Ok(())
 }
 

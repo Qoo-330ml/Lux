@@ -13504,6 +13504,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：将 `scanning_jobs`、`scanner`、`danmaku` 和 PostgreSQL 集成测试中的现行 schema 版本同步为 188，历史迁移编号保持不变。三个 SQLite 定向回归各 1/1、`postgres_database --no-run`、Rust build、fmt check 和 diff check 通过；本机未运行 PostgreSQL 集成服务。
 
+#### LUX-644：原子应用用户权限预设存储快照
+
+范围：在存储层为现有用户原子应用角色、媒体库访问、下载、播放与转码快照，并写入 LUX-642 的来源记录。保护最后一个有效服务器管理员；数据库任一写入失败时回滚全部权限与来源变更。本任务不新增业务 API 或管理页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 一次事务更新角色、下载、播放/转码、媒体库模式/选择和预设来源。
+- [x] `ALL`/`NONE` 清除旧选择，`SELECTED` 完整替换旧选择；失败时旧快照保持不变。
+- [x] 不存在或已删除用户不可应用；最后一个有效管理账户不能被降权。
+- [x] 存储定向回归、Rust build、fmt 与 diff check 通过。
+
+短计划：先添加存储层成功、降权保护与事务回滚回归并确认失败；再实现单事务预设应用。
+
+验证：`cargo test --locked --lib apply_user_permission_preset`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-642、LUX-643。
+
+结果（2026-10-19）：新增存储事务一次性应用角色、下载、播放/转码、媒体库访问与来源快照；`SELECTED` 仅接受启用的普通媒体库，`ALL`/`NONE` 清除旧选择。事务失败回滚全部变更，已删除/不存在用户拒绝操作，单管理员保护并防止并发降权共同移除最后管理员。`apply_user_permission_preset` 定向回归 3/3、Rust build、fmt check、diff check 通过；SQLite 并发回归通过，PostgreSQL 行锁逻辑已编译但未接运行时验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

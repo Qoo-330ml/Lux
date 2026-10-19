@@ -1,6 +1,6 @@
 use super::*;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
-use crate::storage::{NewStoredUserPermissions, UserPlaybackPolicy};
+use crate::storage::{ApplyUserPermissionPreset, NewStoredUserPermissions, UserPlaybackPolicy};
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,202 @@ fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
 }
 
 impl Database {
+    // LUX-645 wires this storage primitive into the application preset service.
+    #[allow(dead_code)]
+    pub(crate) async fn apply_user_permission_preset(
+        &self,
+        user_id: &str,
+        preset: ApplyUserPermissionPreset<'_>,
+    ) -> Result<bool, StorageError> {
+        let permissions = preset.permissions;
+        let valid_library_access = match permissions.library_access_mode {
+            "ALL" | "NONE" => permissions.library_ids.is_empty(),
+            "SELECTED" => !permissions.library_ids.is_empty(),
+            _ => false,
+        };
+        if preset.preset_id.trim().is_empty()
+            || preset.preset_name.trim().is_empty()
+            || preset.preset_version <= 0
+            || (preset.can_manage_server && !preset.is_admin)
+            || permissions.max_simultaneous_playbacks < 0
+            || !valid_library_access
+            || permissions.library_ids.iter().collect::<HashSet<_>>().len()
+                != permissions.library_ids.len()
+        {
+            return Err(StorageError::Conflict(
+                "user permission preset snapshot is invalid".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        if self.backend() == crate::config::DatabaseBackend::Postgres && !preset.can_manage_server {
+            // Lock all current managers in stable order so concurrent demotions cannot each see
+            // the other's still-active row and remove the last manager together.
+            let _active_manager_ids: Vec<String> = self
+                .query_scalar(
+                    "SELECT id FROM users
+                     WHERE can_manage_server = 1 AND is_disabled = 0 AND deleted_at IS NULL
+                     ORDER BY id FOR UPDATE",
+                )
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        let row_lock = if self.backend() == crate::config::DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let user_query = format!(
+            "SELECT is_disabled, can_manage_server, deleted_at FROM users WHERE id = ?{row_lock}"
+        );
+        let Some(current) = self
+            .query(sqlx::AssertSqlSafe(user_query))
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(false);
+        };
+        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+            return Ok(false);
+        }
+
+        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
+        let current_can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        if current_can_manage_server && !current_disabled && !preset.can_manage_server {
+            let remaining: i64 = self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM users
+                     WHERE can_manage_server = 1 AND is_disabled = 0
+                       AND deleted_at IS NULL AND id != ?",
+                )
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if remaining == 0 {
+                return Err(StorageError::LastManager);
+            }
+        }
+
+        if permissions.library_access_mode == "SELECTED" {
+            for library_id in permissions.library_ids {
+                let enabled_regular_library: i64 = self
+                    .query_scalar(
+                        "SELECT COUNT(*) FROM libraries
+                         WHERE id = ? AND is_enabled = 1 AND system_kind IS NULL
+                           AND kind IN ('MOVIE', 'SERIES', 'MIXED', 'HOMEVIDEOS')",
+                    )
+                    .bind(library_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                if enabled_regular_library != 1 {
+                    return Err(StorageError::Conflict(
+                        "user permission preset references an unavailable library".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let updated = self
+            .query(
+                "UPDATE users
+                 SET is_admin = ?, can_manage_server = ?, can_download = ?, can_play = ?,
+                     max_simultaneous_playbacks = ?, allow_remux = ?, allow_audio_transcode = ?,
+                     allow_video_transcode = ?, library_access_mode = ?, updated_at = unixepoch()
+                 WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(database_flag(preset.is_admin))
+            .bind(database_flag(preset.can_manage_server))
+            .bind(database_flag(permissions.can_download))
+            .bind(database_flag(permissions.can_play))
+            .bind(permissions.max_simultaneous_playbacks)
+            .bind(database_flag(permissions.allow_remux))
+            .bind(database_flag(permissions.allow_audio_transcode))
+            .bind(database_flag(permissions.allow_video_transcode))
+            .bind(permissions.library_access_mode)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+
+        self.query("DELETE FROM user_library_access WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if permissions.library_access_mode == "SELECTED" {
+            for library_id in permissions.library_ids {
+                self.query(
+                    "INSERT INTO user_library_access (user_id, library_id, can_view)
+                     VALUES (?, ?, 1)",
+                )
+                .bind(user_id)
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
+        self.query(
+            "INSERT INTO user_permission_preset_sources
+             (user_id, preset_id, preset_name, preset_version, applied_at)
+             VALUES (?, ?, ?, ?, unixepoch())
+             ON CONFLICT(user_id) DO UPDATE SET
+                 preset_id = excluded.preset_id,
+                 preset_name = excluded.preset_name,
+                 preset_version = excluded.preset_version,
+                 applied_at = excluded.applied_at",
+        )
+        .bind(user_id)
+        .bind(preset.preset_id)
+        .bind(preset.preset_name)
+        .bind(preset.preset_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
         self.query_scalar("SELECT CASE WHEN EXISTS(SELECT 1 FROM users LIMIT 1) THEN 1 ELSE 0 END")
             .fetch_one(&self.pool)
