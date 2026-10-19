@@ -157,6 +157,96 @@ pub fn rating_is_at_or_below(
     Some(certification_order <= maximum_order)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ContentRestrictionPolicy<'a> {
+    pub rating_system: &'a str,
+    pub maximum_rating: Option<&'a str>,
+    pub allow_unrated: bool,
+    pub allowed_tags: &'a [String],
+    pub blocked_tags: &'a [String],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ContentRestrictionClassification<'a> {
+    pub certification_code: Option<&'a str>,
+    pub tags: &'a [String],
+    pub indexed: bool,
+}
+
+pub fn content_classification_is_allowed(
+    policy: &ContentRestrictionPolicy<'_>,
+    classification: &ContentRestrictionClassification<'_>,
+) -> bool {
+    let Some(rating_system) = ContentRatingSystem::from_key(policy.rating_system) else {
+        return false;
+    };
+    if policy
+        .maximum_rating
+        .is_some_and(|maximum| normalize_rating_code(rating_system, maximum).is_none())
+        || !valid_policy_tags(policy.allowed_tags)
+        || !valid_policy_tags(policy.blocked_tags)
+    {
+        return false;
+    }
+
+    let restricted = policy.maximum_rating.is_some()
+        || !policy.allow_unrated
+        || !policy.allowed_tags.is_empty()
+        || !policy.blocked_tags.is_empty();
+    if !restricted {
+        return true;
+    }
+    if !classification.indexed {
+        return false;
+    }
+
+    let rating_allowed = match policy.maximum_rating {
+        Some(maximum) => classification
+            .certification_code
+            .and_then(|certification| rating_is_at_or_below(rating_system, certification, maximum))
+            .unwrap_or(policy.allow_unrated),
+        None if !policy.allow_unrated => classification
+            .certification_code
+            .and_then(|certification| normalize_rating_code(rating_system, certification))
+            .is_some(),
+        None => true,
+    };
+    if !rating_allowed {
+        return false;
+    }
+
+    if policy
+        .blocked_tags
+        .iter()
+        .any(|blocked| classification.tags.iter().any(|tag| tag == blocked))
+    {
+        return false;
+    }
+    policy.allowed_tags.is_empty()
+        || policy
+            .allowed_tags
+            .iter()
+            .any(|allowed| classification.tags.iter().any(|tag| tag == allowed))
+}
+
+fn valid_policy_tags(tags: &[String]) -> bool {
+    if tags.len() > MAX_CONTENT_RESTRICTION_TAGS {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    tags.iter().all(|tag| {
+        let normalized = tag
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        (1..=MAX_CONTENT_RESTRICTION_TAG_CHARACTERS).contains(&tag.chars().count())
+            && !tag.chars().any(char::is_control)
+            && normalized == *tag
+            && seen.insert(tag)
+    })
+}
+
 const MAX_CONTENT_RESTRICTION_TAGS: usize = 100;
 const MAX_CONTENT_RESTRICTION_TAG_CHARACTERS: usize = 128;
 
@@ -224,8 +314,9 @@ pub fn project_content_restriction_index(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentRatingSystem, normalize_rating_code, project_content_restriction_index,
-        rating_is_at_or_below,
+        ContentRatingSystem, ContentRestrictionClassification, ContentRestrictionPolicy,
+        content_classification_is_allowed, normalize_rating_code,
+        project_content_restriction_index, rating_is_at_or_below,
     };
 
     #[test]
@@ -349,5 +440,168 @@ mod tests {
 
         assert!(project_content_restriction_index(None, &["x".repeat(129)]).is_err());
         assert!(project_content_restriction_index(None, &["bad\0tag".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn content_policy_combines_rating_unrated_and_tag_rules() {
+        let policy = ContentRestrictionPolicy {
+            rating_system: "MPA",
+            maximum_rating: Some("PG-13"),
+            allow_unrated: false,
+            allowed_tags: &["action".to_owned(), "family".to_owned()],
+            blocked_tags: &["violent".to_owned()],
+        };
+        let action = ["action".to_owned()];
+        let family_and_violent = ["family".to_owned(), "violent".to_owned()];
+        let no_tags: [String; 0] = [];
+
+        assert!(content_classification_is_allowed(
+            &policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("PG-13"),
+                tags: &action,
+                indexed: true,
+            }
+        ));
+        assert!(!content_classification_is_allowed(
+            &policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("R"),
+                tags: &action,
+                indexed: true,
+            }
+        ));
+        assert!(!content_classification_is_allowed(
+            &policy,
+            &ContentRestrictionClassification {
+                certification_code: None,
+                tags: &action,
+                indexed: true,
+            }
+        ));
+        assert!(!content_classification_is_allowed(
+            &policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("PG"),
+                tags: &family_and_violent,
+                indexed: true,
+            }
+        ));
+        assert!(!content_classification_is_allowed(
+            &policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("PG"),
+                tags: &no_tags,
+                indexed: true,
+            }
+        ));
+        assert!(!content_classification_is_allowed(
+            &policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("PG"),
+                tags: &action,
+                indexed: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn content_policy_obeys_tvpg_bbfc_and_unrated_system_boundaries() {
+        let no_tags: [String; 0] = [];
+        let tv_policy = ContentRestrictionPolicy {
+            rating_system: "TVPG",
+            maximum_rating: Some("TV-G"),
+            allow_unrated: true,
+            allowed_tags: &[],
+            blocked_tags: &[],
+        };
+        assert!(content_classification_is_allowed(
+            &tv_policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("TV-G"),
+                tags: &no_tags,
+                indexed: true,
+            }
+        ));
+        assert!(!content_classification_is_allowed(
+            &tv_policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("TV-Y7"),
+                tags: &no_tags,
+                indexed: true,
+            }
+        ));
+        assert!(content_classification_is_allowed(
+            &tv_policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("PG-13"),
+                tags: &no_tags,
+                indexed: true,
+            }
+        ));
+
+        let bbfc_policy = ContentRestrictionPolicy {
+            rating_system: "BBFC",
+            maximum_rating: Some("12"),
+            allow_unrated: false,
+            allowed_tags: &[],
+            blocked_tags: &[],
+        };
+        for code in ["12", "12A"] {
+            assert!(content_classification_is_allowed(
+                &bbfc_policy,
+                &ContentRestrictionClassification {
+                    certification_code: Some(code),
+                    tags: &no_tags,
+                    indexed: true,
+                }
+            ));
+        }
+        assert!(!content_classification_is_allowed(
+            &bbfc_policy,
+            &ContentRestrictionClassification {
+                certification_code: Some("15"),
+                tags: &no_tags,
+                indexed: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_persisted_content_policy_fails_closed() {
+        let no_tags: [String; 0] = [];
+        let indexed_unrated = ContentRestrictionClassification {
+            certification_code: None,
+            tags: &no_tags,
+            indexed: true,
+        };
+        for policy in [
+            ContentRestrictionPolicy {
+                rating_system: "OTHER",
+                maximum_rating: None,
+                allow_unrated: true,
+                allowed_tags: &[],
+                blocked_tags: &[],
+            },
+            ContentRestrictionPolicy {
+                rating_system: "MPA",
+                maximum_rating: Some("21"),
+                allow_unrated: true,
+                allowed_tags: &[],
+                blocked_tags: &[],
+            },
+            ContentRestrictionPolicy {
+                rating_system: "MPA",
+                maximum_rating: None,
+                allow_unrated: true,
+                allowed_tags: &["  ".to_owned()],
+                blocked_tags: &[],
+            },
+        ] {
+            assert!(!content_classification_is_allowed(
+                &policy,
+                &indexed_unrated
+            ));
+        }
     }
 }

@@ -14497,6 +14497,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：Lux 与 Emby 共用的分页查询现在从选中条目、父级季度和系列检查分级与标签策略；索引缺行按不允许访问处理，允许标签需至少命中一项，禁止标签优先。过滤条件进入 SQL 的计数和分页子查询，查询发生在 LIMIT/OFFSET 之前。策略版本加入 library page cache key；管理员不应用用户策略，无策略和完全不收紧策略与既有列表一致。存储回归 1/1、策略更新与缓存版本应用回归 1/1、`tests/catalog.rs` 3/3、`cargo build --locked`、fmt 与 diff check 通过。本任务只覆盖通用媒体库过滤列表；搜索、首页/推荐、详情、图片、字幕、下载和播放仍待实施。
 
+#### LUX-693：定义单条媒体内容限制判定
+
+范围：为用户内容限制提供可复用的领域判定，统一校验所选分级体系中的已知等级、最大等级、未分级规则和标签策略。未知/跨体系分级按未分级处理；无效策略失败关闭；允许标签要求至少一项命中，禁止标签优先。不在本任务连接具体 API 或媒体入口。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/domain/content_restrictions.rs`。
+
+验收标准：
+
+- [x] 三种分级体系按规格顺序比较，BBFC `12` 与 `12A` 同级；选用其他体系时无法映射的等级遵循未分级开关。
+- [x] 标签匹配使用索引及用户策略的规范化值；禁止标签优先，允许标签列表非空时必须命中至少一项。
+- [x] 未限制策略为允许；错误的持久化策略配置按拒绝处理。
+- [x] 领域单测覆盖等级、未分级、标签交叉与无效策略；格式及 diff check 通过。
+
+短计划：先为纯判定 API 添加三种分级体系、未知等级、标签交集及禁用优先回归；再实现无 I/O 的策略评估函数并运行领域定向测试。
+
+验证：运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-678。
+
+结果（2026-10-19）：新增纯领域策略判定，验证 MPA/TVPG/BBFC 顺序、BBFC 12/12A 同级、跨体系与未知分级的未分级行为、允许标签至少命中一项、禁止标签优先和索引缺失 fail closed；损坏的等级体系、最高等级或标签记录失败关闭，完全不限制策略不要求索引。`content_restrictions::tests` 11/11、Rust fmt check 与 diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
