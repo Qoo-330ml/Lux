@@ -14,6 +14,203 @@ pub(crate) struct ReplaceLibraryAccessRequest {
     pub(crate) library_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateUserPermissionPresetRequest {
+    version: u64,
+    name: String,
+    description: Option<String>,
+    is_admin: bool,
+    can_manage_server: bool,
+    permissions: crate::application::settings::NewUserPermissions,
+}
+
+impl UpdateUserPermissionPresetRequest {
+    fn into_input(self) -> crate::application::user_presets::NewUserPermissionPresetInput {
+        crate::application::user_presets::NewUserPermissionPresetInput {
+            name: self.name,
+            description: self.description,
+            is_admin: self.is_admin,
+            can_manage_server: self.can_manage_server,
+            permissions: self.permissions,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteUserPermissionPresetQuery {
+    version: Option<u64>,
+}
+
+async fn admin_list_user_permission_presets(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_presets::list_user_permission_presets(database).await {
+        Ok(presets) => Json(json!({ "presets": presets })).into_response(),
+        Err(error) => user_permission_preset_error(&headers, error),
+    }
+}
+
+async fn admin_create_user_permission_preset(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<crate::application::user_presets::NewUserPermissionPresetInput>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_presets::create_user_permission_preset(database, request).await {
+        Ok(preset) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_PERMISSION_PRESET_CREATED",
+                Some("user_permission_preset"),
+                Some(&preset.id),
+                "{}",
+            )
+            .await;
+            (StatusCode::CREATED, Json(json!({ "preset": preset }))).into_response()
+        }
+        Err(error) => user_permission_preset_error(&headers, error),
+    }
+}
+
+async fn admin_update_user_permission_preset(
+    headers: HeaderMap,
+    Path(preset_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateUserPermissionPresetRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request.version == 0 {
+        return invalid_user_permission_preset_request(&headers);
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_presets::update_user_permission_preset(
+        database,
+        &preset_id,
+        request.version,
+        request.into_input(),
+    )
+    .await
+    {
+        Ok(preset) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_PERMISSION_PRESET_UPDATED",
+                Some("user_permission_preset"),
+                Some(&preset.id),
+                &json!({ "version": preset.version }).to_string(),
+            )
+            .await;
+            Json(json!({ "preset": preset })).into_response()
+        }
+        Err(error) => user_permission_preset_error(&headers, error),
+    }
+}
+
+async fn admin_delete_user_permission_preset(
+    headers: HeaderMap,
+    Path(preset_id): Path<String>,
+    Query(query): Query<DeleteUserPermissionPresetQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(version) = query.version.filter(|version| *version > 0) else {
+        return invalid_user_permission_preset_request(&headers);
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_presets::delete_user_permission_preset(
+        database, &preset_id, version,
+    )
+    .await
+    {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_PERMISSION_PRESET_DELETED",
+                Some("user_permission_preset"),
+                Some(&preset_id),
+                &json!({ "version": version }).to_string(),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => user_permission_preset_error(&headers, error),
+    }
+}
+
+fn invalid_user_permission_preset_request(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::BAD_REQUEST,
+        lux::ApiErrorCode::InvalidRequest,
+        "权限预设请求无效",
+    )
+    .into_response()
+}
+
+fn user_permission_preset_error(
+    headers: &HeaderMap,
+    error: crate::application::user_presets::UserPermissionPresetError,
+) -> Response {
+    use crate::application::user_presets::UserPermissionPresetError as PresetError;
+
+    match error {
+        PresetError::InvalidName
+        | PresetError::InvalidDescription
+        | PresetError::InvalidRole
+        | PresetError::InvalidSnapshot => invalid_user_permission_preset_request(headers),
+        PresetError::DuplicateName
+        | PresetError::BuiltInPreset
+        | PresetError::ConcurrentUpdate
+        | PresetError::VersionConflict
+        | PresetError::PresetLimitReached => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "权限预设已变化或与现有预设冲突",
+        )
+        .into_response(),
+        PresetError::NotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "权限预设不存在",
+        )
+        .into_response(),
+        PresetError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "权限预设暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
 pub(crate) async fn admin_list_users(
     headers: HeaderMap,
     Query(query): Query<AdminUsersQuery>,
@@ -1018,6 +1215,14 @@ pub(crate) async fn admin_update_user_avatar(
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/v1/admin/user-permission-presets",
+            get(admin_list_user_permission_presets).post(admin_create_user_permission_preset),
+        )
+        .route(
+            "/api/v1/admin/user-permission-presets/{preset_id}",
+            put(admin_update_user_permission_preset).delete(admin_delete_user_permission_preset),
+        )
         .route(
             "/api/v1/admin/users",
             get(admin_list_users).post(admin_create_user),

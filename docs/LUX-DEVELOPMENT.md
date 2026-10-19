@@ -13421,6 +13421,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增管理员/普通用户内置预设、自定义预设版本化 CRUD，权限字段复用新用户默认权限的结构校验；空的 `SELECTED` 归一化为 `NONE`，指定媒体库须仍为启用的普通媒体库。`server_settings` 使用单条 SQL 比较并交换，自定义名称不区分大小写且最多 100 项。定向 `user_presets` 5/5、`cargo build --locked`、fmt check、diff check 通过。`cargo test --locked --all-targets` 的库测试部分为 991 passed、4 failed、25 ignored；3 项补全队列基线失败重现，另有 `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 超时，因库测试失败后续集成 targets 未运行。全量 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。预设 HTTP API 和 UI 留待后续模块四任务。
 
+#### LUX-640：暴露管理员权限预设管理 API
+
+范围：为权限预设提供管理员列表、创建、版本化更新和删除接口；变更接口要求管理员 Web session 与 CSRF，预设版本冲突和名称冲突返回稳定错误。暂不实现 Web 管理表单或预设应用到用户的批量操作。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`src/application/user_presets.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可以读取两个内置预设及自定义预设；非管理员不能读取或修改。
+- [x] 创建、更新、删除均通过业务服务；写操作校验 CSRF，删除和更新要求预期版本。
+- [x] 无效输入返回 400，重复名称、内置预设写入和版本冲突返回 409，不存在预设返回 404。
+- [x] API 回归、`users` target、Rust build、fmt 和 diff check 通过。
+
+短计划：先在 `users` 集成回归中覆盖列表、CSRF、CRUD 和错误映射并确认失败；再连接 LUX-639 服务，最后同步 API 合同。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639。
+
+结果（2026-10-19）：新增管理员预设列表与自定义预设创建/更新/删除 API，写操作通过 CSRF 校验并记录审计事件；更新和删除要求当前预设版本。`users` target 2/2、Rust build、fmt check 和 diff check 通过；集成回归覆盖非管理员读写拒绝、重复名称、无效快照、内置项保护、陈旧版本、缺失版本及不存在项。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

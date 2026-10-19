@@ -60,6 +60,189 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         Some(1)
     );
 
+    let preset_list = client
+        .get(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(preset_list.status(), reqwest::StatusCode::OK);
+    let presets = preset_list.json::<Value>().await?["presets"].clone();
+    assert_eq!(presets.as_array().map(Vec::len), Some(2));
+    assert!(
+        presets
+            .as_array()
+            .is_some_and(|presets| presets.iter().any(|preset| preset["id"] == "builtin-admin"))
+    );
+    let preset_input = json!({
+        "name": "Family",
+        "description": "Family media access",
+        "isAdmin": false,
+        "canManageServer": false,
+        "permissions": {
+            "libraryAccessMode": "NONE",
+            "libraryIds": [],
+            "canDownload": false,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true
+        }
+    });
+    let missing_preset_csrf = client
+        .post(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &cookie)
+        .json(&preset_input)
+        .send()
+        .await?;
+    assert_eq!(missing_preset_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let invalid_preset = client
+        .post(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": "Invalid",
+            "isAdmin": false,
+            "canManageServer": false,
+            "permissions": {
+                "libraryAccessMode": "NONE",
+                "libraryIds": [],
+                "canDownload": false,
+                "canPlay": true,
+                "maxSimultaneousPlaybacks": -1,
+                "allowRemux": true,
+                "allowAudioTranscode": true,
+                "allowVideoTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid_preset.status(), reqwest::StatusCode::BAD_REQUEST);
+    let created_preset = client
+        .post(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&preset_input)
+        .send()
+        .await?;
+    assert_eq!(created_preset.status(), reqwest::StatusCode::CREATED);
+    let created_preset = created_preset.json::<Value>().await?["preset"].clone();
+    assert_eq!(created_preset["version"], 1);
+    assert_eq!(created_preset["isBuiltin"], false);
+    let preset_id = created_preset["id"]
+        .as_str()
+        .ok_or("missing permission preset id")?
+        .to_owned();
+    let duplicate_preset = client
+        .post(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": " family ",
+            "isAdmin": false,
+            "canManageServer": false,
+            "permissions": preset_input["permissions"].clone()
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate_preset.status(), reqwest::StatusCode::CONFLICT);
+
+    let updated_preset = client
+        .put(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/{preset_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "version": 1,
+            "name": "Family media",
+            "description": "Updated family access",
+            "isAdmin": false,
+            "canManageServer": false,
+            "permissions": preset_input["permissions"].clone()
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated_preset.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        updated_preset.json::<Value>().await?["preset"]["version"],
+        2
+    );
+    let stale_preset_update = client
+        .put(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/{preset_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "version": 1,
+            "name": "Stale family",
+            "isAdmin": false,
+            "canManageServer": false,
+            "permissions": preset_input["permissions"].clone()
+        }))
+        .send()
+        .await?;
+    assert_eq!(stale_preset_update.status(), reqwest::StatusCode::CONFLICT);
+
+    let builtin_update = client
+        .put(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/builtin-admin"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "version": 1,
+            "name": "Admin override",
+            "isAdmin": true,
+            "canManageServer": true,
+            "permissions": preset_input["permissions"].clone()
+        }))
+        .send()
+        .await?;
+    assert_eq!(builtin_update.status(), reqwest::StatusCode::CONFLICT);
+
+    let builtin_delete = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/builtin-admin?version=1"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(builtin_delete.status(), reqwest::StatusCode::CONFLICT);
+    let missing_delete_version = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/{preset_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(
+        missing_delete_version.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let missing_preset = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/missing?version=1"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(missing_preset.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let deleted_preset = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/user-permission-presets/{preset_id}?version=2"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted_preset.status(), reqwest::StatusCode::NO_CONTENT);
+
     let created = client
         .post(format!("{base_url}/api/v1/admin/users"))
         .header(COOKIE, &cookie)
@@ -76,6 +259,31 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .as_str()
         .ok_or("missing user id")?
         .to_owned();
+
+    let managed_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "managed", "password": "managed password" }))
+        .send()
+        .await?;
+    let managed_cookie = cookie_pair(managed_login.headers());
+    let managed_csrf = cookie_value(managed_login.headers(), "lux_csrf");
+    let managed_presets = client
+        .get(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &managed_cookie)
+        .send()
+        .await?;
+    assert_eq!(managed_presets.status(), reqwest::StatusCode::FORBIDDEN);
+    let managed_preset_create = client
+        .post(format!("{base_url}/api/v1/admin/user-permission-presets"))
+        .header(COOKIE, &managed_cookie)
+        .header("x-csrf-token", &managed_csrf)
+        .json(&preset_input)
+        .send()
+        .await?;
+    assert_eq!(
+        managed_preset_create.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
 
     let default_playback_policy = client
         .get(format!(

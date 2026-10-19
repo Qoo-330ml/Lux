@@ -24,7 +24,8 @@ pub(crate) struct UserPermissionPreset {
     pub(crate) permissions: NewUserPermissions,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NewUserPermissionPresetInput {
     pub(crate) name: String,
     pub(crate) description: Option<String>,
