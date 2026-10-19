@@ -34,6 +34,7 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
+  AdminUserPlaybackPolicy,
   AdminUserListQuery,
   AdminUserListResponse,
   AdminMetadataCandidate,
@@ -1099,6 +1100,19 @@ export class LuxApiClient {
   adminUser(userId: string) {
     return this.request<{ user?: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  adminUserPlaybackPolicy(userId: string) {
+    return this.request<{ policy: AdminUserPlaybackPolicy }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-policy`,
+    );
+  }
+
+  updateAdminUserPlaybackPolicy(userId: string, input: AdminUserPlaybackPolicy) {
+    return this.request<{ policy: AdminUserPlaybackPolicy }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-policy`,
+      { method: "PUT", body: JSON.stringify(input) },
     );
   }
 

@@ -547,6 +547,14 @@ export type AdminUser = LuxUser & {
   presetSource?: string | null;
 };
 
+export type AdminUserPlaybackPolicy = {
+  canPlay: boolean;
+  maxSimultaneousPlaybacks: number;
+  allowRemux: boolean;
+  allowAudioTranscode: boolean;
+  allowVideoTranscode: boolean;
+};
+
 export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
 export type AdminUserSortBy = "createdAt" | "lastLoginAt" | "lastActivityAt";
 export type AdminUserSortOrder = "asc" | "desc";

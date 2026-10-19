@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminUser } from "../../lib/api/types";
+import type { AdminUser, AdminUserPlaybackPolicy } from "../../lib/api/types";
 import "./user-management.css";
 
 const detailSections = [
@@ -71,6 +71,8 @@ export function AdminUserDetailPage() {
           <AdminUserProfileEditor key={user.id} user={user} />
           <AdminUserLifecycleActions user={user} />
         </>
+      ) : section.id === "playback" ? (
+        <AdminUserPlaybackPolicySection key={user.id} user={user} />
       ) : (
         <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-module-title">
           <span className="lux-admin-user-module-icon"><Icon size={19} /></span>
@@ -82,6 +84,120 @@ export function AdminUserDetailPage() {
         </section>
       )}
     </div>
+  );
+}
+
+function AdminUserPlaybackPolicySection({ user }: { user: AdminUser }) {
+  if (user.deletedAt != null) {
+    return (
+      <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-playback-title">
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-playback-title">播放与转码</h2></div></div>
+        <p className="lux-admin-muted">回收站中的账号播放策略为只读，恢复后可查看。</p>
+      </section>
+    );
+  }
+  return <AdminUserPlaybackPolicyEditor user={user} />;
+}
+
+function AdminUserPlaybackPolicyEditor({ user }: { user: AdminUser }) {
+  const queryClient = useQueryClient();
+  const queryKey = ["admin", "user", user.id, "playback-policy"];
+  const policyQuery = useQuery({
+    queryKey,
+    queryFn: () => api.adminUserPlaybackPolicy(user.id),
+  });
+  const [draft, setDraft] = useState<AdminUserPlaybackPolicy | null>(null);
+  const [limitDraft, setLimitDraft] = useState<string | null>(null);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const save = useMutation({
+    mutationFn: (policy: AdminUserPlaybackPolicy) => api.updateAdminUserPlaybackPolicy(user.id, policy),
+    onSuccess: ({ policy }) => {
+      setDraft(policy);
+      setLimitDraft(String(policy.maxSimultaneousPlaybacks));
+      setError("");
+      setNotice("播放策略已保存。");
+      queryClient.setQueryData(queryKey, { policy });
+    },
+    onError: (cause) => {
+      setNotice("");
+      setError(cause.message || "播放策略保存失败，请重试。");
+    },
+  });
+  const currentPolicy = policyQuery.data?.policy;
+  const currentDraft = draft ?? currentPolicy;
+  const limitInput = limitDraft ?? (currentPolicy ? String(currentPolicy.maxSimultaneousPlaybacks) : "");
+  const parsedLimit = Number(limitInput);
+  const validLimit = limitInput.trim() !== "" && Number.isSafeInteger(parsedLimit) && parsedLimit >= 0;
+  const updatedDraft = currentDraft && validLimit ? { ...currentDraft, maxSimultaneousPlaybacks: parsedLimit } : currentDraft;
+  const hasChanges = updatedDraft != null && currentPolicy != null && (
+    updatedDraft.canPlay !== currentPolicy.canPlay
+    || updatedDraft.maxSimultaneousPlaybacks !== currentPolicy.maxSimultaneousPlaybacks
+    || updatedDraft.allowRemux !== currentPolicy.allowRemux
+    || updatedDraft.allowAudioTranscode !== currentPolicy.allowAudioTranscode
+    || updatedDraft.allowVideoTranscode !== currentPolicy.allowVideoTranscode
+  );
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!updatedDraft || !validLimit) return;
+    setNotice("");
+    setError("");
+    save.mutate(updatedDraft);
+  }
+
+  if (policyQuery.isPending) return <AdminUserManagementState label="正在读取播放策略…" />;
+  if (policyQuery.error) return <AdminUserManagementState label={policyQuery.error.message || "暂时无法读取播放策略。"} error />;
+  if (!currentDraft) return <AdminUserManagementState label="暂时无法读取播放策略。" error />;
+
+  return (
+    <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-playback-title">
+      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-playback-title">播放与转码</h2></div></div>
+      <form className="lux-admin-form lux-admin-user-playback-form" onSubmit={submit}>
+        <fieldset className="lux-admin-user-playback-options">
+          <legend className="lux-admin-muted">播放权限</legend>
+          <label className="lux-admin-user-playback-toggle">
+            <input type="checkbox" aria-label="允许播放" checked={currentDraft.canPlay} onChange={(event) => setDraft({ ...currentDraft, canPlay: event.currentTarget.checked })} />
+            <span>允许播放</span>
+          </label>
+          <label className="lux-admin-user-playback-toggle">
+            <input type="checkbox" aria-label="允许封装转换" checked={currentDraft.allowRemux} onChange={(event) => setDraft({ ...currentDraft, allowRemux: event.currentTarget.checked })} />
+            <span>允许封装转换</span>
+          </label>
+          <label className="lux-admin-user-playback-toggle">
+            <input type="checkbox" aria-label="允许音频转码" checked={currentDraft.allowAudioTranscode} onChange={(event) => setDraft({ ...currentDraft, allowAudioTranscode: event.currentTarget.checked })} />
+            <span>允许音频转码</span>
+          </label>
+          <label className="lux-admin-user-playback-toggle">
+            <input type="checkbox" aria-label="允许视频转码" checked={currentDraft.allowVideoTranscode} onChange={(event) => setDraft({ ...currentDraft, allowVideoTranscode: event.currentTarget.checked })} />
+            <span>允许视频转码</span>
+          </label>
+        </fieldset>
+        <label className="lux-admin-user-playback-limit">
+          同时播放上限
+          <input
+            type="number"
+            aria-label="同时播放上限"
+            aria-invalid={!validLimit}
+            aria-describedby="lux-admin-user-playback-limit-help"
+            min={0}
+            step={1}
+            value={limitInput}
+            onChange={(event) => setLimitDraft(event.currentTarget.value)}
+          />
+        </label>
+        <p id="lux-admin-user-playback-limit-help" className="lux-admin-muted">0 表示不限。并发上限只控制此账号的同时播放数。</p>
+        <p className="lux-admin-muted">播放准入策略将在下一步生效；目前保存的设置尚未影响播放请求。</p>
+        {limitInput.trim() === "" || !validLimit ? <p className="lux-admin-user-playback-validation" role="alert">请输入非负整数。</p> : null}
+        <div className="lux-admin-user-profile-actions">
+          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || !validLimit || save.isPending}>
+            {save.isPending ? "保存中…" : "保存播放策略"}
+          </button>
+          {error ? <span role="alert">{error}</span> : null}
+          {notice ? <span role="status">{notice}</span> : null}
+        </div>
+      </form>
+    </section>
   );
 }
 

@@ -12961,6 +12961,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增管理员专用 GET/PUT，PUT 通过 CSRF 校验并要求五字段完整提交；负并发上限返回 400，`0` 原样保存为不限，普通用户无权访问，回收站用户读写均返回 404。每次成功写入记录策略值审计事件，不含认证信息。`users` 定向集成测试 1/1 通过，接口及 `0` 语义已记入兼容文档；未部署。
 
+#### LUX-617：在用户详情接入播放策略表单
+
+范围：将管理员策略 API 接到“播放与转码”模块，提供允许播放、并发上限、封装转换、音频转码和视频转码设置。说明 `0` 表示不限及当前尚未由准入逻辑执行；回收站账号只读。不展示远程访问或码率伪开关。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/admin-user-playback-policy.test.tsx`。
+
+验收标准：
+
+- [x] 播放与转码模块加载已保存策略并可完整保存五项设置。
+- [x] 并发上限只接受非负整数，`0` 明确显示为不限；保存失败时保留用户输入。
+- [x] 回收站账号不请求写入且呈现只读说明；页面标明播放准入仍待实施。
+- [x] 定向 Vitest、Web 构建通过，桌面与窄屏模块布局无溢出。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-playback-policy.test.tsx`、`pnpm --dir web build`、`git diff --check`。另用本地真实浏览器检查用户详情的播放策略流程。
+
+依赖：LUX-616。
+
+结果（2026-10-19）：用户详情的“播放与转码”读取并保存五项策略，非法并发数禁止提交且保存失败保留草稿；回收站账号不请求策略 API。页面说明 `0` 表示不限并标明准入逻辑待后续任务接入。定向 Vitest 3/3、Web 构建通过；Playwright 本地真实浏览器在接口 mock 下完成桌面和 390px 窄屏检查、保存交互及 PUT 载荷确认，无页面横向溢出或控制台错误。未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
