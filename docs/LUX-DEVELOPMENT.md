@@ -14187,6 +14187,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：存储层增加用户策略读取和 CAS 写入，策略与标签通过一条 JOIN 读取，避免并发更新时读到不同版本；允许/禁止标签先 trim、统一小写并以 Rust 顺序排序，每类最多 100 个，空值、超长值和规范化后重复项拒绝。策略版本与标签整组替换位于同一事务，注入标签写失败后版本及原标签保持不变。缺少策略行返回 `None`。存储定向用例 1/1、build、fmt 与 diff check 通过；严格 Clippy 仍被未修改的 `serve_emby_media_file` 与 `verify_emby_direct_stream` 两个既有 `too_many_arguments` 阻挡，按现有基线豁免该 lint 后 Clippy 通过。
 
+#### LUX-678：定义内容限制使用的年龄分级分类
+
+范围：为模块五定义明确的可选年龄分级体系、规范化证书代码及比较顺序。仅解析 NFO 的认证文本，不把 TMDb/community 数值评分当作年龄等级；尚不创建条目索引、不改变媒体访问。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`src/domain/content_restrictions.rs`、`src/domain/mod.rs`。
+
+验收标准：
+
+- [x] 明确支持 MPA 电影分级、TV Parental Guidelines 和 BBFC，策略接口使用稳定体系键与等级键。
+- [x] 仅规范化已知分级文本；未知、缺失或不适用于所选体系的值保持未分级。
+- [x] 分级比较顺序在代码和用户方案中一致；纯函数回归覆盖大小写/空白、已知等级、未知等级、体系不匹配和最大等级判定。
+- [x] 认证字段与社区数值评分严格区分。
+
+短计划：先加入域层纯函数回归，确认未实现时编译失败；再实现体系键、分级键、规范化和比较；最后同步方案与主规格，并运行定向 library 测试、fmt 与 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-677。
+
+结果（2026-10-19）：域层定义稳定体系键 `MPA`、`TVPG`、`BBFC`，只识别各自正式等级代码并兼容 `Rated ` 前缀；未知文本、地域前缀和数值评分均保持未分级。应用内最高等级顺序与方案一致，其中 BBFC `12`/`12A` 同级；TV 指引官方列出六类而未定义数值序列，方案明确登记 Lux 自身比较顺序。纯分类回归 3/3 通过；过滤既有 `too_many_arguments` 基线后 Clippy、fmt 和 diff 检查通过。官方定义核对：[MPA](https://www.filmratings.com/ratings-guide/)、[TV Parental Guidelines](https://www.tvguidelines.org/aboutUs.html)、[BBFC](https://www.bbfc.co.uk/our-age-ratings)。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

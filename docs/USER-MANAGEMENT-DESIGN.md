@@ -161,6 +161,8 @@ Rust、React + TypeScript、单进程服务、有界后台工作以及 Lux/Emby 
 #### 配置项
 
 - 分级体系、最高允许等级；不把 TMDb 等数值评分当作年龄分级。
+- 首批分级体系使用 [MPA 电影分级](https://www.filmratings.com/ratings-guide/)（G、PG、PG-13、R、NC-17）、[TV Parental Guidelines](https://www.tvguidelines.org/aboutUs.html)（TV-Y、TV-Y7、TV-G、TV-PG、TV-14、TV-MA）和 [BBFC](https://www.bbfc.co.uk/our-age-ratings)（U、PG、12、12A、15、18、R18）。MPA 与 BBFC 的限制顺序按表中等级从宽到严；BBFC 的 12 与 12A 视为同一限制级。TV Parental Guidelines 没有官方数值序列，Lux 的比较顺序固定为 TV-Y、TV-G、TV-Y7、TV-PG、TV-14、TV-MA。
+- NFO `mpaa` 的文本只按选定体系的已知代码匹配，可接受前缀 `Rated `；不根据制作国家推断体系，也不跨体系换算。无法明确匹配的值按未分级处理。
 - 未分级内容允许或禁止；缺失、无法识别或无法映射到所选体系的值按未分级处理。
 - 允许标签、禁止标签。
 
