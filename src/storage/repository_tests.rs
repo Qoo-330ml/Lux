@@ -14533,6 +14533,96 @@ async fn apply_user_permission_preset_replaces_snapshot_and_source()
 }
 
 #[tokio::test]
+async fn user_permission_preset_source_reads_support_single_and_batch_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in [
+        "preset-source-first",
+        "preset-source-second",
+        "preset-source-empty",
+    ] {
+        database
+            .insert_user(user_id, user_id, user_id, "test-hash", false, true)
+            .await?;
+    }
+    for (user_id, preset_id, preset_name, preset_version, applied_at) in [
+        ("preset-source-first", "family", "Family", 3_i64, 101_i64),
+        (
+            "preset-source-second",
+            "builtin-user",
+            "普通用户",
+            1_i64,
+            202_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_permission_preset_sources
+             (user_id, preset_id, preset_name, preset_version, applied_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(preset_id)
+        .bind(preset_name)
+        .bind(preset_version)
+        .bind(applied_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .user_permission_preset_source("preset-source-first")
+            .await?,
+        Some(crate::storage::StoredUserPermissionPresetSource {
+            preset_id: "family".to_owned(),
+            preset_name: "Family".to_owned(),
+            preset_version: 3,
+            applied_at: 101,
+        })
+    );
+    assert_eq!(database.query_count(), 1);
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .user_permission_preset_source("preset-source-empty")
+            .await?,
+        None
+    );
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    let empty = database.user_permission_preset_sources(&[]).await?;
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    let user_ids = [
+        "preset-source-first".to_owned(),
+        "preset-source-second".to_owned(),
+        "preset-source-empty".to_owned(),
+    ];
+    database.reset_query_count();
+    let sources = database.user_permission_preset_sources(&user_ids).await?;
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(sources.len(), 2);
+    assert_eq!(
+        sources["preset-source-second"],
+        crate::storage::StoredUserPermissionPresetSource {
+            preset_id: "builtin-user".to_owned(),
+            preset_name: "普通用户".to_owned(),
+            preset_version: 1,
+            applied_at: 202,
+        }
+    );
+    assert!(!sources.contains_key("preset-source-empty"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn apply_user_permission_preset_protects_last_manager_and_ignores_deleted_users()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

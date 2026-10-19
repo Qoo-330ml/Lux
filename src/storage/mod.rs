@@ -671,8 +671,8 @@ pub(crate) use repository::{
     StoredScheduledTaskConfig, StoredScheduledTaskPlan, StoredScheduledTaskPlanLibrary,
     StoredSeriesMetadataSource, StoredStrmMediaSource, StoredStrmProbeJob, StoredSubtitleStream,
     StoredThumbnailScraperRetry, StoredThumbnailSource, StoredUser, StoredUserItemState,
-    StoredWebPlaybackSession, StoredWebSession, StoredWebSessionSummary,
-    UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
+    StoredUserPermissionPresetSource, StoredWebPlaybackSession, StoredWebSession,
+    StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
     WebPlaybackTranscodingDetails, is_lite_manifest_discovery, movie_parent_folder_identity,
     recommendation_batch_key_at,
 };

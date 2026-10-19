@@ -13566,6 +13566,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增管理员权限预设应用端点，复用事务存储与 application 校验，成功后写入以目标用户为对象、详情只含预设 ID 和版本的审计事件，并规范化 UUID 大小写。`users` target 3/3、Rust build、fmt check 与 diff check 通过；回归覆盖管理员/CSRF、权限快照、应用后删除预设、无效/不存在用户、未知预设和最后管理员保护。全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
 
+#### LUX-647：批量读取用户权限预设来源
+
+范围：为管理端用户查询提供单个用户的预设来源读取和一页用户 ID 的批量来源读取，返回预设 ID、应用时名称、版本和时间。查询只读来源快照，不联接现存预设配置，因此自定义预设删除后仍能读取。本任务不修改 API 投影或页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 单条与批量查询准确返回完整来源，缺少来源时返回空结果。
+- [x] 空 ID 列表不执行查询；一页多个用户用单次批量查询完成。
+- [x] SQLite 存储回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加单条/批量来源查询回归并确认存储接口尚不存在；再新增类型、双查询方法和模块导出。
+
+验证：`cargo test --locked --lib user_permission_preset_source`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-642。
+
+结果（2026-10-19）：新增用户预设来源类型、单用户读取及按最多 500 个 ID 分块的批量读取；空输入不执行 SQL。`user_permission_preset_source_reads_support_single_and_batch_queries` 1/1、Rust build、fmt check 和 diff check 通过。为让该中间存储合同保持零新增告警，标注由后续 LUX-648 API 投影接线；全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

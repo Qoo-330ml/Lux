@@ -1116,6 +1116,16 @@ pub(crate) struct StoredAdminUserListItem {
     pub(crate) current_playback_count: i64,
 }
 
+// LUX-648 exposes this stored source in administrator user projections.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUserPermissionPresetSource {
+    pub(crate) preset_id: String,
+    pub(crate) preset_name: String,
+    pub(crate) preset_version: i64,
+    pub(crate) applied_at: i64,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredAccessTokenDevice {
     pub(crate) device_id: String,
@@ -1164,6 +1174,19 @@ pub(crate) fn stored_admin_user_list_item(row: sqlx::any::AnyRow) -> StoredAdmin
         last_activity_at: row.get("last_activity_at"),
         created_at: row.get("created_at"),
         current_playback_count: row.get("current_playback_count"),
+    }
+}
+
+// LUX-648 uses this mapping when building administrator user projections.
+#[allow(dead_code)]
+pub(crate) fn stored_user_permission_preset_source(
+    row: sqlx::any::AnyRow,
+) -> StoredUserPermissionPresetSource {
+    StoredUserPermissionPresetSource {
+        preset_id: row.get("preset_id"),
+        preset_name: row.get("preset_name"),
+        preset_version: row.get("preset_version"),
+        applied_at: row.get("applied_at"),
     }
 }
 

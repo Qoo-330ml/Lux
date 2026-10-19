@@ -215,6 +215,64 @@ impl Database {
         Ok(true)
     }
 
+    // LUX-648 wires these reads into administrator profile and list queries.
+    #[allow(dead_code)]
+    pub(crate) async fn user_permission_preset_source(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<StoredUserPermissionPresetSource>, StorageError> {
+        self.query(
+            "SELECT preset_id, preset_name, preset_version, applied_at
+             FROM user_permission_preset_sources WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_user_permission_preset_source))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn user_permission_preset_sources(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, StoredUserPermissionPresetSource>, StorageError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut sources = HashMap::with_capacity(user_ids.len());
+        for user_ids in user_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", user_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, preset_id, preset_name, preset_version, applied_at
+                 FROM user_permission_preset_sources WHERE user_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in user_ids {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                let user_id = row.get("user_id");
+                sources.insert(user_id, stored_user_permission_preset_source(row));
+            }
+        }
+        Ok(sources)
+    }
+
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
         self.query_scalar("SELECT CASE WHEN EXISTS(SELECT 1 FROM users LIMIT 1) THEN 1 ELSE 0 END")
             .fetch_one(&self.pool)
