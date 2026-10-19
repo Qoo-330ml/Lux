@@ -74,6 +74,7 @@ pub mod strm_probe_policy;
 pub mod strm_target;
 pub(crate) mod thumbnail_policy;
 pub mod thumbnails;
+pub(crate) mod user_access_rules;
 pub(crate) mod user_account_preferences;
 pub mod user_avatars;
 pub(crate) mod user_cleanup;
