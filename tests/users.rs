@@ -4356,6 +4356,125 @@ async fn admin_can_manage_scoped_user_access_blacklist_rules()
 }
 
 #[tokio::test]
+async fn web_login_and_sessions_enforce_device_client_blacklists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let target = UserStore::new(database.clone())?
+        .create_user(
+            "web-blacklist-target",
+            "Web Blacklist Target",
+            "target password",
+            false,
+        )
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let device_a = uuid::Uuid::new_v4().to_string();
+    let device_b = uuid::Uuid::new_v4().to_string();
+    let login = |device_id: &str| {
+        client
+            .post(format!("{base_url}/api/v1/auth/login"))
+            .header("X-Lux-Device-Id", device_id.to_owned())
+            .json(&json!({
+                "username": "web-blacklist-target",
+                "password": "target password"
+            }))
+    };
+
+    let first_login = login(&device_a).send().await?;
+    assert_eq!(first_login.status(), reqwest::StatusCode::OK);
+    let first_cookie = cookie_pair(first_login.headers());
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES (?, ?, 'DEVICE', ?, 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(target.id.to_string())
+    .bind(&device_a)
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let denied_existing = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &first_cookie)
+        .send()
+        .await?;
+    assert_eq!(denied_existing.status(), reqwest::StatusCode::FORBIDDEN);
+    let revoked_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_sessions
+         WHERE user_id = ? AND device_id = ? AND revoked_at IS NOT NULL",
+    )
+    .bind(target.id.to_string())
+    .bind(&device_a)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(revoked_count, 1);
+
+    let denied_device_login = login(&device_a).send().await?;
+    assert_eq!(denied_device_login.status(), reqwest::StatusCode::FORBIDDEN);
+    let active_after_denied_login: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_sessions
+         WHERE user_id = ? AND device_id = ? AND revoked_at IS NULL",
+    )
+    .bind(target.id.to_string())
+    .bind(&device_a)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(active_after_denied_login, 0);
+
+    let other_device_login = login(&device_b).send().await?;
+    assert_eq!(other_device_login.status(), reqwest::StatusCode::OK);
+    let other_device_cookie = cookie_pair(other_device_login.headers());
+    let other_device_access = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &other_device_cookie)
+        .send()
+        .await?;
+    assert_eq!(other_device_access.status(), reqwest::StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES (?, NULL, 'CLIENT', 'lux web', 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let denied_by_client = client
+        .get(format!("{base_url}/api/v1/auth/me"))
+        .header(COOKIE, &other_device_cookie)
+        .send()
+        .await?;
+    assert_eq!(denied_by_client.status(), reqwest::StatusCode::FORBIDDEN);
+    let denied_client_login = login(&device_b).send().await?;
+    assert_eq!(denied_client_login.status(), reqwest::StatusCode::FORBIDDEN);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_list_user_web_sessions_without_exposing_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

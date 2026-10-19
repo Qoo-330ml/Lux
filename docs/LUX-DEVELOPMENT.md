@@ -15870,6 +15870,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因匹配查询 DTO 和 storage 方法缺失而编译失败；实现后 SQLite 定向回归 `user_access_blacklist_matching_is_scoped_enabled_and_type_specific` 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过，Cargo 使用 Toshiba target 目录。
 
+#### LUX-759：在 Web 登录与会话访问中执行设备/客户端黑名单
+
+范围：Web 登录创建会话前，以当前用户、已绑定设备 ID 和固定客户端 `Lux Web` 检查启用的全站及用户级 DEVICE/CLIENT 规则；匹配则拒绝登录。后续 Web 会话请求重复执行同一判断，命中后撤销该会话并拒绝请求。无法读取规则时 fail closed 返回服务不可用。客户端名按 LUX-756 规范化。只覆盖 Web 身份验证边界，不接 Emby、已签发播放链接或 IP/CIDR 规则。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/sessions.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 新登录命中设备或客户端规则时不签发会话；未命中设备仍可正常登录。
+- [x] 已有 Web 会话首次命中规则时被撤销并拒绝请求；未命中规则的其他设备会话不受影响。
+- [x] Web 登录与会话解析的集成回归、Rust build、fmt 与 diff check 通过。
+- [x] 不接入 Emby、播放授权或 IP/CIDR 规则；这些行为留待各自任务。
+
+短计划：先在 `tests/users.rs` 建立已登录设备后添加匹配规则的回归并确认会话仍可用；再于 Web 登录签发前与 Web 会话解析后复用 LUX-758 命中查询，并按命中/存储失败区分拒绝与 503；最后运行 users 定向目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：Web 登录在验证账号后、创建会话前检查规范化的 `Lux Web` 客户端名与当前设备 ID；匹配时返回 403 且不签发会话。后续 Web 会话请求重复检查；命中时先撤销当前会话再拒绝请求，未匹配设备仍可访问。规则存储查询失败时登录/访问 fail closed。
+
+验证：TDD RED 时加入用户设备规则后的已有会话仍返回 200；实现后新增 Web 黑名单集成回归通过，覆盖现有会话撤销、新登录拒绝、另一设备保留访问及全局客户端拒绝。`cargo test --locked --test users -- --test-threads=1` 在设置 `NO_PROXY` 绕过本地代理后 22/22 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 使用 Toshiba target 目录；Emby、播放链接与 IP/CIDR 规则留待后续任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

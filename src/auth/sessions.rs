@@ -45,6 +45,12 @@ impl WebAuthService {
         let Some(user) = self.users.authenticate(username, password).await? else {
             return Ok(None);
         };
+        if self
+            .is_user_access_blacklisted(&user.id.to_string(), device_id)
+            .await?
+        {
+            return Err(WebAuthError::AccessDenied);
+        }
         let session_token = generate_token()?;
         let csrf_token = generate_token()?;
         let session_id = UserId::new();
@@ -83,6 +89,21 @@ impl WebAuthService {
             csrf_token,
             user,
         }))
+    }
+
+    pub async fn is_user_access_blacklisted(
+        &self,
+        user_id: &str,
+        device_id: Option<&str>,
+    ) -> Result<bool, WebAuthError> {
+        Ok(self
+            .database
+            .user_access_blacklist_matches(crate::storage::UserAccessBlacklistRuleMatchQuery {
+                user_id,
+                device_id,
+                client_name: Some("lux web"),
+            })
+            .await?)
     }
 
     pub(crate) async fn find_user_id_by_username(
@@ -270,6 +291,7 @@ fn hash_token(token: &str) -> Vec<u8> {
 
 #[derive(Debug)]
 pub enum WebAuthError {
+    AccessDenied,
     InvalidUserId(String),
     Password(PasswordError),
     Storage(StorageError),
@@ -298,6 +320,7 @@ impl From<UserStoreError> for WebAuthError {
 impl std::fmt::Display for WebAuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AccessDenied => formatter.write_str("access denied by account policy"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::Password(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
@@ -313,7 +336,7 @@ impl std::error::Error for WebAuthError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::UserStore(error) => Some(error),
-            Self::InvalidUserId(_) | Self::TokenGeneration(_) => None,
+            Self::AccessDenied | Self::InvalidUserId(_) | Self::TokenGeneration(_) => None,
         }
     }
 }

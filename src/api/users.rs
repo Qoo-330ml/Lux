@@ -820,6 +820,15 @@ pub(super) async fn auth_login(
         .await
     {
         Ok(session) => session,
+        Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
+            return api_error(
+                &headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "当前设备或客户端已被禁止访问",
+            )
+            .into_response();
+        }
         Err(_) => {
             return api_error(
                 &headers,
@@ -847,6 +856,15 @@ pub(super) async fn auth_login(
                 .await
             {
                 Ok(reauthenticated) => session = reauthenticated,
+                Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前设备或客户端已被禁止访问",
+                    )
+                    .into_response();
+                }
                 Err(_) => {
                     return api_error(
                         &headers,
@@ -2319,6 +2337,39 @@ pub(super) async fn require_web_principal(
                 .into_response());
             }
             let user_id = session.user.id.to_string();
+            match auth
+                .is_user_access_blacklisted(&user_id, session.device_id.as_deref())
+                .await
+            {
+                Ok(false) => {}
+                Ok(true) => {
+                    if auth.logout(&session_token).await.is_err() {
+                        return Err(api_error(
+                            headers,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            lux::ApiErrorCode::DatabaseUnavailable,
+                            "登录状态暂时无法更新",
+                        )
+                        .into_response());
+                    }
+                    return Err(api_error(
+                        headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前设备或客户端已被禁止访问",
+                    )
+                    .into_response());
+                }
+                Err(_) => {
+                    return Err(api_error(
+                        headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "访问规则暂时无法读取",
+                    )
+                    .into_response());
+                }
+            }
             let device_id = session
                 .device_id
                 .clone()
