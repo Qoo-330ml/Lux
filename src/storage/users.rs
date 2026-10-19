@@ -1906,6 +1906,41 @@ impl Database {
         Ok((rules, total_count))
     }
 
+    // LUX-758 checks active device/client rules before auth enforcement is wired.
+    #[allow(dead_code)]
+    pub(crate) async fn user_access_blacklist_matches(
+        &self,
+        query: UserAccessBlacklistRuleMatchQuery<'_>,
+    ) -> Result<bool, StorageError> {
+        if query.device_id.is_none() && query.client_name.is_none() {
+            return Ok(false);
+        }
+        self.query(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM user_access_blacklist_rules
+                 WHERE is_enabled = 1
+                   AND (user_id IS NULL OR user_id = ?)
+                   AND (
+                       (rule_type = 'DEVICE' AND ? IS NOT NULL AND match_value = ?)
+                       OR (rule_type = 'CLIENT' AND ? IS NOT NULL AND match_value = ?)
+                   )
+             ) AS matched",
+        )
+        .bind(query.user_id)
+        .bind(query.device_id)
+        .bind(query.device_id)
+        .bind(query.client_name)
+        .bind(query.client_name)
+        .fetch_one(&self.pool)
+        .await
+        .map(|row| row.get::<i64, _>("matched") != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
         &self,

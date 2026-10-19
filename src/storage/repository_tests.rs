@@ -5,9 +5,9 @@ use crate::storage::{
     MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserAccessBlacklistRule,
     NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation,
     PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, StoredUserActivityEvent,
-    UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserActivityEventQuery,
-    UserContentRestrictionsCasResult, UserDevicePageQuery, UserPermissionCopyGroups,
-    UserPermissionCopyResult, UserPlaybackPolicy,
+    UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
+    UserAccessBlacklistRuleScope, UserActivityEventQuery, UserContentRestrictionsCasResult,
+    UserDevicePageQuery, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -271,6 +271,121 @@ async fn user_access_blacklist_rules_are_scoped_stable_and_bounded()
         })
         .await?;
     assert_eq!(user_a_after_delete, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_access_blacklist_matching_is_scoped_enabled_and_type_specific()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, username) in [
+        ("blacklist-match-a", "blacklist-match-a"),
+        ("blacklist-match-b", "blacklist-match-b"),
+        ("blacklist-match-creator", "blacklist-match-creator"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test-hash')",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, user_id, rule_type, match_value, is_enabled) in [
+        ("match-global-device", None, "DEVICE", "shared-tv", true),
+        ("match-global-client", None, "CLIENT", "lux web", true),
+        (
+            "match-user-a-device",
+            Some("blacklist-match-a"),
+            "DEVICE",
+            "a-phone",
+            true,
+        ),
+        (
+            "match-user-a-client",
+            Some("blacklist-match-a"),
+            "CLIENT",
+            "plex",
+            true,
+        ),
+        (
+            "match-user-b-device",
+            Some("blacklist-match-b"),
+            "DEVICE",
+            "b-phone",
+            true,
+        ),
+        (
+            "match-disabled-device",
+            None,
+            "DEVICE",
+            "disabled-tv",
+            false,
+        ),
+        (
+            "match-ip-same-value",
+            None,
+            "IP_CIDR",
+            "203.0.113.5/32",
+            true,
+        ),
+    ] {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id,
+                user_id,
+                rule_type,
+                match_value,
+                is_enabled,
+                created_by: Some("blacklist-match-creator"),
+                created_at: 100,
+            })
+            .await?;
+    }
+
+    for (user_id, device_id, client_name) in [
+        ("blacklist-match-a", Some("shared-tv"), None),
+        ("blacklist-match-b", Some("shared-tv"), None),
+        ("blacklist-match-a", Some("a-phone"), None),
+        ("blacklist-match-a", None, Some("lux web")),
+        ("blacklist-match-a", None, Some("plex")),
+    ] {
+        assert!(
+            database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id,
+                    device_id,
+                    client_name,
+                })
+                .await?
+        );
+    }
+
+    for (user_id, device_id, client_name) in [
+        ("blacklist-match-b", Some("a-phone"), None),
+        ("blacklist-match-a", Some("a-phone-extra"), None),
+        ("blacklist-match-a", Some("disabled-tv"), None),
+        ("blacklist-match-a", None, Some("203.0.113.5/32")),
+        ("blacklist-match-a", None, None),
+    ] {
+        assert!(
+            !database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id,
+                    device_id,
+                    client_name,
+                })
+                .await?
+        );
+    }
     Ok(())
 }
 

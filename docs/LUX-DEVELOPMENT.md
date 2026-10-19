@@ -15852,6 +15852,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 先因路由未注册返回 404；实现后 `admin_can_manage_scoped_user_access_blacklist_rules` 通过，覆盖认证/CSRF、规则值校验与规范化、重复冲突、分页、作用域隔离及用户 ID 错误。`cargo test --locked --test users -- --test-threads=1` 在显式绕过本地回环代理后 21/21 通过；首次运行 13 个既有本地 HTTP 用例受代理影响返回 502。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 使用 Toshiba target 目录。
 
+#### LUX-758：查询设备与客户端黑名单命中
+
+范围：为认证接线提供一个有界 storage 查询，按目标用户同时检查已启用的全站设备/客户端规则和该用户规则。设备标识精确匹配，客户端名使用调用方已规范化的值；禁用规则、其他用户规则和 IP/CIDR 规则不参与本任务。只增加存储合同及 SQLite 回归，不改变认证、会话或播放行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 同一查询能命中全站或精确用户范围内已启用的设备/客户端规则。
+- [x] 禁用规则、其他用户范围、缺失的设备/客户端值和 IP 规则不产生误命中。
+- [x] SQLite storage 定向回归、Rust build、fmt 与 diff check 通过；不改变认证行为。
+
+短计划：先在 `repository_tests.rs` 覆盖全站/用户隔离、规则类型、启用状态与精确匹配并确认查询合同缺失；再添加匹配查询 DTO 和单条 `EXISTS` storage 查询；最后运行该 library 定向测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：增加单条 `EXISTS` storage 合同，同时检查目标用户的启用全站规则和精确用户规则。只比较设备 ID 与调用方已规范化的客户端名；其他用户、已停用规则、无输入以及 IP/CIDR 规则不产生命中，不改认证行为。
+
+验证：TDD RED 因匹配查询 DTO 和 storage 方法缺失而编译失败；实现后 SQLite 定向回归 `user_access_blacklist_matching_is_scoped_enabled_and_type_specific` 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过，Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
