@@ -13315,6 +13315,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：`docs/API.md` 记录 `newUserPermissions` 全字段、默认值、完整快照更新、媒体库模式归一/拒绝规则、管理员 session + CSRF 和“尚未应用于新账号创建”的边界；`git diff --check` 通过。
 
+#### LUX-635：在用户全局设置页编辑新用户默认权限
+
+范围：将 `newUserPermissions` 接入“新用户默认权限”设置页，支持三态媒体库模式、启用媒体库选择、下载和五项播放/转码权限的完整快照编辑；保存成功更新管理员设置缓存，失败保留草稿。此任务只配置默认值，不改变用户创建行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/src/lib/api/types.ts`、`web/tests/admin-user-default-permissions.test.tsx`。
+
+验收标准：
+
+- [x] 设置页读取服务端快照；媒体库选择只显示已启用普通库，并说明空指定保存为无权限。
+- [x] 管理员可编辑媒体库模式、下载与播放/转码权限，显式保存完整对象。
+- [x] 并发上限只接受非负整数；保存失败保留草稿并显示错误，成功更新缓存。
+- [x] 定向 Vitest、Web build 与差异检查通过。
+
+短计划：先为默认权限模块写三态加载、完整保存、非法并发上限和失败保留回归；再扩展 API 类型与设置页分支，使用现有表单控件样式增加默认权限布局。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-default-permissions.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-633、LUX-634。
+
+结果（2026-10-19）：全局“新用户默认权限”页接入三态媒体库模式、已启用媒体库选项、下载与播放/转码策略及非负并发上限；空指定集合提示为无媒体库权限，错误时草稿保留，成功刷新设置缓存。定向 Vitest 7/7、Web build 和 diff check 通过。Playwright 使用本机临时 SQLite 服务完成保存并刷新恢复；390px 视口文档宽度 375px、无页面横向溢出，控制台无错误。桌面与窄屏截图保存于 `output/playwright/user-default-permissions/.playwright-cli/`。默认值应用至新账号仍由后续任务实现。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

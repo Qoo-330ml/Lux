@@ -1114,6 +1114,7 @@ export type AdminSettings = {
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
   userDeletionGraceDays?: number;
+  newUserPermissions?: NewUserPermissions;
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;
@@ -1146,6 +1147,17 @@ export type NetworkProxyProbe = {
 
 export type AdminSettingsPatch = Partial<AdminSettings> & {
   networkProxyUrl?: string | null;
+};
+
+export type NewUserPermissions = {
+  libraryAccessMode: AdminUserLibraryAccessMode;
+  libraryIds: string[];
+  canDownload: boolean;
+  canPlay: boolean;
+  maxSimultaneousPlaybacks: number;
+  allowRemux: boolean;
+  allowAudioTranscode: boolean;
+  allowVideoTranscode: boolean;
 };
 
 export type MediaStrategySettings = {
