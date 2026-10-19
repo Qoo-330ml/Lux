@@ -1366,6 +1366,12 @@ pub(crate) struct UserAccessBlacklistRuleMatchQuery<'a> {
 }
 
 #[allow(dead_code)]
+pub(crate) struct UserAccessBlacklistIpRuleQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
 pub(crate) struct NewUserAccessBlacklistRule<'a> {
     pub(crate) id: &'a str,
     pub(crate) user_id: Option<&'a str>,

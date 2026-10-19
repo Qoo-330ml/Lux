@@ -1941,6 +1941,35 @@ impl Database {
         })
     }
 
+    // LUX-765 loads at most 201 active global and user IP rules so callers can
+    // fail closed if the supported per-request evaluation bound is exceeded.
+    #[allow(dead_code)]
+    pub(crate) async fn list_user_access_ip_blacklist_rule_values(
+        &self,
+        query: UserAccessBlacklistIpRuleQuery<'_>,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT match_value
+                 FROM user_access_blacklist_rules
+                 WHERE is_enabled = 1
+                   AND rule_type = 'IP_CIDR'
+                   AND (user_id IS NULL OR user_id = ?)
+                 ORDER BY CASE WHEN user_id IS NULL THEN 0 ELSE 1 END,
+                          created_at ASC, id ASC
+                 LIMIT ?",
+            )
+            .bind(query.user_id)
+            .bind(query.limit.clamp(1, 201))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows.into_iter().map(|row| row.get("match_value")).collect())
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
         &self,

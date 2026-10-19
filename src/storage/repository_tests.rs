@@ -390,6 +390,118 @@ async fn user_access_blacklist_matching_is_scoped_enabled_and_type_specific()
 }
 
 #[tokio::test]
+async fn user_access_ip_blacklist_rules_are_bounded_enabled_and_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, username) in [
+        ("ip-rules-a", "ip-rules-a"),
+        ("ip-rules-b", "ip-rules-b"),
+        ("ip-rules-creator", "ip-rules-creator"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test-hash')",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, user_id, rule_type, value, enabled) in [
+        ("ip-global-a", None, "IP_CIDR", "192.0.2.0/24", true),
+        (
+            "ip-global-disabled",
+            None,
+            "IP_CIDR",
+            "198.51.100.0/24",
+            false,
+        ),
+        (
+            "ip-user-a",
+            Some("ip-rules-a"),
+            "IP_CIDR",
+            "2001:db8::/32",
+            true,
+        ),
+        (
+            "ip-user-b",
+            Some("ip-rules-b"),
+            "IP_CIDR",
+            "203.0.113.0/24",
+            true,
+        ),
+        ("ip-not-ip", None, "CLIENT", "192.0.2.0/24", true),
+    ] {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id,
+                user_id,
+                rule_type,
+                match_value: value,
+                is_enabled: enabled,
+                created_by: Some("ip-rules-creator"),
+                created_at: 100,
+            })
+            .await?;
+    }
+
+    let rules = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-a",
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(rules, ["192.0.2.0/24", "2001:db8::/32"]);
+
+    let limited = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-a",
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(limited.len(), 1);
+
+    let other_user = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-b",
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(other_user, ["192.0.2.0/24", "203.0.113.0/24"]);
+
+    for index in 0..205 {
+        let id = format!("ip-overflow-{index}");
+        let match_value = format!("203.0.113.{index}/32");
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: &id,
+                user_id: None,
+                rule_type: "IP_CIDR",
+                match_value: &match_value,
+                is_enabled: true,
+                created_by: Some("ip-rules-creator"),
+                created_at: 101,
+            })
+            .await?;
+    }
+    let bounded = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-a",
+            limit: 500,
+        })
+        .await?;
+    assert_eq!(bounded.len(), 201);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;

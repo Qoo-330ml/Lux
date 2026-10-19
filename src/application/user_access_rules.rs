@@ -3,6 +3,7 @@ use std::{fmt, net::IpAddr, str::FromStr};
 const MAX_USER_ACCESS_RULE_VALUE_BYTES: usize = 256;
 const MAX_FORWARDED_FOR_BYTES: usize = 8 * 1024;
 const MAX_FORWARDED_HOPS: usize = 64;
+const MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST: usize = 200;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +187,32 @@ pub(crate) fn resolve_client_ip_from_trusted_proxies(
     Ok(client_ip)
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IpBlacklistEvaluationError {
+    TooManyRules,
+    InvalidStoredRule,
+}
+
+#[allow(dead_code)]
+pub(crate) fn ip_blacklist_rules_match_address(
+    address: IpAddr,
+    rules: &[String],
+) -> Result<bool, IpBlacklistEvaluationError> {
+    if rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+        return Err(IpBlacklistEvaluationError::TooManyRules);
+    }
+
+    for rule in rules {
+        let cidr =
+            IpCidr::parse(rule).map_err(|_| IpBlacklistEvaluationError::InvalidStoredRule)?;
+        if cidr.contains(address) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn normalize_mapped_ipv4(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V6(address) => address
@@ -248,9 +275,9 @@ fn network_address(address: IpAddr, prefix: u8) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::{
-        IpCidr, TrustedIpResolutionError, UserAccessBlacklistRuleType,
-        UserAccessBlacklistRuleValidationError, normalize_user_access_blacklist_value,
-        resolve_client_ip_from_trusted_proxies,
+        IpBlacklistEvaluationError, IpCidr, TrustedIpResolutionError, UserAccessBlacklistRuleType,
+        UserAccessBlacklistRuleValidationError, ip_blacklist_rules_match_address,
+        normalize_user_access_blacklist_value, resolve_client_ip_from_trusted_proxies,
     };
     use std::net::IpAddr;
 
@@ -334,6 +361,39 @@ mod tests {
         let ipv6 = IpCidr::parse("2001:db8::abcd/64").expect("valid IPv6 CIDR");
         assert!(ipv6.contains("2001:db8::1".parse::<IpAddr>().unwrap()));
         assert!(!ipv6.contains("2001:db8:1::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn ip_blacklist_rule_evaluation_matches_both_address_families() {
+        let rules = vec!["192.0.2.0/24".to_owned(), "2001:db8::/32".to_owned()];
+        assert_eq!(
+            ip_blacklist_rules_match_address("192.0.2.42".parse().unwrap(), &rules),
+            Ok(true)
+        );
+        assert_eq!(
+            ip_blacklist_rules_match_address("2001:db8:1::1".parse().unwrap(), &rules),
+            Ok(true)
+        );
+        assert_eq!(
+            ip_blacklist_rules_match_address("198.51.100.1".parse().unwrap(), &rules),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn ip_blacklist_rule_evaluation_rejects_corrupt_or_unbounded_rules() {
+        assert_eq!(
+            ip_blacklist_rules_match_address(
+                "192.0.2.1".parse().unwrap(),
+                &["not-a-cidr".to_owned()],
+            ),
+            Err(IpBlacklistEvaluationError::InvalidStoredRule)
+        );
+        let too_many_rules = vec!["0.0.0.0/0".to_owned(); 201];
+        assert_eq!(
+            ip_blacklist_rules_match_address("192.0.2.1".parse().unwrap(), &too_many_rules),
+            Err(IpBlacklistEvaluationError::TooManyRules)
+        );
     }
 
     #[test]

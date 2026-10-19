@@ -15982,6 +15982,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 先因客户端方法不存在而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 81/81 通过，`pnpm --dir web build` 通过，`pnpm --dir web install --frozen-lockfile` 通过。Web 全套为 746/750，4 项失败与已有基线相同：首页预取 1 项、媒体库卡片 2 项、详情轮询 1 项；与本任务无关。`git diff --check` 通过。
 
+#### LUX-765：读取并匹配有界 IP/CIDR 黑名单规则
+
+范围：为后续认证接线提供目标用户的启用全站及用户级 `IP_CIDR` 规则值；查询最多返回 201 项，供应用层在超过每请求 200 项的执行上限时 fail closed。应用层只匹配规范 CIDR，存储值损坏或规则超过上限均返回错误。本任务只建立有界读取和纯匹配合同，不接 HTTP、认证、播放授权或管理界面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`、`src/storage/users.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 读取只包含启用的全站及目标用户 IP 规则，忽略其他用户、停用项和 DEVICE/CLIENT 规则。
+- [x] Storage 查询限制最多 201 项；CIDR 匹配覆盖 IPv4、IPv6、未命中、损坏存储值和超过 200 项。
+- [x] 相关定向测试、Rust build、fmt 与 diff check 通过；不改变 HTTP 或授权行为。
+
+短计划：先添加 SQLite 规则范围/启用状态/分页上限回归和 CIDR 匹配边界单测并确认缺失接口；再添加最多返回 201 项的 storage 查询与 200 项 fail-closed 纯匹配；最后运行定向 Rust 测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：Storage 以稳定顺序最多读取 201 条启用的全站及目标用户 `IP_CIDR` 规则，应用层最多评估 200 条；损坏 CIDR 或超过评估上限返回错误，供后续认证层 fail closed。未接 HTTP、认证或播放授权。
+
+验证：TDD RED 因缺少规则查询类型和方法而失败；实现后应用层规则/代理测试 11/11、Storage 作用域与启用状态回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过；严格全目标 Clippy 仍报 13 条已有问题，位于未修改的管理员 API、播放、权限复制及存储测试代码，本任务没有新增 Clippy 诊断。Cargo 命令使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
