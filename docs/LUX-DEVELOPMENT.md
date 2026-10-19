@@ -14518,6 +14518,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增纯领域策略判定，验证 MPA/TVPG/BBFC 顺序、BBFC 12/12A 同级、跨体系与未知分级的未分级行为、允许标签至少命中一项、禁止标签优先和索引缺失 fail closed；损坏的等级体系、最高等级或标签记录失败关闭，完全不限制策略不要求索引。`content_restrictions::tests` 11/11、Rust fmt check 与 diff check 通过。
 
+#### LUX-694：在单条媒体授权中执行内容限制
+
+范围：将 LUX-693 的领域规则接入 `MediaAccessService::can_view_item`，使 Lux/Emby 单条详情及现有经该服务保护的图片、字幕、下载和播放入口共享用户内容限制。检查条目自身及系列/季度父级的索引；活跃策略遇到缺失索引或损坏配置时拒绝。管理员、无策略、无收紧项及媒体库 ACL 合同保持原行为。本任务不筛选父容器的子项分页或首页/搜索列表。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/access.rs`、`src/domain/content_restrictions.rs`、`src/storage/catalog.rs`、`src/storage/repository.rs`。
+
+验收标准：
+
+- [x] 单条访问先通过现有媒体库 ACL，再同时满足条目自身和关联系列/季度的内容限制；禁止项不得通过直接 ItemId 访问。
+- [x] 缺失目标/上级索引、无效持久化策略和未知体系按拒绝处理；无策略与完全不收紧策略维持现有访问，管理员沿用既有绕过。
+- [x] 原本经 `can_view_item` 保护的 Lux/Emby 详情、图片、字幕、下载与播放入口自动使用该判定；访问回归覆盖策略拒绝和父级继承。
+- [x] application 定向测试、内容策略领域测试、Rust build、fmt 与 diff check 通过。
+
+短计划：先在 `MediaAccessService` 测试创建用户、媒体库、等级/标签索引和父子层级并确认策略未拦截；再为 storage 增加有界条目+上级分类读取，将领域策略应用到所有候选；最后运行访问与内容策略定向回归、Rust build、fmt 和 diff check。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_policy_denies_direct_item_access_and_inherits_parent_restrictions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-693。
+
+结果（2026-10-19）：`MediaAccessService::can_view_item` 在现有启用媒体库和 ACL 检查后读取用户策略，并按需取目标及系列/季度的分类索引；缺索引、无效策略或无可评估分类时拒绝。管理员和不存在/完全不收紧策略维持既有路径。详情、图片、字幕、下载、本地直放及 Emby 播放回调原本都使用该共享检查；ACL 1/1、playback 4/4、subtitles 1/1、download_api 1/1、image_api 1/1、直接访问/父级继承回归 1/1、领域策略 11/11、Rust build、fmt 和 diff check 通过。`cargo clippy --locked --lib -- -D warnings` 仍被未改动的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两个 `too_many_arguments` 警告阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

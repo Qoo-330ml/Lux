@@ -277,8 +277,14 @@ pub(crate) use emby_migration::{
     StoredMigrationPersonIdentity, StoredPlaybackHistoryEvent,
 };
 
-use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 use crate::observability::logs::{LogStore, NewAuditLogEvent};
+use crate::{
+    config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError},
+    domain::content_restrictions::{
+        ContentRestrictionPolicy, content_restriction_policy_is_restrictive,
+        content_restriction_policy_is_valid,
+    },
+};
 
 // Keep the embedded migrator source coupled to newly added migration files.
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -3316,11 +3322,18 @@ fn append_content_restriction_predicate<'a>(
     let Some(restrictions) = restrictions else {
         return;
     };
-    let has_restrictions = restrictions.maximum_rating.is_some()
-        || !restrictions.allow_unrated
-        || !restrictions.allowed_tags.is_empty()
-        || !restrictions.blocked_tags.is_empty();
-    if !has_restrictions {
+    let policy = ContentRestrictionPolicy {
+        rating_system: &restrictions.rating_system,
+        maximum_rating: restrictions.maximum_rating.as_deref(),
+        allow_unrated: restrictions.allow_unrated,
+        allowed_tags: &restrictions.allowed_tags,
+        blocked_tags: &restrictions.blocked_tags,
+    };
+    if !content_restriction_policy_is_valid(&policy) {
+        where_clause.push_str(" AND 1 = 0");
+        return;
+    }
+    if !content_restriction_policy_is_restrictive(&policy) {
         return;
     }
 
@@ -3394,7 +3407,7 @@ fn append_content_restriction_predicate<'a>(
              LEFT JOIN media_content_restriction_index restriction_index
                ON restriction_index.item_id = restriction_item.id
              WHERE restriction_item.id IN (mi.id, mi.parent_id, mi.series_id)
-               AND restriction_item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+               AND restriction_item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'VIDEO')
                AND (",
     );
     where_clause.push_str(&violations.join(" OR "));

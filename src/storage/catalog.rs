@@ -7841,6 +7841,56 @@ impl Database {
         })
     }
 
+    pub(crate) async fn media_content_restriction_classifications_for_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<(Option<String>, Vec<String>, bool)>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT related.id AS related_item_id,
+                        restriction_index.item_id AS indexed_item_id,
+                        restriction_index.certification_code,
+                        restriction_tag.tag
+                 FROM media_items target
+                 JOIN media_items related
+                   ON related.id IN (target.id, target.parent_id, target.series_id)
+                 LEFT JOIN media_content_restriction_index restriction_index
+                   ON restriction_index.item_id = related.id
+                 LEFT JOIN media_content_restriction_tags restriction_tag
+                   ON restriction_tag.item_id = related.id
+                 WHERE target.id = ? AND target.removed_at IS NULL
+                   AND related.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'VIDEO')
+                 ORDER BY related.id, restriction_tag.tag",
+            )
+            .bind(item_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut classifications = BTreeMap::new();
+        for row in rows {
+            let related_item_id: String = row.get("related_item_id");
+            let indexed_item_id: Option<String> = row.get("indexed_item_id");
+            let certification_code: Option<String> = row.get("certification_code");
+            let tag: Option<String> = row.get("tag");
+            let classification = classifications.entry(related_item_id).or_insert_with(|| {
+                (
+                    certification_code,
+                    Vec::<String>::new(),
+                    indexed_item_id.is_some(),
+                )
+            });
+            if let Some(tag) = tag
+                && !classification.1.contains(&tag)
+            {
+                classification.1.push(tag);
+            }
+        }
+        Ok(classifications.into_values().collect())
+    }
+
     // LUX-684 consumes this compare-and-swap before persisting a projected index.
     #[allow(dead_code)]
     pub(crate) async fn replace_media_content_restriction_index_if_nfo_json_matches(

@@ -177,23 +177,13 @@ pub fn content_classification_is_allowed(
     policy: &ContentRestrictionPolicy<'_>,
     classification: &ContentRestrictionClassification<'_>,
 ) -> bool {
+    if !content_restriction_policy_is_valid(policy) {
+        return false;
+    }
     let Some(rating_system) = ContentRatingSystem::from_key(policy.rating_system) else {
         return false;
     };
-    if policy
-        .maximum_rating
-        .is_some_and(|maximum| normalize_rating_code(rating_system, maximum).is_none())
-        || !valid_policy_tags(policy.allowed_tags)
-        || !valid_policy_tags(policy.blocked_tags)
-    {
-        return false;
-    }
-
-    let restricted = policy.maximum_rating.is_some()
-        || !policy.allow_unrated
-        || !policy.allowed_tags.is_empty()
-        || !policy.blocked_tags.is_empty();
-    if !restricted {
+    if !content_restriction_policy_is_restrictive(policy) {
         return true;
     }
     if !classification.indexed {
@@ -227,6 +217,25 @@ pub fn content_classification_is_allowed(
             .allowed_tags
             .iter()
             .any(|allowed| classification.tags.iter().any(|tag| tag == allowed))
+}
+
+pub fn content_restriction_policy_is_restrictive(policy: &ContentRestrictionPolicy<'_>) -> bool {
+    !content_restriction_policy_is_valid(policy)
+        || policy.maximum_rating.is_some()
+        || !policy.allow_unrated
+        || !policy.allowed_tags.is_empty()
+        || !policy.blocked_tags.is_empty()
+}
+
+pub fn content_restriction_policy_is_valid(policy: &ContentRestrictionPolicy<'_>) -> bool {
+    let Some(rating_system) = ContentRatingSystem::from_key(policy.rating_system) else {
+        return false;
+    };
+    !policy
+        .maximum_rating
+        .is_some_and(|maximum| normalize_rating_code(rating_system, maximum).is_none())
+        && valid_policy_tags(policy.allowed_tags)
+        && valid_policy_tags(policy.blocked_tags)
 }
 
 fn valid_policy_tags(tags: &[String]) -> bool {

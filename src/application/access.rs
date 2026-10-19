@@ -1,7 +1,13 @@
 use std::fmt;
 
 use crate::{
-    domain::ids::UserId,
+    domain::{
+        content_restrictions::{
+            ContentRestrictionClassification, ContentRestrictionPolicy,
+            content_classification_is_allowed, content_restriction_policy_is_restrictive,
+        },
+        ids::UserId,
+    },
     storage::{Database, GLOBAL_COLLECTION_LIBRARY_ID, StorageError, StoredPlaybackSource},
 };
 
@@ -75,7 +81,42 @@ impl MediaAccessService {
         if principal.is_admin {
             return Ok(true);
         }
-        self.can_view_library(principal, &library_id).await
+        if !self.can_view_library(principal, &library_id).await? {
+            return Ok(false);
+        }
+        let user_id = principal.user_id_string();
+        let Some(restrictions) = self.database.user_content_restrictions(&user_id).await? else {
+            return Ok(true);
+        };
+        let policy = ContentRestrictionPolicy {
+            rating_system: &restrictions.rating_system,
+            maximum_rating: restrictions.maximum_rating.as_deref(),
+            allow_unrated: restrictions.allow_unrated,
+            allowed_tags: &restrictions.allowed_tags,
+            blocked_tags: &restrictions.blocked_tags,
+        };
+        if !content_restriction_policy_is_restrictive(&policy) {
+            return Ok(true);
+        }
+        let classifications = self
+            .database
+            .media_content_restriction_classifications_for_item(item_id)
+            .await?;
+        if classifications.is_empty() {
+            return Ok(false);
+        }
+        Ok(classifications
+            .into_iter()
+            .all(|(certification_code, tags, indexed)| {
+                content_classification_is_allowed(
+                    &policy,
+                    &ContentRestrictionClassification {
+                        certification_code: certification_code.as_deref(),
+                        tags: &tags,
+                        indexed,
+                    },
+                )
+            }))
     }
 
     pub async fn accessible_library_ids(
@@ -136,5 +177,142 @@ impl std::error::Error for AccessError {
 impl From<StorageError> for AccessError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        application::libraries::LibraryService,
+        auth::users::UserStore,
+        config::Config,
+        library::LibraryKind,
+        storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
+    };
+
+    use super::{AccessPrincipal, MediaAccessService};
+
+    #[tokio::test]
+    async fn content_policy_denies_direct_item_access_and_inherits_parent_restrictions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("direct-policy-viewer", "Viewer", "test password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Direct policy series", LibraryKind::Series, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        for (item_id, item_type, parent_id, series_id, certification) in [
+            ("policy-series", "SERIES", None, None, "R"),
+            (
+                "policy-season",
+                "SEASON",
+                Some("policy-series"),
+                Some("policy-series"),
+                "G",
+            ),
+            (
+                "policy-episode",
+                "EPISODE",
+                Some("policy-season"),
+                Some("policy-series"),
+                "G",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, title,
+                     sort_title, identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('policy-episode', 'violent')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let access = MediaAccessService::new(database.clone());
+        let principal = AccessPrincipal::new(user.id, false);
+        assert!(access.can_view_item(principal, "policy-episode").await?);
+
+        let initial = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            initial,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        assert!(!access.can_view_item(principal, "policy-episode").await?);
+
+        sqlx::query(
+            "UPDATE media_content_restriction_index
+             SET certification_code = 'PG' WHERE item_id = 'policy-series'",
+        )
+        .execute(database.pool())
+        .await?;
+        assert!(access.can_view_item(principal, "policy-episode").await?);
+        let tag_restriction = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                1,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &["violent".to_owned()],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            tag_restriction,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        assert!(!access.can_view_item(principal, "policy-episode").await?);
+
+        sqlx::query("DELETE FROM media_content_restriction_index WHERE item_id = 'policy-series'")
+            .execute(database.pool())
+            .await?;
+        assert!(!access.can_view_item(principal, "policy-episode").await?);
+        Ok(())
     }
 }
