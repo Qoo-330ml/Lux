@@ -15378,6 +15378,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`cargo test --locked --lib configured_activity_retention_prunes_one_bounded_batch_and_keeps_boundary` 1/1，覆盖 1,001 条过期活动分批清理和截止边界保留；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
 
+#### LUX-734：管理界面配置活动记录保留期
+
+范围：将用户管理设置页“活动记录保留”占位改为真实表单，读取并保存管理员 settings API 的 `userActivityRetentionDays`。允许 1–3650 天，提供正在读取、保存、校验、成功与错误状态；保存只更新该保留字段。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-retention-settings.test.tsx`。
+
+验收标准：
+
+- [x] 页面展示当前活动记录保留期，默认 90 天并允许输入 1–3650 天。
+- [x] 保存通过 `updateAdminSettings` 只提交 `userActivityRetentionDays`，更新缓存并展示成功/失败状态。
+- [x] 无效输入或无变更时不能保存；定向 Vitest、Web build、锁文件安装和用户设置 Playwright 验证通过。
+- [ ] `pnpm --dir web test` 全量通过；当前有 4 个范围外失败，见下方验证记录。
+
+短计划：先扩展现有删除保留页面测试并确认活动保留占位缺失；再加入活动保留表单及 API 类型；最后运行定向 Vitest、Web build、Web tests 和浏览器流程验证。
+
+依赖：LUX-732、LUX-733。
+
+结果（2026-10-20）：活动保留占位替换为服务端设置表单。默认 90 天，范围 1–3650；无效值和无变更时禁用保存，成功后更新查询缓存并显示状态，错误显示可读提示。删除账号保留表单保持原行为。
+
+验证：TDD RED 测试先因活动保留输入框不存在而失败；实现后 `pnpm --dir web exec vitest run tests/admin-user-retention-settings.test.tsx` 5/5、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 通过。Playwright 使用临时 SQLite 管理员会话验证保存 30 天后刷新仍读回 30 天；390px 视口 `scrollWidth` 为 390，控件可访问名称完整。交互后无新增 console error；登录前的 `auth/me` 401 是预期未登录检查。
+
+全量 `pnpm --dir web test` 的 148 个 Node 测试通过，Vitest 为 734 通过、4 失败。失败是 `home-page.test.tsx` 的首页预取 1 项、`library-card.test.tsx` 两项和 `media-query-polling.test.tsx` 1 项；单独重跑这三个目标仍复现，相关代码不在本任务修改范围内。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

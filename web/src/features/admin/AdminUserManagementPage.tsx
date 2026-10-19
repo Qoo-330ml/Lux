@@ -1533,11 +1533,70 @@ function AdminUserRetentionSettings() {
           </div>
         </form>
       </section>
-      <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-activity-retention-title">
-        <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
-        <div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-user-activity-retention-title">活动记录保留</h2><p>活动记录保留将在模块七接入。</p></div>
-      </section>
+      <AdminUserActivityRetentionSettings />
     </>
+  );
+}
+
+function AdminUserActivityRetentionSettings() {
+  const queryClient = useQueryClient();
+  const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const [retentionDays, setRetentionDays] = useState("90");
+  const [notice, setNotice] = useState("");
+  const update = useMutation({
+    mutationFn: (days: number) => api.updateAdminSettings({ userActivityRetentionDays: days }),
+    onSuccess: (updated, days) => {
+      const savedDays = updated.userActivityRetentionDays ?? days;
+      queryClient.setQueryData(queryKeys.adminSettings, { ...updated, userActivityRetentionDays: savedDays });
+      setRetentionDays(String(savedDays));
+      setNotice("活动记录保留期限已保存。");
+    },
+    onError: (error) => setNotice(error.message || "保存失败，请重试。"),
+  });
+  useEffect(() => {
+    setRetentionDays(String(settings.data?.userActivityRetentionDays ?? 90));
+  }, [settings.data?.userActivityRetentionDays]);
+
+  if (settings.isPending) return <p className="lux-admin-muted" role="status">正在读取活动记录保留设置…</p>;
+  if (settings.error) return <p className="lux-error-copy" role="alert">读取活动记录保留设置失败：{settings.error.message}</p>;
+
+  const parsedDays = Number(retentionDays);
+  const validDays = Number.isInteger(parsedDays) && parsedDays >= 1 && parsedDays <= 3_650;
+  const hasChanges = parsedDays !== (settings.data.userActivityRetentionDays ?? 90);
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!validDays || !hasChanges || update.isPending) return;
+    setNotice("");
+    update.mutate(parsedDays);
+  }
+
+  return (
+    <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-activity-retention-title">
+      <div className="lux-admin-panel-heading"><div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-user-activity-retention-title">活动记录保留</h2></div></div>
+      <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
+        <label>
+          活动记录保留天数
+          <input
+            type="number"
+            min={1}
+            max={3_650}
+            step={1}
+            value={retentionDays}
+            aria-label="活动记录保留天数"
+            onChange={(event) => { setRetentionDays(event.target.value); setNotice(""); }}
+            disabled={update.isPending}
+          />
+        </label>
+        <p className="lux-admin-muted">范围为 1–3650 天。超过期限的用户活动索引会由后台定期清理；观看进度、已看状态、收藏和文件审计不受影响。</p>
+        <div className="lux-admin-user-profile-actions">
+          <button className="lux-button lux-button-primary" type="submit" disabled={!validDays || !hasChanges || update.isPending}>
+            {update.isPending ? "保存中…" : "保存活动保留期限"}
+          </button>
+          {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
+        </div>
+      </form>
+    </section>
   );
 }
 

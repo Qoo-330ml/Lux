@@ -1242,6 +1242,7 @@ export type AdminSettings = {
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
   userDeletionGraceDays?: number;
+  userActivityRetentionDays?: number;
   newUserPermissions?: NewUserPermissions;
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
