@@ -452,22 +452,25 @@ impl CatalogService {
         limit: i64,
         recently_updated_first: bool,
     ) -> Result<GlobalCollectionPage, CatalogError> {
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let (stored_cards, total) = if recently_updated_first {
             self.database
-                .list_recent_global_collection_cards_page(
+                .list_recent_global_collection_cards_page_with_restrictions(
                     &principal.user_id_string(),
                     principal.is_admin,
                     offset,
                     limit,
+                    content_restrictions.as_ref(),
                 )
                 .await?
         } else {
             self.database
-                .list_global_collection_cards_page(
+                .list_global_collection_cards_page_with_restrictions(
                     &principal.user_id_string(),
                     principal.is_admin,
                     offset,
                     limit,
+                    content_restrictions.as_ref(),
                 )
                 .await?
         };
@@ -517,14 +520,16 @@ impl CatalogService {
         if item.library_id != GLOBAL_COLLECTION_LIBRARY_ID || item.item_type != "BOX_SET" {
             return Ok(None);
         }
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let (member_ids, member_count) = self
             .database
-            .list_global_collection_member_ids_page(
+            .list_global_collection_member_ids_page_with_restrictions(
                 collection_item_id,
                 &principal.user_id_string(),
                 principal.is_admin,
                 0,
                 1,
+                content_restrictions.as_ref(),
             )
             .await?;
         if member_count == 0 {
@@ -533,7 +538,11 @@ impl CatalogService {
         let mut poster_item_id = None;
         if item.poster_image_tag.is_none() && !member_ids.is_empty() {
             let work_sources = self
-                .global_collection_sources_for_works(principal, &member_ids)
+                .global_collection_sources_for_works(
+                    principal,
+                    &member_ids,
+                    content_restrictions.as_ref(),
+                )
                 .await?;
             if let Some(source) = work_sources.first().and_then(|work| {
                 work.copies
@@ -560,14 +569,16 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<GlobalCollectionMembersPage, CatalogError> {
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let (member_ids, total) = self
             .database
-            .list_global_collection_member_ids_page(
+            .list_global_collection_member_ids_page_with_restrictions(
                 collection_item_id,
                 &principal.user_id_string(),
                 principal.is_admin,
                 offset,
                 limit,
+                content_restrictions.as_ref(),
             )
             .await?;
         if total == 0 {
@@ -577,7 +588,11 @@ impl CatalogService {
             .catalog_page_from_ids(member_ids.clone(), total, offset, limit)
             .await?;
         let mut sources_by_work = self
-            .global_collection_sources_for_works(principal, &member_ids)
+            .global_collection_sources_for_works(
+                principal,
+                &member_ids,
+                content_restrictions.as_ref(),
+            )
             .await?
             .into_iter()
             .map(|work| (work.work_item_id.clone(), work))
@@ -611,8 +626,13 @@ impl CatalogService {
         principal: AccessPrincipal,
         work_item_id: &str,
     ) -> Result<Option<GlobalCollectionPlaybackSources>, CatalogError> {
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let work_sources = self
-            .global_collection_sources_for_works(principal, &[work_item_id.to_owned()])
+            .global_collection_sources_for_works(
+                principal,
+                &[work_item_id.to_owned()],
+                content_restrictions.as_ref(),
+            )
             .await?;
         let Some(work_sources) = work_sources.into_iter().next() else {
             return Ok(None);
@@ -659,15 +679,19 @@ impl CatalogService {
         source_item_id: &str,
         media_source_id: Option<&str>,
     ) -> Result<(), CatalogError> {
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let saved = self
             .database
-            .set_global_collection_source_preference(
-                &principal.user_id_string(),
-                principal.is_admin,
-                collection_item_id,
-                work_item_id,
-                source_item_id,
-                media_source_id,
+            .set_global_collection_source_preference_with_restrictions(
+                crate::storage::GlobalCollectionSourcePreference {
+                    user_id: &principal.user_id_string(),
+                    is_admin: principal.is_admin,
+                    collection_item_id,
+                    work_item_id,
+                    source_item_id,
+                    media_source_id,
+                },
+                content_restrictions.as_ref(),
             )
             .await?;
         if saved {
@@ -681,13 +705,15 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         work_item_ids: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<Vec<GlobalCollectionWorkSources>, CatalogError> {
         let stored_sources = self
             .database
-            .list_global_collection_sources_for_works(
+            .list_global_collection_sources_for_works_with_restrictions(
                 work_item_ids,
                 &principal.user_id_string(),
                 principal.is_admin,
+                content_restrictions,
             )
             .await?;
         let mut groups = Vec::<GlobalCollectionWorkSources>::new();
@@ -757,12 +783,14 @@ impl CatalogService {
             .database
             .count_catalog_item_types(&library_ids, user_id, is_favorite)
             .await?;
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let global_collection_count = self
             .database
-            .count_visible_global_collections(
+            .count_visible_global_collections_with_restrictions(
                 &principal.user_id_string(),
                 principal.is_admin,
                 is_favorite,
+                content_restrictions.as_ref(),
             )
             .await?;
         Ok(CatalogItemCounts {
@@ -1150,14 +1178,16 @@ impl CatalogService {
             .as_deref()
             == Some(GLOBAL_COLLECTION_LIBRARY_ID)
         {
+            let content_restrictions = self.content_restrictions_for_principal(principal).await?;
             let (member_ids, total) = self
                 .database
-                .list_global_collection_member_ids_page(
+                .list_global_collection_member_ids_page_with_restrictions(
                     collection_item_id,
                     &principal.user_id_string(),
                     principal.is_admin,
                     offset,
                     limit,
+                    content_restrictions.as_ref(),
                 )
                 .await?;
             if total == 0 {
@@ -1761,16 +1791,18 @@ impl CatalogService {
             return Ok(None);
         };
         if library_id == GLOBAL_COLLECTION_LIBRARY_ID {
+            let content_restrictions = self.content_restrictions_for_principal(principal).await?;
             let visible = match item.item_type.as_str() {
                 "BOX_SET" => {
                     let (_, total) = self
                         .database
-                        .list_global_collection_member_ids_page(
+                        .list_global_collection_member_ids_page_with_restrictions(
                             item_id,
                             &principal.user_id_string(),
                             principal.is_admin,
                             0,
                             1,
+                            content_restrictions.as_ref(),
                         )
                         .await?;
                     total > 0
@@ -1780,6 +1812,7 @@ impl CatalogService {
                         .global_collection_sources_for_works(
                             principal,
                             std::slice::from_ref(&item.id),
+                            content_restrictions.as_ref(),
                         )
                         .await?;
                     sources.iter().any(|work| !work.copies.is_empty())
@@ -3066,7 +3099,10 @@ mod tests {
             auth::users::UserStore,
             config::Config,
             library::LibraryKind,
-            storage::{Database, GLOBAL_COLLECTION_LIBRARY_ID},
+            storage::{
+                Database, GLOBAL_COLLECTION_LIBRARY_ID, NewUserContentRestrictions,
+                UserContentRestrictionsCasResult,
+            },
         };
 
         let directory = tempfile::tempdir()?;
@@ -3089,38 +3125,80 @@ mod tests {
             .set_user_library_access(&user.id.to_string(), &visible_library.id.to_string(), true)
             .await?;
 
-        for (item_id, library_id, movie_id) in [
+        for (item_id, library_id, movie_id, collection_id, collection_title, year) in [
             (
                 "catalog-visible-movie",
                 visible_library.id.to_string(),
                 "movie-visible",
+                "catalog-series",
+                "Catalog Series",
+                2020,
             ),
             (
                 "catalog-hidden-movie",
                 hidden_library.id.to_string(),
                 "movie-hidden",
+                "catalog-series",
+                "Catalog Series",
+                2020,
+            ),
+            (
+                "catalog-unindexed-movie",
+                visible_library.id.to_string(),
+                "movie-unindexed",
+                "catalog-series",
+                "Catalog Series",
+                2021,
+            ),
+            (
+                "catalog-visible-restricted-copy",
+                visible_library.id.to_string(),
+                "movie-visible",
+                "catalog-series",
+                "Catalog Series",
+                2020,
+            ),
+            (
+                "catalog-restricted-only-movie",
+                visible_library.id.to_string(),
+                "movie-restricted",
+                "restricted-series",
+                "Restricted Series",
+                2024,
+            ),
+            (
+                "catalog-restricted-only-movie-two",
+                visible_library.id.to_string(),
+                "movie-restricted-two",
+                "restricted-series",
+                "Restricted Series",
+                2025,
             ),
         ] {
             sqlx::query(
                 "INSERT INTO media_items (
                      id, library_id, item_type, title, sort_title, production_year,
                      identification_status, has_available_source
-                 ) VALUES (?, ?, 'MOVIE', ?, ?, 2020, 'ONLINE_CONFIRMED', 1)",
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'ONLINE_CONFIRMED', 1)",
             )
             .bind(item_id)
             .bind(library_id)
             .bind(item_id)
             .bind(item_id)
+            .bind(year)
             .execute(database.pool())
             .await?;
             sqlx::query(
                 "INSERT INTO collection_item_references (
                      item_id, movie_provider, movie_provider_id, collection_provider,
                      collection_provider_id, collection_title, sort_order
-                 ) VALUES (?, 'tmdb', ?, 'tmdb', 'catalog-series', 'Catalog Series', 2020)",
+                 ) VALUES (?, 'tmdb', ?, 'tmdb', ?, ?, ?)",
             )
             .bind(item_id)
             .bind(movie_id)
+            .bind(collection_id)
+            .bind(collection_title)
+            .bind(year)
             .execute(database.pool())
             .await?;
         }
@@ -3136,12 +3214,71 @@ mod tests {
         sqlx::query(
             "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
              VALUES ('catalog-visible-poster', 'catalog-visible-movie', 'POSTER', 0, '/visible.jpg'),
-                    ('catalog-hidden-poster', 'catalog-hidden-movie', 'POSTER', 0, '/hidden.jpg')",
+                    ('catalog-hidden-poster', 'catalog-hidden-movie', 'POSTER', 0, '/hidden.jpg'),
+                    ('catalog-restricted-poster', 'catalog-visible-restricted-copy', 'POSTER', 0, '/restricted.jpg')",
         )
         .execute(database.pool())
         .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('catalog-visible-movie', 'PG'),
+                    ('catalog-visible-restricted-copy', 'R'),
+                    ('catalog-restricted-only-movie', 'R'),
+                    ('catalog-restricted-only-movie-two', 'R')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('catalog-visible-movie', 'family'),
+                    ('catalog-visible-restricted-copy', 'family'),
+                    ('catalog-visible-restricted-copy', 'violent'),
+                    ('catalog-restricted-only-movie', 'family'),
+                    ('catalog-restricted-only-movie', 'violent'),
+                    ('catalog-restricted-only-movie-two', 'family'),
+                    ('catalog-restricted-only-movie-two', 'violent')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+             VALUES ('catalog-visible-source', 'catalog-visible-movie', 'LOCAL_FILE', 1, 'READY'),
+                    ('catalog-restricted-source', 'catalog-visible-restricted-copy', 'LOCAL_FILE', 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        let allowed_tags = vec!["family".to_owned()];
+        let blocked_tags = vec!["violent".to_owned()];
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &allowed_tags,
+                    blocked_tags: &blocked_tags,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
         let collection_item_id: String = sqlx::query_scalar(
             "SELECT item_id FROM collections WHERE library_id = ? AND provider_id = 'catalog-series'",
+        )
+        .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+        .fetch_one(database.pool())
+        .await?;
+        let restricted_work_item_id: String = sqlx::query_scalar(
+            "SELECT work_item_id FROM collection_work_items WHERE movie_provider_id = 'movie-restricted'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        let restricted_collection_item_id: String = sqlx::query_scalar(
+            "SELECT item_id FROM collections WHERE library_id = ? AND provider_id = 'restricted-series'",
         )
         .bind(GLOBAL_COLLECTION_LIBRARY_ID)
         .fetch_one(database.pool())
@@ -3178,6 +3315,15 @@ mod tests {
             page.cards[0].item.poster_image_tag.as_deref(),
             Some("catalog-visible-poster")
         );
+        let counts = catalog
+            .count_item_types(principal, &user.id.to_string(), None)
+            .await?;
+        assert_eq!(counts.box_set_count, 1);
+        let recent_page = catalog
+            .list_recent_global_collection_cards(principal, 0, 10)
+            .await?;
+        assert_eq!(recent_page.total, 1);
+        assert_eq!(recent_page.cards[0].member_count, 1);
 
         assert!(
             catalog
@@ -3214,6 +3360,121 @@ mod tests {
             detailed_members.members[0].sources[0].item_id,
             "catalog-visible-movie"
         );
+        assert!(matches!(
+            catalog
+                .set_global_collection_source_preference(
+                    principal,
+                    &collection_item_id,
+                    &detailed_members.members[0].item.id,
+                    "catalog-visible-restricted-copy",
+                    None,
+                )
+                .await,
+            Err(super::CatalogError::AccessDenied)
+        ));
+        let playback_sources = catalog
+            .global_collection_playback_sources(principal, &detailed_members.members[0].item.id)
+            .await?
+            .ok_or("expected visible playback sources")?;
+        // This fixture has no filesystem entries, so visible metadata works have no playable copy.
+        assert!(playback_sources.copies.is_empty());
+        assert!(
+            catalog
+                .global_collection_playback_sources(principal, &restricted_work_item_id)
+                .await?
+                .is_none()
+        );
+        assert!(matches!(
+            catalog
+                .list_global_collection_members(principal, &restricted_collection_item_id, 0, 10)
+                .await,
+            Err(super::CatalogError::AccessDenied)
+        ));
+        assert!(matches!(
+            catalog
+                .find_global_collection_card(principal, &restricted_collection_item_id)
+                .await,
+            Ok(None)
+        ));
+
+        let admin_principal = AccessPrincipal::new(user.id, true);
+        assert!(
+            catalog
+                .content_restrictions_for_principal(admin_principal)
+                .await?
+                .is_none()
+        );
+        let (_, raw_admin_total) = database
+            .list_global_collection_cards_page(&user.id.to_string(), true, 0, 10)
+            .await?;
+        assert_eq!(raw_admin_total, 2);
+        let admin_page = catalog
+            .list_global_collection_cards(admin_principal, 0, 10)
+            .await?;
+        assert_eq!(admin_page.total, 2);
+        assert_eq!(admin_page.cards[0].member_count, 3);
+        let admin_counts = catalog
+            .count_item_types(admin_principal, &user.id.to_string(), None)
+            .await?;
+        assert_eq!(admin_counts.box_set_count, 2);
+
+        let unrestricted_user = UserStore::new(database.clone())?
+            .create_user(
+                "catalog-unrestricted",
+                "Catalog Unrestricted",
+                "test password",
+                false,
+            )
+            .await?;
+        database
+            .set_user_library_access(
+                &unrestricted_user.id.to_string(),
+                &visible_library.id.to_string(),
+                true,
+            )
+            .await?;
+        let unrestricted_page = catalog
+            .list_global_collection_cards(AccessPrincipal::new(unrestricted_user.id, false), 0, 10)
+            .await?;
+        assert_eq!(unrestricted_page.total, 2);
+        assert_eq!(unrestricted_page.cards[0].member_count, 2);
+        let unrestricted_counts = catalog
+            .count_item_types(
+                AccessPrincipal::new(unrestricted_user.id, false),
+                &unrestricted_user.id.to_string(),
+                None,
+            )
+            .await?;
+        assert_eq!(unrestricted_counts.box_set_count, 2);
+        let open_policy = database
+            .compare_and_swap_user_content_restrictions(
+                &unrestricted_user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            open_policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let open_policy_page = catalog
+            .list_global_collection_cards(AccessPrincipal::new(unrestricted_user.id, false), 0, 10)
+            .await?;
+        assert_eq!(open_policy_page.total, 2);
+        let open_policy_counts = catalog
+            .count_item_types(
+                AccessPrincipal::new(unrestricted_user.id, false),
+                &unrestricted_user.id.to_string(),
+                None,
+            )
+            .await?;
+        assert_eq!(open_policy_counts.box_set_count, 2);
         Ok(())
     }
 

@@ -14670,6 +14670,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1；`cargo test --locked --lib recent_catalog_rows` 3/3；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。
 
+#### LUX-701：在虚拟合集中过滤受限内容
+
+范围：虚拟合集卡片、最近更新卡片、成员列表、跨库副本/版本、默认海报回退、合集计数和来源偏好写入都按当前用户内容策略过滤；限制在卡片计数、成员分页及副本选择前执行。管理员、未配置/不收紧策略和媒体库 ACL 保持原合同。普通手动合集成员列表留给后续任务；本任务不改合集身份同步和数据库 schema。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`。
+
+验收标准：
+
+- [x] 受限工作在虚拟合集卡片、成员列表与总数中不可见，不占分页位置。
+- [x] 同一逻辑作品的受限副本不出现在来源/版本列表、播放来源及默认海报回退中；来源偏好不能指向受限副本。
+- [x] 聚合库的虚拟合集数量与可见卡片一致；管理员、无策略和无收紧策略结果不变。
+- [x] 统一分类谓词继续覆盖条目及缺失索引 fail closed；SQLite 定向回归、catalog、build、fmt 和 diff check 通过。
+
+短计划：先扩展虚拟合集应用回归，加入允许副本、受限副本与仅受限逻辑作品，确认当前卡片/成员/来源会泄漏；再让限制谓词支持物理副本别名、将来源偏好写入收敛为具名请求，并贯穿合集存储查询、计数和偏好写入，在 SQL 计数与分页前过滤；最后运行合集、内容策略、catalog、build、fmt 和 diff 检查。
+
+依赖：LUX-700。
+
+结果（2026-10-19）：虚拟合集卡片、最新更新卡片、卡片成员数/海报回退、成员分页、跨库来源/版本、播放来源、来源偏好写入和聚合库数量统一按请求用户的内容策略过滤。共享谓词可指定物理副本别名，缺少索引的副本 fail closed；管理员策略旁路和无策略/全开放策略保持原结果。手动合集子项列表留待 LUX-702。
+
+验证：`cargo test --locked --lib global_collection` 6/6；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。本任务未运行 PostgreSQL live-query 专项。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -25,6 +25,15 @@ pub(crate) struct MediaContentRestrictionIndexCandidate {
     pub(crate) nfo_metadata_json: Option<String>,
 }
 
+pub(crate) struct GlobalCollectionSourcePreference<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) is_admin: bool,
+    pub(crate) collection_item_id: &'a str,
+    pub(crate) work_item_id: &'a str,
+    pub(crate) source_item_id: &'a str,
+    pub(crate) media_source_id: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetadataAutoMatchPolicy {
     UseLibrarySetting,

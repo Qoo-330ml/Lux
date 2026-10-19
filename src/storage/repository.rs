@@ -3319,6 +3319,15 @@ fn append_content_restriction_predicate<'a>(
     binds: &mut Vec<CatalogBind<'a>>,
     restrictions: Option<&'a UserContentRestrictions>,
 ) {
+    append_content_restriction_predicate_for_item_alias(where_clause, binds, restrictions, "mi");
+}
+
+fn append_content_restriction_predicate_for_item_alias<'a>(
+    where_clause: &mut String,
+    binds: &mut Vec<CatalogBind<'a>>,
+    restrictions: Option<&'a UserContentRestrictions>,
+    item_alias: &str,
+) {
     let Some(restrictions) = restrictions else {
         return;
     };
@@ -3400,16 +3409,16 @@ fn append_content_restriction_predicate<'a>(
         );
     }
 
-    where_clause.push_str(
+    where_clause.push_str(&format!(
         " AND NOT EXISTS (
              SELECT 1
              FROM media_items restriction_item
              LEFT JOIN media_content_restriction_index restriction_index
                ON restriction_index.item_id = restriction_item.id
-             WHERE restriction_item.id IN (mi.id, mi.parent_id, mi.series_id)
+             WHERE restriction_item.id IN ({item_alias}.id, {item_alias}.parent_id, {item_alias}.series_id)
                AND restriction_item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'VIDEO')
                AND (",
-    );
+    ));
     where_clause.push_str(&violations.join(" OR "));
     where_clause.push_str("))");
 }

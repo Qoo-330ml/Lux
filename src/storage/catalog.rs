@@ -1,8 +1,8 @@
 use super::*;
 use crate::storage::{
-    CatalogSearchQuery, GlobalMovieCollectionReference, GlobalMovieCollectionReferenceUpdate,
-    StoredMovieNfoCollectionReferenceReconciliation, global_collection_title_fallback,
-    global_collection_title_is_placeholder,
+    CatalogSearchQuery, GlobalCollectionSourcePreference, GlobalMovieCollectionReference,
+    GlobalMovieCollectionReferenceUpdate, StoredMovieNfoCollectionReferenceReconciliation,
+    global_collection_title_fallback, global_collection_title_is_placeholder,
 };
 use crate::{
     domain::content_restrictions::ContentRestrictionIndexProjection,
@@ -832,11 +832,12 @@ impl Database {
             })
     }
 
-    pub(crate) async fn count_visible_global_collections(
+    pub(crate) async fn count_visible_global_collections_with_restrictions(
         &self,
         user_id: &str,
         is_admin: bool,
         is_favorite: Option<bool>,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<i64, StorageError> {
         let favorite_filter = is_favorite.map_or(String::new(), |_| {
             " AND COALESCE(
@@ -848,6 +849,14 @@ impl Database {
                 .to_owned()
         });
         let library_access_filter = user_library_access_filter("source_item.library_id", true);
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate_for_item_alias(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+            "source_item",
+        );
         let query = format!(
             "SELECT COUNT(DISTINCT collection.id)
              FROM collections collection
@@ -869,6 +878,7 @@ impl Database {
                      AND source_item.removed_at IS NULL
                      AND source_item.has_available_source = 1
                      AND {library_access_filter}
+                     {content_restriction_predicate}
                )
                {favorite_filter}"
         );
@@ -877,6 +887,13 @@ impl Database {
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
             .bind(user_id);
+        for bind in &content_restriction_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(*value),
+                CatalogBind::Integer(value) => statement.bind(*value),
+                CatalogBind::Real(value) => statement.bind(*value),
+            };
+        }
         if let Some(is_favorite) = is_favorite {
             statement = statement.bind(user_id).bind(database_flag(is_favorite));
         }
@@ -6424,6 +6441,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_global_collection_cards_page(
         &self,
         user_id: &str,
@@ -6431,10 +6449,32 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
-        self.list_global_collection_cards_page_ordered(user_id, is_admin, offset, limit, false)
-            .await
+        self.list_global_collection_cards_page_with_restrictions(
+            user_id, is_admin, offset, limit, None,
+        )
+        .await
     }
 
+    pub(crate) async fn list_global_collection_cards_page_with_restrictions(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        self.list_global_collection_cards_page_ordered(
+            user_id,
+            is_admin,
+            offset,
+            limit,
+            false,
+            content_restrictions,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn list_recent_global_collection_cards_page(
         &self,
         user_id: &str,
@@ -6442,8 +6482,29 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
-        self.list_global_collection_cards_page_ordered(user_id, is_admin, offset, limit, true)
-            .await
+        self.list_recent_global_collection_cards_page_with_restrictions(
+            user_id, is_admin, offset, limit, None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_recent_global_collection_cards_page_with_restrictions(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        self.list_global_collection_cards_page_ordered(
+            user_id,
+            is_admin,
+            offset,
+            limit,
+            true,
+            content_restrictions,
+        )
+        .await
     }
 
     async fn list_global_collection_cards_page_ordered(
@@ -6453,8 +6514,17 @@ impl Database {
         offset: i64,
         limit: i64,
         recently_updated_first: bool,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
         let library_access_filter = user_library_access_filter("source_item.library_id", true);
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate_for_item_alias(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+            "source_item",
+        );
         let visible_source = |work_item_id: &str| {
             format!(
                 "EXISTS (
@@ -6467,11 +6537,12 @@ impl Database {
                       AND source_item.removed_at IS NULL
                       AND source_item.has_available_source = 1
                       AND {library_access_filter}
+                      {content_restriction_predicate}
                 )"
             )
         };
         let visible_collection_filter = visible_source("visible_member.item_id");
-        let total = self
+        let mut total_statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(DISTINCT collection.id)
                  FROM collections collection
@@ -6485,7 +6556,15 @@ impl Database {
             )))
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
-            .bind(user_id)
+            .bind(user_id);
+        for bind in &content_restriction_binds {
+            total_statement = match bind {
+                CatalogBind::Text(value) => total_statement.bind(*value),
+                CatalogBind::Integer(value) => total_statement.bind(*value),
+                CatalogBind::Real(value) => total_statement.bind(*value),
+            };
+        }
+        let total = total_statement
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -6511,6 +6590,7 @@ impl Database {
                       AND source_item.removed_at IS NULL
                       AND source_item.has_available_source = 1
                       AND {library_access_filter}
+                      {content_restriction_predicate}
                     ORDER BY fallback_member.sort_order, work_item.sort_title,
                              work_item.id, source_library.name, source_item.id,
                              poster.image_index, poster.id
@@ -6554,14 +6634,33 @@ impl Database {
         let mut rows = self
             .query(sqlx::AssertSqlSafe(query))
             .bind(database_flag(is_admin))
-            .bind(user_id)
-            .bind(database_flag(is_admin))
-            .bind(user_id)
-            .bind(database_flag(is_admin))
-            .bind(user_id)
-            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
-            .bind(database_flag(is_admin))
             .bind(user_id);
+        for bind in &content_restriction_binds {
+            rows = match bind {
+                CatalogBind::Text(value) => rows.bind(*value),
+                CatalogBind::Integer(value) => rows.bind(*value),
+                CatalogBind::Real(value) => rows.bind(*value),
+            };
+        }
+        for _ in 0..2 {
+            rows = rows.bind(database_flag(is_admin)).bind(user_id);
+            for bind in &content_restriction_binds {
+                rows = match bind {
+                    CatalogBind::Text(value) => rows.bind(*value),
+                    CatalogBind::Integer(value) => rows.bind(*value),
+                    CatalogBind::Real(value) => rows.bind(*value),
+                };
+            }
+        }
+        rows = rows.bind(GLOBAL_COLLECTION_LIBRARY_ID);
+        rows = rows.bind(database_flag(is_admin)).bind(user_id);
+        for bind in &content_restriction_binds {
+            rows = match bind {
+                CatalogBind::Text(value) => rows.bind(*value),
+                CatalogBind::Integer(value) => rows.bind(*value),
+                CatalogBind::Real(value) => rows.bind(*value),
+            };
+        }
         rows = rows.bind(limit).bind(offset);
         let rows = rows
             .fetch_all(&self.pool)
@@ -6592,6 +6691,7 @@ impl Database {
         Ok((cards, total))
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_global_collection_member_ids_page(
         &self,
         collection_item_id: &str,
@@ -6600,7 +6700,35 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
+        self.list_global_collection_member_ids_page_with_restrictions(
+            collection_item_id,
+            user_id,
+            is_admin,
+            offset,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_global_collection_member_ids_page_with_restrictions(
+        &self,
+        collection_item_id: &str,
+        user_id: &str,
+        is_admin: bool,
+        offset: i64,
+        limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<(Vec<String>, i64), StorageError> {
         let library_access_filter = user_library_access_filter("source_item.library_id", true);
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate_for_item_alias(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+            "source_item",
+        );
         let visible_source = format!(
             "EXISTS (
                 SELECT 1 FROM collection_work_sources cws
@@ -6612,6 +6740,7 @@ impl Database {
                   AND source_item.removed_at IS NULL
                   AND source_item.has_available_source = 1
                   AND {library_access_filter}
+                  {content_restriction_predicate}
             )"
         );
         let base_query = format!(
@@ -6635,6 +6764,14 @@ impl Database {
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
             .bind(user_id);
+        let mut count = count;
+        for bind in &content_restriction_binds {
+            count = match bind {
+                CatalogBind::Text(value) => count.bind(*value),
+                CatalogBind::Integer(value) => count.bind(*value),
+                CatalogBind::Real(value) => count.bind(*value),
+            };
+        }
         let total = count
             .fetch_one(&self.pool)
             .await
@@ -6653,6 +6790,14 @@ impl Database {
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
             .bind(user_id);
+        let mut rows = rows;
+        for bind in &content_restriction_binds {
+            rows = match bind {
+                CatalogBind::Text(value) => rows.bind(*value),
+                CatalogBind::Integer(value) => rows.bind(*value),
+                CatalogBind::Real(value) => rows.bind(*value),
+            };
+        }
         let rows = rows
             .bind(limit)
             .bind(offset)
@@ -6668,11 +6813,28 @@ impl Database {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_global_collection_sources_for_works(
         &self,
         work_item_ids: &[String],
         user_id: &str,
         is_admin: bool,
+    ) -> Result<Vec<StoredGlobalCollectionSource>, StorageError> {
+        self.list_global_collection_sources_for_works_with_restrictions(
+            work_item_ids,
+            user_id,
+            is_admin,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_global_collection_sources_for_works_with_restrictions(
+        &self,
+        work_item_ids: &[String],
+        user_id: &str,
+        is_admin: bool,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<Vec<StoredGlobalCollectionSource>, StorageError> {
         if work_item_ids.is_empty() {
             return Ok(Vec::new());
@@ -6681,6 +6843,14 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let library_access_filter = user_library_access_filter("source_item.library_id", true);
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate_for_item_alias(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+            "source_item",
+        );
         let query = format!(
             "SELECT source_work.work_item_id, source_item.id AS source_item_id,
                     source_item.library_id, source_library.name AS library_name,
@@ -6718,6 +6888,7 @@ impl Database {
                AND source_item.removed_at IS NULL
                AND source_item.has_available_source = 1
                AND {library_access_filter}
+               {content_restriction_predicate}
              ORDER BY source_work.work_item_id,
                       source_library.name, source_item.id,
                       media_source.is_default DESC, media_source.id"
@@ -6727,6 +6898,13 @@ impl Database {
             rows = rows.bind(work_item_id);
         }
         rows = rows.bind(database_flag(is_admin)).bind(user_id);
+        for bind in &content_restriction_binds {
+            rows = match bind {
+                CatalogBind::Text(value) => rows.bind(*value),
+                CatalogBind::Integer(value) => rows.bind(*value),
+                CatalogBind::Real(value) => rows.bind(*value),
+            };
+        }
         let rows = rows
             .fetch_all(&self.pool)
             .await
@@ -6753,6 +6931,7 @@ impl Database {
             .collect())
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_global_collection_source_preference(
         &self,
         user_id: &str,
@@ -6762,8 +6941,35 @@ impl Database {
         source_item_id: &str,
         media_source_id: Option<&str>,
     ) -> Result<bool, StorageError> {
+        self.set_global_collection_source_preference_with_restrictions(
+            GlobalCollectionSourcePreference {
+                user_id,
+                is_admin,
+                collection_item_id,
+                work_item_id,
+                source_item_id,
+                media_source_id,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn set_global_collection_source_preference_with_restrictions(
+        &self,
+        preference: GlobalCollectionSourcePreference<'_>,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<bool, StorageError> {
         let library_access_filter = user_library_access_filter("source_item.library_id", true);
-        let result = self
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate_for_item_alias(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+            "source_item",
+        );
+        let mut statement = self
             .query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO user_collection_source_preferences (
                      user_id, work_item_id, source_item_id, media_source_id, updated_at
@@ -6786,6 +6992,7 @@ impl Database {
                        AND source_item.removed_at IS NULL
                        AND source_item.has_available_source = 1
                        AND {library_access_filter}
+                       {content_restriction_predicate}
                        AND (
                            ? IS NULL OR EXISTS (
                                SELECT 1 FROM media_sources selected_source
@@ -6807,18 +7014,26 @@ impl Database {
                      media_source_id = excluded.media_source_id,
                      updated_at = excluded.updated_at"
             )))
-            .bind(user_id)
-            .bind(work_item_id)
-            .bind(source_item_id)
-            .bind(media_source_id)
-            .bind(collection_item_id)
+            .bind(preference.user_id)
+            .bind(preference.work_item_id)
+            .bind(preference.source_item_id)
+            .bind(preference.media_source_id)
+            .bind(preference.collection_item_id)
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
-            .bind(work_item_id)
-            .bind(source_item_id)
-            .bind(database_flag(is_admin))
-            .bind(user_id)
-            .bind(media_source_id)
-            .bind(media_source_id)
+            .bind(preference.work_item_id)
+            .bind(preference.source_item_id)
+            .bind(database_flag(preference.is_admin))
+            .bind(preference.user_id);
+        for bind in &content_restriction_binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(*value),
+                CatalogBind::Integer(value) => statement.bind(*value),
+                CatalogBind::Real(value) => statement.bind(*value),
+            };
+        }
+        let result = statement
+            .bind(preference.media_source_id)
+            .bind(preference.media_source_id)
             .execute(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
