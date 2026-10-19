@@ -13978,6 +13978,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：用户列表支持逐项选择或全选当前页、确认预设和完整目标、逐用户成功/错误结果；换页、筛选或切换视图清空选择，成功后刷新列表。批量功能按需加载预设，仅提交当前页明确选中的最多 100 个 ID。LUX-667 组件测试 4/4、用户管理组件回归 41/41、`pnpm --dir web install --frozen-lockfile` 和 Web build 通过。完整 `pnpm --dir web test` 为 699 passed、5 failed；失败在账号头像裁剪、首页媒体库预取、媒体库卡片预取/虚拟合集链接及媒体详情轮询四个未由本任务修改的测试文件，未据此声称为基线失败。`git diff --check` 通过。build 临时使用提交版 `AdminDashboardNowPlaying.tsx`，构建后逐字节还原用户未提交版本；由于本地服务已停止，没有使用真实账户数据做手工浏览器验证。
 
+#### LUX-668：建立版本安全的账户偏好批量复制服务
+
+范围：新增 application 服务，从一个有效来源账号向最多 100 个不同目标账号复制所选的外观、首页和播放偏好组。调用者提供来源与每个目标的预期版本；来源版本过期时整体拒绝，目标版本冲突或账号不可用时逐项报告，不覆盖未选择的偏好组。媒体库排序与播放完成比例因使用独立存储，本任务不复制它们。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_account_preferences.rs`。
+
+验收标准：
+
+- [x] 拒绝空组、空目标、重复目标、来源账号自我复制、超出 100 项及负版本输入。
+- [x] 来源账号不存在、已删除或版本不匹配时不修改任何目标。
+- [x] 成功目标只改所选偏好组并执行目标版本 CAS；冲突、删除、存储失败只影响对应目标。
+- [x] application 定向测试、Rust fmt 和 diff check 通过。
+
+短计划：先为分组选拷贝、目标版本冲突、来源过期和按目标部分失败添加失败测试；再复用现有 CAS 写入完成独立目标复制。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-653、LUX-654。
+
+结果（2026-10-19）：新增外观、首页和播放三类账户偏好组复制服务。来源账号版本过期或来源不可用时不开始写入；每个有效目标按目标版本 CAS 独立更新，缺失/删除、版本冲突和注入的单目标写入错误作为逐项结果返回。7 个 `user_account_preferences::tests` 通过，`cargo build --locked`、fmt、`git diff --check` 和放行仓库已知 `too_many_arguments` lint 的定向 Clippy 通过。服务尚未接 HTTP，临时 `dead_code` 许可用于 LUX-669 接线前的中间层。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

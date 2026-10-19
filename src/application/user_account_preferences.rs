@@ -7,6 +7,8 @@ use crate::storage::{
 };
 
 const MAX_LANGUAGE_PREFERENCE_CHARS: usize = 64;
+#[allow(dead_code)]
+pub(crate) const MAX_BATCH_ACCOUNT_PREFERENCE_TARGETS: usize = 100;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +55,68 @@ pub(crate) struct UpdateAccountPreferences {
     pub(crate) auto_play_next_episode: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CopyAccountPreferencesInput {
+    pub(crate) source_user_id: String,
+    pub(crate) source_expected_version: i64,
+    pub(crate) targets: Vec<CopyAccountPreferencesTarget>,
+    pub(crate) groups: CopyAccountPreferenceGroups,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CopyAccountPreferencesTarget {
+    pub(crate) user_id: String,
+    pub(crate) expected_version: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CopyAccountPreferenceGroups {
+    pub(crate) appearance: bool,
+    pub(crate) home: bool,
+    pub(crate) playback: bool,
+}
+
+#[allow(dead_code)]
+impl CopyAccountPreferenceGroups {
+    fn is_empty(self) -> bool {
+        !self.appearance && !self.home && !self.playback
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum AccountPreferencesCopyErrorCode {
+    UserUnavailable,
+    VersionConflict,
+    InvalidPreferences,
+    StorageUnavailable,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesCopyTargetResult {
+    pub(crate) user_id: String,
+    pub(crate) success: bool,
+    pub(crate) error_code: Option<AccountPreferencesCopyErrorCode>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesCopyBatchResult {
+    pub(crate) source_user_id: String,
+    pub(crate) source_version: i64,
+    pub(crate) results: Vec<AccountPreferencesCopyTargetResult>,
+}
+
 #[derive(Debug)]
 pub(crate) enum AccountPreferencesError {
     InvalidPreferences,
@@ -73,6 +137,49 @@ impl fmt::Display for AccountPreferencesError {
 }
 
 impl std::error::Error for AccountPreferencesError {}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum AccountPreferencesCopyError {
+    InvalidRequest,
+    SourceUnavailable,
+    SourceVersionConflict,
+    UserUnavailable,
+    VersionConflict,
+    InvalidPreferences,
+    Storage(StorageError),
+}
+
+impl fmt::Display for AccountPreferencesCopyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest => {
+                formatter.write_str("account preference copy request is invalid")
+            }
+            Self::SourceUnavailable => formatter.write_str("source account is unavailable"),
+            Self::SourceVersionConflict => {
+                formatter.write_str("source account preferences version changed")
+            }
+            Self::UserUnavailable => formatter.write_str("target account is unavailable"),
+            Self::VersionConflict => {
+                formatter.write_str("target account preferences version changed")
+            }
+            Self::InvalidPreferences => formatter.write_str("account preferences are invalid"),
+            Self::Storage(error) => {
+                let _ = error;
+                formatter.write_str("account preference storage is unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AccountPreferencesCopyError {}
+
+impl From<StorageError> for AccountPreferencesCopyError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
 
 impl From<StorageError> for AccountPreferencesError {
     fn from(error: StorageError) -> Self {
@@ -121,6 +228,171 @@ pub(crate) async fn update_account_preferences(
             Err(AccountPreferencesError::UserUnavailable)
         }
     }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn copy_account_preferences_batch(
+    database: &Database,
+    input: CopyAccountPreferencesInput,
+) -> Result<AccountPreferencesCopyBatchResult, AccountPreferencesCopyError> {
+    validate_copy_input(&input)?;
+    let source_user = database
+        .find_user_by_id(&input.source_user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or(AccountPreferencesCopyError::SourceUnavailable)?;
+    let source_preferences = database
+        .user_account_preferences(&source_user.id)
+        .await?
+        .map(AccountPreferences::from)
+        .unwrap_or_default();
+    if source_preferences.version != input.source_expected_version {
+        return Err(AccountPreferencesCopyError::SourceVersionConflict);
+    }
+
+    let mut results = Vec::with_capacity(input.targets.len());
+    for target in &input.targets {
+        let error_code =
+            match copy_preferences_to_target(database, target, &source_preferences, input.groups)
+                .await
+            {
+                Ok(()) => None,
+                Err(error) => Some(match error {
+                    AccountPreferencesCopyError::VersionConflict => {
+                        AccountPreferencesCopyErrorCode::VersionConflict
+                    }
+                    AccountPreferencesCopyError::UserUnavailable => {
+                        AccountPreferencesCopyErrorCode::UserUnavailable
+                    }
+                    AccountPreferencesCopyError::InvalidPreferences => {
+                        AccountPreferencesCopyErrorCode::InvalidPreferences
+                    }
+                    AccountPreferencesCopyError::Storage(_) => {
+                        AccountPreferencesCopyErrorCode::StorageUnavailable
+                    }
+                    AccountPreferencesCopyError::InvalidRequest
+                    | AccountPreferencesCopyError::SourceUnavailable
+                    | AccountPreferencesCopyError::SourceVersionConflict => {
+                        AccountPreferencesCopyErrorCode::StorageUnavailable
+                    }
+                }),
+            };
+        results.push(AccountPreferencesCopyTargetResult {
+            user_id: target.user_id.clone(),
+            success: error_code.is_none(),
+            error_code,
+        });
+    }
+    Ok(AccountPreferencesCopyBatchResult {
+        source_user_id: source_user.id,
+        source_version: source_preferences.version,
+        results,
+    })
+}
+
+#[allow(dead_code)]
+async fn copy_preferences_to_target(
+    database: &Database,
+    target: &CopyAccountPreferencesTarget,
+    source: &AccountPreferences,
+    groups: CopyAccountPreferenceGroups,
+) -> Result<(), AccountPreferencesCopyError> {
+    let user = database
+        .find_user_by_id(&target.user_id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or(AccountPreferencesCopyError::UserUnavailable)?;
+    let current = database
+        .user_account_preferences(&user.id)
+        .await?
+        .map(AccountPreferences::from)
+        .unwrap_or_default();
+    if current.version != target.expected_version {
+        return Err(AccountPreferencesCopyError::VersionConflict);
+    }
+    let input = UpdateAccountPreferences {
+        expected_version: current.version,
+        theme: if groups.appearance {
+            &source.theme
+        } else {
+            &current.theme
+        }
+        .clone(),
+        accent_color: if groups.appearance {
+            &source.accent_color
+        } else {
+            &current.accent_color
+        }
+        .clone(),
+        show_media_libraries: if groups.home {
+            source.show_media_libraries
+        } else {
+            current.show_media_libraries
+        },
+        show_continue_watching: if groups.home {
+            source.show_continue_watching
+        } else {
+            current.show_continue_watching
+        },
+        audio_language: if groups.playback {
+            &source.audio_language
+        } else {
+            &current.audio_language
+        }
+        .clone(),
+        subtitle_language: if groups.playback {
+            &source.subtitle_language
+        } else {
+            &current.subtitle_language
+        }
+        .clone(),
+        auto_play_next_episode: if groups.playback {
+            source.auto_play_next_episode
+        } else {
+            current.auto_play_next_episode
+        },
+    };
+    update_account_preferences(database, &target.user_id, input)
+        .await
+        .map_err(|error| match error {
+            AccountPreferencesError::InvalidPreferences => {
+                AccountPreferencesCopyError::InvalidPreferences
+            }
+            AccountPreferencesError::Storage(error) => AccountPreferencesCopyError::Storage(error),
+            AccountPreferencesError::UserUnavailable => {
+                AccountPreferencesCopyError::UserUnavailable
+            }
+            AccountPreferencesError::VersionConflict => {
+                AccountPreferencesCopyError::VersionConflict
+            }
+        })?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_copy_input(
+    input: &CopyAccountPreferencesInput,
+) -> Result<(), AccountPreferencesCopyError> {
+    if input.source_expected_version < 0
+        || input.targets.is_empty()
+        || input.targets.len() > MAX_BATCH_ACCOUNT_PREFERENCE_TARGETS
+        || input.groups.is_empty()
+        || input
+            .targets
+            .iter()
+            .any(|target| target.expected_version < 0 || target.user_id == input.source_user_id)
+    {
+        return Err(AccountPreferencesCopyError::InvalidRequest);
+    }
+    let mut user_ids = std::collections::HashSet::with_capacity(input.targets.len());
+    if input
+        .targets
+        .iter()
+        .any(|target| !user_ids.insert(&target.user_id))
+    {
+        return Err(AccountPreferencesCopyError::InvalidRequest);
+    }
+    Ok(())
 }
 
 fn validate_preferences(input: &UpdateAccountPreferences) -> Result<(), AccountPreferencesError> {
@@ -329,5 +601,269 @@ mod tests {
             Err(AccountPreferencesError::UserUnavailable)
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn copies_only_selected_preference_groups_with_target_version_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        for user_id in ["copy-source", "copy-target"] {
+            database
+                .insert_user(user_id, user_id, user_id, "test", false, true)
+                .await?;
+        }
+        update_account_preferences(&database, "copy-source", valid_update(0)).await?;
+        update_account_preferences(&database, "copy-target", valid_update(0)).await?;
+
+        let result = copy_account_preferences_batch(
+            &database,
+            CopyAccountPreferencesInput {
+                source_user_id: "copy-source".to_owned(),
+                source_expected_version: 1,
+                targets: vec![CopyAccountPreferencesTarget {
+                    user_id: "copy-target".to_owned(),
+                    expected_version: 1,
+                }],
+                groups: CopyAccountPreferenceGroups {
+                    appearance: true,
+                    home: true,
+                    playback: false,
+                },
+            },
+        )
+        .await?;
+
+        assert_eq!(result.source_version, 1);
+        assert_eq!(result.results.len(), 1);
+        assert!(result.results[0].success);
+        assert_eq!(result.results[0].error_code, None);
+        let source = get_account_preferences(&database, "copy-source").await?;
+        let target = get_account_preferences(&database, "copy-target").await?;
+        assert_eq!(target.theme, source.theme);
+        assert_eq!(target.accent_color, source.accent_color);
+        assert_eq!(target.show_media_libraries, source.show_media_libraries);
+        assert_eq!(target.show_continue_watching, source.show_continue_watching);
+        assert_eq!(target.audio_language, "日本語");
+        assert_eq!(target.subtitle_language, "关闭");
+        assert_eq!(target.auto_play_next_episode, source.auto_play_next_episode);
+        assert_eq!(target.version, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_batch_preference_copy_results_independently_per_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        for user_id in [
+            "copy-source",
+            "copy-ok",
+            "copy-conflict",
+            "copy-deleted",
+            "copy-storage-error",
+        ] {
+            database
+                .insert_user(user_id, user_id, user_id, "test", false, true)
+                .await?;
+        }
+        update_account_preferences(&database, "copy-source", valid_update(0)).await?;
+        update_account_preferences(&database, "copy-conflict", valid_update(0)).await?;
+        database.soft_delete_user("copy-deleted").await?;
+        sqlx::query(
+            "CREATE TRIGGER fail_one_account_preference_copy
+             BEFORE INSERT ON user_account_preferences
+             WHEN NEW.user_id = 'copy-storage-error'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected preference copy failure');
+             END",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let result = copy_account_preferences_batch(
+            &database,
+            CopyAccountPreferencesInput {
+                source_user_id: "copy-source".to_owned(),
+                source_expected_version: 1,
+                targets: vec![
+                    CopyAccountPreferencesTarget {
+                        user_id: "copy-ok".to_owned(),
+                        expected_version: 0,
+                    },
+                    CopyAccountPreferencesTarget {
+                        user_id: "copy-conflict".to_owned(),
+                        expected_version: 0,
+                    },
+                    CopyAccountPreferencesTarget {
+                        user_id: "copy-deleted".to_owned(),
+                        expected_version: 0,
+                    },
+                    CopyAccountPreferencesTarget {
+                        user_id: "copy-missing".to_owned(),
+                        expected_version: 0,
+                    },
+                    CopyAccountPreferencesTarget {
+                        user_id: "copy-storage-error".to_owned(),
+                        expected_version: 0,
+                    },
+                ],
+                groups: CopyAccountPreferenceGroups {
+                    appearance: false,
+                    home: false,
+                    playback: true,
+                },
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|result| (result.user_id.as_str(), result.error_code))
+                .collect::<Vec<_>>(),
+            vec![
+                ("copy-ok", None),
+                (
+                    "copy-conflict",
+                    Some(AccountPreferencesCopyErrorCode::VersionConflict)
+                ),
+                (
+                    "copy-deleted",
+                    Some(AccountPreferencesCopyErrorCode::UserUnavailable)
+                ),
+                (
+                    "copy-missing",
+                    Some(AccountPreferencesCopyErrorCode::UserUnavailable)
+                ),
+                (
+                    "copy-storage-error",
+                    Some(AccountPreferencesCopyErrorCode::StorageUnavailable)
+                ),
+            ]
+        );
+        assert_eq!(
+            get_account_preferences(&database, "copy-ok")
+                .await?
+                .audio_language,
+            "日本語"
+        );
+        assert_eq!(
+            get_account_preferences(&database, "copy-conflict")
+                .await?
+                .version,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_preference_copy_requests_before_writing_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        for user_id in ["copy-source", "copy-target"] {
+            database
+                .insert_user(user_id, user_id, user_id, "test", false, true)
+                .await?;
+        }
+        update_account_preferences(&database, "copy-source", valid_update(0)).await?;
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.groups = CopyAccountPreferenceGroups {
+            appearance: false,
+            home: false,
+            playback: false,
+        };
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::InvalidRequest)
+        ));
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.source_expected_version = 0;
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::SourceVersionConflict)
+        ));
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.targets.push(input.targets[0].clone());
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::InvalidRequest)
+        ));
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.targets[0].expected_version = -1;
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::InvalidRequest)
+        ));
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.targets[0].user_id = input.source_user_id.clone();
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::InvalidRequest)
+        ));
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.targets.clear();
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::InvalidRequest)
+        ));
+
+        let mut input = copy_input("copy-source", "copy-target", 0);
+        input.targets = (0..=MAX_BATCH_ACCOUNT_PREFERENCE_TARGETS)
+            .map(|index| CopyAccountPreferencesTarget {
+                user_id: format!("bulk-target-{index}"),
+                expected_version: 0,
+            })
+            .collect();
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::InvalidRequest)
+        ));
+
+        let mut input = copy_input("missing-source", "copy-target", 0);
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input.clone()).await,
+            Err(AccountPreferencesCopyError::SourceUnavailable)
+        ));
+
+        database.soft_delete_user("copy-source").await?;
+        input.source_user_id = "copy-source".to_owned();
+        input.source_expected_version = 1;
+        assert!(matches!(
+            copy_account_preferences_batch(&database, input).await,
+            Err(AccountPreferencesCopyError::SourceUnavailable)
+        ));
+        assert_eq!(
+            get_account_preferences(&database, "copy-target")
+                .await?
+                .version,
+            0
+        );
+        Ok(())
+    }
+
+    fn copy_input(
+        source_user_id: &str,
+        target_user_id: &str,
+        expected_version: i64,
+    ) -> CopyAccountPreferencesInput {
+        CopyAccountPreferencesInput {
+            source_user_id: source_user_id.to_owned(),
+            source_expected_version: 1,
+            targets: vec![CopyAccountPreferencesTarget {
+                user_id: target_user_id.to_owned(),
+                expected_version,
+            }],
+            groups: CopyAccountPreferenceGroups {
+                appearance: true,
+                home: false,
+                playback: false,
+            },
+        }
     }
 }
