@@ -15501,6 +15501,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 空库回归先因 schema 实际为 193（预期 194）而失败；实现后 `tests/storage` 设备清单 migration 回归 2/2、活动索引最新 schema 回归 1/1、PostgreSQL 16 空库 migration 回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许已知 lint 类别的全目标 Clippy 通过。未放行的全量 Clippy 仍有 9 条既有诊断，位于 `src/api/admin/admin_users.rs:554`、`src/api/media.rs:2837`、`src/application/playback/session.rs:397, src/application/user_permission_copy.rs:382,657`、`src/storage/users.rs:3161,3164` 和 `src/storage/repository_tests.rs:15587,23380`；本任务未修改这些文件。旧凭证回填行为在 SQLite schema 193 升级回归覆盖；PostgreSQL 本地运行回归覆盖空库迁移和级联清理。
 
+#### LUX-740：实现用户设备活动存储写入
+
+范围：增加用户设备观察的原子 upsert 存储合同。首次写入建立设备记录；后续写入按用户和设备隔离，首次出现保留最早时间，最近活动与设备/客户端摘要不因乱序旧观察回退。新观察缺少 IP 或可选摘要时保留先前已知值。仅实现 storage 层，不接认证写入、HTTP API、黑名单或 ACL。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新设备按用户/设备标识写入完整客户端声明摘要与可选来源 IP。
+- [x] 重复及乱序观察原子合并；首次时间单调取最早，最近时间和摘要不回退。
+- [x] 缺失的可选字段不清除已有值；相同设备标识在不同用户之间独立。
+- [x] 定向 storage 回归、Rust build、fmt 与 diff check 通过；没有认证或访问控制接线。
+
+短计划：先添加 storage upsert 行为回归并确认写入合同缺失；再增加观察 DTO 和兼容 SQLite/PostgreSQL 的单语句 upsert；最后运行最窄 storage 测试、build、fmt 与 diff check。
+
+#### LUX-740 验证记录
+
+结果（2026-10-20）：storage 增加 `NewUserDeviceObservation` 与单语句 upsert。相同用户/设备的首次出现时间只会向更早时间推进，最近活动时间取最大值；设备/客户端摘要和 IP 只由不早于当前记录的观察更新，空或缺失的可选值保留旧值。相同客户端设备 ID 在不同用户间保持隔离。调用接线留给后续任务。
+
+验证：TDD RED 因观察类型及 `upsert_user_device` 缺失而编译失败；实现后 `cargo test --locked --lib user_device_observations_merge_monotonically_and_are_user_scoped` 1/1、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和仅允许 LUX-739 所记录 9 条既有 Clippy 诊断类别的全目标 Clippy 通过。完整 Clippy 的 9 条既有诊断仍未修复；本任务只新增 `repository.rs`、`mod.rs`、`users.rs` 和存储测试，不接认证或 ACL。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

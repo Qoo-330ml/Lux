@@ -1308,6 +1308,19 @@ pub(crate) struct NewUserActivityEvent<'a> {
     pub(crate) metadata_json: &'a str,
 }
 
+// LUX-741 connects this device observation contract to successful authentication and activity.
+#[allow(dead_code)]
+pub(crate) struct NewUserDeviceObservation<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) device_name: Option<&'a str>,
+    pub(crate) device_type: Option<&'a str>,
+    pub(crate) client_name: &'a str,
+    pub(crate) client_version: Option<&'a str>,
+    pub(crate) last_remote_ip: Option<&'a str>,
+    pub(crate) seen_at: i64,
+}
+
 // LUX-723 consumes this bounded query contract in the administrator activity API.
 #[allow(dead_code)]
 pub(crate) struct UserActivityEventQuery<'a> {

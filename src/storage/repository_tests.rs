@@ -3,9 +3,10 @@ use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
     MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserActivityEvent,
-    NewUserContentRestrictions, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
-    StoredUserActivityEvent, UserActivityEventQuery, UserContentRestrictionsCasResult,
-    UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
+    NewUserContentRestrictions, NewUserDeviceObservation, PlaybackAdmissionDecision,
+    PlaybackAdmissionDenialReason, StoredUserActivityEvent, UserActivityEventQuery,
+    UserContentRestrictionsCasResult, UserPermissionCopyGroups, UserPermissionCopyResult,
+    UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -23414,6 +23415,124 @@ async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subje
             .fetch_one(database.pool())
             .await?;
     assert_eq!(invalid_metadata, r#"{"invalid":true}"#);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_observations_merge_monotonically_and_are_user_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, normalized) in [
+        ("device-observation-owner", "device-observation-owner"),
+        ("device-observation-other", "device-observation-other"),
+    ] {
+        database
+            .query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES (?, ?, ?, 'test-hash')",
+            )
+            .bind(user_id)
+            .bind(normalized)
+            .bind(user_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: Some("Phone"),
+            device_type: Some("Mobile"),
+            client_name: "Lux Web",
+            client_version: Some("1.0"),
+            last_remote_ip: Some("198.51.100.1"),
+            seen_at: 100,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: Some("Phone Updated"),
+            device_type: Some("Mobile"),
+            client_name: "Lux Prism",
+            client_version: Some("2.0"),
+            last_remote_ip: Some("198.51.100.2"),
+            seen_at: 200,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: Some("Outdated Name"),
+            device_type: Some("Unknown"),
+            client_name: "Outdated Client",
+            client_version: Some("0.9"),
+            last_remote_ip: Some("198.51.100.0"),
+            seen_at: 50,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: None,
+            device_type: None,
+            client_name: "Lux Prism",
+            client_version: None,
+            last_remote_ip: None,
+            seen_at: 250,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-other",
+            device_id: "shared-device",
+            device_name: Some("Other User Device"),
+            device_type: Some("TV"),
+            client_name: "Other Client",
+            client_version: Some("3.0"),
+            last_remote_ip: Some("203.0.113.3"),
+            seen_at: 300,
+        })
+        .await?;
+
+    let owner_record: (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT device_name, device_type, client_name, client_version,
+                first_seen_at, last_seen_at, last_remote_ip
+         FROM user_devices
+         WHERE user_id = 'device-observation-owner' AND device_id = 'shared-device'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(owner_record.0.as_deref(), Some("Phone Updated"));
+    assert_eq!(owner_record.1.as_deref(), Some("Mobile"));
+    assert_eq!(owner_record.2, "Lux Prism");
+    assert_eq!(owner_record.3.as_deref(), Some("2.0"));
+    assert_eq!(owner_record.4, 50);
+    assert_eq!(owner_record.5, 250);
+    assert_eq!(owner_record.6.as_deref(), Some("198.51.100.2"));
+
+    let user_scoped_devices: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE device_id = 'shared-device'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(user_scoped_devices, 2);
     Ok(())
 }
 

@@ -1693,6 +1693,62 @@ impl Database {
         Ok(event_id)
     }
 
+    // LUX-741 wires this monotonic inventory upsert into authentication and activity recording.
+    #[allow(dead_code)]
+    pub(crate) async fn upsert_user_device(
+        &self,
+        observation: NewUserDeviceObservation<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, device_name, device_type, client_name,
+                 client_version, first_seen_at, last_seen_at, last_remote_ip
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, device_id) DO UPDATE SET
+                 first_seen_at = CASE
+                     WHEN excluded.first_seen_at < user_devices.first_seen_at
+                     THEN excluded.first_seen_at ELSE user_devices.first_seen_at END,
+                 device_name = CASE
+                     WHEN excluded.last_seen_at >= user_devices.last_seen_at
+                     THEN COALESCE(NULLIF(excluded.device_name, ''), user_devices.device_name)
+                     ELSE user_devices.device_name END,
+                 device_type = CASE
+                     WHEN excluded.last_seen_at >= user_devices.last_seen_at
+                     THEN COALESCE(NULLIF(excluded.device_type, ''), user_devices.device_type)
+                     ELSE user_devices.device_type END,
+                 client_name = CASE
+                     WHEN excluded.last_seen_at >= user_devices.last_seen_at
+                     THEN excluded.client_name ELSE user_devices.client_name END,
+                 client_version = CASE
+                     WHEN excluded.last_seen_at >= user_devices.last_seen_at
+                     THEN COALESCE(NULLIF(excluded.client_version, ''), user_devices.client_version)
+                     ELSE user_devices.client_version END,
+                 last_seen_at = CASE
+                     WHEN excluded.last_seen_at > user_devices.last_seen_at
+                     THEN excluded.last_seen_at ELSE user_devices.last_seen_at END,
+                 last_remote_ip = CASE
+                     WHEN excluded.last_seen_at >= user_devices.last_seen_at
+                     THEN COALESCE(NULLIF(excluded.last_remote_ip, ''), user_devices.last_remote_ip)
+                     ELSE user_devices.last_remote_ip END",
+        )
+        .bind(observation.user_id)
+        .bind(observation.device_id)
+        .bind(observation.device_name)
+        .bind(observation.device_type)
+        .bind(observation.client_name)
+        .bind(observation.client_version)
+        .bind(observation.seen_at)
+        .bind(observation.seen_at)
+        .bind(observation.last_remote_ip)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
     // LUX-723 wires this storage contract into the administrator activity API.
     #[allow(dead_code)]
     pub(crate) async fn list_user_activity_events(
