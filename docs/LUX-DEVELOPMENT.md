@@ -12570,13 +12570,13 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
+- [x] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
 - [x] 用户查询统一映射新增字段；邮箱为空允许重复，非空邮箱不区分大小写唯一。
 - [x] 不改变当前登录、用户删除及公开 API 行为。
 
 依赖：LUX-593。后续模块一任务逐步接通 API、用户界面和账号生命周期。
 
-结果（2026-10-19）：SQLite/PostgreSQL 迁移、邮箱唯一索引和用户存储映射已实现；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过。迁移尚未在数据库实例执行，未运行测试。
+结果（2026-10-19）：SQLite/PostgreSQL 迁移、邮箱唯一索引和用户存储映射已实现。新增既有数据库升级回归：从 0183 迁移前账号开始应用 0184 后续迁移，确认旧账号邮箱/验证/删除字段为空且启用状态不变，并确认邮箱唯一索引忽略大小写。SQLite `storage` target 1/1、PostgreSQL `postgres_database` ignored target 1/1（PostgreSQL 16 临时实例）、Rust build、fmt check 与 diff check 通过。
 
 #### LUX-595：管理员账号资料 API
 

@@ -1,4 +1,4 @@
-use std::{env, fs};
+use std::{env, ffi::OsStr, fs};
 
 use luxd::{
     application::{
@@ -23,7 +23,7 @@ use luxd::{
     storage::Database,
 };
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{migrate::Migrator, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 fn postgres_connection(database: String) -> PostgresConnection {
@@ -787,6 +787,97 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_account_profile_migration_preserves_existing_accounts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let migration_prefix = temp_dir
+        .path()
+        .join("postgres-migrations-before-account-profile");
+    fs::create_dir(&migration_prefix)?;
+    for entry in fs::read_dir("migrations-postgres")? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split('_').next())
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if version <= 183 {
+            let file_name = path.file_name().ok_or("migration has no file name")?;
+            fs::copy(&path, migration_prefix.join(file_name))?;
+        }
+    }
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        Migrator::new(migration_prefix.as_path())
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash, is_disabled)
+             VALUES ('legacy-enabled', 'legacy-enabled', 'Legacy Enabled', 'hash', 0),
+                    ('legacy-disabled', 'legacy-disabled', 'Legacy Disabled', 'hash', 1)",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        assert_eq!(database.schema_version().await?, 188);
+        let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> =
+            sqlx::query_as(
+                "SELECT id, email, email_verified_at, deletion_purge_at,
+                        is_disabled, is_disabled_before_delete
+                 FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            users[0],
+            ("legacy-disabled".to_owned(), None, None, None, 1, 0)
+        );
+        assert_eq!(
+            users[1],
+            ("legacy-enabled".to_owned(), None, None, None, 0, 0)
+        );
+
+        sqlx::query("UPDATE users SET email = 'legacy@example.com' WHERE id = 'legacy-enabled'")
+            .execute(database.pool())
+            .await?;
+        let duplicate_email = sqlx::query(
+            "UPDATE users SET email = 'LEGACY@example.com' WHERE id = 'legacy-disabled'",
+        )
+        .execute(database.pool())
+        .await;
+        assert!(
+            duplicate_email.is_err(),
+            "email uniqueness must ignore case"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
 }
 
 #[tokio::test]

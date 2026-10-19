@@ -8,6 +8,10 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
+use sqlx::{
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 
 #[tokio::test]
 async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
@@ -118,6 +122,94 @@ async fn user_library_access_mode_migration_runs_from_an_empty_database()
     .await?;
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("'ALL'"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_profile_migration_preserves_existing_accounts_and_email_uniqueness()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir_all(&config_dir)?;
+    let migration_prefix = temp_dir.path().join("migrations-before-account-profile");
+    fs::create_dir(&migration_prefix)?;
+    for entry in fs::read_dir("migrations")? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split('_').next())
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if version <= 183 {
+            let file_name = path.file_name().ok_or("migration has no file name")?;
+            fs::copy(&path, migration_prefix.join(file_name))?;
+        }
+    }
+
+    let database_path = config_dir.join("lux.db");
+    let legacy_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await?;
+    Migrator::new(migration_prefix.as_path())
+        .await?
+        .run(&legacy_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash, is_disabled)
+         VALUES ('legacy-enabled', 'legacy-enabled', 'Legacy Enabled', 'hash', 0),
+                ('legacy-disabled', 'legacy-disabled', 'Legacy Disabled', 'hash', 1)",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    legacy_pool.close().await;
+
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    })
+    .await?;
+    assert_eq!(database.schema_version().await?, 188);
+    let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> = sqlx::query_as(
+        "SELECT id, email, email_verified_at, deletion_purge_at,
+                is_disabled, is_disabled_before_delete
+         FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(users.len(), 2);
+    assert_eq!(
+        users[0],
+        ("legacy-disabled".to_owned(), None, None, None, 1, 0)
+    );
+    assert_eq!(
+        users[1],
+        ("legacy-enabled".to_owned(), None, None, None, 0, 0)
+    );
+
+    sqlx::query("UPDATE users SET email = 'legacy@example.com' WHERE id = 'legacy-enabled'")
+        .execute(database.pool())
+        .await?;
+    let duplicate_email =
+        sqlx::query("UPDATE users SET email = 'LEGACY@example.com' WHERE id = 'legacy-disabled'")
+            .execute(database.pool())
+            .await;
+    assert!(
+        duplicate_email.is_err(),
+        "email uniqueness must ignore case"
+    );
 
     Ok(())
 }
