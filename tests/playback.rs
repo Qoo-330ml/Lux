@@ -1104,7 +1104,11 @@ async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET max_simultaneous_playbacks = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -1477,11 +1481,78 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         !device_profile_starts.exists(),
         "PlaybackInfo must reserve the Emby HLS session without starting FFmpeg"
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "PlaybackInfo must not occupy a playback slot"
+    );
+
+    let second_hls_info = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str()), ("forceTranscode", "true")])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": true,
+            "EnableDirectStream": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(second_hls_info.status(), reqwest::StatusCode::OK);
+    let second_hls_body = second_hls_info.json::<Value>().await?;
+    let second_hls_play_session_id = second_hls_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing second HLS session")?
+        .to_owned();
+    let second_hls_url = second_hls_body["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .ok_or("missing second HLS URL")?
+        .to_owned();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "preparing another HLS session must not occupy a slot"
+    );
+
+    let head_manifest = client
+        .head(format!("{base_url}{device_profile_url}"))
+        .send()
+        .await?;
+    assert_eq!(head_manifest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "HEAD manifest must not occupy a slot"
+    );
     let device_profile_manifest = client
         .get(format!("{base_url}{device_profile_url}"))
         .send()
         .await?;
     assert_eq!(device_profile_manifest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "the first manifest GET must admit the session"
+    );
     let device_profile_manifest = device_profile_manifest.text().await?;
     assert!(
         !device_profile_starts.exists(),
@@ -1490,6 +1561,40 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert!(device_profile_manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
     assert!(device_profile_manifest.contains("#EXT-X-ENDLIST\n"));
     assert!(device_profile_manifest.contains("#EXTINF:2.336000,"));
+    let blocked_hls = client
+        .get(format!("{base_url}{second_hls_url}"))
+        .send()
+        .await?;
+    assert_eq!(blocked_hls.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let blocked_hls_body = blocked_hls.text().await?;
+    assert!(blocked_hls_body.contains("当前 1 路"));
+    let second_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE play_session_id = ?")
+            .bind(&second_hls_play_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(second_hls_state, "STOPPED");
+    let second_hls_session_id = second_hls_play_session_id
+        .strip_prefix("lux-emby:")
+        .ok_or("invalid second HLS play session")?;
+    assert!(
+        !config
+            .config_dir
+            .join("web-playback")
+            .join(second_hls_session_id)
+            .exists(),
+        "denied HLS session resources must be removed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "a denied HLS session must not stop or replace the admitted session"
+    );
     let resumed_seek_segment_url = device_profile_manifest
         .lines()
         .find(|line| line.contains("segment_001230.m4s?"))
@@ -1502,6 +1607,16 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert_eq!(
         resumed_seek_segment.bytes().await?.as_ref(),
         b"segment-1230"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "HLS segments must reuse the manifest admission"
     );
     let beginning_segment_url = device_profile_manifest
         .lines()
@@ -1532,6 +1647,16 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert_eq!(
         device_profile_stopped.status(),
         reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "STOPPED must release the HLS admission"
     );
 
     let get_with_device_profile = client

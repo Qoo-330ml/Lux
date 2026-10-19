@@ -3090,7 +3090,7 @@ pub(super) async fn emby_transcoding_asset(
 }
 
 async fn serve_emby_transcoding_asset(
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     method: Method,
     public_item_id: &str,
     session_id: &str,
@@ -3174,7 +3174,7 @@ async fn serve_emby_transcoding_asset(
         }) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
-        return Response::builder()
+        let response = Response::builder()
             .status(StatusCode::OK)
             .header("Cache-Control", "private, no-store")
             .header("Content-Type", "application/vnd.apple.mpegurl")
@@ -3185,6 +3185,13 @@ async fn serve_emby_transcoding_asset(
                 Body::from(manifest)
             })
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        if method == Method::GET
+            && response.status().is_success()
+            && let Err(response) = admit_web_playback_request(headers, service, &session).await
+        {
+            return response;
+        }
+        return response;
     }
     let path = match service.wait_for_hls_asset(session_id, asset).await {
         Ok(path) => path,
@@ -3217,13 +3224,20 @@ async fn serve_emby_transcoding_asset(
         };
         Body::from_stream(tokio_util::io::ReaderStream::new(file))
     };
-    Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
         .header("Cache-Control", "private, no-store")
         .header("Content-Type", content_type)
         .header("Content-Length", metadata.len())
         .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    if method == Method::GET
+        && response.status().is_success()
+        && let Err(response) = admit_web_playback_request(headers, service, &session).await
+    {
+        return response;
+    }
+    response
 }
 
 fn is_emby_generation_init_asset(asset: &str) -> bool {

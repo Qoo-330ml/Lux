@@ -13080,14 +13080,16 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] PlaybackInfo 创建 HLS 会话后无准入记录；HEAD manifest 不占位，实际 GET manifest 才原子占位。
-- [ ] 后续 HLS 初始化文件/分片 GET 与重复请求复用同一名额；额度满时拒绝另一条已签发 HLS 会话并清理该会话，已有会话仍可继续读取。
-- [ ] STOPPED 回调释放对应 HLS 准入记录；拒绝或 HEAD 不创建准入记录。
-- [ ] Emby HLS 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
+- [x] PlaybackInfo 创建 HLS 会话后无准入记录；HEAD manifest 不占位，实际 GET manifest 才原子占位。
+- [x] 后续 HLS 初始化文件/分片 GET 与重复请求复用同一名额；额度满时拒绝另一条已签发 HLS 会话并清理该会话，已有会话仍可继续读取。
+- [x] STOPPED 回调释放对应 HLS 准入记录；拒绝或 HEAD 不创建准入记录。
+- [x] Emby HLS 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
 
-验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback emby_playback_info_negotiates_server_transcoding_and_cleans_hls`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback` 通过（4/4）；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 前确认 Toshiba 已挂载。
 
 依赖：LUX-619、LUX-622。
+
+结果（2026-10-19）：PlaybackInfo 创建 HLS 会话、HEAD manifest 均不占位；首次成功 manifest GET 占用一席，初始化文件/媒体分片共用并续租同一会话。并发上限 1 时，另一条已签发链接的 GET 返回 429，停止该 HLS 会话并删除其资源；已获准分片仍可读取。STOPPED 释放会话占位。未部署。
 
 ## 29. 参考资料
 
