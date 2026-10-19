@@ -22,7 +22,7 @@ async fn user_activity_events_migration_runs_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 195);
+    assert_eq!(database.schema_version().await?, 196);
 
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master
@@ -101,7 +101,7 @@ async fn user_device_inventory_migration_runs_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 195);
+    assert_eq!(database.schema_version().await?, 196);
 
     let session_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('web_sessions') WHERE name = 'device_id'",
@@ -188,6 +188,167 @@ async fn user_device_inventory_migration_runs_from_an_empty_database()
         include_str!("../migrations-postgres/0195_web_session_device_id.sql")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_access_blacklist_rules_migration_runs_from_empty_and_existing_databases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 196);
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_access_blacklist_rules')
+         WHERE name IN (
+             'id', 'user_id', 'rule_type', 'match_value', 'is_enabled',
+             'created_by', 'created_at', 'updated_at'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 8);
+    for index_name in [
+        "idx_user_access_blacklist_global_active",
+        "idx_user_access_blacklist_user_active",
+        "uq_user_access_blacklist_global_value",
+        "uq_user_access_blacklist_user_value",
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .bind(index_name)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(count, 1, "missing index {index_name}");
+    }
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_access_blacklist_rules')
+         WHERE \"table\" = 'users'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(foreign_keys, 2);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('blacklist-owner', 'blacklist-owner', 'Blacklist Owner', 'test-hash'),
+                ('blacklist-admin', 'blacklist-admin', 'Blacklist Admin', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, created_by
+         ) VALUES ('user-device-rule', 'blacklist-owner', 'DEVICE', 'blocked-device', 'blacklist-admin'),
+                  ('global-client-rule', NULL, 'CLIENT', 'infuse', 'blacklist-admin'),
+                  ('global-ip-rule', NULL, 'IP_CIDR', '192.0.2.0/24', 'blacklist-admin')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+             id, rule_type, match_value, created_by
+         ) VALUES ('duplicate-global-rule', 'CLIENT', 'infuse', 'blacklist-admin')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+             id, rule_type, match_value, created_by
+         ) VALUES ('invalid-kind-rule', 'OPERATING_SYSTEM', 'macos', 'blacklist-admin')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'blacklist-owner'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'blacklist-admin'")
+        .execute(database.pool())
+        .await?;
+    let (user_scoped_rules, global_rules, attributed_rules): (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             SUM(CASE WHEN user_id IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN user_id IS NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN created_by IS NOT NULL THEN 1 ELSE 0 END)
+         FROM user_access_blacklist_rules",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(user_scoped_rules, 0);
+    assert_eq!(global_rules, 2);
+    assert_eq!(attributed_rules, 0);
+
+    let migration_dir = temp_dir.path().join("migrations-v195");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid migration filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 195 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let legacy_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp_dir.path().join("upgrade-v195.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    Migrator::new(migration_dir.clone())
+        .await?
+        .run(&legacy_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-owner', 'legacy-owner', 'Legacy Owner', 'test-hash')",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('legacy-owner', 'legacy-device', 'Lux Web', 10, 20)",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0196_user_access_blacklist_rules.sql"),
+        migration_dir.join("0196_user_access_blacklist_rules.sql"),
+    )?;
+    Migrator::new(migration_dir)
+        .await?
+        .run(&legacy_pool)
+        .await?;
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&legacy_pool)
+        .await?;
+    let preserved_devices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_devices WHERE user_id = 'legacy-owner' AND device_id = 'legacy-device'",
+    )
+    .fetch_one(&legacy_pool)
+    .await?;
+    assert_eq!(version, 196);
+    assert_eq!(preserved_devices, 1);
     Ok(())
 }
 

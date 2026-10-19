@@ -297,7 +297,7 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
     };
     let (connection, database_name) = create_postgres_test_database().await?;
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 195);
+    assert_eq!(database.schema_version().await?, 196);
 
     let session_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
@@ -367,6 +367,137 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
     assert_eq!(cascaded_devices, 0);
 
     drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_access_blacklist_rules_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    assert_eq!(database.schema_version().await?, 196);
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_access_blacklist_rules'
+           AND column_name IN (
+               'id', 'user_id', 'rule_type', 'match_value', 'is_enabled',
+               'created_by', 'created_at', 'updated_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 8);
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname IN (
+               'idx_user_access_blacklist_global_active',
+               'idx_user_access_blacklist_user_active',
+               'uq_user_access_blacklist_global_value',
+               'uq_user_access_blacklist_user_value'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 4);
+    let (target_delete_action, creator_delete_action): (String, String) = sqlx::query_as(
+        "SELECT
+             (SELECT confdeltype::TEXT FROM pg_constraint
+              WHERE conrelid = 'user_access_blacklist_rules'::regclass
+                AND conname = 'user_access_blacklist_rules_user_id_fkey'),
+             (SELECT confdeltype::TEXT FROM pg_constraint
+              WHERE conrelid = 'user_access_blacklist_rules'::regclass
+                AND conname = 'user_access_blacklist_rules_created_by_fkey')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target_delete_action, "c");
+    assert_eq!(creator_delete_action, "n");
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_access_blacklist_rules_migration_upgrades_v195_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let migration_dir = temp_dir.path().join("migrations-v195");
+    fs::create_dir(&migration_dir)?;
+    let source_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version = filename
+            .to_str()
+            .and_then(|name| name.split_once('_'))
+            .ok_or("invalid migration filename")?
+            .0
+            .parse::<i64>()?;
+        if version <= 195 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let old_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(old_version, 195);
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-blacklist-owner', 'legacy-blacklist-owner', 'Legacy Owner', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('legacy-blacklist-owner', 'legacy-device', 'Lux Web', 10, 20)",
+    )
+    .execute(&pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0196_user_access_blacklist_rules.sql"),
+        migration_dir.join("0196_user_access_blacklist_rules.sql"),
+    )?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let new_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    let preserved_devices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_devices
+         WHERE user_id = 'legacy-blacklist-owner' AND device_id = 'legacy-device'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(new_version, 196);
+    assert_eq!(preserved_devices, 1);
+
+    pool.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
@@ -550,7 +681,7 @@ async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(device_id, None);
-    assert_eq!(database.schema_version().await?, 195);
+    assert_eq!(database.schema_version().await?, 196);
 
     drop(database);
     drop_postgres_test_database(&database_name).await?;

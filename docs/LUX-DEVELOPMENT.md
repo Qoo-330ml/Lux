@@ -15778,6 +15778,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：SQLite storage 回归 1/1、`tests/users` 20/20、真实 PostgreSQL 设备登录状态 API 集成 1/1、设备 UI/API client 用例 84/84、`pnpm --dir web build`、`cargo build --locked`、fmt 检查、放行已记录 Clippy 诊断后的全 targets Clippy 与 `git diff --check` 通过。完整 Web 测试仍有 4 个既有失败（首页库预取 1 项、媒体库卡片 2 项、详情轮询 1 项；745 项通过），不在本任务改动路径。窄屏表格横向滚动由设备列表容器承载，页面宽度保持不变。
 
+#### LUX-754：建立用户设备与客户端黑名单规则表
+
+范围：为模块七的全站与用户级设备、客户端、IP/CIDR 黑名单建立 SQLite/PostgreSQL schema。每条规则保存可选目标用户、规则类型、规范化匹配值、启用状态、创建者及时间；全站规则以空 `user_id` 表示，目标用户删除时清除其用户级规则，创建者删除时保留规则并清空创建者引用。本任务只增加迁移与 schema 验收，不开放 API、不解析 CIDR、不执行授权拒绝，也不改变现有认证行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0196_user_access_blacklist_rules.sql`、`migrations-postgres/0196_user_access_blacklist_rules.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 迁移建立受约束的全站/用户级 `DEVICE`、`CLIENT`、`IP_CIDR` 规则表和有界匹配索引。
+- [x] 空库启动与从 0195 升级成功；删除目标用户级联删除规则，删除创建者保留规则并清空创建者字段。
+- [x] SQLite schema 约束回归与本机 PostgreSQL 空库迁移回归通过；本任务不引入规则执行行为。
+
+短计划：先给 SQLite/PostgreSQL migration 回归增加版本、列、约束、唯一索引和外键断言并确认新迁移缺失；再加入双库迁移；最后运行 storage 定向测试、PostgreSQL 迁移测试、Rust build、fmt 与 diff check。
+
+结果（2026-10-20）：SQLite 与 PostgreSQL 新增 0196 用户访问黑名单规则迁移，支持全站与用户范围的 `DEVICE`、`CLIENT`、`IP_CIDR` 类型，包含规范化值唯一约束、启用规则匹配索引、目标用户级联删除和创建者置空关系。迁移仅建立 schema，没有接入请求授权。
+
+验证：SQLite 空库 schema/约束与从 0195 升级保留现有设备回归 1/1；PostgreSQL 空库迁移和从 0195 升级保留设备回归分别 1/1 通过。新增列、索引与外键删除动作通过检查；未新增依赖或修改认证行为。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
