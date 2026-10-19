@@ -24303,6 +24303,34 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
 }
 
 #[tokio::test]
+async fn trusted_proxy_cidrs_setting_reads_and_replaces_raw_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    assert_eq!(database.trusted_proxy_cidrs_json().await?, None);
+    database
+        .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+        .await?;
+    assert_eq!(
+        database.trusted_proxy_cidrs_json().await?.as_deref(),
+        Some("[\"10.0.0.0/8\"]")
+    );
+    database
+        .set_trusted_proxy_cidrs_json("[\"192.0.2.0/24\",\"2001:db8::/32\"]")
+        .await?;
+    assert_eq!(
+        database.trusted_proxy_cidrs_json().await?.as_deref(),
+        Some("[\"192.0.2.0/24\",\"2001:db8::/32\"]")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_emby_login_session_page_is_bounded_and_excludes_revoked_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

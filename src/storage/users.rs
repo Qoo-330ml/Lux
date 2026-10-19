@@ -3079,6 +3079,41 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)] // LUX-763 exposes and validates this setting through the admin API.
+    pub(crate) async fn trusted_proxy_cidrs_json(&self) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'trusted_proxy_cidrs'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-763 exposes and validates this setting through the admin API.
+    pub(crate) async fn set_trusted_proxy_cidrs_json(
+        &self,
+        value: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('trusted_proxy_cidrs', ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
     pub(crate) async fn new_user_permissions_json(&self) -> Result<Option<String>, StorageError> {
         self.query_scalar(
             "SELECT value FROM server_settings

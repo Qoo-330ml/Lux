@@ -15927,6 +15927,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因解析函数及错误类型缺失而编译失败；实现后 `cargo test --locked --lib application::user_access_rules::tests` 9/9 通过。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
 
+#### LUX-762：存储全局可信代理 CIDR 列表
+
+范围：在现有 `server_settings` 键值表中增加可信代理 CIDR JSON 的读取与原子 upsert 合同，不新增 schema migration。存储层保留 JSON 原文并不解释地址；解析、规范化与上限校验由应用层负责。补充 SQLite 存储回归，不接设置 API、HTTP peer 或 ACL。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空库读取返回未配置；写入后能准确读回相同 JSON；后续写入覆盖旧值。
+- [x] 仍使用 server settings 参数化 upsert；错误通过既有 `StorageError` 返回。
+- [x] SQLite 存储定向测试、Rust build、fmt 与 diff check 通过；请求与授权行为不变。
+
+短计划：先增加 server-settings 回归并确认数据库接口缺失；再新增原文 JSON 的 getter/upsert；最后运行存储单测、build、fmt 与 diff check。
+
+结果（2026-10-20）：`server_settings` 新增 `trusted_proxy_cidrs` 的原文 JSON 查询和参数化 upsert，不增加迁移；空值保持 `None`，后续设置覆盖原值。存储层不解释或信任 CIDR 内容。
+
+验证：TDD RED 因读写方法缺失而编译失败；实现后 `trusted_proxy_cidrs_setting_reads_and_replaces_raw_json` 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
