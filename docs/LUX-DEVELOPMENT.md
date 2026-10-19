@@ -13159,18 +13159,18 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] SQLite 与 PostgreSQL 都提供仅允许 `ALL`、`SELECTED`、`NONE` 的非空字段，空库完整启动可应用迁移（SQLite 已运行验证；PostgreSQL 环境不可用，待补运行验证）。
+- [x] SQLite 与 PostgreSQL 都提供仅允许 `ALL`、`SELECTED`、`NONE` 的非空字段，空库完整启动可应用迁移。
 - [x] 旧用户无正向授权记录（包括只有 `can_view=0` 的历史记录）迁移为 `ALL`；存在正向记录迁移为 `SELECTED`。
 - [x] 新迁移保留既有媒体库授权表记录，且不改动任何读取行为。
 - [x] SQLite 迁移回归、格式检查和 `git diff --check` 通过；受影响的 schema 版本接口/存储目标定向回归通过。
 
 短计划：在主规格与方案中确认旧/新模式语义，先写旧 SQLite 授权数据迁移回归，再补 SQLite/PostgreSQL migration；更新空库启动、PostgreSQL 启动与既有最新 schema 版本断言；不改 ACL 查询和 API。
 
-验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_mode_migration_preserves_legacy_semantics`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_library_access_mode_migration_runs_from_an_empty_database -- --exact`、受影响的 `admin_health` / `ready_version` / `scanner` / `scanning_jobs` / `danmaku` 定向用例、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database --no-run`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。PostgreSQL migration 另做静态审阅；运行时验证在 PostgreSQL 可用时补充。
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_mode_migration_preserves_legacy_semantics`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_library_access_mode_migration_runs_from_an_empty_database -- --exact`、受影响的 `admin_health` / `ready_version` / `scanner` / `scanning_jobs` / `danmaku` 定向用例、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database --no-run`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_bootstrap_runs_migrations_and_persists_core_state -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_user_library_access_mode_migration_preserves_legacy_semantics -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
 
 依赖：LUX-593、LUX-626。
 
-结果（2026-10-19）：新增 SQLite 旧授权回填和空库启动回归；SQLite 对无授权/仅拒绝/正向授权账号分别回填 `ALL` / `ALL` / `SELECTED`，保留授权行并拒绝非法模式。SQLite 新库非空字段及 `ALL` 默认值验证通过；PostgreSQL bootstrap 断言已更新为 187 并可编译，但本机 `127.0.0.1:55432` 无服务，未完成 PostgreSQL 运行验证。相关 schema 版本断言同步到 187；迁移定向用例与 health/version/scanner/scanning_jobs/danmaku 用例通过，完整 `storage` 目标串行运行 63/63 通过（并行运行时旧 cooldown 时间窗口用例曾波动）。格式与 diff 检查通过；未部署。
+结果（2026-10-19）：SQLite 对无授权/仅拒绝/正向授权账号分别回填 `ALL` / `ALL` / `SELECTED`，保留授权行并拒绝非法模式；PostgreSQL 16 运行时升级回归得到相同回填结果，并验证模式字段非空且拒绝非法值。PostgreSQL 空库完整启动至 schema 188，验证默认 `ALL`。两项 PostgreSQL 专项用例均 1/1；旧 SQLite 回归、受影响 schema 版本接口和存储目标、格式及 diff 检查通过。完整 `storage` 目标串行运行 63/63 通过（并行运行时旧 cooldown 时间窗口用例曾波动）。空库启动测试将初始管理员创建移至其他测试账号之前，避免测试本身提前完成初始化导致 `AlreadyCompleted`。未部署。
 
 #### LUX-628：按显式模式执行媒体库访问检查
 

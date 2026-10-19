@@ -136,6 +136,10 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
     assert_eq!(database.schema_version().await?, 188);
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("postgres-admin", "PostgreSQL Admin", "test-password")
+        .await?;
     sqlx::query(
         "INSERT INTO users (id, username_normalized, display_name, password_hash)
          VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
@@ -584,10 +588,6 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .await?;
     assert_eq!(external_stream_index_count, 0);
 
-    let setup = SetupService::new(database.clone())?;
-    setup
-        .complete("postgres-admin", "PostgreSQL Admin", "test-password")
-        .await?;
     let auth = WebAuthService::new(database.clone())?;
     let login = auth
         .login("postgres-admin", "test-password")
@@ -873,6 +873,116 @@ async fn postgres_account_profile_migration_preserves_existing_accounts()
             duplicate_email.is_err(),
             "email uniqueness must ignore case"
         );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_library_access_mode_migration_preserves_legacy_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let migration_prefix = temp_dir
+        .path()
+        .join("postgres-migrations-before-library-access-mode");
+    fs::create_dir(&migration_prefix)?;
+    for entry in fs::read_dir("migrations-postgres")? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split('_').next())
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if version <= 186 {
+            let file_name = path.file_name().ok_or("migration has no file name")?;
+            fs::copy(&path, migration_prefix.join(file_name))?;
+        }
+    }
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        Migrator::new(migration_prefix.as_path())
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::raw_sql(
+            "INSERT INTO libraries (id, name, kind)
+             VALUES ('access-library', 'Access library', 'MOVIE');
+             INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('legacy-all', 'legacy-all', 'Legacy All', 'hash'),
+                    ('legacy-denials-only', 'legacy-denials-only', 'Legacy Denials', 'hash'),
+                    ('legacy-selected', 'legacy-selected', 'Legacy Selected', 'hash');
+             INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES ('legacy-denials-only', 'access-library', 0),
+                    ('legacy-selected', 'access-library', 1);",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        assert_eq!(database.schema_version().await?, 188);
+        let modes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            modes,
+            [
+                ("legacy-all".to_owned(), "ALL".to_owned()),
+                ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+                ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+            ]
+        );
+        let preserved_grant_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, can_view FROM user_library_access
+             WHERE user_id LIKE 'legacy-%' ORDER BY user_id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            preserved_grant_rows,
+            [
+                ("legacy-denials-only".to_owned(), 0),
+                ("legacy-selected".to_owned(), 1),
+            ]
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE users SET library_access_mode = 'INVALID' WHERE id = 'legacy-all'",
+            )
+            .execute(database.pool())
+            .await
+            .is_err(),
+            "PostgreSQL must reject modes outside the supported values"
+        );
+        assert!(
+            sqlx::query("UPDATE users SET library_access_mode = NULL WHERE id = 'legacy-all'")
+                .execute(database.pool())
+                .await
+                .is_err(),
+            "PostgreSQL mode must remain non-null"
+        );
+        database.close().await;
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
