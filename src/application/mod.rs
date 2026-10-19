@@ -18,8 +18,6 @@ pub mod candidates;
 pub mod catalog;
 pub mod chapter_detector;
 pub mod collections;
-// LUX-685 wires this cached-NFO batch processor into the background lifecycle.
-#[allow(dead_code)]
 pub(crate) mod content_restriction_index;
 pub mod danmaku;
 pub mod database_diagnostics;

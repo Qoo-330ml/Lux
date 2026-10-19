@@ -1,3 +1,7 @@
+use std::{sync::Arc, time::Duration};
+
+use tokio::{sync::watch, task::JoinHandle};
+
 use crate::{
     application::nfo::{LocalNfoDetails, local_nfo_details_from_cache_json},
     domain::content_restrictions::project_content_restriction_index,
@@ -83,11 +87,126 @@ impl ContentRestrictionIndexService {
     }
 }
 
+const CONTENT_RESTRICTION_INDEX_IDLE_RETRY: Duration = Duration::from_secs(10);
+const CONTENT_RESTRICTION_INDEX_ERROR_RETRY: Duration = Duration::from_secs(1);
+const CONTENT_RESTRICTION_INDEX_BATCH_YIELD: Duration = Duration::from_millis(10);
+
+#[derive(Clone)]
+pub(crate) struct ContentRestrictionIndexWorker {
+    shutdown_sender: watch::Sender<bool>,
+    task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl ContentRestrictionIndexWorker {
+    pub(crate) fn start(database: Database) -> Self {
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let task = tokio::spawn(run_content_restriction_index_worker(
+            database,
+            shutdown_receiver,
+        ));
+        Self {
+            shutdown_sender,
+            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.shutdown_sender.send_replace(true);
+        if let Some(task) = self.task.lock().await.take()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "content restriction index worker stopped unexpectedly");
+        }
+    }
+}
+
+async fn run_content_restriction_index_worker(
+    database: Database,
+    mut shutdown_receiver: watch::Receiver<bool>,
+) {
+    let indexer = ContentRestrictionIndexService::new(database);
+    let mut cursor: Option<String> = None;
+    loop {
+        if *shutdown_receiver.borrow() {
+            return;
+        }
+
+        match indexer
+            .index_batch(cursor.as_deref(), CONTENT_RESTRICTION_INDEX_BATCH_LIMIT)
+            .await
+        {
+            Ok(report) if report.candidates > 0 => {
+                if report.invalid_cache > 0 || report.invalid_projection > 0 {
+                    tracing::warn!(
+                        indexed = report.indexed,
+                        invalid_cache = report.invalid_cache,
+                        invalid_projection = report.invalid_projection,
+                        stale_snapshots = report.stale_snapshots,
+                        "content restriction index batch left some items unready"
+                    );
+                } else {
+                    tracing::debug!(
+                        indexed = report.indexed,
+                        stale_snapshots = report.stale_snapshots,
+                        "content restriction index batch completed"
+                    );
+                }
+                cursor = report.last_item_id;
+                if wait_for_content_restriction_index_worker(
+                    &mut shutdown_receiver,
+                    CONTENT_RESTRICTION_INDEX_BATCH_YIELD,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Ok(_) => {
+                cursor = None;
+                if wait_for_content_restriction_index_worker(
+                    &mut shutdown_receiver,
+                    CONTENT_RESTRICTION_INDEX_IDLE_RETRY,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "content restriction indexing failed; will retry");
+                if wait_for_content_restriction_index_worker(
+                    &mut shutdown_receiver,
+                    CONTENT_RESTRICTION_INDEX_ERROR_RETRY,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_content_restriction_index_worker(
+    shutdown_receiver: &mut watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => *shutdown_receiver.borrow(),
+        changed = shutdown_receiver.changed() => {
+            changed.is_err() || *shutdown_receiver.borrow()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         application::{
-            content_restriction_index::ContentRestrictionIndexService, libraries::LibraryService,
+            content_restriction_index::{
+                ContentRestrictionIndexService, ContentRestrictionIndexWorker,
+            },
+            libraries::LibraryService,
         },
         config::Config,
         library::LibraryKind,
@@ -209,6 +328,53 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(invalid_ready, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_worker_indexes_cached_metadata_and_shuts_down()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Content Index Worker", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 nfo_metadata_json
+             ) VALUES (?, ?, 'MOVIE', 'Worker Item', 'worker item', 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind("index-worker-item")
+        .bind(library.id.to_string())
+        .bind(r#"{"certification":"PG","genres":["Family"]}"#)
+        .execute(database.pool())
+        .await?;
+
+        let worker = ContentRestrictionIndexWorker::start(database.clone());
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let indexed: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM media_content_restriction_index
+                     WHERE item_id = 'index-worker-item' AND certification_code = 'PG'",
+                )
+                .fetch_one(database.pool())
+                .await?;
+                if indexed == 1 {
+                    break Ok::<i64, sqlx::Error>(indexed);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        worker.shutdown().await;
+        assert_eq!(result??, 1);
         Ok(())
     }
 }

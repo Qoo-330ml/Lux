@@ -60,6 +60,7 @@ use crate::{
         },
         chapter_detector::{ChapterDetectionError, ChapterDetectionService},
         collections::{CollectionError, CollectionService, GlobalCollectionSyncWorker},
+        content_restriction_index::ContentRestrictionIndexWorker,
         database_diagnostics::DatabaseDiagnosticsService,
         directory_browser::{DirectoryBrowserError, list_directories},
         emby_migration_service::{
@@ -191,6 +192,7 @@ pub struct AppState {
     scraper: Option<ScraperProvider>,
     collections: Option<CollectionService>,
     global_collection_sync_worker: Option<GlobalCollectionSyncWorker>,
+    content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
@@ -212,6 +214,9 @@ impl AppState {
     }
 
     pub async fn shutdown_background_workers_checked(&self) -> Result<(), String> {
+        if let Some(worker) = &self.content_restriction_index_worker {
+            worker.shutdown().await;
+        }
         crate::application::probe::shutdown_probe_runtime()
             .await
             .map_err(|error| error.to_string())?;
@@ -452,6 +457,7 @@ impl AppState {
             scraper: Some(scraper),
             collections,
             global_collection_sync_worker,
+            content_restriction_index_worker: None,
             people: Some(people),
             local_nfo: Some(local_nfo),
             user_avatars,
@@ -619,6 +625,16 @@ impl AppState {
             && let Err(error) = scan_jobs.start_local_metadata_outbox_worker().await
         {
             tracing::error!(%error, "failed to start the local metadata outbox worker");
+        }
+    }
+
+    pub fn start_content_restriction_index_worker(&mut self) {
+        if self.database_selection_required || self.content_restriction_index_worker.is_some() {
+            return;
+        }
+        if let Some(database) = &self.database {
+            self.content_restriction_index_worker =
+                Some(ContentRestrictionIndexWorker::start(database.clone()));
         }
     }
 

@@ -14330,6 +14330,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：application 批处理器逐条消费缓存 NFO JSON，通过领域投影和 LUX-683 快照 CAS 写入；缓存不存在会登记为未分级就绪，坏 JSON/超界标签保留未就绪但游标仍向后推进。SQLite application 回归 1/1、SQLite/PostgreSQL 存储游标回归各 1/1、build、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。处理器还未由后台生命周期启动，准备在 LUX-685 接入。
 
+#### LUX-685：启动内容分类索引后台 worker
+
+范围：在 database selection 完成后启动内容索引后台 worker，并纳入 AppState 优雅关闭。worker 用 LUX-684 的 ID 游标分批处理现有及后续 NFO 变化，只访问缓存，不从媒体路径读取 NFO；每批不超过 100 项，错误重试，坏缓存/非法投影不就绪但不阻塞之后条目。日志只记录批次数量与错误，不写 NFO 文本。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/content_restriction_index.rs`、`src/application/mod.rs`、`src/api/legacy.rs`、`src/main.rs`。
+
+验收标准：
+
+- [x] worker 在数据库选择状态确认后启动，不在 database-selection 阻塞模式运行；重复启动不会生成重复 worker。
+- [x] 现有缓存与后来失效的索引都会被有界回填；坏项不饿死后续批次，无候选时退避等待。
+- [x] AppState shutdown 会停止并等待 worker；后台日志不含 NFO 内容或外部路径。
+- [x] SQLite worker 启动/处理/关闭回归、build、fmt 与 diff check 通过。
+
+短计划：先增加 worker 启动和处理的 SQLite 回归并确认 worker 不存在；再实现可退避的游标循环、AppState 持有与 shutdown、main 启动接线；最后运行定向测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::content_restriction_index::tests::background_worker_indexes_cached_metadata_and_shuts_down -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-684。
+
+结果（2026-10-19）：内容分类索引 worker 现在由主进程在数据库选择完成后启动，并由 AppState 持有、重复调用不重复创建，关闭时等待其退出。worker 每批最多 100 项，沿 ID 游标继续处理，坏 JSON/非法标签只记录汇总且不就绪，无候选时 10 秒退避，数据库错误 1 秒后重试。SQLite worker 处理及关闭回归 1/1、build、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过；不读取磁盘 NFO。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
