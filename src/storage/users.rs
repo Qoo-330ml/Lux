@@ -2170,6 +2170,56 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn user_permission_presets_json(
+        &self,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'user_permission_presets'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn compare_and_set_user_permission_presets_json(
+        &self,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, StorageError> {
+        let result = if let Some(expected) = expected {
+            self.query(
+                "UPDATE server_settings
+                 SET value = ?, updated_at = unixepoch()
+                 WHERE key = 'user_permission_presets' AND value = ?",
+            )
+            .bind(value)
+            .bind(expected)
+            .execute(&self.pool)
+            .await
+        } else {
+            self.query(
+                "INSERT INTO server_settings (key, value)
+                 VALUES ('user_permission_presets', ?)
+                 ON CONFLICT(key) DO NOTHING",
+            )
+            .bind(value)
+            .execute(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn are_enabled_regular_libraries(
         &self,
         library_ids: &[String],

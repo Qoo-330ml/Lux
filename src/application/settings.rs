@@ -129,7 +129,7 @@ impl Default for NewUserPermissions {
 }
 
 impl NewUserPermissions {
-    fn has_valid_shape(&self) -> bool {
+    pub(crate) fn has_valid_shape(&self) -> bool {
         self.max_simultaneous_playbacks >= 0
             && self.library_ids.len() <= 100
             && match self.library_access_mode.as_str() {
@@ -143,7 +143,7 @@ impl NewUserPermissions {
             }
     }
 
-    fn normalize_empty_selection(&mut self) {
+    pub(crate) fn normalize_empty_selection(&mut self) {
         if self.library_access_mode == "SELECTED" && self.library_ids.is_empty() {
             self.library_access_mode = "NONE".to_owned();
         }

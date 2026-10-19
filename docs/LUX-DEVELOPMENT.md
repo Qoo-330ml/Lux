@@ -13399,6 +13399,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：Emby `/Users/New` 管理员创建账号时读取同一份默认权限快照并原子保存，设置读取失败返回 503 且无账号残留；既有 `UserPolicy` / `UserConfiguration` 集成回归保持通过。Emby 定向测试 9/9、Rust build、fmt check、diff check 通过。同步 `docs/API.md`，说明默认快照在 Lux/Emby 管理员建号中的应用及复制选项的覆盖顺序。全量 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
 
+#### LUX-639：实现权限预设的版本化存储与业务校验
+
+范围：建立管理员、普通用户内置预设及自定义预设的数据模型，在现有 `server_settings` 中保存自定义权限快照；支持创建、更新、删除的业务操作、版本冲突检测和输入校验。本任务不暴露 HTTP 接口或管理页面，不把预设自动应用到已有用户。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/settings.rs`、`src/application/user_presets.rs`、`src/storage/users.rs`。
+
+验收标准：
+
+- [x] 列表包含管理员和普通用户内置预设；内置预设不能修改或删除。
+- [x] 自定义预设支持创建、版本检查更新和删除，名称唯一且数量有上限。
+- [x] 媒体库模式、下载、播放、并发与转码策略按新用户默认权限规则验证；空选择归一化为无权限。
+- [x] 并发管理更新使用存储层比较并交换，冲突不会丢失另一份已保存预设。
+- [x] 业务/存储定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先写内置预设、校验、版本冲突和存储并发回归；再实现自定义预设 JSON 持久化 CAS 与 application CRUD 服务。
+
+验证：`cargo test --locked --lib user_presets`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-633、LUX-636。
+
+结果（2026-10-19）：新增管理员/普通用户内置预设、自定义预设版本化 CRUD，权限字段复用新用户默认权限的结构校验；空的 `SELECTED` 归一化为 `NONE`，指定媒体库须仍为启用的普通媒体库。`server_settings` 使用单条 SQL 比较并交换，自定义名称不区分大小写且最多 100 项。定向 `user_presets` 5/5、`cargo build --locked`、fmt check、diff check 通过。`cargo test --locked --all-targets` 的库测试部分为 991 passed、4 failed、25 ignored；3 项补全队列基线失败重现，另有 `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 超时，因库测试失败后续集成 targets 未运行。全量 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。预设 HTTP API 和 UI 留待后续模块四任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
