@@ -13823,6 +13823,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：增加只读有效 Web 会话页查询及总数读取，SQL 按更新时间和 ID 倒序分页，存储层将页大小限制在 1–100 并将负偏移归零；当前会话通过 token 摘要比较标记。回归覆盖 101 条会话的分页/硬上限，以及已撤销和已过期记录过滤，`admin_web_session_page` 1/1、fmt check 与 diff check 通过。管理员 HTTP 路由及撤销留给 LUX-660。
 
+#### LUX-660：开放管理员分页读取用户 Web 会话 API
+
+范围：新增 `GET /api/v1/admin/users/{user_id}/sessions`，返回有效 Web 会话摘要、页码、页大小和总数。要求管理员权限，页大小默认 50 且最大 100；当前会话只通过比较现有 token 摘要标记。接口不返回 Cookie、session token 或 CSRF token，不提供撤销操作。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/auth/sessions.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可读取指定用户的分页活动 Web 会话；未认证和非管理员不能访问。
+- [x] 响应只公开会话 ID、时间字段与当前会话标记，不包含任何登录凭证；非法用户 ID 返回 400。
+- [x] `users` 集成 target、API 文档、Rust 格式和 diff check 通过。
+
+短计划：先补管理员权限、分页、当前会话标记和敏感字段排除的 API 回归并确认端点未开放；再复用 LUX-659 存储页接入服务与路由并记录公开合同。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_list_user_web_sessions_without_exposing_tokens -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：管理员分页会话接口接入 LUX-659 查询，返回摘要、当前页及总数；未认证/普通用户访问拒绝，非法用户 ID 返回 400，页大小上限 100，当前会话仅比较 token 摘要且响应不含 Cookie 或凭证。`admin_can_list_user_web_sessions_without_exposing_tokens` 1/1、fmt check 与 diff check 通过，API 合同已写入 `docs/API.md`。撤销和管理页面留待后续任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

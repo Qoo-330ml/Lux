@@ -49,6 +49,13 @@ struct ApplyUserPermissionPresetRequest {
     preset_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdminUserSessionsQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
 async fn admin_list_user_permission_presets(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -204,6 +211,75 @@ async fn admin_apply_user_permission_preset(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => user_permission_preset_application_error(&headers, error),
+    }
+}
+
+async fn admin_list_user_sessions(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    let Some(auth) = state.auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = i64::from(query.page_size.unwrap_or(50).clamp(1, 100));
+    let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
+    let current_session_token = request_cookie(&headers, "lux_session");
+    match auth
+        .list_user_sessions_for_admin(
+            &user_id,
+            current_session_token.as_deref(),
+            page_size,
+            offset,
+        )
+        .await
+    {
+        Ok((sessions, total_count)) => Json(json!({
+            "sessions": sessions.iter().map(|session| json!({
+                "id": session.id,
+                "createdAt": session.created_at,
+                "updatedAt": session.updated_at,
+                "expiresAt": session.expires_at,
+                "lastSeenAt": session.last_seen_at,
+                "isCurrent": session.is_current,
+            })).collect::<Vec<_>>(),
+            "page": page,
+            "pageSize": page_size,
+            "totalCount": total_count,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -1335,6 +1411,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/profile",
             patch(admin_update_user_profile),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/sessions",
+            get(admin_list_user_sessions),
         )
         .route(
             "/api/v1/admin/users/{user_id}/permission-preset",

@@ -1444,3 +1444,152 @@ async fn admin_user_profile_api_normalizes_email_and_preserves_verification_stat
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_list_user_web_sessions_without_exposing_tokens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/sessions",
+            admin.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "username": "session-target",
+            "password": "target password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let target_id = created.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing target user id")?
+        .to_owned();
+    let first_target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "session-target", "password": "target password" }))
+        .send()
+        .await?;
+    let _second_target_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "session-target", "password": "target password" }))
+        .send()
+        .await?;
+    let target_cookie = cookie_pair(first_target_login.headers());
+
+    let denied = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions"
+        ))
+        .header(COOKIE, &target_cookie)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let first_page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions?page=1&pageSize=1"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(first_page.status(), reqwest::StatusCode::OK);
+    let first_body = first_page.json::<Value>().await?;
+    assert_eq!(first_body["page"], 1);
+    assert_eq!(first_body["pageSize"], 1);
+    assert_eq!(first_body["totalCount"], 2);
+    assert_eq!(first_body["sessions"].as_array().map(Vec::len), Some(1));
+    let first_id = first_body["sessions"][0]["id"]
+        .as_str()
+        .ok_or("missing first id")?;
+    assert!(first_body["sessions"][0]["createdAt"].as_i64().is_some());
+    assert!(first_body["sessions"][0].get("sessionToken").is_none());
+    assert!(first_body["sessions"][0].get("csrfToken").is_none());
+
+    let second_page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions?page=2&pageSize=1"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(second_page.status(), reqwest::StatusCode::OK);
+    let second_body = second_page.json::<Value>().await?;
+    assert_eq!(second_body["totalCount"], 2);
+    assert_ne!(
+        first_id,
+        second_body["sessions"][0]["id"]
+            .as_str()
+            .unwrap_or_default()
+    );
+
+    let capped_page = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{target_id}/sessions?page=1&pageSize=500"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(capped_page.status(), reqwest::StatusCode::OK);
+    let capped_body = capped_page.json::<Value>().await?;
+    assert_eq!(capped_body["pageSize"], 100);
+    assert_eq!(capped_body["sessions"].as_array().map(Vec::len), Some(2));
+
+    let admin_sessions = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/sessions",
+            admin.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(admin_sessions.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        admin_sessions.json::<Value>().await?["sessions"][0]["isCurrent"],
+        true
+    );
+
+    let invalid_id = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/not-a-user-id/sessions"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_id.status(), reqwest::StatusCode::BAD_REQUEST);
+    server.abort();
+    Ok(())
+}

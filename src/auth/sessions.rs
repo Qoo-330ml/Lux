@@ -132,6 +132,34 @@ impl WebAuthService {
             .collect())
     }
 
+    pub async fn list_user_sessions_for_admin(
+        &self,
+        user_id: &str,
+        current_session_token: Option<&str>,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<WebSessionSummary>, i64), WebAuthError> {
+        let current_token_hash = current_session_token.map(hash_token).unwrap_or_default();
+        let (sessions, total_count) = self
+            .database
+            .list_web_session_summaries_page(user_id, &current_token_hash, page_size, offset)
+            .await?;
+        Ok((
+            sessions
+                .into_iter()
+                .map(|session| WebSessionSummary {
+                    id: session.id,
+                    created_at: session.created_at,
+                    updated_at: session.updated_at,
+                    expires_at: session.expires_at,
+                    last_seen_at: session.last_seen_at,
+                    is_current: session.is_current,
+                })
+                .collect(),
+            total_count,
+        ))
+    }
+
     pub async fn revoke_session(
         &self,
         user_id: &UserId,
