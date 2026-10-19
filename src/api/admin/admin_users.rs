@@ -97,6 +97,18 @@ struct AdminUserSessionsQuery {
     page_size: Option<u32>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AdminUserActivityQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    event_type: Option<String>,
+    #[serde(rename = "from")]
+    from_at: Option<i64>,
+    #[serde(rename = "to")]
+    to_at: Option<i64>,
+}
+
 async fn admin_list_user_permission_presets(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -883,6 +895,120 @@ async fn admin_list_user_emby_login_sessions(
                 "updatedAt": session.updated_at,
                 "lastSeenAt": session.last_seen_at,
             })).collect::<Vec<_>>(),
+            "page": page,
+            "pageSize": page_size,
+            "totalCount": total_count,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_list_user_activity(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminUserActivityQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let user_id = user_id.to_string();
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.find_user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+
+    let event_type = match query.event_type.as_deref() {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty()
+                || value.chars().count() > 128
+                || value.chars().any(char::is_control)
+            {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "用户活动查询参数无效",
+                )
+                .into_response();
+            }
+            Some(value.to_owned())
+        }
+        None => None,
+    };
+    if query.from_at.is_some_and(|value| value < 0)
+        || query.to_at.is_some_and(|value| value < 0)
+        || query
+            .from_at
+            .zip(query.to_at)
+            .is_some_and(|(from, to)| from > to)
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户活动查询参数无效",
+        )
+        .into_response();
+    }
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    match database
+        .list_user_activity_events(crate::storage::UserActivityEventQuery {
+            user_id: &user_id,
+            event_type: event_type.as_deref(),
+            from_at: query.from_at,
+            to_at: query.to_at,
+            offset,
+            limit: page_size,
+        })
+        .await
+    {
+        Ok((events, total_count)) => Json(json!({
+            "events": events.into_iter().map(|event| {
+                let metadata = serde_json::from_str(&event.metadata_json)
+                    .map(crate::observability::logs::redact_sensitive_log_values)
+                    .unwrap_or_else(|_| json!({ "invalid": true }));
+                let metadata = match metadata {
+                    Value::Object(object) => Value::Object(object),
+                    value => json!({ "value": value }),
+                };
+                json!({
+                    "id": event.id,
+                    "userId": event.user_id,
+                    "actorUserId": event.actor_user_id,
+                    "eventType": event.event_type,
+                    "targetType": event.target_type,
+                    "targetId": event.target_id,
+                    "metadata": metadata,
+                    "occurredAt": event.occurred_at,
+                })
+            }).collect::<Vec<_>>(),
             "page": page,
             "pageSize": page_size,
             "totalCount": total_count,
@@ -2318,6 +2444,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/users/{user_id}/emby-sessions",
             get(admin_list_user_emby_login_sessions)
                 .delete(admin_revoke_all_user_emby_login_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/activity",
+            get(admin_list_user_activity),
         )
         .route(
             "/api/v1/admin/users/{user_id}/emby-sessions/{session_id}",

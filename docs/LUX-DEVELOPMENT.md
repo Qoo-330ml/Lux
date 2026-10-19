@@ -15151,6 +15151,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-721。
 
+#### LUX-723：开放管理员用户活动分页 API
+
+范围：新增只读 `GET /api/v1/admin/users/{userId}/activity`，从 LUX-722 的用户范围存储查询返回脱敏活动时间线。查询参数为 `page`、`pageSize`、`eventType`、`from`、`to`；页码缺省 1 且最小为 1，页大小缺省 20 并限制为 1–100，时间以包含端点的 Unix 秒表示。响应为 `{ events, page, pageSize, totalCount }`；活动项包含 `id`、`userId`、`actorUserId`、`eventType`、目标引用、已脱敏 `metadata` 和 `occurredAt`。仅管理员可读；无效用户 ID、负时间、反向时间范围、空/超长事件类型返回结构化 400；用户不存在返回 404。不得返回原始未脱敏 JSON。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 接口认证管理员、校验用户 ID/存在性及查询边界；非管理员不能读取。
+- [x] 响应与存储总数、稳定分页一致，元数据为已脱敏 JSON 对象。
+- [x] 回归覆盖用户隔离、时间端点、类型筛选、跨页排序、非法参数、缺失用户和未授权请求。
+- [x] 更新 API 文档；`users` 定向集成回归、build、fmt 和 diff check 通过。
+
+短计划：先写 API 登录后读取及过滤分页集成回归并确认路由缺失而失败；再接入 LUX-722 存储查询和结构化错误映射；最后更新 API 文档并运行定向用户测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增管理员只读用户活动时间线 API，认证检查后校验用户 ID、账号存在状态、Unix 秒区间和事件类型；默认页为 1、每页 20，服务端限制页大小 1–100。响应提供活动/操作者、目标、发生时间及经过再次脱敏的 JSON 元数据；未知或损坏元数据不会以原文返回。已同步 `docs/API.md`。
+
+验证：TDD RED 在登录后的有效管理员请求上确认新路由返回 404；最终 `admin_can_filter_and_page_user_activity_events` 1/1，覆盖管理员分页、用户隔离、含端点时间过滤、类型筛选、同时间跨页排序、普通用户 403、匿名 401、无效用户/时间范围/事件类型 400、缺失用户 404。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+依赖：LUX-722、LUX-660。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

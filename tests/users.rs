@@ -83,6 +83,252 @@ async fn successful_login_is_written_to_the_user_activity_index()
 }
 
 #[tokio::test]
+async fn admin_can_filter_and_page_user_activity_events() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("activity-admin", "Activity Admin", "correct password")
+        .await?;
+    let admin_id = admin.id.to_string();
+    for (id, user_id, actor_user_id, event_type, occurred_at) in [
+        (
+            "timeline-login-100",
+            admin_id.as_str(),
+            Some(admin_id.as_str()),
+            "AUTH_LOGIN",
+            100_i64,
+        ),
+        (
+            "timeline-pause-200",
+            admin_id.as_str(),
+            Some(admin_id.as_str()),
+            "PLAYBACK_PAUSED",
+            200,
+        ),
+        (
+            "timeline-start-200",
+            admin_id.as_str(),
+            Some(admin_id.as_str()),
+            "PLAYBACK_STARTED",
+            200,
+        ),
+        (
+            "timeline-other-user-200",
+            "activity-unrelated-user",
+            None,
+            "AUTH_LOGIN",
+            200,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (
+                 id, user_id, actor_user_id, event_type, metadata_json, occurred_at
+             ) VALUES (?, ?, ?, ?, '{\"client\":\"Lux\"}', ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(actor_user_id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO user_activity_events (
+             id, user_id, actor_user_id, event_type, metadata_json, occurred_at
+         ) VALUES ('timeline-scalar-300', ?, ?, 'TEST_SCALAR', '\"https://private.example\"', 300)",
+    )
+    .bind(&admin_id)
+    .bind(&admin_id)
+    .execute(database.pool())
+    .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "activity-admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let created_reader = client
+        .post(format!("http://{address}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "activity-reader",
+            "password": "reader password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(created_reader.status(), reqwest::StatusCode::CREATED);
+    let reader_login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "activity-reader",
+            "password": "reader password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(reader_login.status(), reqwest::StatusCode::OK);
+    let forbidden = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity"
+        ))
+        .header(COOKIE, cookie_pair(reader_login.headers()))
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    let unauthorized = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?page=1&pageSize=2&from=100&to=200"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let first_page = response.json::<Value>().await?;
+    assert_eq!(first_page["page"], 1);
+    assert_eq!(first_page["pageSize"], 2);
+    assert_eq!(first_page["totalCount"], 3);
+    assert_eq!(first_page["events"][0]["id"], "timeline-start-200");
+    assert_eq!(first_page["events"][0]["userId"], admin_id);
+    assert_eq!(first_page["events"][0]["actorUserId"], admin_id);
+    assert_eq!(first_page["events"][0]["eventType"], "PLAYBACK_STARTED");
+    assert_eq!(first_page["events"][0]["metadata"]["client"], "Lux");
+    assert_eq!(first_page["events"][0]["occurredAt"], 200);
+    assert_eq!(first_page["events"][1]["id"], "timeline-pause-200");
+
+    let second_page = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?page=2&pageSize=2&from=100&to=200"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(second_page["totalCount"], 3);
+    assert_eq!(second_page["events"][0]["id"], "timeline-login-100");
+
+    let filtered = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?eventType=PLAYBACK_STARTED"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(filtered["totalCount"], 1);
+    assert_eq!(filtered["page"], 1);
+    assert_eq!(filtered["pageSize"], 20);
+    assert_eq!(filtered["events"][0]["id"], "timeline-start-200");
+
+    let oversized_page = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?pageSize=1000"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(oversized_page["pageSize"], 100);
+
+    let sanitized_scalar = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?eventType=TEST_SCALAR"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(sanitized_scalar["totalCount"], 1);
+    assert_eq!(
+        sanitized_scalar["events"][0]["metadata"]["value"],
+        "[REDACTED_URL]"
+    );
+
+    let invalid_type = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?eventType=%20"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_type.status(), reqwest::StatusCode::BAD_REQUEST);
+    let negative_time = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?from=-1"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(negative_time.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_range = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{admin_id}/activity?from=201&to=200"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_range.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let invalid_user_id = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/invalid/activity"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_user_id.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let missing_user_id = uuid::Uuid::now_v7().to_string();
+    let missing_user = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{missing_user_id}/activity"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_manage_users_and_last_manager_is_protected()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
