@@ -15461,6 +15461,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 回归先因客户端方法缺失而失败；实现后 `tests/api-client.test.ts -t "admin user playback and CSRF-protected stop contracts"` 1/1、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`git diff --check` 通过。完整 `pnpm --dir web test` 为 736 passed、4 failed；失败仍为此前记录的 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项及 `media-query-polling.test.tsx` 1 项，本任务没有修改这些实现/测试文件。无 Rust 或 migration 变化。
 
+#### LUX-738：在用户详情展示当前播放与停止 HLS 会话
+
+范围：在用户详情“设备与登录”页复用 LUX-737 客户端展示目标用户最近 90 秒活跃的播放会话，提供分页、媒体/进度、客户端/设备和 IP 摘要。只有 API 标记 `canStop` 的 Lux 服务端 HLS 才可请求停止；停止前确认，成功后刷新，失败可重试。页面必须说明直放和 STRM 外部播放的控制边界。本任务不增加设备清单、黑名单或 Emby 播放控制。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-sessions.test.tsx`。
+
+验收标准：
+
+- [x] 活跃播放摘要按用户分页显示媒体标题、播放进度、状态、客户端、设备和来源 IP，提供加载、错误/重试、空结果及翻页反馈。
+- [x] 只有 `canStop` 会话显示停止操作；操作需确认，成功后刷新当前列表，失败显示错误；其他会话保持不变。
+- [x] 明确说明停止仅支持 Lux 服务端 HLS；直放与 STRM 外部播放无法保证立即中断，且不撤销用户登录。
+- [x] 定向 session UI Vitest、Web build、桌面/窄屏浏览器验证和 diff check 通过。
+
+短计划：先扩展 session UI 回归覆盖播放列表摘要、分页、停止权限/确认/刷新/失败及边界文案并确认失败；再接入播放查询面板和响应式样式；最后运行定向 Vitest、Web build、浏览器验证和 diff check。
+
+结果（2026-10-20）：用户详情“设备与登录”增加当前播放面板，使用 LUX-737 API 显示分页媒体、进度/时长、播放方式、客户端/设备、来源 IP、状态和停止资格。仅 `canStop` 会话展示操作；停止前确认，成功刷新数据，失败保留会话并提示错误。直放和 STRM 的控制边界清楚说明，停止不会撤销登录。窄屏使用表格内部横向滚动，避免页面整体横溢出。
+
+验证：TDD RED 回归在面板缺失时失败；最终 `tests/admin-user-sessions.test.tsx` 11/11、冻结依赖安装、`pnpm --dir web build` 和 `git diff --check` 通过。完整 `pnpm --dir web test` 为 738 passed、4 failed；仍是此前已记录且不涉及本任务文件的 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项和 `media-query-polling.test.tsx` 1 项。Playwright 用本地模拟 API 验证 1280×900 桌面与 390×844 窄屏：桌面内容区 809px 时播放表格和停止操作完整可见；窄屏文档宽 375px、表格视口 310px，通过表格内横滑访问操作列，页面无横向溢出。确认对话框确认后发送 DELETE 204 并显示成功状态；`canStop=false` 的 STRM 行没有停止按钮；浏览器控制台错误 0。截图：`output/playwright/user-current-playback-desktop.png`、`output/playwright/user-current-playback-390.png`、`output/playwright/user-current-playback-390-actions.png`。此验证使用模拟 API，不代表真实 FNOS 或生产数据验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -10,6 +10,7 @@ import { api } from "../src/lib/api/client";
 import type {
   AdminUser,
   AdminUserEmbySessionPage,
+  AdminUserPlaybackSessionPage,
   AdminUserWebSessionPage,
 } from "../src/lib/api/types";
 
@@ -160,6 +161,116 @@ describe("AdminUserDetailPage Web session management", () => {
     });
     expect(container.textContent).toContain("Emby 登录已撤销。");
     expect(container.textContent).toContain("1 个有效 Emby 登录凭证");
+  });
+
+  it("shows current playback summaries and only stops confirmed server HLS sessions", async () => {
+    const sessions: AdminUserPlaybackSessionPage = {
+      sessions: [
+        makePlaybackSession("hls-playback", {
+          canStop: true,
+          playbackPlan: "SERVER_HLS",
+          playMethod: "Transcode",
+          title: "Example Movie",
+          positionTicks: 600_000_000,
+          durationTicks: 1_200_000_000,
+        }),
+        makePlaybackSession("direct-playback", {
+          canStop: false,
+          playbackPlan: null,
+          playMethod: "DirectPlay",
+          title: "External STRM Movie",
+          client: "External Player",
+        }),
+      ],
+      page: 1,
+      pageSize: 20,
+      totalCount: 2,
+    };
+    const emptyPage: AdminUserPlaybackSessionPage = { ...sessions, sessions: [], totalCount: 0 };
+    const list = vi.spyOn(api, "adminUserPlaybackSessions")
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce(emptyPage);
+    const stop = vi.spyOn(api, "stopAdminUserPlaybackSession")
+      .mockRejectedValueOnce(new Error("temporary stop failure"))
+      .mockResolvedValue(undefined);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderDevices();
+    await waitForPlaybackTable();
+
+    expect(list).toHaveBeenCalledWith("user-1", 1, 20);
+    expect(container.textContent).toContain("2 个活跃播放会话");
+    expect(container.textContent).toContain("Example Movie");
+    expect(container.textContent).toContain("50%");
+    expect(container.textContent).toContain("Lux Web 1.0");
+    expect(container.textContent).toContain("Living Room");
+    expect(container.textContent).toContain("192.0.2.10");
+    expect(container.textContent).toContain("External STRM Movie");
+    expect(container.textContent).toContain("无法远程停止");
+    expect(container.textContent).toContain("直放与 STRM 外部播放无法保证立即中断");
+    expect(container.querySelectorAll(".lux-admin-user-playback-stop")).toHaveLength(1);
+
+    const stopButton = findButton("停止播放");
+    act(() => stopButton.click());
+    expect(confirm).toHaveBeenCalledWith("将停止此用户通过 Lux 服务端 HLS 进行的播放。用户登录仍然有效。确定停止吗？");
+    expect(stop).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await act(async () => {
+      stopButton.click();
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledWith("user-1", "hls-playback"));
+      await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("temporary stop failure"));
+    });
+    expect(container.textContent).toContain("2 个活跃播放会话");
+
+    await act(async () => {
+      findButton("停止播放").click();
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(container.textContent).toContain("当前没有活跃的播放会话。"));
+    });
+    expect(container.textContent).toContain("播放已停止。");
+  });
+
+  it("paginates current playback and retries a failed session read", async () => {
+    const firstPage: AdminUserPlaybackSessionPage = {
+      sessions: Array.from({ length: 20 }, (_, index) => makePlaybackSession("playback-" + (index + 1), {
+        canStop: false,
+        title: "Movie " + (index + 1),
+      })),
+      page: 1,
+      pageSize: 20,
+      totalCount: 21,
+    };
+    const secondPage: AdminUserPlaybackSessionPage = {
+      sessions: [makePlaybackSession("playback-21", { canStop: false, title: "Movie 21" })],
+      page: 2,
+      pageSize: 20,
+      totalCount: 21,
+    };
+    const list = vi.spyOn(api, "adminUserPlaybackSessions")
+      .mockRejectedValueOnce(new Error("temporary playback failure"))
+      .mockResolvedValueOnce(firstPage)
+      .mockResolvedValueOnce(secondPage);
+    renderDevices();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("temporary playback failure"));
+    });
+    await act(async () => {
+      findButton("重试").click();
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(container.textContent).toContain("第 1 / 2 页"));
+    });
+    await act(async () => {
+      const pagination = container.querySelector('[aria-label="当前播放分页"]');
+      const nextButton = [...pagination!.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("下一页"));
+      expect(nextButton).toBeTruthy();
+      nextButton!.click();
+      await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", 2, 20));
+      await vi.waitFor(() => expect(container.textContent).toContain("Movie 21"));
+    });
+    expect(container.textContent).toContain("第 2 / 2 页");
   });
 
   it("paginates active Emby login credentials", async () => {
@@ -331,6 +442,14 @@ describe("AdminUserDetailPage Web session management", () => {
         totalCount: 0,
       });
     }
+    if (!vi.isMockFunction(api.adminUserPlaybackSessions)) {
+      vi.spyOn(api, "adminUserPlaybackSessions").mockResolvedValue({
+        sessions: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+    }
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -356,6 +475,12 @@ describe("AdminUserDetailPage Web session management", () => {
   async function waitForEmbySessionTable() {
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-user-emby-session-table")).toBeTruthy());
+    });
+  }
+
+  async function waitForPlaybackTable() {
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-user-playback-table")).toBeTruthy());
     });
   }
 
@@ -399,5 +524,33 @@ function makeEmbySession(id: string) {
     createdAt: 1_700_000_000,
     updatedAt: 1_700_000_100,
     lastSeenAt: 1_700_000_100 as number | null,
+  };
+}
+
+function makePlaybackSession(id: string, overrides: Partial<AdminUserPlaybackSessionPage["sessions"][number]>) {
+  return {
+    id,
+    userId: "user-1",
+    userName: "Viewer",
+    itemId: "item-" + id,
+    title: "Example Movie",
+    itemType: "MOVIE",
+    posterAvailable: false,
+    positionTicks: 0,
+    durationTicks: 1_200_000_000,
+    state: "PLAYING",
+    isPaused: false,
+    lastEventAt: 1_700_000_100,
+    client: "Lux Web",
+    clientVersion: "1.0",
+    deviceId: "device-" + id,
+    deviceName: "Living Room",
+    deviceType: "Browser",
+    remoteIp: "192.0.2.10",
+    playSessionId: "play-session-" + id,
+    playMethod: "DirectPlay",
+    playbackPlan: null,
+    canStop: false,
+    ...overrides,
   };
 }
