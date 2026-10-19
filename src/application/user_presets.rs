@@ -11,6 +11,7 @@ const PRESETS_SETTING_KEY: &str = "user_permission_presets";
 const MAX_CUSTOM_PRESETS: usize = 100;
 const MAX_PRESET_NAME_CHARS: usize = 80;
 const MAX_PRESET_DESCRIPTION_CHARS: usize = 500;
+pub(crate) const MAX_BATCH_USER_PERMISSION_PRESET_TARGETS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -107,6 +108,39 @@ impl From<StorageError> for UserPermissionPresetApplicationError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum UserPermissionPresetBatchErrorCode {
+    InvalidUserId,
+    UserNotFound,
+    LastManager,
+    InvalidSnapshot,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserPermissionPresetBatchItemResult {
+    pub(crate) user_id: String,
+    pub(crate) success: bool,
+    pub(crate) error_code: Option<UserPermissionPresetBatchErrorCode>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserPermissionPresetBatchSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) version: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserPermissionPresetBatchResult {
+    pub(crate) preset: UserPermissionPresetBatchSummary,
+    pub(crate) results: Vec<UserPermissionPresetBatchItemResult>,
 }
 
 pub(crate) async fn list_user_permission_presets(
@@ -253,6 +287,81 @@ pub(crate) async fn apply_user_permission_preset(
         }
         Err(error) => Err(UserPermissionPresetApplicationError::Storage(error)),
     }
+}
+
+pub(crate) async fn apply_user_permission_preset_batch(
+    database: &Database,
+    user_ids: &[String],
+    preset_id: &str,
+) -> Result<UserPermissionPresetBatchResult, UserPermissionPresetApplicationError> {
+    let mut preset = list_user_permission_presets(database)
+        .await
+        .map_err(|error| match error {
+            UserPermissionPresetError::Storage(error) => {
+                UserPermissionPresetApplicationError::Storage(error)
+            }
+            _ => UserPermissionPresetApplicationError::InvalidSnapshot,
+        })?
+        .into_iter()
+        .find(|preset| preset.id == preset_id)
+        .ok_or(UserPermissionPresetApplicationError::PresetNotFound)?;
+
+    preset.permissions.normalize_empty_selection();
+    if !preset.permissions.has_valid_shape()
+        || (preset.permissions.library_access_mode == "SELECTED"
+            && !database
+                .are_enabled_regular_libraries(&preset.permissions.library_ids)
+                .await?)
+    {
+        return Err(UserPermissionPresetApplicationError::InvalidSnapshot);
+    }
+    let preset_version = i64::try_from(preset.version)
+        .map_err(|_| UserPermissionPresetApplicationError::InvalidSnapshot)?;
+    let permissions = preset.permissions.stored_snapshot();
+    let mut results = Vec::with_capacity(user_ids.len());
+
+    for user_id in user_ids {
+        let Ok(user_id) = user_id.parse::<UserId>() else {
+            results.push(UserPermissionPresetBatchItemResult {
+                user_id: user_id.clone(),
+                success: false,
+                error_code: Some(UserPermissionPresetBatchErrorCode::InvalidUserId),
+            });
+            continue;
+        };
+        let user_id = user_id.to_string();
+        let apply = ApplyUserPermissionPreset {
+            preset_id: &preset.id,
+            preset_name: &preset.name,
+            preset_version,
+            is_admin: preset.is_admin,
+            can_manage_server: preset.can_manage_server,
+            permissions,
+        };
+        let outcome = match database.apply_user_permission_preset(&user_id, apply).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(UserPermissionPresetBatchErrorCode::UserNotFound),
+            Err(StorageError::LastManager) => Err(UserPermissionPresetBatchErrorCode::LastManager),
+            Err(StorageError::Conflict(_)) => {
+                Err(UserPermissionPresetBatchErrorCode::InvalidSnapshot)
+            }
+            Err(_) => Err(UserPermissionPresetBatchErrorCode::StorageUnavailable),
+        };
+        results.push(UserPermissionPresetBatchItemResult {
+            user_id,
+            success: outcome.is_ok(),
+            error_code: outcome.err(),
+        });
+    }
+
+    Ok(UserPermissionPresetBatchResult {
+        preset: UserPermissionPresetBatchSummary {
+            id: preset.id,
+            name: preset.name,
+            version: preset.version,
+        },
+        results,
+    })
 }
 
 fn built_in_presets() -> Vec<UserPermissionPreset> {

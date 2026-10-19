@@ -1281,6 +1281,197 @@ async fn admin_can_apply_permission_preset_to_user_with_audit_and_guards()
 }
 
 #[tokio::test]
+async fn admin_can_batch_apply_permission_presets_with_per_user_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin_user = setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let batch_url = format!("{base_url}/api/v1/admin/users/batch/permission-preset");
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+
+    let unauthenticated = client
+        .post(&batch_url)
+        .json(&json!({ "userIds": [], "presetId": "builtin-user" }))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let missing_csrf = client
+        .post(&batch_url)
+        .header(COOKIE, &admin_cookie)
+        .json(&json!({ "userIds": [], "presetId": "builtin-user" }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let create_user = |username: &'static str| {
+        client
+            .post(format!("{base_url}/api/v1/admin/users"))
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&json!({ "username": username, "password": "target password" }))
+    };
+    let failed_target = create_user("batch-failed-target")
+        .send()
+        .await?
+        .json::<Value>()
+        .await?["user"]["id"]
+        .as_str()
+        .ok_or("missing failed target ID")?
+        .to_owned();
+    let successful_target = create_user("batch-success-target")
+        .send()
+        .await?
+        .json::<Value>()
+        .await?["user"]["id"]
+        .as_str()
+        .ok_or("missing successful target ID")?
+        .to_owned();
+    sqlx::query(
+        "CREATE TRIGGER fail_batch_permission_preset_source
+         BEFORE INSERT ON user_permission_preset_sources
+         WHEN NEW.user_id = (
+             SELECT id FROM users WHERE username_normalized = 'batch-failed-target'
+         )
+         BEGIN SELECT RAISE(ABORT, 'injected batch target failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let missing_user_id = "00000000-0000-4000-8000-000000000000";
+    let body = json!({
+        "userIds": [
+            "not-a-user-id",
+            missing_user_id,
+            failed_target,
+            successful_target,
+            admin_user.id.to_string()
+        ],
+        "presetId": "builtin-user"
+    });
+    let applied = client
+        .post(&batch_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&body)
+        .send()
+        .await?;
+    let applied_status = applied.status();
+    let applied_body = applied.text().await?;
+    assert_eq!(applied_status, reqwest::StatusCode::OK, "{applied_body}");
+    assert!(!applied_body.to_ascii_lowercase().contains("cookie"));
+    assert!(!applied_body.to_ascii_lowercase().contains("token"));
+    let response = serde_json::from_str::<Value>(&applied_body)?;
+    let results = response["results"].as_array().ok_or("missing results")?;
+    assert_eq!(results.len(), 5);
+    assert_eq!(results[0]["userId"], "not-a-user-id");
+    assert_eq!(results[0]["success"], false);
+    assert_eq!(results[0]["errorCode"], "INVALID_USER_ID");
+    assert_eq!(results[1]["userId"], missing_user_id);
+    assert_eq!(results[1]["errorCode"], "USER_NOT_FOUND");
+    assert_eq!(results[2]["userId"], failed_target);
+    assert_eq!(results[2]["errorCode"], "STORAGE_UNAVAILABLE");
+    assert_eq!(results[3]["userId"], successful_target);
+    assert_eq!(results[3]["success"], true);
+    assert!(results[3]["errorCode"].is_null());
+    assert_eq!(results[4]["userId"], admin_user.id.to_string());
+    assert_eq!(results[4]["errorCode"], "LAST_MANAGER");
+    assert_eq!(response["preset"]["id"], "builtin-user");
+
+    let applied_source_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_permission_preset_sources WHERE user_id = ?")
+            .bind(&successful_target)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(applied_source_count, 1);
+    let failed_source_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_permission_preset_sources WHERE user_id = ?")
+            .bind(&failed_target)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(failed_source_count, 0);
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let events = audit.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing audit events")?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["eventType"] == "USER_PERMISSION_PRESET_APPLIED"
+                    && event["targetId"] == successful_target
+            })
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "USER_PERMISSION_PRESET_APPLIED"
+            && (event["targetId"] == failed_target
+                || event["targetId"] == admin_user.id.to_string())
+    }));
+
+    for invalid_body in [
+        json!({ "userIds": [], "presetId": "builtin-user" }),
+        json!({ "userIds": [successful_target, successful_target], "presetId": "builtin-user" }),
+        json!({
+            "userIds": (0..101).map(|index| format!("invalid-{index}")).collect::<Vec<_>>(),
+            "presetId": "builtin-user"
+        }),
+    ] {
+        let invalid = client
+            .post(&batch_url)
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&invalid_body)
+            .send()
+            .await?;
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let unknown_preset = client
+        .post(&batch_url)
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "userIds": [successful_target], "presetId": "missing-preset" }))
+        .send()
+        .await?;
+    assert_eq!(unknown_preset.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_user_profile_api_normalizes_email_and_preserves_verification_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

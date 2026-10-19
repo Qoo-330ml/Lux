@@ -13916,6 +13916,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：会话组件测试 3/3 通过；Web build 在临时恢复用户当前提交版 `AdminDashboardNowPlaying.tsx` 后通过，并逐字节还原了该文件的未提交用户改动。直接在当前工作区运行 build 仍被这份既有改动中两个未使用 helper 阻断。macOS 浏览器本地验证显示有效会话摘要、时间、状态、撤销操作和分页，浏览器控制台无警告或错误；`git diff --check` 通过。
 
+#### LUX-665：批量应用用户权限预设 API
+
+范围：新增管理员对明确用户 ID 集合批量应用权限预设的 API。每项结果独立返回成功状态和稳定失败码；各用户仍单独原子应用，单项失败不回滚其他用户。单批最多 100 个不同用户 ID。管理员 Web 会话、CSRF、最后一个有效服务器管理员保护及每个成功目标的审计事件均沿用现有单用户合同。本任务不增加列表多选或“全部筛选结果”界面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_presets.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 仅管理员可通过 CSRF 保护端点批量应用预设；空集合、重复 ID 和超过 100 项请求整体拒绝。
+- [x] 每个 ID 按输入顺序返回成功或稳定失败码；无效/不存在目标、最后管理员保护和单项存储错误不影响其他目标。
+- [x] 每个成功目标写入原有预设来源与独立审计事件；请求和响应不包含登录凭证。
+- [x] users 集成定向回归、API 文档、Rust 格式和 diff check 通过。
+
+短计划：先添加认证/CSRF、输入边界、多目标部分成功和逐项失败回归；再复用预设快照校验并逐用户执行现有原子存储操作，最后记录 API 合同与审计行为。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_batch_apply_permission_presets_with_per_user_results -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639、LUX-640、LUX-644–646、LUX-650。
+
+结果（2026-10-19）：批量 API 对 1–100 个不同目标逐项执行同一份已校验预设快照，每项单独提交并按输入顺序返回稳定结果码；最后管理员、无效/不存在 ID 和注入的单项存储失败不影响其余目标，成功项各自写入脱敏审计事件。`admin_can_batch_apply_permission_presets_with_per_user_results` 1/1、Rust fmt check、定向 Clippy（仅放行仓库已知的 `too_many_arguments` lint）和 diff check 通过。未豁免的定向 Clippy 仍被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处同一 lint 阻断。API 文档同步完成。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

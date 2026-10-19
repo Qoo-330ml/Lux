@@ -51,6 +51,13 @@ struct ApplyUserPermissionPresetRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BatchApplyUserPermissionPresetRequest {
+    user_ids: Vec<String>,
+    preset_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AdminUserSessionsQuery {
     page: Option<u32>,
     page_size: Option<u32>,
@@ -212,6 +219,65 @@ async fn admin_apply_user_permission_preset(
         }
         Err(error) => user_permission_preset_application_error(&headers, error),
     }
+}
+
+async fn admin_batch_apply_user_permission_preset(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<BatchApplyUserPermissionPresetRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request.user_ids.is_empty()
+        || request.user_ids.len()
+            > crate::application::user_presets::MAX_BATCH_USER_PERMISSION_PRESET_TARGETS
+        || has_duplicate_user_ids(&request.user_ids)
+    {
+        return invalid_user_permission_preset_request(&headers);
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::user_presets::apply_user_permission_preset_batch(
+        database,
+        &request.user_ids,
+        &request.preset_id,
+    )
+    .await
+    {
+        Ok(result) => {
+            for item in result.results.iter().filter(|item| item.success) {
+                record_audit_event(
+                    &state,
+                    &headers,
+                    "USER_PERMISSION_PRESET_APPLIED",
+                    Some("user"),
+                    Some(&item.user_id),
+                    &json!({
+                        "presetId": result.preset.id,
+                        "version": result.preset.version,
+                        "batch": true
+                    })
+                    .to_string(),
+                )
+                .await;
+            }
+            Json(result).into_response()
+        }
+        Err(error) => user_permission_preset_application_error(&headers, error),
+    }
+}
+
+fn has_duplicate_user_ids(user_ids: &[String]) -> bool {
+    let mut unique_ids = std::collections::HashSet::with_capacity(user_ids.len());
+    user_ids.iter().any(|user_id| {
+        let key = user_id
+            .parse::<crate::domain::ids::UserId>()
+            .map(|user_id| user_id.to_string())
+            .unwrap_or_else(|_| user_id.clone());
+        !unique_ids.insert(key)
+    })
 }
 
 async fn admin_list_user_sessions(
@@ -1491,6 +1557,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users",
             get(admin_list_users).post(admin_create_user),
+        )
+        .route(
+            "/api/v1/admin/users/batch/permission-preset",
+            post(admin_batch_apply_user_permission_preset),
         )
         .route(
             "/api/v1/admin/users/{user_id}",
