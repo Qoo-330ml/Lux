@@ -1816,6 +1816,156 @@ impl Database {
         Ok((devices, total_count))
     }
 
+    // LUX-755 supplies scope-safe CRUD for future administrator blacklist APIs.
+    #[allow(dead_code)]
+    pub(crate) async fn insert_user_access_blacklist_rule(
+        &self,
+        rule: NewUserAccessBlacklistRule<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by,
+                 created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(rule.id)
+        .bind(rule.user_id)
+        .bind(rule.rule_type)
+        .bind(rule.match_value)
+        .bind(database_flag(rule.is_enabled))
+        .bind(rule.created_by)
+        .bind(rule.created_at)
+        .bind(rule.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn list_user_access_blacklist_rules_page(
+        &self,
+        query: UserAccessBlacklistRulePageQuery<'_>,
+    ) -> Result<(Vec<StoredUserAccessBlacklistRule>, i64), StorageError> {
+        let (where_clause, user_id) = match query.scope {
+            UserAccessBlacklistRuleScope::Global => ("user_id IS NULL", None),
+            UserAccessBlacklistRuleScope::User(user_id) => ("user_id = ?", Some(user_id)),
+        };
+        let count_sql = format!(
+            "SELECT COUNT(*) AS total_count FROM user_access_blacklist_rules WHERE {where_clause}"
+        );
+        let mut count_query = self.query(sqlx::AssertSqlSafe(count_sql));
+        if let Some(user_id) = user_id {
+            count_query = count_query.bind(user_id);
+        }
+        let total_count = count_query
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| row.get::<i64, _>("total_count"))
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let page_sql = format!(
+            "SELECT id, user_id, rule_type, match_value, is_enabled, created_by,
+                    created_at, updated_at
+             FROM user_access_blacklist_rules WHERE {where_clause}
+             ORDER BY created_at DESC, id ASC
+             LIMIT ? OFFSET ?"
+        );
+        let mut page_query = self.query(sqlx::AssertSqlSafe(page_sql));
+        if let Some(user_id) = user_id {
+            page_query = page_query.bind(user_id);
+        }
+        let rows = page_query
+            .bind(query.limit.clamp(1, 100))
+            .bind(query.offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rules = rows
+            .into_iter()
+            .map(|row| StoredUserAccessBlacklistRule {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                rule_type: row.get("rule_type"),
+                match_value: row.get("match_value"),
+                is_enabled: row.get::<i64, _>("is_enabled") != 0,
+                created_by: row.get("created_by"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+            })
+            .collect();
+        Ok((rules, total_count))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn set_user_access_blacklist_rule_enabled(
+        &self,
+        scope: UserAccessBlacklistRuleScope<'_>,
+        rule_id: &str,
+        is_enabled: bool,
+    ) -> Result<bool, StorageError> {
+        let (where_clause, user_id) = match scope {
+            UserAccessBlacklistRuleScope::Global => ("user_id IS NULL", None),
+            UserAccessBlacklistRuleScope::User(user_id) => ("user_id = ?", Some(user_id)),
+        };
+        let sql = format!(
+            "UPDATE user_access_blacklist_rules
+             SET is_enabled = ?, updated_at = ?
+             WHERE id = ? AND {where_clause}"
+        );
+        let mut update = self
+            .query(sqlx::AssertSqlSafe(sql))
+            .bind(database_flag(is_enabled))
+            .bind(current_unix_timestamp())
+            .bind(rule_id);
+        if let Some(user_id) = user_id {
+            update = update.bind(user_id);
+        }
+        update
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn delete_user_access_blacklist_rule(
+        &self,
+        scope: UserAccessBlacklistRuleScope<'_>,
+        rule_id: &str,
+    ) -> Result<bool, StorageError> {
+        let (where_clause, user_id) = match scope {
+            UserAccessBlacklistRuleScope::Global => ("user_id IS NULL", None),
+            UserAccessBlacklistRuleScope::User(user_id) => ("user_id = ?", Some(user_id)),
+        };
+        let sql =
+            format!("DELETE FROM user_access_blacklist_rules WHERE id = ? AND {where_clause}");
+        let mut delete = self.query(sqlx::AssertSqlSafe(sql)).bind(rule_id);
+        if let Some(user_id) = user_id {
+            delete = delete.bind(user_id);
+        }
+        delete
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     // LUX-723 wires this storage contract into the administrator activity API.
     #[allow(dead_code)]
     pub(crate) async fn list_user_activity_events(

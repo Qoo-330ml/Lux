@@ -2,9 +2,10 @@ use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
-    MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserActivityEvent,
-    NewUserContentRestrictions, NewUserDeviceObservation, PlaybackAdmissionDecision,
-    PlaybackAdmissionDenialReason, StoredUserActivityEvent, UserActivityEventQuery,
+    MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserAccessBlacklistRule,
+    NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation,
+    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, StoredUserActivityEvent,
+    UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserActivityEventQuery,
     UserContentRestrictionsCasResult, UserDevicePageQuery, UserPermissionCopyGroups,
     UserPermissionCopyResult, UserPlaybackPolicy,
 };
@@ -77,6 +78,199 @@ async fn web_session_device_association_is_optional_and_only_read_from_active_se
     database.revoke_web_session(&token_hash).await?;
     assert!(database.find_web_session(&token_hash).await?.is_none());
     assert!(database.find_web_session(&[7_u8; 32]).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_access_blacklist_rules_are_scoped_stable_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, username) in [
+        ("blacklist-user-a", "blacklist-user-a"),
+        ("blacklist-user-b", "blacklist-user-b"),
+        ("blacklist-creator", "blacklist-creator"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test-hash')",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, user_id, rule_type, match_value, created_at) in [
+        ("global-client", None, "CLIENT", "infuse", 200_i64),
+        ("global-device", None, "DEVICE", "living-room-tv", 200_i64),
+        (
+            "user-a-client",
+            Some("blacklist-user-a"),
+            "CLIENT",
+            "infuse",
+            250_i64,
+        ),
+        (
+            "user-a-ip",
+            Some("blacklist-user-a"),
+            "IP_CIDR",
+            "192.0.2.0/24",
+            150_i64,
+        ),
+        (
+            "user-b-device",
+            Some("blacklist-user-b"),
+            "DEVICE",
+            "living-room-tv",
+            300_i64,
+        ),
+    ] {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id,
+                user_id,
+                rule_type,
+                match_value,
+                is_enabled: true,
+                created_by: Some("blacklist-creator"),
+                created_at,
+            })
+            .await?;
+    }
+
+    let (global_page_1, global_total) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::Global,
+            offset: 0,
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(global_total, 2);
+    assert_eq!(global_page_1[0].id, "global-client");
+    let (global_page_2, _) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::Global,
+            offset: 1,
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(global_page_2[0].id, "global-device");
+
+    let (user_a_page, user_a_total) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+            offset: -1,
+            limit: 0,
+        })
+        .await?;
+    assert_eq!(user_a_total, 2);
+    assert_eq!(user_a_page.len(), 1);
+    assert_eq!(user_a_page[0].id, "user-a-client");
+    assert_eq!(user_a_page[0].user_id.as_deref(), Some("blacklist-user-a"));
+    assert!(user_a_page[0].is_enabled);
+
+    let (user_b_page, user_b_total) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::User("blacklist-user-b"),
+            offset: 0,
+            limit: 101,
+        })
+        .await?;
+    assert_eq!(user_b_total, 1);
+    assert_eq!(user_b_page.len(), 1);
+    assert_eq!(user_b_page[0].id, "user-b-device");
+
+    assert!(
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: "duplicate-global-client",
+                user_id: None,
+                rule_type: "CLIENT",
+                match_value: "infuse",
+                is_enabled: true,
+                created_by: Some("blacklist-creator"),
+                created_at: 300,
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: "duplicate-user-device",
+                user_id: Some("blacklist-user-b"),
+                rule_type: "DEVICE",
+                match_value: "living-room-tv",
+                is_enabled: true,
+                created_by: Some("blacklist-creator"),
+                created_at: 300,
+            })
+            .await
+            .is_err()
+    );
+
+    assert!(
+        database
+            .set_user_access_blacklist_rule_enabled(
+                UserAccessBlacklistRuleScope::Global,
+                "global-client",
+                false,
+            )
+            .await?
+    );
+    assert!(
+        !database
+            .set_user_access_blacklist_rule_enabled(
+                UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+                "global-client",
+                false,
+            )
+            .await?
+    );
+    let (disabled_page, _) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::Global,
+            offset: 0,
+            limit: 10,
+        })
+        .await?;
+    let disabled = disabled_page
+        .iter()
+        .find(|rule| rule.id == "global-client")
+        .ok_or("disabled global rule was not listed")?;
+    assert!(!disabled.is_enabled);
+    assert!(disabled.updated_at >= disabled.created_at);
+
+    assert!(
+        !database
+            .delete_user_access_blacklist_rule(
+                UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+                "global-client",
+            )
+            .await?
+    );
+    assert!(
+        database
+            .delete_user_access_blacklist_rule(
+                UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+                "user-a-ip",
+            )
+            .await?
+    );
+    let (_, user_a_after_delete) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+            offset: 0,
+            limit: 100,
+        })
+        .await?;
+    assert_eq!(user_a_after_delete, 1);
     Ok(())
 }
 

@@ -15796,6 +15796,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：SQLite 空库 schema/约束与从 0195 升级保留现有设备回归 1/1；PostgreSQL 空库迁移和从 0195 升级保留设备回归分别 1/1 通过。新增列、索引与外键删除动作通过检查；未新增依赖或修改认证行为。
 
+#### LUX-755：提供有界黑名单规则存储合同
+
+范围：为 LUX-754 的规则表提供按全站或指定用户范围分页读取、创建、启停和删除的 storage 合同。列表固定按创建时间倒序、规则 ID 正序稳定排序，页大小限制为 1–100；用户范围只能读写该用户规则，不能包含全站或其他用户规则。只增加内部存储模型与 SQLite 回归，不开放 API、解析匹配值或执行授权拒绝。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 能在全站与指定用户范围创建、分页查询、启停和删除规则，并返回匹配范围内总数。
+- [x] 用户隔离、全站/用户重名规则分离、重复规则由唯一约束拒绝；分页稳定且限制有界。
+- [x] SQLite storage 定向回归、Rust build、fmt 与 diff check 通过；不接认证行为。
+
+短计划：先在 `repository_tests.rs` 写范围隔离、CRUD、稳定分页和重复规则回归，确认 storage 合同缺失；再加入最小 repository DTO 与 storage 方法；最后运行对应 storage 测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：storage 提供全站或精确用户范围的规则创建、分页读取、启停及删除；分页按创建时间倒序和 ID 正序稳定排序，limit 限制为 1–100。启停/删除按 rule ID 与作用范围双重限定，不会操作另一范围的规则。
+
+验证：TDD RED 确认类型与 storage 方法缺失；定向回归 1/1 通过，覆盖全站/用户隔离、同匹配值跨范围、范围内重复拒绝、页数/排序/上限、错误范围更新删除和启停状态。Rust build、fmt 检查与 `git diff --check` 通过；没有接入 HTTP 或请求授权。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

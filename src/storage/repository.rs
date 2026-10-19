@@ -1343,6 +1343,45 @@ pub(crate) struct StoredUserDevice {
     pub(crate) last_remote_ip: Option<String>,
 }
 
+// LUX-755 exposes scope-safe persistence for device, client, and IP rules.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserAccessBlacklistRuleScope<'a> {
+    Global,
+    User(&'a str),
+}
+
+#[allow(dead_code)]
+pub(crate) struct UserAccessBlacklistRulePageQuery<'a> {
+    pub(crate) scope: UserAccessBlacklistRuleScope<'a>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+pub(crate) struct NewUserAccessBlacklistRule<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) user_id: Option<&'a str>,
+    pub(crate) rule_type: &'a str,
+    pub(crate) match_value: &'a str,
+    pub(crate) is_enabled: bool,
+    pub(crate) created_by: Option<&'a str>,
+    pub(crate) created_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct StoredUserAccessBlacklistRule {
+    pub(crate) id: String,
+    pub(crate) user_id: Option<String>,
+    pub(crate) rule_type: String,
+    pub(crate) match_value: String,
+    pub(crate) is_enabled: bool,
+    pub(crate) created_by: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
 // LUX-723 consumes this bounded query contract in the administrator activity API.
 #[allow(dead_code)]
 pub(crate) struct UserActivityEventQuery<'a> {
