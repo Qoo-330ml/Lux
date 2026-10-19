@@ -10,6 +10,9 @@ use crate::storage::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+#[allow(dead_code)] // LUX-732 wires the bounded activity-retention worker.
+const USER_ACTIVITY_RETENTION_MAX_BATCH_SIZE: i64 = 1_000;
+
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
@@ -1765,6 +1768,36 @@ impl Database {
             })
             .collect();
         Ok((events, total_count))
+    }
+
+    #[allow(dead_code)] // LUX-732 wires the bounded activity-retention worker.
+    pub(crate) async fn delete_user_activity_events_before(
+        &self,
+        occurred_before: i64,
+        limit: i64,
+    ) -> Result<u64, StorageError> {
+        if limit <= 0 {
+            return Ok(0);
+        }
+        let limit = limit.min(USER_ACTIVITY_RETENTION_MAX_BATCH_SIZE);
+        self.query(
+            "DELETE FROM user_activity_events
+             WHERE id IN (
+                 SELECT id FROM user_activity_events
+                 WHERE occurred_at < ?
+                 ORDER BY occurred_at, id
+                 LIMIT ?
+             )",
+        )
+        .bind(occurred_before)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn list_activity_events(

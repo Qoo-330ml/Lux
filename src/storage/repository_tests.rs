@@ -23432,6 +23432,70 @@ async fn user_activity_index_query_filters_and_pages_in_stable_order()
 }
 
 #[tokio::test]
+async fn user_activity_index_retention_deletes_old_events_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, occurred_at) in [
+        ("retention-old-a", 10_i64),
+        ("retention-old-b", 10),
+        ("retention-old-c", 99),
+        ("retention-boundary", 100),
+        ("retention-new", 101),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, event_type, occurred_at)
+             VALUES (?, 'retention-user', 'AUTH_LOGIN', ?)",
+        )
+        .bind(id)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO audit_events (id, event_type, metadata_json, created_at)
+         VALUES ('retention-audit', 'AUTH_LOGIN', '{}', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(
+        database.delete_user_activity_events_before(100, 2).await?,
+        2
+    );
+    let old_after_first_batch: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_activity_events WHERE occurred_at < 100")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(old_after_first_batch, 1);
+    assert_eq!(
+        database.delete_user_activity_events_before(100, 2).await?,
+        1
+    );
+    assert_eq!(
+        database.delete_user_activity_events_before(100, 2).await?,
+        0
+    );
+    let retained_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM user_activity_events ORDER BY occurred_at, id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(retained_ids, vec!["retention-boundary", "retention-new"]);
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE id = 'retention-audit'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(audit_count, 1);
+    assert_eq!(database.delete_user_activity_events_before(0, 0).await?, 0);
+    assert_eq!(database.delete_user_activity_events_before(0, -1).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_emby_login_session_page_is_bounded_and_excludes_revoked_tokens()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

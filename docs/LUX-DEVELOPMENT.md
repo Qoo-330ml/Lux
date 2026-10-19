@@ -15298,6 +15298,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 集成回归先得到 0 条失败事件（预期 7 条）；实现后 `cargo test --locked --test users` 18/18、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。回归覆盖用户名、唯一显示名称、已知用户 ID、禁用账号、未知/非法目标、速率限制，以及活动和审计元数据不包含账号名或凭证。
 
+#### LUX-730：提供有界用户活动过期清理
+
+范围：在 storage 层按发生时间删除早于明确截止时间的用户活动索引，单次最多处理一个固定上限批次，并按时间和 ID 稳定选择。保留截止时间及之后的事件，不触及文件审计、观看进度、已看状态或收藏；本任务只提供清理合同，不启动 worker 或更改保留设置。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 清理只删除 `occurred_at` 早于截止时间的用户活动记录，边界时间及较新事件保留。
+- [x] 每次调用有界且安全处理空结果、非法/超大批次；现有进度、收藏和文件审计数据不变。
+- [x] storage 库定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先写过期与边界时间的 storage 回归并确认清理方法缺失；再用时间/ID 索引执行最多 1,000 条的参数化批次删除；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-719、LUX-720。
+
+结果（2026-10-20）：storage 新增 `delete_user_activity_events_before`，使用 `occurred_at, id` 稳定选择最多 1,000 条过期事件并通过单条参数化删除；截止点采用严格早于语义，非正批次返回 0。数据存储层不修改 file audit、播放/已看/收藏数据；worker 接线由后续任务完成。
+
+验证：TDD RED 库回归因清理方法不存在而失败；实现后 `cargo test --locked --lib user_activity_index_retention_deletes_old_events_in_bounded_batches` 1/1、`cargo build --locked`（无新增 warning）、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
