@@ -9094,6 +9094,31 @@ impl Database {
             source,
         })
     }
+
+    pub(crate) async fn is_active_web_session_token(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        session_token_hash: &[u8],
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM web_sessions
+                WHERE user_id = ? AND id = ? AND session_token_hash = ?
+                  AND revoked_at IS NULL AND expires_at > unixepoch()
+            ) THEN 1 ELSE 0 END",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(session_token_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
 }
 
 fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {
@@ -10039,6 +10064,73 @@ mod tests {
             active_sessions
                 .iter()
                 .all(|session| session.id != "session-100" && session.id != "session-099")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_current_web_session_guard_checks_full_identity_and_activity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::setup::SetupService, config::Config};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup
+            .complete("Session Admin", "Session Admin", "admin password")
+            .await?;
+        let user_id = user.id.to_string();
+        let session_id = "active-session";
+        let token_hash = vec![7_u8; 32];
+        database
+            .create_web_session(session_id, &user_id, &token_hash, &[0_u8; 32], 3600)
+            .await?;
+
+        assert!(
+            database
+                .is_active_web_session_token(&user_id, session_id, &token_hash)
+                .await?
+        );
+        assert!(
+            !database
+                .is_active_web_session_token("other-user", session_id, &token_hash)
+                .await?
+        );
+        assert!(
+            !database
+                .is_active_web_session_token(&user_id, "other-session", &token_hash)
+                .await?
+        );
+        assert!(
+            !database
+                .is_active_web_session_token(&user_id, session_id, &[8_u8; 32])
+                .await?
+        );
+
+        sqlx::query("UPDATE web_sessions SET expires_at = unixepoch() - 1 WHERE id = ?")
+            .bind(session_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !database
+                .is_active_web_session_token(&user_id, session_id, &token_hash)
+                .await?
+        );
+        sqlx::query(
+            "UPDATE web_sessions SET expires_at = unixepoch() + 3600, revoked_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .execute(database.pool())
+        .await?;
+        assert!(
+            !database
+                .is_active_web_session_token(&user_id, session_id, &token_hash)
+                .await?
         );
         Ok(())
     }

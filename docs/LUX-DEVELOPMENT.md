@@ -13841,6 +13841,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：管理员分页会话接口接入 LUX-659 查询，返回摘要、当前页及总数；未认证/普通用户访问拒绝，非法用户 ID 返回 400，页大小上限 100，当前会话仅比较 token 摘要且响应不含 Cookie 或凭证。`admin_can_list_user_web_sessions_without_exposing_tokens` 1/1、fmt check 与 diff check 通过，API 合同已写入 `docs/API.md`。撤销和管理页面留待后续任务。
 
+#### LUX-661：提供当前 Web 会话身份的精确存储检查
+
+范围：增加按用户 ID、会话 ID 和 token 摘要精确检查有效 Web 会话身份的存储操作，供管理员撤销 API 防止撤销管理员自己的当前会话。只接受未撤销且未过期记录，不读取或返回原始凭证；本任务不新增 HTTP 行为。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`（含存储回归）。
+
+验收标准：
+
+- [x] 只有三项身份均匹配且会话仍有效时返回 true；错用户、错会话、错摘要、撤销或过期记录均返回 false。
+- [x] 存储定向回归、Rust 格式检查和 diff check 通过。
+
+短计划：先添加匹配/错配/失效会话测试并确认检查方法缺失，再实现单条 EXISTS 查询。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib admin_current_web_session_guard`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：新增单条 EXISTS 存储检查，只有用户、会话 ID、token 摘要完全匹配且会话未撤销/未过期时返回 true。回归覆盖错用户、错会话、错摘要、过期和撤销，`admin_current_web_session_guard` 1/1、fmt check 与 diff check 通过。管理员撤销 API 将在 LUX-662 使用此检查。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
