@@ -188,8 +188,12 @@
 .lux-admin-user-session-table tbody th { font-weight: 550; }
 .lux-admin-user-session-table tbody tr:last-child th, .lux-admin-user-session-table tbody tr:last-child td { border-bottom: 0; }
 .lux-admin-user-session-other, .lux-admin-user-session-protected { color: var(--lux-muted); font-size: .68rem; }
+.lux-admin-user-session-device-meta { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .64rem; font-weight: 400; }
 .lux-admin-user-session-revoke { color: var(--lux-danger, #d86d6d); white-space: nowrap; }
 .lux-admin-user-session-revoke:hover { border-color: color-mix(in srgb, var(--lux-danger, #d86d6d) 55%, transparent); }
+.lux-admin-user-session-revoke-all { color: var(--lux-danger, #d86d6d); white-space: nowrap; }
+.lux-admin-user-session-revoke-all:hover { border-color: color-mix(in srgb, var(--lux-danger, #d86d6d) 55%, transparent); }
+.lux-admin-user-session-revoke-all:disabled { cursor: not-allowed; opacity: .55; }
 .lux-admin-user-session-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
 .lux-admin-user-session-pagination > div { display: flex; gap: 8px; }
 .lux-admin-user-content-section { display: grid; gap: 16px; min-width: 0; max-width: 760px; }
@@ -217,4 +221,6 @@
 @media (max-width: 600px) {
   .lux-admin-user-content-policy, .lux-admin-user-content-index { padding: 16px; }
   .lux-admin-user-content-policy-grid { grid-template-columns: minmax(0, 1fr); }
+  .lux-admin-user-sessions > .lux-admin-panel-heading { align-items: flex-start; flex-direction: column; }
+  .lux-admin-user-session-revoke-all { width: 100%; }
 }

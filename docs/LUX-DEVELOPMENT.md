@@ -15045,6 +15045,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 确认新增客户端回归在方法缺失时失败；`tests/api-client.test.ts -t "admin user Emby session"` 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。
 
+#### LUX-718：在用户设备与登录页管理 Emby 登录凭证
+
+范围：在现有用户“设备与登录”区域统一展示 Web 登录会话与 Emby 登录凭证。Emby 区域展示 API 提供的设备/客户端/时间安全摘要，支持分页、确认后撤销单项及撤销该用户全部有效凭证；提供独立加载、错误、重试、空结果和操作反馈。本任务不新增设备/IP/客户端黑名单、IP 来源推断、活动记录、真实 IP 或当前在线状态。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-sessions.test.tsx`。
+
+验收标准：
+
+- [x] 页面同时显示 Web 与 Emby 登录摘要；Emby 列表只显示服务端返回的设备、客户端和时间元数据，不暴露凭证材料，也不虚构 IP/在线状态。
+- [x] Emby 登录列表有界分页；页内最后一项被撤销时回退页码；撤销单项与全部撤销前均要求确认。
+- [x] 列表读取失败可重试；撤销失败显示错误并允许再次尝试，成功展示反馈；批量撤销展示服务端实际撤销数量并刷新列表。
+- [x] 定向 session 管理 Vitest、Web build、桌面与窄屏浏览器交互验证及 diff check 通过。
+
+短计划：先在现有会话页面测试中覆盖 Emby 摘要、分页及单项/全部撤销并确认失败；再加独立 Emby 查询与撤销面板，复用当前会话表格风格；最后运行定向 Vitest、Web build、浏览器交互验证和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-sessions.test.tsx`、`pnpm --dir web build`、浏览器桌面及 390×844 视口验证、`git diff --check`。
+
+依赖：LUX-717、LUX-716。
+
+结果（2026-10-20）：在“设备与登录”页分别展示 Web 会话与 Emby 登录凭证。Emby 面板提供设备 ID/类型、客户端/版本、首次登录、最近活动和每用户 20 条分页；最后一项撤销后回到前页。单项和全部撤销均在确认后调用 API，成功后刷新会话列表并按服务端实际数量反馈；读取失败可重试，撤销失败保留凭证并显示错误。页面不呈现 IP、归属地或推断的在线状态。
+
+验证：测试文件 admin-user-sessions.test.tsx 为 9/9，pnpm --dir web build 和 git diff --check 通过。Playwright 使用本地模拟 API 验证桌面 1200px 页面及全部撤销确认/DELETE/结果提示；390×844 CSS 视口下页面宽 375px，无页面级横向溢出，两张 760px 表格均在各自 310px 横向滚动区内。控制台 0 错误。截图：output/playwright/user-emby-sessions-desktop.png、output/playwright/user-emby-sessions-390.png。浏览器检查为本地模拟 API，不代表真实 FNOS 或生产环境验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

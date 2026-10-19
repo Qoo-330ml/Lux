@@ -7,7 +7,11 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUserDetailPage } from "../src/features/admin/AdminUserManagementPage";
 import { api } from "../src/lib/api/client";
-import type { AdminUser, AdminUserWebSessionPage } from "../src/lib/api/types";
+import type {
+  AdminUser,
+  AdminUserEmbySessionPage,
+  AdminUserWebSessionPage,
+} from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -111,8 +115,222 @@ describe("AdminUserDetailPage Web session management", () => {
     });
   });
 
+  it("shows safe Emby device summaries and confirms single credential revocation", async () => {
+    const sessions: AdminUserEmbySessionPage = {
+      sessions: [makeEmbySession("credential-1"), {
+        ...makeEmbySession("credential-2"),
+        deviceName: "Bedroom TV",
+        lastSeenAt: null,
+      }],
+      page: 1,
+      pageSize: 20,
+      totalCount: 2,
+    };
+    const refreshedSessions: AdminUserEmbySessionPage = {
+      ...sessions,
+      sessions: [sessions.sessions[0]],
+      totalCount: 1,
+    };
+    const list = vi.spyOn(api, "adminUserEmbySessions")
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce(refreshedSessions);
+    const revoke = vi.spyOn(api, "revokeAdminUserEmbySession").mockResolvedValue(undefined);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderDevices();
+    await waitForEmbySessionTable();
+
+    expect(container.textContent).toContain("2 个有效 Emby 登录凭证");
+    expect(container.textContent).toContain("Living Room");
+    expect(container.textContent).toContain("设备 ID：device-credential-1");
+    expect(container.textContent).toContain("Infuse 8.1");
+    expect(container.textContent).toContain("最近活动未知");
+    expect(container.textContent).not.toContain("access-token");
+    expect(container.querySelectorAll(".lux-admin-user-emby-session-table tbody tr")).toHaveLength(2);
+
+    const revokeButton = findButton("撤销登录");
+    act(() => revokeButton.click());
+    expect(confirm).toHaveBeenCalledWith("撤销此 Emby 登录凭证后，对应客户端需要重新登录。确定撤销吗？");
+    expect(revoke).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await act(async () => {
+      revokeButton.click();
+      await vi.waitFor(() => expect(revoke).toHaveBeenCalledWith("user-1", "credential-1"));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    });
+    expect(container.textContent).toContain("Emby 登录已撤销。");
+    expect(container.textContent).toContain("1 个有效 Emby 登录凭证");
+  });
+
+  it("paginates active Emby login credentials", async () => {
+    const firstPage: AdminUserEmbySessionPage = {
+      sessions: Array.from({ length: 20 }, (_, index) => makeEmbySession("credential-" + (index + 1))),
+      page: 1,
+      pageSize: 20,
+      totalCount: 21,
+    };
+    const secondPage: AdminUserEmbySessionPage = {
+      sessions: [makeEmbySession("credential-21")],
+      page: 2,
+      pageSize: 20,
+      totalCount: 21,
+    };
+    const list = vi.spyOn(api, "adminUserEmbySessions").mockImplementation(async (_userId, page = 1) => (
+      page === 1 ? firstPage : secondPage
+    ));
+    renderDevices();
+    await waitForEmbySessionTable();
+    expect(container.textContent).toContain("第 1 / 2 页");
+
+    const pagination = container.querySelector('[aria-label="Emby 登录分页"]');
+    const nextButton = [...pagination!.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("下一页"));
+    expect(nextButton).toBeTruthy();
+    await act(async () => {
+      nextButton!.click();
+      await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", 2, 20));
+      await vi.waitFor(() => expect(container.querySelector('[aria-label="Emby 登录分页"]')?.textContent).toContain("第 2 / 2 页"));
+    });
+    expect(container.querySelectorAll(".lux-admin-user-emby-session-table tbody tr")).toHaveLength(1);
+  });
+
+  it("returns to the previous Emby page when its last credential is revoked", async () => {
+    const firstPage: AdminUserEmbySessionPage = {
+      sessions: Array.from({ length: 20 }, (_, index) => makeEmbySession("credential-" + (index + 1))),
+      page: 1,
+      pageSize: 20,
+      totalCount: 21,
+    };
+    const firstPageAfterRevoke: AdminUserEmbySessionPage = { ...firstPage, totalCount: 20 };
+    const lastPage: AdminUserEmbySessionPage = {
+      sessions: [makeEmbySession("credential-21")],
+      page: 2,
+      pageSize: 20,
+      totalCount: 21,
+    };
+    let revoked = false;
+    const list = vi.spyOn(api, "adminUserEmbySessions").mockImplementation(async (_userId, page = 1) => {
+      if (page === 1) return revoked ? firstPageAfterRevoke : firstPage;
+      return lastPage;
+    });
+    const revoke = vi.spyOn(api, "revokeAdminUserEmbySession").mockImplementation(async () => {
+      revoked = true;
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderDevices();
+    await waitForEmbySessionTable();
+
+    const pagination = container.querySelector('[aria-label="Emby 登录分页"]');
+    const nextButton = [...pagination!.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("下一页"));
+    await act(async () => {
+      nextButton!.click();
+      await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", 2, 20));
+      await vi.waitFor(() => expect(container.textContent).toContain("credential-21"));
+    });
+
+    await act(async () => {
+      findButton("撤销登录").click();
+      await vi.waitFor(() => expect(revoke).toHaveBeenCalledWith("user-1", "credential-21"));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", 1, 20));
+      await vi.waitFor(() => expect(container.querySelector('[aria-label="Emby 登录分页"]')?.textContent).toContain("第 1 / 1 页"));
+    });
+    expect(container.querySelectorAll(".lux-admin-user-emby-session-table tbody tr")).toHaveLength(20);
+  });
+
+  it("confirms bulk Emby revocation, reports the revoked count, and refreshes", async () => {
+    const populated: AdminUserEmbySessionPage = {
+      sessions: [makeEmbySession("credential-1"), makeEmbySession("credential-2")],
+      page: 1,
+      pageSize: 20,
+      totalCount: 2,
+    };
+    const empty: AdminUserEmbySessionPage = { ...populated, sessions: [], totalCount: 0 };
+    const list = vi.spyOn(api, "adminUserEmbySessions")
+      .mockResolvedValueOnce(populated)
+      .mockResolvedValueOnce(empty);
+    const revokeAll = vi.spyOn(api, "revokeAllAdminUserEmbySessions").mockResolvedValue({ revokedCount: 2 });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderDevices();
+    await waitForEmbySessionTable();
+
+    const revokeAllButton = findButton("撤销全部 Emby 登录");
+    act(() => revokeAllButton.click());
+    expect(confirm).toHaveBeenCalledWith("即将撤销此用户全部 2 个有效 Emby 登录凭证，对应客户端需要重新登录。确定继续吗？");
+    expect(revokeAll).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await act(async () => {
+      revokeAllButton.click();
+      await vi.waitFor(() => expect(revokeAll).toHaveBeenCalledWith("user-1"));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    });
+    expect(container.textContent).toContain("已撤销 2 个 Emby 登录凭证。");
+    expect(container.textContent).toContain("当前没有有效的 Emby 登录凭证。");
+  });
+
+  it("reports Emby credential revoke errors and allows another attempt", async () => {
+    const sessions: AdminUserEmbySessionPage = {
+      sessions: [makeEmbySession("credential-1")],
+      page: 1,
+      pageSize: 20,
+      totalCount: 1,
+    };
+    vi.spyOn(api, "adminUserEmbySessions").mockResolvedValue(sessions);
+    const revoke = vi.spyOn(api, "revokeAdminUserEmbySession")
+      .mockRejectedValueOnce(new Error("temporary revoke failure"))
+      .mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderDevices();
+    await waitForEmbySessionTable();
+
+    await act(async () => {
+      findButton("撤销登录").click();
+      await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("temporary revoke failure"));
+    });
+    expect(revoke).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      findButton("撤销登录").click();
+      await vi.waitFor(() => expect(revoke).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(container.querySelector('[role="status"]')?.textContent).toContain("Emby 登录已撤销"));
+    });
+  });
+
+  it("allows retry after an Emby session read error", async () => {
+    const list = vi.spyOn(api, "adminUserEmbySessions")
+      .mockRejectedValueOnce(new Error("temporary Emby failure"))
+      .mockResolvedValueOnce({ sessions: [], page: 1, pageSize: 20, totalCount: 0 });
+    renderDevices();
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("读取 Emby 登录失败：temporary Emby failure"));
+    });
+
+    await act(async () => {
+      findButton("重试").click();
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(container.textContent).toContain("当前没有有效的 Emby 登录凭证。"));
+    });
+  });
+
   function renderDevices() {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user: makeUser() });
+    if (!vi.isMockFunction(api.adminUserWebSessions)) {
+      vi.spyOn(api, "adminUserWebSessions").mockResolvedValue({
+        sessions: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+    }
+    if (!vi.isMockFunction(api.adminUserEmbySessions)) {
+      vi.spyOn(api, "adminUserEmbySessions").mockResolvedValue({
+        sessions: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+    }
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -132,6 +350,12 @@ describe("AdminUserDetailPage Web session management", () => {
   async function waitForSessionTable() {
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-user-session-table")).toBeTruthy());
+    });
+  }
+
+  async function waitForEmbySessionTable() {
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-user-emby-session-table")).toBeTruthy());
     });
   }
 
@@ -161,5 +385,19 @@ function makeSession(id: string) {
     expiresAt: 1_702_000_000,
     lastSeenAt: 1_700_000_100,
     isCurrent: false,
+  };
+}
+
+function makeEmbySession(id: string) {
+  return {
+    id,
+    deviceId: "device-" + id,
+    deviceName: "Living Room",
+    deviceType: "TV",
+    clientName: "Infuse",
+    clientVersion: "8.1",
+    createdAt: 1_700_000_000,
+    updatedAt: 1_700_000_100,
+    lastSeenAt: 1_700_000_100 as number | null,
   };
 }
