@@ -1097,6 +1097,7 @@ fn emby_start_time_hint(start_time_ticks: i64, runtime_ticks: Option<i64>) -> Op
 fn emby_playback_session_error_status(error: WebPlaybackSessionError) -> StatusCode {
     match error {
         WebPlaybackSessionError::Invalid(_) => StatusCode::BAD_REQUEST,
+        WebPlaybackSessionError::PlaybackPolicyDenied => StatusCode::FORBIDDEN,
         WebPlaybackSessionError::NotFound => StatusCode::NOT_FOUND,
         WebPlaybackSessionError::Expired | WebPlaybackSessionError::NotActive => StatusCode::GONE,
         WebPlaybackSessionError::Hls(_) => StatusCode::BAD_GATEWAY,
@@ -2555,6 +2556,11 @@ pub(super) fn web_playback_error(headers: &HeaderMap, error: WebPlaybackSessionE
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             message,
+        ),
+        WebPlaybackSessionError::PlaybackPolicyDenied => (
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "当前用户策略未允许所需的服务端转码档位".to_owned(),
         ),
         WebPlaybackSessionError::NotFound => (
             StatusCode::NOT_FOUND,

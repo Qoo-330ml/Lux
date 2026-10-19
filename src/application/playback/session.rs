@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::storage::{
     Database, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
-    StoredWebPlaybackSession, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    StoredWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails,
 };
 
 use super::decision::{
@@ -104,6 +105,7 @@ pub struct SignedResource {
 #[derive(Debug)]
 pub(crate) enum WebPlaybackSessionError {
     Invalid(String),
+    PlaybackPolicyDenied,
     NotFound,
     Expired,
     NotActive,
@@ -115,6 +117,9 @@ impl fmt::Display for WebPlaybackSessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
+            Self::PlaybackPolicyDenied => {
+                formatter.write_str("server-side playback is not allowed by user policy")
+            }
             Self::NotFound => formatter.write_str("web playback session not found"),
             Self::Expired => formatter.write_str("web playback session expired"),
             Self::NotActive => formatter.write_str("web playback session is not active"),
@@ -128,7 +133,11 @@ impl std::error::Error for WebPlaybackSessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::Invalid(_) | Self::NotFound | Self::Expired | Self::NotActive => None,
+            Self::Invalid(_)
+            | Self::PlaybackPolicyDenied
+            | Self::NotFound
+            | Self::Expired
+            | Self::NotActive => None,
             Self::Hls(error) => Some(error),
         }
     }
@@ -257,12 +266,20 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
+        let policy = self
+            .database
+            .get_user_playback_policy(input.user_id)
+            .await?
+            .ok_or(WebPlaybackSessionError::NotFound)?;
         let capabilities =
             apply_server_capabilities(input.capabilities, self.hls.hardware_transcode_available());
-        let plan = WebPlaybackPlan::from(choose_plan(PlaybackDecisionInput {
-            source_kind: input.source_kind,
-            capabilities,
-        }));
+        let plan = WebPlaybackPlan::from(choose_plan_for_policy(
+            PlaybackDecisionInput {
+                source_kind: input.source_kind,
+                capabilities,
+            },
+            policy,
+        )?);
         let WebPlaybackPlan::Unsupported { .. } = plan else {
             let id = Uuid::now_v7().to_string();
             let play_session_id = format!("{}:{id}", input.play_session_prefix);
@@ -847,6 +864,54 @@ fn apply_server_capabilities(
     capabilities
 }
 
+fn choose_plan_for_policy(
+    input: PlaybackDecisionInput,
+    policy: UserPlaybackPolicy,
+) -> Result<PlaybackPlan, WebPlaybackSessionError> {
+    let unrestricted_plan = choose_plan(input);
+    if input.source_kind == PlaybackSourceKind::Strm
+        || input.capabilities.direct_play
+        || !matches!(unrestricted_plan, PlaybackPlan::ServerHls { .. })
+    {
+        return Ok(unrestricted_plan);
+    }
+
+    let capabilities = input.capabilities;
+    let candidates = [
+        (
+            capabilities.video_copy_to_fmp4 && capabilities.audio_copy_to_fmp4,
+            policy.allow_remux,
+            ServerTier::Remux,
+        ),
+        (
+            capabilities.video_copy_to_fmp4
+                && (!capabilities.audio_copy_to_fmp4 || !policy.allow_remux),
+            policy.allow_audio_transcode,
+            ServerTier::AudioTranscode,
+        ),
+        (
+            capabilities.hardware_transcode
+                && (capabilities.audio_copy_to_fmp4 || policy.allow_audio_transcode),
+            policy.allow_video_transcode,
+            ServerTier::HardwareTranscode,
+        ),
+        (
+            capabilities.software_transcode
+                && (capabilities.audio_copy_to_fmp4 || policy.allow_audio_transcode),
+            policy.allow_video_transcode,
+            ServerTier::SoftwareTranscode,
+        ),
+    ];
+    if let Some((_, _, tier)) = candidates
+        .into_iter()
+        .find(|(available, allowed, _)| *available && *allowed)
+    {
+        return Ok(PlaybackPlan::ServerHls { tier });
+    }
+
+    Err(WebPlaybackSessionError::PlaybackPolicyDenied)
+}
+
 #[derive(Clone)]
 pub struct ResourceSigner {
     key: [u8; 32],
@@ -912,13 +977,17 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
     use super::{
-        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities, unix_timestamp,
+        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities,
+        choose_plan_for_policy, unix_timestamp,
     };
     use crate::{
         application::{
             libraries::LibraryService,
             playback::{
-                decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
+                decision::{
+                    PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind,
+                    ServerTier, UnsupportedReason,
+                },
                 hls::{HlsManager, HlsSegmentContainer, HlsStartOptions},
                 session::{
                     CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan,
@@ -929,7 +998,7 @@ mod tests {
         },
         config::Config,
         library::LibraryKind,
-        storage::{NewWebPlaybackSession, WebPlaybackEventClaim},
+        storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
     };
     use uuid::Uuid;
 
@@ -998,6 +1067,142 @@ mod tests {
         );
 
         assert!(normalized.hardware_transcode);
+    }
+
+    #[test]
+    fn user_policy_skips_remux_and_selects_an_allowed_audio_transcode_tier() {
+        let plan = choose_plan_for_policy(
+            PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: PlaybackCapabilities {
+                    direct_play: false,
+                    hls: true,
+                    video_copy_to_fmp4: true,
+                    audio_copy_to_fmp4: true,
+                    hardware_transcode: true,
+                    software_transcode: true,
+                },
+            },
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: true,
+                allow_video_transcode: false,
+            },
+        );
+
+        assert!(matches!(
+            plan,
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::AudioTranscode
+            })
+        ));
+    }
+
+    #[test]
+    fn user_policy_selects_video_transcode_when_lower_tiers_are_forbidden() {
+        let plan = choose_plan_for_policy(
+            PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: PlaybackCapabilities {
+                    direct_play: false,
+                    hls: true,
+                    video_copy_to_fmp4: true,
+                    audio_copy_to_fmp4: true,
+                    hardware_transcode: true,
+                    software_transcode: true,
+                },
+            },
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: false,
+                allow_video_transcode: true,
+            },
+        );
+
+        assert!(matches!(
+            plan,
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode
+            })
+        ));
+    }
+
+    #[test]
+    fn user_policy_rejects_all_transcoding_without_affecting_direct_or_strm_rules() {
+        let policy = UserPlaybackPolicy {
+            can_play: true,
+            max_simultaneous_playbacks: 2,
+            allow_remux: false,
+            allow_audio_transcode: false,
+            allow_video_transcode: false,
+        };
+        let capabilities = PlaybackCapabilities {
+            direct_play: false,
+            hls: true,
+            video_copy_to_fmp4: true,
+            audio_copy_to_fmp4: true,
+            hardware_transcode: true,
+            software_transcode: true,
+        };
+
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities,
+                },
+                policy,
+            ),
+            Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+        ));
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: true,
+                        ..capabilities
+                    },
+                },
+                policy,
+            ),
+            Ok(PlaybackPlan::Direct)
+        ));
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::Strm,
+                    capabilities,
+                },
+                policy,
+            ),
+            Ok(PlaybackPlan::Unsupported {
+                reason: UnsupportedReason::StrmRequiresDirectPlay,
+            })
+        ));
+        assert!(matches!(
+            choose_plan_for_policy(
+                PlaybackDecisionInput {
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        video_copy_to_fmp4: false,
+                        audio_copy_to_fmp4: false,
+                        ..capabilities
+                    },
+                },
+                UserPlaybackPolicy {
+                    allow_remux: false,
+                    allow_audio_transcode: false,
+                    allow_video_transcode: true,
+                    ..policy
+                },
+            ),
+            Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+        ));
     }
 
     #[cfg(unix)]

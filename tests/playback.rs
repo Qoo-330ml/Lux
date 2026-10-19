@@ -1975,6 +1975,38 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
             .exists()
     );
 
+    sqlx::query(
+        "UPDATE users SET allow_remux = 0, allow_audio_transcode = 0,
+             allow_video_transcode = 0 WHERE id = ?",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    let policy_denied_transcoding = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": false,
+            "EnableDirectStream": false,
+            "EnableTranscoding": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        policy_denied_transcoding.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "a policy-denied Emby request must not leave an HLS session"
+    );
+
     let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
         "SELECT mi.id, ms.id
          FROM media_items mi

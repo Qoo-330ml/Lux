@@ -819,6 +819,13 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .bind(&admin_id)
         .execute(database.pool())
         .await?;
+    sqlx::query(
+        "UPDATE users SET allow_remux = 0, allow_audio_transcode = 1,
+             allow_video_transcode = 0 WHERE id = ?",
+    )
+    .bind(&admin_id)
+    .execute(database.pool())
+    .await?;
     let hls_create = client
         .post(format!("{base_url}/api/v1/playback/sessions"))
         .header(COOKIE, &cookies)
@@ -839,6 +846,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     assert_eq!(hls_create.status(), reqwest::StatusCode::OK);
     let hls_body = hls_create.json::<Value>().await?;
     assert_eq!(hls_body["plan"]["type"], "SERVER_HLS");
+    assert_eq!(
+        hls_body["tier"], 2,
+        "audio transcode is allowed when Remux is denied"
+    );
     let hls_session_id = hls_body["sessionId"]
         .as_str()
         .ok_or("missing HLS session id")?;
@@ -923,6 +934,42 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(hls_admission_state, "RELEASED");
+
+    sqlx::query(
+        "UPDATE users SET allow_remux = 0, allow_audio_transcode = 0,
+             allow_video_transcode = 0 WHERE id = ?",
+    )
+    .bind(&admin_id)
+    .execute(database.pool())
+    .await?;
+    let denied_hls = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "hardwareTranscode": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(denied_hls.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "a policy-denied Web request must not leave an HLS session"
+    );
 
     sqlx::query("UPDATE users SET can_play = 0 WHERE id = ?")
         .bind(&admin_id)

@@ -13099,14 +13099,16 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] 直放优先且不受转码权限影响；STRM 不创建 Remux、转码或 HLS 会话。
-- [ ] Remux、音频转码、硬件/软件视频转码分别遵守用户策略；禁止低档位时可选择其他允许且服务器可用的档位。
-- [ ] 所有兼容档位都被禁止时，Web 与 Emby 明确拒绝，不创建或遗留 HLS 会话。
-- [ ] Web 与 Emby 定向集成测试，以及 Rust 格式检查和 `git diff --check` 通过。
+- [x] 直放优先且不受转码权限影响；STRM 不创建 Remux、转码或 HLS 会话。
+- [x] Remux、音频转码、硬件/软件视频转码分别遵守用户策略；禁止低档位时可选择其他允许且服务器可用的档位。
+- [x] 所有兼容档位都被禁止时，Web 与 Emby 明确拒绝，不创建或遗留 HLS 会话。
+- [x] Web 与 Emby 定向集成测试，以及 Rust 格式检查和 `git diff --check` 通过。
 
 验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test web_playback`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
 
 依赖：LUX-614、LUX-615、LUX-617、LUX-620、LUX-623。
+
+结果（2026-10-19）：Web 与 Emby 共用的会话服务按用户策略和服务器能力选择最低允许 HLS 档位；转码权限全部关闭时，在写入会话或启动 HLS 前返回 403。直放及 STRM 的外部直放决策保持原样。策略单元测试 3/3、`web_playback` 1/1、`playback` 4/4 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --all-targets --all-features -- -D warnings` 被两个既有 `clippy::too_many_arguments` 报错阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`，本任务未修改这两个函数签名。未部署。
 
 ## 29. 参考资料
 
