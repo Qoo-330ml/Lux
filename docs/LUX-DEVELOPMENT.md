@@ -14539,6 +14539,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：`MediaAccessService::can_view_item` 在现有启用媒体库和 ACL 检查后读取用户策略，并按需取目标及系列/季度的分类索引；缺索引、无效策略或无可评估分类时拒绝。管理员和不存在/完全不收紧策略维持既有路径。详情、图片、字幕、下载、本地直放及 Emby 播放回调原本都使用该共享检查；ACL 1/1、playback 4/4、subtitles 1/1、download_api 1/1、image_api 1/1、直接访问/父级继承回归 1/1、领域策略 11/11、Rust build、fmt 和 diff check 通过。`cargo clippy --locked --lib -- -D warnings` 仍被未改动的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两个 `too_many_arguments` 警告阻断。
 
+#### LUX-695：在搜索候选分页前应用用户内容限制
+
+范围：将同一内容限制谓词加入 Lux 与 Emby 共用的 FTS/LIKE 搜索候选查询，在排序、总数和分页前过滤等级、标签、上级条目及未就绪索引。管理员和无收紧策略保持原结果。搜索并发合并键包含策略版本，不能让不同版本的同用户请求共享旧结果。本任务不覆盖首页/推荐或媒体库子项列表。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] Lux 与 Emby 搜索均在 SQL 的 `COUNT/LIMIT/OFFSET` 前执行统一内容限制；被过滤条目不增加总数或占用页位。
+- [x] FTS、LIKE fallback、PostgreSQL LIKE 和 SQLite 深页 FTS+LIKE union 分支都传递策略与对应有序标签绑定。
+- [x] 活跃策略下索引缺失 fail closed，父级限制继承；管理员及无策略、完全不收紧策略保持原结果。
+- [x] 应用搜索回归验证等级过滤和准确总数；search/catalog、Rust build、fmt 与 diff check 通过。
+
+短计划：先在 CatalogService 搜索回归创建可被同一搜索命中的允许/拒绝条目并确认尚未过滤；再让搜索并发键携带策略版本，并把版本化策略贯穿 SQLite/PostgreSQL 搜索绑定和所有分页分支；最后运行应用搜索、目录和内容策略回归及构建检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib library_search_applies_content_restrictions_before_pagination`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+结果（2026-10-19）：搜索并发合并键加入策略版本；SQLite FTS、LIKE 回退和深页 FTS+LIKE union、PostgreSQL LIKE 查询都在排序/计数/分页前使用相同策略谓词，标签绑定按 blocked/allowed 顺序分别应用到各搜索分支。应用回归覆盖最高等级、允许和屏蔽标签、过滤后总数、LIKE 回退与深页 union。定向应用测试 1/1、`tests/catalog.rs` 3/3、`cargo build --locked`、fmt 和 diff check 通过；PostgreSQL 分支本任务未连接真实 PostgreSQL 实例验证。
+
+依赖：LUX-694。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -77,6 +77,7 @@ struct CatalogSearchPageBindings<'a> {
     like_query: Option<&'a str>,
     item_types: &'a [String],
     library_ids: Option<&'a [String]>,
+    content_restriction_binds: &'a [CatalogBind<'a>],
     offset: i64,
     limit: i64,
 }
@@ -911,6 +912,7 @@ impl Database {
         library_ids: Option<&[String]>,
         offset: i64,
         limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<(Vec<String>, i64), StorageError> {
         if item_types.is_empty() {
             return Ok((Vec::new(), 0));
@@ -923,6 +925,7 @@ impl Database {
                     library_ids,
                     offset,
                     limit,
+                    content_restrictions,
                 )
                 .await;
         }
@@ -946,14 +949,21 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let fts_query = format!(
             "SELECT mi.id FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE media_search MATCH ? AND mi.removed_at IS NULL
-               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
-            library_filter.as_deref().unwrap_or_default()
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
+            library_filter.as_deref().unwrap_or_default(),
         );
         // Complete-token searches are served by FTS alone. The LIKE branch remains
         // available for partial searches, but is avoided when FTS already has a page.
@@ -970,6 +980,7 @@ impl Database {
                     like_query: None,
                     item_types,
                     library_ids,
+                    content_restriction_binds: &content_restriction_binds,
                     offset,
                     limit,
                 },
@@ -986,9 +997,9 @@ impl Database {
              WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
-               AND mi.removed_at IS NULL
-               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
-            library_filter.as_deref().unwrap_or_default()
+             AND mi.removed_at IS NULL
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
+            library_filter.as_deref().unwrap_or_default(),
         );
         let like_page_query = format!(
             "SELECT matches.id, COUNT(*) OVER() AS total FROM ({like_query_sql}) matches
@@ -1004,6 +1015,7 @@ impl Database {
                         like_query: Some(like_query),
                         item_types,
                         library_ids,
+                        content_restriction_binds: &content_restriction_binds,
                         offset,
                         limit,
                     },
@@ -1024,6 +1036,7 @@ impl Database {
                 like_query: Some(like_query),
                 item_types,
                 library_ids,
+                content_restriction_binds: &content_restriction_binds,
                 offset,
                 limit,
             },
@@ -1038,6 +1051,7 @@ impl Database {
         library_ids: Option<&[String]>,
         offset: i64,
         limit: i64,
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<(Vec<String>, i64), StorageError> {
         if let Some(library_ids) = library_ids
             && library_ids.is_empty()
@@ -1058,6 +1072,13 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let like_query_sql = format!(
             "SELECT mi.id FROM media_search ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -1066,8 +1087,8 @@ impl Database {
              WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
                     OR ms.aliases ILIKE ? ESCAPE '\\')
                AND mi.removed_at IS NULL
-               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
-            library_filter.as_deref().unwrap_or_default()
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
+            library_filter.as_deref().unwrap_or_default(),
         );
         let page_query = format!(
             "SELECT matches.id, COUNT(*) OVER() AS total FROM ({like_query_sql}) matches
@@ -1081,6 +1102,7 @@ impl Database {
                 like_query: Some(like_query),
                 item_types,
                 library_ids,
+                content_restriction_binds: &content_restriction_binds,
                 offset,
                 limit,
             },
@@ -1104,6 +1126,13 @@ impl Database {
                     statement = statement.bind(library_id);
                 }
             }
+            for bind in bindings.content_restriction_binds {
+                statement = match bind {
+                    CatalogBind::Text(value) => statement.bind(*value),
+                    CatalogBind::Integer(value) => statement.bind(*value),
+                    CatalogBind::Real(value) => statement.bind(*value),
+                };
+            }
         }
         if let Some(like_query) = bindings.like_query {
             statement = statement.bind(like_query).bind(like_query).bind(like_query);
@@ -1114,6 +1143,13 @@ impl Database {
                 for library_id in library_ids {
                     statement = statement.bind(library_id);
                 }
+            }
+            for bind in bindings.content_restriction_binds {
+                statement = match bind {
+                    CatalogBind::Text(value) => statement.bind(*value),
+                    CatalogBind::Integer(value) => statement.bind(*value),
+                    CatalogBind::Real(value) => statement.bind(*value),
+                };
             }
         }
         let rows = statement

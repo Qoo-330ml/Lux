@@ -83,6 +83,7 @@ struct SearchFlightKey {
     query: String,
     like_query: String,
     item_types: Vec<String>,
+    content_restriction_version: Option<i64>,
     offset: i64,
     limit: i64,
 }
@@ -1930,6 +1931,13 @@ impl CatalogService {
         } else {
             Some(self.access.accessible_library_ids(principal).await?)
         };
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database
+                .user_content_restrictions(&principal.user_id_string())
+                .await?
+        };
         let key = SearchFlightKey {
             user_id: principal.user_id_string(),
             is_admin: principal.is_admin,
@@ -1937,6 +1945,9 @@ impl CatalogService {
             query: query.to_owned(),
             like_query: like_query.to_owned(),
             item_types: item_types.clone(),
+            content_restriction_version: content_restrictions
+                .as_ref()
+                .map(|restrictions| restrictions.version),
             offset,
             limit,
         };
@@ -1951,6 +1962,7 @@ impl CatalogService {
                 let task_like_query = like_query.to_owned();
                 let task_library_ids = library_ids.clone();
                 let task_item_types = item_types.clone();
+                let task_content_restrictions = content_restrictions.clone();
                 let task = tokio::spawn(async move {
                     let result = service
                         .search_items_uncached(
@@ -1958,6 +1970,7 @@ impl CatalogService {
                             &task_like_query,
                             task_library_ids.as_deref(),
                             &task_item_types,
+                            task_content_restrictions.as_ref(),
                             offset,
                             limit,
                         )
@@ -1985,6 +1998,7 @@ impl CatalogService {
                     like_query,
                     library_ids.as_deref(),
                     &item_types,
+                    content_restrictions.as_ref(),
                     offset,
                     limit,
                 )
@@ -1996,6 +2010,7 @@ impl CatalogService {
                     like_query,
                     library_ids.as_deref(),
                     &item_types,
+                    content_restrictions.as_ref(),
                     offset,
                     limit,
                 )
@@ -2010,12 +2025,21 @@ impl CatalogService {
         like_query: &str,
         library_ids: Option<&[String]>,
         item_types: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let (ids, total) = self
             .database
-            .search_catalog_item_ids(query, like_query, item_types, library_ids, offset, limit)
+            .search_catalog_item_ids(
+                query,
+                like_query,
+                item_types,
+                library_ids,
+                offset,
+                limit,
+                content_restrictions,
+            )
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
         let items_by_id = assemble_items(rows)
@@ -2832,6 +2856,7 @@ mod tests {
             query: "query".to_owned(),
             like_query: "%query%".to_owned(),
             item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+            content_restriction_version: None,
             offset: 0,
             limit: 50,
         };
@@ -3219,6 +3244,144 @@ mod tests {
             .await?;
         assert_eq!(updated_page.total, 1);
         assert_eq!(updated_page.items[0].id, "policy-visible");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_search_applies_content_restrictions_before_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "search-policy-viewer",
+                "Search Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Search policy movies", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        for (item_id, title, certification, tags) in [
+            (
+                "search-policy-visible",
+                "Policy Visible Film",
+                "PG",
+                &["approved"][..],
+            ),
+            (
+                "search-policy-hidden",
+                "Policy Hidden Film",
+                "R",
+                &["approved"][..],
+            ),
+            (
+                "search-policy-blocked-tag",
+                "Policy Blocked Tag Film",
+                "PG",
+                &["approved", "violent"][..],
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(title)
+            .bind(title)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+            for tag in tags {
+                sqlx::query(
+                    "INSERT INTO media_content_restriction_tags (item_id, tag) VALUES (?, ?)",
+                )
+                .bind(item_id)
+                .bind(tag)
+                .execute(database.pool())
+                .await?;
+            }
+        }
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let item_types = vec!["MOVIE".to_owned()];
+        let before_policy = catalog
+            .search_items_with_types(principal, "policy", "%Policy%", item_types.clone(), 0, 10)
+            .await?;
+        assert_eq!(before_policy.total, 3);
+
+        let allowed_tags = vec!["approved".to_owned()];
+        let blocked_tags = vec!["violent".to_owned()];
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &allowed_tags,
+                    blocked_tags: &blocked_tags,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        let restricted_page = catalog
+            .search_items_with_types(principal, "policy", "%Policy%", item_types, 0, 1)
+            .await?;
+        assert_eq!(restricted_page.total, 1);
+        assert_eq!(restricted_page.items.len(), 1);
+        assert_eq!(restricted_page.items[0].id, "search-policy-visible");
+        let like_fallback = catalog
+            .search_items_with_types(principal, "oli", "%oli%", vec!["MOVIE".to_owned()], 0, 10)
+            .await?;
+        assert_eq!(like_fallback.total, 1);
+        assert_eq!(like_fallback.items[0].id, "search-policy-visible");
+        let past_end = catalog
+            .search_items_with_types(
+                principal,
+                "policy",
+                "%Policy%",
+                vec!["MOVIE".to_owned()],
+                1,
+                1,
+            )
+            .await?;
+        assert!(past_end.items.is_empty());
         Ok(())
     }
 }
