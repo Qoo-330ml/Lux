@@ -34,6 +34,8 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
+  AdminUserPermissionPreset,
+  AdminUserPermissionPresetInput,
   AdminUserLibraryAccess,
   AdminUserLibraryAccessUpdateResult,
   AdminUserPlaybackPolicy,
@@ -1097,6 +1099,37 @@ export class LuxApiClient {
     });
     if (options.search?.trim()) params.set("search", options.search.trim());
     return this.request<AdminUserListResponse>(`/api/v1/admin/users?${params}`);
+  }
+
+  adminUserPermissionPresets() {
+    return this.request<{ presets: AdminUserPermissionPreset[] }>(
+      "/api/v1/admin/user-permission-presets",
+    );
+  }
+
+  createAdminUserPermissionPreset(input: AdminUserPermissionPresetInput) {
+    return this.request<{ preset: AdminUserPermissionPreset }>(
+      "/api/v1/admin/user-permission-presets",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  updateAdminUserPermissionPreset(
+    presetId: string,
+    version: number,
+    input: AdminUserPermissionPresetInput,
+  ) {
+    return this.request<{ preset: AdminUserPermissionPreset }>(
+      `/api/v1/admin/user-permission-presets/${encodeURIComponent(presetId)}`,
+      { method: "PUT", body: JSON.stringify({ version, ...input }) },
+    );
+  }
+
+  deleteAdminUserPermissionPreset(presetId: string, version: number) {
+    return this.request<void>(
+      `/api/v1/admin/user-permission-presets/${encodeURIComponent(presetId)}?version=${version}`,
+      { method: "DELETE" },
+    );
   }
 
   adminUser(userId: string) {

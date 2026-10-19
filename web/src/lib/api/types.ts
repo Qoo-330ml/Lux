@@ -1160,6 +1160,25 @@ export type NewUserPermissions = {
   allowVideoTranscode: boolean;
 };
 
+export type AdminUserPermissionPreset = {
+  id: string;
+  name: string;
+  description: string | null;
+  version: number;
+  isBuiltin: boolean;
+  isAdmin: boolean;
+  canManageServer: boolean;
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserPermissionPresetInput = {
+  name: string;
+  description: string | null;
+  isAdmin: boolean;
+  canManageServer: boolean;
+  permissions: NewUserPermissions;
+};
+
 export type MediaStrategySettings = {
   metadataLanguage: string;
   imageLanguage: string;

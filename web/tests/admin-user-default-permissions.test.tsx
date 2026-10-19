@@ -110,7 +110,88 @@ describe("AdminUserSettingsPage new user permission defaults", () => {
     expect(findButton("保存默认权限").disabled).toBe(false);
   });
 
-  function renderPage(permissionDefaults: NewUserPermissions) {
+  it("edits versioned presets while keeping built-in presets read-only", async () => {
+    const adminPreset = permissionPreset({
+      id: "builtin-admin",
+      name: "管理员",
+      isBuiltin: true,
+      isAdmin: true,
+      canManageServer: true,
+    });
+    const familyPreset = permissionPreset({ id: "preset-family", name: "Family", version: 3 });
+    const load = vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [adminPreset, familyPreset] });
+    const update = vi.spyOn(api, "updateAdminUserPermissionPreset").mockResolvedValue({
+      preset: permissionPreset({ id: familyPreset.id, name: "Friends", version: 4 }),
+    });
+    vi.spyOn(api, "deleteAdminUserPermissionPreset").mockResolvedValue(undefined);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderPage(defaults(), "/admin/users/settings?section=presets");
+    await waitForPresets();
+
+    expect(container.textContent).toContain("管理员");
+    expect(container.textContent).toContain("Family");
+    expect(findActionButton("编辑预设 管理员").disabled).toBe(true);
+    expect(findActionButton("删除预设 管理员").disabled).toBe(true);
+
+    await act(async () => findActionButton("编辑预设 Family").click());
+    await act(async () => {
+      changeTextInput("预设名称", "Friends");
+      findInput("允许下载").click();
+      changePresetNumberInput("4");
+    });
+    await act(async () => {
+      findButton("保存预设").click();
+      await vi.waitFor(() => expect(update).toHaveBeenCalledWith(familyPreset.id, 3, {
+        name: "Friends",
+        description: "A reusable permission snapshot",
+        isAdmin: false,
+        canManageServer: false,
+        permissions: { ...defaults(), canDownload: true, maxSimultaneousPlaybacks: 4 },
+      }));
+    });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("已更新");
+    await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      findActionButton("删除预设 Family").click();
+      await vi.waitFor(() => expect(confirm).toHaveBeenCalled());
+      await vi.waitFor(() => expect(api.deleteAdminUserPermissionPreset).toHaveBeenCalledWith(familyPreset.id, 3));
+    });
+  });
+
+  it("creates a preset and keeps the draft after a server validation error", async () => {
+    vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [
+      permissionPreset({ id: "builtin-admin", name: "管理员", isBuiltin: true, isAdmin: true, canManageServer: true }),
+      permissionPreset({ id: "builtin-user", name: "普通用户", isBuiltin: true }),
+    ] });
+    vi.spyOn(api, "createAdminUserPermissionPreset")
+      .mockRejectedValueOnce(new Error("名称已存在"))
+      .mockResolvedValueOnce({ preset: permissionPreset({ id: "preset-new", name: "Friends" }) });
+    renderPage(defaults(), "/admin/users/settings?section=presets");
+    await waitForPresets();
+
+    await act(async () => findButton("新建角色预设").click());
+    await act(async () => changeTextInput("预设名称", "Friends"));
+    await act(async () => {
+      findButton("保存预设").click();
+      await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("名称已存在"));
+    });
+    expect((container.querySelector('input[aria-label="预设名称"]') as HTMLInputElement).value).toBe("Friends");
+
+    await act(async () => {
+      findButton("保存预设").click();
+      await vi.waitFor(() => expect(api.createAdminUserPermissionPreset).toHaveBeenLastCalledWith({
+        name: "Friends",
+        description: null,
+        isAdmin: false,
+        canManageServer: false,
+        permissions: defaults(),
+      }));
+    });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("已创建");
+  });
+
+  function renderPage(permissionDefaults: NewUserPermissions, initialEntry = "/admin/users/settings?section=defaults") {
     vi.spyOn(api, "adminSettings").mockResolvedValue(settings(permissionDefaults));
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [
       { id: "library-1", name: "电影库", kind: "MOVIE", isEnabled: true, realtimeWatchEnabled: false, realtimeMetadataAutoMatchEnabled: false, roots: [] },
@@ -122,7 +203,7 @@ describe("AdminUserSettingsPage new user permission defaults", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     act(() => root.render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={["/admin/users/settings?section=defaults"]}>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <AdminUserSettingsPage />
         </MemoryRouter>
       </QueryClientProvider>,
@@ -133,6 +214,13 @@ describe("AdminUserSettingsPage new user permission defaults", () => {
   async function waitForEditor() {
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-new-user-permissions")).toBeTruthy());
+    });
+  }
+
+  async function waitForPresets() {
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-user-presets")).toBeTruthy());
+      await vi.waitFor(() => expect(container.textContent).toContain("角色预设"));
     });
   }
 
@@ -187,9 +275,58 @@ describe("AdminUserSettingsPage new user permission defaults", () => {
     });
   }
 
+  function changePresetNumberInput(value: string) {
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="预设同时播放上限"]');
+    expect(input).toBeTruthy();
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      input?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+
+  function changeTextInput(label: string, value: string) {
+    const input = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
+    expect(input).toBeTruthy();
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      input?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+
+  function permissionPreset(changes: Partial<{
+    id: string;
+    name: string;
+    version: number;
+    isBuiltin: boolean;
+    isAdmin: boolean;
+    canManageServer: boolean;
+  }> = {}) {
+    return {
+      id: "preset-custom",
+      name: "Family",
+      description: "A reusable permission snapshot",
+      version: 1,
+      isBuiltin: false,
+      isAdmin: false,
+      canManageServer: false,
+      permissions: defaults(),
+      ...changes,
+    };
+  }
+
   function findButton(label: string) {
     const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent?.includes(label));
     expect(button, `button containing ${label}`).toBeTruthy();
+    return button!;
+  }
+
+  function findActionButton(label: string) {
+    const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+    expect(button, `button ${label}`).toBeTruthy();
     return button!;
   }
 });

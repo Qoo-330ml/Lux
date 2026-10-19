@@ -13442,6 +13442,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增管理员预设列表与自定义预设创建/更新/删除 API，写操作通过 CSRF 校验并记录审计事件；更新和删除要求当前预设版本。`users` target 2/2、Rust build、fmt check 和 diff check 通过；集成回归覆盖非管理员读写拒绝、重复名称、无效快照、内置项保护、陈旧版本、缺失版本及不存在项。
 
+#### LUX-641：在用户全局设置中管理权限预设
+
+范围：为模块四“角色预设”占位页增加自定义预设列表、新建、编辑和删除表单，复用已完成的管理员预设 API；展示两个只读内置预设和每份快照的管理角色、媒体库、下载、播放与转码信息。不在本任务中将预设应用到已有账号。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-default-permissions.test.tsx`。
+
+验收标准：
+
+- [x] 全局设置“角色预设”页读取并区分内置和自定义预设，内置项只读。
+- [x] 管理员可创建、编辑和删除自定义预设；保存快照覆盖媒体库、管理角色、下载、播放、并发和转码选项。
+- [x] 表单校验非空名称、并发上限和空媒体库选择；服务器错误保留可继续编辑的草稿。
+- [x] Web 定向回归、构建和 diff check 通过，桌面/窄屏浏览器验证可操作。
+
+短计划：先扩展现有默认权限设置测试，覆盖预设页加载与保存；再添加 API 客户端方法、页面交互并验证真实浏览器。
+
+验证：`pnpm --dir web test -- admin-user-default-permissions`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-640。
+
+结果（2026-10-19）：页面接入管理员预设 API，支持自定义权限快照的创建、版本化更新与删除，并展示不可变内置项。定向 Vitest 6/6、冻结依赖安装、Web 构建、diff check 通过。Playwright 真实浏览器在 1280px 桌面和 390px 窄屏验证完整 CRUD，移动视口无页面横向溢出；控制台的 401 来自登录前匿名 `/auth/me` 探测，404 来自临时管理员无头像资源。
+
+完整 Web 门禁未全绿：`pnpm --dir web test` 的 Node 布局断言失败（其中 hero 行高期望与工作区既有 `web/src/react.css` 修改不一致）；单独全量 Vitest 为 91 个文件、677 passed、4 failed。四项失败位于既有首页预取焦点、LibraryCard 预取/虚拟链接和媒体图片轮询测试，与本任务文件无关。该工作区 `web/src/react.css` 的改动属于已有用户修改，未触碰或纳入提交。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
