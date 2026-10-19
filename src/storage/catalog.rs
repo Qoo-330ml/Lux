@@ -9019,6 +9019,61 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_web_session_summaries_page(
+        &self,
+        user_id: &str,
+        current_session_token_hash: &[u8],
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredWebSessionSummary>, i64), StorageError> {
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let total_count = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM web_sessions
+                 WHERE user_id = ? AND revoked_at IS NULL AND expires_at > unixepoch()",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let sessions = self
+            .query(
+                "SELECT id, created_at, updated_at, expires_at, last_seen_at,
+                        session_token_hash = ? AS is_current
+                 FROM web_sessions
+                 WHERE user_id = ? AND revoked_at IS NULL AND expires_at > unixepoch()
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(current_session_token_hash)
+            .bind(user_id)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredWebSessionSummary {
+                        id: row.get("id"),
+                        created_at: row.get("created_at"),
+                        updated_at: row.get("updated_at"),
+                        expires_at: row.get("expires_at"),
+                        last_seen_at: row.get("last_seen_at"),
+                        is_current: row.get::<i64, _>("is_current") != 0,
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((sessions, total_count))
+    }
+
     pub(crate) async fn revoke_web_session_by_id(
         &self,
         user_id: &str,
@@ -9919,6 +9974,72 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(retry_result, (2, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_web_session_page_is_bounded_and_filters_inactive_sessions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::setup::SetupService, config::Config};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup
+            .complete("Session Admin", "Session Admin", "admin password")
+            .await?;
+        let current_token_hash = vec![100_u8; 32];
+
+        for index in 0..101 {
+            let token_hash = vec![index as u8; 32];
+            database
+                .create_web_session(
+                    &format!("session-{index:03}"),
+                    &user.id.to_string(),
+                    &token_hash,
+                    &[0_u8; 32],
+                    3600,
+                )
+                .await?;
+        }
+
+        let (first_page, total_count) = database
+            .list_web_session_summaries_page(&user.id.to_string(), &current_token_hash, 500, 0)
+            .await?;
+        assert_eq!(first_page.len(), 100);
+        assert_eq!(total_count, 101);
+        assert_eq!(first_page[0].id, "session-100");
+        assert!(first_page[0].is_current);
+
+        let (second_page, second_count) = database
+            .list_web_session_summaries_page(&user.id.to_string(), &[], 500, 100)
+            .await?;
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].id, "session-000");
+        assert_eq!(second_count, 101);
+
+        sqlx::query("UPDATE web_sessions SET revoked_at = unixepoch() WHERE id = 'session-100'")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "UPDATE web_sessions SET expires_at = unixepoch() - 1 WHERE id = 'session-099'",
+        )
+        .execute(database.pool())
+        .await?;
+        let (active_sessions, active_count) = database
+            .list_web_session_summaries_page(&user.id.to_string(), &[], 100, 0)
+            .await?;
+        assert_eq!(active_count, 99);
+        assert_eq!(active_sessions.len(), 99);
+        assert!(
+            active_sessions
+                .iter()
+                .all(|session| session.id != "session-100" && session.id != "session-099")
+        );
         Ok(())
     }
 }

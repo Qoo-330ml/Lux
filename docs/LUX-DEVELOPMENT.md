@@ -13805,6 +13805,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：账户页已读取服务端偏好快照；正版本服务端设置覆盖旧浏览器值，版本 0 只迁移一次现存本地偏好且不提交媒体库顺序。更新通过 CAS 队列按返回版本串行保存，成功后更新本地缓存与首页查询；遇到版本冲突禁用偏好控件并提示刷新，普通网络错误保留当前选择且允许再次保存。初始读取失败时控件保持禁用并提供重试。账户设置回归 31/31、TypeScript 与 Web production build、diff check 通过。尚未部署。
 
+#### LUX-659：为管理员会话管理提供分页存储查询
+
+范围：为管理员读取单个用户有效 Web 会话提供服务端分页存储查询，返回有效会话总数及单页摘要，并标记当前 Web 会话。每页上限为 100；摘要只包含会话 ID、创建/更新时间、过期时间及最近活动时间，不包含凭证。HTTP 路由、撤销与页面接线留待后续任务。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`（含存储回归）。
+
+验收标准：
+
+- [x] 查询只返回指定用户未撤销且未过期的 Web 会话，并提供稳定的时间/ID 排序及总数。
+- [x] 分页偏移与大小受存储层约束，超大页请求不能超过 100 条；当前会话标记只比较 token 摘要。
+- [x] 存储定向回归、Rust 格式检查和 diff check 通过。
+
+短计划：先补多会话、分页边界、过期/撤销过滤和当前会话标记的存储回归；再新增有界 SQL 页面读取与总数查询。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib admin_web_session_page`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：增加只读有效 Web 会话页查询及总数读取，SQL 按更新时间和 ID 倒序分页，存储层将页大小限制在 1–100 并将负偏移归零；当前会话通过 token 摘要比较标记。回归覆盖 101 条会话的分页/硬上限，以及已撤销和已过期记录过滤，`admin_web_session_page` 1/1、fmt check 与 diff check 通过。管理员 HTTP 路由及撤销留给 LUX-660。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
