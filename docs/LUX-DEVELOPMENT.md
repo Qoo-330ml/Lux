@@ -15889,6 +15889,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 时加入用户设备规则后的已有会话仍返回 200；实现后新增 Web 黑名单集成回归通过，覆盖现有会话撤销、新登录拒绝、另一设备保留访问及全局客户端拒绝。`cargo test --locked --test users -- --test-threads=1` 在设置 `NO_PROXY` 绕过本地代理后 22/22 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 使用 Toshiba target 目录；Emby、播放链接与 IP/CIDR 规则留待后续任务。
 
+#### LUX-760：在 Emby 登录与凭证访问中执行设备/客户端黑名单
+
+范围：Emby 用户登录签发 token 前，以用户、客户端声明设备 ID 和规范化客户端名检查启用的全站及用户级 DEVICE/CLIENT 规则；命中时不签发凭证。已有凭证的每次认证解析重复检查；命中时立即撤销该凭证并按未认证处理。规则读取失败时 fail closed。共享管理员 API Key 不属于普通用户设备，不执行此规则。只覆盖 Emby 认证及凭证，不接播放链接或 IP/CIDR。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/emby.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] Emby 新登录命中设备或客户端规则时返回未认证且不创建 token；不同设备/客户端仍可登录。
+- [x] 已有 Emby 凭证首次命中规则时被撤销，认证请求被拒绝；不匹配的凭证继续有效。
+- [x] Emby 认证集成定向目标、Rust build、fmt 与 diff check 通过。
+- [x] 不接入共享管理员 API Key、播放链接或 IP/CIDR 规则。
+
+短计划：先在 `tests/emby_auth.rs` 覆盖凭证签发、加入设备规则后既有凭证访问和另一个设备登录，并确认当前访问仍有效；再在 `EmbyAuthService` 签发及 token 解析路径复用 LUX-758 查询，命中时撤销现有凭证；最后运行 `emby_auth` 定向目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：Emby token 签发前检查设备 ID 和按规则规范化的客户端名；匹配规则时以现有未认证响应拒绝，不写凭证。已签发 token 每次解析时读取设备摘要，命中后立即撤销并按未认证处理；规则存储失败时不继续授权。共享管理员 API Key 不走普通 Emby 用户凭证路径。
+
+验证：TDD RED 先证明加入设备规则后旧 token 仍可访问；实现后 `emby_login_and_existing_tokens_enforce_device_client_blacklists` 通过，覆盖 token 撤销、同设备拒绝、其他设备继续登录及全局客户端规则规范化。`cargo test --locked --test emby_auth -- --test-threads=1` 绕过本地回环代理后 12/12 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 使用 Toshiba target 目录；播放链接与 IP/CIDR 仍由后续任务处理。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

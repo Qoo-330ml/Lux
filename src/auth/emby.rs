@@ -3,12 +3,18 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    application::user_access_rules::{
+        UserAccessBlacklistRuleType, normalize_user_access_blacklist_value,
+    },
     auth::{
         password::PasswordError,
         users::{UserRecord, UserStore, UserStoreError},
     },
     domain::ids::UserId,
-    storage::{Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary},
+    storage::{
+        Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary,
+        UserAccessBlacklistRuleMatchQuery,
+    },
 };
 
 #[derive(Clone)]
@@ -72,7 +78,7 @@ impl EmbyAuthService {
         else {
             return Ok(None);
         };
-        self.create_access_token(user, device).await.map(Some)
+        self.create_access_token(user, device).await
     }
 
     pub async fn find_failed_authentication_user_id(
@@ -94,14 +100,20 @@ impl EmbyAuthService {
         let Some(user) = self.users.authenticate_by_id(user_id, password).await? else {
             return Ok(None);
         };
-        self.create_access_token(user, device).await.map(Some)
+        self.create_access_token(user, device).await
     }
 
     async fn create_access_token(
         &self,
         user: UserRecord,
         device: &EmbyDeviceInfo,
-    ) -> Result<EmbyAuthResult, EmbyAuthError> {
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        if self
+            .user_access_blacklist_matches(&user.id.to_string(), device)
+            .await?
+        {
+            return Ok(None);
+        }
         let token = generate_token()?;
         let token_id = UserId::new().to_string();
         let token_hash = hash_token(&token);
@@ -118,12 +130,37 @@ impl EmbyAuthService {
                 device_type: None,
             })
             .await?;
-        Ok(EmbyAuthResult {
+        Ok(Some(EmbyAuthResult {
             token,
             session_id: token_id,
             user: user.clone(),
             device: device.clone(),
-        })
+        }))
+    }
+
+    async fn user_access_blacklist_matches(
+        &self,
+        user_id: &str,
+        device: &EmbyDeviceInfo,
+    ) -> Result<bool, EmbyAuthError> {
+        let device_id = normalize_user_access_blacklist_value(
+            UserAccessBlacklistRuleType::Device,
+            &device.device_id,
+        )
+        .ok();
+        let client_name = normalize_user_access_blacklist_value(
+            UserAccessBlacklistRuleType::Client,
+            &device.client,
+        )
+        .ok();
+        Ok(self
+            .database
+            .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                user_id,
+                device_id: device_id.as_deref(),
+                client_name: client_name.as_deref(),
+            })
+            .await?)
     }
 
     pub async fn logout(&self, token: &str) -> Result<(), EmbyAuthError> {
@@ -201,6 +238,14 @@ impl EmbyAuthService {
             return Ok(None);
         };
         if stored.is_disabled {
+            return Ok(None);
+        }
+        if let Some(device) = self.device_info(token).await?
+            && self
+                .user_access_blacklist_matches(&stored.id, &device)
+                .await?
+        {
+            self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
         user_record(stored).map(Some)

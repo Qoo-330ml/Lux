@@ -1260,6 +1260,137 @@ async fn emby_authenticated_access_refreshes_device_activity()
 }
 
 #[tokio::test]
+async fn emby_login_and_existing_tokens_enforce_device_client_blacklists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let target = UserStore::new(database.clone())?
+        .create_user(
+            "emby-blacklist-target",
+            "Emby Blacklist Target",
+            "target password",
+            false,
+        )
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let base_url = format!("http://{address}");
+    let login = |client_name: &str, device_id: &str| {
+        client
+            .post(format!("{base_url}/Users/AuthenticateByName"))
+            .header(
+                AUTHORIZATION,
+                format!(
+                    r#"Emby Client="{client_name}", Device="Test Device", DeviceId="{device_id}", Version="1.0""#
+                ),
+            )
+            .json(&json!({
+                "Username": "emby-blacklist-target",
+                "Pw": "target password"
+            }))
+    };
+
+    let device_a = "emby-blacklist-device-a";
+    let first_login = login("Infuse", device_a).send().await?;
+    assert_eq!(first_login.status(), reqwest::StatusCode::OK);
+    let first_token = first_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing access token")?
+        .to_owned();
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES (?, ?, 'DEVICE', ?, 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(target.id.to_string())
+    .bind(device_a)
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let blocked_existing_token = client
+        .get(format!("{base_url}/Users/{}", target.id))
+        .header("X-Emby-Token", &first_token)
+        .send()
+        .await?;
+    assert_eq!(
+        blocked_existing_token.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let first_token_hash = Sha256::digest(first_token.as_bytes()).to_vec();
+    let revoked_at: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE token_hash = ?")
+            .bind(first_token_hash)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(revoked_at.is_some());
+
+    let denied_device_login = login("Infuse", device_a).send().await?;
+    assert_eq!(
+        denied_device_login.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let device_b = "emby-blacklist-device-b";
+    let other_device_login = login("Infuse", device_b).send().await?;
+    assert_eq!(other_device_login.status(), reqwest::StatusCode::OK);
+    let other_device_token = other_device_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing other-device token")?
+        .to_owned();
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES (?, NULL, 'CLIENT', 'infuse', 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let blocked_by_client = client
+        .get(format!("{base_url}/Users/{}", target.id))
+        .header("X-Emby-Token", &other_device_token)
+        .send()
+        .await?;
+    assert_eq!(
+        blocked_by_client.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let denied_normalized_client = login("  INFUSE   ", "emby-blacklist-device-c")
+        .send()
+        .await?;
+    assert_eq!(
+        denied_normalized_client.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let other_client_login = login("Plex", "emby-blacklist-device-c").send().await?;
+    assert_eq!(other_client_login.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_password_logins_update_device_inventory_without_blocking_auth()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
