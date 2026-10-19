@@ -14247,6 +14247,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 SQLite migration 0192；NFO 认证元数据实际变化或清空时，触发删除条目分类索引并级联删除标签。SQLite catalog 兼容表重建后会幂等恢复该触发器；无变化更新保留索引。空库专项测试 1/1、build、fmt、diff 检查通过；测试目标 Clippy 在豁免既有 `too_many_arguments` 与 `type_complexity` 后通过。
 
+#### LUX-681：为 PostgreSQL 建立等价的内容索引失效触发器
+
+范围：为 PostgreSQL 的 NFO 缓存变化建立与 LUX-680 相同行为的索引失效触发器，并通过本地 PostgreSQL 集成测试验证更新、清空、无变化更新和标签级联清理。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations-postgres/0192_media_content_restriction_index_invalidation.sql`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] PostgreSQL 对 `nfo_metadata_json` 使用行级 `AFTER UPDATE` 触发器，只在旧值与新值不同时删除分类索引和标签。
+- [x] PostgreSQL 空库测试验证无变化更新保留索引、内容变化或清空时失效，以及后续媒体/索引级联删除。
+- [x] PostgreSQL 定向集成测试、build、fmt 与 diff 检查通过。
+
+短计划：先扩展专用 PostgreSQL migration 测试并确认 NFO 变化不会使现有索引失效；再添加与 LUX-680 同版本的 PostgreSQL 函数/触发器 migration；最后在本地 PostgreSQL 上运行专项测试并执行格式与构建检查。
+
+验证：确认 Toshiba 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_media_content_restriction_index_migration -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-679、LUX-680。
+
+结果（2026-10-19）：PostgreSQL schema 192 使用 `AFTER UPDATE OF nfo_metadata_json` 行级触发器，并以 `OLD ... IS DISTINCT FROM NEW ...` 条件仅对真实变化失效索引；认证变化与清空均会级联删除标签，无变化更新保留索引。PostgreSQL migration/行为专项 1/1、build、fmt、diff 和过滤既有测试 lint 后的 Clippy 通过。实现依据 PostgreSQL 16 的 [CREATE TRIGGER](https://www.postgresql.org/docs/16/sql-createtrigger.html) 和 [PL/pgSQL Trigger Functions](https://www.postgresql.org/docs/16/plpgsql-trigger.html) 说明。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -182,6 +182,86 @@ async fn postgres_media_content_restriction_index_migration()
     )
     .execute(database.pool())
     .await?;
+
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = nfo_metadata_json
+         WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let unchanged_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged_index_rows, 1);
+
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"R\"}'
+         WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let changed_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let changed_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_index_rows, 0);
+    assert_eq!(changed_tag_rows, 0);
+
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'R')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = NULL WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let cleared_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let cleared_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cleared_index_rows, 0);
+    assert_eq!(cleared_tag_rows, 0);
+
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', NULL)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
     sqlx::query("DELETE FROM media_items WHERE id = 'restriction-index-item'")
         .execute(database.pool())
         .await?;
