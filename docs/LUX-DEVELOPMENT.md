@@ -14823,6 +14823,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`tests/admin-user-batch-actions.test.tsx` 6/6、`pnpm --dir web build` 和 `git diff --check` 通过。未运行完整 Web 测试套件。
 
+#### LUX-708：为权限复制提供有界用户策略快照读取
+
+范围：为模块四的“从来源账号复制权限到多个目标账号”建立存储读取合同，一次读取来源和最多 100 个目标的显式媒体库模式/库 ID、播放/下载/转码权限及内容限制快照与版本。已删除或不存在的账号不返回快照。该任务仅提供有界的一致读，不修改账号、预设或内容策略。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 快照包含媒体库 `ALL` / `SELECTED` / `NONE` 与确定排序的库 ID、播放额度和三类转码开关、下载权限，以及可空的完整内容限制和版本。
+- [x] 单次读取覆盖来源与至多 100 个目标；空集合不查询，目标缺失/删除可与空内容策略区分。
+- [x] SQLite 回归验证完整值、无策略用户、缺失目标、排序稳定及上限；Rust build、fmt 和 diff check 通过。
+
+短计划：先为新的批量权限快照读取补库测试并确认接口不存在而失败；再定义存储快照类型和单事务/有界批量查询；最后运行窄库测试、build、fmt 与 diff check。写入、预览 API 和 Web 界面留给后续 LUX 任务。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_permission_copy_snapshots`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-627、LUX-628、LUX-614、LUX-675、LUX-677。
+
+结果（2026-10-19）：新增按最多 101 个明确账号 ID（1 个来源 + 100 个目标）批量读取权限快照的存储合同。三条有界查询在单个一致性事务中读取用户权限、已选媒体库与完整内容限制；PostgreSQL 使用可重复读，SQLite 保持事务快照。无权限记录与无效目标明确区分，媒体库 ID 与限制标签稳定排序。定向存储回归 1/1、Rust build、fmt check 和 diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

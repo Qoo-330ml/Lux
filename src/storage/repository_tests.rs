@@ -15276,6 +15276,145 @@ async fn user_content_restrictions_storage_uses_atomic_versioned_tag_replacement
     Ok(())
 }
 
+#[tokio::test]
+async fn user_permission_copy_snapshots_read_bounded_complete_snapshots()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, username) in [
+        ("permission-copy-source", "permission-copy-source"),
+        ("permission-copy-target", "permission-copy-target"),
+        ("permission-copy-empty", "permission-copy-empty"),
+        ("permission-copy-deleted", "permission-copy-deleted"),
+    ] {
+        database
+            .insert_user(id, username, username, "test", false, true)
+            .await?;
+    }
+    let library = LibraryService::new(database.clone())
+        .create_library("Permission Copy", LibraryKind::Movie, false)
+        .await?;
+    let second_library = LibraryService::new(database.clone())
+        .create_library("Permission Copy Two", LibraryKind::Movie, false)
+        .await?;
+    let mut library_ids = vec![library.id.to_string(), second_library.id.to_string()];
+    library_ids.sort_unstable();
+    database
+        .replace_user_library_access_mode("permission-copy-source", "SELECTED", &library_ids)
+        .await?;
+    database
+        .query(
+            "UPDATE users SET can_download = 1, can_play = 1,
+                max_simultaneous_playbacks = 3, allow_remux = 0,
+                allow_audio_transcode = 1, allow_video_transcode = 0
+             WHERE id = 'permission-copy-source'",
+        )
+        .execute(database.pool())
+        .await?;
+    let allowed_tags = vec!["Family".to_owned(), "Animation".to_owned()];
+    let blocked_tags = vec!["Horror".to_owned(), "Action".to_owned()];
+    let policy = database
+        .compare_and_swap_user_content_restrictions(
+            "permission-copy-source",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed_tags,
+                blocked_tags: &blocked_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        policy,
+        UserContentRestrictionsCasResult::Updated(_)
+    ));
+    database
+        .query("UPDATE users SET deleted_at = unixepoch() WHERE id = 'permission-copy-deleted'")
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    let snapshots = database
+        .user_permission_copy_snapshots(&[
+            "permission-copy-source".to_owned(),
+            "permission-copy-target".to_owned(),
+            "permission-copy-empty".to_owned(),
+            "permission-copy-deleted".to_owned(),
+            "permission-copy-missing".to_owned(),
+        ])
+        .await?;
+
+    assert_eq!(
+        database.query_count(),
+        3,
+        "snapshot reads should stay batched"
+    );
+    assert_eq!(
+        snapshots.len(),
+        3,
+        "missing and deleted users are unavailable"
+    );
+    let source = &snapshots["permission-copy-source"];
+    assert_eq!(source.library_access_mode, "SELECTED");
+    assert_eq!(source.library_ids, library_ids);
+    assert!(source.can_download);
+    assert!(source.playback_policy.can_play);
+    assert_eq!(source.playback_policy.max_simultaneous_playbacks, 3);
+    assert!(!source.playback_policy.allow_remux);
+    assert!(source.playback_policy.allow_audio_transcode);
+    assert!(!source.playback_policy.allow_video_transcode);
+    let restrictions = source
+        .content_restrictions
+        .as_ref()
+        .ok_or("source content restriction snapshot missing")?;
+    assert_eq!(restrictions.version, 1);
+    assert_eq!(restrictions.rating_system, "MPA");
+    assert_eq!(restrictions.maximum_rating.as_deref(), Some("PG-13"));
+    assert!(!restrictions.allow_unrated);
+    assert_eq!(restrictions.allowed_tags, ["animation", "family"]);
+    assert_eq!(restrictions.blocked_tags, ["action", "horror"]);
+
+    let empty_policy_user = &snapshots["permission-copy-empty"];
+    assert_eq!(empty_policy_user.library_access_mode, "ALL");
+    assert!(empty_policy_user.content_restrictions.is_none());
+    assert_eq!(
+        empty_policy_user.playback_policy.max_simultaneous_playbacks,
+        2
+    );
+
+    let over_limit = (0..102)
+        .map(|index| format!("permission-copy-target-{index}"))
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    assert!(
+        database
+            .user_permission_copy_snapshots(&over_limit)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database.query_count(),
+        0,
+        "over-limit reads should not query"
+    );
+
+    database.reset_query_count();
+    assert!(
+        database
+            .user_permission_copy_snapshots(&[])
+            .await?
+            .is_empty()
+    );
+    assert_eq!(database.query_count(), 0, "empty reads should not query");
+    Ok(())
+}
+
 async fn assert_media_content_restriction_index_storage(
     database: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {

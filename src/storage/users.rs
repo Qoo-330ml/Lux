@@ -2,7 +2,8 @@ use super::*;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 use crate::storage::{
     ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserAccountPreferences,
-    UserAccountPreferences, UserAccountPreferencesCasResult, UserPlaybackPolicy,
+    UserAccountPreferences, UserAccountPreferencesCasResult, UserPermissionCopySnapshot,
+    UserPlaybackPolicy,
 };
 
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
+const MAX_PERMISSION_COPY_USER_IDS: usize = 101;
 
 fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
     value
@@ -2619,6 +2621,173 @@ impl Database {
             version: row.get("version"),
             updated_at: row.get("updated_at"),
         }))
+    }
+
+    // LUX-708 reads the source and all selected targets from one bounded database snapshot.
+    #[allow(dead_code)]
+    pub(crate) async fn user_permission_copy_snapshots(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, UserPermissionCopySnapshot>, StorageError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if user_ids.len() > MAX_PERMISSION_COPY_USER_IDS
+            || user_ids.iter().collect::<HashSet<_>>().len() != user_ids.len()
+        {
+            return Err(StorageError::Conflict(
+                "user permission copy snapshot request is invalid".to_owned(),
+            ));
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if self.backend() == crate::config::DatabaseBackend::Postgres {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let placeholders = vec!["?"; user_ids.len()].join(", ");
+        let user_sql = format!(
+            "SELECT id, library_access_mode, can_download, can_play,
+                    max_simultaneous_playbacks, allow_remux,
+                    allow_audio_transcode, allow_video_transcode
+             FROM users WHERE deleted_at IS NULL AND id IN ({placeholders})"
+        );
+        let mut user_query = self.query(sqlx::AssertSqlSafe(user_sql));
+        for user_id in user_ids {
+            user_query = user_query.bind(user_id);
+        }
+        let user_rows = user_query
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut snapshots = HashMap::with_capacity(user_rows.len());
+        for row in user_rows {
+            let user_id: String = row.get("id");
+            snapshots.insert(
+                user_id,
+                UserPermissionCopySnapshot {
+                    library_access_mode: row.get("library_access_mode"),
+                    library_ids: Vec::new(),
+                    can_download: row.get::<i64, _>("can_download") != 0,
+                    playback_policy: UserPlaybackPolicy {
+                        can_play: row.get::<i64, _>("can_play") != 0,
+                        max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
+                        allow_remux: row.get::<i64, _>("allow_remux") != 0,
+                        allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
+                        allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
+                    },
+                    content_restrictions: None,
+                },
+            );
+        }
+
+        let library_sql = format!(
+            "SELECT access.user_id, access.library_id
+             FROM user_library_access access
+             INNER JOIN users ON users.id = access.user_id AND users.deleted_at IS NULL
+             WHERE access.can_view = 1 AND access.user_id IN ({placeholders})
+             ORDER BY access.user_id, access.library_id"
+        );
+        let mut library_query = self.query(sqlx::AssertSqlSafe(library_sql));
+        for user_id in user_ids {
+            library_query = library_query.bind(user_id);
+        }
+        for row in library_query
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let user_id: String = row.get("user_id");
+            let library_id: String = row.get("library_id");
+            if let Some(snapshot) = snapshots.get_mut(&user_id) {
+                snapshot.library_ids.push(library_id);
+            }
+        }
+
+        let restrictions_sql = format!(
+            "SELECT restrictions.user_id, restrictions.rating_system,
+                    restrictions.maximum_rating, restrictions.allow_unrated,
+                    restrictions.version, restrictions.updated_at,
+                    tags.tag_kind, tags.tag
+             FROM user_content_restrictions restrictions
+             INNER JOIN users ON users.id = restrictions.user_id AND users.deleted_at IS NULL
+             LEFT JOIN user_content_restriction_tags tags
+               ON tags.user_id = restrictions.user_id
+             WHERE restrictions.user_id IN ({placeholders})
+             ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
+        );
+        let mut restrictions_query = self.query(sqlx::AssertSqlSafe(restrictions_sql));
+        for user_id in user_ids {
+            restrictions_query = restrictions_query.bind(user_id);
+        }
+        let mut restrictions_by_user = HashMap::<String, UserContentRestrictions>::new();
+        for row in restrictions_query
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let user_id: String = row.get("user_id");
+            let restrictions =
+                restrictions_by_user
+                    .entry(user_id)
+                    .or_insert_with(|| UserContentRestrictions {
+                        rating_system: row.get("rating_system"),
+                        maximum_rating: row.get("maximum_rating"),
+                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
+                        allowed_tags: Vec::new(),
+                        blocked_tags: Vec::new(),
+                        version: row.get("version"),
+                        updated_at: row.get("updated_at"),
+                    });
+            let tag_kind: Option<String> = row.get("tag_kind");
+            let tag: Option<String> = row.get("tag");
+            match (tag_kind.as_deref(), tag) {
+                (None, None) => {}
+                (Some("ALLOW"), Some(tag)) => restrictions.allowed_tags.push(tag),
+                (Some("BLOCK"), Some(tag)) => restrictions.blocked_tags.push(tag),
+                _ => {
+                    return Err(StorageError::Serialization(
+                        "invalid user content restriction tag row".to_owned(),
+                    ));
+                }
+            }
+        }
+        for (user_id, restrictions) in restrictions_by_user {
+            if let Some(snapshot) = snapshots.get_mut(&user_id) {
+                snapshot.content_restrictions = Some(restrictions);
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(snapshots)
     }
 
     // LUX-677 keeps the policy version and both tag groups in one CAS transaction.

@@ -50,6 +50,15 @@ pub(crate) struct UserPlaybackPolicy {
     pub(crate) allow_video_transcode: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserPermissionCopySnapshot {
+    pub(crate) library_access_mode: String,
+    pub(crate) library_ids: Vec<String>,
+    pub(crate) can_download: bool,
+    pub(crate) playback_policy: UserPlaybackPolicy,
+    pub(crate) content_restrictions: Option<repository::UserContentRestrictions>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewStoredUserPermissions<'a> {
     pub(crate) library_access_mode: &'a str,
