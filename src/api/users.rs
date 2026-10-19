@@ -758,6 +758,29 @@ fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
     (device_id.get_version_num() == 4).then_some(device_id.to_string())
 }
 
+async fn record_web_device_observation(headers: &HeaderMap, state: &AppState, user_id: &str) {
+    let (Some(device_id), Some(database)) = (web_login_device_id(headers), state.database.as_ref())
+    else {
+        return;
+    };
+    let remote_ip = request_client_ip(headers, &state.remote_access);
+    if let Err(error) = database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id,
+            device_id: &device_id,
+            device_name: None,
+            device_type: Some("WEB"),
+            client_name: "Lux Web",
+            client_version: None,
+            last_remote_ip: remote_ip.as_deref(),
+            seen_at: super::playback::current_unix_timestamp(),
+        })
+        .await
+    {
+        tracing::warn!(%error, "failed to update web user device inventory");
+    }
+}
+
 pub(super) async fn auth_login(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -858,26 +881,7 @@ pub(super) async fn auth_login(
     }
 
     let user_id = session.user.id.to_string();
-    if let (Some(device_id), Some(database)) =
-        (web_login_device_id(&headers), state.database.as_ref())
-    {
-        let remote_ip = request_client_ip(&headers, &state.remote_access);
-        if let Err(error) = database
-            .upsert_user_device(NewUserDeviceObservation {
-                user_id: &user_id,
-                device_id: &device_id,
-                device_name: None,
-                device_type: Some("WEB"),
-                client_name: "Lux Web",
-                client_version: None,
-                last_remote_ip: remote_ip.as_deref(),
-                seen_at: super::playback::current_unix_timestamp(),
-            })
-            .await
-        {
-            tracing::warn!(%error, "failed to update web user device inventory");
-        }
-    }
+    record_web_device_observation(&headers, &state, &user_id).await;
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -1326,6 +1330,8 @@ async fn require_web_session_csrf(
         )
         .into_response());
     }
+    let user_id = session.user.id.to_string();
+    record_web_device_observation(headers, state, &user_id).await;
     Ok(session)
 }
 
@@ -2289,6 +2295,8 @@ pub(super) async fn require_web_principal(
                 )
                 .into_response());
             }
+            let user_id = session.user.id.to_string();
+            record_web_device_observation(headers, state, &user_id).await;
             Ok(crate::auth::users::AuthenticationPrincipal::User(
                 session.user,
             ))

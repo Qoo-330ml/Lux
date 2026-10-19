@@ -85,6 +85,49 @@ async fn successful_login_is_written_to_the_user_activity_index()
     assert!(first_seen_at > 0);
     assert!(last_seen_at >= first_seen_at);
 
+    let authenticated_cookie = cookie_pair(response.headers());
+    sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
+        .bind(&user_id)
+        .bind(device_id)
+        .execute(database.pool())
+        .await?;
+    let authenticated_access = client
+        .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
+        .header("X-Lux-Device-Id", device_id)
+        .header(COOKIE, &authenticated_cookie)
+        .send()
+        .await?;
+    assert_eq!(authenticated_access.status(), reqwest::StatusCode::OK);
+    let (refreshed_first_seen_at, refreshed_last_seen_at): (i64, i64) = sqlx::query_as(
+        "SELECT first_seen_at, last_seen_at FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(&user_id)
+    .bind(device_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(refreshed_first_seen_at, first_seen_at);
+    assert!(refreshed_last_seen_at > 1);
+
+    sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
+        .bind(&user_id)
+        .bind(device_id)
+        .execute(database.pool())
+        .await?;
+    let invalid_device_access = client
+        .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
+        .header("X-Lux-Device-Id", "not-a-uuid")
+        .header(COOKIE, &authenticated_cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_device_access.status(), reqwest::StatusCode::OK);
+    let (invalid_device_count, unchanged_last_seen_at): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), MAX(last_seen_at) FROM user_devices WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(invalid_device_count, 1);
+    assert_eq!(unchanged_last_seen_at, 1);
+
     let invalid_device_login = client
         .post(format!("http://{address}/api/v1/auth/login"))
         .header("X-Lux-Device-Id", "not-a-uuid")
@@ -120,10 +163,10 @@ async fn successful_login_is_written_to_the_user_activity_index()
         .await?;
     assert_eq!(storage_failure_login.status(), reqwest::StatusCode::OK);
 
-    let cookie = cookie_pair(response.headers());
     let audit = client
         .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
-        .header(COOKIE, cookie)
+        .header("X-Lux-Device-Id", device_id)
+        .header(COOKIE, authenticated_cookie)
         .send()
         .await?;
     assert_eq!(audit.status(), reqwest::StatusCode::OK);

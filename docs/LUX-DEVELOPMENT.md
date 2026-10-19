@@ -15668,6 +15668,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：设备组件测试 4/4、现有用户会话组件测试 11/11；`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。全量 Web 测试为 745 passed、4 failed，仍为 `home-page.test.tsx`、`library-card.test.tsx` 两项与 `media-query-polling.test.tsx` 的同四项既有基线失败。隔离 Playwright 固定假数据预览在 390×844 显示设备清单；视口和文档宽度均为 390 px，840 px 表格通过 350 px 内层容器滚动，浏览器 console 无错误/警告；截图 `output/playwright/admin-user-devices-390.png`。`git diff --check` 通过。
 
+#### LUX-748：通过 Web 有效访问刷新设备活跃时间
+
+范围：为携带有效 UUID v4 `X-Lux-Device-Id` 的已认证 Web 请求刷新该用户设备记录的最近活动时间及可用展示 IP。必须先通过会话、远程访问策略，再做 best-effort 存储；无效/缺失 ID 跳过，设备存储错误不得改变请求响应且日志不得记录用户或设备字段。设备 ID 仍不参与身份验证或授权。不接入 Emby 后续访问记录或设备黑名单。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 成功登录后，后续通过 Web 会话与远程访问检查的请求刷新同一设备的 `last_seen_at` 和可用展示 IP，不改变 `first_seen_at`。
+- [x] 缺失或格式无效的设备 ID 不写入设备记录；设备存储写入失败不阻断已通过认证的请求。
+- [x] 用户认证集成定向测试、Rust build、fmt、可用 Clippy 检查及 diff check 通过。
+
+短计划：先在 `tests/users.rs` 将已登录设备的 `last_seen_at` 置为旧值，再用同会话访问受保护 API 并确认时间更新、首次时间不变；确认当前实现未刷新后，在共享 Web 用户身份解析的会话分支通过策略检查后加入 best-effort upsert；最后运行 `users` 精确回归、build、fmt、Clippy 与 diff check。
+
+#### LUX-748 验证记录
+
+结果（2026-10-20）：Web 登录沿用原设备登记入口；之后通过 Web 会话和远程访问策略检查的请求携带有效设备 ID 时，会 best-effort upsert 同一设备，刷新最近活动和可用展示 IP，保留首次出现时间。无效设备 ID 不新增或刷新记录。设备存储失败不会改变已认证请求响应，且告警不含用户/设备字段；设备 ID 仍只用于清单归并。
+
+验证：TDD RED 在同一 authenticated request 带有效设备 ID、旧 `last_seen_at` 时失败；实现后 `tests/users` 串行 20/20，最后精确回归 1/1，另覆盖首次时间不变、无效设备 ID 跳过和设备存储失败时受保护请求仍成功。Rust build、fmt check、`git diff --check` 与放行既有 Clippy 诊断类别后的全目标 Clippy 通过。严格全目标 Clippy 仍受 10 条既有、位于未改文件的诊断阻断，本任务相关文件没有新增诊断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
