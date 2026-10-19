@@ -23,6 +23,7 @@ const DEFAULT_GROUPS: AdminAccountPreferenceCopyGroups = {
   appearance: true,
   home: true,
   playback: true,
+  libraryOrder: true,
 };
 
 export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: Props) {
@@ -46,6 +47,11 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
       sortOrder: "desc",
     }),
   });
+  const libraryCatalog = useQuery({
+    queryKey: ["admin", "libraries"],
+    queryFn: () => api.adminLibraries(),
+  });
+  const libraryNames = new Map((libraryCatalog.data?.libraries ?? []).map((library) => [library.id, library.name]));
   const candidates = (sourceUsers.data?.users ?? []).filter((user) => !targetIds.includes(user.id));
   const preview = useMutation({ mutationFn: (input: AdminAccountPreferenceCopyPreviewInput) => api.previewAdminAccountPreferencesCopy(input) });
   const apply = useMutation({
@@ -54,7 +60,7 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
       return api.copyAdminAccountPreferences({
         sourceUserId: preview.data.sourceUserId,
         sourceExpectedVersion: preview.data.sourceVersion,
-        targets: preview.data.targets,
+        targets: preview.data.targets.map(({ userId, expectedVersion }) => ({ userId, expectedVersion })),
         groups: preview.data.groups,
       });
     },
@@ -132,6 +138,7 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
     groups.appearance ? "外观" : null,
     groups.home ? "首页" : null,
     groups.playback ? "播放" : null,
+    groups.libraryOrder ? "媒体库排序" : null,
   ].filter((group): group is string => group !== null);
   const selectedSourceIsValid = sourceUserId.length > 0 && !targetIds.includes(sourceUserId);
   const copyDisabled = apply.isPending || preview.isPending || !preview.data || !selectedSourceIsValid || results !== null;
@@ -182,7 +189,8 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
             <legend>复制项目</legend>
             <label><input aria-label="复制外观偏好" type="checkbox" checked={groups.appearance} onChange={(event) => changeGroup("appearance", event.target.checked)} />外观与强调色</label>
             <label><input aria-label="复制首页偏好" type="checkbox" checked={groups.home} onChange={(event) => changeGroup("home", event.target.checked)} />首页分区</label>
-            <label><input aria-label="复制播放偏好" type="checkbox" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} />音轨、字幕与自动连播</label>
+            <label><input aria-label="复制播放偏好" type="checkbox" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} />音轨、字幕、自动连播与已看阈值</label>
+            <label><input aria-label="复制媒体库排序" type="checkbox" checked={groups.libraryOrder} onChange={(event) => changeGroup("libraryOrder", event.target.checked)} />媒体库排序</label>
           </fieldset>
           <p className="lux-admin-muted">不选择任何项目时不能继续。每次最多复制到 100 个账号。</p>
           <button className="lux-button lux-button-primary" type="button" aria-label="预览偏好复制" onClick={previewCopy} disabled={!sourceUserId || !selectedGroups.length || preview.isPending || apply.isPending || !selectedSourceIsValid}>
@@ -195,16 +203,17 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
           <section className="lux-admin-user-preference-copy-preview" aria-label="偏好复制预览">
             <h3>复制预览</h3>
             <p>来源版本 {preview.data.sourceVersion} · 复制项目：{selectedGroups.join("、")}</p>
-            <PreferenceSnapshot snapshot={preview.data.sourceSnapshot} />
+            <PreferenceSnapshot snapshot={preview.data.sourceSnapshot} libraryNames={libraryNames} />
             <ul className="lux-admin-user-preference-copy-versions">
               {preview.data.targets.map((target) => (
                 <li key={target.userId}>
                   <span>{targetSnapshot.find((item) => item.id === target.userId)?.name ?? target.userId}</span>
                   <span>当前版本 {target.expectedVersion}</span>
+                  {preview.data.groups.libraryOrder ? <small>媒体库排序：{libraryOrderLabel(target.libraryOrder, libraryNames)}</small> : null}
                 </li>
               ))}
             </ul>
-            <p className="lux-admin-muted">应用时会再次检查这些版本；已发生变化的目标会单独标为冲突。</p>
+            <p className="lux-admin-muted">排序预览按目标当前可访问的媒体库过滤；应用时会按目标届时的权限重新过滤，且不会更改管理员强制排序。应用时也会再次检查偏好版本；已发生变化的目标会单独标为冲突。</p>
             <button className="lux-button lux-button-primary" type="button" aria-label="应用偏好复制" onClick={() => apply.mutate()} disabled={copyDisabled}>
               {apply.isPending ? "正在复制…" : `应用到 ${preview.data.targets.length} 个账号`}
             </button>
@@ -225,14 +234,23 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
   );
 }
 
-function PreferenceSnapshot({ snapshot }: { snapshot: AdminAccountPreferenceCopyPreview["sourceSnapshot"] }) {
+function PreferenceSnapshot({ snapshot, libraryNames }: {
+  snapshot: AdminAccountPreferenceCopyPreview["sourceSnapshot"];
+  libraryNames: Map<string, string>;
+}) {
   return (
     <dl className="lux-admin-user-preference-copy-snapshot">
       {snapshot.appearance ? <><dt>外观</dt><dd>{themeName(snapshot.appearance.theme)} · {accentName(snapshot.appearance.accentColor)}</dd></> : null}
       {snapshot.home ? <><dt>首页</dt><dd>{snapshot.home.showMediaLibraries ? "显示媒体库" : "隐藏媒体库"} · {snapshot.home.showContinueWatching ? "显示继续观看" : "隐藏继续观看"}</dd></> : null}
-      {snapshot.playback ? <><dt>播放</dt><dd>音轨 {snapshot.playback.audioLanguage} · 字幕 {snapshot.playback.subtitleLanguage} · 自动连播 {snapshot.playback.autoPlayNextEpisode ? "开启" : "关闭"}</dd></> : null}
+      {snapshot.playback ? <><dt>播放</dt><dd>音轨 {snapshot.playback.audioLanguage} · 字幕 {snapshot.playback.subtitleLanguage} · 自动连播 {snapshot.playback.autoPlayNextEpisode ? "开启" : "关闭"} · 已看阈值 {snapshot.playback.playedPercent}%</dd></> : null}
+      {snapshot.libraryOrder ? <><dt>媒体库排序</dt><dd>{libraryOrderLabel(snapshot.libraryOrder, libraryNames)}</dd></> : null}
     </dl>
   );
+}
+
+function libraryOrderLabel(libraryIds: string[] | undefined, libraryNames: Map<string, string>) {
+  if (!libraryIds?.length) return "没有已保存的媒体库顺序";
+  return libraryIds.map((libraryId) => libraryNames.get(libraryId) ?? libraryId).join(" → ");
 }
 
 function adminUserName(user: AdminUser) {

@@ -1255,6 +1255,7 @@ export type AdminAccountPreferenceCopyGroups = {
   appearance: boolean;
   home: boolean;
   playback: boolean;
+  libraryOrder: boolean;
 };
 
 export type AdminAccountPreferenceCopyPreviewInput = {
@@ -1280,9 +1281,11 @@ export type AdminAccountPreferenceCopyPreview = {
       audioLanguage: string;
       subtitleLanguage: string;
       autoPlayNextEpisode: boolean;
+      playedPercent: number;
     };
+    libraryOrder?: string[];
   };
-  targets: Array<{ userId: string; expectedVersion: number }>;
+  targets: Array<{ userId: string; expectedVersion: number; libraryOrder?: string[] }>;
   groups: AdminAccountPreferenceCopyGroups;
 };
 

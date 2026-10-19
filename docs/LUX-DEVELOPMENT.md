@@ -14104,6 +14104,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：`user_settings` 2/2、`library_order` 1/1、`account_preferences_use_compare_and_swap_versions` 1/1、`user_account_preferences::tests` 9/9、Web 账户设置/API client 定向测试 101/101 通过；Rust build、fmt、Web build 与 `git diff --check` 通过。Web build 临时用 HEAD 版本覆盖用户未提交的 `AdminDashboardNowPlaying.tsx`，完成后已校验恢复原文件。Cargo 网络测试使用 `NO_PROXY=127.0.0.1,localhost` 避免本机请求经过代理。API 合同已同步到 `docs/API.md`。
 
+#### LUX-674：完成账户偏好分组复制
+
+范围：在管理员账户偏好复制中增加媒体库排序组；播放组同时复制已看阈值。预览按每个目标当前可访问媒体库过滤来源排序，应用时重新按目标当前权限过滤；复制只更新选中的组，并继续使用账户偏好版本 CAS，不改变管理员强制排序设置。
+
+预计修改文件（10 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_account_preferences.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserPreferenceCopyDialog.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-preference-copy.test.tsx`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 预览/应用合同支持独立 `libraryOrder` 组；播放组选中时包含 `playedPercent`。
+- [x] 预览为每个目标返回按其当前可访问范围过滤后的排序，应用时再次过滤；其他未选组保持原值。
+- [x] 管理强制排序偏好不被复制或覆盖；逐目标 CAS 冲突和脱敏审计行为保持不变。
+- [x] 管理员对话框可选择排序组并查看来源排序、各目标的过滤结果及已看阈值；过滤规则清楚可见。
+- [x] application/API/Web 定向测试、Rust build/fmt、Web build 通过。
+
+短计划：先扩展 application 复制与预览回归测试、管理员 API 响应合同和 Web 类型/组件测试；再扩展分组快照及逐目标权限过滤，并更新审计组标志和 API 文档。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_preview_and_copy_account_preferences`、Web 偏好复制/API client 定向 Vitest、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt、Web build 与 `git diff --check`。
+
+依赖：LUX-671、LUX-672、LUX-673。
+
+结果（2026-10-19）：管理员复制 API 增加 `libraryOrder` 选择组；预览返回来源个人顺序及逐目标过滤结果，应用时重新依据目标当前可访问媒体库过滤并以 CAS 保存。播放组现在包含 `playedPercent`。复制不修改目标的管理员强制排序设置，审计仅增加组标志、不写偏好值。`user_account_preferences::tests` 9/9、`users` 定向集成 1/1、Web 偏好复制/API client 定向测试 71/71、`cargo build --locked`、fmt、Web build 与 `git diff --check` 通过。Web build 临时以 HEAD 版覆盖用户未提交的 `AdminDashboardNowPlaying.tsx`，结束后已逐字节恢复；由于本会话未配置 Chrome DevTools MCP，没有真实浏览器截图验证。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

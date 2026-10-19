@@ -436,7 +436,7 @@ describe("LuxApiClient", () => {
     const request = {
       sourceUserId: "source-1",
       targetUserIds: ["user-1", "user-2"],
-      groups: { appearance: true, home: false, playback: true },
+      groups: { appearance: true, home: false, playback: true, libraryOrder: true },
     };
     const preview = {
       sourceUserId: "source-1",
@@ -447,11 +447,13 @@ describe("LuxApiClient", () => {
           audioLanguage: "Japanese",
           subtitleLanguage: "English",
           autoPlayNextEpisode: false,
+          playedPercent: 80,
         },
+        libraryOrder: ["movies", "series"],
       },
       targets: [
-        { userId: "user-1", expectedVersion: 2 },
-        { userId: "user-2", expectedVersion: 0 },
+        { userId: "user-1", expectedVersion: 2, libraryOrder: ["movies"] },
+        { userId: "user-2", expectedVersion: 0, libraryOrder: ["movies", "series"] },
       ],
       groups: request.groups,
     };
@@ -478,7 +480,7 @@ describe("LuxApiClient", () => {
       sourceUserId: "source-1",
       sourceExpectedVersion: 4,
       targets: [{ userId: "user-1", expectedVersion: 2 }],
-      groups: { appearance: true, home: false, playback: false },
+      groups: { appearance: true, home: false, playback: false, libraryOrder: true },
     };
     const result = {
       sourceUserId: "source-1",

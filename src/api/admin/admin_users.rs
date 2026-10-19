@@ -357,7 +357,8 @@ async fn admin_copy_account_preferences(
                         "groups": {
                             "appearance": groups.appearance,
                             "home": groups.home,
-                            "playback": groups.playback
+                            "playback": groups.playback,
+                            "libraryOrder": groups.library_order
                         }
                     })
                     .to_string(),

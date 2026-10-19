@@ -7,7 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
-import type { AdminSettings, AdminUser } from "../src/lib/api/types";
+import type { AdminLibrary, AdminSettings, AdminUser } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -41,17 +41,27 @@ describe("AdminUsersPage account preference copy", () => {
     const unselected = user("unselected", "other", "未选择用户");
     const usersPage = { users: [source, alice, bob, unselected], page: 1, pageSize: 20, totalCount: 4 };
     const listUsers = vi.spyOn(api, "adminUsers").mockResolvedValue(usersPage);
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [
+        { id: "movies", name: "电影", kind: "MOVIE" } as AdminLibrary,
+        { id: "series", name: "剧集", kind: "SERIES" } as AdminLibrary,
+      ],
+    });
     vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays: 7 } as AdminSettings);
     vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [] });
     const preview = vi.spyOn(api, "previewAdminAccountPreferencesCopy").mockResolvedValue({
       sourceUserId: source.id,
       sourceVersion: 4,
-      sourceSnapshot: { appearance: { theme: "dark", accentColor: "berry" } },
+      sourceSnapshot: {
+        appearance: { theme: "dark", accentColor: "berry" },
+        playback: { audioLanguage: "日语", subtitleLanguage: "简体中文", autoPlayNextEpisode: true, playedPercent: 67 },
+        libraryOrder: ["movies", "series"],
+      },
       targets: [
-        { userId: alice.id, expectedVersion: 7 },
-        { userId: bob.id, expectedVersion: 0 },
+        { userId: alice.id, expectedVersion: 7, libraryOrder: ["movies"] },
+        { userId: bob.id, expectedVersion: 0, libraryOrder: ["movies", "series"] },
       ],
-      groups: { appearance: true, home: false, playback: false },
+      groups: { appearance: true, home: false, playback: true, libraryOrder: true },
     });
     const apply = vi.spyOn(api, "copyAdminAccountPreferences").mockResolvedValue({
       sourceUserId: source.id,
@@ -86,18 +96,19 @@ describe("AdminUsersPage account preference copy", () => {
       }
       const home = container.querySelector<HTMLInputElement>('input[aria-label="复制首页偏好"]');
       home?.click();
-      const playback = container.querySelector<HTMLInputElement>('input[aria-label="复制播放偏好"]');
-      playback?.click();
       container.querySelector<HTMLButtonElement>('button[aria-label="预览偏好复制"]')?.click();
       await vi.waitFor(() => expect(preview).toHaveBeenCalledOnce());
     });
     expect(preview).toHaveBeenCalledWith({
       sourceUserId: source.id,
       targetUserIds: [alice.id, bob.id],
-      groups: { appearance: true, home: false, playback: false },
+      groups: { appearance: true, home: false, playback: true, libraryOrder: true },
     });
     expect(container.textContent).toContain("深色");
     expect(container.textContent).toContain("莓果");
+    expect(container.textContent).toContain("已看阈值 67%");
+    expect(container.textContent).toContain("电影 → 剧集");
+    expect(container.textContent).toContain("媒体库排序：电影");
     expect(container.textContent).toContain("版本 7");
     expect(container.textContent).toContain("版本 0");
 
@@ -112,7 +123,7 @@ describe("AdminUsersPage account preference copy", () => {
         { userId: alice.id, expectedVersion: 7 },
         { userId: bob.id, expectedVersion: 0 },
       ],
-      groups: { appearance: true, home: false, playback: false },
+      groups: { appearance: true, home: false, playback: true, libraryOrder: true },
     });
     expect(container.textContent).toContain("爱丽丝：成功");
     expect(container.textContent).toContain("鲍勃：偏好已被其他操作修改");
@@ -124,14 +135,19 @@ describe("AdminUsersPage account preference copy", () => {
     const source = user("source", "source-user", "来源账号");
     const target = user("target", "target-user", "目标账号");
     vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [source, target], page: 1, pageSize: 20, totalCount: 2 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
     vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays: 7 } as AdminSettings);
     vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [] });
     const preview = vi.spyOn(api, "previewAdminAccountPreferencesCopy").mockResolvedValue({
       sourceUserId: source.id,
       sourceVersion: 1,
-      sourceSnapshot: { appearance: { theme: "light", accentColor: "silver" } },
+      sourceSnapshot: {
+        appearance: { theme: "light", accentColor: "silver" },
+        playback: { audioLanguage: "原始音轨", subtitleLanguage: "简体中文", autoPlayNextEpisode: true, playedPercent: 95 },
+        libraryOrder: [],
+      },
       targets: [{ userId: target.id, expectedVersion: 0 }],
-      groups: { appearance: true, home: true, playback: true },
+      groups: { appearance: true, home: true, playback: true, libraryOrder: true },
     });
     const apply = vi.spyOn(api, "copyAdminAccountPreferences").mockRejectedValue(new Error("来源偏好已变更"));
     renderPage();

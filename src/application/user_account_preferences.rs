@@ -88,11 +88,13 @@ pub(crate) struct CopyAccountPreferenceGroups {
     pub(crate) appearance: bool,
     pub(crate) home: bool,
     pub(crate) playback: bool,
+    #[serde(default)]
+    pub(crate) library_order: bool,
 }
 
 impl CopyAccountPreferenceGroups {
     fn is_empty(self) -> bool {
-        !self.appearance && !self.home && !self.playback
+        !self.appearance && !self.home && !self.playback && !self.library_order
     }
 }
 
@@ -127,8 +129,17 @@ pub(crate) struct AccountPreferencesCopyPreview {
     pub(crate) source_user_id: String,
     pub(crate) source_version: i64,
     pub(crate) source_snapshot: AccountPreferencesCopySnapshot,
-    pub(crate) targets: Vec<CopyAccountPreferencesTarget>,
+    pub(crate) targets: Vec<AccountPreferencesCopyPreviewTarget>,
     pub(crate) groups: CopyAccountPreferenceGroups,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountPreferencesCopyPreviewTarget {
+    pub(crate) user_id: String,
+    pub(crate) expected_version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) library_order: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -140,6 +151,8 @@ pub(crate) struct AccountPreferencesCopySnapshot {
     pub(crate) home: Option<AccountPreferencesHomeSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) playback: Option<AccountPreferencesPlaybackSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) library_order: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -162,6 +175,7 @@ pub(crate) struct AccountPreferencesPlaybackSnapshot {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
+    pub(crate) played_percent: i64,
 }
 
 #[derive(Debug)]
@@ -285,7 +299,7 @@ pub(crate) async fn preview_account_preferences_copy(
     database: &Database,
     input: PreviewAccountPreferencesCopyInput,
 ) -> Result<AccountPreferencesCopyPreview, AccountPreferencesCopyError> {
-    let mut targets = input
+    let validation_targets = input
         .target_user_ids
         .iter()
         .map(|user_id| CopyAccountPreferencesTarget {
@@ -296,7 +310,7 @@ pub(crate) async fn preview_account_preferences_copy(
     validate_copy_input(&CopyAccountPreferencesInput {
         source_user_id: input.source_user_id.clone(),
         source_expected_version: 0,
-        targets: targets.clone(),
+        targets: validation_targets,
         groups: input.groups,
     })?;
 
@@ -311,17 +325,39 @@ pub(crate) async fn preview_account_preferences_copy(
         .map(AccountPreferences::from)
         .unwrap_or_default();
 
-    for target in &mut targets {
+    let mut targets = Vec::with_capacity(input.target_user_ids.len());
+    for target_user_id in &input.target_user_ids {
         let user = database
-            .find_user_by_id(&target.user_id)
+            .find_user_by_id(target_user_id)
             .await?
             .filter(|user| user.deleted_at.is_none())
             .ok_or(AccountPreferencesCopyError::UserUnavailable)?;
-        target.expected_version = database
+        let expected_version = database
             .user_account_preferences(&user.id)
             .await?
             .map(|preferences| preferences.version)
             .unwrap_or_default();
+        let library_order = if input.groups.library_order {
+            let accessible_library_ids = database.list_accessible_library_ids(&user.id).await?;
+            let accessible_library_ids = accessible_library_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            Some(
+                source_preferences
+                    .library_order
+                    .iter()
+                    .filter(|library_id| accessible_library_ids.contains(*library_id))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        targets.push(AccountPreferencesCopyPreviewTarget {
+            user_id: user.id,
+            expected_version,
+            library_order,
+        });
     }
 
     Ok(AccountPreferencesCopyPreview {
@@ -352,7 +388,11 @@ fn copy_snapshot(
             audio_language: preferences.audio_language.clone(),
             subtitle_language: preferences.subtitle_language.clone(),
             auto_play_next_episode: preferences.auto_play_next_episode,
+            played_percent: preferences.played_percent,
         }),
+        library_order: groups
+            .library_order
+            .then(|| preferences.library_order.clone()),
     }
 }
 
@@ -434,6 +474,22 @@ async fn copy_preferences_to_target(
     if current.version != target.expected_version {
         return Err(AccountPreferencesCopyError::VersionConflict);
     }
+    let library_order = if groups.library_order {
+        let accessible_library_ids = database.list_accessible_library_ids(&user.id).await?;
+        let accessible_library_ids = accessible_library_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        Some(
+            source
+                .library_order
+                .iter()
+                .filter(|library_id| accessible_library_ids.contains(*library_id))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        None
+    };
     let input = UpdateAccountPreferences {
         expected_version: current.version,
         theme: if groups.appearance {
@@ -475,8 +531,8 @@ async fn copy_preferences_to_target(
         } else {
             current.auto_play_next_episode
         },
-        library_order: None,
-        played_percent: None,
+        library_order,
+        played_percent: groups.playback.then_some(source.played_percent),
     };
     update_account_preferences(database, &target.user_id, input)
         .await
@@ -806,8 +862,23 @@ mod tests {
                 .insert_user(user_id, user_id, user_id, "test", false, true)
                 .await?;
         }
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind)
+             VALUES ('copy-source-library', 'Source', 'MOVIE'),
+                    ('copy-target-library', 'Target', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
         update_account_preferences(&database, "copy-source", valid_update(0)).await?;
         update_account_preferences(&database, "copy-target", valid_update(0)).await?;
+        database
+            .replace_user_library_order("copy-source", &["copy-source-library".to_owned()])
+            .await?;
+        database
+            .replace_user_library_order("copy-target", &["copy-target-library".to_owned()])
+            .await?;
+        database.set_user_played_percent("copy-source", 67).await?;
+        database.set_user_played_percent("copy-target", 42).await?;
 
         let result = copy_account_preferences_batch(
             &database,
@@ -822,6 +893,7 @@ mod tests {
                     appearance: true,
                     home: true,
                     playback: false,
+                    library_order: false,
                 },
             },
         )
@@ -840,6 +912,8 @@ mod tests {
         assert_eq!(target.audio_language, "日本語");
         assert_eq!(target.subtitle_language, "关闭");
         assert_eq!(target.auto_play_next_episode, source.auto_play_next_episode);
+        assert_eq!(target.library_order, ["copy-target-library"]);
+        assert_eq!(target.played_percent, 42);
         assert_eq!(target.version, 2);
         Ok(())
     }
@@ -864,6 +938,7 @@ mod tests {
                     appearance: true,
                     home: false,
                     playback: true,
+                    library_order: false,
                 },
             },
         )
@@ -962,6 +1037,7 @@ mod tests {
                     appearance: false,
                     home: false,
                     playback: true,
+                    library_order: false,
                 },
             },
         )
@@ -1024,6 +1100,7 @@ mod tests {
             appearance: false,
             home: false,
             playback: false,
+            library_order: false,
         };
         assert!(matches!(
             copy_account_preferences_batch(&database, input).await,
@@ -1115,6 +1192,7 @@ mod tests {
                 appearance: true,
                 home: false,
                 playback: false,
+                library_order: false,
             },
         }
     }

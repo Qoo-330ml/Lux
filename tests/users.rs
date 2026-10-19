@@ -1561,6 +1561,53 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
     .bind(&conflict_target)
     .execute(database.pool())
     .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind)
+         VALUES ('copy-library-shared', 'Shared Library', 'MOVIE'),
+                ('copy-library-private', 'Private Library', 'MOVIE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(&target)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'ALL' WHERE id = ?")
+        .bind(&conflict_target)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, 'copy-library-shared', 1)",
+    )
+    .bind(&target)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_order (user_id, library_id, position)
+         VALUES (?, 'copy-library-shared', 0), (?, 'copy-library-private', 1),
+                (?, 'copy-library-private', 0)",
+    )
+    .bind(&source)
+    .bind(&source)
+    .bind(&target)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_playback_settings (user_id, played_percent)
+         VALUES (?, 67), (?, 42)",
+    )
+    .bind(&source)
+    .bind(&target)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_order_preferences (user_id, use_admin_library_order)
+         VALUES (?, 1)",
+    )
+    .bind(&target)
+    .execute(database.pool())
+    .await?;
 
     let unavailable_target = client
         .post(&preview_url)
@@ -1637,7 +1684,7 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
         .json(&json!({
             "sourceUserId": source,
             "targetUserIds": [target, conflict_target],
-            "groups": { "appearance": true, "home": false, "playback": false }
+            "groups": { "appearance": true, "home": false, "playback": true, "libraryOrder": true }
         }))
         .send()
         .await?;
@@ -1648,20 +1695,43 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
     assert_eq!(preview["sourceVersion"], 3);
     assert_eq!(preview["sourceSnapshot"]["appearance"]["theme"], "light");
     assert!(preview["sourceSnapshot"].get("home").is_none());
-    assert!(preview["sourceSnapshot"].get("playback").is_none());
+    assert_eq!(preview["sourceSnapshot"]["playback"]["playedPercent"], 67);
+    assert_eq!(
+        preview["sourceSnapshot"]["libraryOrder"],
+        json!(["copy-library-shared", "copy-library-private"])
+    );
     assert_eq!(preview["targets"][0]["expectedVersion"], 4);
     assert_eq!(preview["targets"][1]["expectedVersion"], 2);
+    assert_eq!(
+        preview["targets"][0]["libraryOrder"],
+        json!(["copy-library-shared"])
+    );
+    assert_eq!(
+        preview["targets"][1]["libraryOrder"],
+        json!(["copy-library-shared", "copy-library-private"])
+    );
     sqlx::query("UPDATE user_account_preferences SET version = version + 1 WHERE user_id = ?")
         .bind(&conflict_target)
         .execute(database.pool())
         .await?;
 
     let apply_url = format!("{base_url}/api/v1/admin/users/account-preferences/copy");
+    let apply_targets = preview["targets"]
+        .as_array()
+        .ok_or("missing preview targets")?
+        .iter()
+        .map(|target| {
+            json!({
+                "userId": target["userId"],
+                "expectedVersion": target["expectedVersion"]
+            })
+        })
+        .collect::<Vec<_>>();
     let apply_request = json!({
         "sourceUserId": source,
         "sourceExpectedVersion": preview["sourceVersion"],
-        "targets": preview["targets"],
-        "groups": { "appearance": true, "home": false, "playback": false }
+        "targets": apply_targets,
+        "groups": { "appearance": true, "home": false, "playback": true, "libraryOrder": true }
     });
     let missing_csrf = client
         .post(&apply_url)
@@ -1698,7 +1768,27 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
     assert_eq!(stored.0, "light");
     assert_eq!(stored.1, "berry");
     assert_eq!(stored.2, 1);
-    assert_eq!(stored.3, "Chinese");
+    assert_eq!(stored.3, "Japanese");
+    let copied_library_order: Vec<String> = sqlx::query_scalar(
+        "SELECT library_id FROM user_library_order WHERE user_id = ? ORDER BY position",
+    )
+    .bind(&target)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(copied_library_order, ["copy-library-shared"]);
+    let copied_played_percent: i64 =
+        sqlx::query_scalar("SELECT played_percent FROM user_playback_settings WHERE user_id = ?")
+            .bind(&target)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(copied_played_percent, 67);
+    let use_admin_library_order: i64 = sqlx::query_scalar(
+        "SELECT use_admin_library_order FROM user_library_order_preferences WHERE user_id = ?",
+    )
+    .bind(&target)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(use_admin_library_order, 1);
 
     sqlx::query("UPDATE user_account_preferences SET version = version + 1 WHERE user_id = ?")
         .bind(&source)
@@ -1732,6 +1822,8 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
     assert_eq!(copy_event["metadata"]["sourceUserId"], source);
     assert_eq!(copy_event["metadata"]["groups"]["appearance"], true);
     assert_eq!(copy_event["metadata"]["groups"]["home"], false);
+    assert_eq!(copy_event["metadata"]["groups"]["playback"], true);
+    assert_eq!(copy_event["metadata"]["groups"]["libraryOrder"], true);
     assert!(!copy_event["metadata"].to_string().contains("light"));
     assert!(
         !copy_event["metadata"]

@@ -111,8 +111,10 @@
 .lux-admin-user-preference-copy-snapshot dt { color: var(--lux-muted); }
 .lux-admin-user-preference-copy-snapshot dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .lux-admin-user-preference-copy-versions, .lux-admin-user-preference-copy-results ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
-.lux-admin-user-preference-copy-versions li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 9px; border-radius: 7px; background: color-mix(in srgb, var(--lux-surface) 58%, transparent); font-size: .73rem; }
-.lux-admin-user-preference-copy-versions li span:last-child { color: var(--lux-muted); white-space: nowrap; }
+.lux-admin-user-preference-copy-versions li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 12px; padding: 7px 9px; border-radius: 7px; background: color-mix(in srgb, var(--lux-surface) 58%, transparent); font-size: .73rem; }
+.lux-admin-user-preference-copy-versions li span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.lux-admin-user-preference-copy-versions li span:nth-child(2) { color: var(--lux-muted); white-space: nowrap; }
+.lux-admin-user-preference-copy-versions li small { grid-column: 1 / -1; color: var(--lux-muted); font-size: .68rem; line-height: 1.45; overflow-wrap: anywhere; }
 .lux-admin-user-preference-copy-results { font-size: .75rem; }
 .lux-admin-user-preference-copy-results li.is-success { color: var(--lux-success, #64bd91); }
 .lux-admin-user-preference-copy-results li.is-failure { color: var(--lux-danger, #d86d6d); }
