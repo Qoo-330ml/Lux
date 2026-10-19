@@ -13465,6 +13465,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 完整 Web 门禁未全绿：`pnpm --dir web test` 的 Node 布局断言失败（其中 hero 行高期望与工作区既有 `web/src/react.css` 修改不一致）；单独全量 Vitest 为 91 个文件、677 passed、4 failed。四项失败位于既有首页预取焦点、LibraryCard 预取/虚拟链接和媒体图片轮询测试，与本任务文件无关。该工作区 `web/src/react.css` 的改动属于已有用户修改，未触碰或纳入提交。
 
+#### LUX-642：记录用户已应用的权限预设来源
+
+范围：为用户已应用的权限快照建立来源记录，保存预设 ID、名称、版本和应用时间；来源快照不依赖自定义预设继续存在，删除用户时级联清理。本任务只建立 SQLite/PostgreSQL 持久化结构，不改变用户权限和 API 行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0188_user_permission_preset_sources.sql`、`migrations-postgres/0188_user_permission_preset_sources.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] 空库升级后出现来源表，外键以用户为主表并在用户删除时级联清理。
+- [x] 来源记录保存预设 ID、名称、正版本号和应用时间；不外键关联可删除的自定义预设。
+- [x] SQLite 迁移回归和 PostgreSQL 迁移定义检查、Rust build、fmt 与 diff check 通过。
+
+短计划：先扩展空库迁移回归并确认失败；再添加双数据库迁移及来源记录约束。
+
+验证：`cargo test --locked --test storage -- --test-threads=1`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639、LUX-640。
+
+结果（2026-10-19）：新增双数据库用户预设来源表，保存应用时的 ID、名称、版本和时间，并在账号彻底删除时级联清理。`storage` target 串行运行 64/64、Rust build、fmt check、diff check 通过；PostgreSQL 迁移通过结构定义断言，本机 PostgreSQL 运行时未验证。第一次并行跑完整 `storage` target 时，时间敏感的既有重试迁移断言失败，单线程复跑通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
