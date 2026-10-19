@@ -1,4 +1,4 @@
-use std::{io::Write, path::Path};
+use std::{collections::HashSet, io::Write, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,7 @@ use crate::{
 use tokio::fs;
 
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
+const MAX_TRUSTED_PROXY_CIDRS: usize = 100;
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
 pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
 pub const LOGIN_BACKGROUND_PLUGIN_SOURCE_PREFIX: &str = "PLUGIN:";
@@ -180,6 +181,7 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
     pub(crate) user_activity_retention_days: i64,
+    pub(crate) trusted_proxy_cidrs: Vec<String>,
     pub(crate) new_user_permissions: NewUserPermissions,
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
@@ -200,6 +202,7 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) user_deletion_grace_days: Option<i64>,
     pub(crate) user_activity_retention_days: Option<i64>,
+    pub(crate) trusted_proxy_cidrs: Option<Vec<String>>,
     pub(crate) new_user_permissions: Option<NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
@@ -215,6 +218,7 @@ pub(crate) enum AdminSettingsError {
     InvalidGlobalSettings,
     InvalidUserDeletionGraceDays,
     InvalidUserActivityRetentionDays,
+    InvalidTrustedProxyCidrs,
     InvalidNewUserPermissions,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
@@ -228,6 +232,7 @@ struct StoredAdminSettings {
     force_admin_library_order: bool,
     user_deletion_grace_days: i64,
     user_activity_retention_days: i64,
+    trusted_proxy_cidrs: Vec<String>,
     new_user_permissions: NewUserPermissions,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
@@ -247,6 +252,7 @@ pub(crate) async fn read_admin_settings(
         .user_activity_retention_days()
         .await
         .map_err(|_| ())?;
+    let trusted_proxy_cidrs = read_trusted_proxy_cidrs(database).await?;
     let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
@@ -266,6 +272,7 @@ pub(crate) async fn read_admin_settings(
         force_admin_library_order,
         user_deletion_grace_days,
         user_activity_retention_days,
+        trusted_proxy_cidrs,
         new_user_permissions,
         login_background_source,
         login_background_source_status,
@@ -332,6 +339,12 @@ pub(crate) async fn update_admin_settings(
     if !(1..=3_650).contains(&user_activity_retention_days) {
         return Err(AdminSettingsError::InvalidUserActivityRetentionDays);
     }
+    let trusted_proxy_cidrs = match update.trusted_proxy_cidrs {
+        Some(values) => normalize_trusted_proxy_cidrs(values)?,
+        None => current.trusted_proxy_cidrs,
+    };
+    let trusted_proxy_cidrs_json =
+        serde_json::to_string(&trusted_proxy_cidrs).map_err(|_| AdminSettingsError::Unavailable)?;
     let mut new_user_permissions = update
         .new_user_permissions
         .unwrap_or(current.new_user_permissions);
@@ -407,6 +420,7 @@ pub(crate) async fn update_admin_settings(
             force_admin_library_order,
             user_deletion_grace_days,
             user_activity_retention_days,
+            trusted_proxy_cidrs_json: &trusted_proxy_cidrs_json,
             new_user_permissions_json: &new_user_permissions_json,
             login_background_source: &login_background_source,
             server_name: &server_name,
@@ -426,6 +440,7 @@ pub(crate) async fn update_admin_settings(
         force_admin_library_order,
         user_deletion_grace_days,
         user_activity_retention_days,
+        trusted_proxy_cidrs,
         new_user_permissions,
         login_background_source,
         login_background_source_status,
@@ -444,6 +459,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         .user_activity_retention_days()
         .await
         .map_err(|_| ())?;
+    let trusted_proxy_cidrs = read_trusted_proxy_cidrs(database).await?;
     let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
@@ -460,10 +476,42 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         force_admin_library_order,
         user_deletion_grace_days,
         user_activity_retention_days,
+        trusted_proxy_cidrs,
         new_user_permissions,
         login_background_source,
         media_strategy,
     })
+}
+
+pub(crate) async fn read_trusted_proxy_cidrs(database: &Database) -> Result<Vec<String>, ()> {
+    let stored = database.trusted_proxy_cidrs_json().await.map_err(|_| ())?;
+    let Some(stored) = stored else {
+        return Ok(Vec::new());
+    };
+    let Ok(values) = serde_json::from_str::<Vec<String>>(&stored) else {
+        return Ok(Vec::new());
+    };
+    Ok(normalize_trusted_proxy_cidrs(values).unwrap_or_default())
+}
+
+fn normalize_trusted_proxy_cidrs(values: Vec<String>) -> Result<Vec<String>, AdminSettingsError> {
+    if values.len() > MAX_TRUSTED_PROXY_CIDRS {
+        return Err(AdminSettingsError::InvalidTrustedProxyCidrs);
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = crate::application::user_access_rules::normalize_user_access_blacklist_value(
+            crate::application::user_access_rules::UserAccessBlacklistRuleType::IpCidr,
+            &value,
+        )
+        .map_err(|_| AdminSettingsError::InvalidTrustedProxyCidrs)?;
+        if !seen.insert(value.clone()) {
+            return Err(AdminSettingsError::InvalidTrustedProxyCidrs);
+        }
+        normalized.push(value);
+    }
+    Ok(normalized)
 }
 
 pub(crate) async fn read_new_user_permissions(
@@ -691,6 +739,7 @@ pub(crate) struct AdminSettingsWrite<'a> {
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
     pub(crate) user_activity_retention_days: i64,
+    pub(crate) trusted_proxy_cidrs_json: &'a str,
     pub(crate) new_user_permissions_json: &'a str,
     pub(crate) login_background_source: &'a str,
     pub(crate) server_name: &'a str,
@@ -719,6 +768,10 @@ pub(crate) async fn write_admin_settings(
         .map_err(|_| ())?;
     database
         .set_user_activity_retention_days(settings.user_activity_retention_days)
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_trusted_proxy_cidrs_json(settings.trusted_proxy_cidrs_json)
         .await
         .map_err(|_| ())?;
     database

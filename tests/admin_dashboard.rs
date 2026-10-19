@@ -206,6 +206,64 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         initial_settings["newUserPermissions"]["maxSimultaneousPlaybacks"],
         2
     );
+    assert_eq!(initial_settings["trustedProxyCidrs"], json!([]));
+
+    let missing_csrf_proxy_update = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .json(&json!({ "trustedProxyCidrs": ["10.0.0.0/8"] }))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_csrf_proxy_update.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    let trusted_proxy_update = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({
+            "trustedProxyCidrs": ["10.1.2.3/8", "2001:db8::1/32"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(trusted_proxy_update.status(), reqwest::StatusCode::OK);
+    let trusted_proxy_body: Value = trusted_proxy_update.json().await?;
+    let canonical_trusted_proxies = json!(["10.0.0.0/8", "2001:db8::/32"]);
+    assert_eq!(
+        trusted_proxy_body["trustedProxyCidrs"],
+        canonical_trusted_proxies
+    );
+
+    let excessive_cidrs = (0..101)
+        .map(|octet| format!("192.0.2.{octet}/32"))
+        .collect::<Vec<_>>();
+    for invalid_trusted_proxies in [
+        json!(["not-an-ip"]),
+        json!(["10.0.0.0/8", "10.2.3.4/8"]),
+        json!(excessive_cidrs),
+    ] {
+        let rejected = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "trustedProxyCidrs": invalid_trusted_proxies }))
+            .send()
+            .await?;
+        assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let preserved_trusted_proxies: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        preserved_trusted_proxies["trustedProxyCidrs"],
+        canonical_trusted_proxies
+    );
 
     let selected_defaults = json!({
         "libraryAccessMode": "SELECTED",
@@ -353,6 +411,21 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
     let settings_body: Value = settings.json().await?;
     assert_eq!(settings_body["userDeletionGraceDays"], 30);
+    assert_eq!(
+        settings_body["trustedProxyCidrs"],
+        canonical_trusted_proxies
+    );
+
+    let cleared_trusted_proxies = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({ "trustedProxyCidrs": [] }))
+        .send()
+        .await?;
+    assert_eq!(cleared_trusted_proxies.status(), reqwest::StatusCode::OK);
+    let cleared_trusted_proxy_body: Value = cleared_trusted_proxies.json().await?;
+    assert_eq!(cleared_trusted_proxy_body["trustedProxyCidrs"], json!([]));
 
     for invalid_days in [0, 3_651] {
         let invalid_retention = client

@@ -15945,6 +15945,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因读写方法缺失而编译失败；实现后 `trusted_proxy_cidrs_setting_reads_and_replaces_raw_json` 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
 
+#### LUX-763：管理 API 配置可信代理网段
+
+范围：在管理员服务器设置 GET/PATCH 中暴露 `trustedProxyCidrs`。读取默认 `[]`；PATCH 支持最多 100 个 IPv4/IPv6 地址或 CIDR，规范化网络位、拒绝非法值与规范化后的重复值；空数组清除信任设置，字段省略则保留。写入由管理员 Web session 与 CSRF 保护。本任务不把该配置用于 IP 封禁或改变请求处理。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] GET 总是返回 canonical `trustedProxyCidrs` 数组，未配置时为空。
+- [x] PATCH 规范化 IPv4/IPv6/CIDR 并持久化；空数组能清除，省略字段不覆盖已有设置。
+- [x] 非法地址、重复网段和超过 100 项均返回 400，失败时不改变已存设置。
+- [x] 管理员认证/CSRF、设置 API 定向集成目标、build、fmt 与 diff check 通过；此任务不执行 IP ACL。
+
+短计划：先扩展管理设置集成回归，确认 GET 缺少该字段且 PATCH 未保存；再增加应用层规范化和拒绝规则、API DTO 与映射，读取/写入 LUX-762 storage；最后更新 API 文档并运行定向设置目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：管理员设置 GET/PATCH 增加 `trustedProxyCidrs`，默认空列表；地址和网段经规范化，拒绝非法、规范化重复和超过 100 项，空数组清除，省略时保留。设置保存在 LUX-762 的键值记录中；认证与 CSRF 边界保持管理员 Web session。更新了 `docs/API.md`。本任务仍未将代理设置用于 ACL。
+
+验证：TDD RED 先因 GET 字段缺失而失败；实现后 `admin_dashboard_returns_server_playback_and_activity_data` 1/1 通过，覆盖默认、存储回读、canonical IPv4/IPv6、清除、部分更新、非法输入、CSRF 和失败后保留原值。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。严格 `cargo clippy --locked --all-targets --all-features -- -D warnings` 仍报 13 项既有诊断（相关位置均不在本次新增代码；完整 Rust 门禁尚未通过）。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
