@@ -12999,6 +12999,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：SQLite 定向迁移回归 1/1 通过，覆盖新库 schema、复合主键、用户外键、状态与时间约束，以及旧播放记录保留。PostgreSQL 集成目标成功编译；19 个测试因需要本地 PostgreSQL 全部 ignored，因此 bootstrap 断言尚未运行时验证。Rust 格式检查与 `git diff --check` 通过。此任务只建立 schema，未实现准入逻辑。
 
+#### LUX-619：原子执行共享播放准入
+
+范围：在 storage 层增加播放会话准入、续租和释放操作。SQLite 用立即写事务串行准入，PostgreSQL 锁定用户行；计数合并活跃占位与 `playback_sessions` 中活跃/暂停会话，按用户和播放会话 ID 去重。沿用 90 秒活跃窗口；`0` 表示不限，禁止播放策略拒绝准入，同一现有会话在额度降低后可继续续租。此任务不接入 Web/Emby/STRM 路由。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/sessions.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 并发争抢最后一个名额时，数据库只准入一个新会话；同一会话续租不重复占用名额。
+- [x] 旧播放记录与新占位按会话去重；暂停会话计入额度，停止释放，超过 90 秒的未续租占位不再计数。
+- [x] 并发上限降低时保留现存会话并拒绝新会话；`0` 不限，`can_play=false` 拒绝准入。
+- [x] SQLite 定向存储回归、Rust 格式检查通过；PostgreSQL 分支编译验证通过。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib playback_admission`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-618、LUX-617。
+
+结果（2026-10-19）：`playback_admission` 定向存储测试 3/3 通过，覆盖同用户并发争抢、续租复用、停止释放、旧播放记录去重、暂停计数、额度下调、不限额、禁播和 90 秒过期回收。PostgreSQL 集成目标编译通过，但 19 个测试均因需要本地 PostgreSQL 而 ignored；PostgreSQL 行锁逻辑尚未运行时验证。Rust 格式检查与 `git diff --check` 通过。播放入口接入留给后续任务。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

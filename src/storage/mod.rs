@@ -19,6 +19,29 @@ pub(crate) struct UserPlaybackPolicy {
     pub(crate) allow_video_transcode: bool,
 }
 
+// LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaybackAdmissionDenialReason {
+    PlaybackDisabled,
+    ConcurrentLimit,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlaybackAdmissionDecision {
+    Admitted,
+    Denied(PlaybackAdmissionDenialReason),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackAdmissionResult {
+    pub(crate) decision: PlaybackAdmissionDecision,
+    pub(crate) active_playback_count: i64,
+    pub(crate) max_simultaneous_playbacks: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

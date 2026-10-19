@@ -1,5 +1,7 @@
 use super::*;
-use crate::storage::UserPlaybackPolicy;
+use crate::storage::{
+    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserPlaybackPolicy,
+};
 
 #[tokio::test]
 async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
@@ -14040,6 +14042,278 @@ async fn user_playback_admission_migration_creates_constrained_ledger()
         legacy_playback_count, 1,
         "migration must preserve old playback records"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user_id = "playback-admission-user";
+    database
+        .insert_user(user_id, user_id, "Playback Admission", "test", false, true)
+        .await?;
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+
+    let now = 1_000_i64;
+    let (first, second) = tokio::join!(
+        database.reserve_playback_admission(user_id, "admission-session-a", now),
+        database.reserve_playback_admission(user_id, "admission-session-b", now),
+    );
+    let first = first?.expect("user exists");
+    let second = second?.expect("user exists");
+    assert_ne!(first.decision, second.decision);
+    let (accepted_session, denied) = if first.decision == PlaybackAdmissionDecision::Admitted {
+        ("admission-session-a", second)
+    } else {
+        ("admission-session-b", first)
+    };
+    assert_eq!(
+        denied.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+    );
+    assert_eq!(denied.active_playback_count, 1);
+
+    let renewal = database
+        .reserve_playback_admission(user_id, accepted_session, now + 1)
+        .await?
+        .expect("user exists");
+    assert_eq!(renewal.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(renewal.active_playback_count, 1);
+    assert!(
+        database
+            .release_playback_admission(user_id, accepted_session, now + 2)
+            .await?
+    );
+    assert!(
+        !database
+            .release_playback_admission(user_id, accepted_session, now + 2)
+            .await?
+    );
+
+    let retry = database
+        .reserve_playback_admission(user_id, "admission-session-c", now + 3)
+        .await?
+        .expect("user exists");
+    assert_eq!(retry.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(retry.active_playback_count, 1);
+
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 0,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    for session_id in ["admission-session-d", "admission-session-e"] {
+        let unlimited = database
+            .reserve_playback_admission(user_id, session_id, now + 4)
+            .await?
+            .expect("user exists");
+        assert_eq!(unlimited.decision, PlaybackAdmissionDecision::Admitted);
+    }
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    for session_id in [
+        "admission-session-c",
+        "admission-session-d",
+        "admission-session-e",
+    ] {
+        let existing = database
+            .reserve_playback_admission(user_id, session_id, now + 5)
+            .await?
+            .expect("user exists");
+        assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(existing.active_playback_count, 3);
+    }
+    let new_session = database
+        .reserve_playback_admission(user_id, "admission-session-f", now + 6)
+        .await?
+        .expect("user exists");
+    assert_eq!(
+        new_session.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+    );
+    assert_eq!(new_session.active_playback_count, 3);
+
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: false,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    let disabled = database
+        .reserve_playback_admission(user_id, "admission-session-g", now + 7)
+        .await?
+        .expect("user exists");
+    assert_eq!(
+        disabled.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::PlaybackDisabled)
+    );
+    assert_eq!(disabled.active_playback_count, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user_id = "legacy-playback-admission-user";
+    database
+        .insert_user(
+            user_id,
+            user_id,
+            "Legacy Playback Admission",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback Admission", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('playback-admission-item', ?, 'MOVIE', 'Admission', 'Admission', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    database
+        .record_playback_event(NewPlaybackEvent {
+            user_id,
+            item_id: "playback-admission-item",
+            media_source_id: None,
+            play_session_id: "legacy-play-session",
+            device_id: "test-device",
+            client: None,
+            device_name: None,
+            client_version: None,
+            device_type: None,
+            remote_ip: None,
+            state: "PAUSED",
+            position_ticks: 10,
+            duration_ticks: Some(100),
+            played_percent: 95,
+            is_paused: true,
+        })
+        .await?;
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    let existing = database
+        .reserve_playback_admission(user_id, "legacy-play-session", now)
+        .await?
+        .expect("user exists");
+    assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(existing.active_playback_count, 1);
+    let denied = database
+        .reserve_playback_admission(user_id, "new-play-session", now)
+        .await?
+        .expect("user exists");
+    assert_eq!(
+        denied.decision,
+        PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+    );
+
+    database
+        .record_playback_event(NewPlaybackEvent {
+            user_id,
+            item_id: "playback-admission-item",
+            media_source_id: None,
+            play_session_id: "legacy-play-session",
+            device_id: "test-device",
+            client: None,
+            device_name: None,
+            client_version: None,
+            device_type: None,
+            remote_ip: None,
+            state: "STOPPED",
+            position_ticks: 10,
+            duration_ticks: Some(100),
+            played_percent: 95,
+            is_paused: false,
+        })
+        .await?;
+    assert!(
+        database
+            .release_playback_admission(user_id, "legacy-play-session", now + 1)
+            .await?
+    );
+    let stale_admission = database
+        .reserve_playback_admission(user_id, "stale-play-session", now + 2)
+        .await?
+        .expect("user exists");
+    assert_eq!(stale_admission.active_playback_count, 1);
+    let after_stale = database
+        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92)
+        .await?
+        .expect("user exists");
+    assert_eq!(after_stale.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(after_stale.active_playback_count, 1);
+    let stale_state: String = sqlx::query_scalar(
+        "SELECT state FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = 'stale-play-session'",
+    )
+    .bind(user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_state, "RELEASED");
     Ok(())
 }
 
