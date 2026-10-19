@@ -36,6 +36,7 @@ import type {
   AdminApiKey,
   NetworkProxyDiagnostics,
   AdminUser,
+  AdminUserWebSessionPage,
   AdminUserPermissionPreset,
   AdminUserPermissionPresetInput,
   AdminUserLibraryAccess,
@@ -1155,6 +1156,20 @@ export class LuxApiClient {
   adminUser(userId: string) {
     return this.request<{ user?: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  adminUserWebSessions(userId: string, page = 1, pageSize = 50) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserWebSessionPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/sessions?${params.toString()}`,
+    );
+  }
+
+  revokeAdminUserWebSession(userId: string, sessionId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
     );
   }
 

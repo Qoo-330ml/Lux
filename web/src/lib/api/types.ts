@@ -564,6 +564,22 @@ export type AdminUser = LuxUser & {
   presetSourceDetails?: AdminUserPermissionPresetSourceDetails | null;
 };
 
+export type AdminUserWebSession = {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  lastSeenAt: number | null;
+  isCurrent: boolean;
+};
+
+export type AdminUserWebSessionPage = {
+  sessions: AdminUserWebSession[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
 export type AdminUserPermissionPresetSourceDetails = {
   id: string;
   name: string;

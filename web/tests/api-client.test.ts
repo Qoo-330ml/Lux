@@ -343,6 +343,48 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
   });
 
+  it("uses paginated admin user Web session and CSRF-protected revoke contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: [{
+          id: "session-1",
+          createdAt: 10,
+          updatedAt: 20,
+          expiresAt: 30,
+          lastSeenAt: 15,
+          isCurrent: false,
+        }],
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserWebSessions("user/1", 2, 10)).resolves.toMatchObject({
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+        sessions: [{ id: "session-1", isCurrent: false }],
+      });
+      await expect(client.revokeAdminUserWebSession("user/1", "session/1")).resolves.toBeUndefined();
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/sessions?page=2&pageSize=10",
+      );
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/sessions/session%2F1",
+      );
+      expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     const cookie = installCookieDocument("lux_csrf=csrf-token");

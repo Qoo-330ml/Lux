@@ -13876,6 +13876,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增管理员单会话撤销 DELETE API，管理员 Web 登录需通过 CSRF；当前会话使用 user/session/token 摘要精确匹配保护。存储更新原子要求目标未撤销且未过期；错误归属、过期、重复撤销返回 404，撤销后只使目标 Cookie 失效并记录安全审计事件。撤销回归 1/1，串行 `users` target 6/6、Rust fmt check 与 diff check 通过。默认并发 `users` target 曾有一个既有用户管理测试收到 503；该测试单独及串行 target 重跑通过，暂未查明并发失败原因。
 
+#### LUX-663：为管理员 Web 会话管理补齐 Web API 客户端合同
+
+范围：为 LUX-660/LUX-662 管理员 Web 会话读取与撤销 API 增加有类型的 Web 客户端方法。列表支持页码和页大小参数；撤销使用 DELETE 和现有自动 CSRF 头处理。此任务不修改页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 会话列表类型只含会话 ID、时间和当前会话标记；没有 token/cookie/凭证字段。
+- [x] 客户端正确编码用户/会话 ID、构建分页查询，并为撤销请求附带 CSRF 头。
+- [x] API 客户端定向 Vitest、Web 类型构建与 diff check 通过。
+
+短计划：先添加列表/撤销 URL、参数与 CSRF 头的失败客户端回归；再新增安全摘要类型和两个 API 方法，运行定向 API 客户端测试与 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "uses paginated admin user Web session"`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-660、LUX-662。
+
+结果（2026-10-19）：新增 Web 会话分页摘要类型，以及管理员读取和撤销客户端方法；DELETE 复用统一请求层自动附加 CSRF。定向 API 客户端测试 1/1 通过，Web build 在临时恢复当前提交版 `AdminDashboardNowPlaying.tsx` 后通过，并确认还原了该文件原有未提交内容。直接在当前工作区运行 build 会被该用户改动中两个未使用 helper 阻断；`git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
