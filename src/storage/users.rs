@@ -1651,6 +1651,95 @@ impl Database {
         Ok(event_id)
     }
 
+    // LUX-723 wires this storage contract into the administrator activity API.
+    #[allow(dead_code)]
+    pub(crate) async fn list_user_activity_events(
+        &self,
+        query: UserActivityEventQuery<'_>,
+    ) -> Result<(Vec<StoredUserActivityEvent>, i64), StorageError> {
+        let event_type = query
+            .event_type
+            .map(str::trim)
+            .filter(|event_type| !event_type.is_empty());
+        let mut conditions = vec!["user_id = ?"];
+        if event_type.is_some() {
+            conditions.push("event_type = ?");
+        }
+        if query.from_at.is_some() {
+            conditions.push("occurred_at >= ?");
+        }
+        if query.to_at.is_some() {
+            conditions.push("occurred_at <= ?");
+        }
+        let where_clause = format!(" WHERE {}", conditions.join(" AND "));
+
+        let count_sql =
+            format!("SELECT COUNT(*) AS total_count FROM user_activity_events{where_clause}");
+        let mut count_query = self
+            .query(sqlx::AssertSqlSafe(count_sql))
+            .bind(query.user_id);
+        if let Some(event_type) = event_type {
+            count_query = count_query.bind(event_type);
+        }
+        if let Some(from_at) = query.from_at {
+            count_query = count_query.bind(from_at);
+        }
+        if let Some(to_at) = query.to_at {
+            count_query = count_query.bind(to_at);
+        }
+        let total_count = count_query
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| row.get::<i64, _>("total_count"))
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let page_sql = format!(
+            "SELECT id, user_id, actor_user_id, event_type, target_type, target_id,
+                    metadata_json, occurred_at
+             FROM user_activity_events{where_clause}
+             ORDER BY occurred_at DESC, id DESC
+             LIMIT ? OFFSET ?"
+        );
+        let mut page_query = self
+            .query(sqlx::AssertSqlSafe(page_sql))
+            .bind(query.user_id);
+        if let Some(event_type) = event_type {
+            page_query = page_query.bind(event_type);
+        }
+        if let Some(from_at) = query.from_at {
+            page_query = page_query.bind(from_at);
+        }
+        if let Some(to_at) = query.to_at {
+            page_query = page_query.bind(to_at);
+        }
+        let rows = page_query
+            .bind(query.limit.clamp(1, 100))
+            .bind(query.offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let events = rows
+            .into_iter()
+            .map(|row| StoredUserActivityEvent {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                actor_user_id: row.get("actor_user_id"),
+                event_type: row.get("event_type"),
+                target_type: row.get("target_type"),
+                target_id: row.get("target_id"),
+                metadata_json: row.get("metadata_json"),
+                occurred_at: row.get("occurred_at"),
+            })
+            .collect();
+        Ok((events, total_count))
+    }
+
     pub(crate) async fn list_activity_events(
         &self,
         limit: i64,

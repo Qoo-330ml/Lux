@@ -15130,6 +15130,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-720。
 
+#### LUX-722：提供用户活动索引的过滤分页存储查询
+
+范围：为模块七活动时间线增加按固定用户范围读取用户活动索引的存储合同，支持可选事件类型和起止 Unix 时间筛选、稳定的时间/ID 倒序、匹配总数和有界分页。页大小强制限制为 1–100，负偏移归零；越界页仍返回正确总数。只读取索引表，不扫描文件审计归档，不加载未分页用户事件。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 用户隔离及事件类型/时间边界筛选在分页前执行，匹配总数准确。
+- [x] 按 `occurred_at DESC, id DESC` 稳定排序；相同时间跨页不重复、不遗漏。
+- [x] 页大小 1–100、负偏移归零；越界页返回空项和准确总数。
+- [x] 定向 storage 回归、build、fmt 和 diff check 通过。
+
+短计划：先增加过滤/排序/分页存储回归并确认查询合同缺失而失败；再补查询 DTO、存储方法和导出；最后跑定向 repository 测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增 `UserActivityEventQuery` 与按用户、事件类型、起止时间过滤的索引表查询。匹配总数独立计算，保证越界页仍返回准确总数；结果按 `occurred_at DESC, id DESC` 稳定排序，限制页大小 1–100 并将负偏移归零。不读取用户归档日志。
+
+验证：TDD RED 因查询类型/方法不存在而编译失败；`user_activity_index_query_filters_and_pages_in_stable_order` 1/1，覆盖用户隔离、含边界时间过滤、事件类型、同时间跨页、稳定 ID 顺序、负偏移、最大页大小及越界页总数。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+依赖：LUX-721。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -4,8 +4,8 @@ use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
     MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserActivityEvent,
     NewUserContentRestrictions, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
-    UserContentRestrictionsCasResult, UserPermissionCopyGroups, UserPermissionCopyResult,
-    UserPlaybackPolicy,
+    StoredUserActivityEvent, UserActivityEventQuery, UserContentRestrictionsCasResult,
+    UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -23312,6 +23312,122 @@ async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subje
             .fetch_one(database.pool())
             .await?;
     assert_eq!(invalid_metadata, r#"{"invalid":true}"#);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_activity_index_query_filters_and_pages_in_stable_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, user_id, event_type, occurred_at) in [
+        ("login-10", "timeline-user", "AUTH_LOGIN", 10_i64),
+        ("pause-20", "timeline-user", "PLAYBACK_PAUSED", 20),
+        ("started-20", "timeline-user", "PLAYBACK_STARTED", 20),
+        ("before-9", "timeline-user", "AUTH_LOGIN", 9),
+        ("other-30", "other-timeline-user", "AUTH_LOGIN", 30),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, event_type, occurred_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first_page, total_count) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: Some(10),
+            to_at: Some(20),
+            offset: 0,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(total_count, 3);
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|event: &StoredUserActivityEvent| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["started-20", "pause-20"]
+    );
+    assert_eq!(first_page[0].user_id, "timeline-user");
+    assert_eq!(first_page[0].event_type, "PLAYBACK_STARTED");
+    assert_eq!(first_page[0].occurred_at, 20);
+
+    let (second_page, second_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: Some(10),
+            to_at: Some(20),
+            offset: 2,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(second_total, 3);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, "login-10");
+
+    let (playback_events, playback_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: Some("PLAYBACK_PAUSED"),
+            from_at: None,
+            to_at: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await?;
+    assert_eq!(playback_total, 1);
+    assert_eq!(playback_events[0].id, "pause-20");
+
+    for index in 0..101_i64 {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, event_type, occurred_at)
+             VALUES (?, 'timeline-user', 'FILLER', ?)",
+        )
+        .bind(format!("filler-{index:03}"))
+        .bind(100 + index)
+        .execute(database.pool())
+        .await?;
+    }
+    let (bounded_page, bounded_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: None,
+            to_at: None,
+            offset: -1,
+            limit: 1_000,
+        })
+        .await?;
+    assert_eq!(bounded_total, 105);
+    assert_eq!(bounded_page.len(), 100);
+    assert_eq!(bounded_page[0].id, "filler-100");
+
+    let (past_end, past_end_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: None,
+            to_at: None,
+            offset: 10_000,
+            limit: 20,
+        })
+        .await?;
+    assert!(past_end.is_empty());
+    assert_eq!(past_end_total, 105);
     Ok(())
 }
 

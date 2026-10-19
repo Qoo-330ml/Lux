@@ -1308,6 +1308,30 @@ pub(crate) struct NewUserActivityEvent<'a> {
     pub(crate) metadata_json: &'a str,
 }
 
+// LUX-723 consumes this bounded query contract in the administrator activity API.
+#[allow(dead_code)]
+pub(crate) struct UserActivityEventQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) event_type: Option<&'a str>,
+    pub(crate) from_at: Option<i64>,
+    pub(crate) to_at: Option<i64>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct StoredUserActivityEvent {
+    pub(crate) id: String,
+    pub(crate) user_id: String,
+    pub(crate) actor_user_id: Option<String>,
+    pub(crate) event_type: String,
+    pub(crate) target_type: Option<String>,
+    pub(crate) target_id: Option<String>,
+    pub(crate) metadata_json: String,
+    pub(crate) occurred_at: i64,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredActivityEvent {
     pub(crate) id: String,
