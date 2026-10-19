@@ -1060,7 +1060,6 @@ fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option
         .map(|address| address.to_string())
 }
 
-#[allow(dead_code)] // LUX-767 and later auth tasks wire this resolver into request checks.
 async fn request_access_ip(
     headers: &HeaderMap,
     state: &AppState,

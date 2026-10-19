@@ -2122,9 +2122,13 @@ pub(super) async fn emby_authenticate(
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let client_ip = match super::request_access_ip(&headers, &state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let device = emby_device_info_from_headers(&headers);
     match auth
-        .authenticate(&request.username, &request.password, &device)
+        .authenticate_with_ip(&request.username, &request.password, &device, client_ip)
         .await
     {
         Ok(Some(result)) => {
@@ -2147,6 +2151,9 @@ pub(super) async fn emby_authenticate(
             }
             StatusCode::UNAUTHORIZED.into_response()
         }
+        Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -2168,9 +2175,13 @@ pub(super) async fn emby_authenticate_user_id(
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let client_ip = match super::request_access_ip(&headers, &state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let device = emby_device_info_from_headers(&headers);
     match auth
-        .authenticate_user_id(&user_id, &request.password, &device)
+        .authenticate_user_id_with_ip(&user_id, &request.password, &device, client_ip)
         .await
     {
         Ok(Some(result)) => {
@@ -2189,6 +2200,9 @@ pub(super) async fn emby_authenticate_user_id(
                 .await;
             }
             StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -2407,13 +2421,17 @@ pub(super) async fn resolve_emby_user_with_auth(
     headers: &HeaderMap,
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<UserRecord, StatusCode> {
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    match auth.resolve_token(&token).await {
+    match auth.resolve_token_with_ip(&token, client_ip).await {
         Ok(Some(user)) => Ok(user),
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
+        Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -2534,7 +2552,10 @@ pub(super) async fn require_emby_user_with_query(
     let Some(auth) = state.emby_auth.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let user = resolve_emby_user_with_auth(headers, query, auth, client_ip).await?;
     if state.remote_access.is_remote(
         header_str(headers, "x-lux-peer-ip"),
         header_str(headers, "x-forwarded-for"),
@@ -2585,9 +2606,15 @@ pub(super) async fn require_emby_principal_with_query(
     let principal = if let Some(principal) = principal {
         principal
     } else {
-        match auth.resolve_token(&token).await {
+        let client_ip = super::request_access_ip(headers, state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        match auth.resolve_token_with_ip(&token, client_ip).await {
             Ok(Some(user)) => crate::auth::users::AuthenticationPrincipal::User(user),
             Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+            Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     };

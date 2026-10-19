@@ -1858,3 +1858,217 @@ async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts
     assert_eq!(response.status(), native_baseline.status());
     Ok(())
 }
+
+#[tokio::test]
+async fn emby_login_and_existing_tokens_enforce_ip_blacklists_through_trusted_proxies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let target = UserStore::new(database.clone())?
+        .create_user("emby-ip-target", "Emby IP Target", "target password", false)
+        .await?;
+    let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        emby_auth.clone(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    }));
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let base_url = format!("http://{address}");
+    let login = |client_ip: &str| {
+        client
+            .post(format!("{base_url}/Users/AuthenticateByName"))
+            .header(
+                AUTHORIZATION,
+                r#"Emby Client="Infuse", Device="iPhone", DeviceId="emby-ip-device", Version="1.0""#,
+            )
+            .header("X-Forwarded-For", client_ip)
+            .json(&json!({
+                "Username": "emby-ip-target",
+                "Pw": "target password"
+            }))
+    };
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES ('emby-ip-rule', ?, 'IP_CIDR', '198.51.100.0/24', 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(target.id.to_string())
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let untrusted_xff = login("198.51.100.7").send().await?;
+    assert_eq!(untrusted_xff.status(), reqwest::StatusCode::OK);
+    let untrusted_token = untrusted_xff.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing access token")?
+        .to_owned();
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
+    let no_peer_auth = emby_auth
+        .authenticate(
+            "emby-ip-target",
+            "target password",
+            &EmbyDeviceInfo {
+                client: "Infuse".to_owned(),
+                device: "iPhone".to_owned(),
+                device_id: "emby-ip-no-peer".to_owned(),
+                version: "1.0".to_owned(),
+                user_id: None,
+            },
+        )
+        .await?;
+    assert!(no_peer_auth.is_none());
+
+    let trusted_xff = login("198.51.100.8").send().await?;
+    assert_eq!(trusted_xff.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let trusted_user_id_login = client
+        .post(format!("{base_url}/Users/{}/Authenticate", target.id))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="iPhone", DeviceId="emby-ip-device", Version="1.0""#,
+        )
+        .header("X-Forwarded-For", "198.51.100.10")
+        .json(&json!({ "Pw": "target password" }))
+        .send()
+        .await?;
+    assert_eq!(
+        trusted_user_id_login.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let existing_token_on_blocked_ip = client
+        .get(format!("{base_url}/Users/{}", target.id))
+        .header("X-Emby-Token", &untrusted_token)
+        .header("X-Forwarded-For", "198.51.100.9")
+        .send()
+        .await?;
+    assert_eq!(
+        existing_token_on_blocked_ip.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let token_hash = Sha256::digest(untrusted_token.as_bytes()).to_vec();
+    let revoked_at: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE token_hash = ?")
+            .bind(token_hash)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(revoked_at.is_some());
+
+    let allowed_login = login("192.0.2.17").send().await?;
+    assert_eq!(allowed_login.status(), reqwest::StatusCode::OK);
+    let allowed_token = allowed_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing allowed access token")?
+        .to_owned();
+    let allowed_existing_token = client
+        .get(format!("{base_url}/Users/{}", target.id))
+        .header("X-Emby-Token", &allowed_token)
+        .header("X-Forwarded-For", "192.0.2.18")
+        .send()
+        .await?;
+    assert_eq!(allowed_existing_token.status(), reqwest::StatusCode::OK);
+
+    sqlx::query(
+        "UPDATE user_access_blacklist_rules SET match_value = 'not-a-cidr'
+         WHERE id = 'emby-ip-rule'",
+    )
+    .execute(database.pool())
+    .await?;
+    let corrupt_rule_login = login("192.0.2.19").send().await?;
+    assert_eq!(
+        corrupt_rule_login.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    sqlx::query(
+        "UPDATE user_access_blacklist_rules SET match_value = '198.51.100.0/24'
+         WHERE id = 'emby-ip-rule'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', 'invalid-json')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await?;
+    let invalid_proxy_settings_login = login("192.0.2.21").send().await?;
+    assert_eq!(
+        invalid_proxy_settings_login.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    sqlx::query("UPDATE server_settings SET value = ? WHERE key = 'trusted_proxy_cidrs'")
+        .bind("[\"127.0.0.1/32\"]")
+        .execute(database.pool())
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES ('emby-ip-global-rule', NULL, 'IP_CIDR', '203.0.113.0/24', 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let shared_admin_key_access = client
+        .get(format!("{base_url}/Users"))
+        .query(&[("api_key", admin_key.as_str())])
+        .header("X-Forwarded-For", "203.0.113.5")
+        .send()
+        .await?;
+    assert_eq!(shared_admin_key_access.status(), reqwest::StatusCode::OK);
+
+    for index in 0..200 {
+        let id = format!("emby-ip-overflow-{index}");
+        let match_value = format!("10.0.{}/32", index % 256);
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by,
+                 created_at, updated_at
+             ) VALUES (?, ?, 'IP_CIDR', ?, 1, ?, unixepoch(), unixepoch())",
+        )
+        .bind(id)
+        .bind(target.id.to_string())
+        .bind(match_value)
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
+    }
+    let overflow_login = login("192.0.2.20").send().await?;
+    assert_eq!(
+        overflow_login.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    Ok(())
+}

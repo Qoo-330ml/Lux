@@ -1,10 +1,13 @@
+use std::net::IpAddr;
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::{
     application::user_access_rules::{
-        UserAccessBlacklistRuleType, normalize_user_access_blacklist_value,
+        MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST, UserAccessBlacklistRuleType,
+        ip_blacklist_rules_match_address, normalize_user_access_blacklist_value,
     },
     auth::{
         password::PasswordError,
@@ -13,7 +16,7 @@ use crate::{
     domain::ids::UserId,
     storage::{
         Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary,
-        UserAccessBlacklistRuleMatchQuery,
+        UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
     },
 };
 
@@ -71,6 +74,17 @@ impl EmbyAuthService {
         password: &str,
         device: &EmbyDeviceInfo,
     ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        self.authenticate_with_ip(username, password, device, None)
+            .await
+    }
+
+    pub async fn authenticate_with_ip(
+        &self,
+        username: &str,
+        password: &str,
+        device: &EmbyDeviceInfo,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
         let Some(user) = self
             .users
             .authenticate_emby_name(username, password)
@@ -78,7 +92,7 @@ impl EmbyAuthService {
         else {
             return Ok(None);
         };
-        self.create_access_token(user, device).await
+        self.create_access_token(user, device, client_ip).await
     }
 
     pub async fn find_failed_authentication_user_id(
@@ -97,19 +111,37 @@ impl EmbyAuthService {
         password: &str,
         device: &EmbyDeviceInfo,
     ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        self.authenticate_user_id_with_ip(user_id, password, device, None)
+            .await
+    }
+
+    pub async fn authenticate_user_id_with_ip(
+        &self,
+        user_id: &str,
+        password: &str,
+        device: &EmbyDeviceInfo,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
         let Some(user) = self.users.authenticate_by_id(user_id, password).await? else {
             return Ok(None);
         };
-        self.create_access_token(user, device).await
+        self.create_access_token(user, device, client_ip).await
     }
 
     async fn create_access_token(
         &self,
         user: UserRecord,
         device: &EmbyDeviceInfo,
+        client_ip: Option<IpAddr>,
     ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
         if self
             .user_access_blacklist_matches(&user.id.to_string(), device)
+            .await?
+        {
+            return Ok(None);
+        }
+        if self
+            .is_user_ip_blacklisted(&user.id.to_string(), client_ip)
             .await?
         {
             return Ok(None);
@@ -161,6 +193,32 @@ impl EmbyAuthService {
                 client_name: client_name.as_deref(),
             })
             .await?)
+    }
+
+    async fn is_user_ip_blacklisted(
+        &self,
+        user_id: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<bool, EmbyAuthError> {
+        let rules = self
+            .database
+            .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                user_id,
+                limit: MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST as i64 + 1,
+            })
+            .await
+            .map_err(|_| EmbyAuthError::AccessRulesUnavailable)?;
+        if rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            return Err(EmbyAuthError::AccessRulesUnavailable);
+        }
+        if rules.is_empty() {
+            return Ok(false);
+        }
+        let Some(client_ip) = client_ip else {
+            return Ok(true);
+        };
+        ip_blacklist_rules_match_address(client_ip, &rules)
+            .map_err(|_| EmbyAuthError::AccessRulesUnavailable)
     }
 
     pub async fn logout(&self, token: &str) -> Result<(), EmbyAuthError> {
@@ -232,12 +290,24 @@ impl EmbyAuthService {
     }
 
     pub async fn resolve_token(&self, token: &str) -> Result<Option<UserRecord>, EmbyAuthError> {
+        self.resolve_token_with_ip(token, None).await
+    }
+
+    pub async fn resolve_token_with_ip(
+        &self,
+        token: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<UserRecord>, EmbyAuthError> {
         let token_hash = hash_token(token);
         self.database.touch_access_token(&token_hash).await?;
         let Some(stored) = self.database.find_user_by_access_token(&token_hash).await? else {
             return Ok(None);
         };
         if stored.is_disabled {
+            return Ok(None);
+        }
+        if self.is_user_ip_blacklisted(&stored.id, client_ip).await? {
+            self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
         if let Some(device) = self.device_info(token).await?
@@ -356,6 +426,7 @@ fn hash_token(token: &str) -> Vec<u8> {
 
 #[derive(Debug)]
 pub enum EmbyAuthError {
+    AccessRulesUnavailable,
     InvalidUserId(String),
     Password(PasswordError),
     Storage(StorageError),
@@ -384,6 +455,7 @@ impl From<UserStoreError> for EmbyAuthError {
 impl std::fmt::Display for EmbyAuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AccessRulesUnavailable => formatter.write_str("access rules are unavailable"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::Password(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
@@ -399,7 +471,9 @@ impl std::error::Error for EmbyAuthError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::UserStore(error) => Some(error),
-            Self::InvalidUserId(_) | Self::TokenGeneration(_) => None,
+            Self::AccessRulesUnavailable | Self::InvalidUserId(_) | Self::TokenGeneration(_) => {
+                None
+            }
         }
     }
 }

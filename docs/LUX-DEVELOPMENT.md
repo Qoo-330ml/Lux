@@ -16036,6 +16036,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`cargo test --locked --test users -- --test-threads=1` 23/23、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍有 13 项既有诊断，位于未修改的管理员 API、媒体播放、权限复制及存储测试代码；本任务没有新增诊断。Cargo 命令使用 Toshiba target 目录。直接、可信代理、缺少 peer、已有会话撤销及超限 fail-closed 均由 Web 集成用例覆盖。
 
+#### LUX-768：在 Emby 登录与凭证解析中执行 IP/CIDR 黑名单
+
+范围：Emby 按名称/用户 ID 登录签发凭证前，以及每次 Emby 凭证解析时，使用 LUX-766 的可信代理访问 IP 与 LUX-765 的有界规则匹配。命中时不签发新 token；已有 token 命中后撤销并按未认证处理。缺少 peer 且存在活动 IP 规则时 fail closed；损坏规则、规则超限或读取错误不得放行。共享管理员 API Key 不属于普通用户 Emby 凭证，不受本任务影响。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/emby.rs`、`src/api/emby_handlers.rs`、`src/api/legacy.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] 全部 Emby 密码登录入口以可信访问 IP 检查用户/全站 IP 规则；命中不创建凭证，未命中可登录。
+- [x] Emby token 每次解析时执行同一规则；命中后凭证被撤销，缺少 peer 时 fail closed，其他地址仍可访问。
+- [x] 坏规则、超限或 storage/可信代理解析错误返回服务不可用；管理员 API Key 行为不变。
+- [x] Emby 认证集成定向目标、Rust build、fmt 与 diff check 通过；不接 Lux Web API 兼容认证或播放授权。
+
+短计划：先在 `tests/emby_auth.rs` 覆盖可信/不可信来源的登录、已有 token 撤销、缺少 peer 和规则超限，并确认当前 IP 规则尚未限制 Emby；再在 `EmbyAuthService` 增加带 IP 的签发/解析入口并接入 Emby handler；最后运行 `emby_auth` 定向目标、build、fmt 与 diff check。
+
+验证：`cargo test --locked --test emby_auth -- --test-threads=1` 13/13、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍报 13 项既有诊断，均在本任务未修改位置；本任务文件没有新增诊断。Cargo 命令使用 Toshiba target 目录。集成回归覆盖按名称和用户 ID 登录、可信/不可信代理、缺少 peer、已有 token 撤销、未命中地址、损坏与超限规则、可信代理配置损坏，以及共享管理员 API Key 不受影响。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
