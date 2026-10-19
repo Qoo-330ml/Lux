@@ -54,6 +54,10 @@ async fn global_collection_playback_uses_visible_original_copy_for_video_and_sub
     .bind(visible_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
 
     let visible_root = temp_dir.path().join("visible");
     let hidden_root = temp_dir.path().join("hidden");

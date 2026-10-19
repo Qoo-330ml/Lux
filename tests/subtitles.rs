@@ -50,6 +50,10 @@ async fn external_subtitles_are_indexed_served_and_acl_protected()
     .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Movies");
     let movie_dir = root.join("Probe Movie (2024)");
     tokio::fs::create_dir_all(&movie_dir).await?;

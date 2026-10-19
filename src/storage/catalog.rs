@@ -11,6 +11,29 @@ const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
+fn user_library_access_filter(library_id_expression: &str, include_admin: bool) -> String {
+    let selected_access = format!(
+        "EXISTS (
+            SELECT 1 FROM users access_mode_user
+            WHERE access_mode_user.id = ?
+              AND (
+                  access_mode_user.library_access_mode = 'ALL'
+                  OR (access_mode_user.library_access_mode = 'SELECTED' AND EXISTS (
+                      SELECT 1 FROM user_library_access selected_library
+                      WHERE selected_library.user_id = access_mode_user.id
+                        AND selected_library.library_id = {library_id_expression}
+                        AND selected_library.can_view = 1
+                  ))
+              )
+        )"
+    );
+    if include_admin {
+        format!("(? = 1 OR {selected_access})")
+    } else {
+        selected_access
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingGlobalCollectionSync {
     pub(crate) collection_provider: String,
@@ -811,6 +834,7 @@ impl Database {
             ) = ?"
                 .to_owned()
         });
+        let library_access_filter = user_library_access_filter("source_item.library_id", true);
         let query = format!(
             "SELECT COUNT(DISTINCT collection.id)
              FROM collections collection
@@ -831,15 +855,7 @@ impl Database {
                      AND source_item.item_type = 'MOVIE'
                      AND source_item.removed_at IS NULL
                      AND source_item.has_available_source = 1
-                     AND (? = 1 OR NOT EXISTS (
-                         SELECT 1 FROM user_library_access any_visible_library
-                         WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
-                     ) OR EXISTS (
-                         SELECT 1 FROM user_library_access visible_library
-                         WHERE visible_library.user_id = ?
-                           AND visible_library.library_id = source_item.library_id
-                           AND visible_library.can_view = 1
-                     ))
+                     AND {library_access_filter}
                )
                {favorite_filter}"
         );
@@ -847,7 +863,6 @@ impl Database {
             .query_scalar::<i64>(sqlx::AssertSqlSafe(query))
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id);
         if let Some(is_favorite) = is_favorite {
             statement = statement.bind(user_id).bind(database_flag(is_favorite));
@@ -4678,20 +4693,11 @@ impl Database {
         user_id: &str,
         is_admin: bool,
     ) -> Result<Option<StoredPlaybackSource>, StorageError> {
-        // The explicit allow-list limits access only when at least one library is selected.
+        // Administrators bypass per-user modes; other principals use the stored explicit mode.
         let access_filter = if is_admin {
-            ""
+            String::new()
         } else {
-            "AND (
-                NOT EXISTS (
-                    SELECT 1 FROM user_library_access scope
-                    WHERE scope.user_id = ? AND scope.can_view = 1
-                )
-                OR EXISTS (
-                    SELECT 1 FROM user_library_access allowed
-                    WHERE allowed.user_id = ? AND allowed.library_id = mi.library_id AND allowed.can_view = 1
-                )
-             )"
+            format!("AND {}", user_library_access_filter("mi.library_id", false))
         };
         let query = format!(
             "SELECT ms.id AS source_id, ms.source_kind, ms.container, ms.external_url,
@@ -4712,7 +4718,7 @@ impl Database {
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
         statement = statement.bind(item_id);
         if !is_admin {
-            statement = statement.bind(user_id).bind(user_id);
+            statement = statement.bind(user_id);
         }
         statement = statement.bind(source_id).bind(source_id);
         statement
@@ -6283,6 +6289,7 @@ impl Database {
         limit: i64,
         recently_updated_first: bool,
     ) -> Result<(Vec<StoredGlobalCollection>, i64), StorageError> {
+        let library_access_filter = user_library_access_filter("source_item.library_id", true);
         let visible_source = |work_item_id: &str| {
             format!(
                 "EXISTS (
@@ -6294,15 +6301,7 @@ impl Database {
                       AND source_item.item_type = 'MOVIE'
                       AND source_item.removed_at IS NULL
                       AND source_item.has_available_source = 1
-                      AND (? = 1 OR NOT EXISTS (
-                          SELECT 1 FROM user_library_access any_visible_library
-                          WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
-                      ) OR EXISTS (
-                          SELECT 1 FROM user_library_access visible_library
-                          WHERE visible_library.user_id = ?
-                            AND visible_library.library_id = source_item.library_id
-                            AND visible_library.can_view = 1
-                      ))
+                      AND {library_access_filter}
                 )"
             )
         };
@@ -6321,7 +6320,6 @@ impl Database {
             )))
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
@@ -6347,15 +6345,7 @@ impl Database {
                       AND source_item.item_type = 'MOVIE'
                       AND source_item.removed_at IS NULL
                       AND source_item.has_available_source = 1
-                      AND (? = 1 OR NOT EXISTS (
-                          SELECT 1 FROM user_library_access any_visible_library
-                          WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
-                      ) OR EXISTS (
-                          SELECT 1 FROM user_library_access visible_library
-                          WHERE visible_library.user_id = ?
-                            AND visible_library.library_id = source_item.library_id
-                            AND visible_library.can_view = 1
-                      ))
+                      AND {library_access_filter}
                     ORDER BY fallback_member.sort_order, work_item.sort_title,
                              work_item.id, source_library.name, source_item.id,
                              poster.image_index, poster.id
@@ -6400,16 +6390,12 @@ impl Database {
             .query(sqlx::AssertSqlSafe(query))
             .bind(database_flag(is_admin))
             .bind(user_id)
-            .bind(user_id)
             .bind(database_flag(is_admin))
             .bind(user_id)
-            .bind(user_id)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id)
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id);
         rows = rows.bind(limit).bind(offset);
         let rows = rows
@@ -6449,7 +6435,9 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
-        let visible_source = "EXISTS (
+        let library_access_filter = user_library_access_filter("source_item.library_id", true);
+        let visible_source = format!(
+            "EXISTS (
                 SELECT 1 FROM collection_work_sources cws
                 JOIN media_items source_item ON source_item.id = cws.source_item_id
                 JOIN libraries source_library
@@ -6458,16 +6446,9 @@ impl Database {
                   AND source_item.item_type = 'MOVIE'
                   AND source_item.removed_at IS NULL
                   AND source_item.has_available_source = 1
-                  AND (? = 1 OR NOT EXISTS (
-                      SELECT 1 FROM user_library_access any_visible_library
-                      WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
-                  ) OR EXISTS (
-                      SELECT 1 FROM user_library_access visible_library
-                      WHERE visible_library.user_id = ?
-                        AND visible_library.library_id = source_item.library_id
-                        AND visible_library.can_view = 1
-                  ))
-            )";
+                  AND {library_access_filter}
+            )"
+        );
         let base_query = format!(
             "FROM collection_items member
              JOIN collections collection ON collection.id = member.collection_id
@@ -6488,7 +6469,6 @@ impl Database {
             .bind(collection_item_id)
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id);
         let total = count
             .fetch_one(&self.pool)
@@ -6507,7 +6487,6 @@ impl Database {
             .bind(collection_item_id)
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id);
         let rows = rows
             .bind(limit)
@@ -6536,6 +6515,7 @@ impl Database {
         let work_placeholders = std::iter::repeat_n("?", work_item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let library_access_filter = user_library_access_filter("source_item.library_id", true);
         let query = format!(
             "SELECT source_work.work_item_id, source_item.id AS source_item_id,
                     source_item.library_id, source_library.name AS library_name,
@@ -6572,15 +6552,7 @@ impl Database {
                AND source_item.item_type = 'MOVIE'
                AND source_item.removed_at IS NULL
                AND source_item.has_available_source = 1
-               AND (? = 1 OR NOT EXISTS (
-                   SELECT 1 FROM user_library_access any_visible_library
-                   WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
-               ) OR EXISTS (
-                   SELECT 1 FROM user_library_access visible_library
-                   WHERE visible_library.user_id = ?
-                     AND visible_library.library_id = source_item.library_id
-                     AND visible_library.can_view = 1
-               ))
+               AND {library_access_filter}
              ORDER BY source_work.work_item_id,
                       source_library.name, source_item.id,
                       media_source.is_default DESC, media_source.id"
@@ -6589,10 +6561,7 @@ impl Database {
         for work_item_id in work_item_ids {
             rows = rows.bind(work_item_id);
         }
-        rows = rows
-            .bind(database_flag(is_admin))
-            .bind(user_id)
-            .bind(user_id);
+        rows = rows.bind(database_flag(is_admin)).bind(user_id);
         let rows = rows
             .fetch_all(&self.pool)
             .await
@@ -6628,8 +6597,9 @@ impl Database {
         source_item_id: &str,
         media_source_id: Option<&str>,
     ) -> Result<bool, StorageError> {
+        let library_access_filter = user_library_access_filter("source_item.library_id", true);
         let result = self
-            .query(
+            .query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO user_collection_source_preferences (
                      user_id, work_item_id, source_item_id, media_source_id, updated_at
                  )
@@ -6650,15 +6620,7 @@ impl Database {
                        AND source_item.item_type = 'MOVIE'
                        AND source_item.removed_at IS NULL
                        AND source_item.has_available_source = 1
-                       AND (? = 1 OR NOT EXISTS (
-                           SELECT 1 FROM user_library_access any_visible_library
-                           WHERE any_visible_library.user_id = ? AND any_visible_library.can_view = 1
-                       ) OR EXISTS (
-                           SELECT 1 FROM user_library_access visible_library
-                           WHERE visible_library.user_id = ?
-                             AND visible_library.library_id = source_item.library_id
-                             AND visible_library.can_view = 1
-                       ))
+                       AND {library_access_filter}
                        AND (
                            ? IS NULL OR EXISTS (
                                SELECT 1 FROM media_sources selected_source
@@ -6678,8 +6640,8 @@ impl Database {
                  ON CONFLICT (user_id, work_item_id) DO UPDATE SET
                      source_item_id = excluded.source_item_id,
                      media_source_id = excluded.media_source_id,
-                     updated_at = excluded.updated_at",
-            )
+                     updated_at = excluded.updated_at"
+            )))
             .bind(user_id)
             .bind(work_item_id)
             .bind(source_item_id)
@@ -6689,7 +6651,6 @@ impl Database {
             .bind(work_item_id)
             .bind(source_item_id)
             .bind(database_flag(is_admin))
-            .bind(user_id)
             .bind(user_id)
             .bind(media_source_id)
             .bind(media_source_id)
@@ -9538,6 +9499,53 @@ mod tests {
             .await?;
         assert_eq!(admin_total, 2);
         assert_eq!(admin_cards[0].member_count, 2);
+
+        sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")
+            .bind(viewer.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let (none_cards, none_total) = database
+            .list_global_collection_cards_page(&viewer.id.to_string(), false, 0, 10)
+            .await?;
+        assert!(none_cards.is_empty());
+        assert_eq!(none_total, 0);
+        let (none_recent_cards, none_recent_total) = database
+            .list_recent_global_collection_cards_page(&viewer.id.to_string(), false, 0, 10)
+            .await?;
+        assert!(none_recent_cards.is_empty());
+        assert_eq!(none_recent_total, 0);
+        let (_, none_members_total) = database
+            .list_global_collection_member_ids_page(
+                &first_page[0].item_id,
+                &viewer.id.to_string(),
+                false,
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(none_members_total, 0);
+        assert!(
+            database
+                .list_global_collection_sources_for_works(
+                    &alpha_member_ids,
+                    &viewer.id.to_string(),
+                    false,
+                )
+                .await?
+                .is_empty()
+        );
+        assert!(
+            !database
+                .set_global_collection_source_preference(
+                    &viewer.id.to_string(),
+                    false,
+                    &first_page[0].item_id,
+                    &alpha_member_ids[0],
+                    "visible-alpha-one",
+                    None,
+                )
+                .await?
+        );
         Ok(())
     }
 

@@ -1419,6 +1419,7 @@ impl Database {
         library_id: &str,
         can_view: bool,
     ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO user_library_access (user_id, library_id, can_view)
              VALUES (?, ?, ?)
@@ -1428,13 +1429,34 @@ impl Database {
         .bind(user_id)
         .bind(library_id)
         .bind(database_flag(can_view))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        self.query(
+            "UPDATE users
+             SET library_access_mode = CASE WHEN EXISTS (
+                 SELECT 1 FROM user_library_access
+                 WHERE user_id = users.id AND can_view = 1
+             ) THEN 'SELECTED' ELSE 'ALL' END
+             WHERE id = ?",
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn set_user_library_access_batch(
@@ -1475,6 +1497,21 @@ impl Database {
                     source,
                 })?;
         }
+        self.query(
+            "UPDATE users
+             SET library_access_mode = CASE WHEN EXISTS (
+                 SELECT 1 FROM user_library_access
+                 WHERE user_id = users.id AND can_view = 1
+             ) THEN 'SELECTED' ELSE 'ALL' END
+             WHERE id = ?",
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await
@@ -1492,16 +1529,21 @@ impl Database {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM libraries WHERE id = ? AND is_enabled = 1
-            ) AND (NOT EXISTS(
-                SELECT 1 FROM user_library_access
-                WHERE user_id = ? AND can_view = 1
-            ) OR EXISTS(
-                SELECT 1 FROM user_library_access
-                WHERE user_id = ? AND library_id = ? AND can_view = 1
-            )) THEN 1 ELSE 0 END",
+            ) AND EXISTS(
+                SELECT 1 FROM users access_user
+                WHERE access_user.id = ?
+                  AND (
+                      access_user.library_access_mode = 'ALL'
+                      OR (access_user.library_access_mode = 'SELECTED' AND EXISTS (
+                          SELECT 1 FROM user_library_access allowed_library
+                          WHERE allowed_library.user_id = access_user.id
+                            AND allowed_library.library_id = ?
+                            AND allowed_library.can_view = 1
+                      ))
+                  )
+            ) THEN 1 ELSE 0 END",
         )
         .bind(library_id)
-        .bind(user_id)
         .bind(user_id)
         .bind(library_id)
         .fetch_one(&self.pool)
@@ -1517,25 +1559,27 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Vec<String>, StorageError> {
-        // No positive entries means no library restriction; enabled libraries are all visible.
+        // The explicit mode decides whether enabled libraries or only positive selections are visible.
         self.query_scalar(
             "SELECT l.id
              FROM libraries l
              WHERE l.is_enabled = 1
                AND l.system_kind IS NULL
-               AND (
-                   NOT EXISTS (
-                       SELECT 1 FROM user_library_access
-                       WHERE user_id = ? AND can_view = 1
-                   )
-                   OR EXISTS (
-                       SELECT 1 FROM user_library_access ula
-                       WHERE ula.user_id = ? AND ula.library_id = l.id AND ula.can_view = 1
-                   )
+               AND EXISTS (
+                   SELECT 1 FROM users access_user
+                   WHERE access_user.id = ?
+                     AND (
+                         access_user.library_access_mode = 'ALL'
+                         OR (access_user.library_access_mode = 'SELECTED' AND EXISTS (
+                             SELECT 1 FROM user_library_access allowed_library
+                             WHERE allowed_library.user_id = access_user.id
+                               AND allowed_library.library_id = l.id
+                               AND allowed_library.can_view = 1
+                         ))
+                     )
                )
              ORDER BY l.name, l.id",
         )
-        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -2499,7 +2543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_user_library_access_batch_upserts_multiple_libraries_in_one_statement()
+    async fn set_user_library_access_batch_updates_rows_and_mode_transactionally()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database) = test_database().await?;
         let user_id = Uuid::now_v7().to_string();
@@ -2526,7 +2570,12 @@ mod tests {
                 ],
             )
             .await?;
-        assert_eq!(database.query_count(), 1);
+        assert_eq!(database.query_count(), 2);
+        let mode: String = sqlx::query_scalar("SELECT library_access_mode FROM users WHERE id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(mode, "SELECTED");
         assert!(
             database
                 .has_user_library_access(&user_id, &first_library_id)

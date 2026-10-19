@@ -14110,6 +14110,128 @@ async fn user_library_access_mode_migration_preserves_legacy_semantics()
 }
 
 #[tokio::test]
+async fn user_library_access_modes_are_enforced_by_storage_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("Access Mode One", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Access Mode Two", LibraryKind::Movie, false)
+        .await?;
+    for user_id in [
+        "access-mode-all",
+        "access-mode-selected",
+        "access-mode-none",
+    ] {
+        database
+            .insert_user(user_id, user_id, user_id, "test-hash", false, true)
+            .await?;
+    }
+    let later_library = libraries
+        .create_library("Access Mode Three", LibraryKind::Movie, false)
+        .await?;
+
+    database
+        .set_user_library_access("access-mode-selected", &first_library.id.to_string(), true)
+        .await?;
+    database
+        .set_user_library_access("access-mode-none", &first_library.id.to_string(), true)
+        .await?;
+    let selected_mode: String = sqlx::query_scalar(
+        "SELECT library_access_mode FROM users WHERE id = 'access-mode-selected'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(selected_mode, "SELECTED");
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = 'access-mode-none'")
+        .execute(database.pool())
+        .await?;
+
+    assert!(
+        database
+            .has_user_library_access("access-mode-all", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .has_user_library_access("access-mode-all", &second_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .has_user_library_access("access-mode-selected", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        !database
+            .has_user_library_access("access-mode-selected", &second_library.id.to_string())
+            .await?
+    );
+    assert!(
+        !database
+            .has_user_library_access("access-mode-none", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        !database
+            .has_user_library_access("missing-access-mode-user", &first_library.id.to_string())
+            .await?
+    );
+
+    assert_eq!(
+        database
+            .list_accessible_library_ids("access-mode-all")
+            .await?,
+        vec![
+            first_library.id.to_string(),
+            later_library.id.to_string(),
+            second_library.id.to_string(),
+        ]
+    );
+    assert_eq!(
+        database
+            .list_accessible_library_ids("access-mode-selected")
+            .await?,
+        vec![first_library.id.to_string()]
+    );
+    database
+        .set_user_library_access("access-mode-selected", &first_library.id.to_string(), false)
+        .await?;
+    let mode_after_clearing_selection: String = sqlx::query_scalar(
+        "SELECT library_access_mode FROM users WHERE id = 'access-mode-selected'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(mode_after_clearing_selection, "ALL");
+    assert!(
+        database
+            .has_user_library_access("access-mode-selected", &later_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .list_accessible_library_ids("access-mode-none")
+            .await?
+            .is_empty()
+    );
+    assert!(
+        database
+            .list_accessible_library_ids("missing-access-mode-user")
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

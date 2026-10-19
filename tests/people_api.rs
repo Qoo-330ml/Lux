@@ -59,6 +59,11 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     .bind(library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id IN (?, ?)")
+        .bind(viewer.id.to_string())
+        .bind(denied.id.to_string())
+        .execute(database.pool())
+        .await?;
     sqlx::query(
         "INSERT INTO user_library_access (user_id, library_id, can_view)
          VALUES (?, ?, 1)",
@@ -475,6 +480,11 @@ async fn lux_person_favorites_are_user_scoped_and_require_person_acl_and_csrf()
     .bind(library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id IN (?, ?)")
+        .bind(viewer.id.to_string())
+        .bind(denied.id.to_string())
+        .execute(database.pool())
+        .await?;
     PeopleService::new(config.config_dir.clone())
         .with_database(database.clone())
         .persist_item_actors(

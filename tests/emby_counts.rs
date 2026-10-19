@@ -99,6 +99,10 @@ async fn emby_item_counts_respects_auth_user_scope_and_favorites()
     .bind(movie_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     sqlx::query(
         "INSERT INTO user_item_state (user_id, item_id, is_favorite)
          VALUES (?, ?, 1)",

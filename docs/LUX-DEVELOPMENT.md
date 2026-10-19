@@ -13172,6 +13172,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 SQLite 旧授权回填和空库启动回归；SQLite 对无授权/仅拒绝/正向授权账号分别回填 `ALL` / `ALL` / `SELECTED`，保留授权行并拒绝非法模式。SQLite 新库非空字段及 `ALL` 默认值验证通过；PostgreSQL bootstrap 断言已更新为 187 并可编译，但本机 `127.0.0.1:55432` 无服务，未完成 PostgreSQL 运行验证。相关 schema 版本断言同步到 187；迁移定向用例与 health/version/scanner/scanning_jobs/danmaku 用例通过，完整 `storage` 目标串行运行 63/63 通过（并行运行时旧 cooldown 时间窗口用例曾波动）。格式与 diff 检查通过；未部署。
 
+#### LUX-628：按显式模式执行媒体库访问检查
+
+范围：让存储层 ACL、授权播放源和全局合集来源筛选按 `ALL` / `SELECTED` / `NONE` 判断；更新旧的单库及批量授权写入，使其事务内继续按旧界面语义在有正向授权时写入 `SELECTED`、无正向授权时写入 `ALL`。不开放 `NONE` 的管理界面，本任务不改管理员接口形状、新用户默认策略或内容分级规则。
+
+预计修改文件（16 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`src/storage/users.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`tests/catalog.rs`、`tests/collections.rs`、`tests/search.rs`、`tests/playback.rs`、`tests/resume_favorites.rs`、`tests/emby_counts.rs`、`tests/series_api.rs`、`tests/remote.rs`、`tests/emby_global_collection_playback.rs`、`tests/subtitles.rs`、`tests/people_api.rs`。
+
+验收标准：
+
+- [x] 用户媒体库检查和可访问库列表严格遵循三种模式；未知用户、`NONE` 不可读，`ALL` 含之后新增的启用库，`SELECTED` 只含正向授权库。
+- [x] 播放源、合集卡片、合集成员、合集来源及来源偏好写入的 SQL 过滤均遵循同一模式判定。
+- [x] 旧管理接口单条与批量授权写入事务性地同步模式，现有“清空所选后恢复全部”行为保持不变。
+- [x] 直接插入旧授权记录的测试夹具显式设置 `SELECTED`；相关存储与媒体访问目标通过。
+
+短计划：先新增 `ALL` / `SELECTED` / `NONE` 的 SQLite 存储回归并确认 `NONE` 在旧推断逻辑下失败；再改存储授权查询和全局合集 SQL；在旧接口写入中用同一事务更新模式，最后为依赖旧正向授权夹具的集成目标显式设置 `SELECTED`。
+
+验证：检查 Toshiba 挂载状态后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_modes_are_enforced_by_storage_queries` 与受影响的 `catalog`、`collections`、`search`、`playback`、`resume_favorites`、`emby_counts`、`series_api`、`remote`、`emby_global_collection_playback`、`subtitles`、`people_api` 测试目标，再运行 `cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-627。
+
+结果（2026-10-19）：存储授权和合集/播放 SQL 已按显式模式过滤；旧单条、批量写入在事务内同步为 `SELECTED` 或 `ALL`。`ALL` / `SELECTED` / `NONE`（包括 `NONE` 覆盖既有正向授权）、新启用媒体库、未知用户及清空选择回归通过；全局合集和直接播放 `NONE` 拒绝回归通过。相关 `catalog`、`collections`、`search`、`playback`、`resume_favorites`、`emby_counts`、`series_api`、`remote`、`emby_global_collection_playback`、`subtitles`、`people_api` 目标及存储批量写入回归均通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。PostgreSQL 运行时仍因本机服务不可用而未验证；未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

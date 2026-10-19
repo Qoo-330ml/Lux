@@ -51,6 +51,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     let media_path = root.join("Range.Movie.2024.mkv");
@@ -372,6 +376,20 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .send()
         .await?;
     assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let denied_with_none_mode = client
+        .get(&stream_url)
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(
+        denied_with_none_mode.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
 
     let outside = temp_dir.path().join("outside.mkv");
     tokio::fs::write(&outside, b"outside").await?;

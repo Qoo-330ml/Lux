@@ -51,6 +51,10 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(root.join("Eligible.Movie.2024.mkv"), b"eligible").await?;

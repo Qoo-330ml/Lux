@@ -54,6 +54,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Shows");
     let season_dir = root.join("Example Show/Season 01");
     tokio::fs::create_dir_all(&season_dir).await?;

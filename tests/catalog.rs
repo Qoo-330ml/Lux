@@ -1440,6 +1440,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     .bind(library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let mixed_access_latest_batch = client
         .get(format!("{base_url}/api/v1/home/libraries/latest"))
         .header(COOKIE, &viewer_cookies)
