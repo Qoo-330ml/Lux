@@ -16069,6 +16069,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 时允许地址携带 Emby token 访问 `/api/v1/auth/me` 返回 401；接入 LUX-766 来源解析后新增回归通过。完整 `cargo test --locked --test users -- --test-threads=1` 24/24、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍有 13 项既有诊断，未在本任务改动文件中产生新诊断。Cargo 使用 Toshiba target 目录。
 
+#### LUX-770：为 Web 播放票据持久化授权设备与客户端
+
+范围：扩展 `web_playback_sessions`，保存会话签发时的可选设备 ID 和客户端名称，并提供按会话/用户写入及读取授权上下文的 storage 合同。为已有数据库增加可空 SQLite/PostgreSQL migration；本任务不改变播放授权或黑名单行为。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0197_web_playback_access_context.sql`、`migrations-postgres/0197_web_playback_access_context.sql`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/sessions.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空库可完成迁移；已有播放 session 的授权上下文保持空值，不破坏既有会话读写。
+- [x] storage 可写入活动 session 的设备/客户端摘要，并能有界读取该 session 的用户与上下文；目标用户/状态不匹配时不更新。
+- [x] SQLite 定向存储回归、Rust build、fmt 与 diff check 通过；不改变任何 API 响应。
+
+短计划：先在 storage 回归中覆盖活动/错误用户/终态 session 的授权上下文写入和读取，并确认合同缺失；再添加双后端可空迁移、query DTO 及有界读写；最后运行指定 library 测试、build、fmt 与 diff check。
+
+验证：TDD RED 因上下文存取合同缺失而编译失败；新增 `web_playback_access_context_is_scoped_to_active_session` 1/1 通过，并在空 SQLite 数据库上应用完整 migration 集。`cargo build --locked`、fmt 与 diff check 通过。PostgreSQL migration 为对应的可空文本列；本任务没有 PostgreSQL runtime 验证。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

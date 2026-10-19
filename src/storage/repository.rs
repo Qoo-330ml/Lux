@@ -2917,6 +2917,13 @@ pub(crate) struct NewWebPlaybackEvent<'a> {
     pub(crate) now: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredWebPlaybackAccessContext {
+    pub(crate) user_id: String,
+    pub(crate) device_id: Option<String>,
+    pub(crate) client_name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WebPlaybackTranscodingDetails {
     pub(crate) video_codec: Option<String>,

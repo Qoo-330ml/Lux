@@ -20810,6 +20810,119 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
 }
 
 #[tokio::test]
+async fn web_playback_access_context_is_scoped_to_active_session()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        application::{libraries::LibraryService, setup::SetupService},
+        config::Config,
+        library::LibraryKind,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Playback Context", "Playback Context", "context password")
+        .await?;
+    let user_id = user.id.to_string();
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback Context", LibraryKind::Movie, false)
+        .await?;
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'MOVIE', 'Playback Context', 'playback context', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    database
+        .insert_web_playback_session(NewWebPlaybackSession {
+            id: "playback-context-session",
+            user_id: &user_id,
+            item_id: &item_id,
+            media_source_id: None,
+            play_session_id: "lux-web:playback-context-session",
+            tier: 1,
+            plan: "DIRECT",
+            temp_dir: None,
+            is_admin: true,
+            expires_at: 10_000,
+            now: 1,
+        })
+        .await?;
+
+    let empty_context = database
+        .find_web_playback_access_context("playback-context-session")
+        .await?
+        .ok_or("active playback session has no access context")?;
+    assert_eq!(empty_context.user_id, user_id);
+    assert_eq!(empty_context.device_id, None);
+    assert_eq!(empty_context.client_name, None);
+
+    assert!(
+        database
+            .set_web_playback_access_context(
+                "playback-context-session",
+                &user_id,
+                Some("browser-device-id"),
+                Some("Lux Web"),
+                2,
+            )
+            .await?
+    );
+    let stored_context = database
+        .find_web_playback_access_context("playback-context-session")
+        .await?
+        .ok_or("updated playback context was not found")?;
+    assert_eq!(
+        stored_context.device_id.as_deref(),
+        Some("browser-device-id")
+    );
+    assert_eq!(stored_context.client_name.as_deref(), Some("Lux Web"));
+
+    assert!(
+        !database
+            .set_web_playback_access_context(
+                "playback-context-session",
+                "another-user",
+                Some("other-device"),
+                Some("Other Client"),
+                3,
+            )
+            .await?
+    );
+    sqlx::query(
+        "UPDATE web_playback_sessions SET state = 'STOPPED' WHERE id = 'playback-context-session'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        !database
+            .set_web_playback_access_context(
+                "playback-context-session",
+                &user_id,
+                Some("late-device"),
+                Some("Late Client"),
+                4,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .find_web_playback_access_context("playback-context-session")
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

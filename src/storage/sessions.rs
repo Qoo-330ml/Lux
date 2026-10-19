@@ -926,6 +926,60 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
+    pub(crate) async fn set_web_playback_access_context(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        device_id: Option<&str>,
+        client_name: Option<&str>,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET authorization_device_id = ?, authorization_client_name = ?, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(device_id)
+        .bind(client_name)
+        .bind(updated_at)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
+    pub(crate) async fn find_web_playback_access_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredWebPlaybackAccessContext>, StorageError> {
+        self.query(
+            "SELECT user_id, authorization_device_id, authorization_client_name
+             FROM web_playback_sessions
+             WHERE id = ? AND state = 'ACTIVE'",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredWebPlaybackAccessContext {
+                user_id: row.get("user_id"),
+                device_id: row.get("authorization_device_id"),
+                client_name: row.get("authorization_client_name"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_web_playback_transcoding_details(
         &self,
         session_id: &str,
