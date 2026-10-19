@@ -13586,6 +13586,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增用户预设来源类型、单用户读取及按最多 500 个 ID 分块的批量读取；空输入不执行 SQL。`user_permission_preset_source_reads_support_single_and_batch_queries` 1/1、Rust build、fmt check 和 diff check 通过。为让该中间存储合同保持零新增告警，标注由后续 LUX-648 API 投影接线；全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
 
+#### LUX-648：在管理员用户列表与详情公开预设来源
+
+范围：将 LUX-647 的预设来源快照投影到管理员用户分页列表和单用户详情 API。为现有 `presetSource` 提供应用时名称，并新增含预设 ID、名称、版本和应用时间的 `presetSourceDetails`；无来源时两个字段均为 `null`。分页列表须一次批量读取本页来源。本任务不改 Web 页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员列表和详情返回一致的预设来源字段；没有来源时返回 `null`。
+- [x] 删除自定义预设后仍显示已保存的来源快照；列表不会逐用户查询来源。
+- [x] `users` 集成 target、Rust build、fmt 和 diff check 通过。
+
+短计划：先扩展 API 集成回归并确认来源字段缺失；再将来源接入 auth DTO 和列表批量投影，最后同步 API 文档。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-647。
+
+结果（2026-10-19）：管理员用户列表和详情现在返回预设名称与完整来源快照，未应用的用户返回 `null`；列表通过一次批量来源查询，用户编辑资料后的详情响应也保留来源。`users` target 3/3、Rust build、fmt check 和 diff check 通过；回归覆盖删除自定义预设后来源仍可读。全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

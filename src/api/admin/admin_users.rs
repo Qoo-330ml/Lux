@@ -399,8 +399,27 @@ fn admin_user_list_entry_json(entry: &crate::auth::users::AdminUserListEntry) ->
     user["lastLoginAt"] = json!(entry.user.last_login_at);
     user["lastActivityAt"] = json!(entry.user.last_activity_at);
     user["currentPlaybackCount"] = json!(entry.current_playback_count);
-    user["presetSource"] = Value::Null;
+    admin_user_permission_preset_source_fields(&mut user, entry.preset_source.as_ref());
     user
+}
+
+fn admin_user_permission_preset_source_fields(
+    user: &mut Value,
+    source: Option<&crate::storage::StoredUserPermissionPresetSource>,
+) {
+    user["presetSource"] = source
+        .map(|source| json!(source.preset_name))
+        .unwrap_or(Value::Null);
+    user["presetSourceDetails"] = source
+        .map(|source| {
+            json!({
+                "id": source.preset_id,
+                "name": source.preset_name,
+                "version": source.preset_version,
+                "appliedAt": source.applied_at,
+            })
+        })
+        .unwrap_or(Value::Null);
 }
 
 pub(crate) async fn admin_get_user(
@@ -824,6 +843,7 @@ fn admin_user_profile_json(profile: &crate::auth::users::AdminUserProfile) -> Va
     user["emailVerifiedAt"] = json!(profile.email_verified_at);
     user["deletedAt"] = json!(profile.deleted_at);
     user["deletionPurgeAt"] = json!(profile.deletion_purge_at);
+    admin_user_permission_preset_source_fields(&mut user, profile.preset_source.as_ref());
     user
 }
 

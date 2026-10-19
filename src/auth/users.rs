@@ -3,8 +3,8 @@ use crate::{
     domain::ids::UserId,
     storage::{
         AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser,
-        NewStoredUserPermissions, StorageError, StoredAdminUserListItem, UpdateUser,
-        UserPlaybackPolicy,
+        NewStoredUserPermissions, StorageError, StoredAdminUserListItem,
+        StoredUserPermissionPresetSource, UpdateUser, UserPlaybackPolicy,
     },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,6 +31,7 @@ pub struct AdminUserProfile {
     pub email_verified_at: Option<i64>,
     pub deleted_at: Option<i64>,
     pub deletion_purge_at: Option<i64>,
+    pub(crate) preset_source: Option<StoredUserPermissionPresetSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +43,7 @@ pub(crate) struct AdminUserListEntry {
     pub deletion_purge_at: Option<i64>,
     pub created_at: i64,
     pub current_playback_count: i64,
+    pub preset_source: Option<StoredUserPermissionPresetSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,9 +334,20 @@ impl UserStore {
             .database
             .query_admin_users(status, search, sort_by, descending, page_size, offset)
             .await?;
+        let user_ids = stored
+            .iter()
+            .map(|user| user.id.clone())
+            .collect::<Vec<_>>();
+        let preset_sources = self
+            .database
+            .user_permission_preset_sources(&user_ids)
+            .await?;
         let entries = stored
             .into_iter()
-            .map(admin_user_list_entry)
+            .map(|stored| {
+                let preset_source = preset_sources.get(&stored.id).cloned();
+                admin_user_list_entry(stored, preset_source)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(AdminUserPage {
             entries,
@@ -359,11 +372,11 @@ impl UserStore {
         if user_id.parse::<UserId>().is_err() {
             return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
         }
-        self.database
-            .find_user_by_id(user_id)
-            .await?
-            .map(admin_user_profile)
-            .transpose()
+        let Some(stored) = self.database.find_user_by_id(user_id).await? else {
+            return Ok(None);
+        };
+        let preset_source = self.database.user_permission_preset_source(user_id).await?;
+        admin_user_profile(stored, preset_source).map(Some)
     }
 
     pub(crate) async fn get_playback_policy(
@@ -488,15 +501,19 @@ impl UserStore {
         let email = email
             .map(|email| email.map(normalize_email).transpose())
             .transpose()?;
-        self.database
+        let Some(stored) = self
+            .database
             .update_user_profile(
                 user_id,
                 display_name,
                 email.as_ref().map(|email| email.as_deref()),
             )
             .await?
-            .map(admin_user_profile)
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let preset_source = self.database.user_permission_preset_source(user_id).await?;
+        admin_user_profile(stored, preset_source).map(Some)
     }
 
     pub async fn change_password(
@@ -836,6 +853,7 @@ fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, UserSto
 
 fn admin_user_list_entry(
     stored: StoredAdminUserListItem,
+    preset_source: Option<StoredUserPermissionPresetSource>,
 ) -> Result<AdminUserListEntry, UserStoreError> {
     let id = stored
         .id
@@ -861,11 +879,13 @@ fn admin_user_list_entry(
         deletion_purge_at: stored.deletion_purge_at,
         created_at: stored.created_at,
         current_playback_count: stored.current_playback_count,
+        preset_source,
     })
 }
 
 fn admin_user_profile(
     stored: crate::storage::StoredUser,
+    preset_source: Option<StoredUserPermissionPresetSource>,
 ) -> Result<AdminUserProfile, UserStoreError> {
     let email = stored.email.clone();
     let email_verified_at = stored.email_verified_at;
@@ -878,5 +898,6 @@ fn admin_user_profile(
         email_verified_at,
         deleted_at,
         deletion_purge_at,
+        preset_source,
     })
 }

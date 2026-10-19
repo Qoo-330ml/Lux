@@ -1113,17 +1113,58 @@ async fn admin_can_apply_permission_preset_to_user_with_audit_and_guards()
         library_access.json::<Value>().await?["libraryAccessMode"],
         "NONE"
     );
-    let applied_source: (String, String, i64) = sqlx::query_as(
-        "SELECT preset_id, preset_name, preset_version
+    let applied_source: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version, applied_at
          FROM user_permission_preset_sources WHERE user_id = ?",
     )
     .bind(&target_id)
     .fetch_one(database.pool())
     .await?;
+    assert_eq!(applied_source.0, preset_id);
+    assert_eq!(applied_source.1, "Applied snapshot");
+    assert_eq!(applied_source.2, 1);
+
+    let expected_source_details = json!({
+        "id": preset_id,
+        "name": "Applied snapshot",
+        "version": 1,
+        "appliedAt": applied_source.3,
+    });
+    let list = client
+        .get(format!("{base_url}/api/v1/admin/users?page=1&pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+    let listed_users = list.json::<Value>().await?["users"]
+        .as_array()
+        .cloned()
+        .ok_or("missing users list")?;
+    let listed_target = listed_users
+        .iter()
+        .find(|user| user["id"] == target_id)
+        .ok_or("missing target user in admin list")?;
+    assert_eq!(listed_target["presetSource"], "Applied snapshot");
     assert_eq!(
-        applied_source,
-        (preset_id.to_owned(), "Applied snapshot".to_owned(), 1)
+        listed_target["presetSourceDetails"],
+        expected_source_details
     );
+    let listed_admin = listed_users
+        .iter()
+        .find(|user| user["id"] == admin_user.id.to_string())
+        .ok_or("missing administrator in admin list")?;
+    assert!(listed_admin["presetSource"].is_null());
+    assert!(listed_admin["presetSourceDetails"].is_null());
+
+    let profile = client
+        .get(format!("{base_url}/api/v1/admin/users/{target_id}"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(profile.status(), reqwest::StatusCode::OK);
+    let profile_user = profile.json::<Value>().await?["user"].clone();
+    assert_eq!(profile_user["presetSource"], "Applied snapshot");
+    assert_eq!(profile_user["presetSourceDetails"], expected_source_details);
 
     let deleted_preset = client
         .delete(format!(
@@ -1145,6 +1186,19 @@ async fn admin_can_apply_permission_preset_to_user_with_audit_and_guards()
     assert_eq!(
         preserved_policy.json::<Value>().await?["policy"]["canPlay"],
         true
+    );
+    let profile_after_deleting_preset = client
+        .get(format!("{base_url}/api/v1/admin/users/{target_id}"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        profile_after_deleting_preset.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        profile_after_deleting_preset.json::<Value>().await?["user"]["presetSourceDetails"],
+        expected_source_details
     );
 
     let target_login = client
