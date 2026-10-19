@@ -445,6 +445,48 @@ describe("LuxApiClient", () => {
     } satisfies Partial<ApiError>);
   });
 
+  it("reads and updates versioned account preferences with CSRF", async () => {
+    const defaults = {
+      theme: "dark",
+      accentColor: "silver",
+      showMediaLibraries: true,
+      showContinueWatching: true,
+      audioLanguage: "原始音轨",
+      subtitleLanguage: "简体中文",
+      autoPlayNextEpisode: true,
+      version: 0,
+      updatedAt: null,
+    };
+    const input = {
+      expectedVersion: 0,
+      theme: "light" as const,
+      accentColor: "berry" as const,
+      showMediaLibraries: false,
+      showContinueWatching: true,
+      audioLanguage: "日本語",
+      subtitleLanguage: "关闭",
+      autoPlayNextEpisode: false,
+    };
+    const saved = { ...input, version: 1, updatedAt: 1_792_382_400 };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
+      expect(String(request)).toBe("/api/v1/auth/account-preferences");
+      if (!init?.method) return new Response(JSON.stringify(defaults), { status: 200 });
+
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toEqual(input);
+      return new Response(JSON.stringify(saved), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.accountPreferences()).resolves.toEqual(defaults);
+    await expect(client.updateAccountPreferences(input)).resolves.toEqual(saved);
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
   it("reads and updates the current user's playback threshold", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (!init?.method) {

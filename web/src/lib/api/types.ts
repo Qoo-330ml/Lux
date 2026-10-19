@@ -42,6 +42,22 @@ export type UserPlaybackSettings = {
   libraryOrderForced?: boolean;
 };
 
+export type AccountPreferences = {
+  theme: "light" | "dark";
+  accentColor: "silver" | "berry" | "ocean" | "amber" | "mint";
+  showMediaLibraries: boolean;
+  showContinueWatching: boolean;
+  audioLanguage: string;
+  subtitleLanguage: string;
+  autoPlayNextEpisode: boolean;
+  version: number;
+  updatedAt: number | null;
+};
+
+export type AccountPreferencesUpdate = Omit<AccountPreferences, "version" | "updatedAt"> & {
+  expectedVersion: number;
+};
+
 export type UserLibraryOrder = {
   libraryOrder: string[];
 };

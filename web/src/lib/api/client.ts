@@ -1,4 +1,6 @@
 import type {
+  AccountPreferences,
+  AccountPreferencesUpdate,
   AccountProfile,
   AuthSession,
   AdminAuditEvent,
@@ -327,6 +329,17 @@ export class LuxApiClient {
 
   accountProfile() {
     return this.request<{ user: AccountProfile }>("/api/v1/auth/profile");
+  }
+
+  accountPreferences() {
+    return this.request<AccountPreferences>("/api/v1/auth/account-preferences");
+  }
+
+  updateAccountPreferences(input: AccountPreferencesUpdate) {
+    return this.request<AccountPreferences>("/api/v1/auth/account-preferences", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
   }
 
   updateAccountProfile(input: { displayName: string; email: string }) {

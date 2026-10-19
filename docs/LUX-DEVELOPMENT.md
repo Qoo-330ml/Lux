@@ -13743,6 +13743,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增当前用户账户偏好 GET/PATCH 端点，GET 返回应用服务快照；PATCH 要求当前用户和 CSRF，通过完整字段及 `expectedVersion` 写入并在成功后失效首页缓存。错误映射为 400、404、503 或 409 `VERSION_CONFLICT`，新增稳定 API 错误码。`user_settings` 2/2、Rust build、fmt check 和 diff check 通过；测试覆盖未认证、默认值、缺少 CSRF、首次写入、陈旧版本、无效主题及数据库故障。全目标 Clippy 仍被未修改的两个 `too_many_arguments` 函数阻断；允许该既有 lint 后的 lib/all-features Clippy 通过。公开合同已加入 `docs/API.md`。
 
+#### LUX-656：为 Web 接入账户偏好 API
+
+范围：为 Web API 类型增加账户偏好响应和完整更新请求类型，并提供当前用户账户偏好 GET/PATCH 客户端方法。PATCH 复用客户端现有 CSRF 注入和错误处理；本任务不改账户设置页面或本地存储。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] Web 类型完整表达主题、强调色、首页区块、语言、自动连播、版本与更新时间。
+- [x] API 客户端 GET/PATCH 使用正确 endpoint，PATCH 序列化完整版本化请求并发送 CSRF。
+- [x] API client 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先补客户端 endpoint、载荷与 CSRF 回归并确认方法缺失；再添加响应/请求类型和 GET/PATCH 方法，最后运行定向 Vitest、Web build 与 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-655。
+
+结果（2026-10-19）：Web API 增加账户偏好响应与完整更新类型，以及 GET/PATCH 客户端方法；写入复用公共请求层的 CSRF 注入。新增 API 客户端合同回归，`api-client.test.ts` 65/65、TypeScript/Web build 与 diff check 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
