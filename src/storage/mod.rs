@@ -3,6 +3,17 @@ mod repository;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod sql_templates;
 
+// LUX-684 consumes this bound and candidate contract in the background index worker.
+#[allow(dead_code)]
+pub(crate) const CONTENT_RESTRICTION_INDEX_BATCH_LIMIT: usize = 100;
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaContentRestrictionIndexCandidate {
+    pub(crate) item_id: String,
+    pub(crate) nfo_metadata_json: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetadataAutoMatchPolicy {
     UseLibrarySetting,

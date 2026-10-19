@@ -4,6 +4,10 @@ use crate::storage::{
     StoredMovieNfoCollectionReferenceReconciliation, global_collection_title_fallback,
     global_collection_title_is_placeholder,
 };
+use crate::{
+    domain::content_restrictions::ContentRestrictionIndexProjection,
+    storage::{CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, MediaContentRestrictionIndexCandidate},
+};
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
@@ -7762,6 +7766,135 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    // LUX-684 consumes these bounded candidates in the background index worker.
+    #[allow(dead_code)]
+    pub(crate) async fn media_content_restriction_index_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MediaContentRestrictionIndexCandidate>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bounded_limit = limit.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT) as i64;
+        let rows: Vec<(String, Option<String>)> = self
+            .query_as(
+                "SELECT item.id, item.nfo_metadata_json
+                 FROM media_items item
+                 LEFT JOIN media_content_restriction_index restriction_index
+                   ON restriction_index.item_id = item.id
+                 WHERE item.removed_at IS NULL
+                   AND restriction_index.item_id IS NULL
+                 ORDER BY item.id
+                 LIMIT ?",
+            )
+            .bind(bounded_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(item_id, nfo_metadata_json)| MediaContentRestrictionIndexCandidate {
+                    item_id,
+                    nfo_metadata_json,
+                },
+            )
+            .collect())
+    }
+
+    // LUX-684 consumes this compare-and-swap before persisting a projected index.
+    #[allow(dead_code)]
+    pub(crate) async fn replace_media_content_restriction_index_if_nfo_json_matches(
+        &self,
+        item_id: &str,
+        expected_nfo_json: Option<&str>,
+        projection: &ContentRestrictionIndexProjection,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let snapshot_query = match self.backend() {
+            DatabaseBackend::Sqlite => {
+                "SELECT nfo_metadata_json FROM media_items
+                 WHERE id = ? AND removed_at IS NULL"
+            }
+            DatabaseBackend::Postgres => {
+                "SELECT nfo_metadata_json FROM media_items
+                 WHERE id = ? AND removed_at IS NULL FOR UPDATE"
+            }
+        };
+        let current: Option<(Option<String>,)> = self
+            .query_as(snapshot_query)
+            .bind(item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let snapshot_matches = current
+            .as_ref()
+            .is_some_and(|(current_nfo_json,)| current_nfo_json.as_deref() == expected_nfo_json);
+        if !snapshot_matches {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+
+        self.query("DELETE FROM media_content_restriction_tags WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES (?, ?)
+             ON CONFLICT (item_id) DO UPDATE SET
+                 certification_code = excluded.certification_code,
+                 indexed_at = unixepoch()",
+        )
+        .bind(item_id)
+        .bind(projection.certification_code.as_deref())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        for tag in &projection.tags {
+            self.query(
+                "INSERT INTO media_content_restriction_tags (item_id, tag)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(tag)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
     }
 
     pub(crate) async fn media_item_nfo_metadata_snapshot(

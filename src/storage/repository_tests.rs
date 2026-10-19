@@ -1,6 +1,8 @@
 use super::*;
+use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
-    ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserContentRestrictions,
+    ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
+    MediaContentRestrictionIndexCandidate, NewStoredUserPermissions, NewUserContentRestrictions,
     PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserContentRestrictionsCasResult,
     UserPlaybackPolicy,
 };
@@ -14981,6 +14983,311 @@ async fn user_content_restrictions_storage_uses_atomic_versioned_tag_replacement
             .await?,
         UserContentRestrictionsCasResult::UserUnavailable
     );
+    Ok(())
+}
+
+async fn assert_media_content_restriction_index_storage(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library = LibraryService::new(database.clone())
+        .create_library("Restriction Index", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let original_nfo = r#"{"certification":"PG-13"}"#;
+    let changed_nfo = r#"{"certification":"R"}"#;
+    for (item_id, nfo_json, removed_at) in [
+        ("restriction-index-a", Some(original_nfo), None),
+        ("restriction-index-b", None, None),
+        (
+            "restriction-index-c",
+            Some(r#"{"certification":"G"}"#),
+            None,
+        ),
+        (
+            "restriction-index-d",
+            Some(r#"{"certification":"NC-17"}"#),
+            Some(1_i64),
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     nfo_metadata_json, removed_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(nfo_json)
+            .bind(removed_at)
+            .execute(database.pool())
+            .await?;
+    }
+    database
+        .query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('restriction-index-c', 'G')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let candidates = database
+        .media_content_restriction_index_candidates(1)
+        .await?;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].item_id, "restriction-index-a");
+    assert_eq!(
+        candidates[0].nfo_metadata_json.as_deref(),
+        Some(original_nfo)
+    );
+    assert!(
+        database
+            .media_content_restriction_index_candidates(0)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        !database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-d",
+                Some(r#"{"certification":"NC-17"}"#),
+                &ContentRestrictionIndexProjection {
+                    certification_code: Some("NC-17".to_owned()),
+                    tags: Vec::new(),
+                },
+            )
+            .await?
+    );
+
+    let projection = ContentRestrictionIndexProjection {
+        certification_code: Some("PG-13".to_owned()),
+        tags: vec!["family".to_owned()],
+    };
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-a",
+                Some(original_nfo),
+                &projection,
+            )
+            .await?
+    );
+    let indexed: (Option<String>,) = database
+        .query_as(
+            "SELECT certification_code FROM media_content_restriction_index
+             WHERE item_id = 'restriction-index-a'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(indexed.0.as_deref(), Some("PG-13"));
+    let indexed_tags: Vec<String> = database
+        .query_scalar(
+            "SELECT tag FROM media_content_restriction_tags
+             WHERE item_id = 'restriction-index-a' ORDER BY tag",
+        )
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(indexed_tags, ["family"]);
+
+    database
+        .query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
+        .bind(changed_nfo)
+        .bind("restriction-index-a")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-a",
+                Some(original_nfo),
+                &projection,
+            )
+            .await?
+    );
+    let pending = database
+        .media_content_restriction_index_candidates(10)
+        .await?;
+    assert_eq!(
+        pending,
+        [
+            MediaContentRestrictionIndexCandidate {
+                item_id: "restriction-index-a".to_owned(),
+                nfo_metadata_json: Some(changed_nfo.to_owned()),
+            },
+            MediaContentRestrictionIndexCandidate {
+                item_id: "restriction-index-b".to_owned(),
+                nfo_metadata_json: None,
+            },
+        ]
+    );
+
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-b",
+                None,
+                &ContentRestrictionIndexProjection {
+                    certification_code: None,
+                    tags: vec!["x".repeat(129)],
+                },
+            )
+            .await
+            .is_err()
+    );
+    let failed_write_rows: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index
+             WHERE item_id = 'restriction-index-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        failed_write_rows, 0,
+        "index and tags must roll back together"
+    );
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-b",
+                None,
+                &ContentRestrictionIndexProjection {
+                    certification_code: None,
+                    tags: Vec::new(),
+                },
+            )
+            .await?
+    );
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-a",
+                Some(changed_nfo),
+                &ContentRestrictionIndexProjection {
+                    certification_code: None,
+                    tags: vec!["horror".to_owned()],
+                },
+            )
+            .await?
+    );
+    let ready_unrated: (Option<String>,) = database
+        .query_as(
+            "SELECT certification_code FROM media_content_restriction_index
+             WHERE item_id = 'restriction-index-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(ready_unrated.0, None);
+    let ready_unrated_tags: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_tags
+             WHERE item_id = 'restriction-index-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(ready_unrated_tags, 0);
+    assert!(
+        database
+            .media_content_restriction_index_candidates(10)
+            .await?
+            .is_empty()
+    );
+
+    for index in 0..105 {
+        let item_id = format!("restriction-index-z-batch-{index:03}");
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(&item_id)
+            .bind(&library_id)
+            .bind(&item_id)
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    let bounded = database
+        .media_content_restriction_index_candidates(usize::MAX)
+        .await?;
+    assert_eq!(bounded.len(), CONTENT_RESTRICTION_INDEX_BATCH_LIMIT);
+    assert_eq!(
+        bounded.first().map(|row| row.item_id.as_str()),
+        Some("restriction-index-z-batch-000")
+    );
+    assert_eq!(
+        bounded.last().map(|row| row.item_id.as_str()),
+        Some("restriction-index-z-batch-099")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_content_restriction_index_storage_uses_bounded_snapshot_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert_media_content_restriction_index_storage(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = crate::config::DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        },
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let assertions = assert_media_content_restriction_index_storage(&database).await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
     Ok(())
 }
 

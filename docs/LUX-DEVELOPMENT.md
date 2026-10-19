@@ -14288,6 +14288,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：域层现从认证代码并集规范化已知等级（后续仍由所选体系解释），将 NFO 类型标签折叠空白、统一小写、去重并稳定排序；未知/数值认证按未分级处理，空标签忽略，控制字符、超长标签或超过 100 个不同标签会拒绝整个投影，避免截断漏掉禁止标签。`cargo test --locked --lib content_restrictions` 7/7、fmt 与 diff check 通过。严格库 Clippy 仍被未修改的 `serve_emby_media_file` 与 `verify_emby_direct_stream` 两个 `too_many_arguments` 报错阻挡；豁免此既有 lint 后通过。无文件读取或授权行为变更。
 
+#### LUX-683：存储内容分类索引候选并校验 NFO 快照
+
+范围：为内容索引回填提供有界缺失候选查询和按 NFO 缓存快照原子写入。候选仅包含未删除且无索引行的媒体，按 ID 稳定排序并限制最多 100 项；查询只读取数据库中的 NFO JSON。写入前在 PostgreSQL 锁定媒体行，在 SQLite 使用立即写事务，且只有当前 NFO JSON 与读取快照完全相同才替换索引及标签；NFO 为空仍可写入已就绪的未分级行。此任务不解析 NFO、不启动 worker 或执行授权。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 缺失候选查询有稳定顺序、服务端批次上限，排除已索引和已删除媒体，空 NFO 仍作为候选。
+- [x] SQLite/PostgreSQL 写入只在 NFO 快照匹配且媒体未删除时成功；标签与索引行原子替换，陈旧快照不产生索引。
+- [x] SQLite 与 PostgreSQL 存储回归覆盖上限、候选过滤、NFO 改变后的陈旧写入拒绝、空快照就绪状态。
+- [x] 定向 Rust 测试、构建、fmt 与 diff check 通过。
+
+短计划：先增加 SQLite/PostgreSQL 共用存储回归并确认候选/快照 API 缺失时失败；再实现有界查询、后端特定事务锁和索引原子替换；最后执行存储定向测试（含可用的本地 PostgreSQL ignored 用例）、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-679、LUX-681、LUX-682。
+
+结果（2026-10-19）：存储层现在以 ID 顺序读取未删除且缺少索引的缓存条目，硬上限 100，空 NFO 作为可索引的未分级快照。SQLite 立即写事务与 PostgreSQL 媒体行锁保护快照比较；只有未删除条目的 NFO JSON 完全匹配才会事务性替换索引和标签。SQLite/PostgreSQL 共用回归各 1/1 通过，覆盖已就绪/删除过滤、批次上限、陈旧快照、空 NFO 与写标签约束失败回滚；`cargo build --locked`、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。后台 worker 尚未接入。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
