@@ -14691,6 +14691,30 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：`cargo test --locked --lib global_collection` 6/6；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。本任务未运行 PostgreSQL live-query 专项。
 
+#### LUX-702：在手动合集子项分页前应用用户内容限制
+
+范围：对普通媒体库中的手动合集子项列表，在 SQL 总数计算和 LIMIT/OFFSET 前应用当前用户内容策略，与媒体库 ACL 共用同一可见集合。覆盖 Lux 与 Emby 复用的 `CatalogService::list_collection_items`。合集容器自身没有媒体内容分级索引：详情仅在媒体库 ACL 允许且至少存在一个可见成员时返回，子项继续按内容策略过滤；不放宽图片等单条媒体资源的访问检查。本任务不修改合集成员关系、自动/虚拟合集或 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/media.rs`。
+
+验收标准：
+
+- [x] 普通用户手动合集子项按自身、系列/季度父级分级和标签策略过滤；缺失索引 fail closed。
+- [x] 过滤在总数、分页前执行；受限成员不占页位且不计入总数。
+- [x] 受限用户能打开 ACL 允许且至少有一个可见成员的合集容器；单条媒体图片等访问校验不放宽。
+- [x] 管理员、无策略和无收紧策略保持既有结果。
+- [x] CatalogService 回归覆盖允许/拒绝、缺失索引、父级和分页计数；合集相关目标、build、fmt 与 diff check 通过。
+
+短计划：先扩展 CatalogService 回归，在普通合集加入允许、受限、缺索引和父级受限成员，确认严格策略当前错误阻止合集容器访问；再让合集目录详情依赖过滤后的可见成员、列表入口对容器单独检查媒体库 ACL，并将统一策略谓词加入 count/list 查询；最后运行定向合集回归、相关内容限制测试、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib manual_collection_items_apply_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+结果（2026-10-19）：Lux 与 Emby 共用的普通合集成员查询在 SQL 计数和分页前应用当前用户策略、父级继承和媒体库 ACL。合集容器不做媒体分级判定；严格策略用户只有在库 ACL 允许且至少有一个可见子项时才能获取容器详情，直接图片等单条资源授权仍拒绝无索引容器。回归覆盖较早位置的 R/屏蔽标签成员、缺失索引成员、较低分级但属于 R 系列的分集及尾部允许成员，并验证管理员与无策略用户保持原结果。
+
+验证：`manual_collection_items_apply_content_restrictions_before_pagination` 1/1；`content_restriction` 23 passed、1 ignored（PostgreSQL 专用）；`tests/collections.rs` 4/4；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
+
+依赖：LUX-701。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

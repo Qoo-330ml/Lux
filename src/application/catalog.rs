@@ -1171,13 +1171,11 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
-        if self
+        let collection_library_id = self
             .database
             .find_item_library_id(collection_item_id)
-            .await?
-            .as_deref()
-            == Some(GLOBAL_COLLECTION_LIBRARY_ID)
-        {
+            .await?;
+        if collection_library_id.as_deref() == Some(GLOBAL_COLLECTION_LIBRARY_ID) {
             let content_restrictions = self.content_restrictions_for_principal(principal).await?;
             let (member_ids, total) = self
                 .database
@@ -1197,7 +1195,22 @@ impl CatalogService {
                 .catalog_page_from_ids(member_ids, total, offset, limit)
                 .await;
         }
-        if !self
+        let Some(collection_library_id) = collection_library_id else {
+            return Err(CatalogError::AccessDenied);
+        };
+        if self
+            .database
+            .is_collection_container(collection_item_id)
+            .await?
+        {
+            if !self
+                .access
+                .can_view_library(principal, &collection_library_id)
+                .await?
+            {
+                return Err(CatalogError::AccessDenied);
+            }
+        } else if !self
             .access
             .can_view_item(principal, collection_item_id)
             .await?
@@ -1209,11 +1222,13 @@ impl CatalogService {
         } else {
             Some(self.access.accessible_library_ids(principal).await?)
         };
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         let (member_ids, total) = self
             .database
             .list_collection_member_ids_page(
                 collection_item_id,
                 library_ids.as_deref(),
+                content_restrictions.as_ref(),
                 offset,
                 limit,
             )
@@ -1823,7 +1838,31 @@ impl CatalogService {
                 return Ok(None);
             }
         } else if !self.access.can_view_item(principal, item_id).await? {
-            return Ok(None);
+            if item.item_type.as_str() != "BOX_SET"
+                || !self.database.is_collection_container(item_id).await?
+                || !self.access.can_view_library(principal, &library_id).await?
+            {
+                return Ok(None);
+            }
+            let library_ids = if principal.is_admin {
+                None
+            } else {
+                Some(self.access.accessible_library_ids(principal).await?)
+            };
+            let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+            let (_, visible_member_count) = self
+                .database
+                .list_collection_member_ids_page(
+                    item_id,
+                    library_ids.as_deref(),
+                    content_restrictions.as_ref(),
+                    0,
+                    1,
+                )
+                .await?;
+            if visible_member_count == 0 {
+                return Ok(None);
+            }
         }
         if let Some(detail) = self.database.find_catalog_detail(item_id).await? {
             apply_catalog_detail(&mut item, &detail);
@@ -3475,6 +3514,216 @@ mod tests {
             )
             .await?;
         assert_eq!(open_policy_counts.box_set_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_collection_items_apply_content_restrictions_before_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::{Database, NewUserContentRestrictions},
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Manual Collection Movies", LibraryKind::Movie, false)
+            .await?;
+        let restricted_user = UserStore::new(database.clone())?
+            .create_user("manual-collection-viewer", "Viewer", "test password", false)
+            .await?;
+        let unrestricted_user = UserStore::new(database.clone())?
+            .create_user(
+                "manual-collection-open",
+                "Open Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        for user_id in [restricted_user.id, unrestricted_user.id] {
+            database
+                .set_user_library_access(&user_id.to_string(), &library.id.to_string(), true)
+                .await?;
+        }
+
+        for (item_id, item_type, title) in [
+            ("manual-collection", "BOX_SET", "Manual Collection"),
+            ("manual-visible-movie", "MOVIE", "Allowed movie"),
+            ("manual-restricted-movie", "MOVIE", "Restricted movie"),
+            ("manual-unindexed-movie", "MOVIE", "Unindexed movie"),
+            ("manual-parent-series", "SERIES", "Restricted series"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_type)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, series_id, episode_number, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'EPISODE', 'manual-parent-series', 1,
+                       'Allowed rated episode', 'allowed rated episode', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind("manual-parent-restricted-episode")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('manual-hidden-collection', ?, 'BOX_SET', 'Hidden Collection',
+                       'hidden collection', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO collections (id, item_id, library_id, provider, provider_id, title)
+             VALUES ('manual-collection-row', 'manual-collection', ?, 'manual',
+                     'manual-collection', 'Manual Collection'),
+                    ('manual-hidden-collection-row', 'manual-hidden-collection', ?, 'manual',
+                     'manual-hidden-collection', 'Hidden Collection')",
+        )
+        .bind(library.id.to_string())
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO collection_items (collection_id, item_id, sort_order)
+             VALUES ('manual-collection-row', 'manual-restricted-movie', 1),
+                    ('manual-collection-row', 'manual-unindexed-movie', 2),
+                    ('manual-collection-row', 'manual-parent-restricted-episode', 3),
+                    ('manual-collection-row', 'manual-visible-movie', 4)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO collection_items (collection_id, item_id, sort_order)
+             VALUES ('manual-hidden-collection-row', 'manual-restricted-movie', 1),
+                    ('manual-hidden-collection-row', 'manual-unindexed-movie', 2),
+                    ('manual-hidden-collection-row', 'manual-parent-restricted-episode', 3)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('manual-collection', 'PG'),
+                    ('manual-visible-movie', 'PG'),
+                    ('manual-restricted-movie', 'R'),
+                    ('manual-parent-series', 'R'),
+                    ('manual-parent-restricted-episode', 'PG')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('manual-collection', 'family'),
+                    ('manual-visible-movie', 'family'),
+                    ('manual-restricted-movie', 'family'),
+                    ('manual-restricted-movie', 'violent'),
+                    ('manual-parent-series', 'family'),
+                    ('manual-parent-restricted-episode', 'family')",
+        )
+        .execute(database.pool())
+        .await?;
+        database
+            .compare_and_swap_user_content_restrictions(
+                &restricted_user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &["family".to_owned()],
+                    blocked_tags: &["violent".to_owned()],
+                },
+            )
+            .await?;
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let direct_access = crate::application::access::MediaAccessService::new(database.clone());
+        assert!(
+            !direct_access
+                .can_view_item(
+                    AccessPrincipal::new(restricted_user.id, false),
+                    "manual-collection",
+                )
+                .await?
+        );
+        assert!(
+            catalog
+                .find_item(
+                    AccessPrincipal::new(restricted_user.id, false),
+                    "manual-collection",
+                )
+                .await?
+                .is_some()
+        );
+        let page = catalog
+            .list_collection_items(
+                AccessPrincipal::new(restricted_user.id, false),
+                "manual-collection",
+                0,
+                1,
+            )
+            .await?;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "manual-visible-movie");
+        assert!(
+            catalog
+                .find_item(
+                    AccessPrincipal::new(restricted_user.id, false),
+                    "manual-hidden-collection",
+                )
+                .await?
+                .is_none()
+        );
+
+        let unrestricted_page = catalog
+            .list_collection_items(
+                AccessPrincipal::new(unrestricted_user.id, false),
+                "manual-collection",
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(unrestricted_page.total, 4);
+        assert_eq!(unrestricted_page.items.len(), 4);
+        let admin_page = catalog
+            .list_collection_items(
+                AccessPrincipal::new(restricted_user.id, true),
+                "manual-collection",
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(admin_page.total, 4);
+        assert_eq!(admin_page.items.len(), 4);
+
+        database.close().await;
         Ok(())
     }
 

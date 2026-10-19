@@ -227,6 +227,27 @@ impl Database {
         })
     }
 
+    pub(crate) async fn is_collection_container(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM collections collection
+                 JOIN media_items item ON item.id = collection.item_id
+                 WHERE collection.item_id = ? AND item.removed_at IS NULL
+             )",
+        )
+        .bind(item_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_media_strategy_settings(
         &self,
         item_id: &str,
@@ -3860,6 +3881,7 @@ impl Database {
         &self,
         collection_item_id: &str,
         library_ids: Option<&[String]>,
+        content_restrictions: Option<&UserContentRestrictions>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
@@ -3874,17 +3896,31 @@ impl Database {
                 format!(" AND mi.library_id IN ({placeholders})")
             })
             .unwrap_or_default();
+        let mut content_restriction_predicate = String::new();
+        let mut content_restriction_binds = Vec::new();
+        append_content_restriction_predicate(
+            &mut content_restriction_predicate,
+            &mut content_restriction_binds,
+            content_restrictions,
+        );
         let from_where = format!(
             "FROM collection_items ci
              JOIN collections c ON c.id = ci.collection_id
              JOIN media_items mi ON mi.id = ci.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE c.item_id = ? AND mi.removed_at IS NULL
-               {CATALOG_VISIBLE_PREDICATE}{library_filter}"
+               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}{library_filter}"
         );
         let mut count_statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {from_where}")))
             .bind(collection_item_id);
+        for bind in &content_restriction_binds {
+            count_statement = match bind {
+                CatalogBind::Text(value) => count_statement.bind(*value),
+                CatalogBind::Integer(value) => count_statement.bind(*value),
+                CatalogBind::Real(value) => count_statement.bind(*value),
+            };
+        }
         if let Some(library_ids) = library_ids {
             for library_id in library_ids {
                 count_statement = count_statement.bind(library_id);
@@ -3905,6 +3941,13 @@ impl Database {
                  LIMIT ? OFFSET ?"
             )))
             .bind(collection_item_id);
+        for bind in &content_restriction_binds {
+            list_statement = match bind {
+                CatalogBind::Text(value) => list_statement.bind(*value),
+                CatalogBind::Integer(value) => list_statement.bind(*value),
+                CatalogBind::Real(value) => list_statement.bind(*value),
+            };
+        }
         if let Some(library_ids) = library_ids {
             for library_id in library_ids {
                 list_statement = list_statement.bind(library_id);
