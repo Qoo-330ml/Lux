@@ -474,17 +474,6 @@ impl WebPlaybackSessionService {
         )
     }
 
-    pub(crate) async fn authorize_resource(
-        &self,
-        session_id: &str,
-        resource: &str,
-        expires_at: i64,
-        signature: &str,
-    ) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
-        self.authorize_resource_with_ip(session_id, resource, expires_at, signature, None)
-            .await
-    }
-
     pub(crate) async fn authorize_resource_with_ip(
         &self,
         session_id: &str,
@@ -505,7 +494,9 @@ impl WebPlaybackSessionService {
             let _ = self.hls.stop(session_id).await;
             return Err(WebPlaybackSessionError::Expired);
         }
-        if session.play_session_id.starts_with("lux-web:") {
+        if session.play_session_id.starts_with("lux-web:")
+            || session.play_session_id.starts_with("lux-emby:")
+        {
             self.enforce_playback_access_rules(&session, client_ip)
                 .await?;
         }

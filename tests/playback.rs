@@ -2050,6 +2050,68 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
             .exists()
     );
 
+    let blacklisted_hls_ticket = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .header(
+            "X-Emby-Authorization",
+            "Emby Client=SpoofedClient,Device=Other,DeviceId=spoofed-device,Version=9",
+        )
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectStream": false,
+            "EnableTranscoding": true,
+            "AllowVideoStreamCopy": false,
+            "AllowAudioStreamCopy": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(blacklisted_hls_ticket.status(), reqwest::StatusCode::OK);
+    let blacklisted_hls_ticket = blacklisted_hls_ticket.json::<Value>().await?;
+    let blacklisted_hls_url = blacklisted_hls_ticket["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .ok_or("missing blacklist HLS URL")?;
+    let blacklisted_hls_session_id = blacklisted_hls_ticket["PlaySessionId"]
+        .as_str()
+        .and_then(|play_session_id| play_session_id.strip_prefix("lux-emby:"))
+        .ok_or("missing blacklist HLS session")?;
+    let authorization_context: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT authorization_device_id, authorization_client_name
+         FROM web_playback_sessions WHERE id = ?",
+    )
+    .bind(blacklisted_hls_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(authorization_context.0.as_deref(), Some("transcode-test"));
+    assert_eq!(authorization_context.1.as_deref(), Some("PlaybackTest"));
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by
+         ) VALUES ('playback-emby-hls-client-rule', NULL, 'CLIENT', 'playbacktest', 1, ?)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    let blocked_hls_manifest = client
+        .get(format!("{base_url}{blacklisted_hls_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        blocked_hls_manifest.status(),
+        reqwest::StatusCode::GONE,
+        "a newly added client rule must revoke an already issued Emby HLS URL"
+    );
+    let blocked_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(blacklisted_hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(blocked_hls_state, "STOPPED");
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("playback-emby-hls-client-rule")
+        .execute(database.pool())
+        .await?;
+
     sqlx::query(
         "UPDATE users SET allow_remux = 0, allow_audio_transcode = 0,
              allow_video_transcode = 0 WHERE id = ?",

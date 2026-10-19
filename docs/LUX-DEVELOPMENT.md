@@ -16102,6 +16102,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：先确认已签发票据在新增设备规则后仍返回 200（TDD RED），并确认伪报设备回归在绑定设备被请求头替换时失败；修复后 `cargo test --locked --test web_playback` 1/1、`NO_PROXY=127.0.0.1,localhost cargo test --locked --test playback` 4/4、`cargo build --locked`、fmt 与 `git diff --check` 通过。完整 Rust all-targets 门禁为 1079 通过、4 失败、26 忽略：三项 fill-missing dispatch/retry 测试已在干净基线复现；`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 在未改动的 metadata 代码中单独复现。严格 Clippy 仍有 13 项既存诊断，均不在本任务新增代码。所有 Cargo 检查使用 Toshiba target 目录。
 
+#### LUX-772：在 Emby HLS 票据上执行访问黑名单
+
+范围：Emby 用户 token 请求创建服务端 HLS 会话时，从已认证凭证读取设备/客户端上下文并保存；只有缺少凭证设备字段时才使用本次 Emby 客户端声明补齐。每次访问已签发 Emby HLS manifest、初始化片段或分片时，检查会话设备/客户端规则和可信来源 IP；命中后停止会话并释放准入，规则变化立即使剩余票据失效。访问 IP、规则读取错误和坏/超限规则不得放行；共享管理员 API Key 的认证行为不变。无状态 Emby 直放票据留待单独任务处理。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/playback.rs`、`src/application/playback/session.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 新签发 Emby HLS 会话持久化经过认证凭证绑定的设备与客户端上下文；上下文写入失败时停止会话且不返回链接。
+- [x] 每个已签发 HLS manifest、初始化片段和分片请求均检查设备/客户端及可信来源 IP 规则；命中停止会话并使后续票据失效。
+- [x] 缺少上下文但存在对应规则、缺少 peer 但存在 IP 规则、损坏/超限规则及代理/存储错误 fail closed；普通 Emby token 的未命中请求可继续播放。
+- [x] `playback` 定向集成目标、Rust build、fmt 与 diff check 通过；共享管理员 API Key 行为保持不变。
+
+短计划：先在 `tests/playback.rs` 添加“先签发 HLS 链接、再启用设备/客户端规则”的失败回归；再保存 token 绑定的授权上下文并让 Emby HLS 资源请求解析可信访问 IP、复用会话规则检查；最后运行 `playback` 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 时启用全站客户端规则后，已签发 Emby HLS URL 仍返回 200；修复后 `NO_PROXY=127.0.0.1,localhost cargo test --locked --test playback --test web_playback` 中 `playback` 4/4、`web_playback` 1/1 通过。回归同时确认 HLS 会话绑定 token 中的 `transcode-test`/`PlaybackTest`，请求头伪报值不能替换已绑定值，命中后返回 410 并停止会话。`cargo build --locked`、fmt 与 `git diff --check` 通过。严格 Clippy 仍有 13 项既存诊断，没有来自本任务新增代码的诊断；完整 Rust all-targets 失败记录见 LUX-771。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

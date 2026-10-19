@@ -211,6 +211,22 @@ pub(super) async fn emby_playback_info(
     } else {
         None
     };
+    let authorization_context = if transcode_requested {
+        match emby_playback_authorization_context(
+            &headers,
+            query.api_key.as_deref(),
+            query.client.as_deref(),
+            &state,
+            &device_id,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(status) => return status.into_response(),
+        }
+    } else {
+        (None, None)
+    };
     let transcode_session = if transcode_requested {
         let Some((source_item, source)) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
@@ -222,6 +238,8 @@ pub(super) async fn emby_playback_info(
             source,
             EmbyTranscodingSessionOptions {
                 request: &request,
+                authorization_device_id: authorization_context.0.as_deref(),
+                authorization_client_name: authorization_context.1.as_deref(),
                 hls: HlsStartOptions {
                     segment_container: transcode_container.unwrap_or(HlsSegmentContainer::MpegTs),
                     start_time_ticks: transcode_start_time_ticks,
@@ -977,6 +995,8 @@ fn emby_force_transcode_from_raw(raw_query: &RawQuery) -> bool {
 
 struct EmbyTranscodingSessionOptions<'a> {
     request: &'a EmbyPlaybackInfoRequest,
+    authorization_device_id: Option<&'a str>,
+    authorization_client_name: Option<&'a str>,
     hls: HlsStartOptions,
 }
 
@@ -1037,6 +1057,18 @@ async fn create_emby_transcoding_session(
     if !matches!(created.plan, WebPlaybackPlan::ServerHls { .. }) {
         return Err(StatusCode::BAD_GATEWAY);
     }
+    if let Err(error) = service
+        .set_authorization_context(
+            &created.id,
+            &user_id,
+            options.authorization_device_id,
+            options.authorization_client_name,
+        )
+        .await
+    {
+        let _ = service.stop(&created.id, &user_id).await;
+        return Err(emby_playback_session_error_status(error));
+    }
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
         let output = emby_transcoding_output(
             source,
@@ -1054,6 +1086,48 @@ async fn create_emby_transcoding_session(
         }
     }
     Ok(Some(created))
+}
+
+async fn emby_playback_authorization_context(
+    headers: &HeaderMap,
+    query_api_key: Option<&str>,
+    query_client: Option<&str>,
+    state: &AppState,
+    request_device_id: &str,
+) -> Result<(Option<String>, Option<String>), StatusCode> {
+    let registered_device = if let Some(token) =
+        emby_token_from_headers(headers).or_else(|| query_api_key.map(str::to_owned))
+    {
+        let Some(auth) = state.emby_auth.as_ref() else {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        auth.device_info(&token)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    } else {
+        None
+    };
+    let declared_device = emby_device_info_from_headers(headers);
+    let device_id = registered_device
+        .as_ref()
+        .map(|device| device.device_id.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| non_empty_device_id(request_device_id))
+        .or_else(|| non_empty_device_id(&declared_device.device_id));
+    let client_name = registered_device
+        .as_ref()
+        .map(|device| device.client.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| non_empty_profile_value(Some(&declared_device.client)).map(str::to_owned))
+        .or_else(|| {
+            query_client
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        });
+    Ok((device_id, client_name))
 }
 
 async fn emby_transcoding_start_time_ticks(
@@ -3216,8 +3290,18 @@ async fn serve_emby_transcoding_asset(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let resource = emby_hls_resource(segment_container, asset);
+    if service
+        .verify_resource_signature(session_id, &resource, expires_at, signature)
+        .is_err()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let client_ip = match super::request_access_ip(headers, state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let session = match service
-        .authorize_resource(session_id, &resource, expires_at, signature)
+        .authorize_resource_with_ip(session_id, &resource, expires_at, signature, client_ip)
         .await
     {
         Ok(session) => session,
