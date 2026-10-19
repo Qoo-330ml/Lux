@@ -23668,6 +23668,23 @@ async fn user_device_listing_is_scoped_stable_and_bounded() -> Result<(), Box<dy
             })
             .await?;
     }
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at, device_id
+         ) VALUES ('device-a-web-session', 'device-list-owner', X'01', X'11', unixepoch() + 3600, 'device-a'),
+                  ('device-c-expired-web-session', 'device-list-owner', X'02', X'12', unixepoch() - 1, 'device-c')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+             id, token_hash, user_id, device_id, client_name, device_name,
+             client_version, created_at, updated_at, revoked_at
+         ) VALUES ('device-b-emby-token', X'21', 'device-list-owner', 'device-b', 'Emby', 'Phone B', '1.0', unixepoch(), unixepoch(), NULL),
+                  ('device-c-revoked-emby-token', X'22', 'device-list-owner', 'device-c', 'Emby', 'Tablet C', '1.0', unixepoch(), unixepoch(), unixepoch())",
+    )
+    .execute(database.pool())
+    .await?;
 
     let (first_page, total_count) = database
         .list_user_devices_page(UserDevicePageQuery {
@@ -23690,6 +23707,8 @@ async fn user_device_listing_is_scoped_stable_and_bounded() -> Result<(), Box<dy
     assert_eq!(first_page[0].client_version.as_deref(), Some("1.2.3"));
     assert_eq!(first_page[0].first_seen_at, 300);
     assert_eq!(first_page[0].last_seen_at, 300);
+    assert!(first_page[0].has_active_login);
+    assert!(first_page[1].has_active_login);
     assert_eq!(
         first_page[0].last_remote_ip.as_deref(),
         Some("203.0.113.10")
@@ -23705,6 +23724,7 @@ async fn user_device_listing_is_scoped_stable_and_bounded() -> Result<(), Box<dy
     assert_eq!(second_total, 3);
     assert_eq!(second_page.len(), 1);
     assert_eq!(second_page[0].device_id, "device-c");
+    assert!(!second_page[0].has_active_login);
 
     let (empty_page, empty_total) = database
         .list_user_devices_page(UserDevicePageQuery {

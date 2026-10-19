@@ -41,6 +41,7 @@ describe("AdminUserDetailPage device inventory", () => {
     const devices: AdminUserDevicePage = {
       devices: [{
         deviceId: "browser-device-1",
+        hasActiveLogin: true,
         deviceName: "Office Mac",
         deviceType: "Browser",
         clientName: "Lux Web",
@@ -48,10 +49,10 @@ describe("AdminUserDetailPage device inventory", () => {
         firstSeenAt: 1_700_000_000,
         lastSeenAt: 1_700_000_100,
         lastRemoteIp: "192.0.2.25",
-      }],
+      }, { ...makeDevice("signed-out-device"), hasActiveLogin: false }],
       page: 1,
       pageSize: 20,
-      totalCount: 1,
+      totalCount: 2,
     };
     const list = vi.spyOn(api, "adminUserDevices").mockResolvedValue(devices);
     renderDevices();
@@ -64,6 +65,8 @@ describe("AdminUserDetailPage device inventory", () => {
     expect(container.textContent).toContain("1.2.3");
     expect(container.textContent).toContain("Browser");
     expect(container.textContent).toContain("192.0.2.25");
+    expect(container.textContent).toContain("有有效登录");
+    expect(container.textContent).toContain("无有效登录");
     expect(container.textContent).not.toContain("session-token");
     expect(container.textContent).not.toContain("access-token");
   });
@@ -173,6 +176,7 @@ function makeUser(): AdminUser {
 function makeDevice(deviceId: string) {
   return {
     deviceId,
+    hasActiveLogin: false,
     deviceName: null,
     deviceType: "Browser",
     clientName: "Lux Web",

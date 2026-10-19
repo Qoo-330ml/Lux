@@ -1333,6 +1333,7 @@ pub(crate) struct UserDevicePageQuery<'a> {
 #[derive(Debug)]
 pub(crate) struct StoredUserDevice {
     pub(crate) device_id: String,
+    pub(crate) has_active_login: bool,
     pub(crate) device_name: Option<String>,
     pub(crate) device_type: Option<String>,
     pub(crate) client_name: String,

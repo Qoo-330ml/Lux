@@ -4004,6 +4004,27 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
         .await?;
     }
     sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at, device_id
+         ) VALUES ('device-a-web-session', ?, X'31', X'41', unixepoch() + 3600, 'device-a'),
+                  ('device-c-expired-web-session', ?, X'32', X'42', unixepoch() - 1, 'device-c')",
+    )
+    .bind(target.id.to_string())
+    .bind(target.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+             id, token_hash, user_id, device_id, client_name, device_name,
+             client_version, created_at, updated_at, revoked_at
+         ) VALUES ('device-b-emby-token', X'51', ?, 'device-b', 'Emby', 'Phone B', '1.0', unixepoch(), unixepoch(), NULL),
+                  ('device-c-revoked-emby-token', X'52', ?, 'device-c', 'Emby', 'Tablet C', '1.0', unixepoch(), unixepoch(), unixepoch())",
+    )
+    .bind(target.id.to_string())
+    .bind(target.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
         "INSERT INTO user_devices (
              user_id, device_id, device_name, device_type, client_name,
              client_version, first_seen_at, last_seen_at
@@ -4026,6 +4047,7 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
     assert_eq!(first_body["devices"].as_array().map(Vec::len), Some(1));
     let device = &first_body["devices"][0];
     assert_eq!(device["deviceId"], "device-a");
+    assert_eq!(device["hasActiveLogin"], true);
     assert_eq!(device["deviceName"], "Phone A");
     assert_eq!(device["deviceType"], "TEST");
     assert_eq!(device["clientName"], "Lux Web");
@@ -4044,6 +4066,16 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
     let second_body = second_page.json::<Value>().await?;
     assert_eq!(second_body["totalCount"], 3);
     assert_eq!(second_body["devices"][0]["deviceId"], "device-b");
+    assert_eq!(second_body["devices"][0]["hasActiveLogin"], true);
+
+    let third_page = client
+        .get(format!("{path}?page=3&pageSize=1"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    let third_body = third_page.json::<Value>().await?;
+    assert_eq!(third_body["devices"][0]["deviceId"], "device-c");
+    assert_eq!(third_body["devices"][0]["hasActiveLogin"], false);
 
     let clamped = client
         .get(format!("{path}?page=0&pageSize=101"))

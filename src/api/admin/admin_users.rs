@@ -798,6 +798,7 @@ async fn admin_list_user_devices(
         Ok((devices, total_count)) => Json(json!({
             "devices": devices.iter().map(|device| json!({
                 "deviceId": device.device_id,
+                "hasActiveLogin": device.has_active_login,
                 "deviceName": device.device_name,
                 "deviceType": device.device_type,
                 "clientName": device.client_name,

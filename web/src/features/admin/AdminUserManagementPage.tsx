@@ -432,6 +432,7 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
             <thead>
               <tr>
                 <th scope="col">客户端 / 设备</th>
+                <th scope="col">登录状态</th>
                 <th scope="col">类型</th>
                 <th scope="col">首次出现</th>
                 <th scope="col">最近活动</th>
@@ -448,6 +449,11 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
                       {device.clientVersion ? ` · 版本 ${device.clientVersion}` : ""}
                     </span>
                   </th>
+                  <td>
+                    <span className={`lux-admin-device-login-status ${device.hasActiveLogin ? "is-active" : "is-inactive"}`}>
+                      {device.hasActiveLogin ? "有有效登录" : "无有效登录"}
+                    </span>
+                  </td>
                   <td>{device.deviceType || "—"}</td>
                   <td><WebSessionDate value={device.firstSeenAt} /></td>
                   <td><WebSessionDate value={device.lastSeenAt} /></td>

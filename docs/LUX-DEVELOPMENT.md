@@ -15760,6 +15760,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：新增回归先因会话设备字段为空而失败；实现后精确用例通过，并验证绑定会话在请求头缺失、改变或无效时只刷新原设备，NULL 历史会话继续按有效头记录。`cargo test --locked --test users -- --test-threads=1` 最终 20/20 通过；首次整目标运行中管理员删除测试出现一次 503，单项复跑及完整目标重跑均通过。`cargo build --locked`、`cargo fmt --all -- --check`、Clippy 放行 7 类既有诊断后的全 targets 检查及 `git diff --check` 通过。
 
+#### LUX-753：在设备清单展示有效登录状态
+
+范围：扩展用户设备分页结果，指示同一用户、同一设备是否存在有效登录。未撤销且未过期的 Web 会话，或未撤销的 Emby 凭证，均计为有效登录；撤销/过期凭证不计。设备清单新增文字状态，不把有效登录状态表述为实时在线。本任务不改变会话有效期、撤销规则或认证策略。
+
+预计修改文件（12 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`、`tests/postgres_database.rs`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-devices.test.tsx`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 有效 Web 会话与 Emby 凭证能按用户和设备关联到设备清单；已撤销或已过期凭证不会显示为有效登录，SQLite 与 PostgreSQL 查询均通过。
+- [x] 管理员设备 API 返回布尔登录状态，分页、用户隔离、凭证保密合同不变。
+- [x] Web 设备表格用文字显示“有有效登录”或“无有效登录”，并覆盖客户端渲染与相关 Rust 查询测试。
+
+短计划：先扩展 `user_device_listing_is_scoped_stable_and_bounded` 与设备 API/UI 测试，覆盖有效 Web、有效 Emby、撤销及过期记录；运行定向目标确认登录状态字段尚缺；再让有界设备页查询以 EXISTS 关联有效凭证，扩展 DTO 与表格；最后运行 SQLite storage/users、PostgreSQL 登录状态集成、对应 Web 用例、build、fmt、可用 Clippy 与 diff check。
+
+结果（2026-10-20）：设备分页查询通过有界 correlated `EXISTS` 汇总未撤销且未过期的 Web 会话及未撤销 Emby 凭证；管理员 API 暴露 `hasActiveLogin`，用户详情设备表以文字显示有效登录状态。没有返回会话 Cookie 或 Emby token 字段。
+
+验证：SQLite storage 回归 1/1、`tests/users` 20/20、真实 PostgreSQL 设备登录状态 API 集成 1/1、设备 UI/API client 用例 84/84、`pnpm --dir web build`、`cargo build --locked`、fmt 检查、放行已记录 Clippy 诊断后的全 targets Clippy 与 `git diff --check` 通过。完整 Web 测试仍有 4 个既有失败（首页库预取 1 项、媒体库卡片 2 项、详情轮询 1 项；745 项通过），不在本任务改动路径。窄屏表格横向滚动由设备列表容器承载，页面宽度保持不变。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -373,6 +373,125 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_device_listing_correlates_active_web_and_emby_logins()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("pg-admin", "Postgres Admin", "admin password")
+        .await?;
+    let target = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user(
+            "pg-device-target",
+            "Device Target",
+            "target password",
+            false,
+        )
+        .await?;
+    let user_id = target.id.to_string();
+    for device_id in ["web-device", "emby-device", "inactive-device"] {
+        sqlx::query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, client_name, first_seen_at, last_seen_at
+             ) VALUES ($1, $2, 'Test Client', 10, 20)",
+        )
+        .bind(&user_id)
+        .bind(device_id)
+        .execute(database.pool())
+        .await?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at, device_id
+         ) VALUES ('pg-active-web-session', $1, decode('31', 'hex'), decode('41', 'hex'), $2, 'web-device'),
+                  ('pg-expired-web-session', $1, decode('32', 'hex'), decode('42', 'hex'), $3, 'inactive-device')",
+    )
+    .bind(&user_id)
+    .bind(now + 3600)
+    .bind(now - 1)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+             id, token_hash, user_id, device_id, client_name, device_name,
+             client_version, created_at, updated_at, revoked_at
+         ) VALUES ('pg-active-emby-token', decode('51', 'hex'), $1, 'emby-device', 'Emby', 'TV', '1.0', $2, $2, NULL),
+                  ('pg-revoked-emby-token', decode('52', 'hex'), $1, 'inactive-device', 'Emby', 'TV', '1.0', $2, $2, $3)",
+    )
+    .bind(&user_id)
+    .bind(now)
+    .bind(now)
+    .execute(database.pool())
+    .await?;
+
+    let app = luxd::api::app_with_state(luxd::api::AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        luxd::auth::emby::EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({ "username": "pg-admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session_cookie = login
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let pair = value.split(';').next()?;
+            pair.starts_with("lux_session=").then(|| pair.to_owned())
+        })
+        .ok_or("missing Web session cookie")?;
+    let response = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{user_id}/devices"
+        ))
+        .header(reqwest::header::COOKIE, session_cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    let devices = body["devices"].as_array().ok_or("missing devices")?;
+    for (device_id, expected) in [
+        ("web-device", true),
+        ("emby-device", true),
+        ("inactive-device", false),
+    ] {
+        let device = devices
+            .iter()
+            .find(|device| device["deviceId"] == device_id)
+            .ok_or("missing test device")?;
+        assert_eq!(device["hasActiveLogin"], expected);
+    }
+
+    server.abort();
+    let _ = server.await;
+    drop(client);
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

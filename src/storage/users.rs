@@ -1768,13 +1768,27 @@ impl Database {
 
         let rows = self
             .query(
-                "SELECT device_id, device_name, device_type, client_name, client_version,
-                        first_seen_at, last_seen_at, last_remote_ip
-                 FROM user_devices
-                 WHERE user_id = ?
-                 ORDER BY last_seen_at DESC, device_id ASC
+                "SELECT ud.device_id, ud.device_name, ud.device_type, ud.client_name,
+                        ud.client_version, ud.first_seen_at, ud.last_seen_at,
+                        ud.last_remote_ip,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM web_sessions ws
+                            WHERE ws.user_id = ud.user_id
+                              AND ws.device_id = ud.device_id
+                              AND ws.revoked_at IS NULL
+                              AND ws.expires_at > ?
+                        ) OR EXISTS (
+                            SELECT 1 FROM access_tokens at
+                            WHERE at.user_id = ud.user_id
+                              AND at.device_id = ud.device_id
+                              AND at.revoked_at IS NULL
+                        ) THEN CAST(1 AS BIGINT) ELSE CAST(0 AS BIGINT) END AS has_active_login
+                 FROM user_devices ud
+                 WHERE ud.user_id = ?
+                 ORDER BY ud.last_seen_at DESC, ud.device_id ASC
                  LIMIT ? OFFSET ?",
             )
+            .bind(current_unix_timestamp())
             .bind(query.user_id)
             .bind(query.limit.clamp(1, 100))
             .bind(query.offset.max(0))
@@ -1788,6 +1802,7 @@ impl Database {
             .into_iter()
             .map(|row| StoredUserDevice {
                 device_id: row.get("device_id"),
+                has_active_login: row.get::<i64, _>("has_active_login") != 0,
                 device_name: row.get("device_name"),
                 device_type: row.get("device_type"),
                 client_name: row.get("client_name"),

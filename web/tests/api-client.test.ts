@@ -656,6 +656,7 @@ describe("LuxApiClient", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({
         devices: [{
           deviceId: "device-1",
+          hasActiveLogin: true,
           deviceName: "Living Room",
           deviceType: "EMBY",
           clientName: "Infuse",
@@ -677,7 +678,7 @@ describe("LuxApiClient", () => {
 
     const client = new LuxApiClient();
     await expect(client.adminUserDevices("user /1", 2, 5)).resolves.toMatchObject({
-      devices: [{ deviceId: "device-1", clientName: "Infuse", lastSeenAt: 200 }],
+      devices: [{ deviceId: "device-1", hasActiveLogin: true, clientName: "Infuse", lastSeenAt: 200 }],
       page: 2,
       pageSize: 5,
       totalCount: 6,

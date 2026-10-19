@@ -196,13 +196,20 @@
 .lux-admin-user-session-revoke-all:disabled { cursor: not-allowed; opacity: .55; }
 .lux-admin-user-session-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
 .lux-admin-user-session-pagination > div { display: flex; gap: 8px; }
-.lux-admin-user-device-table { min-width: 840px; table-layout: fixed; }
+.lux-admin-user-device-table { min-width: 960px; table-layout: fixed; }
 .lux-admin-user-device-table th, .lux-admin-user-device-table td { white-space: normal; overflow-wrap: anywhere; }
-.lux-admin-user-device-table th:nth-child(1) { width: 36%; }
-.lux-admin-user-device-table th:nth-child(2) { width: 12%; }
-.lux-admin-user-device-table th:nth-child(3), .lux-admin-user-device-table th:nth-child(4) { width: 17%; }
-.lux-admin-user-device-table th:nth-child(5) { width: 18%; }
+.lux-admin-user-device-table th:nth-child(1) { width: 32%; }
+.lux-admin-user-device-table th:nth-child(2) { width: 14%; }
+.lux-admin-user-device-table th:nth-child(3) { width: 10%; }
+.lux-admin-user-device-table th:nth-child(4), .lux-admin-user-device-table th:nth-child(5) { width: 15%; }
+.lux-admin-user-device-table th:nth-child(6) { width: 14%; }
 .lux-admin-user-device-table .lux-admin-user-session-device-meta { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .lux-admin-user-device-table { min-width: 640px; }
+}
+.lux-admin-device-login-status { display: inline-flex; padding: 3px 7px; border: 1px solid var(--lux-line-soft); border-radius: 5px; font-size: .66rem; line-height: 1.35; }
+.lux-admin-device-login-status.is-active { border-color: color-mix(in srgb, var(--lux-accent) 42%, transparent); color: var(--lux-accent); background: color-mix(in srgb, var(--lux-accent) 8%, transparent); }
+.lux-admin-device-login-status.is-inactive { color: var(--lux-muted); }
 .lux-admin-user-playback-sessions { max-width: 1180px; }
 .lux-admin-user-playback-sessions > .lux-admin-panel-heading { margin: 0; }
 .lux-admin-user-playback-sessions h2 { margin: 4px 0 0; color: var(--lux-text); font-size: .95rem; }

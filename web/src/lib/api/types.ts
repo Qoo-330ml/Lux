@@ -617,6 +617,7 @@ export type AdminUserEmbySessionRevokeAllResponse = {
 
 export type AdminUserDevice = {
   deviceId: string;
+  hasActiveLogin: boolean;
   deviceName: string | null;
   deviceType: string | null;
   clientName: string;
