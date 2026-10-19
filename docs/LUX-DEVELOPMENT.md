@@ -14126,6 +14126,45 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：管理员复制 API 增加 `libraryOrder` 选择组；预览返回来源个人顺序及逐目标过滤结果，应用时重新依据目标当前可访问媒体库过滤并以 CAS 保存。播放组现在包含 `playedPercent`。复制不修改目标的管理员强制排序设置，审计仅增加组标志、不写偏好值。`user_account_preferences::tests` 9/9、`users` 定向集成 1/1、Web 偏好复制/API client 定向测试 71/71、`cargo build --locked`、fmt、Web build 与 `git diff --check` 通过。Web build 临时以 HEAD 版覆盖用户未提交的 `AdminDashboardNowPlaying.tsx`，结束后已逐字节恢复；由于本会话未配置 Chrome DevTools MCP，没有真实浏览器截图验证。
 
+#### LUX-675：建立用户内容限制策略表
+
+范围：为模块五增加按用户版本化的内容限制策略表，以及允许/禁止标签子表。策略字段保存分级体系、最高分级和未分级处理；不迁移现有 numeric `rating`，不在请求内扫描 NFO，也不在此任务启用拦截。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0190_user_content_restrictions.sql`、`migrations-postgres/0190_user_content_restrictions.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL migration 均创建受用户生命周期级联清理的策略表和标签表。
+- [x] 分级/未分级字段与标签类别有数据库约束；标签区分允许与禁止并按用户去重。
+- [x] SQLite 空库迁移回归覆盖非法分级/布尔值、非法/重复标签和用户删除级联；存储测试的 schema 版本断言同步到 190。
+- [x] Rust 存储定向测试、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加 SQLite 空库迁移回归并确认失败；再写 SQLite/PostgreSQL migration 及约束；最后运行存储定向检查和构建。其他集成目标的当前 schema 版本断言与 PostgreSQL 启动合同由 LUX-676 对齐。本切片只建立可持久化结构，存储 CAS、规则校验、索引与媒体访问执行留给后续任务。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_content_restrictions_migration_runs_from_an_empty_database`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。PostgreSQL migration 的运行验证由 LUX-676 的 ignored PostgreSQL bootstrap 测试负责。
+
+依赖：LUX-593、LUX-628。
+
+结果（2026-10-19）：新增双数据库策略与标签表迁移，已有账号不回填策略行，因此尚未设置限制的用户保持既有访问行为；策略行随用户删除、标签行随策略删除。SQLite 空库迁移回归通过，检查非法空分级、越界未分级标志、非法类别、空/重复标签及级联删除。`cargo test --test storage -- --test-threads=1` 67/67、定向迁移测试、`cargo build --locked`、fmt 与 diff check 通过。并行执行完整存储目标时，既有重试冷却断言因执行耗时落在 299–300 秒窗口外失败；隔离复跑及串行完整目标通过。PostgreSQL migration 执行测试和其余目标的 schema 版本更新见 LUX-676。
+
+#### LUX-676：同步内容限制 migration 的数据库测试基线
+
+范围：将依赖当前数据库 schema 版本的 PostgreSQL、扫描器、扫描任务与弹幕测试更新到 LUX-675 的版本 190；PostgreSQL bootstrap 回归验证内容限制表、策略字段和标签表能从空库创建。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`tests/postgres_database.rs`、`tests/scanner.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`。
+
+验收标准：
+
+- [ ] 相关目标的 schema 版本预期为 190，原功能断言不变。
+- [ ] PostgreSQL bootstrap 验证策略/标签表、字段约束、外键级联与非法值拒绝。
+- [ ] 对应 SQLite 测试目标、Rust build、fmt 与 diff check 通过；本机 PostgreSQL 不可用时明确标注未实跑。
+
+短计划：先更新相关测试目标的版本断言；再扩展 ignored PostgreSQL bootstrap 检查迁移后的结构和约束；运行 SQLite 定向目标并在可用时执行 PostgreSQL 测试。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanner`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test danmaku`、可用时运行 PostgreSQL bootstrap ignored 测试、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。
+
+依赖：LUX-675。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
