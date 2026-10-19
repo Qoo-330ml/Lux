@@ -39,6 +39,8 @@ import type {
   AdminUserContentRestrictionsResponse,
   AdminUserContentRestrictionUpdateInput,
   AdminUser,
+  AdminUserEmbySessionPage,
+  AdminUserEmbySessionRevokeAllResponse,
   AdminUserWebSessionPage,
   AdminUserPermissionPreset,
   AdminUserPermissionPresetBatchResponse,
@@ -1245,6 +1247,27 @@ export class LuxApiClient {
   revokeAdminUserWebSession(userId: string, sessionId: string) {
     return this.request<void>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserEmbySessions(userId: string, page = 1, pageSize = 50) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserEmbySessionPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions?${params.toString()}`,
+    );
+  }
+
+  revokeAdminUserEmbySession(userId: string, sessionId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  revokeAllAdminUserEmbySessions(userId: string) {
+    return this.request<AdminUserEmbySessionRevokeAllResponse>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions`,
       { method: "DELETE" },
     );
   }

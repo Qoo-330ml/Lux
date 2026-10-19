@@ -15022,6 +15022,29 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 在缺少路由时返回 404；最终 `admin_can_manage_emby_login_sessions` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。集成回归确认分页上限、单项/全部撤销、跨用户隔离、未认证与 CSRF 拒绝、token 失效及响应/审计不含原始 token。无 migration。
 
+#### LUX-717：为管理员 Emby 登录会话增加 Web API 客户端合同
+
+范围：为 LUX-716 的 Emby 登录会话分页、单项撤销和全部撤销接口增加 TypeScript DTO 与客户端方法。请求通过统一客户端处理，撤销沿用 JSON/CSRF 与错误处理边界；本任务不修改用户管理页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] DTO 只包含凭证记录 ID、设备/客户端与时间字段，不定义 token、hash 或密码字段。
+- [x] 分页方法默认页码 1、页大小 50，使用 URL 编码的用户 ID 与 `page`/`pageSize` 查询参数。
+- [x] 单项及全部撤销使用精确 DELETE 路径和统一 CSRF 请求层；全部撤销类型包含 `revokedCount`。
+- [x] API client 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先为分页、单项撤销和全部撤销增加精确路径、响应及 CSRF 合同测试并确认失败；再增加 DTO 与客户端方法；最后运行定向 Vitest、Web build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user Emby session"`、`pnpm --dir web build` 和 `git diff --check`。
+
+依赖：LUX-716。
+
+结果（2026-10-20）：新增 Emby 登录摘要分页、单项撤销和全部撤销的 TypeScript DTO 与客户端方法，复用统一请求层处理 URL 编码、CSRF 与 API 错误。响应 DTO 仅暴露设备、客户端及时间元数据。
+
+验证：TDD RED 确认新增客户端回归在方法缺失时失败；`tests/api-client.test.ts -t "admin user Emby session"` 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -592,6 +592,29 @@ export type AdminUserWebSessionPage = {
   totalCount: number;
 };
 
+export type AdminUserEmbySession = {
+  id: string;
+  deviceId: string;
+  deviceName: string;
+  deviceType: string | null;
+  clientName: string;
+  clientVersion: string;
+  createdAt: number;
+  updatedAt: number;
+  lastSeenAt: number | null;
+};
+
+export type AdminUserEmbySessionPage = {
+  sessions: AdminUserEmbySession[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserEmbySessionRevokeAllResponse = {
+  revokedCount: number;
+};
+
 export type AdminContentRestrictionIndexStatus = {
   totalItems: number;
   indexedItems: number;

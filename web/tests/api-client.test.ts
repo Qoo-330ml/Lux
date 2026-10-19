@@ -436,6 +436,56 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("uses paginated admin user Emby session and CSRF-protected revoke contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: [{
+          id: "credential-1",
+          deviceId: "device-1",
+          deviceName: "Living Room",
+          deviceType: "TV",
+          clientName: "Infuse",
+          clientVersion: "8.1",
+          createdAt: 10,
+          updatedAt: 20,
+          lastSeenAt: null,
+        }],
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ revokedCount: 3 }), { status: 200 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserEmbySessions("user/1", 2, 10)).resolves.toMatchObject({
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+        sessions: [{ id: "credential-1", deviceId: "device-1", lastSeenAt: null }],
+      });
+      await expect(client.revokeAdminUserEmbySession("user/1", "credential/1")).resolves.toBeUndefined();
+      await expect(client.revokeAllAdminUserEmbySessions("user/1")).resolves.toEqual({ revokedCount: 3 });
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/emby-sessions?page=2&pageSize=10",
+      );
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/emby-sessions/credential%2F1",
+      );
+      expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      expect(fetchMock.mock.calls[2]?.[0]).toBe("/api/v1/admin/users/user%2F1/emby-sessions");
+      expect(fetchMock.mock.calls[2]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[2]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     const cookie = installCookieDocument("lux_csrf=csrf-token");
