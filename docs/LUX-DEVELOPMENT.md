@@ -13647,6 +13647,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：权限页展示应用时保存的预设名称、版本和时间，即使来源自定义预设已经删除；可确认应用内置或自定义预设。成功后刷新用户详情、分页用户列表、媒体库访问和播放策略缓存；取消确认不提交，加载/应用错误可读且允许重试，回收站用户仍只读。`admin-users-access.test.tsx` 10/10、TypeScript 与 Web production build、diff check 通过。Playwright 使用模拟 API 验证 204 应用、详情来源重读及确认交互；1280px 和 390px viewport 均无横向溢出。浏览器验证不代表真实服务端或部署验证；本地模拟 EventSource 曾返回一条 MIME 错误，不影响预设请求链路。
 
+#### LUX-651：建立服务端账户偏好存储结构
+
+范围：新增用户账户偏好表，保存主题、强调色、首页分区开关、默认音轨/字幕语言和自动连播；保存版本号以供后续比较并交换，账号删除时级联清理。本任务只建立 SQLite/PostgreSQL schema 与 SQLite 空库迁移回归，不连接 API 或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0189_user_account_preferences.sql`、`migrations-postgres/0189_user_account_preferences.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] 空库升级后创建带用户级联外键的账户偏好表，偏好列和版本列具有明确类型、默认值与合法值约束。
+- [x] 新建偏好行使用与当前账户页一致的默认设置，版本为正整数。
+- [x] SQLite 空库迁移回归通过；PostgreSQL schema 版本和迁移运行时由后续 LUX-652 覆盖。
+
+短计划：先添加空库 schema 回归并确认失败；新增双数据库迁移，验证默认值、约束和用户删除级联。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_account_preferences_migration_runs_from_an_empty_database -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+结果（2026-10-19）：新增 SQLite/PostgreSQL 账户偏好表迁移，保存主题、强调色、首页区块、音轨/字幕语言、自动连播、版本和更新时间；约束限定可选主题/强调色、布尔值及正版本，用户删除级联清理。SQLite 空库回归先以 schema 版本 188/预期 189 失败，迁移后 1/1 通过，覆盖字段默认值、非法值拒绝和级联删除。PostgreSQL 运行时与当前 schema 断言由 LUX-652 接续。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

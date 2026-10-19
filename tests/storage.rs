@@ -127,6 +127,103 @@ async fn user_library_access_mode_migration_runs_from_an_empty_database()
 }
 
 #[tokio::test]
+async fn user_account_preferences_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert_eq!(database.schema_version().await?, 189);
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'user_account_preferences'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+    let owner_cascade_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_account_preferences')
+         WHERE \"table\" = 'users' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(owner_cascade_count, 1);
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('account-preferences-owner', 'account-preferences-owner', 'Preferences', 'hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_account_preferences (user_id)
+         VALUES ('account-preferences-owner')",
+    )
+    .execute(database.pool())
+    .await?;
+    let defaults: (String, String, i64, i64, String, String, i64, i64) = sqlx::query_as(
+        "SELECT theme, accent_color, show_media_libraries, show_continue_watching,
+                audio_language, subtitle_language, auto_play_next_episode, version
+         FROM user_account_preferences WHERE user_id = 'account-preferences-owner'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        defaults,
+        (
+            "dark".to_owned(),
+            "silver".to_owned(),
+            1,
+            1,
+            "原始音轨".to_owned(),
+            "简体中文".to_owned(),
+            1,
+            1,
+        )
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET theme = 'sepia'
+             WHERE user_id = 'account-preferences-owner'",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET accent_color = 'ultraviolet'
+             WHERE user_id = 'account-preferences-owner'",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET version = 0
+             WHERE user_id = 'account-preferences-owner'",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'account-preferences-owner'")
+        .execute(database.pool())
+        .await?;
+    let remaining_preferences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_account_preferences
+         WHERE user_id = 'account-preferences-owner'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_preferences, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_profile_migration_preserves_existing_accounts_and_email_uniqueness()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
