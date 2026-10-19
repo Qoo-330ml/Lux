@@ -13053,6 +13053,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-620。
 
+#### LUX-622：接入 Emby 直放准入
+
+范围：Emby `PlaybackInfo` 签发媒体链接前只读检查 `can_play` 与当前并发额度；额度不足时返回包含当前播放数和上限的错误，且不创建 HLS 会话。Emby 直放链接的实际 GET（含 Range）及 STRM 外部 URL 交接时，按 `PlaySessionId` 原子准入；HEAD 不占位，同一会话重复取流复用名额。Emby `PLAYING`/`PAUSED` 回调只续租已有有效占位，`STOPPED` 回调停止并释放相同会话；回调不能创建或复活过期占位。兼容未带 Lux 签名票据的旧直放请求，并使用 Emby 回调共享的稳定会话身份，不接受客户端任意更换 ID 拆分并发计数。本任务不接入 Emby HLS 实际分片准入。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`src/api/media.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [ ] `PlaybackInfo` 额度预检不占位；达到上限或禁止播放时返回当前播放数和上限，不创建 HLS 会话。
+- [ ] 直放/STRM 首次 GET 原子占位，HEAD 不占位；Range 与同一 `PlaySessionId` 的重复 GET 复用名额，超额新会话被拒绝且不影响已有会话。
+- [ ] 有效 `PLAYING`/`PAUSED` 回调续租，`STOPPED` 释放；迟到回调不能复活已过期占位。
+- [ ] Emby playback 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback emby_direct_playback_admission`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-619、LUX-621。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
