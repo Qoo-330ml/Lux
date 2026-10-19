@@ -1,8 +1,9 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::setup::SetupService,
-    auth::{emby::EmbyAuthService, sessions::WebAuthService},
+    application::{libraries::LibraryService, setup::SetupService},
+    auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
+    library::LibraryKind,
     storage::Database,
 };
 use reqwest::header::COOKIE;
@@ -1996,6 +1997,78 @@ async fn admin_user_profile_api_normalizes_email_and_preserves_verification_stat
     let unchanged_user = unchanged_profile.json::<Value>().await?["user"].clone();
     assert_eq!(unchanged_user["email"], "new@example.com");
     assert_eq!(unchanged_user["emailVerifiedAt"], 456);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_read_content_restriction_index_readiness()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let users = UserStore::new(database.clone())?;
+    users
+        .create_user("reader", "Reader", "reader password", false)
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Restriction Readiness", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('restriction-readiness-item', ?, 'MOVIE', 'Readiness', 'Readiness', 'LOCAL_CONFIRMED')",
+    )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let url = format!("{base_url}/api/v1/admin/content-restriction-index");
+
+    let anonymous = client.get(&url).send().await?;
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_response = client.get(&url).header(COOKIE, admin_cookie).send().await?;
+    assert_eq!(admin_response.status(), reqwest::StatusCode::OK);
+    let readiness = admin_response.json::<Value>().await?;
+    assert_eq!(readiness["totalItems"], 1);
+    assert_eq!(readiness["indexedItems"], 0);
+    assert_eq!(readiness["pendingItems"], 1);
+    assert_eq!(readiness.as_object().map(|body| body.len()), Some(3));
+
+    let reader_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "reader", "password": "reader password" }))
+        .send()
+        .await?;
+    let reader_cookie = cookie_pair(reader_login.headers());
+    let reader_response = client
+        .get(&url)
+        .header(COOKIE, reader_cookie)
+        .send()
+        .await?;
+    assert_eq!(reader_response.status(), reqwest::StatusCode::FORBIDDEN);
 
     server.abort();
     Ok(())

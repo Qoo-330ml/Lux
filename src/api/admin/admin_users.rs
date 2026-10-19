@@ -1,5 +1,32 @@
 use super::*;
 
+async fn admin_content_restriction_index_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.media_content_restriction_index_status().await {
+        Ok((total_items, indexed_items)) => Json(json!({
+            "totalItems": total_items,
+            "indexedItems": indexed_items,
+            "pendingItems": total_items.saturating_sub(indexed_items),
+        }))
+        .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "无法读取内容分类索引状态",
+        )
+        .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SetLibraryAccessRequest {
@@ -1699,6 +1726,10 @@ pub(crate) async fn admin_update_user_avatar(
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/v1/admin/content-restriction-index",
+            get(admin_content_restriction_index_status),
+        )
         .route(
             "/api/v1/admin/user-permission-presets",
             get(admin_list_user_permission_presets).post(admin_create_user_permission_preset),

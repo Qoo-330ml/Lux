@@ -14351,6 +14351,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：内容分类索引 worker 现在由主进程在数据库选择完成后启动，并由 AppState 持有、重复调用不重复创建，关闭时等待其退出。worker 每批最多 100 项，沿 ID 游标继续处理，坏 JSON/非法标签只记录汇总且不就绪，无候选时 10 秒退避，数据库错误 1 秒后重试。SQLite worker 处理及关闭回归 1/1、build、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过；不读取磁盘 NFO。
 
+#### LUX-686：提供内容分类索引就绪度管理员 API
+
+范围：增加只读管理员 API，汇总未删除媒体条目总数、已建立分类索引数和未就绪数。统计口径与后台回填一致；仅管理员可读，不返回条目名称、路径、NFO 或用户策略。此任务不改变媒体访问，也不做前端展示。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 存储统计排除已移除媒体，并准确计算总数、已索引数与待处理数。
+- [x] SQLite 与 PostgreSQL 存储合同覆盖空库、部分索引及移除条目。
+- [x] 只读管理员端点拒绝匿名及普通账户，并返回 camelCase 汇总，不泄露媒体内容或路径。
+- [x] 定向存储/API 测试、build、fmt 与 diff check 通过。
+
+短计划：先在共享存储回归和管理员 HTTP 集成测试中加入就绪度断言并确认接口缺失时失败；再实现有界 SQL 汇总与管理员路由；最后运行目标测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --ignored --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_read_content_restriction_index_readiness -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt、全目标 Clippy（放行两个既有 lint）与 `git diff --check`。
+
+依赖：LUX-679、LUX-683、LUX-685。
+
+结果（2026-10-19）：存储层用单条 LEFT JOIN 聚合活跃条目总数与已有索引数，已移除媒体不计入，待处理数由两者差值生成。只读端点 `/api/v1/admin/content-restriction-index` 要求管理员会话，响应仅含 `totalItems`、`indexedItems`、`pendingItems`。SQLite 与本地 PostgreSQL 存储回归各 1/1、管理员 HTTP 回归 1/1、`cargo build --locked`、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。UI 展示由后续独立任务接入。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

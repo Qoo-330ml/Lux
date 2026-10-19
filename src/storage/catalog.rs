@@ -7823,6 +7823,24 @@ impl Database {
             .collect())
     }
 
+    pub(crate) async fn media_content_restriction_index_status(
+        &self,
+    ) -> Result<(i64, i64), StorageError> {
+        self.query_as(
+            "SELECT COUNT(*), COUNT(restriction_index.item_id)
+             FROM media_items item
+             LEFT JOIN media_content_restriction_index restriction_index
+               ON restriction_index.item_id = item.id
+             WHERE item.removed_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     // LUX-684 consumes this compare-and-swap before persisting a projected index.
     #[allow(dead_code)]
     pub(crate) async fn replace_media_content_restriction_index_if_nfo_json_matches(

@@ -15033,6 +15033,11 @@ async fn assert_media_content_restriction_index_storage(
         .execute(database.pool())
         .await?;
 
+    assert_eq!(
+        database.media_content_restriction_index_status().await?,
+        (3, 1)
+    );
+
     let candidates = database
         .media_content_restriction_index_candidates(None, 1)
         .await?;
@@ -15084,6 +15089,10 @@ async fn assert_media_content_restriction_index_storage(
                 &projection,
             )
             .await?
+    );
+    assert_eq!(
+        database.media_content_restriction_index_status().await?,
+        (3, 2)
     );
     let indexed: (Option<String>,) = database
         .query_as(
