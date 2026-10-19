@@ -1187,3 +1187,24 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 | 浏览器与部署 | 使用隔离 Chromium/Playwright、临时 SQLite 数据库和独立本地端口实测用户列表搜索、详情、全局保留设置、创建普通账号、移入回收站及恢复；模块六呈现无操作控件的占位。截图：`output/playwright/user-management-list.png`。控制台 0 warning；7 个资源错误仅为初始化前未登录的 `/auth/me` 401 与无头像账户的头像 API 404，通用头像回退可见；未见脚本异常。未完整审计网络面板；未推送或部署，未验证 FNOS/x86_64。 |
 
 因此阶段 1 的定向实现、构建检查和临时数据库上的真实浏览器交互验证已记录；完整项目门禁仍未通过，网络面板也未完整审阅。阶段 2 不自动开始，等待项目所有者确认阶段结果。
+
+## 用户管理模块六：播放与转码权限（2026-10-19）
+
+新建 Web 或 Emby 播放会话时，服务端按当前用户策略选择可用方案：Direct 不依赖转码开关；STRM 仍为 Direct-only；Remux 受 `allow_remux` 控制；音频转码受 `allow_audio_transcode` 控制。当前 HLS 视频转码命令也会输出 AAC 音频，因此硬件与软件视频转码同时要求 `allow_video_transcode` 和 `allow_audio_transcode`。策略禁止所有兼容转码方案时，创建会话返回 403，且不创建会话或 HLS 资源。服务器未启用硬件编码时，硬件方案不会被选中。
+
+每次读取已签发的服务端 HLS 资源（含 HEAD）都会重新检查当前用户策略。权限撤销后该请求返回 403，并停止会话、释放播放并发占用及清理 HLS 临时资源；同一 ticket 后续请求返回 410。Direct 与 STRM 的资源授权行为未变。此处只完成模块六；设备、会话活动和登录限制等模块七能力未在本轮实现。
+
+### 本机验证
+
+环境为 Toshiba 挂载盘、macOS `arm64`；Cargo 构建、测试与 Clippy 均使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 定向 Rust | `user_policy_`：3/3；`web_playback`：1/1；`playback`：4/4。覆盖新建会话选档及拒绝、Web/Emby 403、已签 HLS ticket 撤权后的拒绝、停止与资源释放。 |
+| Rust build / fmt | `cargo build --locked` 与 `cargo fmt --all -- --check` 通过。 |
+| 完整 Rust | `cargo test --locked --all-targets` 的库 target 为 981 通过、4 失败、25 忽略；4 个失败是扫描/元数据队列用例：`local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 超时，`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate` 与 `changed_local_fill_request_during_running_item_is_not_lost` 预期计数为 1、实际为 0，`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures` 读取空集合时越界。全量命令因此未继续执行 integration targets；模块六定向 targets 均独立通过。 |
+| Clippy | `cargo clippy --locked --all-targets --all-features -- -D warnings` 未通过：`src/api/media.rs::serve_emby_media_file` 和 `src/application/playback/session.rs::verify_emby_direct_stream` 各有 8 个参数，触发 `clippy::too_many_arguments`。本轮未改这两个函数签名。 |
+| Web | 冻结依赖安装与 `pnpm --dir web build` 通过。`pnpm --dir web test` 静态阶段为 144 通过、4 失败（编辑器懒加载、首页 hero 标题行高、首页媒体卡片宽度、触屏卡片动作样式），因此未进入同命令中的 Vitest 阶段。模块六没有 Web UI 改动。 |
+| 浏览器与部署 | 本轮模块六以 API / HLS 服务端策略为改动面，使用定向 Web/播放协议测试验证；未验证真实 HLS 播放器、第三方客户端、FNOS 或 NAS/x86_64，也未推送或部署。 |
+
+因此模块六的定向实现与本机服务端检查已记录；Rust 全量测试、Clippy 和 Web 静态门禁仍未全部通过。未进入模块七或后续阶段。
