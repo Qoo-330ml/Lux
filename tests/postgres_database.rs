@@ -135,7 +135,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 189);
+    assert_eq!(database.schema_version().await?, 190);
     let setup = SetupService::new(database.clone())?;
     setup
         .complete("postgres-admin", "PostgreSQL Admin", "test-password")
@@ -144,6 +144,64 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         sqlx::query_scalar("SELECT id FROM users WHERE username_normalized = 'postgres-admin'")
             .fetch_one(database.pool())
             .await?;
+    let restriction_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_content_restrictions'
+           AND column_name IN (
+               'user_id', 'rating_system', 'maximum_rating', 'allow_unrated',
+               'version', 'updated_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_columns, 6);
+    let restriction_tag_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_content_restriction_tags'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_tag_table, 1);
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ($1, 'MPAA', 'PG-13', 0)",
+    )
+    .bind(&postgres_admin_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'ALLOW', 'family'), ($1, 'BLOCK', 'horror')",
+    )
+    .bind(&postgres_admin_id)
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query("UPDATE user_content_restrictions SET allow_unrated = 2 WHERE user_id = $1",)
+            .bind(&postgres_admin_id)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    for invalid_tag in [
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'NEUTRAL', 'other')",
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'ALLOW', '   ')",
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'ALLOW', 'family')",
+    ] {
+        assert!(
+            sqlx::query(invalid_tag)
+                .bind(&postgres_admin_id)
+                .execute(database.pool())
+                .await
+                .is_err()
+        );
+    }
     let preference_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_schema = current_schema()
@@ -217,6 +275,42 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     )
     .execute(database.pool())
     .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('postgres-pref-cascade', 'MPAA', NULL, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('postgres-pref-cascade', 'BLOCK', 'horror')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM user_content_restrictions WHERE user_id = 'postgres-pref-cascade'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_restriction_tags: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restriction_tags
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cascaded_restriction_tags, 0);
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('postgres-pref-cascade', 'MPAA', NULL, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('postgres-pref-cascade', 'BLOCK', 'horror')",
+    )
+    .execute(database.pool())
+    .await?;
     sqlx::query("DELETE FROM users WHERE id = 'postgres-pref-cascade'")
         .execute(database.pool())
         .await?;
@@ -227,6 +321,20 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(cascaded_preferences, 0);
+    let cascaded_restrictions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restrictions
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let cascaded_user_tags: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restriction_tags
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cascaded_restrictions, 0);
+    assert_eq!(cascaded_user_tags, 0);
     sqlx::query(
         "INSERT INTO users (id, username_normalized, display_name, password_hash)
          VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
@@ -929,7 +1037,7 @@ async fn postgres_account_profile_migration_preserves_existing_accounts()
         pool.close().await;
 
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(database.schema_version().await?, 189);
+        assert_eq!(database.schema_version().await?, 190);
         let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> =
             sqlx::query_as(
                 "SELECT id, email, email_verified_at, deletion_purge_at,
@@ -1026,7 +1134,7 @@ async fn postgres_user_library_access_mode_migration_preserves_legacy_semantics(
         pool.close().await;
 
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(database.schema_version().await?, 189);
+        assert_eq!(database.schema_version().await?, 190);
         let modes: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
         )
@@ -1263,7 +1371,7 @@ async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
                     ),
                 ]
             );
-            assert_eq!(database.schema_version().await?, 189);
+            assert_eq!(database.schema_version().await?, 190);
             let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
                 "SELECT version, checksum FROM _sqlx_migrations
                  WHERE version <= $1 ORDER BY version",
@@ -1392,7 +1500,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 189);
+        assert_eq!(upgraded_database.schema_version().await?, 190);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -1513,7 +1621,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 189);
+    assert_eq!(database.schema_version().await?, 190);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2888,7 +2996,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 189);
+    assert_eq!(database.schema_version().await?, 190);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)

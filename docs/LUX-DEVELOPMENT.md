@@ -14155,15 +14155,17 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] 相关目标的 schema 版本预期为 190，原功能断言不变。
-- [ ] PostgreSQL bootstrap 验证策略/标签表、字段约束、外键级联与非法值拒绝。
-- [ ] 对应 SQLite 测试目标、Rust build、fmt 与 diff check 通过；本机 PostgreSQL 不可用时明确标注未实跑。
+- [x] 相关目标的 schema 版本预期为 190，原功能断言不变。
+- [x] PostgreSQL bootstrap 验证策略/标签表、字段约束、外键级联与非法值拒绝。
+- [x] scanner、danmaku 与扫描任务的其他 90 项通过；单独记录并排除已在基线复现的扫描断言失败，Rust build、fmt 与 diff check 通过。
 
 短计划：先更新相关测试目标的版本断言；再扩展 ignored PostgreSQL bootstrap 检查迁移后的结构和约束；运行 SQLite 定向目标并在可用时执行 PostgreSQL 测试。
 
-验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanner`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test danmaku`、可用时运行 PostgreSQL bootstrap ignored 测试、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanner`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs -- --skip manifest_discovery_reopens_and_retries_persisted_frontier_idempotently`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test danmaku`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_bootstrap_runs_migrations_and_persists_core_state -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。
 
 依赖：LUX-675。
+
+结果（2026-10-19）：PostgreSQL 空库启动通过，策略字段与标签表可创建，非法布尔值/标签类别/空标签/重复标签均被约束拒绝，删除策略及用户可级联清理关联行。`scanner` 18/18、`danmaku` 7/7、扫描任务排除基线失败后的 90/90、PostgreSQL bootstrap 1/1、Rust build、fmt 与 diff check 通过。完整 `scanning_jobs` 目标中 `manifest_discovery_reopens_and_retries_persisted_frontier_idempotently` 在第 7311 行因检查点实数为 1、预期 2 而失败；该失败在未包含 LUX-675 的干净提交 `a3173c1d` 上以同名定向测试原样复现，未纳入本任务改动。
 
 ## 29. 参考资料
 
