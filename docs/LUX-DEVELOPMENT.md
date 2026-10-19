@@ -13896,6 +13896,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增 Web 会话分页摘要类型，以及管理员读取和撤销客户端方法；DELETE 复用统一请求层自动附加 CSRF。定向 API 客户端测试 1/1 通过，Web build 在临时恢复当前提交版 `AdminDashboardNowPlaying.tsx` 后通过，并确认还原了该文件原有未提交内容。直接在当前工作区运行 build 会被该用户改动中两个未使用 helper 阻断；`git diff --check` 通过。
 
+#### LUX-664：在用户详情管理 Web 登录会话
+
+范围：将用户详情的“设备与登录”页接入管理员 Web 会话 API，显示分页有效会话摘要与当前会话状态，并允许管理员撤销其他单个 Web 登录。当前会话没有撤销操作；撤销前确认，撤销后刷新列表并保留其他登录。该任务不展示或管理 Emby 凭证、设备黑名单和播放设备清单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-sessions.test.tsx`。
+
+验收标准：
+
+- [x] 详情页列出 Web 会话创建、最近活动、到期时间、当前会话状态及有效会话数量，不展示任何凭证。
+- [x] 管理员可分页读取和确认撤销其他会话；当前会话不可撤销，成功后列表更新且其他会话仍保留。
+- [x] 读取错误可重试，空结果清晰可见；组件回归通过。
+
+短计划：先添加设备与登录页加载、会话摘要、分页、确认撤销、当前会话保护、错误和空状态回归；再连接 LUX-663 客户端方法与 React Query，最后检查组件回归和 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-sessions.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-593、LUX-660、LUX-662、LUX-663。
+
+结果（2026-10-19）：会话组件测试 3/3 通过；Web build 在临时恢复用户当前提交版 `AdminDashboardNowPlaying.tsx` 后通过，并逐字节还原了该文件的未提交用户改动。直接在当前工作区运行 build 仍被这份既有改动中两个未使用 helper 阻断。macOS 浏览器本地验证显示有效会话摘要、时间、状态、撤销操作和分页，浏览器控制台无警告或错误；`git diff --check` 通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

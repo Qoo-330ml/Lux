@@ -99,3 +99,16 @@
   .lux-admin-user-section-nav button { flex: 0 0 auto; }
   .lux-admin-user-module-placeholder { min-height: 180px; padding: 18px; }
 }
+.lux-admin-user-sessions { max-width: 1180px; }
+.lux-admin-user-session-summary { margin: 8px 0 0; color: var(--lux-muted); font-size: .76rem; }
+.lux-admin-user-session-table-wrap { min-width: 0; overflow-x: auto; }
+.lux-admin-user-session-table { width: 100%; min-width: 760px; border-collapse: collapse; color: var(--lux-text); font-size: .74rem; text-align: left; }
+.lux-admin-user-session-table th, .lux-admin-user-session-table td { padding: 12px 13px; border-bottom: 1px solid var(--lux-line-soft); vertical-align: middle; white-space: nowrap; }
+.lux-admin-user-session-table thead th { color: var(--lux-subtle); font-size: .67rem; font-weight: 600; }
+.lux-admin-user-session-table tbody th { font-weight: 550; }
+.lux-admin-user-session-table tbody tr:last-child th, .lux-admin-user-session-table tbody tr:last-child td { border-bottom: 0; }
+.lux-admin-user-session-other, .lux-admin-user-session-protected { color: var(--lux-muted); font-size: .68rem; }
+.lux-admin-user-session-revoke { color: var(--lux-danger, #d86d6d); white-space: nowrap; }
+.lux-admin-user-session-revoke:hover { border-color: color-mix(in srgb, var(--lux-danger, #d86d6d) 55%, transparent); }
+.lux-admin-user-session-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; color: var(--lux-subtle); font-size: .72rem; }
+.lux-admin-user-session-pagination > div { display: flex; gap: 8px; }
