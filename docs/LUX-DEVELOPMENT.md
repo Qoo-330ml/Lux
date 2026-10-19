@@ -13072,6 +13072,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：PlaybackInfo 仅做准入预检，满额时拒绝 direct 与强制转码请求，未创建 HLS 会话。签名直放 GET 和 STRM 302 交接均按会话占位；HEAD 不占位，Range 复用占位，管理员并发上限从 1 到达后新会话被拒绝，原会话保留。PAUSED 续租、STOPPED 释放已验证；无播放 GET 的回调不创建占位。旧式直放使用条目/设备稳定会话 ID，STOPPED 无 PlaySessionId 时可释放。未部署。
 
+#### LUX-623：接入 Emby HLS 实际准入
+
+范围：Emby HLS manifest、初始化文件及媒体分片的实际 GET 在签名、会话、条目、源和资产均验证并可提供内容后，按对应 `lux-emby` `PlaySessionId` 原子准入；同一 HLS 会话的 manifest、分片、重复请求复用名额。HEAD 和 PlaybackInfo 预检不占位。满额或禁播时返回当前播放数与上限，并停止未准入的新 HLS 会话以回收其服务端资源；不得停止已有获准会话。Emby STOPPED 回调释放准入。本任务仅接入 Emby HLS，不改变 Web HLS 或 FFmpeg 服务器级并发策略。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/playback.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [ ] PlaybackInfo 创建 HLS 会话后无准入记录；HEAD manifest 不占位，实际 GET manifest 才原子占位。
+- [ ] 后续 HLS 初始化文件/分片 GET 与重复请求复用同一名额；额度满时拒绝另一条已签发 HLS 会话并清理该会话，已有会话仍可继续读取。
+- [ ] STOPPED 回调释放对应 HLS 准入记录；拒绝或 HEAD 不创建准入记录。
+- [ ] Emby HLS 定向集成测试、Rust 格式检查和 `git diff --check` 通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test playback emby_playback_info_negotiates_server_transcoding_and_cleans_hls`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-619、LUX-622。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
