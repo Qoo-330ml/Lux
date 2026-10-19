@@ -15724,6 +15724,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：SQLite 空库迁移与既有 0194 会话升级分别通过；PostgreSQL 空库 migration 和旧会话升级两个真实本机测试均通过。`cargo build --locked`、`cargo fmt --all -- --check`、PostgreSQL 测试目标编译及 `git diff --check` 通过；`storage` 与 PostgreSQL 测试目标 Clippy 在放行 7 类既有诊断后通过。另一个宽泛 `storage migration_runs_from_an_empty_database` 过滤运行到 7 项，其中 5 项旧迁移测试仍因断言 schema 版本为 190/192 而失败；本任务新增与直接关联的迁移用例通过，这些历史版本断言尚未同步。
 
+#### LUX-751：存储 Web 会话设备关联
+
+范围：扩展 Web 会话存储，使调用者可为新会话写入可选的客户端声明设备 ID，并可从已验证会话安全读回该字段。原有无设备参数的内部调用继续写 NULL。只增加存储合同，不从 HTTP Header 绑定设备、不改变登录流程或设备访问策略。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新会话创建时可选择写入设备 ID，旧入口仍可创建 `device_id=NULL` 的会话。
+- [x] 通过有效会话凭证读取时返回对应设备 ID；不存在、撤销或过期会话仍不可读取。
+- [x] 存储会话相关单测、build、fmt、可用 Clippy 与 diff check 通过。
+
+短计划：先扩展 session storage 测试，验证指定设备 ID 可写可读且默认空值保持；运行定向测试确认 RED；然后为 session insert 增加可选参数合同并在 `StoredWebSession` 返回字段；最后运行 session 存储回归和常规检查。
+
+结果（2026-10-20）：`web_sessions` 存储合同增加带可选设备 ID 的创建入口，并由已验证会话查询返回该 nullable 字段；原创建入口保持兼容且写入 NULL。凭证查询仍过滤不存在、过期和撤销会话。
+
+验证：TDD RED 先因创建方法和返回字段不存在而编译失败；实现后 `storage::repository::repository_tests::web_session_device_association_is_optional_and_only_read_from_active_sessions` 1/1 通过，覆盖有关联、旧入口空值、过期、撤销和未知 token。`cargo build --locked`、`cargo fmt --all -- --check`、定向 Clippy 放行 7 类既有诊断后及 `git diff --check` 通过。设备字段将在下一增量接入 Web 登录与活动检查。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

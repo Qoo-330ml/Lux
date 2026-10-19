@@ -9619,16 +9619,37 @@ impl Database {
         csrf_token_hash: &[u8],
         lifetime_seconds: i64,
     ) -> Result<(), StorageError> {
+        self.create_web_session_with_device(
+            id,
+            user_id,
+            session_token_hash,
+            csrf_token_hash,
+            None,
+            lifetime_seconds,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_web_session_with_device(
+        &self,
+        id: &str,
+        user_id: &str,
+        session_token_hash: &[u8],
+        csrf_token_hash: &[u8],
+        device_id: Option<&str>,
+        lifetime_seconds: i64,
+    ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO web_sessions (
-                id, user_id, session_token_hash, csrf_token_hash, expires_at
-            ) VALUES (?, ?, ?, ?, unixepoch() + ?)",
+                id, user_id, session_token_hash, csrf_token_hash, expires_at, device_id
+            ) VALUES (?, ?, ?, ?, unixepoch() + ?, ?)",
         )
         .bind(id)
         .bind(user_id)
         .bind(session_token_hash)
         .bind(csrf_token_hash)
         .bind(lifetime_seconds)
+        .bind(device_id)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -9643,7 +9664,7 @@ impl Database {
         session_token_hash: &[u8],
     ) -> Result<Option<StoredWebSession>, StorageError> {
         self.query(
-            "SELECT ws.csrf_token_hash, u.id AS user_id,
+            "SELECT ws.csrf_token_hash, ws.device_id, u.id AS user_id,
                     u.username_normalized, u.display_name, u.has_password,
                     u.is_disabled, u.is_admin, u.can_manage_server,
                     u.can_remote_access, u.can_download, u.last_login_at,
@@ -9664,6 +9685,7 @@ impl Database {
         .map(|row| {
             row.map(|row| StoredWebSession {
                 csrf_token_hash: row.get("csrf_token_hash"),
+                device_id: row.get("device_id"),
                 user_id: row.get("user_id"),
                 username_normalized: row.get("username_normalized"),
                 display_name: row.get("display_name"),

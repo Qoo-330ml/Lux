@@ -10,6 +10,77 @@ use crate::storage::{
 };
 
 #[tokio::test]
+async fn web_session_device_association_is_optional_and_only_read_from_active_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Session Device", "Session Device", "password")
+        .await?;
+    let user_id = user.id.to_string();
+    let token_hash = [1_u8; 32];
+    database
+        .create_web_session_with_device(
+            "device-session",
+            &user_id,
+            &token_hash,
+            &[2_u8; 32],
+            Some("browser-device-id"),
+            3600,
+        )
+        .await?;
+    let stored = database
+        .find_web_session(&token_hash)
+        .await?
+        .ok_or("active device session was not found")?;
+    assert_eq!(stored.device_id.as_deref(), Some("browser-device-id"));
+
+    let legacy_token_hash = [3_u8; 32];
+    database
+        .create_web_session(
+            "legacy-session",
+            &user_id,
+            &legacy_token_hash,
+            &[4_u8; 32],
+            3600,
+        )
+        .await?;
+    let legacy = database
+        .find_web_session(&legacy_token_hash)
+        .await?
+        .ok_or("active legacy session was not found")?;
+    assert_eq!(legacy.device_id, None);
+
+    let expired_token_hash = [5_u8; 32];
+    database
+        .create_web_session_with_device(
+            "expired-session",
+            &user_id,
+            &expired_token_hash,
+            &[6_u8; 32],
+            Some("expired-device"),
+            -1,
+        )
+        .await?;
+    assert!(
+        database
+            .find_web_session(&expired_token_hash)
+            .await?
+            .is_none()
+    );
+    database.revoke_web_session(&token_hash).await?;
+    assert!(database.find_web_session(&token_hash).await?.is_none());
+    assert!(database.find_web_session(&[7_u8; 32]).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
