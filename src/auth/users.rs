@@ -3,7 +3,7 @@ use crate::{
     domain::ids::UserId,
     storage::{
         AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser, StorageError,
-        StoredAdminUserListItem, UpdateUser,
+        StoredAdminUserListItem, UpdateUser, UserPlaybackPolicy,
     },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -272,6 +272,42 @@ impl UserStore {
             .await?
             .map(admin_user_profile)
             .transpose()
+    }
+
+    pub(crate) async fn get_playback_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserPlaybackPolicy>, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        let Some(profile) = self.find_admin_profile_by_id(user_id).await? else {
+            return Ok(None);
+        };
+        if profile.deleted_at.is_some() {
+            return Ok(None);
+        }
+        self.database
+            .get_user_playback_policy(user_id)
+            .await
+            .map_err(UserStoreError::from)
+    }
+
+    pub(crate) async fn update_playback_policy(
+        &self,
+        user_id: &str,
+        policy: UserPlaybackPolicy,
+    ) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        if policy.max_simultaneous_playbacks < 0 {
+            return Err(UserStoreError::InvalidPlaybackPolicy);
+        }
+        self.database
+            .update_user_playback_policy(user_id, policy)
+            .await
+            .map_err(UserStoreError::from)
     }
 
     pub async fn find_by_username(
@@ -619,6 +655,7 @@ fn normalize_email(email: &str) -> Result<String, UserStoreError> {
 pub enum UserStoreError {
     InvalidUsername,
     InvalidEmail,
+    InvalidPlaybackPolicy,
     InvalidUserId(String),
     SetupAlreadyCompleted,
     Password(PasswordError),
@@ -643,6 +680,9 @@ impl std::fmt::Display for UserStoreError {
         match self {
             Self::InvalidUsername => formatter.write_str("username must be 1-128 characters"),
             Self::InvalidEmail => formatter.write_str("email address is invalid"),
+            Self::InvalidPlaybackPolicy => {
+                formatter.write_str("simultaneous playback limit cannot be negative")
+            }
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::SetupAlreadyCompleted => {
                 formatter.write_str("initial setup has already completed")
@@ -663,6 +703,7 @@ impl std::error::Error for UserStoreError {
             Self::Storage(error) => Some(error),
             Self::InvalidUsername
             | Self::InvalidEmail
+            | Self::InvalidPlaybackPolicy
             | Self::InvalidUserId(_)
             | Self::SetupAlreadyCompleted
             | Self::LastManager => None,

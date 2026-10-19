@@ -209,6 +209,101 @@ pub(crate) async fn admin_update_user_profile(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetUserPlaybackPolicyRequest {
+    can_play: bool,
+    max_simultaneous_playbacks: i64,
+    allow_remux: bool,
+    allow_audio_transcode: bool,
+    allow_video_transcode: bool,
+}
+
+pub(crate) async fn admin_get_user_playback_policy(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users.get_playback_policy(&user_id).await {
+        Ok(Some(policy)) => {
+            Json(json!({ "policy": admin_user_playback_policy_json(policy) })).into_response()
+        }
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
+pub(crate) async fn admin_set_user_playback_policy(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<SetUserPlaybackPolicyRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let policy = crate::storage::UserPlaybackPolicy {
+        can_play: request.can_play,
+        max_simultaneous_playbacks: request.max_simultaneous_playbacks,
+        allow_remux: request.allow_remux,
+        allow_audio_transcode: request.allow_audio_transcode,
+        allow_video_transcode: request.allow_video_transcode,
+    };
+    match users.update_playback_policy(&user_id, policy).await {
+        Ok(true) => {
+            let metadata = json!({
+                "canPlay": policy.can_play,
+                "maxSimultaneousPlaybacks": policy.max_simultaneous_playbacks,
+                "allowRemux": policy.allow_remux,
+                "allowAudioTranscode": policy.allow_audio_transcode,
+                "allowVideoTranscode": policy.allow_video_transcode,
+            })
+            .to_string();
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_PLAYBACK_POLICY_UPDATED",
+                Some("user"),
+                Some(&user_id),
+                &metadata,
+            )
+            .await;
+            Json(json!({ "policy": admin_user_playback_policy_json(policy) })).into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "用户不存在",
+        )
+        .into_response(),
+        Err(error) => user_store_error(&headers, error),
+    }
+}
+
 pub(crate) async fn admin_list_user_library_access(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -305,6 +400,16 @@ fn admin_user_profile_json(profile: &crate::auth::users::AdminUserProfile) -> Va
     user["deletedAt"] = json!(profile.deleted_at);
     user["deletionPurgeAt"] = json!(profile.deletion_purge_at);
     user
+}
+
+fn admin_user_playback_policy_json(policy: crate::storage::UserPlaybackPolicy) -> Value {
+    json!({
+        "canPlay": policy.can_play,
+        "maxSimultaneousPlaybacks": policy.max_simultaneous_playbacks,
+        "allowRemux": policy.allow_remux,
+        "allowAudioTranscode": policy.allow_audio_transcode,
+        "allowVideoTranscode": policy.allow_video_transcode,
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -540,6 +645,7 @@ pub(crate) fn user_store_error(headers: &HeaderMap, error: UserStoreError) -> Re
     match error {
         UserStoreError::InvalidUsername
         | UserStoreError::InvalidEmail
+        | UserStoreError::InvalidPlaybackPolicy
         | UserStoreError::Password(_) => api_error(
             headers,
             StatusCode::BAD_REQUEST,
@@ -776,6 +882,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/users/{user_id}/profile",
             patch(admin_update_user_profile),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/playback-policy",
+            get(admin_get_user_playback_policy).put(admin_set_user_playback_policy),
         )
         .route(
             "/api/v1/admin/users/{user_id}/avatar",

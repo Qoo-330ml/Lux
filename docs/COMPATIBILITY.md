@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-616 管理员用户播放策略 API（2026-10-19）
+
+管理员可通过 `GET /api/v1/admin/users/{userId}/playback-policy` 读取用户的 `canPlay`、
+`maxSimultaneousPlaybacks`、`allowRemux`、`allowAudioTranscode` 和 `allowVideoTranscode`；
+使用 `PUT` 提交完整策略。并发上限 `0` 表示不限，负值返回 `400`；未知或已回收站用户
+返回 `404`。写入要求管理员会话及 CSRF token，并记录 `USER_PLAYBACK_POLICY_UPDATED`。
+该设置接口不表示播放准入或转码限制已经实施；对应实施任务另行记录。
+
 ## LUX-592 反向代理客户端 IP（2026-10-19）
 
 播放会话和登录/播放活动的客户端 IP 按有效 `X-Forwarded-For`、`X-Real-IP`、

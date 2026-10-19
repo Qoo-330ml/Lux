@@ -12942,6 +12942,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：普通用户和首个管理员的应用创建路径显式设为 2 路；migration 对已有用户的 0（不限）保持不变。存储层增加五项策略读取/更新，负并发被 CHECK 拒绝，已软删除/不存在账号不接受更新。定向测试 1/1 通过，未部署。
 
+#### LUX-616：开放管理员播放策略接口
+
+范围：增加管理员读取及完整替换用户播放策略的 API。`maxSimultaneousPlaybacks=0` 表示不限；拒绝负值。修改要求管理员会话和 CSRF，并记录策略值审计事件；回收站账号只读。本任务不实施播放准入或转码限制。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可通过 `GET /api/v1/admin/users/{userId}/playback-policy` 读取五项策略。
+- [x] CSRF 保护的 `PUT` 接收完整策略并返回保存结果；负上限返回 400，未知或回收站用户返回 404。
+- [x] 普通用户不能访问；成功变更产生 `USER_PLAYBACK_POLICY_UPDATED` 审计事件，不记录凭证。
+- [x] 兼容文档说明接口字段和 `0` 不限语义；定向 users 集成测试通过。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_users_and_last_manager_is_protected`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-615。
+
+结果（2026-10-19）：新增管理员专用 GET/PUT，PUT 通过 CSRF 校验并要求五字段完整提交；负并发上限返回 400，`0` 原样保存为不限，普通用户无权访问，回收站用户读写均返回 404。每次成功写入记录策略值审计事件，不含认证信息。`users` 定向集成测试 1/1 通过，接口及 `0` 语义已记入兼容文档；未部署。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
