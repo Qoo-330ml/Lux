@@ -1475,7 +1475,7 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     let device_profile_starts = config
         .config_dir
         .join("web-playback")
-        .join(device_profile_hls_session_id)
+        .join(&device_profile_hls_session_id)
         .join("starts.log");
     assert!(
         !device_profile_starts.exists(),
@@ -1634,6 +1634,59 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         tokio::fs::read_to_string(&device_profile_starts).await?,
         "1230\n0\n"
     );
+    let device_profile_tier: i64 =
+        sqlx::query_scalar("SELECT tier FROM web_playback_sessions WHERE id = ?")
+            .bind(&device_profile_hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        (3..=4).contains(&device_profile_tier),
+        "this DeviceProfile request needs video transcoding"
+    );
+    sqlx::query("UPDATE users SET allow_video_transcode = 0 WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let revoked_device_profile_segment = client
+        .get(format!("{base_url}{beginning_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        revoked_device_profile_segment.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let reused_revoked_device_profile_segment = client
+        .get(format!("{base_url}{beginning_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        reused_revoked_device_profile_segment.status(),
+        reqwest::StatusCode::GONE
+    );
+    let revoked_device_profile_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(&device_profile_hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(revoked_device_profile_state, "STOPPED");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM playback_admissions WHERE user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "revoking the HLS tier releases the Emby admission"
+    );
+    assert!(
+        !config
+            .config_dir
+            .join("web-playback")
+            .join(&device_profile_hls_session_id)
+            .exists(),
+        "revoking the HLS tier removes Emby temporary resources"
+    );
     let device_profile_stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .query(&[("api_key", token.as_str())])
@@ -1658,6 +1711,10 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         0,
         "STOPPED must release the HLS admission"
     );
+    sqlx::query("UPDATE users SET allow_video_transcode = 1 WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
 
     let get_with_device_profile = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))

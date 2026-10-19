@@ -443,6 +443,23 @@ impl WebPlaybackSessionService {
             let _ = self.hls.stop(session_id).await;
             return Err(WebPlaybackSessionError::Expired);
         }
+        if session.plan == "SERVER_HLS" {
+            let policy = self
+                .database
+                .get_user_playback_policy(&session.user_id)
+                .await?
+                .ok_or(WebPlaybackSessionError::NotFound)?;
+            if !playback_policy_allows_hls_tier(policy, session.tier) {
+                if let Err(error) = self.stop(session_id, &session.user_id).await {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %error,
+                        "failed to stop HLS session after playback policy was revoked"
+                    );
+                }
+                return Err(WebPlaybackSessionError::PlaybackPolicyDenied);
+            }
+        }
         Ok(session)
     }
 
@@ -908,6 +925,15 @@ fn choose_plan_for_policy(
     }
 
     Err(WebPlaybackSessionError::PlaybackPolicyDenied)
+}
+
+fn playback_policy_allows_hls_tier(policy: UserPlaybackPolicy, tier: i64) -> bool {
+    match tier {
+        1 => policy.allow_remux,
+        2 => policy.allow_audio_transcode,
+        3 | 4 => policy.allow_audio_transcode && policy.allow_video_transcode,
+        _ => false,
+    }
 }
 
 #[derive(Clone)]

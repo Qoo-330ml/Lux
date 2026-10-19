@@ -898,23 +898,38 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         1,
         "HLS segment reuses the same slot"
     );
-    tokio::fs::remove_file(
-        temp_dir
-            .path()
-            .join("config/web-playback")
-            .join(hls_session_id)
-            .join("segment_000000.m4s"),
-    )
-    .await?;
-    let failed_hls_segment = client
+    sqlx::query("UPDATE users SET allow_audio_transcode = 0 WHERE id = ?")
+        .bind(&admin_id)
+        .execute(database.pool())
+        .await?;
+    let revoked_hls_head = client
+        .head(format!("{base_url}{segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(revoked_hls_head.status(), reqwest::StatusCode::FORBIDDEN);
+    let revoked_hls_segment = client
         .get(format!("{base_url}{segment_url}"))
         .send()
         .await?;
-    assert_eq!(failed_hls_segment.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(revoked_hls_segment.status(), reqwest::StatusCode::GONE);
+    let revoked_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(revoked_hls_state, "STOPPED");
     assert_eq!(
         active_admission_count(&database, &admin_id, &hls_play_session_id).await?,
         0,
-        "a failed HLS asset request releases the admission"
+        "revoking the HLS tier releases its admission"
+    );
+    assert!(
+        !temp_dir
+            .path()
+            .join("config/web-playback")
+            .join(hls_session_id)
+            .exists(),
+        "revoking the HLS tier removes temporary resources"
     );
     let hls_stopped = client
         .delete(format!(
