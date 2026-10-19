@@ -163,6 +163,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         "/Videos/{emby_item_id}/stream.mkv?MediaSourceId={source_id}"
     )));
     assert!(generic_direct_url.contains("&PlaySessionId="));
+    assert!(generic_direct_url.contains("&luxPlaybackTicketVersion=2"));
     assert!(generic_direct_url.contains("&static=true"));
     assert!(generic_direct_url.contains("&UserId="));
     assert!(generic_direct_url.contains("&luxPlayback"));
@@ -178,6 +179,31 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await?;
     assert_eq!(generic_stream.status(), reqwest::StatusCode::OK);
     assert_eq!(generic_stream.bytes().await?.as_ref(), b"0123456789");
+    let without_ticket_version = generic_direct_url
+        .split_once("&luxPlaybackTicketVersion=")
+        .and_then(|(prefix, rest)| {
+            rest.split_once('&')
+                .map(|(_, suffix)| format!("{prefix}&{suffix}"))
+        })
+        .ok_or("direct URL has no playback ticket version")?;
+    let downgraded_stream = client
+        .get(format!("{base_url}{without_ticket_version}"))
+        .send()
+        .await?;
+    assert_eq!(
+        downgraded_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let changed_ticket_version =
+        generic_direct_url.replace("luxPlaybackTicketVersion=2", "luxPlaybackTicketVersion=1");
+    let changed_version_stream = client
+        .get(format!("{base_url}{changed_ticket_version}"))
+        .send()
+        .await?;
+    assert_eq!(
+        changed_version_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let tampered_play_session =
         generic_direct_url.replacen("PlaySessionId=", "PlaySessionId=forged-", 1);
     let tampered_play_session_stream = client
@@ -186,6 +212,19 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await?;
     assert_eq!(
         tampered_play_session_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let tampered_media_source = generic_direct_url.replacen(
+        &format!("MediaSourceId={source_id}"),
+        "MediaSourceId=forged-source",
+        1,
+    );
+    let tampered_media_source_stream = client
+        .get(format!("{base_url}{tampered_media_source}"))
+        .send()
+        .await?;
+    assert_eq!(
+        tampered_media_source_stream.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
     let without_play_session = generic_direct_url

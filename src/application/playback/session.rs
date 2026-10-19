@@ -34,6 +34,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
+pub(crate) const EMBY_DIRECT_STREAM_TICKET_VERSION: &str = "2";
 const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const WEB_PLAYBACK_STALE_AFTER_SECONDS: i64 = 90;
 const EMBY_DIRECT_STREAM_SESSION_ID: &str = "emby-direct-stream";
@@ -427,28 +428,6 @@ impl WebPlaybackSessionService {
         }
     }
 
-    pub(crate) fn sign_emby_direct_stream(
-        &self,
-        user_id: &str,
-        is_admin: bool,
-        item_id: &str,
-        media_source_id: &str,
-        play_session_id: &str,
-        expires_at: i64,
-    ) -> Option<String> {
-        self.signer.sign(
-            EMBY_DIRECT_STREAM_SESSION_ID,
-            &emby_direct_stream_resource(
-                user_id,
-                is_admin,
-                item_id,
-                media_source_id,
-                play_session_id,
-            ),
-            expires_at,
-        )
-    }
-
     pub(crate) fn verify_emby_direct_stream(
         &self,
         user_id: &str,
@@ -462,6 +441,53 @@ impl WebPlaybackSessionService {
         self.signer.verify(
             EMBY_DIRECT_STREAM_SESSION_ID,
             &emby_direct_stream_resource(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
+            expires_at,
+            signature,
+            unix_timestamp(),
+        )
+    }
+
+    pub(crate) fn sign_emby_direct_stream_v2(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        item_id: &str,
+        media_source_id: &str,
+        play_session_id: &str,
+        expires_at: i64,
+    ) -> Option<String> {
+        self.signer.sign(
+            EMBY_DIRECT_STREAM_SESSION_ID,
+            &emby_direct_stream_resource_v2(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
+            expires_at,
+        )
+    }
+
+    pub(crate) fn verify_emby_direct_stream_v2(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        item_id: &str,
+        media_source_id: &str,
+        play_session_id: &str,
+        expires_at: i64,
+        signature: &str,
+    ) -> bool {
+        self.signer.verify(
+            EMBY_DIRECT_STREAM_SESSION_ID,
+            &emby_direct_stream_resource_v2(
                 user_id,
                 is_admin,
                 item_id,
@@ -1148,6 +1174,19 @@ fn emby_direct_stream_resource(
     )
 }
 
+fn emby_direct_stream_resource_v2(
+    user_id: &str,
+    is_admin: bool,
+    item_id: &str,
+    media_source_id: &str,
+    play_session_id: &str,
+) -> String {
+    format!(
+        "emby-direct-stream-v2\n{}\n{user_id}\n{is_admin}\n{item_id}\n{media_source_id}\n{play_session_id}",
+        EMBY_DIRECT_STREAM_TICKET_VERSION
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
@@ -1226,6 +1265,50 @@ mod tests {
     #[test]
     fn emby_direct_stream_tickets_last_twelve_hours() {
         assert_eq!(EMBY_DIRECT_STREAM_TTL_SECONDS, 12 * 60 * 60);
+    }
+
+    #[test]
+    fn emby_direct_stream_v2_signature_is_separate_from_legacy_domain() {
+        let signer = ResourceSigner::random();
+        let expires_at = unix_timestamp() + 60;
+        let legacy_resource =
+            super::emby_direct_stream_resource("user-1", false, "item-1", "source-1", "session-1");
+        let v2_resource = super::emby_direct_stream_resource_v2(
+            "user-1",
+            false,
+            "item-1",
+            "source-1",
+            "session-1",
+        );
+        let legacy_signature = signer
+            .sign("emby-direct-stream", &legacy_resource, expires_at)
+            .unwrap();
+        let v2_signature = signer
+            .sign("emby-direct-stream", &v2_resource, expires_at)
+            .unwrap();
+
+        assert!(signer.verify(
+            "emby-direct-stream",
+            &legacy_resource,
+            expires_at,
+            &legacy_signature,
+            unix_timestamp()
+        ));
+        assert!(!signer.verify(
+            "emby-direct-stream",
+            &v2_resource,
+            expires_at,
+            &legacy_signature,
+            unix_timestamp()
+        ));
+        assert!(!signer.verify(
+            "emby-direct-stream",
+            &legacy_resource,
+            expires_at,
+            &v2_signature,
+            unix_timestamp()
+        ));
+        assert!(v2_resource.starts_with("emby-direct-stream-v2\n2\n"));
     }
 
     #[test]

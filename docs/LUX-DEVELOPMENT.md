@@ -16152,6 +16152,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因缺少 `NewEmbyDirectPlaybackTicket` 类型而编译失败；实现后 `emby_direct_playback_ticket_storage_scopes_and_revokes_context` 1/1 通过，覆盖用户隔离、旧记录兼容写入不覆盖、撤销一次性和 1000 行清理硬上限。`cargo build --locked`、fmt 与 `git diff --check` 通过。storage 接口只接收设备/客户端上下文、用户/播放会话 ID 与时间，不接收 token、签名或 URL。Cargo 使用 Toshiba target 目录。
 
+#### LUX-775：版本化 Emby 直放票据签名
+
+范围：为后续持久化授权上下文的 Emby 直放 URL 增加 v2 签名域与明确版本参数，版本参数必须由签名域保护；服务端识别并验证 v2，同时暂时兼容无版本参数的旧版签名票据直到其自身过期。URL 不新增认证 token、设备 ID 或客户端明文。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/emby_catalog.rs`、`src/api/media.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 新 Emby 直放票据使用独立 v2 HMAC 域，并在 URL 加入受签名保护的版本参数。
+- [x] v2 直放票据正常读取；删除/修改版本参数、修改会话或媒体源均拒绝，不能降级按旧 HMAC 验证。
+- [x] 无版本的旧 HMAC 链接仍按原签名域验证至过期；签名 URL 不增加原始认证 token、设备标识或客户端名称。
+- [x] `playback` 定向集成目标、Rust build、fmt 与 diff check 通过。
+
+短计划：先增加新链接版本标记与去标记降级失败回归并确认当前链接仍被当作旧票据接受；再新增独立 v2 资源编码、URL 参数解析与双版本验证；最后运行 `playback` 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 时新直放 URL 缺少版本标记，新增断言失败；实现后 `cargo test --locked --test playback -- --test-threads=1` 4/4 通过，覆盖 v2 读取、删改版本及篡改播放会话/媒体源拒绝；`cargo test --locked --lib application::playback::session::tests::emby_direct_stream_v2_signature_is_separate_from_legacy_domain -- --exact` 1/1 通过，确认旧签名与 v2 域不能互验，旧无版本请求保留原验证路径。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

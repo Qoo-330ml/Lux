@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 
 const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
 const MAX_HOME_LATEST_LIBRARY_IDS: usize = 100;
@@ -2417,6 +2418,7 @@ pub(super) struct EmbyStreamQuery {
     pub(super) play_session_id: Option<String>,
     pub(super) playback_user_id: Option<String>,
     pub(super) playback_is_admin: Option<bool>,
+    pub(super) playback_ticket_version: Option<String>,
     pub(super) playback_expires: Option<i64>,
     pub(super) playback_signature: Option<String>,
 }
@@ -2462,6 +2464,10 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
                 "0" => Some(false),
                 _ => None,
             };
+        } else if query.playback_ticket_version.is_none()
+            && name.eq_ignore_ascii_case("luxPlaybackTicketVersion")
+        {
+            query.playback_ticket_version = Some(value.into_owned());
         } else if query.playback_expires.is_none()
             && name.eq_ignore_ascii_case("luxPlaybackExpires")
         {
@@ -2479,6 +2485,7 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
 pub(super) fn emby_stream_query_has_playback_ticket(query: &EmbyStreamQuery) -> bool {
     query.playback_user_id.is_some()
         || query.playback_is_admin.is_some()
+        || query.playback_ticket_version.is_some()
         || query.playback_expires.is_some()
         || query.playback_signature.is_some()
 }
@@ -2528,6 +2535,9 @@ pub(super) fn emby_stream_query_from_path(
     if query.playback_is_admin.is_none() {
         query.playback_is_admin = embedded.playback_is_admin;
     }
+    if query.playback_ticket_version.is_none() {
+        query.playback_ticket_version = embedded.playback_ticket_version;
+    }
     if query.playback_expires.is_none() {
         query.playback_expires = embedded.playback_expires;
     }
@@ -2569,15 +2579,28 @@ pub(super) async fn emby_stream_principal(
         let Some(service) = state.web_playback.as_ref() else {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         };
-        if !service.verify_emby_direct_stream(
-            &user_id.to_string(),
-            is_admin,
-            item_id,
-            source_id,
-            play_session_id,
-            expires_at,
-            signature,
-        ) {
+        let is_valid = match query.playback_ticket_version.as_deref() {
+            None => service.verify_emby_direct_stream(
+                &user_id.to_string(),
+                is_admin,
+                item_id,
+                source_id,
+                play_session_id,
+                expires_at,
+                signature,
+            ),
+            Some(EMBY_DIRECT_STREAM_TICKET_VERSION) => service.verify_emby_direct_stream_v2(
+                &user_id.to_string(),
+                is_admin,
+                item_id,
+                source_id,
+                play_session_id,
+                expires_at,
+                signature,
+            ),
+            Some(_) => false,
+        };
+        if !is_valid {
             return Err(StatusCode::UNAUTHORIZED);
         }
         return Ok(AccessPrincipal::new(user_id, is_admin));

@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
@@ -4661,7 +4662,7 @@ pub(super) fn emby_signed_direct_stream_url(
 ) -> Option<String> {
     let expires_at = current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
     let user_id = user.id.to_string();
-    let signature = service.sign_emby_direct_stream(
+    let signature = service.sign_emby_direct_stream_v2(
         &user_id,
         user.is_admin,
         item_id,
@@ -4698,6 +4699,8 @@ pub(super) fn emby_signed_direct_stream_url(
     url.push_str(&percent_encode_filename(&user_id));
     url.push_str("&luxPlaybackAdmin=");
     url.push_str(if user.is_admin { "1" } else { "0" });
+    url.push_str("&luxPlaybackTicketVersion=");
+    url.push_str(EMBY_DIRECT_STREAM_TICKET_VERSION);
     url.push_str("&luxPlaybackExpires=");
     url.push_str(&expires_at.to_string());
     url.push_str("&luxPlaybackSignature=");
