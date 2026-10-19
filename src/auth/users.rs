@@ -250,8 +250,6 @@ impl UserStore {
         })
     }
 
-    // LUX-637 wires administrator Emby user creation to this permission snapshot.
-    #[allow(dead_code)]
     pub(crate) async fn create_user_without_password_with_permission_snapshot(
         &self,
         username: &str,

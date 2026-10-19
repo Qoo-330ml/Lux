@@ -1261,11 +1261,17 @@ pub(super) async fn emby_create_user(
             .user_copy_options
             .as_deref()
             .is_some_and(|options| has_emby_copy_option(options, "UserConfiguration"));
+    let default_permissions =
+        match crate::application::settings::read_new_user_permissions(database).await {
+            Ok(permissions) => permissions,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     let mut created = match users
-        .create_user_without_password(
+        .create_user_without_password_with_permission_snapshot(
             name,
             name,
             copy_policy && source.as_ref().is_some_and(|user| user.is_admin),
+            default_permissions.stored_snapshot(),
         )
         .await
     {

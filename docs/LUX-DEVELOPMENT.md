@@ -13376,7 +13376,28 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 依赖：LUX-633、LUX-636。
 
-结果（2026-10-19）：管理员直建读取服务端默认快照并使用原子创建；返回的 `canDownload`、播放策略及媒体库模式均与设置一致。定向 `users` 集成测试 2/2、Rust build、fmt check 与 diff check 通过。删除设置表模拟读取故障时 API 返回 503，账号未写入。Emby 创建入口仍由 LUX-638 实施。
+结果（2026-10-19）：管理员直建读取服务端默认快照并使用原子创建；返回的 `canDownload`、播放策略及媒体库模式均与设置一致。定向 `users` 集成测试 2/2、Rust build、fmt check 与 diff check 通过。删除设置表模拟读取故障时 API 返回 503，账号未写入；Emby 创建和公开 API 文档同步由 LUX-638 完成。
+
+#### LUX-638：Emby 管理员建号应用默认权限并同步 API 文档
+
+范围：Emby `/Users/New` 管理员创建账号时应用同一份新用户默认权限快照，并继续执行现有用户策略/配置复制选项；默认设置读取失败时不创建账号。同步公开 API 文档中的快照应用范围和管理员建号行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/emby_handlers.rs`、`src/auth/users.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] Emby 管理员创建账号取得默认的媒体库、下载和播放/转码策略。
+- [x] 显式 `UserPolicy` / `UserConfiguration` 复制仍按现有顺序执行。
+- [x] 默认设置读取失败时返回服务不可用，不留下账号。
+- [x] Emby 创建回归、Rust build、fmt、diff check 通过；API 文档不再称默认值只保存未应用。
+
+短计划：先修改 Emby 建号集成测试并确认默认策略断言失败；再接入 passwordless 权限快照创建，最后同步管理员设置与用户创建 API 文档。
+
+验证：`cargo test --locked --test emby_auth`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-633、LUX-636、LUX-637。
+
+结果（2026-10-19）：Emby `/Users/New` 管理员创建账号时读取同一份默认权限快照并原子保存，设置读取失败返回 503 且无账号残留；既有 `UserPolicy` / `UserConfiguration` 集成回归保持通过。Emby 定向测试 9/9、Rust build、fmt check、diff check 通过。同步 `docs/API.md`，说明默认快照在 Lux/Emby 管理员建号中的应用及复制选项的覆盖顺序。全量 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
 
 ## 29. 参考资料
 

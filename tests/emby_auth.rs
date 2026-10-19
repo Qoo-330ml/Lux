@@ -819,6 +819,20 @@ async fn emby_create_user_accepts_query_name_without_a_request_body()
     let viewer = UserStore::new(database.clone())?
         .create_user("Viewer", "Viewer", "viewer password", false)
         .await?;
+    let defaults = json!({
+        "libraryAccessMode": "NONE",
+        "libraryIds": [],
+        "canDownload": true,
+        "canPlay": false,
+        "maxSimultaneousPlaybacks": 3,
+        "allowRemux": false,
+        "allowAudioTranscode": true,
+        "allowVideoTranscode": false,
+    });
+    sqlx::query("INSERT INTO server_settings (key, value) VALUES ('new_user_permissions', ?)")
+        .bind(defaults.to_string())
+        .execute(database.pool())
+        .await?;
     let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
         .rotate()
         .await?;
@@ -827,7 +841,7 @@ async fn emby_create_user_accepts_query_name_without_a_request_body()
         database.clone(),
         setup,
         WebAuthService::new(database.clone())?,
-        EmbyAuthService::new(database)?,
+        EmbyAuthService::new(database.clone())?,
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -849,7 +863,18 @@ async fn emby_create_user_accepts_query_name_without_a_request_body()
         .as_str()
         .ok_or("missing created user id")?;
     assert_eq!(created_body["HasPassword"], false);
+    assert_eq!(created_body["Policy"]["EnableContentDownloading"], true);
     assert!(uuid::Uuid::parse_str(created_id).is_ok());
+    let stored_policy: (i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT can_download, can_play, max_simultaneous_playbacks,
+                allow_remux, allow_audio_transcode, allow_video_transcode,
+                library_access_mode
+         FROM users WHERE id = ?",
+    )
+    .bind(created_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_policy, (1, 0, 3, 0, 1, 0, "NONE".to_owned()));
 
     let duplicate = client
         .post(format!("http://{address}/Users/New"))
@@ -886,6 +911,26 @@ async fn emby_create_user_accepts_query_name_without_a_request_body()
         .send()
         .await?;
     assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    sqlx::query("DROP TABLE server_settings")
+        .execute(database.pool())
+        .await?;
+    let settings_unavailable = client
+        .post(format!("http://{address}/Users/New"))
+        .query(&[("Name", "SettingsUnavailable")])
+        .header("X-Emby-Token", &admin_key)
+        .send()
+        .await?;
+    assert_eq!(
+        settings_unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let missing_user_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE username_normalized = 'settingsunavailable'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(missing_user_count, 0);
     assert_eq!(viewer.id.to_string().len(), 36);
     Ok(())
 }
