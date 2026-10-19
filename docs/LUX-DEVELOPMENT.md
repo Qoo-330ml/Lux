@@ -14956,6 +14956,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD 初始回归在入口缺失时失败；`tests/admin-user-batch-actions.test.tsx` 8/8、冻结依赖安装、Web build 和 `git diff --check` 通过。完整 `pnpm --dir web test` 为 723 passed、4 failed；失败是 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项、`media-query-polling.test.tsx` 1 项，与此前记录的失败集合相同，本任务没有改动相关代码。Playwright 使用模拟 API 在桌面 1280×900 和窄屏 390×844 检查预览/应用、逐项结果、权限组选项作废预览、Escape 关闭及焦点返回；窄屏文档宽 375px、滚动宽 375px，弹窗宽 359px、内容滚动宽 342px，无横向溢出，控制台错误 0。截图：`output/playwright/user-permission-copy-preview-desktop.png`、`output/playwright/user-permission-copy-preview-390.png`。首轮窄屏检查发现弹窗内溢出，经修复后复验通过。完整 Rust 门禁不属于本任务。
 
+#### LUX-714：为管理员 Emby 登录凭证摘要提供分页存储查询
+
+范围：基于现有 `access_tokens` 表，为指定用户分页读取未撤销的 Emby 登录凭证摘要，供模块七统一展示登录状态和设备信息。摘要包含凭证记录 ID、设备 ID/名称/类型、客户端名称/版本、创建/更新时间和最近访问时间；绝不返回 token、token hash 或其他凭证材料。本任务只增加有界只读存储合同，不修改登录验证、撤销行为、公开 API 或管理页面；无需新增 migration。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 只返回指定用户仍有效的 Emby 凭证摘要；已撤销凭证和其他用户记录不进入结果，也不读取/序列化 token hash。
+- [x] 结果提供稳定的最近访问（缺失时回退更新时间）/记录 ID 顺序、匹配总数和分页；页大小在存储层限制为 1–100，负偏移归零。
+- [x] SQLite 回归覆盖多设备/多 token、撤销过滤、用户隔离、稳定排序、分页上限和空结果；Rust 定向库测试、build、fmt 与 diff check 通过。
+
+短计划：先在存储回归中增加有界 Emby 凭证摘要读取合同并确认新方法缺失而失败；再扩展存储摘要类型及查询；最后运行定向库测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增 `StoredEmbyLoginSessionSummary` 只含设备、客户端和时间字段；`list_user_emby_login_sessions_for_admin` 过滤已撤销/其他用户凭证，按 `COALESCE(last_seen_at, updated_at) DESC, id DESC` 排序，存储层限制页大小 1–100、负偏移归零，并返回总数。无 migration，也没有将 token hash 投影进查询或摘要结构。
+
+验证：TDD RED 确认方法缺失时编译失败；最终 `admin_emby_login_session_page` 定向测试 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。完整 `cargo test --locked --all-targets` 使用 `NO_PROXY=127.0.0.1,localhost` 后为 1048 passed、4 failed、26 ignored；三项 fill-missing 失败与先前记录的基线相同，另有 `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 在全量并发下超时、单独复跑通过，因此全量门禁未通过。第一次未设置 `NO_PROXY` 的全量运行中 `remote_body` 本地 HTTP 测试超时，补齐环境变量后的运行通过该测试。`cargo clippy --locked --all-targets --all-features -- -D warnings` 未通过，报告 8 条非本查询实现范围的 lint（`admin_users.rs`、`media.rs`、`playback/session.rs`、`user_permission_copy.rs`、`users.rs` 既有逻辑和一条既有测试断言）；新摘要查询没有新增 Clippy 报错。all-targets 因库测试失败未进入后续集成 targets。
+
+依赖：LUX-593、LUX-660。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

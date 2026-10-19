@@ -2,8 +2,9 @@ use super::*;
 use crate::storage::repository::{stored_admin_user_list_item, stored_user};
 use crate::storage::{
     ApplyUserPermissionPreset, NewStoredUserPermissions, NewUserAccountPreferences,
-    UserAccountPreferences, UserAccountPreferencesCasResult, UserPermissionCopyGroups,
-    UserPermissionCopyResult, UserPermissionCopySnapshot, UserPlaybackPolicy,
+    StoredEmbyLoginSessionSummary, UserAccountPreferences, UserAccountPreferencesCasResult,
+    UserPermissionCopyGroups, UserPermissionCopyResult, UserPermissionCopySnapshot,
+    UserPlaybackPolicy,
 };
 
 use std::time::{Duration, Instant};
@@ -1775,6 +1776,63 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn list_user_emby_login_sessions_for_admin(
+        &self,
+        user_id: &str,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredEmbyLoginSessionSummary>, i64), StorageError> {
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let total_count = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM access_tokens
+                 WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let sessions = self
+            .query(
+                "SELECT id, device_id, device_name, device_type, client_name, client_version,
+                        created_at, updated_at, last_seen_at
+                 FROM access_tokens
+                 WHERE user_id = ? AND revoked_at IS NULL
+                 ORDER BY COALESCE(last_seen_at, updated_at) DESC, id DESC
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(user_id)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredEmbyLoginSessionSummary {
+                        id: row.get("id"),
+                        device_id: row.get("device_id"),
+                        device_name: row.get("device_name"),
+                        device_type: row.get("device_type"),
+                        client_name: row.get("client_name"),
+                        client_version: row.get("client_version"),
+                        created_at: row.get("created_at"),
+                        updated_at: row.get("updated_at"),
+                        last_seen_at: row.get("last_seen_at"),
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((sessions, total_count))
     }
 
     pub(crate) async fn set_user_library_access(

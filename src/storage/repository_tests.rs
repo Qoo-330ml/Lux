@@ -23239,6 +23239,120 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
 }
 
 #[tokio::test]
+async fn admin_emby_login_session_page_is_bounded_and_excludes_revoked_tokens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in ["emby-page-user", "emby-page-other"] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test')",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, user_id, updated_at, last_seen_at, revoked_at) in [
+        ("older", "emby-page-user", 120_i64, Some(130_i64), None),
+        ("newer", "emby-page-user", 140, Some(150), None),
+        ("revoked", "emby-page-user", 1_000, Some(1_000), Some(1_100)),
+        ("other-user", "emby-page-other", 2_000, Some(2_000), None),
+    ] {
+        let mut token_hash = id.as_bytes().to_vec();
+        token_hash.resize(32, 0);
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, device_type, created_at, updated_at, last_seen_at, revoked_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(format!("device-{id}"))
+        .bind("Emby")
+        .bind(format!("Device {id}"))
+        .bind("1.2.3")
+        .bind("TV")
+        .bind(updated_at)
+        .bind(last_seen_at)
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for index in 0..101_i64 {
+        let id = format!("filler-{index:03}");
+        let last_seen_at = (index != 100).then_some(110_i64);
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, device_type, created_at, updated_at, last_seen_at
+             ) VALUES (?, ?, 'emby-page-user', ?, 'Emby', ?, '1.2.3', 'TV', 100, 110, ?)",
+        )
+        .bind(&id)
+        .bind(vec![index as u8; 32])
+        .bind(format!("device-{id}"))
+        .bind(format!("Device {id}"))
+        .bind(last_seen_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first_page, total_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 1, 0)
+        .await?;
+    assert_eq!(total_count, 103);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, "newer");
+    assert_eq!(first_page[0].device_id, "device-newer");
+    assert_eq!(first_page[0].device_name, "Device newer");
+    assert_eq!(first_page[0].device_type.as_deref(), Some("TV"));
+    assert_eq!(first_page[0].client_name, "Emby");
+    assert_eq!(first_page[0].client_version, "1.2.3");
+    assert_eq!(first_page[0].created_at, 100);
+    assert_eq!(first_page[0].updated_at, 140);
+    assert_eq!(first_page[0].last_seen_at, Some(150));
+    assert!(!format!("{:?}", first_page[0]).contains("token_hash"));
+
+    let (second_page, second_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 1, 1)
+        .await?;
+    assert_eq!(second_count, 103);
+    assert_eq!(second_page[0].id, "older");
+    let (tie_page, tie_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 2, 2)
+        .await?;
+    assert_eq!(tie_count, 103);
+    assert_eq!(tie_page[0].id, "filler-100");
+    assert_eq!(tie_page[0].last_seen_at, None);
+    assert_eq!(tie_page[1].id, "filler-099");
+    let (bounded_page, bounded_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 1_000, -4)
+        .await?;
+    assert_eq!(bounded_count, 103);
+    assert_eq!(bounded_page.len(), 100);
+    assert_eq!(bounded_page[0].id, "newer");
+    assert!(bounded_page.iter().all(|session| session.id != "revoked"));
+    assert!(
+        bounded_page
+            .iter()
+            .all(|session| session.id != "other-user")
+    );
+    let (empty_page, empty_count) = database
+        .list_user_emby_login_sessions_for_admin("missing-user", 50, 0)
+        .await?;
+    assert!(empty_page.is_empty());
+    assert_eq!(empty_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_pipeline_activity_page_is_bounded_and_aggregates_scan_status()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::StoredPipelineStageKind;

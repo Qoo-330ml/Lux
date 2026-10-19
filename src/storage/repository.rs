@@ -1209,6 +1209,19 @@ pub(crate) struct StoredAccessTokenDevice {
     pub(crate) client_version: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyLoginSessionSummary {
+    pub(crate) id: String,
+    pub(crate) device_id: String,
+    pub(crate) device_name: String,
+    pub(crate) device_type: Option<String>,
+    pub(crate) client_name: String,
+    pub(crate) client_version: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) last_seen_at: Option<i64>,
+}
+
 pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
     StoredUser {
         id: row.get("id"),
