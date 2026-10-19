@@ -15215,6 +15215,44 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 的组件回归确认该页仍是占位；实现后 `pnpm --dir web exec vitest run tests/admin-user-activity.test.tsx tests/admin-user-sessions.test.tsx` 11/11、`pnpm --dir web build` 和 `git diff --check` 通过。Playwright 使用合成 API 数据验证活动读取、筛选查询、翻页、敏感字段不显示；390px 视口的活动面板/筛选区无水平溢出，浏览器控制台无错误。截图保存于 `output/playwright/admin-user-activity-20261020-mobile.png`。
 
+#### LUX-726：增加失败认证活动安全记录器
+
+范围：为已知用户提供失败认证活动写入入口，记录 `AUTH_LOGIN_FAILED` 用户活动并沿用既有审计日志和 Dashboard 失效通知。事件使用目标用户 ID，`actorUserId` 为空；调用者只传入固定协议标签和可选展示 IP，不传用户名、密码、token 或请求 URL。本任务只实现可安全调用的记录器，不接入 Web 或 Emby 认证分支。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_logs_events.rs`。
+
+验收标准：
+
+- [x] 记录器写入 `AUTH_LOGIN_FAILED` 用户活动和既有审计事件，活动用户/目标为指定用户且 actor 为空。
+- [x] 元数据只含调用者提供的安全协议标签与可选 IP；没有用户名、密码、凭证或 URL。
+- [x] 审计写入成功时发布 Dashboard 失效通知；索引失败不阻断既有审计流程。
+- [x] 记录器定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加失败事件记录器的 SQLite 与审计/通知回归并确认记录器缺失；再实现 actor 为空的安全写入；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-720。
+
+结果（2026-10-20）：新增 `record_failed_authentication_event`，用户活动事件和既有审计事件都以 `AUTH_LOGIN_FAILED` 记录，actor 为空、目标指向被尝试账号；元数据只含固定协议标签和可选展示 IP。索引写入失败仅发出事件类型告警，不阻断审计写入；审计成功后发布 Dashboard 失效通知。
+
+验证：TDD RED 确认记录器缺失时库测试编译失败；最终 `failed_authentication_activity_keeps_actor_empty_and_metadata_safe` 1/1，验证活动字段、actor、白名单元数据与 Dashboard 通知；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Web 登录路由接线留待 LUX-727。
+
+#### LUX-727：索引已知账号的 Web 登录失败
+
+范围：在未被限流的 Web 登录尝试认证失败后，使用与登录一致的用户名规范化规则查找已有账号；只对解析到的用户调用 LUX-726 记录器。事件不改变认证响应和频率限制行为；未知/非法用户名、数据库错误及被限流直接拒绝的请求不进入个人活动索引。本任务不记录 Emby 失败登录。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/sessions.rs`、`src/api/admin.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] 已知账号密码错误或账号被禁用时记录一条 `AUTH_LOGIN_FAILED`，活动用户为目标账号且 actor 为空。
+- [ ] 未知/非法用户名、数据库错误和限流直接拒绝不写入用户活动索引；失败元数据不含用户名、密码、凭证或完整 URL。
+- [ ] 认证 HTTP 状态、频率限制与成功登录事件保持不变；审计记录仍产生。
+- [ ] `users` 定向集成回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加已知/未知账号失败尝试集成回归并确认个人活动缺失；再在 Web 认证服务提供安全用户名到用户 ID 查询，并仅在正确失败分支接入 LUX-726；最后运行定向 `users` 测试、build、fmt 和 diff check。
+
+依赖：LUX-726、LUX-720。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

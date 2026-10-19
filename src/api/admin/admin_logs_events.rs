@@ -157,6 +157,54 @@ pub(crate) async fn record_activity_event(
     }
 }
 
+#[allow(dead_code)] // LUX-727 connects this writer to Web authentication failures.
+pub(crate) async fn record_failed_authentication_event(
+    database: Option<&Database>,
+    admin_events: &AdminEventHub,
+    user_id: &str,
+    client: &str,
+    remote_ip: Option<String>,
+) {
+    let Some(database) = database else {
+        return;
+    };
+    let metadata_json = serde_json::to_string(&json!({
+        "client": client,
+        "remoteIp": remote_ip,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned());
+    if database
+        .insert_user_activity_event(crate::storage::NewUserActivityEvent {
+            user_id,
+            actor_user_id: None,
+            event_type: "AUTH_LOGIN_FAILED",
+            target_type: Some("user"),
+            target_id: Some(user_id),
+            metadata_json: &metadata_json,
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            event_type = "AUTH_LOGIN_FAILED",
+            "failed to write user activity index event"
+        );
+    }
+    if database
+        .insert_audit_event(crate::storage::NewAuditEvent {
+            actor_user_id: None,
+            event_type: "AUTH_LOGIN_FAILED",
+            target_type: Some("user"),
+            target_id: Some(user_id),
+            metadata_json: &metadata_json,
+        })
+        .await
+        .is_ok()
+    {
+        admin_events.publish(AdminEventScope::Dashboard);
+    }
+}
+
 pub(crate) fn playback_activity_event_type(
     previous: Option<&StoredPlaybackSession>,
     state_name: &str,
@@ -414,4 +462,69 @@ pub(crate) async fn user_events(headers: HeaderMap, State(state): State<AppState
     });
 
     event_stream_response(reader)
+}
+
+#[cfg(test)]
+mod failed_authentication_activity_tests {
+    use super::*;
+
+    use crate::{
+        application::{admin_events::AdminEventHub, setup::SetupService},
+        config::Config,
+        storage::Database,
+    };
+
+    #[tokio::test]
+    async fn failed_authentication_activity_keeps_actor_empty_and_metadata_safe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup
+            .complete("activity-failure", "Failure", "private password")
+            .await?;
+        let user_id = user.id.to_string();
+        let events = AdminEventHub::new();
+        let mut receiver = events.subscribe();
+
+        record_failed_authentication_event(
+            Some(&database),
+            &events,
+            &user_id,
+            "LUX_WEB",
+            Some("192.0.2.1".to_owned()),
+        )
+        .await;
+
+        let (event_type, actor_user_id, target_type, target_id, metadata_json): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT event_type, actor_user_id, target_type, target_id, metadata_json
+             FROM user_activity_events WHERE user_id = ?",
+        )
+        .bind(&user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(event_type, "AUTH_LOGIN_FAILED");
+        assert_eq!(actor_user_id, None);
+        assert_eq!(target_type.as_deref(), Some("user"));
+        assert_eq!(target_id.as_deref(), Some(user_id.as_str()));
+        let metadata: Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(metadata["client"], "LUX_WEB");
+        assert_eq!(metadata["remoteIp"], "192.0.2.1");
+        assert!(!metadata_json.contains("private password"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdminEventScope::Dashboard)
+        ));
+        Ok(())
+    }
 }
