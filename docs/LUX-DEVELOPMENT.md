@@ -13701,6 +13701,27 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：新增账户偏好读取和单语句 CAS 写入。版本 0 创建版本 1，匹配版本更新时递增，陈旧版本返回冲突且保留当前值；数据库约束拒绝无效主题，回收站和不存在账号不可写。`account_preferences_use_compare_and_swap_versions` 1/1、`cargo build --locked`、fmt check 与 diff check 通过。API 接线留给后续任务。
 
+#### LUX-654：实现账户偏好应用服务
+
+范围：为账户设置 API 提供服务端默认偏好读取、完整偏好校验和版本比较并交换写入。无存储记录时返回与当前账户页一致的默认值及版本 0；有效写入委托 LUX-653 CAS 存储合同，明确映射版本冲突和不可用账号。本任务不接 HTTP 或 Web 页面。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_account_preferences.rs`（包含服务层回归）。
+
+验收标准：
+
+- [x] 未创建偏好记录的账号读取到当前账户页默认值、版本 0 和空更新时间。
+- [x] 有效完整更新通过 CAS 返回递增版本与服务端更新时间；过期版本及不可用账号映射为明确错误。
+- [x] 拒绝不支持的主题/强调色、负版本、超长语言值和控制字符。
+- [x] 应用服务定向回归、Rust 格式检查与 diff check 通过。
+
+短计划：先添加默认值、有效写入、版本冲突与输入校验回归并确认服务缺失；再实现默认值投影、输入校验和 CAS 错误映射。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-653。
+
+结果（2026-10-19）：新增账户偏好 application 服务，缺少服务端记录时返回 dark/silver、首页区块开启、原始音轨/简体中文、自动连播、版本 0 和空更新时间；写入校验主题、强调色、非负版本和最长 64 字符且无控制字符的语言值，再调用版本 CAS。新增默认读取、成功写入、过期版本、无效字段及回收站用户回归，`user_account_preferences` 4/4 通过；`cargo build --locked`、fmt check 与 diff check 通过。全目标 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断；以 `-A clippy::too_many_arguments` 排除这两项后，lib/all-features Clippy 通过。全目标测试为 1004 passed、5 failed、25 ignored；失败项 `stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`local_metadata_worker_dispatches_fill_missing_without_blocking_scan`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost` 均在先前任务的全目标门禁中记录过，本次与账户偏好无关联。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
