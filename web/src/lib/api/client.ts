@@ -404,8 +404,12 @@ export class LuxApiClient {
     return this.request<LoginBackgroundResponse>("/api/v1/auth/login-background");
   }
 
-  acceptUserInvitation(input: UserInvitationAcceptanceInput) {
-    return this.request<UserInvitationAcceptanceResponse>("/api/v1/auth/invitations/accept", {
+  acceptUserInvitation(input: UserInvitationAcceptanceInput, sitePath = "") {
+    const prefix = sitePath.replace(/\/+$/, "");
+    if (!/^(?:\/[^/?#\\\s]+)*$/.test(prefix)) {
+      return Promise.reject(new ApiError("站点路径无效", { code: "INVALID_REQUEST", status: 400 }));
+    }
+    return this.request<UserInvitationAcceptanceResponse>(prefix + "/api/v1/auth/invitations/accept", {
       method: "POST",
       body: JSON.stringify(input),
     });

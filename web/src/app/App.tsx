@@ -8,6 +8,7 @@ import type { LuxUser } from "../lib/api/types";
 import { LuxShell } from "../components/layout/LuxShell";
 import { attachTouchCardHoverTracking } from "./touch-card-hover";
 import { LoginPage } from "../features/auth/LoginPage";
+import { AcceptInvitationPage } from "../features/auth/AcceptInvitationPage";
 import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
 import {
@@ -43,6 +44,14 @@ const AdminUserDetailPage = lazy(() => import("../features/admin/AdminUserManage
 const AdminUserSettingsPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserSettingsPage }) => ({ default: AdminUserSettingsPage })));
 
 export function App() {
+  const location = useLocation();
+  if (location.pathname.replace(/\/+$/, "").endsWith("/register/invitation")) {
+    return <AcceptInvitationPage />;
+  }
+  return <ServerApp />;
+}
+
+function ServerApp() {
   const setup = useQuery({
     queryKey: queryKeys.setup,
     queryFn: () => api.setupStatus(),

@@ -1973,6 +1973,21 @@ describe("LuxApiClient", () => {
     })).rejects.toMatchObject({ name: "ApiError", code, status, requestId: "invitation-request" });
   });
 
+  it("preserves the invitation deployment path in its API request", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ created: true }), { status: 201 }),
+    );
+    await new LuxApiClient().acceptUserInvitation({ token: "token", username: "user", password: "password" }, "/proxy/lux/");
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/proxy/lux/api/v1/auth/invitations/accept");
+  });
+
+  it.each(["//other.example.test", "https://other.example.test"])("rejects an external invitation deployment path %s", async (sitePath) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    await expect(new LuxApiClient().acceptUserInvitation({ token: "token", username: "user", password: "password" }, sitePath))
+      .rejects.toMatchObject({ code: "INVALID_REQUEST", status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("loads the anonymous login background contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       expect(String(input)).toBe("/api/v1/auth/login-background");

@@ -16627,15 +16627,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：实现 `/register/invitation` 页面，从 URL fragment 读取 token 后立即清理地址栏，仅保存在组件内存；用户设置用户名、显示名称和密码并调用 LUX-800。页面展示固定错误和成功状态，不暴露邀请是否存在于列表或有效期细节。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/App.tsx`、`web/src/features/auth/AcceptInvitationPage.tsx`、`web/tests/accept-invitation.test.tsx`。
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/auth/AcceptInvitationPage.tsx`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`、`web/tests/accept-invitation.test.tsx`。现有入口实际位于 `app/App.tsx`；公开页面需在 setup/session 查询前识别邀请路由，并向邀请客户端方法传递同源站点子路径。
 
 验收标准：
 
-- [ ] URL fragment token 不发送到服务器日志、不存入本地/会话存储，完成或失败后不留在地址栏。
-- [ ] 表单具备可访问标签、提交中状态、固定错误反馈和创建成功后的登录入口。
-- [ ] 组件回归、Web build 与 diff check 通过；真实浏览器验证 token 清理和子路径路由。
+- [x] URL fragment token 不发送到服务器日志、不存入本地/会话存储，完成或失败后不留在地址栏。
+- [x] 表单具备可访问标签、提交中状态、固定错误反馈和创建成功后的登录入口。
+- [x] 组件回归、Web build 与 diff check 通过；真实浏览器验证 token 清理和子路径路由。
 
 短计划：先写页面加载、fragment 清理和提交回归；再注册路由与实现表单；最后运行 Vitest、Web build 和本地浏览器检查。
+
+结果（2026-10-20）：公开邀请页在 setup/session 查询前接管根路径和反向代理子路径，StrictMode 下读取 fragment 后立即替换清理地址栏。Token 仅保存在页面内存，密码在成功/失败后清空；直接 API 请求避免 query/mutation cache 与持久化。页面有可访问标签、重复提交保护、固定错误、成功登录入口；子路径及任意尾斜杠均保留正确的 API 前缀。
+
+验证：定向 Vitest（邀请页面、API client、登录页）110/110，Web build 与 diff check 通过。边界 RED 回归证明多个尾斜杠曾使 API 前缀包含注册路径，修正后通过。隔离浏览器验证 fragment 清理、子路径 POST 201、点击与键盘 Enter 提交成功；320/768/1024/1440 视口无横向溢出，成功状态截图位于 `output/playwright/user-invitation/.playwright-cli/`。此前有头浏览器曾一次进入登录页，隔离会话的两种提交方式均未复现，原因未确定；隔离邀请页控制台 0 error/0 warning。浏览器仅用本地生产预览和 mock 响应，服务端创建与登录由 LUX-799 集成回归覆盖；未部署。
 
 #### LUX-802：持久化公开注册模式
 
