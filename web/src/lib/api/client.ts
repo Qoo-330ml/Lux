@@ -2,6 +2,8 @@ import type {
   AccountPreferences,
   AccountPreferencesUpdate,
   AccountProfile,
+  AccountEmailVerificationResponse,
+  AccountEmailVerificationResendResponse,
   AuthSession,
   UserInvitationAcceptanceInput,
   UserInvitationAcceptanceResponse,
@@ -528,6 +530,20 @@ export class LuxApiClient {
       method: "PATCH",
       body: JSON.stringify(input),
     });
+  }
+
+  resendAccountEmailVerification() {
+    return this.request<AccountEmailVerificationResendResponse>(
+      "/api/v1/auth/profile/email-verification/resend",
+      { method: "POST" },
+    );
+  }
+
+  verifyAccountEmail(input: { token: string }) {
+    return this.request<AccountEmailVerificationResponse>(
+      "/api/v1/auth/profile/email-verification/verify",
+      { method: "POST", body: JSON.stringify(input) },
+    );
   }
 
   userSettings() {

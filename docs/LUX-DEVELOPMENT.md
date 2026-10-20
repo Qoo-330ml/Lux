@@ -16979,15 +16979,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：账户资料页显示邮箱未验证状态，提供发送/重发验证邮件并处理完成链接；保持原邮箱直到验证成功。Token 仅从 fragment 读取并在地址栏立即清理。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`/`types.ts`、`web/src/features/account/AccountPage.tsx`、`web/tests/account-email-verification.test.tsx`。
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/account/AccountPage.tsx`、`web/tests/account-email-verification.test.tsx`。
 
 验收标准：
 
-- [ ] 邮箱变更显示待验证目标和发送结果；重载后由服务端状态恢复，页面不误报已验证。
-- [ ] Token 不留在地址栏、cache 或持久化；加载、重发、成功及失败有组件回归。
-- [ ] 定向 Vitest、Web build 和真实浏览器验证通过。
+- [x] 邮箱变更显示待验证目标和发送结果；重载后由服务端状态恢复，页面不误报已验证。
+- [x] Token 不留在地址栏、cache 或持久化；加载、重发、成功及失败有组件回归。
+- [x] 定向 Vitest、Web build 和真实浏览器验证通过。
 
 短计划：先添加账户邮箱流程回归；再连接 LUX-815 client/service；最后运行组件测试、Web build 和浏览器检查。
+
+实施结果（2026-10-20）：账户资料类型和 client 已接入待验证邮箱、验证及重发 API。账户页从服务端资料恢复 `pendingEmail`，并优先于当前邮箱的已验证时间展示待验证地址；保存邮箱后保留待验证目标并显示邮件发送结果。重发按钮只在存在待验证地址时出现，发送中禁用并呈现状态。页面用 layout effect 读取 fragment token，先以 `history.replaceState` 清除地址栏，再通过受登录 session/CSRF 保护的 JSON body 验证；token 只在请求闭包内存活，不进入 React Query cache 或持久化。验证加载、成功、失败均提供可访问反馈；成功后刷新账户资料。
+
+验证：`vitest run tests/account-email-verification.test.tsx` 8/8、`tsc --noEmit`、Vite production build 与 `git diff --check` 通过。隔离 in-app browser 使用临时本地 mock API 实际渲染账户页，验证 fragment 清理后显示邮箱验证成功及已验证状态；无真实账户、邮件或远程 API 参与。测试覆盖服务端待验证状态恢复、邮箱保存、重发/验证加载、成功和失败，以及 API 方法路径、POST body 和 token 不入 cache/localStorage。
 
 #### LUX-818：管理全站访问黑名单
 

@@ -13,7 +13,7 @@ import {
   Sun,
   UserRound,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -71,6 +71,11 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [profileName, setProfileName] = useState(user.displayName || user.usernameNormalized);
   const [profileEmail, setProfileEmail] = useState("");
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const [emailVerificationNotice, setEmailVerificationNotice] = useState<{
+    kind: "pending" | "success" | "error";
+    message: string;
+  } | null>(null);
+  const emailVerificationHandled = useRef(false);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -176,6 +181,16 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const libraryOrderForced = playbackSettings.data?.libraryOrderForced ?? false;
   const libraryOrderLocked = libraryOrderForced || (!user.canManageServer && useAdminLibraryOrder);
   const accountPreferencesDisabled = !accountPreferencesReady || accountPreferencesBlocked;
+  const pendingEmail = accountProfile.data?.user.pendingEmail ?? null;
+  const emailStatus = accountProfile.isPending
+    ? "正在读取资料…"
+    : pendingEmail
+      ? `待验证邮箱：${pendingEmail}`
+      : accountProfile.data?.user.emailVerifiedAt
+        ? "邮箱已验证"
+        : profileEmail
+          ? "保存后将发送邮箱验证邮件。"
+          : "尚未设置邮箱";
 
   useEffect(() => {
     if (!pendingLibraryOrder || !libraries.data?.libraries) return;
@@ -294,8 +309,8 @@ export function AccountPage({ user }: { user: LuxUser }) {
     mutationFn: () => api.updateAccountProfile({ displayName: profileName, email: profileEmail }),
     onSuccess: ({ user: updatedUser }) => {
       setProfileName(updatedUser.displayName || updatedUser.usernameNormalized);
-      setProfileEmail(updatedUser.email ?? "");
-      setProfileNotice("账户资料已保存");
+      setProfileEmail(updatedUser.pendingEmail ?? updatedUser.email ?? "");
+      setProfileNotice(updatedUser.pendingEmail ? "账户资料已保存，验证邮件已发送。" : "账户资料已保存");
       queryClient.setQueryData(queryKeys.accountProfile, { user: updatedUser });
       queryClient.setQueryData<AuthSession>(queryKeys.me, (current) => current
         ? { ...current, user: { ...current.user, ...updatedUser } }
@@ -305,11 +320,41 @@ export function AccountPage({ user }: { user: LuxUser }) {
     onError: (error) => setProfileNotice(error instanceof Error ? `资料保存失败：${error.message}` : "资料保存失败，请重试。"),
   });
 
+  const resendEmailVerification = useMutation({
+    mutationFn: () => api.resendAccountEmailVerification(),
+    onSuccess: () => setEmailVerificationNotice({ kind: "success", message: "验证邮件已重新发送，请检查邮箱。" }),
+    onError: (error) => setEmailVerificationNotice({
+      kind: "error",
+      message: error instanceof Error ? `验证邮件发送失败：${error.message}` : "验证邮件发送失败，请重试。",
+    }),
+  });
+
+  useLayoutEffect(() => {
+    if (emailVerificationHandled.current) return;
+    const token = new URLSearchParams(window.location.hash.slice(1)).get("token");
+    if (!token) return;
+
+    emailVerificationHandled.current = true;
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    setEmailVerificationNotice({ kind: "pending", message: "正在验证邮箱…" });
+    void api.verifyAccountEmail({ token })
+      .then(() => {
+        setEmailVerificationNotice({ kind: "success", message: "邮箱验证成功。" });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.accountProfile });
+      })
+      .catch((error: unknown) => {
+        setEmailVerificationNotice({
+          kind: "error",
+          message: error instanceof Error ? `邮箱验证失败：${error.message}` : "邮箱验证失败，请检查链接后重试。",
+        });
+      });
+  }, [queryClient]);
+
   useEffect(() => {
     const profileUser = accountProfile.data?.user;
     if (!profileUser) return;
     setProfileName(profileUser.displayName || profileUser.usernameNormalized);
-    setProfileEmail(profileUser.email ?? "");
+    setProfileEmail(profileUser.pendingEmail ?? profileUser.email ?? "");
   }, [accountProfile.data?.user]);
 
   const updateSettings = (patch: Partial<AccountSettings>) => {
@@ -724,12 +769,15 @@ export function AccountPage({ user }: { user: LuxUser }) {
               <label className="lux-setting-field"><span>邮箱</span><input type="email" value={profileEmail} onChange={(event) => setProfileEmail(event.target.value)} autoComplete="email" placeholder="可选" /></label>
               <div className="lux-setting-field lux-account-profile-save">
                 <span>邮箱状态</span>
-                <small>{accountProfile.isPending ? "正在读取资料…" : accountProfile.data?.user.emailVerifiedAt ? "邮箱已验证" : profileEmail ? "邮箱未验证；邮件验证功能接入后可发送验证邮件。" : "尚未设置邮箱"}</small>
+                <small>{emailStatus}</small>
+                {pendingEmail ? <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="重新发送邮箱验证邮件" onClick={() => { setEmailVerificationNotice(null); resendEmailVerification.mutate(); }} disabled={resendEmailVerification.isPending}>{resendEmailVerification.isPending ? "正在发送…" : "重新发送验证邮件"}</button> : null}
                 <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={saveProfile.isPending || accountProfile.isPending}>{saveProfile.isPending ? "保存中…" : "保存资料"}</button>
               </div>
             </form>
             {accountProfile.error ? <p className="lux-error-copy" role="alert">账户资料读取失败：{accountProfile.error.message}</p> : null}
             {profileNotice ? <p className={saveProfile.error ? "lux-error-copy" : "lux-account-notice"} role={saveProfile.error ? "alert" : "status"}>{profileNotice}</p> : null}
+            {emailVerificationNotice ? <p className={emailVerificationNotice.kind === "error" ? "lux-error-copy" : "lux-account-notice"} role={emailVerificationNotice.kind === "error" ? "alert" : "status"}>{emailVerificationNotice.message}</p> : null}
+            {resendEmailVerification.isPending ? <p className="lux-account-notice" role="status">正在发送验证邮件…</p> : null}
             <form className="lux-password-panel" onSubmit={submitPasswordChange}>
               <input className="lux-visually-hidden" type="text" value={user.usernameNormalized} readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" />
               <div className="lux-setting-block-heading"><div><strong>修改密码</strong><p>使用一个没有在其他服务重复使用的新密码。</p></div><ShieldCheck size={18} aria-hidden="true" /></div>

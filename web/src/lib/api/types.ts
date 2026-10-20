@@ -123,6 +123,15 @@ export type PublicUserRegistrationResendInput = {
 export type AccountProfile = LuxUser & {
   email?: string | null;
   emailVerifiedAt?: number | null;
+  pendingEmail?: string | null;
+};
+
+export type AccountEmailVerificationResponse = {
+  verified: true;
+};
+
+export type AccountEmailVerificationResendResponse = {
+  accepted: true;
 };
 
 export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED" | `PLUGIN:${string}`;
