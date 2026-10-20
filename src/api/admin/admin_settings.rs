@@ -3,6 +3,12 @@ use super::*;
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
         .route(
+            "/api/v1/admin/settings/registration",
+            get(admin_get_registration_settings)
+                .patch(admin_update_registration_settings)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
         )
@@ -27,6 +33,108 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/settings/network-proxy/test",
             post(admin_test_network_proxy),
         )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RegistrationSettingsPatch {
+    registration_mode: Option<String>,
+    version: Option<i64>,
+}
+
+fn registration_settings_response(settings: crate::storage::StoredRegistrationMode) -> Response {
+    Json(json!({ "registrationMode": settings.mode, "version": settings.version })).into_response()
+}
+
+async fn admin_get_registration_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::settings::read_registration_mode(database).await {
+        Ok(settings) => registration_settings_response(settings),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_update_registration_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let invalid = || {
+        api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册设置无效",
+        )
+        .into_response()
+    };
+    let value = match payload {
+        Ok(Json(value)) => value,
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        Err(_) => return invalid(),
+    };
+    if value
+        .as_object()
+        .is_some_and(|fields| fields.values().any(Value::is_null))
+    {
+        return invalid();
+    }
+    let Ok(request) = serde_json::from_value::<RegistrationSettingsPatch>(value) else {
+        return invalid();
+    };
+    if request.version.is_some_and(|version| version < 0) {
+        return invalid();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(mode) = request.registration_mode else {
+        return match crate::application::settings::read_registration_mode(database).await {
+            Ok(settings) => registration_settings_response(settings),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    };
+    let Some(version) = request.version else {
+        return invalid();
+    };
+    use crate::application::settings::RegistrationModeError;
+    match crate::application::settings::update_registration_mode(database, &mode, version).await {
+        Ok(settings) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "SETTINGS_UPDATED",
+                Some("registration_settings"),
+                None,
+                &json!({"registrationMode": settings.mode, "version": settings.version})
+                    .to_string(),
+            )
+            .await;
+            registration_settings_response(settings)
+        }
+        Err(RegistrationModeError::InvalidMode) => invalid(),
+        Err(RegistrationModeError::Conflict) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "注册设置已更新，请刷新后重试",
+        )
+        .into_response(),
+        Err(RegistrationModeError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 pub(crate) async fn admin_get_mail_settings(

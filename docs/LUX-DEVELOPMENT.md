@@ -16661,17 +16661,21 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 #### LUX-803：开放公开注册模式管理员 API
 
-范围：通过受管理员认证与 CSRF 保护的设置 API 读取和修改 LUX-802 注册模式；响应仅返回模式枚举，不混入 SMTP 凭据。
+范围：通过受管理员认证与 CSRF 保护的设置 API 读取和修改 LUX-802 注册模式；响应仅返回模式枚举，不混入 SMTP 凭据。使用独立 `GET/PATCH /api/v1/admin/settings/registration`，响应为 `{ registrationMode, version }`；PATCH 带当前版本，省略模式为无修改，显式 null/未知字段/非法值返回 400，陈旧版本返回 409，请求体上限 4 KiB。
 
 预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_settings.rs`、`tests/admin_settings.rs`。
 
 验收标准：
 
-- [ ] 默认与已保存模式可读取；无效枚举拒绝，省略字段不改变当前值。
-- [ ] 未认证、非管理员及缺失 CSRF 的写请求拒绝；测试确认模式切换不触及 SMTP 凭据。
-- [ ] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
+- [x] 默认与已保存模式可读取；无效枚举拒绝，省略字段不改变当前值。
+- [x] 未认证、非管理员及缺失 CSRF 的写请求拒绝；测试确认模式切换不触及 SMTP 凭据。
+- [x] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
 
 短计划：先增加管理员设置 HTTP 回归并确认字段缺失；再连接 LUX-802 storage/application 合同；最后运行定向目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：独立注册设置端点只返回 `registrationMode` 和版本；PATCH 调用 LUX-802 的版本化服务，空对象不修改配置，未知字段、null、非法模式/版本和缺少写入版本均固定返回 400，陈旧版本为 409 `VERSION_CONFLICT`。写请求复用管理员及 CSRF 校验，沿用共享管理员 API Key 的既有规则；请求体限制 4 KiB。成功修改写入只含模式/版本的审计事件，不读取或改写 SMTP 凭据。
+
+验证：TDD RED 确认缺失端点返回 404；`cargo test --locked --test admin_settings --test admin_mail_settings` 2/2 通过，覆盖未认证、非管理员、缺失 CSRF、读取/开关/省略、非法输入、版本冲突、大小上限、审计脱敏及邮件凭据不变。`cargo build --locked`、fmt 与 diff check 通过；Cargo 使用 Toshiba target，本机 arm64。库 Clippy 仍被 LUX-802 已记录的 11 条既有告警阻断，本任务路由无新增诊断。未开放公开注册提交/验证接口，未部署。
 
 #### LUX-804：在用户管理中配置公开注册模式
 
