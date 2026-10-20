@@ -161,6 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker();
+    let mail_worker = luxd::application::mail_worker::MailDeliveryWorker::start(
+        database.clone(),
+        config.config_dir.clone(),
+    );
     // A large existing library can contain hundreds of thousands of episodes.
     // Repairing their legacy identities is a one-time background operation and
     // must not block the HTTP listener from becoming available.
@@ -205,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
+    mail_worker.shutdown().await;
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {

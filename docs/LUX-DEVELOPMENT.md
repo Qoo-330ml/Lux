@@ -16349,6 +16349,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：定向存储测试 `cargo test --locked --lib storage::repository::mail_outbox_tests` 8/8、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。非法 ID 测试同时断言没有执行 SQL，重复 ID 由主键唯一约束拒绝。全目标全 feature Clippy 仍失败于 15 项既有诊断，均位于未修改的管理员 API、Emby 播放、权限复制或用户存储文件；本任务文件没有新增诊断。
 
+#### LUX-786：投递持久化注册邮件队列
+
+范围：启动有界邮件 worker，领取持久化 outbox 项，按挑战 ID 重建并验证一次性凭证，生成纯文本邀请/邮箱验证邮件并通过已保存的 TLS SMTP 配置发送。成功、可重试失败和不可重试记录分别更新队列状态；不在数据库、文件或日志中保存原始凭证。本任务不创建邀请或公开注册业务记录，也不开放管理队列 API。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mail_worker.rs`、`src/application/mod.rs`、`src/main.rs`（worker 测试内置于 mail_worker 模块）。
+
+验收标准：
+
+- [x] worker 每次只领取一封邮件，使用租约恢复崩溃项；成功置为 SENT，临时错误按最多 5 次退避重试，过期/撤销/不匹配挑战立即置为 FAILED。
+- [x] 仅当 outbox 模板、收件地址、挑战类型、状态和 SHA-256 摘要均匹配时才发送；邀请与验证链接使用 URL fragment 携带短期 token。
+- [x] worker 使用已保存 SMTPS/STARTTLS 配置；SMTP 错误、收件地址、邮件正文、token、用户名和密码不进入日志；测试使用假的发送器，不连接外部邮件服务。
+- [x] 自动化测试覆盖邮件正文/链接、成功状态、不可重试挑战、SMTP 失败重试、最多尝试次数及正常关闭。
+- [x] 运行 mail worker 定向测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先写邮件链接与状态转移失败测试；再实现消息验证、纯文本渲染、重试和生命周期受控的后台 worker；最后运行 mail worker 定向测试、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib application::mail_worker::tests` 5/5、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。邮件正文仅包含纯文本链接；链接 token 位于 fragment。过期挑战不会交给发送器，SMTP 错误在 5 次尝试后转为 FAILED；worker 在关闭信号下及时退出。SMTP 凭据、收件地址、正文和错误详情均不写入日志。此前全目标全 feature Clippy 检查仍有 15 项既有诊断，涉及未修改的管理员 API、Emby 播放、权限复制及用户存储文件；本任务文件没有新增诊断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
