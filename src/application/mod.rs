@@ -84,6 +84,9 @@ pub(crate) mod user_content_restrictions;
 // LUX-790 consumes these invitation operations in the admin API.
 #[allow(dead_code)]
 pub(crate) mod user_invitations;
+// LUX-809 connects public registration endpoints to this service.
+#[allow(dead_code)]
+pub(crate) mod user_registration;
 // The next API task consumes this service; keep this task limited to its storage and business model.
 pub(crate) mod user_permission_copy;
 #[allow(dead_code)]

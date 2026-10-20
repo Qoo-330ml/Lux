@@ -16757,12 +16757,16 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 注册关闭、输入非法、重复邮箱和数据库错误均不泄漏账户存在状态；有效申请不创建可登录用户。
-- [ ] 邮件频率上限按邮箱与连接 peer 执行；不信任未经验证的转发头作为 rate-limit 身份。
-- [ ] 邮箱验证成功只将申请转为待审批；重复、过期、撤销 token 无副作用。
-- [ ] application 定向回归、build、fmt 与 diff check 通过。
+- [x] 注册关闭、输入非法、重复邮箱和数据库错误均不泄漏账户存在状态；有效申请不创建可登录用户。
+- [x] 邮件频率上限按邮箱与连接 peer 执行；rate-limit 身份只使用服务端 middleware 附加的连接 peer，不读取转发头。
+- [x] 邮箱验证成功只将申请转为待审批；重复、过期、撤销 token 无副作用。
+- [x] application 定向回归、build、fmt 与 diff check 通过。
 
 短计划：先补注册/验证及重复邮箱回归；再加入有界 service、token 与 outbox 原子流；最后运行定向测试和常规检查。
+
+结果（2026-10-20）：公开提交只在 `PUBLIC_EMAIL` 模式开放；邮箱、用户名、显示名和密码均有界规范化，密码用 Argon2id 哈希后写入待验证申请，管理员配置的新用户权限保存为非管理员快照。24 小时 EMAIL_VERIFICATION 凭证由 HMAC signer 生成，数据库只保存摘要，challenge 与 outbox 原子入队；服务端不返回 token。重复/已注册邮箱和 storage 邮箱限额返回相同成功结果，避免账号枚举；应用层另按规范化邮箱每分钟最多 5 次、服务端连接 peer 每分钟最多 20 次限流。连接 peer 由 HTTP middleware 从 TCP `ConnectInfo` 注入，rate limiter 不读取 `X-Forwarded-For`。验证通过 HMAC 后只把申请转为 `PENDING_APPROVAL`，不创建用户；错误、重放、过期或撤销 token 均拒绝。
+
+验证：TDD RED 确认提交和验证 service 缺失；实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_registration::tests` 4/4 通过，覆盖默认权限快照、待激活无账户、邀请模式关闭、非法及重复邮箱脱敏、邮箱/peer 限流、错误/重放/过期/撤销 token 与待审批状态。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过，构建无 warning。本机 arm64；未连接 SMTP 或部署。
 
 #### LUX-809：开放公开注册与邮箱验证 API
 
