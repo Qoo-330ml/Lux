@@ -16221,6 +16221,26 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：主规格已同步邀请注册默认值、公开邮箱注册开关、邮箱验证与管理员审批顺序，以及待激活账户不可登录/访问媒体的边界。检索确认 §3.10 已无旧的注册限制条文；模块八仍标记已取消。`git diff --check` 通过。未改变代码、数据库模型或依赖。
 
+#### LUX-779：建立安全的 SMTP 邮件传输基础
+
+范围：新增基于 Tokio 与 rustls 的 SMTP 客户端及邮件配置模型。SMTP 主机、端口、TLS 模式、发件人和站点 URL 存入设置文件；认证用户名与密码一起写入 config 目录内权限为 0600 的独立凭据文件，不进入数据库、API DTO、调试输出或日志。仅允许 SMTPS 和强制 STARTTLS，不提供明文 SMTP；邮件地址和配置值在构造传输前校验。本任务只建立传输与安全配置基础，不开放 API、不发送用户邮件、不创建邀请或注册行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`Cargo.toml`、`Cargo.lock`、`src/application/mail.rs`、`src/application/mod.rs`。
+
+验收标准：
+
+- [x] 使用 Lettre Tokio/rustls 异步传输；SMTP 模式只能是隐式 TLS 或强制 STARTTLS。
+- [x] SMTP 凭据与非敏感配置分开持久化，Unix 凭据文件权限为 0600；删除凭据时清除文件。
+- [x] 配置校验拒绝空/超长主机、非法端口、无效发件人或站点 URL，以及未支持的 TLS 模式。
+- [x] 测试覆盖配置读写、SMTP 凭据隔离/删除、无效配置拒绝和 TLS 传输构造；不访问外部邮件服务器。
+- [x] 不改变现有登录、用户邮箱验证、管理员设置 API 或注册行为。
+
+依赖：LUX-778。SMTP API、队列、邀请和注册后续按独立任务实施。
+
+短计划：先添加安全配置读写、字段校验和 TLS 模式回归并确认失败；再用 Lettre 0.11 的 Tokio/rustls 支持实现配置模型与传输构造；最后运行邮件模块定向库测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：邮件模块定向库测试 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍被 11 条位于未修改 API/播放/用户存储文件的既有诊断阻断；本模块无新增 Clippy 诊断。仅构造 SMTP TLS 传输，未连接外部 SMTP 服务。依赖 Lettre 0.11.23，Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
@@ -16238,6 +16258,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - SQLx SQLite 文档：https://docs.rs/sqlx/latest/sqlx/sqlite/index.html
 - notify 文档与大目录限制：https://docs.rs/notify/latest/notify/
 - SQLite WAL：https://www.sqlite.org/wal.html
+- Lettre async SMTP transport：https://docs.rs/lettre/latest/lettre/transport/smtp/struct.AsyncSmtpTransport.html
 - SQLite FTS5：https://www.sqlite.org/fts5.html
 - TMDb 开发文档：https://developer.themoviedb.org/docs/getting-started
 - FFprobe 文档：https://ffmpeg.org/ffprobe.html

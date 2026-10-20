@@ -39,6 +39,7 @@ pub mod item_merge;
 pub mod libraries;
 pub mod library_covers;
 pub mod login_background_assets;
+pub(crate) mod mail;
 pub mod media_matching;
 pub mod metadata;
 pub mod metadata_objects;

@@ -16,6 +16,7 @@ axum = "0.8"
 base64 = "0.22"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 httpdate = "1"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 hmac = "0.12"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
