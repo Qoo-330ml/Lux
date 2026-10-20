@@ -16384,6 +16384,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：SQLite 空库定向测试 `cargo test --locked --test storage user_invitations_migration_runs_from_an_empty_database -- --exact` 1/1，PostgreSQL 16 空库迁移 `cargo test --locked --test postgres_database postgres_mail_and_invitation_migrations_apply_to_an_empty_database -- --ignored --exact` 1/1；`cargo build --locked`、fmt 与 diff check 通过。测试覆盖待处理邮箱唯一索引、无效状态/非对象快照拒绝、终态后可再次邀请，以及用户删除后邀请历史保留。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
 
+#### LUX-788：实现邀请存储与邮件入队事务
+
+范围：提供创建、读取、过滤分页和撤销邀请的 storage 合同。新邀请、关联邀请挑战及 outbox 邮件必须在同一事务内写入；创建前把该邮箱已过期的待处理邀请转为终态。列表按服务端上限分页，并将已到期待处理项显示为 EXPIRED。本任务不实现邀请业务校验、公开 API 或 Web 界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`（含 SQLite 与 PostgreSQL storage 回归）。
+
+验收标准：
+
+- [x] 邀请/挑战/outbox 关联不匹配或任何一项写入失败时整笔事务回滚；重复待处理邮箱返回稳定冲突结果。
+- [x] 创建会把同邮箱已过期邀请标记为 EXPIRED；读取和过滤分页返回准确状态/总数，页大小受 100 条上限约束且排序稳定。
+- [x] 撤销只作用于尚未过期的待处理邀请；已接受、已撤销、已过期或不存在的邀请不会被重复改变。
+- [x] SQLite 与 PostgreSQL 均验证创建、队列原子性、过期替换、冲突、分页和撤销；定向测试、build、fmt 与 diff check 通过。
+
+短计划：先为 storage 写入、分页、终态与原子回滚补充失败回归；再实现事务、硬上限分页及 CAS 撤销；最后运行 SQLite/PostgreSQL 定向目标、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib user_invitation_storage_` 3/3；本机 PostgreSQL 16 定向用例 `cargo test --locked --lib postgres_user_invitation_storage_covers_lifecycle_and_atomicity -- --ignored` 1/1；`cargo build --locked`（最终验证无 warning）、`cargo fmt --all -- --check` 与 `git diff --check` 通过。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

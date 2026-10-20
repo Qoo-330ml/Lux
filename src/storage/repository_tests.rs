@@ -2,12 +2,14 @@ use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
-    MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewStoredUserPermissions,
-    NewUserAccessBlacklistRule, NewUserActivityEvent, NewUserContentRestrictions,
-    NewUserDeviceObservation, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
-    StoredUserActivityEvent, UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
+    MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewMailChallenge,
+    NewMailOutboxMessage, NewStoredUserPermissions, NewUserAccessBlacklistRule,
+    NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation, NewUserInvitation,
+    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, StoredUserActivityEvent,
+    UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
     UserAccessBlacklistRuleScope, UserActivityEventQuery, UserContentRestrictionsCasResult,
-    UserDevicePageQuery, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
+    UserDevicePageQuery, UserInvitationCreateResult, UserInvitationStatus,
+    UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -20611,6 +20613,591 @@ async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
             .await
             .expect("confirmed candidate status");
     assert_eq!(candidate_status, "SELECTED");
+}
+
+fn invitation_storage_bundle<'a>(
+    id: &'a str,
+    recipient_email: &'a str,
+    challenge_id: &'a str,
+    idempotency_key: &'a str,
+    expires_at: i64,
+    available_at: i64,
+    token_hash: &'a [u8],
+) -> (
+    NewUserInvitation<'a>,
+    NewMailChallenge<'a>,
+    NewMailOutboxMessage<'a>,
+) {
+    (
+        NewUserInvitation {
+            id,
+            recipient_email,
+            created_by_user_id: None,
+            preset_id: "viewer",
+            preset_name: "Viewer",
+            preset_version: 1,
+            permission_snapshot_json: r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"NONE","libraryIds":[],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#,
+            expires_at,
+        },
+        NewMailChallenge {
+            id: challenge_id,
+            kind: MailChallengeKind::Invitation,
+            recipient_email,
+            reference_id: id,
+            token_hash,
+            expires_at,
+        },
+        NewMailOutboxMessage {
+            idempotency_key,
+            recipient_email,
+            template_kind: MailOutboxTemplateKind::Invitation,
+            reference_id: challenge_id,
+            available_at,
+        },
+    )
+}
+
+#[tokio::test]
+async fn user_invitation_storage_creates_mail_atomically_and_rejects_duplicate_email()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let now = 1_000;
+    let first_hash = [1_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-first",
+        "viewer@example.test",
+        "challenge-first",
+        "invite-mail-first",
+        10_000,
+        now,
+        &first_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, now)
+            .await?,
+        UserInvitationCreateResult::Created
+    );
+    let created = database
+        .get_user_invitation("invitation-first", now)
+        .await?
+        .ok_or("created invitation was not found")?;
+    assert_eq!(created.status, UserInvitationStatus::Pending);
+    assert_eq!(created.recipient_email, "viewer@example.test");
+    let stored_challenge = database
+        .get_mail_challenge("challenge-first")
+        .await?
+        .ok_or("invitation challenge was not stored")?;
+    assert_eq!(stored_challenge.reference_id, created.id);
+    let queued = database.list_mail_outbox_page(None, 100, 0).await?;
+    assert_eq!(queued.messages.len(), 1);
+    assert_eq!(queued.messages[0].reference_id, "challenge-first");
+
+    let second_hash = [2_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-duplicate",
+        "viewer@example.test",
+        "challenge-duplicate",
+        "invite-mail-duplicate",
+        10_000,
+        now,
+        &second_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, now)
+            .await?,
+        UserInvitationCreateResult::AlreadyPending
+    );
+    assert!(
+        database
+            .get_mail_challenge("challenge-duplicate")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .list_mail_outbox_page(None, 100, 0)
+            .await?
+            .messages
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_expires_replaced_rows_and_paginates_revokeable_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let first_hash = [3_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-expired",
+        "viewer@example.test",
+        "challenge-expired",
+        "invite-mail-expired",
+        1_100,
+        1_000,
+        &first_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+
+    let second_hash = [4_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-current",
+        "viewer@example.test",
+        "challenge-current",
+        "invite-mail-current",
+        10_000,
+        1_100,
+        &second_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_100)
+        .await?;
+    let expired = database
+        .get_user_invitation("invitation-expired", 1_100)
+        .await?
+        .ok_or("expired invitation was not found")?;
+    assert_eq!(expired.status, UserInvitationStatus::Expired);
+
+    let all = database
+        .list_user_invitations_page(None, 1_000, 0, 1_100)
+        .await?;
+    assert_eq!(all.total_count, 2);
+    assert_eq!(all.page_size, 100);
+    assert_eq!(all.entries.len(), 2);
+    assert_eq!(all.entries[0].id, "invitation-current");
+    let expired_page = database
+        .list_user_invitations_page(Some(UserInvitationStatus::Expired), 20, 0, 1_100)
+        .await?;
+    assert_eq!(expired_page.total_count, 1);
+    assert_eq!(expired_page.entries[0].id, "invitation-expired");
+
+    assert!(
+        database
+            .revoke_user_invitation("invitation-current", 1_200)
+            .await?
+    );
+    assert!(
+        !database
+            .revoke_user_invitation("invitation-current", 1_201)
+            .await?
+    );
+    let revoked = database
+        .get_user_invitation("invitation-current", 1_201)
+        .await?
+        .ok_or("revoked invitation was not found")?;
+    assert_eq!(revoked.status, UserInvitationStatus::Revoked);
+    assert!(
+        !database
+            .revoke_user_invitation("missing-invitation", 1_201)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_rolls_back_when_mail_enqueue_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [5_u8; 32];
+    let (first_invitation, first_challenge, first_outbox) = invitation_storage_bundle(
+        "invitation-existing",
+        "existing@example.test",
+        "challenge-existing",
+        "shared-mail-idempotency",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(first_invitation, first_challenge, first_outbox, 1_000)
+        .await?;
+
+    let second_hash = [6_u8; 32];
+    let (second_invitation, second_challenge, second_outbox) = invitation_storage_bundle(
+        "invitation-rolled-back",
+        "rollback@example.test",
+        "challenge-rolled-back",
+        "shared-mail-idempotency",
+        10_000,
+        1_001,
+        &second_hash,
+    );
+    assert!(
+        database
+            .create_user_invitation_with_mail(
+                second_invitation,
+                second_challenge,
+                second_outbox,
+                1_001,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .get_user_invitation("invitation-rolled-back", 1_001)
+            .await?
+            .is_none()
+    );
+    assert!(
+        database
+            .get_mail_challenge("challenge-rolled-back")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .list_mail_outbox_page(None, 100, 0)
+            .await?
+            .messages
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let result = async {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: database_name.clone(),
+                ..admin_connection.clone()
+            }),
+        )
+        .await?;
+        let token_hash = [7_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-expiring-invitation",
+            "postgres@example.test",
+            "postgres-expiring-challenge",
+            "postgres-mail-key",
+            1_100,
+            1_000,
+            &token_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+                .await?,
+            UserInvitationCreateResult::Created
+        );
+
+        let duplicate_hash = [8_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-duplicate-invitation",
+            "postgres@example.test",
+            "postgres-duplicate-challenge",
+            "postgres-duplicate-mail-key",
+            10_000,
+            1_050,
+            &duplicate_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_050)
+                .await?,
+            UserInvitationCreateResult::AlreadyPending
+        );
+        assert!(
+            database
+                .get_mail_challenge("postgres-duplicate-challenge")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+                .fetch_one(database.pool())
+                .await?,
+            1
+        );
+
+        let replacement_hash = [9_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-replacement-invitation",
+            "postgres@example.test",
+            "postgres-replacement-challenge",
+            "postgres-replacement-mail-key",
+            10_000,
+            1_100,
+            &replacement_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_100)
+                .await?,
+            UserInvitationCreateResult::Created
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-expiring-invitation", 1_100)
+                .await?
+                .ok_or("expired PostgreSQL invitation was not found")?
+                .status,
+            UserInvitationStatus::Expired
+        );
+        assert_eq!(
+            database
+                .list_user_invitations_page(Some(UserInvitationStatus::Expired), 10, 0, 1_100)
+                .await?
+                .total_count,
+            1
+        );
+
+        let revocable_hash = [10_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-revocable-invitation",
+            "revoke@example.test",
+            "postgres-revocable-challenge",
+            "postgres-revocable-mail-key",
+            10_000,
+            1_200,
+            &revocable_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_200)
+            .await?;
+
+        let accepted_hash = [11_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-accepted-invitation",
+            "accepted@example.test",
+            "postgres-accepted-challenge",
+            "postgres-accepted-mail-key",
+            10_000,
+            1_200,
+            &accepted_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_200)
+            .await?;
+        sqlx::query(
+            "UPDATE user_invitations
+             SET status = 'ACCEPTED', accepted_at = 1_200, updated_at = 1_200
+             WHERE id = 'postgres-accepted-invitation'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        for (id, email, challenge_id, key, byte) in [
+            (
+                "postgres-stable-a",
+                "stable-a@example.test",
+                "postgres-stable-a-challenge",
+                "postgres-stable-a-mail-key",
+                12_u8,
+            ),
+            (
+                "postgres-stable-b",
+                "stable-b@example.test",
+                "postgres-stable-b-challenge",
+                "postgres-stable-b-mail-key",
+                13_u8,
+            ),
+        ] {
+            let token_hash = [byte; 32];
+            let (invitation, challenge, outbox) =
+                invitation_storage_bundle(id, email, challenge_id, key, 10_000, 1_300, &token_hash);
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_300)
+                .await?;
+        }
+
+        let page = database
+            .list_user_invitations_page(None, 1_000, 0, 1_300)
+            .await?;
+        assert_eq!(page.total_count, 6);
+        assert_eq!(page.page_size, 100);
+        assert_eq!(page.entries.len(), 6);
+        assert_eq!(page.entries[0].id, "postgres-stable-b");
+        assert_eq!(page.entries[1].id, "postgres-stable-a");
+
+        let rollback_hash = [14_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-rolled-back-invitation",
+            "rollback@example.test",
+            "postgres-rolled-back-challenge",
+            "postgres-mail-key",
+            10_000,
+            1_400,
+            &rollback_hash,
+        );
+        assert!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_400)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .get_user_invitation("postgres-rolled-back-invitation", 1_400)
+                .await?
+                .is_none()
+        );
+        assert!(
+            database
+                .get_mail_challenge("postgres-rolled-back-challenge")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+                .fetch_one(database.pool())
+                .await?,
+            6
+        );
+
+        let mismatch_hash = [15_u8; 32];
+        let (invitation, mut challenge, outbox) = invitation_storage_bundle(
+            "postgres-mismatched-invitation",
+            "mismatch@example.test",
+            "postgres-mismatched-challenge",
+            "postgres-mismatched-mail-key",
+            10_000,
+            1_500,
+            &mismatch_hash,
+        );
+        challenge.recipient_email = "different@example.test";
+        assert!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_500)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .get_user_invitation("postgres-mismatched-invitation", 1_500)
+                .await?
+                .is_none()
+        );
+
+        assert!(
+            database
+                .revoke_user_invitation("postgres-revocable-invitation", 1_501)
+                .await?
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-revocable-invitation", 1_501)
+                .await?
+                .ok_or("PostgreSQL invitation was not found")?
+                .status,
+            UserInvitationStatus::Revoked
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-revocable-invitation", 1_502)
+                .await?
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-expiring-invitation", 1_501)
+                .await?
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-accepted-invitation", 1_501)
+                .await?
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-missing-invitation", 1_501)
+                .await?
+        );
+        let challenge_revoked_at: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM mail_challenges WHERE id = $1")
+                .bind("postgres-revocable-challenge")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(challenge_revoked_at, Some(1_501));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM mail_outbox WHERE idempotency_key = $1",
+            )
+            .bind("postgres-revocable-mail-key")
+            .fetch_one(database.pool())
+            .await?,
+            "FAILED"
+        );
+        database.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let admin_url = DatabaseConfiguration::Postgres(PostgresConnection {
+        database: "postgres".to_owned(),
+        ..admin_connection
+    })
+    .postgres_url()?
+    .ok_or("missing PostgreSQL admin URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    result?;
+    Ok(())
 }
 
 #[tokio::test]

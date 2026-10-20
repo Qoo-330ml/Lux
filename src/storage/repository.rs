@@ -551,6 +551,81 @@ pub(crate) struct MailOutboxPage {
     pub(crate) total_count: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // LUX-789 consumes these states in the invitation API.
+pub(crate) enum UserInvitationStatus {
+    Pending,
+    Accepted,
+    Revoked,
+    Expired,
+}
+
+impl UserInvitationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Accepted => "ACCEPTED",
+            Self::Revoked => "REVOKED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    #[allow(dead_code)] // LUX-789 parses persisted states in the invitation API.
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "ACCEPTED" => Ok(Self::Accepted),
+            "REVOKED" => Ok(Self::Revoked),
+            "EXPIRED" => Ok(Self::Expired),
+            _ => Err(StorageError::Serialization(
+                "unknown user invitation status".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewUserInvitation<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) created_by_user_id: Option<&'a str>,
+    pub(crate) preset_id: &'a str,
+    pub(crate) preset_name: &'a str,
+    pub(crate) preset_version: i64,
+    pub(crate) permission_snapshot_json: &'a str,
+    pub(crate) expires_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserInvitationCreateResult {
+    Created,
+    AlreadyPending,
+}
+
+#[allow(dead_code)] // LUX-789 consumes the full invitation profile in its admin API.
+pub(crate) struct StoredUserInvitation {
+    pub(crate) id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) created_by_user_id: Option<String>,
+    pub(crate) accepted_user_id: Option<String>,
+    pub(crate) status: UserInvitationStatus,
+    pub(crate) preset_id: String,
+    pub(crate) preset_name: String,
+    pub(crate) preset_version: i64,
+    pub(crate) permission_snapshot_json: String,
+    pub(crate) expires_at: i64,
+    pub(crate) accepted_at: Option<i64>,
+    pub(crate) revoked_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)] // LUX-789 returns this page from the invitation API.
+pub(crate) struct UserInvitationPage {
+    pub(crate) entries: Vec<StoredUserInvitation>,
+    pub(crate) page_size: i64,
+    pub(crate) total_count: i64,
+}
+
 // LUX-784 uses this type to rebuild a stable, non-persisted mail link token.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -657,6 +732,25 @@ struct MailOutboxRecord {
     updated_at: i64,
 }
 
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)] // LUX-789 consumes this record in the invitation API.
+struct UserInvitationRecord {
+    id: String,
+    recipient_email: String,
+    created_by_user_id: Option<String>,
+    accepted_user_id: Option<String>,
+    status: String,
+    preset_id: String,
+    preset_name: String,
+    preset_version: i64,
+    permission_snapshot_json: String,
+    expires_at: i64,
+    accepted_at: Option<i64>,
+    revoked_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
 impl TryFrom<MailOutboxRecord> for StoredMailOutboxMessage {
     type Error = StorageError;
 
@@ -677,6 +771,29 @@ impl TryFrom<MailOutboxRecord> for StoredMailOutboxMessage {
                 .map(MailDeliveryErrorCode::parse)
                 .transpose()?,
             sent_at: record.sent_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        })
+    }
+}
+
+impl TryFrom<UserInvitationRecord> for StoredUserInvitation {
+    type Error = StorageError;
+
+    fn try_from(record: UserInvitationRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: record.id,
+            recipient_email: record.recipient_email,
+            created_by_user_id: record.created_by_user_id,
+            accepted_user_id: record.accepted_user_id,
+            status: UserInvitationStatus::parse(&record.status)?,
+            preset_id: record.preset_id,
+            preset_name: record.preset_name,
+            preset_version: record.preset_version,
+            permission_snapshot_json: record.permission_snapshot_json,
+            expires_at: record.expires_at,
+            accepted_at: record.accepted_at,
+            revoked_at: record.revoked_at,
             created_at: record.created_at,
             updated_at: record.updated_at,
         })
@@ -1646,6 +1763,379 @@ impl Database {
             source,
         })?
         .try_into()
+    }
+
+    pub(crate) async fn create_user_invitation_with_mail(
+        &self,
+        invitation: NewUserInvitation<'_>,
+        challenge: NewMailChallenge<'_>,
+        message: NewMailOutboxMessage<'_>,
+        now: i64,
+    ) -> Result<UserInvitationCreateResult, StorageError> {
+        let snapshot =
+            serde_json::from_str::<serde_json::Value>(invitation.permission_snapshot_json)
+                .map_err(|_| {
+                    StorageError::Conflict("invalid invitation permission snapshot".to_owned())
+                })?;
+        if now < 0
+            || invitation.id.trim() != invitation.id
+            || !(1..=128).contains(&invitation.id.len())
+            || invitation.id.chars().any(char::is_control)
+            || invitation.recipient_email.trim() != invitation.recipient_email
+            || invitation.recipient_email != invitation.recipient_email.to_lowercase()
+            || !(3..=254).contains(&invitation.recipient_email.len())
+            || invitation.recipient_email.chars().any(char::is_control)
+            || invitation
+                .created_by_user_id
+                .is_some_and(|id| id.trim() != id || !(1..=128).contains(&id.len()))
+            || invitation.preset_id.trim() != invitation.preset_id
+            || !(1..=128).contains(&invitation.preset_id.len())
+            || invitation.preset_name.trim() != invitation.preset_name
+            || !(1..=80).contains(&invitation.preset_name.chars().count())
+            || invitation.preset_version < 1
+            || invitation.permission_snapshot_json.len() > 32_768
+            || !snapshot.is_object()
+            || invitation.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
+            || challenge.kind != MailChallengeKind::Invitation
+            || challenge.recipient_email != invitation.recipient_email
+            || challenge.reference_id != invitation.id
+            || challenge.token_hash.len() != 32
+            || challenge.expires_at != invitation.expires_at
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email != invitation.recipient_email
+            || message.template_kind != MailOutboxTemplateKind::Invitation
+            || message.reference_id != challenge.id
+            || message.available_at != now
+        {
+            return Err(StorageError::Conflict(
+                "invalid user invitation and mail bundle".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE user_invitations
+             SET status = 'EXPIRED', updated_at = ?
+             WHERE recipient_email = ? AND status = 'PENDING' AND expires_at <= ?",
+        )
+        .bind(now)
+        .bind(invitation.recipient_email)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let inserted = self
+            .query(
+                "INSERT INTO user_invitations (
+                     id, recipient_email, created_by_user_id, status, preset_id,
+                     preset_name, preset_version, permission_snapshot_json,
+                     expires_at, created_at, updated_at
+                 ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(invitation.id)
+            .bind(invitation.recipient_email)
+            .bind(invitation.created_by_user_id)
+            .bind(invitation.preset_id)
+            .bind(invitation.preset_name)
+            .bind(invitation.preset_version)
+            .bind(invitation.permission_snapshot_json)
+            .bind(invitation.expires_at)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted.rows_affected() != 1 {
+            let pending_invitation_exists: Option<String> = self
+                .query_scalar(
+                    "SELECT id FROM user_invitations
+                     WHERE recipient_email = ? AND status = 'PENDING' AND expires_at > ?
+                     LIMIT 1",
+                )
+                .bind(invitation.recipient_email)
+                .bind(now)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return if pending_invitation_exists.is_some() {
+                Ok(UserInvitationCreateResult::AlreadyPending)
+            } else {
+                Err(StorageError::Conflict(
+                    "user invitation ID already exists".to_owned(),
+                ))
+            };
+        }
+
+        self.query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(challenge.id)
+        .bind(challenge.kind.as_str())
+        .bind(challenge.recipient_email)
+        .bind(challenge.reference_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let outbox_id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
+        )
+        .bind(&outbox_id)
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.template_kind.as_str())
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserInvitationCreateResult::Created)
+    }
+
+    pub(crate) async fn get_user_invitation(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<StoredUserInvitation>, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid invitation read time".to_owned(),
+            ));
+        }
+        self.query_as::<UserInvitationRecord>(
+            "SELECT id, recipient_email, created_by_user_id, accepted_user_id,
+                    CASE WHEN status = 'PENDING' AND expires_at <= ?
+                         THEN 'EXPIRED' ELSE status END AS status,
+                    preset_id, preset_name, preset_version, permission_snapshot_json,
+                    expires_at, accepted_at, revoked_at, created_at, updated_at
+             FROM user_invitations WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn list_user_invitations_page(
+        &self,
+        status: Option<UserInvitationStatus>,
+        page_size: i64,
+        offset: i64,
+        now: i64,
+    ) -> Result<UserInvitationPage, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid invitation page time".to_owned(),
+            ));
+        }
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let status_filter = if status.is_some() {
+            " WHERE status = ?"
+        } else {
+            ""
+        };
+        let count_statement = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT CASE WHEN status = 'PENDING' AND expires_at <= ?
+                             THEN 'EXPIRED' ELSE status END AS status
+                 FROM user_invitations
+             ) AS invitations{status_filter}"
+        );
+        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_statement));
+        count_query = count_query.bind(now);
+        if let Some(status) = status {
+            count_query = count_query.bind(status.as_str());
+        }
+        let total_count =
+            count_query
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+        let page_statement = format!(
+            "SELECT id, recipient_email, created_by_user_id, accepted_user_id, status,
+                    preset_id, preset_name, preset_version, permission_snapshot_json,
+                    expires_at, accepted_at, revoked_at, created_at, updated_at
+             FROM (
+                 SELECT id, recipient_email, created_by_user_id, accepted_user_id,
+                        CASE WHEN status = 'PENDING' AND expires_at <= ?
+                             THEN 'EXPIRED' ELSE status END AS status,
+                        preset_id, preset_name, preset_version, permission_snapshot_json,
+                        expires_at, accepted_at, revoked_at, created_at, updated_at
+                 FROM user_invitations
+             ) AS invitations{status_filter}
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut page_query = self
+            .query_as::<UserInvitationRecord>(sqlx::AssertSqlSafe(page_statement))
+            .bind(now);
+        if let Some(status) = status {
+            page_query = page_query.bind(status.as_str());
+        }
+        let records = page_query
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let entries = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<StoredUserInvitation>, StorageError>>()?;
+        Ok(UserInvitationPage {
+            entries,
+            page_size,
+            total_count,
+        })
+    }
+
+    pub(crate) async fn revoke_user_invitation(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0 || id.trim() != id || !(1..=128).contains(&id.len()) {
+            return Err(StorageError::Conflict(
+                "invalid invitation revocation".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE user_invitations
+             SET status = 'EXPIRED', updated_at = ?
+             WHERE id = ? AND status = 'PENDING' AND expires_at <= ?",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let revoked = self
+            .query(
+                "UPDATE user_invitations
+                 SET status = 'REVOKED', revoked_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING' AND expires_at > ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1;
+        if revoked {
+            self.query(
+                "UPDATE mail_challenges SET revoked_at = ?
+                 WHERE challenge_kind = 'INVITATION' AND reference_id = ?
+                   AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE mail_outbox
+                 SET status = 'FAILED', lease_expires_at = NULL,
+                     last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
+                     updated_at = ?
+                 WHERE reference_id IN (
+                     SELECT id FROM mail_challenges
+                     WHERE challenge_kind = 'INVITATION' AND reference_id = ?
+                 ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(revoked)
     }
 
     pub(crate) async fn get_mail_challenge(
