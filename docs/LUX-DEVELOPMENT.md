@@ -16768,6 +16768,20 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验证：TDD RED 确认提交和验证 service 缺失；实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_registration::tests` 4/4 通过，覆盖默认权限快照、待激活无账户、邀请模式关闭、非法及重复邮箱脱敏、邮箱/peer 限流、错误/重放/过期/撤销 token 与待审批状态。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过，构建无 warning。本机 arm64；未连接 SMTP 或部署。
 
+#### LUX-808B：为注册申请增加验证邮件重发 service/storage
+
+范围：为尚未验证、未过期的公开注册申请重新入队原 EMAIL_VERIFICATION challenge 邮件。重发复用原 token、申请期限和权限快照；不能为不存在、已验证、过期或撤销的申请创建凭证或邮件。按同邮箱每小时最多发送 5 封验证邮件，并将不可重发情况合并为同一 application 结果。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`src/application/user_registration.rs`。
+
+验收标准：
+
+- [ ] SQLite 与 PostgreSQL 在单个存储事务中校验申请与原挑战并入队；并发和幂等重试不更改申请、凭证或过期时间。
+- [ ] 每邮箱小时上限原子执行；无效/已验证/过期/撤销申请均无副作用且不暴露存在状态。
+- [ ] service 与双后端定向回归、build、fmt 和 diff check 通过；服务不返回 token。
+
+短计划：先为有效重发、状态冲突、限额、原 token/过期时间不变和失败回滚添加 RED；再实现 storage 事务与 service；最后运行定向 SQLite/PostgreSQL 测试及常规检查。
+
 #### LUX-809：开放公开注册与邮箱验证 API
 
 范围：新增公开注册提交、邮箱验证和验证邮件重发 API。三者均执行有界请求频率、请求体上限及固定脱敏响应；重发不更改原申请权限快照或过期时间。
@@ -16780,7 +16794,9 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 - [ ] 邮件验证、重复提交、重发限额、无效/过期 token 和邮件队列失败均有稳定响应与集成覆盖。
 - [ ] Token 不在 URL/query/log 中；更新 API 文档，定向集成目标、build、fmt 与 diff check 通过。
 
-短计划：先添加公开端点合同并确认 RED；再连接 LUX-808 service 与访问限额；最后运行用户认证集成目标、build、fmt 和 diff check。
+依赖：LUX-808、LUX-808B。
+
+短计划：先添加公开端点合同并确认 RED；再连接 LUX-808/LUX-808B service 与访问限额；最后运行用户认证集成目标、build、fmt 和 diff check。
 
 #### LUX-810：建立公开注册 Web API 客户端
 
