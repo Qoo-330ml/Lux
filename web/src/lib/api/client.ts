@@ -3,6 +3,8 @@ import type {
   AccountPreferencesUpdate,
   AccountProfile,
   AuthSession,
+  UserInvitationAcceptanceInput,
+  UserInvitationAcceptanceResponse,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -400,6 +402,13 @@ export class LuxApiClient {
 
   loginBackground() {
     return this.request<LoginBackgroundResponse>("/api/v1/auth/login-background");
+  }
+
+  acceptUserInvitation(input: UserInvitationAcceptanceInput) {
+    return this.request<UserInvitationAcceptanceResponse>("/api/v1/auth/invitations/accept", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
   }
 
   logout() {

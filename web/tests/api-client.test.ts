@@ -31,6 +31,7 @@ function installLocalStorage(initialValue: string | null) {
   const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   let value = initialValue;
   let deviceId: string | null = null;
+  const writes: string[] = [];
   Object.defineProperty(globalThis, "localStorage", {
     configurable: true,
     value: {
@@ -40,6 +41,7 @@ function installLocalStorage(initialValue: string | null) {
         return null;
       },
       setItem(key: string, nextValue: string) {
+        writes.push(`${key}=${nextValue}`);
         if (key === "lux_csrf_token") value = nextValue;
         if (key === "lux_device_id") deviceId = nextValue;
       },
@@ -52,6 +54,7 @@ function installLocalStorage(initialValue: string | null) {
   return {
     current: () => value,
     deviceId: () => deviceId,
+    writes: () => writes,
     restore: () => {
       if (storageDescriptor) {
         Object.defineProperty(globalThis, "localStorage", storageDescriptor);
@@ -1926,6 +1929,48 @@ describe("LuxApiClient", () => {
       id: "admin-1",
       canManageServer: true,
     });
+  });
+
+  it("posts invitation credentials only in the JSON body without persisting them", async () => {
+    const input = {
+      token: "invitation-secret",
+      username: "invited-user",
+      displayName: "Invited User",
+      password: "invited-user-password",
+    };
+    const storage = installLocalStorage(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ created: true }), { status: 201 }),
+    );
+    try {
+      await expect(new LuxApiClient().acceptUserInvitation(input)).resolves.toEqual({ created: true });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/auth/invitations/accept");
+      expect(options?.method).toBe("POST");
+      expect(JSON.parse(String(options?.body))).toEqual(input);
+      expect((options?.headers as Headers).get("Content-Type")).toBe("application/json");
+      expect(storage.writes().join("\n")).not.toContain(input.token);
+      expect(storage.writes().join("\n")).not.toContain(input.password);
+    } finally {
+      storage.restore();
+    }
+  });
+
+  it.each([
+    [400, "INVALID_REQUEST"],
+    [409, "INVALID_REQUEST"],
+    [413, "INVALID_REQUEST"],
+    [503, "DATABASE_UNAVAILABLE"],
+    [500, "INTERNAL"],
+  ])("maps invitation acceptance HTTP %i to a structured error", async (status, code) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      error: { code, message: "邀请暂时无法处理", requestId: "invitation-request" },
+    }), { status }));
+    await expect(new LuxApiClient().acceptUserInvitation({
+      token: "invitation-secret",
+      username: "invited-user",
+      password: "invited-user-password",
+    })).rejects.toMatchObject({ name: "ApiError", code, status, requestId: "invitation-request" });
   });
 
   it("loads the anonymous login background contract", async () => {

@@ -16613,11 +16613,15 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 客户端按 POST JSON 调用 LUX-799，错误码具备显式类型映射。
-- [ ] Token 与密码请求不进入 query cache 或持久化，测试覆盖方法、字段和失败响应。
-- [ ] 定向 Vitest、Web build 与 diff check 通过。
+- [x] 客户端按 POST JSON 调用 LUX-799，错误码具备显式类型映射。
+- [x] Token 与密码请求不进入 query cache 或持久化，测试覆盖方法、字段和失败响应。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
 
 短计划：先添加客户端合同回归并确认方法缺失；再实现类型和请求；最后运行定向 Vitest、Web build 与 diff check。
+
+结果（2026-10-20）：新增邀请接受输入/响应类型及 `acceptUserInvitation` 方法，通过直接 Promise 调用发送 POST JSON，不使用 React Query 或保存凭据。既有 `ApiError` 保留 HTTP 状态、固定错误码与请求 ID，供页面安全映射。
+
+验证：新增 6 项合同回归先因方法缺失失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 88/88、`pnpm --dir web build` 与 `git diff --check` 通过。覆盖成功 JSON、无 URL 凭据、浏览器存储无凭据写入和 400/409/413/503/500 错误映射。
 
 #### LUX-801：实现受邀用户账户创建页面
 

@@ -84,6 +84,17 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
+export type UserInvitationAcceptanceInput = {
+  token: string;
+  username: string;
+  displayName?: string;
+  password: string;
+};
+
+export type UserInvitationAcceptanceResponse = {
+  created: true;
+};
+
 export type AccountProfile = LuxUser & {
   email?: string | null;
   emailVerifiedAt?: number | null;
