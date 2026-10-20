@@ -16440,6 +16440,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：路由实现前，HTTP 回归因端点返回 404 失败；实现后 `cargo test --locked --test admin_user_invitations` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。回归覆盖未认证、缺失 CSRF、邀请创建/重复冲突、默认与上限分页、状态筛选、撤销、DTO 字段缺席和审计脱敏。全目标全 feature Clippy 被 11 项既有库代码与 15 项既有测试代码诊断阻断，均在本任务文件之外。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
 
+#### LUX-791：原子重新入队有效邀请邮件
+
+范围：为已有邀请提供存储层重发邮件操作：仅对仍待处理且未过期的邀请，找到邮箱、邀请 ID 和有效期匹配的未消费、未撤销邀请挑战，并原子地新增 outbox 项。重复使用同一幂等键不得重复入队；不同幂等键允许代表一次新的发送请求。重发复用原挑战和 token，不延长邀请有效期、不创建新挑战，也不写入正文或凭证。本任务不开放应用服务、HTTP API、速率限制或 Web 界面，不修改 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 有效邀请的重发 outbox 项与邀请、邮箱和现有有效挑战一致，并在一个事务内创建。
+- [x] 同一幂等键重复调用仅有一个 outbox 项；不同幂等键可产生独立重发项，但均引用同一挑战。
+- [x] 不存在、已接受、已撤销、已过期邀请，以及缺失、已消费、已撤销或过期挑战均不入队；错误幂等键不会污染队列。
+- [x] SQLite 与 PostgreSQL 回归覆盖有效重发、幂等、挑战复用和不可重发状态；定向存储测试、build、fmt 与 diff check 通过。
+
+短计划：先在 SQLite 与 PostgreSQL 邀请存储回归中增加重发合同并确认 RED；再实现按邀请/挑战状态校验并原子入队；最后运行两个定向存储目标、build、fmt、Clippy 和 diff check。
+
+验证（2026-10-20）：新增 SQLite 回归先因缺少重发存储方法而编译失败；实现后 `cargo test --locked --lib user_invitation_storage_` 5/5 通过，忽略的 PostgreSQL 生命周期目标 `cargo test --locked --lib postgres_user_invitation_storage_covers_lifecycle_and_atomicity -- --ignored` 1/1 通过。`cargo build --locked`、fmt 与 diff check 通过。全目标全 feature Clippy 仍被 11 项既有库代码与 15 项既有测试代码诊断阻断，均不在本任务新增代码中。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

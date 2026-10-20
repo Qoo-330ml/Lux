@@ -1941,6 +1941,142 @@ impl Database {
         Ok(UserInvitationCreateResult::Created)
     }
 
+    pub(crate) async fn queue_user_invitation_resend(
+        &self,
+        invitation_id: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0
+            || invitation_id.trim() != invitation_id
+            || !(1..=128).contains(&invitation_id.len())
+            || invitation_id.chars().any(char::is_control)
+            || idempotency_key.trim() != idempotency_key
+            || !(1..=256).contains(&idempotency_key.len())
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user invitation resend".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let invitation_statement = format!(
+            "SELECT recipient_email, expires_at FROM user_invitations
+             WHERE id = ? AND status = 'PENDING' AND expires_at > ?{lock_clause}"
+        );
+        let invitation: Option<(String, i64)> = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(invitation_statement))
+            .bind(invitation_id)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((recipient_email, invitation_expires_at)) = invitation else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+
+        let challenge_statement = format!(
+            "SELECT id FROM mail_challenges
+             WHERE challenge_kind = 'INVITATION' AND reference_id = ?
+               AND recipient_email = ? AND expires_at = ? AND expires_at > ?
+               AND created_at <= ? AND consumed_at IS NULL AND revoked_at IS NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
+        );
+        let challenge_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
+            .bind(invitation_id)
+            .bind(&recipient_email)
+            .bind(invitation_expires_at)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(challenge_id) = challenge_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        };
+
+        let outbox_id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'INVITATION', ?, 'PENDING', 0, ?, ?, ?)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&outbox_id)
+        .bind(idempotency_key)
+        .bind(&recipient_email)
+        .bind(&challenge_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let existing_message = self
+            .query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if existing_message.recipient_email != recipient_email
+            || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
+            || existing_message.reference_id != challenge_id
+        {
+            return Err(StorageError::Conflict(
+                "mail outbox idempotency key already used".to_owned(),
+            ));
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn get_user_invitation(
         &self,
         id: &str,

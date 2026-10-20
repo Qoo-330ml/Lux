@@ -20732,6 +20732,223 @@ async fn user_invitation_storage_creates_mail_atomically_and_rejects_duplicate_e
 }
 
 #[tokio::test]
+async fn user_invitation_storage_requeues_valid_challenge_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [16_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "resend-active-invitation",
+        "resend-active@example.test",
+        "resend-active-challenge",
+        "resend-active-initial-mail",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+
+    assert!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "resend-mail-1", 1_001)
+            .await?
+    );
+    assert!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "resend-mail-1", 1_002)
+            .await?
+    );
+    assert!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "resend-mail-2", 1_003)
+            .await?
+    );
+    assert!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "", 1_004)
+            .await
+            .is_err()
+    );
+
+    let resend_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT idempotency_key, recipient_email, reference_id
+         FROM mail_outbox WHERE idempotency_key LIKE 'resend-mail-%'
+         ORDER BY idempotency_key",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(resend_rows.len(), 2);
+    assert_eq!(resend_rows[0].0, "resend-mail-1");
+    assert_eq!(resend_rows[1].0, "resend-mail-2");
+    assert!(resend_rows.iter().all(|row| {
+        row.1 == "resend-active@example.test" && row.2 == "resend-active-challenge"
+    }));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_challenges")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("resend-active-invitation", 1_003)
+            .await?
+            .ok_or("resend invitation disappeared")?
+            .expires_at,
+        10_000
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_does_not_resend_inactive_challenges()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, email, challenge_id, mail_key, expires_at, byte) in [
+        (
+            "resend-expired-invitation",
+            "resend-expired@example.test",
+            "resend-expired-challenge",
+            "resend-expired-mail",
+            1_100,
+            17_u8,
+        ),
+        (
+            "resend-revoked-invitation",
+            "resend-revoked@example.test",
+            "resend-revoked-challenge",
+            "resend-revoked-mail",
+            10_000,
+            18_u8,
+        ),
+        (
+            "resend-accepted-invitation",
+            "resend-accepted@example.test",
+            "resend-accepted-challenge",
+            "resend-accepted-mail",
+            10_000,
+            19_u8,
+        ),
+        (
+            "resend-consumed-invitation",
+            "resend-consumed@example.test",
+            "resend-consumed-challenge",
+            "resend-consumed-mail",
+            10_000,
+            20_u8,
+        ),
+        (
+            "resend-challenge-revoked-invitation",
+            "resend-challenge-revoked@example.test",
+            "resend-challenge-revoked",
+            "resend-challenge-revoked-mail",
+            10_000,
+            21_u8,
+        ),
+        (
+            "resend-challenge-expired-invitation",
+            "resend-challenge-expired@example.test",
+            "resend-challenge-expired",
+            "resend-challenge-expired-mail",
+            10_000,
+            22_u8,
+        ),
+        (
+            "resend-challenge-missing-invitation",
+            "resend-challenge-missing@example.test",
+            "resend-challenge-missing",
+            "resend-challenge-missing-mail",
+            10_000,
+            23_u8,
+        ),
+    ] {
+        let token_hash = [byte; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            id,
+            email,
+            challenge_id,
+            mail_key,
+            expires_at,
+            1_000,
+            &token_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+            .await?;
+    }
+
+    assert!(
+        !database
+            .queue_user_invitation_resend("resend-expired-invitation", "resend-x1", 1_100)
+            .await?
+    );
+    assert!(
+        database
+            .revoke_user_invitation("resend-revoked-invitation", 1_200)
+            .await?
+    );
+    sqlx::query(
+        "UPDATE user_invitations SET status = 'ACCEPTED', accepted_at = 1200
+         WHERE id = 'resend-accepted-invitation'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE mail_challenges SET consumed_at = 1200 WHERE id = 'resend-consumed-challenge'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE mail_challenges SET revoked_at = 1200
+         WHERE id = 'resend-challenge-revoked'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE mail_challenges SET expires_at = 1100
+         WHERE id = 'resend-challenge-expired'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM mail_challenges WHERE id = 'resend-challenge-missing'")
+        .execute(database.pool())
+        .await?;
+
+    for (invitation_id, idempotency_key) in [
+        ("resend-revoked-invitation", "resend-x2"),
+        ("resend-accepted-invitation", "resend-x3"),
+        ("resend-consumed-invitation", "resend-x4"),
+        ("resend-challenge-revoked-invitation", "resend-x5"),
+        ("resend-challenge-expired-invitation", "resend-x6"),
+        ("resend-challenge-missing-invitation", "resend-x7"),
+    ] {
+        assert!(
+            !database
+                .queue_user_invitation_resend(invitation_id, idempotency_key, 1_201)
+                .await?
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        7
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_invitation_storage_expires_replaced_rows_and_paginates_revokeable_rows()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -21175,6 +21392,81 @@ async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
             .await?,
             "FAILED"
         );
+        assert!(
+            !database
+                .queue_user_invitation_resend(
+                    "postgres-revocable-invitation",
+                    "postgres-resend-revoked",
+                    1_502
+                )
+                .await?
+        );
+        assert!(
+            !database
+                .queue_user_invitation_resend(
+                    "postgres-expiring-invitation",
+                    "postgres-resend-expired",
+                    1_501
+                )
+                .await?
+        );
+        assert!(
+            !database
+                .queue_user_invitation_resend(
+                    "postgres-accepted-invitation",
+                    "postgres-resend-accepted",
+                    1_501
+                )
+                .await?
+        );
+
+        let resend_hash = [24_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-resend-invitation",
+            "postgres-resend@example.test",
+            "postgres-resend-challenge",
+            "postgres-resend-initial-mail",
+            20_000,
+            1_600,
+            &resend_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_600)
+            .await?;
+        assert!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-resend-invitation",
+                    "postgres-resend-mail-1",
+                    1_601
+                )
+                .await?
+        );
+        assert!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-resend-invitation",
+                    "postgres-resend-mail-1",
+                    1_602
+                )
+                .await?
+        );
+        assert!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-resend-invitation",
+                    "postgres-resend-mail-2",
+                    1_603
+                )
+                .await?
+        );
+        let resend_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mail_outbox
+             WHERE reference_id = 'postgres-resend-challenge'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(resend_count, 3);
         database.close().await;
         Ok::<(), Box<dyn std::error::Error>>(())
     }
