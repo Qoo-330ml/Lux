@@ -1336,6 +1336,28 @@ export type AdminSettingsPatch = Partial<AdminSettings> & {
   networkProxyUrl?: string | null;
 };
 
+export type SmtpTlsMode = "SMTPS" | "STARTTLS";
+
+export type MailSettings = {
+  host: string;
+  port: number;
+  tlsMode: SmtpTlsMode;
+  senderName: string;
+  senderEmail: string;
+  siteUrl: string;
+};
+
+export type AdminMailSettingsResponse = {
+  configured: boolean;
+  credentialsConfigured: boolean;
+  settings: MailSettings | null;
+};
+
+export type SmtpCredentialsInput = {
+  username: string;
+  password: string;
+};
+
 export type NewUserPermissions = {
   libraryAccessMode: AdminUserLibraryAccessMode;
   libraryIds: string[];

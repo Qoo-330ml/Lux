@@ -24,6 +24,9 @@ import type {
   AdminRoot,
   AdminSettings,
   AdminSettingsPatch,
+  AdminMailSettingsResponse,
+  MailSettings,
+  SmtpCredentialsInput,
   AdminEmbyMigrationConnection,
   AdminEmbyMigrationSourceUserPage,
   AdminEmbyMigrationScope,
@@ -1806,6 +1809,37 @@ export class LuxApiClient {
     return this.request<AdminSettings>("/api/v1/admin/settings", {
       method: "PATCH",
       body: JSON.stringify(input),
+    });
+  }
+
+  adminMailSettings() {
+    return this.request<AdminMailSettingsResponse>("/api/v1/admin/settings/mail");
+  }
+
+  updateAdminMailSettings(input: MailSettings) {
+    return this.request<void>("/api/v1/admin/settings/mail", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
+  }
+
+  updateAdminMailCredentials(input: SmtpCredentialsInput) {
+    return this.request<void>("/api/v1/admin/settings/mail/credentials", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
+  }
+
+  deleteAdminMailCredentials() {
+    return this.request<void>("/api/v1/admin/settings/mail/credentials", {
+      method: "DELETE",
+    });
+  }
+
+  testAdminMailConnection() {
+    return this.request<{ reachable: boolean }>("/api/v1/admin/settings/mail/test", {
+      method: "POST",
+      body: JSON.stringify({}),
     });
   }
 

@@ -16259,6 +16259,25 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：TDD RED 时新接口返回 404；实现后 `cargo test --locked --test admin_mail_settings` 1/1、邮件模块定向库测试 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成回归用本机 SMTP 停滞连接确认 TLS 握手整体在 8 秒 Tokio 超时内退出；普通设置再次保存后凭据文件保持不变，且 API 响应无用户名/密码。`cargo clippy --locked --lib --test admin_mail_settings -- -D warnings` 被 11 项已有诊断阻断，均位于未修改的用户 API、Emby 播放和用户存储文件，本任务文件没有新增诊断。未连接外部 SMTP 服务。Cargo 使用 Toshiba target 目录。
 
+#### LUX-781：接入管理员 SMTP 配置界面
+
+范围：在用户管理全局设置的“邮件”页接入 LUX-780 SMTP API，管理员可保存 SMTP 主机、端口、TLS 模式、发件人和站点地址，单独更新或删除认证凭据，并执行连通性检查。页面只显示凭据是否已配置，不预填或缓存密码；发送测试只检查 SMTP 连接，不实际发送邮件。注册方式、邀请、邮件队列和公开注册流程仍由后续模块二任务实现。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-mail-settings.test.tsx`。
+
+验收标准：
+
+- [x] 邮件设置页显示并编辑完整 SMTP 配置；加载、保存失败和保存成功均有可访问状态提示。
+- [x] 凭据以用户名/密码组合独立保存；页面不回显旧凭据，保存后清空密码输入，并显示已配置状态；删除凭据有明确操作反馈。凭据请求不进入 React Query mutation cache。
+- [x] 连通性检查通过 LUX-780 API，展示成功或脱敏失败消息；操作中禁用重复提交。
+- [x] Vitest 覆盖配置加载与保存、凭据不回显/保存/删除、连接检查及错误状态。
+- [x] `pnpm --dir web build` 通过；本任务仅修改计划中的 SMTP 页面、API 类型/客户端和测试文件。
+- [ ] `pnpm --dir web test` 全量通过。完成时重复结果为 751 passed、4 failed；失败位于既有首页预取、LibraryCard 预取/虚拟集合链接和媒体查询轮询用例，详见验证记录。
+
+短计划：先增加邮件设置页组件测试并确认 RED；再补类型、API 客户端方法和全局设置页表单；最后运行指定 Web 测试与构建并记录结果。
+
+验证（2026-10-20）：组件测试先因 SMTP 密码仍保留在 React Query mutation cache 而失败；改为直接执行凭据请求后，`tests/admin-user-mail-settings.test.tsx` 5/5 通过，并确认 mutation cache 不含密码。`pnpm --dir web build` 通过。完整 `pnpm --dir web test` 连续运行两次，最终均稳定为 751 passed、4 failed：`home-page.test.tsx` 首页媒体库预取 1 项、`library-card.test.tsx` 预取与虚拟集合链接 2 项、`media-query-polling.test.tsx` 图片查询调用次数 1 项；均为既有基线失败，与本任务文件无关。第一次全量运行另有 1 项头像裁切失败，单独重跑通过，第二次全量运行未复现。Playwright 在本机临时配置上确认邮件设置保存成功；390×844 移动视口页面宽度无横向溢出。未执行 SMTP NOOP 或联系外部邮件服务器。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
