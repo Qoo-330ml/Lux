@@ -1399,6 +1399,13 @@ export type AdminSettingsPatch = Partial<AdminSettings> & {
   networkProxyUrl?: string | null;
 };
 
+export type RegistrationMode = "INVITATION_ONLY" | "PUBLIC_EMAIL";
+
+export type AdminRegistrationSettings = {
+  registrationMode: RegistrationMode;
+  version: number;
+};
+
 export type SmtpTlsMode = "SMTPS" | "STARTTLS";
 
 export type MailSettings = {

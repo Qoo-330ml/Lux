@@ -27,6 +27,7 @@ import type {
   AdminSettings,
   AdminSettingsPatch,
   AdminMailSettingsResponse,
+  AdminRegistrationSettings,
   MailSettings,
   SmtpCredentialsInput,
   AdminEmbyMigrationConnection,
@@ -1858,6 +1859,17 @@ export class LuxApiClient {
 
   updateAdminSettings(input: AdminSettingsPatch) {
     return this.request<AdminSettings>("/api/v1/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  adminRegistrationSettings() {
+    return this.request<AdminRegistrationSettings>("/api/v1/admin/settings/registration");
+  }
+
+  updateAdminRegistrationSettings(input: AdminRegistrationSettings) {
+    return this.request<AdminRegistrationSettings>("/api/v1/admin/settings/registration", {
       method: "PATCH",
       body: JSON.stringify(input),
     });
