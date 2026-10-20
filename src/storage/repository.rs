@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use super::sql_templates::SqlTemplateCache;
 use super::{
     NewInvitationUserAccount, NewUserRegistrationRequest, StoredUserInvitationAcceptance,
-    StoredUserRegistrationChallenge, StoredUserRegistrationRequest, UserInvitationAcceptResult,
-    UserRegistrationApproveResult, UserRegistrationCreateResult, UserRegistrationRejectResult,
-    UserRegistrationRequestPage, UserRegistrationResendResult, UserRegistrationStatus,
-    UserRegistrationVerifyResult,
+    StoredUserRegistrationChallenge, StoredUserRegistrationRequest, UserEmailChangeCreateResult,
+    UserInvitationAcceptResult, UserRegistrationApproveResult, UserRegistrationCreateResult,
+    UserRegistrationRejectResult, UserRegistrationRequestPage, UserRegistrationResendResult,
+    UserRegistrationStatus, UserRegistrationVerifyResult,
 };
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
@@ -1834,6 +1834,158 @@ impl Database {
         .try_into()
     }
 
+    pub(crate) async fn create_user_email_change_with_mail(
+        &self,
+        user_id: &str,
+        challenge: NewMailChallenge<'_>,
+        message: NewMailOutboxMessage<'_>,
+        now: i64,
+    ) -> Result<UserEmailChangeCreateResult, StorageError> {
+        if now < 0
+            || challenge.kind != MailChallengeKind::EmailVerification
+            || challenge.reference_id != user_id
+            || challenge.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
+            || challenge.token_hash.len() != 32
+            || challenge.recipient_email.trim() != challenge.recipient_email
+            || challenge.recipient_email != challenge.recipient_email.to_lowercase()
+            || !(3..=254).contains(&challenge.recipient_email.len())
+            || challenge.recipient_email.chars().any(char::is_control)
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email != challenge.recipient_email
+            || message.template_kind != MailOutboxTemplateKind::EmailVerification
+            || message.reference_id != challenge.id
+            || message.available_at != now
+        {
+            return Err(StorageError::Conflict(
+                "invalid user email change mail request".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let active_user_statement = format!(
+            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
+             AND deleted_at IS NULL{lock_clause}"
+        );
+        let active_user_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(active_user_statement))
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_user_id.is_none() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserEmailChangeCreateResult::NotAcceptable);
+        }
+
+        self.query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, 'EMAIL_VERIFICATION', ?, ?, ?, ?, ?)",
+        )
+        .bind(challenge.id)
+        .bind(challenge.recipient_email)
+        .bind(user_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let outbox_id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'EMAIL_VERIFICATION', ?, 'PENDING', 0, ?, ?, ?)",
+        )
+        .bind(&outbox_id)
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        self.query(
+            "UPDATE mail_challenges SET revoked_at = ?
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND id <> ? AND consumed_at IS NULL AND revoked_at IS NULL
+               AND created_at <= ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(challenge.id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE mail_outbox
+             SET status = 'FAILED', lease_expires_at = NULL,
+                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
+                 updated_at = ?
+             WHERE reference_id IN (
+                 SELECT id FROM mail_challenges
+                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+                   AND id <> ?
+             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(challenge.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserEmailChangeCreateResult::Created)
+    }
+
     pub(crate) async fn create_user_invitation_with_mail(
         &self,
         invitation: NewUserInvitation<'_>,
@@ -2742,6 +2894,85 @@ impl Database {
              FROM mail_challenges WHERE id = ?",
         )
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn get_user_email_change_challenge_by_token_hash(
+        &self,
+        user_id: &str,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<StoredMailChallenge>, StorageError> {
+        if now < 0
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+            || token_hash.len() != 32
+        {
+            return Err(StorageError::Conflict(
+                "invalid user email change challenge lookup".to_owned(),
+            ));
+        }
+        self.query_as::<MailChallengeRecord>(
+            "SELECT c.id, c.challenge_kind, c.recipient_email, c.reference_id,
+                    c.token_hash, c.expires_at, c.consumed_at, c.revoked_at, c.created_at
+             FROM mail_challenges c
+             JOIN users u ON u.id = c.reference_id
+             WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.reference_id = ?
+               AND c.token_hash = ? AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND u.is_disabled = 0 AND u.deleted_at IS NULL
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn get_pending_user_email_change(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Option<StoredMailChallenge>, StorageError> {
+        if now < 0
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid pending user email change lookup".to_owned(),
+            ));
+        }
+        self.query_as::<MailChallengeRecord>(
+            "SELECT c.id, c.challenge_kind, c.recipient_email, c.reference_id,
+                    c.token_hash, c.expires_at, c.consumed_at, c.revoked_at, c.created_at
+             FROM mail_challenges c
+             JOIN users u ON u.id = c.reference_id
+             WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.reference_id = ?
+               AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND u.is_disabled = 0 AND u.deleted_at IS NULL
+             ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(now)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {

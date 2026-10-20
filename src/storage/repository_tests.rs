@@ -1,6 +1,5 @@
 use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
-use crate::storage::UserEmailChangeVerifyResult;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
     MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewInvitationUserAccount,
@@ -14,6 +13,7 @@ use crate::storage::{
     UserRegistrationApproveResult, UserRegistrationCreateResult, UserRegistrationRejectResult,
     UserRegistrationResendResult, UserRegistrationStatus, UserRegistrationVerifyResult,
 };
+use crate::storage::{UserEmailChangeCreateResult, UserEmailChangeVerifyResult};
 
 #[tokio::test]
 async fn web_session_device_association_is_optional_and_only_read_from_active_sessions()
@@ -29491,6 +29491,95 @@ async fn exercise_user_email_change_storage_contract(
         race_user,
         (Some("race-new@example.test".to_owned()), Some(150))
     );
+
+    seed_email_change_user(database, "email-request", "request-old@example.test", 100).await?;
+    let first_hash = [8_u8; 32];
+    let first_challenge = database
+        .create_user_email_change_with_mail(
+            "email-request",
+            NewMailChallenge {
+                id: "email-request-first",
+                kind: MailChallengeKind::EmailVerification,
+                recipient_email: "request-new@example.test",
+                reference_id: "email-request",
+                token_hash: &first_hash,
+                expires_at: 3_700,
+            },
+            NewMailOutboxMessage {
+                idempotency_key: "email-request-mail-first",
+                recipient_email: "request-new@example.test",
+                template_kind: MailOutboxTemplateKind::EmailVerification,
+                reference_id: "email-request-first",
+                available_at: 100,
+            },
+            100,
+        )
+        .await?;
+    assert_eq!(first_challenge, UserEmailChangeCreateResult::Created);
+    let original_email: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-request")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        original_email,
+        (Some("request-old@example.test".to_owned()), Some(100))
+    );
+    let first_pending = database
+        .get_pending_user_email_change("email-request", 101)
+        .await?
+        .ok_or("first pending email change was not found")?;
+    assert_eq!(first_pending.recipient_email, "request-new@example.test");
+    assert_eq!(first_pending.expires_at, 3_700);
+    assert_eq!(
+        database
+            .get_user_email_change_challenge_by_token_hash("email-request", &first_hash, 101)
+            .await?
+            .map(|challenge| challenge.id),
+        Some("email-request-first".to_owned())
+    );
+
+    let second_hash = [9_u8; 32];
+    assert_eq!(
+        database
+            .create_user_email_change_with_mail(
+                "email-request",
+                NewMailChallenge {
+                    id: "email-request-second",
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "request-next@example.test",
+                    reference_id: "email-request",
+                    token_hash: &second_hash,
+                    expires_at: 3_800,
+                },
+                NewMailOutboxMessage {
+                    idempotency_key: "email-request-mail-second",
+                    recipient_email: "request-next@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: "email-request-second",
+                    available_at: 200,
+                },
+                200,
+            )
+            .await?,
+        UserEmailChangeCreateResult::Created
+    );
+    let revoked_first = database
+        .get_mail_challenge("email-request-first")
+        .await?
+        .ok_or("first email change challenge disappeared")?;
+    assert_eq!(revoked_first.revoked_at, Some(200));
+    assert!(
+        database
+            .get_user_email_change_challenge_by_token_hash("email-request", &first_hash, 201)
+            .await?
+            .is_none()
+    );
+    let second_pending = database
+        .get_pending_user_email_change("email-request", 201)
+        .await?
+        .ok_or("second pending email change was not found")?;
+    assert_eq!(second_pending.recipient_email, "request-next@example.test");
     Ok(())
 }
 
