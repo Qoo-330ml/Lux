@@ -1906,6 +1906,45 @@ impl Database {
         Ok((rules, total_count))
     }
 
+    pub(crate) async fn find_user_access_blacklist_rule(
+        &self,
+        scope: UserAccessBlacklistRuleScope<'_>,
+        rule_id: &str,
+    ) -> Result<Option<StoredUserAccessBlacklistRule>, StorageError> {
+        let (where_clause, user_id) = match scope {
+            UserAccessBlacklistRuleScope::Global => ("user_id IS NULL", None),
+            UserAccessBlacklistRuleScope::User(user_id) => ("user_id = ?", Some(user_id)),
+        };
+        let sql = format!(
+            "SELECT id, user_id, rule_type, match_value, is_enabled, created_by,
+                    created_at, updated_at
+             FROM user_access_blacklist_rules WHERE id = ? AND {where_clause}"
+        );
+        let mut query = self.query(sqlx::AssertSqlSafe(sql)).bind(rule_id);
+        if let Some(user_id) = user_id {
+            query = query.bind(user_id);
+        }
+        query
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| {
+                row.map(|row| StoredUserAccessBlacklistRule {
+                    id: row.get("id"),
+                    user_id: row.get("user_id"),
+                    rule_type: row.get("rule_type"),
+                    match_value: row.get("match_value"),
+                    is_enabled: row.get::<i64, _>("is_enabled") != 0,
+                    created_by: row.get("created_by"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                })
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     // LUX-758 checks active device/client rules before auth enforcement is wired.
     #[allow(dead_code)]
     pub(crate) async fn user_access_blacklist_matches(

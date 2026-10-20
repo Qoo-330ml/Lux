@@ -4,6 +4,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
     auth::{
+        admin_api_key::AdminApiKeyService,
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
         users::UserStore,
@@ -5322,6 +5323,360 @@ async fn admin_can_manage_scoped_user_access_blacklist_rules()
     assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_access_blacklist_prevents_self_lockout_and_respects_user_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    let other_user = UserStore::new(database.clone())?
+        .create_user(
+            "access-rule-target",
+            "Access Rule Target",
+            "target password",
+            false,
+        )
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let device_id = "00000000-0000-4000-8000-000000000001";
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("X-Lux-Device-Id", device_id)
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+    let global_path = format!("{base_url}/api/v1/admin/access-blacklist/global");
+
+    for (rule_type, match_value) in [("DEVICE", device_id), ("CLIENT", "Lux Web")] {
+        let response = client
+            .post(&global_path)
+            .header(COOKIE, &admin_cookie)
+            .header("X-CSRF-Token", &admin_csrf)
+            .json(&json!({ "ruleType": rule_type, "matchValue": match_value }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<Value>().await?["error"]["code"],
+            "VERSION_CONFLICT"
+        );
+    }
+
+    let admin_scope_path = format!(
+        "{base_url}/api/v1/admin/users/{}/access-blacklist",
+        admin.id
+    );
+    let same_user_rule = client
+        .post(&admin_scope_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "CLIENT", "matchValue": "lux web" }))
+        .send()
+        .await?;
+    assert_eq!(same_user_rule.status(), reqwest::StatusCode::CONFLICT);
+
+    let same_user_disabled_rule = client
+        .post(&admin_scope_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({
+            "ruleType": "CLIENT",
+            "matchValue": "lux web",
+            "isEnabled": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        same_user_disabled_rule.status(),
+        reqwest::StatusCode::CREATED
+    );
+    let same_user_rule_id = same_user_disabled_rule.json::<Value>().await?["id"]
+        .as_str()
+        .ok_or("rule ID missing")?
+        .to_owned();
+    let enable_same_user_rule = client
+        .patch(format!("{admin_scope_path}/{same_user_rule_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "isEnabled": true }))
+        .send()
+        .await?;
+    assert_eq!(
+        enable_same_user_rule.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let same_user_rule_remains_disabled: i64 =
+        sqlx::query_scalar("SELECT is_enabled FROM user_access_blacklist_rules WHERE id = ?")
+            .bind(same_user_rule_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(same_user_rule_remains_disabled, 0);
+
+    let other_user_path = format!(
+        "{base_url}/api/v1/admin/users/{}/access-blacklist",
+        other_user.id
+    );
+    let other_user_rule = client
+        .post(&other_user_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "DEVICE", "matchValue": device_id }))
+        .send()
+        .await?;
+    assert_eq!(other_user_rule.status(), reqwest::StatusCode::CREATED);
+
+    let unrelated_client_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "ruleType": "CLIENT", "matchValue": "Kodi" }))
+        .send()
+        .await?;
+    assert_eq!(unrelated_client_rule.status(), reqwest::StatusCode::CREATED);
+
+    let disabled_self_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({
+            "ruleType": "DEVICE",
+            "matchValue": device_id,
+            "isEnabled": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(disabled_self_rule.status(), reqwest::StatusCode::CREATED);
+    let disabled_self_rule_id = disabled_self_rule.json::<Value>().await?["id"]
+        .as_str()
+        .ok_or("rule ID missing")?
+        .to_owned();
+    let enable_self_rule = client
+        .patch(format!("{global_path}/{disabled_self_rule_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "isEnabled": true }))
+        .send()
+        .await?;
+    assert_eq!(enable_self_rule.status(), reqwest::StatusCode::CONFLICT);
+    let remains_disabled: i64 =
+        sqlx::query_scalar("SELECT is_enabled FROM user_access_blacklist_rules WHERE id = ?")
+            .bind(disabled_self_rule_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remains_disabled, 0);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_access_blacklist_uses_peer_and_complete_trusted_proxy_chain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+    let global_path = format!("{base_url}/api/v1/admin/access-blacklist/global");
+
+    let spoofed_xff_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .header("X-Forwarded-For", "198.51.100.7")
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "198.51.100.0/24" }))
+        .send()
+        .await?;
+    assert_eq!(spoofed_xff_rule.status(), reqwest::StatusCode::CREATED);
+
+    let peer_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .header("X-Forwarded-For", "203.0.113.7")
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "127.0.0.1/32" }))
+        .send()
+        .await?;
+    assert_eq!(peer_rule.status(), reqwest::StatusCode::CONFLICT);
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\",\"10.0.0.0/8\"]")
+    .execute(database.pool())
+    .await?;
+
+    let trusted_chain_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .header("X-Forwarded-For", "203.0.113.20, 10.10.0.2")
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "203.0.113.20/32" }))
+        .send()
+        .await?;
+    assert_eq!(trusted_chain_rule.status(), reqwest::StatusCode::CONFLICT);
+
+    let unrelated_chain_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .header("X-Forwarded-For", "203.0.113.20, 10.10.0.2")
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "192.0.2.8/32" }))
+        .send()
+        .await?;
+    assert_eq!(unrelated_chain_rule.status(), reqwest::StatusCode::CREATED);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_ip_blacklist_requires_peer_for_web_sessions_but_keeps_shared_key_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+    let global_path = format!("{base_url}/api/v1/admin/access-blacklist/global");
+
+    let unresolved_ip_rule = client
+        .post(&global_path)
+        .header(COOKIE, &admin_cookie)
+        .header("X-CSRF-Token", &admin_csrf)
+        .header("X-Lux-Peer-Ip", "192.0.2.9")
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "192.0.2.0/24" }))
+        .send()
+        .await?;
+    assert_eq!(unresolved_ip_rule.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        unresolved_ip_rule.json::<Value>().await?["error"]["code"],
+        "VERSION_CONFLICT"
+    );
+
+    let stored_before_key: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_access_blacklist_rules WHERE user_id IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_before_key, 0);
+
+    server.abort();
+    let key_service = AdminApiKeyService::new(config.config_dir.clone(), database.clone());
+    let key = key_service.rotate().await?;
+    let api_key_app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        SetupService::new(database.clone())?,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let api_key_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let api_key_address = api_key_listener.local_addr()?;
+    let api_key_server = tokio::spawn(async move {
+        axum::serve(
+            api_key_listener,
+            api_key_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let api_key_base_url = format!("http://{api_key_address}");
+    let shared_key_rule = client
+        .post(format!(
+            "{api_key_base_url}/api/v1/admin/access-blacklist/global"
+        ))
+        .header("X-Lux-Api-Key", &key)
+        .json(&json!({ "ruleType": "IP_CIDR", "matchValue": "127.0.0.1/32" }))
+        .send()
+        .await?;
+    assert_eq!(shared_key_rule.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        shared_key_rule.json::<Value>().await?["createdBy"],
+        Value::Null
+    );
+
+    api_key_server.abort();
     Ok(())
 }
 

@@ -950,6 +950,19 @@ async fn create_user_access_blacklist_rule(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let is_enabled = request.is_enabled.unwrap_or(true);
+    if is_enabled
+        && let Err(response) = ensure_user_access_rule_does_not_block_admin(
+            headers,
+            state,
+            user_id.as_deref(),
+            rule_type,
+            &match_value,
+        )
+        .await
+    {
+        return response;
+    }
     let rule_id = uuid::Uuid::now_v7().to_string();
     let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
     let created_by = admin_user_access_blacklist_creator(headers, state).await;
@@ -959,7 +972,7 @@ async fn create_user_access_blacklist_rule(
             user_id: user_id.as_deref(),
             rule_type: rule_type.as_database_value(),
             match_value: &match_value,
-            is_enabled: request.is_enabled.unwrap_or(true),
+            is_enabled,
             created_by: created_by.as_deref(),
             created_at,
         })
@@ -972,7 +985,7 @@ async fn create_user_access_blacklist_rule(
                 "userId": user_id,
                 "ruleType": rule_type.as_database_value(),
                 "matchValue": match_value,
-                "isEnabled": request.is_enabled.unwrap_or(true),
+                "isEnabled": is_enabled,
                 "createdBy": created_by,
                 "createdAt": created_at,
                 "updatedAt": created_at,
@@ -1026,6 +1039,42 @@ async fn set_user_access_blacklist_rule_enabled(
         crate::storage::UserAccessBlacklistRuleScope::Global,
         |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
     );
+    if request.is_enabled {
+        let rule = match database
+            .find_user_access_blacklist_rule(scope, &rule_id)
+            .await
+        {
+            Ok(Some(rule)) => rule,
+            Ok(None) => {
+                return api_error(
+                    headers,
+                    StatusCode::NOT_FOUND,
+                    lux::ApiErrorCode::NotFound,
+                    "黑名单规则不存在",
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let Some(rule_type) =
+            crate::application::user_access_rules::UserAccessBlacklistRuleType::parse(
+                &rule.rule_type,
+            )
+        else {
+            return user_access_blacklist_conflict(headers);
+        };
+        if let Err(response) = ensure_user_access_rule_does_not_block_admin(
+            headers,
+            state,
+            user_id.as_deref(),
+            rule_type,
+            &rule.match_value,
+        )
+        .await
+        {
+            return response;
+        }
+    }
     match database
         .set_user_access_blacklist_rule_enabled(scope, &rule_id, request.is_enabled)
         .await
@@ -1040,6 +1089,110 @@ async fn set_user_access_blacklist_rule_enabled(
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+async fn ensure_user_access_rule_does_not_block_admin(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope_user_id: Option<&str>,
+    rule_type: crate::application::user_access_rules::UserAccessBlacklistRuleType,
+    rule_value: &str,
+) -> Result<(), Response> {
+    // Shared API keys have no Web-session device or user identity and retain their
+    // independent recovery path, so these rules do not apply to API-key requests.
+    if lux_api_key_from_headers(headers).is_some() {
+        return Ok(());
+    }
+    let Some(session_token) = request_cookie(headers, "lux_session") else {
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response());
+    };
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let session = match auth.resolve(&session_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response());
+        }
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
+    let current_user_id = session.user.id.to_string();
+    if scope_user_id.is_some_and(|scope_user_id| scope_user_id != current_user_id) {
+        return Ok(());
+    }
+    let client_ip = if rule_type
+        == crate::application::user_access_rules::UserAccessBlacklistRuleType::IpCidr
+    {
+        match admin_request_access_ip(headers, state).await {
+            Ok(client_ip) => Some(client_ip),
+            Err(()) => return Err(user_access_blacklist_conflict(headers)),
+        }
+    } else {
+        None
+    };
+    match crate::application::user_access_rules::user_access_blacklist_rule_matches_context(
+        rule_type,
+        rule_value,
+        session.device_id.as_deref(),
+        Some("lux web"),
+        client_ip,
+    ) {
+        Ok(true) | Err(_) => Err(user_access_blacklist_conflict(headers)),
+        Ok(false) => Ok(()),
+    }
+}
+
+async fn admin_request_access_ip(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<std::net::IpAddr, ()> {
+    let peer = headers
+        .get("x-lux-peer-ip")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(())?
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| ())?;
+    let database = state.database.as_ref().ok_or(())?;
+    let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
+        .await
+        .map_err(|_| ())?;
+    let trusted_proxies = trusted_proxy_values
+        .iter()
+        .map(|value| crate::application::user_access_rules::IpCidr::parse(value).map_err(|_| ()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let forwarded_for_values = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|value| value.to_str().map_err(|_| ()))
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
+        peer,
+        &forwarded_for_values,
+        &trusted_proxies,
+    )
+    .map_err(|_| ())
+}
+
+fn user_access_blacklist_conflict(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::CONFLICT,
+        lux::ApiErrorCode::VersionConflict,
+        "规则会阻断当前管理员入口，或无法安全确认其影响",
+    )
+    .into_response()
 }
 
 async fn admin_delete_global_user_access_blacklist_rule(

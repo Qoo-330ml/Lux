@@ -80,6 +80,48 @@ pub(crate) fn normalize_user_access_blacklist_value(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserAccessBlacklistContextError {
+    InvalidRule,
+    MissingClientIp,
+}
+
+pub(crate) fn user_access_blacklist_rule_matches_context(
+    rule_type: UserAccessBlacklistRuleType,
+    rule_value: &str,
+    device_id: Option<&str>,
+    client_name: Option<&str>,
+    client_ip: Option<IpAddr>,
+) -> Result<bool, UserAccessBlacklistContextError> {
+    match rule_type {
+        UserAccessBlacklistRuleType::Device => Ok(device_id == Some(rule_value)),
+        UserAccessBlacklistRuleType::Client => {
+            let Some(client_name) = client_name else {
+                return Ok(false);
+            };
+            let normalized_rule = normalize_user_access_blacklist_value(
+                UserAccessBlacklistRuleType::Client,
+                rule_value,
+            )
+            .map_err(|_| UserAccessBlacklistContextError::InvalidRule)?;
+            let normalized_client = normalize_user_access_blacklist_value(
+                UserAccessBlacklistRuleType::Client,
+                client_name,
+            )
+            .map_err(|_| UserAccessBlacklistContextError::InvalidRule)?;
+            Ok(normalized_rule == normalized_client)
+        }
+        UserAccessBlacklistRuleType::IpCidr => {
+            let Some(client_ip) = client_ip else {
+                return Err(UserAccessBlacklistContextError::MissingClientIp);
+            };
+            let cidr = IpCidr::parse(rule_value)
+                .map_err(|_| UserAccessBlacklistContextError::InvalidRule)?;
+            Ok(cidr.contains(client_ip))
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IpCidr {

@@ -17033,15 +17033,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：在创建或启用全站及用户级规则前，比较当前管理请求的设备、客户端与可信访问 IP；若规则将阻断当前管理员会话则返回稳定冲突。IP 比较必须调用 LUX-766 可信代理解析结果，不能直接信任 XFF；无法安全判定时拒绝高风险 IP 规则启用。共享 API Key 的既有策略单独保持明确。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`、`src/api/admin/admin_users.rs`、`src/storage/users.rs`、`tests/users.rs`。启用已有规则前需要按规则 ID 和作用范围读取类型和值，现有 storage 接口不提供单条读取。
 
 验收标准：
 
-- [ ] 设备/客户端/IP 自封禁规则被拒绝，未命中当前入口的规则仍可管理。
-- [ ] 代理伪造、peer 缺失、可信代理多跳和 API Key 请求有回归；拒绝不新增或启用规则。
-- [ ] 定向集成测试、build、fmt 与 diff check 通过。
+- [x] 设备/客户端/IP 自封禁规则被拒绝，未命中当前入口的规则仍可管理。
+- [x] 代理伪造、peer 缺失、可信代理多跳和 API Key 请求有回归；拒绝不新增或启用规则。
+- [x] 定向集成测试、build、fmt 与 diff check 通过。
 
-短计划：先构造可信/伪造 peer 的规则 API 回归；再在写入前执行访问上下文匹配；最后运行 `tests/users` 目标与常规检查。
+短计划：先构造可信/伪造 peer 的规则 API 回归；再在写入前执行访问上下文匹配并增加作用域安全的单条规则读取；最后运行 `tests/users` 目标与常规检查。
+
+实施结果（2026-10-20）：Web 管理员创建启用规则或启用已有规则前，按会话用户范围比较已记录设备 ID、固定客户端 `lux web` 和访问 IP。IP 只由服务端注入的 peer 与 LUX-766 可信代理链解析器计算；无法读取 peer/可信代理配置或链格式异常时，启用 IP 规则以稳定 `409 VERSION_CONFLICT` 拒绝。拒绝发生在 insert/update 之前。启用已有规则先按 ID 与全站/用户作用范围精确读取规则；禁用规则仍可保存。共享 API Key 没有 Web 会话身份，继续走独立认证策略并保留恢复入口，不套用当前 Web 会话自锁检查。
+
+验证：新增 API 回归先复现设备与 IP 自封禁规则仍可返回 `201`；实现后 `cargo test --locked --test users -- --test-threads=1` 35/35 通过，另对新增的用户范围禁用规则启用回归定向复跑 1/1。覆盖全站和用户规则、拒绝后不写入/不启用、无关规则可管理、伪造 XFF 不影响 peer 判断、可信代理多跳、peer 缺失 fail-closed，以及共享 API Key 可创建命中自身 IP 的规则。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。全目标 Clippy 仍被 19 项既有 `-D warnings` 诊断阻断，未报告本任务新增行；本机 `arm64`，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`。未部署。
 
 #### LUX-821：为用户设备摘要补充可用 IP 归属地
 
