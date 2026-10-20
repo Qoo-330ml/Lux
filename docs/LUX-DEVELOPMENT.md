@@ -16823,17 +16823,41 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验证：新增 API client 回归先因方法缺失失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 99/99 通过，覆盖提交、验证、重发的路径/body/header、匿名无 CSRF 请求、凭证不持久化及 400/403/413/429/503 错误映射。`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过，`git diff --check` 通过。完整 `pnpm --dir web test` 为 784 passed、5 failed：1 项媒体库删除组件仍使用 LUX-794 并行实现前的 mock 返回结构，另 4 项在首页媒体库预取、媒体库卡片预取/虚拟合集链接和媒体详情轮询；LUX-810 定向目标全部通过。
 
+#### LUX-811A：公开读取注册模式
+
+背景：LUX-811 的公开页面需要根据服务器当前模式决定是否显示注册申请表单。现有模式读取接口只允许管理员访问，账户设置接口需要登录，不能安全复用。
+
+范围：新增匿名只读 `GET /api/v1/auth/registrations/settings`，只返回 `{ "registrationMode": "INVITATION_ONLY" | "PUBLIC_EMAIL" }`。不返回配置版本、SMTP 状态、默认权限或其他服务端设置；不增加写入接口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 未认证请求可读取注册模式；未设置、损坏或未知模式安全回退为邀请制。
+- [x] 响应只暴露注册模式，不包含版本、邮件配置或注册申请数据。
+- [x] 定向 `tests/users`、build、fmt 与 diff check 通过。
+
+短计划：先增加匿名模式读取集成回归并确认路由缺失；再复用 LUX-802 的模式读取服务；最后运行定向集成目标和常规检查。
+
+依赖：LUX-802。
+
+实施结果（2026-10-20）：新增匿名只读 `GET /api/v1/auth/registrations/settings`，只序列化注册模式枚举；沿用 LUX-802 对缺省、损坏和未知持久化值的邀请制回退。不返回版本、邮件状态、默认权限或申请内容。
+
+验证：新增集成回归先因路由缺失得到 404；实现后匿名默认模式及切换为公开注册的响应均通过，且响应严格只含 `registrationMode`。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users -- --test-threads=1` 29/29、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Toshiba 已挂载，本机 macOS arm64；未连接 SMTP、未部署。
+
 #### LUX-811：实现公开注册与邮箱验证页面
 
-范围：增加公开注册申请及邮箱验证页面；仅在服务端允许公开注册时显示提交表单。邮箱链接 token 从 fragment 读取后清除地址栏，并只在验证请求期间存于内存。说明邮箱验证后仍须管理员批准。
+范围：增加公开注册申请及邮箱验证页面；通过 LUX-811A 匿名读取当前模式，仅在服务端允许公开注册时显示提交表单。邮箱链接 token 从 fragment 读取后清除地址栏，并只在验证请求期间存于内存。说明邮箱验证后仍须管理员批准。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/App.tsx`、`web/src/features/auth/RegisterPage.tsx`、`web/tests/register-page.test.tsx`。
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/auth/RegisterPage.tsx`、`web/src/lib/api/client.ts`、`web/tests/register-page.test.tsx`。
 
 验收标准：
 
 - [ ] 邀请模式不暴露可提交表单；公开模式表单校验、等待/成功/错误状态可访问。
 - [ ] 邮件验证成功显示“等待管理员审批”，token 被清理且不写入持久化。
 - [ ] 定向 Vitest、Web build 与真实浏览器路由/fragment 验证通过。
+
+依赖：LUX-810、LUX-811A。
 
 短计划：先增加模式、提交及验证页面回归；再添加页面路由与状态；最后运行 Vitest、Web build 和浏览器检查。
 

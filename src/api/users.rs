@@ -1342,6 +1342,16 @@ pub(super) async fn auth_resend_public_user_registration_email(
     }
 }
 
+pub(super) async fn public_registration_settings(State(state): State<AppState>) -> Response {
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::settings::read_registration_mode(database).await {
+        Ok(settings) => Json(json!({ "registrationMode": settings.mode })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Some(candidate) = lux_api_key_from_headers(&headers) {
         let Some(service) = state.admin_api_key.as_ref() else {
@@ -2934,6 +2944,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/invitations/accept",
             post(users::auth_accept_user_invitation).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations/settings",
+            get(users::public_registration_settings),
         )
         .route(
             "/api/v1/auth/registrations",

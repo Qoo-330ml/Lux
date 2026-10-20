@@ -5399,6 +5399,59 @@ async fn admin_can_manage_emby_login_sessions() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test]
+async fn public_registration_settings_api_exposes_only_anonymous_mode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete(
+            "registration-status-admin",
+            "Registration Status Admin",
+            "admin password",
+        )
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let url = format!("http://{address}/api/v1/auth/registrations/settings");
+
+    let invitation_only = client.get(&url).send().await?;
+    assert_eq!(invitation_only.status(), reqwest::StatusCode::OK);
+    let invitation_only: Value = invitation_only.json().await?;
+    assert_eq!(
+        invitation_only,
+        json!({ "registrationMode": "INVITATION_ONLY" })
+    );
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('registration_mode', '{\"mode\":\"PUBLIC_EMAIL\",\"version\":7}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let public_email = client.get(&url).send().await?;
+    assert_eq!(public_email.status(), reqwest::StatusCode::OK);
+    let public_email: Value = public_email.json().await?;
+    assert_eq!(public_email, json!({ "registrationMode": "PUBLIC_EMAIL" }));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_registration_submission_api_is_mode_gated_and_uses_a_fixed_response()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
