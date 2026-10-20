@@ -1988,6 +1988,111 @@ describe("LuxApiClient", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("submits public registration as anonymous JSON without caching credentials", async () => {
+    const input = {
+      email: "applicant@example.test",
+      username: "applicant",
+      displayName: "Public Applicant",
+      password: "applicant-password",
+    };
+    const storage = installLocalStorage(null);
+    const cookie = installCookieDocument("");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        accepted: true,
+        message: "若申请符合条件，我们会发送邮件",
+      }), { status: 202 }),
+    );
+    try {
+      await expect(new LuxApiClient().submitPublicUserRegistration(input, "/proxy/lux/"))
+        .resolves.toEqual({ accepted: true, message: "若申请符合条件，我们会发送邮件" });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      const headers = options?.headers as Headers;
+      expect(path).toBe("/proxy/lux/api/v1/auth/registrations");
+      expect(options?.method).toBe("POST");
+      expect(options?.credentials).toBe("omit");
+      expect(options?.body).toBe(JSON.stringify(input));
+      expect(headers.get("Content-Type")).toBe("application/json");
+      expect(headers.has("X-CSRF-Token")).toBe(false);
+      expect(storage.writes().join("\n")).not.toContain(input.password);
+      expect(storage.writes().join("\n")).not.toContain(input.email);
+      expect(cookie.current()).toBe("");
+    } finally {
+      storage.restore();
+      cookie.restore();
+    }
+  });
+
+  it("verifies public registration with a body-only token and no session", async () => {
+    const token = "email-verification-secret";
+    const storage = installLocalStorage(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ verified: true, status: "PENDING_APPROVAL" }), { status: 200 }),
+    );
+    try {
+      await expect(new LuxApiClient().verifyPublicUserRegistrationEmail({ token }, "/proxy/lux"))
+        .resolves.toEqual({ verified: true, status: "PENDING_APPROVAL" });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      const headers = options?.headers as Headers;
+      expect(path).toBe("/proxy/lux/api/v1/auth/registrations/verify-email");
+      expect(options?.method).toBe("POST");
+      expect(options?.credentials).toBe("omit");
+      expect(options?.body).toBe(JSON.stringify({ token }));
+      expect(String(path)).not.toContain(token);
+      expect(headers.has("X-CSRF-Token")).toBe(false);
+      expect(storage.writes().join("\n")).not.toContain(token);
+    } finally {
+      storage.restore();
+    }
+  });
+
+  it("resends a registration email with its idempotency key in an anonymous JSON request", async () => {
+    const input = { email: "applicant@example.test" };
+    const idempotencyKey = "registration-resend-attempt-1";
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        accepted: true,
+        message: "若申请符合条件，我们会发送邮件",
+      }), { status: 202 }),
+    );
+
+    await expect(new LuxApiClient().resendPublicUserRegistrationEmail(
+      input,
+      idempotencyKey,
+      "/proxy/lux",
+    )).resolves.toEqual({ accepted: true, message: "若申请符合条件，我们会发送邮件" });
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    const headers = options?.headers as Headers;
+    expect(path).toBe("/proxy/lux/api/v1/auth/registrations/resend");
+    expect(options?.method).toBe("POST");
+    expect(options?.credentials).toBe("omit");
+    expect(options?.body).toBe(JSON.stringify(input));
+    expect(headers.get("Idempotency-Key")).toBe(idempotencyKey);
+    expect(String(path)).not.toContain(idempotencyKey);
+  });
+
+  it.each([
+    [400, "INVALID_REQUEST"],
+    [403, "PERMISSION_DENIED"],
+    [413, "INVALID_REQUEST"],
+    [429, "RATE_LIMITED"],
+    [503, "DATABASE_UNAVAILABLE"],
+  ])("maps public registration HTTP %i to a structured error", async (status, code) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      error: { code, message: "注册请求无效或已失效", requestId: "registration-request" },
+    }), { status }));
+    await expect(new LuxApiClient().submitPublicUserRegistration({
+      email: "applicant@example.test",
+      username: "applicant",
+      password: "applicant-password",
+    })).rejects.toMatchObject({
+      name: "ApiError",
+      code,
+      status,
+      requestId: "registration-request",
+    });
+  });
+
   it("loads the anonymous login background contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       expect(String(input)).toBe("/api/v1/auth/login-background");

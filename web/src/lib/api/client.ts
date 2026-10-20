@@ -5,6 +5,11 @@ import type {
   AuthSession,
   UserInvitationAcceptanceInput,
   UserInvitationAcceptanceResponse,
+  PublicUserRegistrationInput,
+  PublicUserRegistrationResponse,
+  PublicUserRegistrationEmailVerificationInput,
+  PublicUserRegistrationEmailVerificationResponse,
+  PublicUserRegistrationResendInput,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -248,6 +253,14 @@ export class ApiError extends Error {
   }
 }
 
+function publicAuthEndpointPath(sitePath: string, endpoint: string): string {
+  const prefix = sitePath.replace(/\/+$/, "");
+  if (!/^(?:\/[^/?#\\\s]+)*$/.test(prefix)) {
+    throw new ApiError("站点路径无效", { code: "INVALID_REQUEST", status: 400 });
+  }
+  return prefix + endpoint;
+}
+
 function readCookie(name: string): string {
   if (typeof document === "undefined") return "";
   try {
@@ -325,6 +338,24 @@ export class LuxApiClient {
       credentials: "same-origin",
       headers,
     });
+    return this.decodeResponse<T>(response);
+  }
+
+  private async requestPublic<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const headers = new Headers(options.headers);
+    headers.set("Accept", "application/json");
+    if (options.body && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+    const response = await fetch(path, {
+      ...options,
+      credentials: "omit",
+      headers,
+    });
+    return this.decodeResponse<T>(response);
+  }
+
+  private async decodeResponse<T>(response: Response): Promise<T> {
     const body = await readJson<T & ApiErrorBody>(response);
     if (!response.ok) {
       throw new ApiError(
@@ -414,6 +445,38 @@ export class LuxApiClient {
       method: "POST",
       body: JSON.stringify(input),
     });
+  }
+
+  submitPublicUserRegistration(input: PublicUserRegistrationInput, sitePath = "") {
+    return this.requestPublic<PublicUserRegistrationResponse>(
+      publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations"),
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  verifyPublicUserRegistrationEmail(
+    input: PublicUserRegistrationEmailVerificationInput,
+    sitePath = "",
+  ) {
+    return this.requestPublic<PublicUserRegistrationEmailVerificationResponse>(
+      publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations/verify-email"),
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  resendPublicUserRegistrationEmail(
+    input: PublicUserRegistrationResendInput,
+    idempotencyKey: string,
+    sitePath = "",
+  ) {
+    return this.requestPublic<PublicUserRegistrationResponse>(
+      publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations/resend"),
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(input),
+      },
+    );
   }
 
   logout() {

@@ -95,6 +95,31 @@ export type UserInvitationAcceptanceResponse = {
   created: true;
 };
 
+export type PublicUserRegistrationInput = {
+  email: string;
+  username: string;
+  displayName?: string;
+  password: string;
+};
+
+export type PublicUserRegistrationResponse = {
+  accepted: true;
+  message: string;
+};
+
+export type PublicUserRegistrationEmailVerificationInput = {
+  token: string;
+};
+
+export type PublicUserRegistrationEmailVerificationResponse = {
+  verified: true;
+  status: "PENDING_APPROVAL";
+};
+
+export type PublicUserRegistrationResendInput = {
+  email: string;
+};
+
 export type AccountProfile = LuxUser & {
   email?: string | null;
   emailVerifiedAt?: number | null;

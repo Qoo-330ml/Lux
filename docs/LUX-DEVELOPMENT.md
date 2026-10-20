@@ -16814,10 +16814,14 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 请求路径、字段、CSRF/无会话公开语义和错误码映射与 LUX-809 一致。
-- [ ] 密码与 token 不进入 React Query cache；定向 Vitest、Web build 与 diff check 通过。
+- [x] 请求路径、字段、CSRF/无会话公开语义和错误码映射与 LUX-809 一致。
+- [x] 密码与 token 不进入 React Query cache；定向 Vitest、Web build 与 diff check 通过。
 
 短计划：先写 client RED 回归，再实现显式 DTO/方法，最后运行定向 Vitest 和 Web build。
+
+结果（2026-10-20）：新增公开注册提交、邮箱验证和重发 DTO 与类型化 client 方法。公开请求只发送同源 API path 和 JSON body，使用 `credentials: "omit"`，不带 session cookie、CSRF 或设备 ID；重发幂等键通过 `Idempotency-Key` header 传递。方法直接返回 Promise，不使用 React Query；密码/token 不进入 URL、query cache 或浏览器持久化。支持部署子路径并拒绝外部站点路径；失败仍由公共响应解码映射为 `ApiError` 的 status、code 与 requestId。
+
+验证：新增 API client 回归先因方法缺失失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 99/99 通过，覆盖提交、验证、重发的路径/body/header、匿名无 CSRF 请求、凭证不持久化及 400/403/413/429/503 错误映射。`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过，`git diff --check` 通过。完整 `pnpm --dir web test` 为 784 passed、5 failed：1 项媒体库删除组件仍使用 LUX-794 并行实现前的 mock 返回结构，另 4 项在首页媒体库预取、媒体库卡片预取/虚拟合集链接和媒体详情轮询；LUX-810 定向目标全部通过。
 
 #### LUX-811：实现公开注册与邮箱验证页面
 
