@@ -660,6 +660,13 @@ export type AdminUserEmbySessionRevokeAllResponse = {
   revokedCount: number;
 };
 
+export type AdminUserDeviceIpLocation = {
+  country: string | null;
+  province: string | null;
+  city: string | null;
+  isp: string | null;
+};
+
 export type AdminUserDevice = {
   deviceId: string;
   hasActiveLogin: boolean;
@@ -670,6 +677,7 @@ export type AdminUserDevice = {
   firstSeenAt: number;
   lastSeenAt: number;
   lastRemoteIp: string | null;
+  lastRemoteIpLocation: AdminUserDeviceIpLocation | null;
 };
 
 export type AdminUserDevicePage = {

@@ -439,30 +439,44 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
                 <th scope="col">类型</th>
                 <th scope="col">首次出现</th>
                 <th scope="col">最近活动</th>
-                <th scope="col">最近展示 IP</th>
+                <th scope="col">最近展示 IP / 归属地</th>
               </tr>
             </thead>
             <tbody>
-              {devicePage.devices.map((device) => (
-                <tr key={device.deviceId}>
-                  <th scope="row">
-                    {device.clientName}
-                    <span className="lux-admin-user-session-device-meta">
-                      {device.deviceName || "未命名设备"} · ID：{device.deviceId}
-                      {device.clientVersion ? ` · 版本 ${device.clientVersion}` : ""}
-                    </span>
-                  </th>
-                  <td>
-                    <span className={`lux-admin-device-login-status ${device.hasActiveLogin ? "is-active" : "is-inactive"}`}>
-                      {device.hasActiveLogin ? "有有效登录" : "无有效登录"}
-                    </span>
-                  </td>
-                  <td>{device.deviceType || "—"}</td>
-                  <td><WebSessionDate value={device.firstSeenAt} /></td>
-                  <td><WebSessionDate value={device.lastSeenAt} /></td>
-                  <td>{device.lastRemoteIp || "—"}</td>
-                </tr>
-              ))}
+              {devicePage.devices.map((device) => {
+                const locationSummary = [
+                  device.lastRemoteIpLocation?.country,
+                  device.lastRemoteIpLocation?.province,
+                  device.lastRemoteIpLocation?.city,
+                  device.lastRemoteIpLocation?.isp,
+                ]
+                  .map((value) => value?.trim())
+                  .filter((value): value is string => Boolean(value))
+                  .join(" · ") || "未知";
+                return (
+                  <tr key={device.deviceId}>
+                    <th scope="row">
+                      {device.clientName}
+                      <span className="lux-admin-user-session-device-meta">
+                        {device.deviceName || "未命名设备"} · ID：{device.deviceId}
+                        {device.clientVersion ? ` · 版本 ${device.clientVersion}` : ""}
+                      </span>
+                    </th>
+                    <td>
+                      <span className={`lux-admin-device-login-status ${device.hasActiveLogin ? "is-active" : "is-inactive"}`}>
+                        {device.hasActiveLogin ? "有有效登录" : "无有效登录"}
+                      </span>
+                    </td>
+                    <td>{device.deviceType || "—"}</td>
+                    <td><WebSessionDate value={device.firstSeenAt} /></td>
+                    <td><WebSessionDate value={device.lastSeenAt} /></td>
+                    <td>
+                      <span>{device.lastRemoteIp || "—"}</span>
+                      <span className="lux-admin-user-session-device-meta">{locationSummary}</span>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -23,9 +23,10 @@ describe("AdminUserDetailPage device inventory", () => {
 
   it("shows a loading state until the device inventory is available", async () => {
     let resolveDevices: ((page: AdminUserDevicePage) => void) | undefined;
-    vi.spyOn(api, "adminUserDevices").mockImplementation(() => new Promise((resolve) => {
+    const pendingDevices = new Promise<AdminUserDevicePage>((resolve) => {
       resolveDevices = resolve;
-    }));
+    });
+    vi.spyOn(api, "adminUserDevices").mockReturnValue(pendingDevices);
     renderDevices();
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("正在读取设备清单…"));
@@ -49,6 +50,12 @@ describe("AdminUserDetailPage device inventory", () => {
         firstSeenAt: 1_700_000_000,
         lastSeenAt: 1_700_000_100,
         lastRemoteIp: "192.0.2.25",
+        lastRemoteIpLocation: {
+          country: "美国",
+          province: "加利福尼亚州",
+          city: "山景城",
+          isp: "<img src=x onerror=alert(1)>",
+        },
       }, { ...makeDevice("signed-out-device"), hasActiveLogin: false }],
       page: 1,
       pageSize: 20,
@@ -65,6 +72,12 @@ describe("AdminUserDetailPage device inventory", () => {
     expect(container.textContent).toContain("1.2.3");
     expect(container.textContent).toContain("Browser");
     expect(container.textContent).toContain("192.0.2.25");
+    const deviceRows = [...container.querySelectorAll(".lux-admin-user-device-table tbody tr")];
+    const locatedRow = deviceRows.find((row) => row.textContent?.includes("browser-device-1"));
+    const unknownLocationRow = deviceRows.find((row) => row.textContent?.includes("signed-out-device"));
+    expect(locatedRow?.lastElementChild?.textContent).toContain("美国 · 加利福尼亚州 · 山景城 · <img src=x onerror=alert(1)>");
+    expect(unknownLocationRow?.lastElementChild?.textContent).toContain("未知");
+    expect(container.querySelector(".lux-admin-user-device-table img")).toBeNull();
     expect(container.textContent).toContain("有有效登录");
     expect(container.textContent).toContain("无有效登录");
     expect(container.textContent).not.toContain("session-token");
@@ -110,9 +123,11 @@ describe("AdminUserDetailPage device inventory", () => {
   });
 
   it("allows retry after a read error and shows an empty state", async () => {
-    const list = vi.spyOn(api, "adminUserDevices")
-      .mockRejectedValueOnce(new Error("temporary device failure"))
-      .mockResolvedValueOnce({ devices: [], page: 1, pageSize: 20, totalCount: 0 });
+    let deviceReadAttempts = 0;
+    const list = vi.spyOn(api, "adminUserDevices").mockImplementation(async (_userId, page = 1, pageSize = 20) => {
+      if (pageSize === 20 && deviceReadAttempts++ === 0) throw new Error("temporary device failure");
+      return { devices: [], page, pageSize, totalCount: 0 };
+    });
     renderDevices();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent)
@@ -121,9 +136,10 @@ describe("AdminUserDetailPage device inventory", () => {
 
     await act(async () => {
       findButton("重试").click();
-      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(deviceReadAttempts).toBe(2));
       await vi.waitFor(() => expect(container.textContent).toContain("尚无已记录的设备。"));
     });
+    expect(list.mock.calls.filter(([, , pageSize]) => pageSize === 20)).toHaveLength(2);
   });
 
   function renderDevices() {
@@ -184,5 +200,6 @@ function makeDevice(deviceId: string) {
     firstSeenAt: 1_700_000_000,
     lastSeenAt: 1_700_000_100,
     lastRemoteIp: null,
+    lastRemoteIpLocation: null,
   };
 }

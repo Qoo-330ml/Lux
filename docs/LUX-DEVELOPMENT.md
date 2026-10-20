@@ -17073,10 +17073,14 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 设备表安全显示国家/地区/运营商摘要和未知状态；窄屏仍由表格容器滚动。
-- [ ] 定向 Vitest、Web build 与 diff check 通过。
+- [x] 设备表安全显示国家/地区/运营商摘要和未知状态；窄屏仍由表格容器滚动。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
 
 短计划：先为有/无归属地添加行级回归；再扩展 DTO 与展示；最后运行设备 Vitest 和 Web build。
+
+实施结果（2026-10-21）：`AdminUserDevice` 增加可空归属地 DTO；设备表在最近 IP 下以普通文本显示国家、省/地区、城市和运营商，字段缺失或为空时显示“未知”。展示数据不参与 ACL 判定；设备表仍由 `overflow-x: auto` 容器承载，窄屏保留横向滚动。
+
+验证：`pnpm --dir web install --frozen-lockfile` 显示依赖已是最新；定向 `vitest run tests/admin-user-devices.test.tsx` 4/4 通过，覆盖位置摘要、未知状态和外部字符串按文本安全渲染；`pnpm --dir web build` 通过。`git diff --check` 通过。全量 `pnpm --dir web test` 为 103 个文件通过、5 个文件失败（826 项中 9 项失败）；失败分布在其他用户会话、首页/媒体卡片和轮询测试，设备清单目标文件通过。未做真实浏览器或部署验证。
 
 #### LUX-823：修正内容限制索引页的过期说明
 
