@@ -580,6 +580,7 @@ impl MailChallengeKind {
 }
 
 pub(crate) struct NewMailChallenge<'a> {
+    pub(crate) id: &'a str,
     pub(crate) kind: MailChallengeKind,
     pub(crate) recipient_email: &'a str,
     pub(crate) reference_id: &'a str,
@@ -1609,6 +1610,9 @@ impl Database {
     ) -> Result<StoredMailChallenge, StorageError> {
         if now < 0
             || challenge.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
             || challenge.token_hash.len() != 32
             || challenge.recipient_email.trim() != challenge.recipient_email
             || !(3..=320).contains(&challenge.recipient_email.len())
@@ -1620,7 +1624,6 @@ impl Database {
             return Err(StorageError::Conflict("invalid mail challenge".to_owned()));
         }
 
-        let id = Uuid::now_v7().to_string();
         self.query_as::<MailChallengeRecord>(
             "INSERT INTO mail_challenges (
                  id, challenge_kind, recipient_email, reference_id, token_hash,
@@ -1629,7 +1632,7 @@ impl Database {
              RETURNING id, challenge_kind, recipient_email, reference_id, token_hash,
                        expires_at, consumed_at, revoked_at, created_at",
         )
-        .bind(id)
+        .bind(challenge.id)
         .bind(challenge.kind.as_str())
         .bind(challenge.recipient_email)
         .bind(challenge.reference_id)
@@ -5338,6 +5341,7 @@ mod mail_outbox_tests {
     }
 
     fn new_challenge<'a>(
+        id: &'a str,
         kind: MailChallengeKind,
         recipient_email: &'a str,
         reference_id: &'a str,
@@ -5345,6 +5349,7 @@ mod mail_outbox_tests {
         expires_at: i64,
     ) -> NewMailChallenge<'a> {
         NewMailChallenge {
+            id,
             kind,
             recipient_email,
             reference_id,
@@ -5403,6 +5408,7 @@ mod mail_outbox_tests {
         let invitation = database
             .create_mail_challenge(
                 new_challenge(
+                    "challenge-invitation-1",
                     MailChallengeKind::Invitation,
                     "one@example.test",
                     "invite-record-1",
@@ -5413,8 +5419,25 @@ mod mail_outbox_tests {
             )
             .await?;
         assert_eq!(invitation.kind, MailChallengeKind::Invitation);
+        assert_eq!(invitation.id, "challenge-invitation-1");
         assert_eq!(invitation.token_hash, invitation_hash);
         assert!(database.get_mail_challenge(&invitation.id).await?.is_some());
+        assert!(
+            database
+                .create_mail_challenge(
+                    new_challenge(
+                        "challenge-invitation-1",
+                        MailChallengeKind::Invitation,
+                        "one@example.test",
+                        "invite-record-1",
+                        &invitation_hash,
+                        20,
+                    ),
+                    10,
+                )
+                .await
+                .is_err()
+        );
         assert!(
             !database
                 .consume_mail_challenge(&invitation.id, &[8_u8; 32], 11)
@@ -5440,6 +5463,7 @@ mod mail_outbox_tests {
         let verification = database
             .create_mail_challenge(
                 new_challenge(
+                    "challenge-verification-1",
                     MailChallengeKind::EmailVerification,
                     "two@example.test",
                     "registration-2",
@@ -5477,6 +5501,7 @@ mod mail_outbox_tests {
             database
                 .create_mail_challenge(
                     new_challenge(
+                        "invalid-hash-challenge",
                         MailChallengeKind::Invitation,
                         "one@example.test",
                         "invite-record-1",
@@ -5492,6 +5517,7 @@ mod mail_outbox_tests {
             database
                 .create_mail_challenge(
                     new_challenge(
+                        "expired-challenge",
                         MailChallengeKind::Invitation,
                         "one@example.test",
                         "invite-record-1",
@@ -5509,6 +5535,34 @@ mod mail_outbox_tests {
                 .await,
             Err(StorageError::Conflict(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_storage_rejects_invalid_ids() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, database) = test_database().await?;
+        let long_id = "x".repeat(129);
+        database.reset_query_count();
+        for id in ["", " padded ", "control\ncharacter", long_id.as_str()] {
+            assert!(matches!(
+                database
+                    .create_mail_challenge(
+                        new_challenge(
+                            id,
+                            MailChallengeKind::Invitation,
+                            "one@example.test",
+                            "invite-record-1",
+                            &[1_u8; 32],
+                            20,
+                        ),
+                        10,
+                    )
+                    .await,
+                Err(StorageError::Conflict(_))
+            ));
+        }
+        assert_eq!(database.query_count(), 0);
         Ok(())
     }
 

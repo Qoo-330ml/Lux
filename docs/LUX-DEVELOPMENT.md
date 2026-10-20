@@ -16332,6 +16332,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：`cargo test --locked --lib application::mail::tests` 9/9、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。测试覆盖首次私有创建、密钥重载稳定性、并发初始化、权限/符号链接/长度拒绝、凭证域隔离、URL-safe 编码、摘要和验证。全目标全 feature Clippy 仍失败于 15 项既有诊断（11 项库代码、4 项测试代码），均位于未修改的管理员 API、Emby 播放、权限复制或用户存储文件；`src/application/mail.rs` 无 Clippy 诊断。
 
+#### LUX-785：让邮件挑战存储接受预先分配的挑战 ID
+
+范围：使注册邮件挑战的应用层可先用挑战 ID 派生 HMAC token 与摘要，再将该 ID 和摘要一起写入数据库。当前 storage 方法在插入时自行生成 ID，与 LUX-784 的 ID 绑定凭证合同不匹配。本任务只调整内部存储输入，不改变 schema、公开 API 或凭证算法。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`（定向存储测试内置于 repository 模块）。
+
+验收标准：
+
+- [x] 创建挑战的内部输入必须包含调用方预先分配的 ID；storage 校验 ID 并原样持久化，不再在插入后生成 ID。
+- [x] 重复 ID 由数据库唯一约束拒绝；空白、控制字符和超长 ID 在进入 SQL 前拒绝。
+- [x] 现有挑战摘要、消费、过期与撤销行为保持不变，并有定向回归覆盖。
+- [x] 运行邮件挑战存储定向测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先增加预分配 ID 保留和边界拒绝测试并确认 RED；再把 ID 纳入挑战输入并在 storage 校验、持久化；最后运行定向存储测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：定向存储测试 `cargo test --locked --lib storage::repository::mail_outbox_tests` 8/8、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。非法 ID 测试同时断言没有执行 SQL，重复 ID 由主键唯一约束拒绝。全目标全 feature Clippy 仍失败于 15 项既有诊断，均位于未修改的管理员 API、Emby 播放、权限复制或用户存储文件；本任务文件没有新增诊断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
