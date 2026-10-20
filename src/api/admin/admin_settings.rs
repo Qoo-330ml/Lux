@@ -7,6 +7,18 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_settings).patch(admin_update_settings),
         )
         .route(
+            "/api/v1/admin/settings/mail",
+            get(admin_get_mail_settings).put(admin_update_mail_settings),
+        )
+        .route(
+            "/api/v1/admin/settings/mail/credentials",
+            put(admin_update_mail_credentials).delete(admin_delete_mail_credentials),
+        )
+        .route(
+            "/api/v1/admin/settings/mail/test",
+            post(admin_test_mail_connection),
+        )
+        .route(
             "/api/v1/admin/api-key",
             get(admin_get_api_key).delete(admin_revoke_api_key),
         )
@@ -15,6 +27,163 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/settings/network-proxy/test",
             post(admin_test_network_proxy),
         )
+}
+
+pub(crate) async fn admin_get_mail_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let settings = match crate::application::mail::read_mail_settings(config_dir).await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let credentials_configured =
+        match crate::application::mail::read_smtp_credentials(config_dir).await {
+            Ok(credentials) => credentials.is_some(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    Json(json!({
+        "configured": settings.is_some(),
+        "credentialsConfigured": credentials_configured,
+        "settings": settings,
+    }))
+    .into_response()
+}
+
+pub(crate) async fn admin_update_mail_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(settings): Json<crate::application::mail::MailSettings>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if settings.validate().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 设置无效",
+        )
+        .into_response();
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::write_mail_settings(config_dir, Some(&settings)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 设置无效",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_update_mail_credentials(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(credentials): Json<crate::application::mail::SmtpCredentials>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if credentials.validate().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 凭据无效",
+        )
+        .into_response();
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::write_smtp_credentials(config_dir, Some(&credentials)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 凭据无效",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_delete_mail_credentials(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::write_smtp_credentials(config_dir, None).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_test_mail_connection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::test_smtp_connection(config_dir).await {
+        Ok(()) => Json(json!({ "reachable": true })).into_response(),
+        Err(crate::application::mail::MailError::SettingsNotConfigured) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "请先保存 SMTP 设置",
+        )
+        .into_response(),
+        Err(crate::application::mail::MailError::SettingsRejected) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 设置无效",
+        )
+        .into_response(),
+        Err(crate::application::mail::MailError::SettingsUnavailable)
+        | Err(crate::application::mail::MailError::CredentialsUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(crate::application::mail::MailError::CredentialsRejected) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "SMTP 配置暂时不可用",
+        )
+        .into_response(),
+        Err(crate::application::mail::MailError::ConnectionFailed)
+        | Err(crate::application::mail::MailError::TransportUnavailable) => api_error(
+            &headers,
+            StatusCode::BAD_GATEWAY,
+            lux::ApiErrorCode::Internal,
+            "SMTP 连接失败",
+        )
+        .into_response(),
+    }
 }
 
 pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {

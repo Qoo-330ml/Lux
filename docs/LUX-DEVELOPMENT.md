@@ -16241,6 +16241,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：邮件模块定向库测试 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍被 11 条位于未修改 API/播放/用户存储文件的既有诊断阻断；本模块无新增 Clippy 诊断。仅构造 SMTP TLS 传输，未连接外部 SMTP 服务。依赖 Lettre 0.11.23，Cargo 使用 Toshiba target 目录。
 
+#### LUX-780：提供管理员 SMTP 设置与连通性检查 API
+
+范围：提供管理员读取/更新 SMTP 非敏感配置、单独保存/删除 SMTP 用户名与密码，以及检查已保存 SMTP 服务连接的 API。设置读取和响应只返回 `credentialsConfigured`，不回显凭据；设置更新不得覆盖凭据文件。连通性检查使用 SMTP `NOOP` 验证连接并要求 TLS，不发送测试邮件；连接失败返回固定脱敏错误，SMTP 错误详情不得进入响应或日志。不实现邮件队列、邀请、注册或 Web 设置 UI。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/mail.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_mail_settings.rs`。
+
+验收标准：
+
+- [x] `GET/PUT /api/v1/admin/settings/mail` 读写 SMTP 主机、端口、TLS 模式、发件人和站点 URL；GET 附带配置状态但不返回用户名或密码。
+- [x] `PUT/DELETE /api/v1/admin/settings/mail/credentials` 将用户名和密码一起保存到私有凭据文件或删除文件；所有写操作需要管理员权限与 CSRF。
+- [x] `POST /api/v1/admin/settings/mail/test` 只对已保存配置执行有界超时的 TLS SMTP `NOOP` 连通性检查，不发送邮件；返回不包含供应商错误、用户名或密码的结果。
+- [x] 集成测试覆盖鉴权/CSRF、配置往返与凭据隔离、校验失败、凭据删除和脱敏连接失败。
+- [x] 更新 `docs/API.md`；定向集成目标、`cargo build --locked`、fmt 与 diff check 通过。
+
+短计划：先新增管理员邮件设置集成测试并运行定向目标确认 RED；再补应用层连接检查与管理员路由；最后更新 API 文档，运行定向目标、build、fmt 和 diff check。
+
+验证（2026-10-20）：TDD RED 时新接口返回 404；实现后 `cargo test --locked --test admin_mail_settings` 1/1、邮件模块定向库测试 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成回归用本机 SMTP 停滞连接确认 TLS 握手整体在 8 秒 Tokio 超时内退出；普通设置再次保存后凭据文件保持不变，且 API 响应无用户名/密码。`cargo clippy --locked --lib --test admin_mail_settings -- -D warnings` 被 11 项已有诊断阻断，均位于未修改的用户 API、Emby 播放和用户存储文件，本任务文件没有新增诊断。未连接外部 SMTP 服务。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

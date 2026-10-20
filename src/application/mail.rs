@@ -4,6 +4,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use lettre::{
@@ -19,6 +20,7 @@ const MAX_SMTP_HOST_LENGTH: usize = 253;
 const MAX_SMTP_USERNAME_LENGTH: usize = 320;
 const MAX_SENDER_NAME_LENGTH: usize = 128;
 const MAX_SMTP_PASSWORD_LENGTH: usize = 4_096;
+const SMTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -46,7 +48,7 @@ pub(crate) struct SmtpCredentials {
 }
 
 impl SmtpCredentials {
-    fn validate(&self) -> Result<(), MailError> {
+    pub(crate) fn validate(&self) -> Result<(), MailError> {
         if self.username.trim().is_empty()
             || self.username.trim() != self.username
             || self.username.len() > MAX_SMTP_USERNAME_LENGTH
@@ -114,6 +116,10 @@ impl MailSettings {
 pub(crate) enum MailError {
     SettingsRejected,
     CredentialsRejected,
+    SettingsUnavailable,
+    CredentialsUnavailable,
+    SettingsNotConfigured,
+    ConnectionFailed,
     TransportUnavailable,
 }
 
@@ -133,7 +139,8 @@ pub(crate) fn build_smtp_transport(
         }
     }
     .map_err(|_| MailError::TransportUnavailable)?
-    .port(settings.port);
+    .port(settings.port)
+    .timeout(Some(SMTP_OPERATION_TIMEOUT));
 
     let builder = match credentials {
         Some(credentials) => {
@@ -142,6 +149,21 @@ pub(crate) fn build_smtp_transport(
         None => builder,
     };
     Ok(builder.build())
+}
+
+pub(crate) async fn test_smtp_connection(config_dir: &Path) -> Result<(), MailError> {
+    let settings = read_mail_settings(config_dir)
+        .await
+        .map_err(|_| MailError::SettingsUnavailable)?
+        .ok_or(MailError::SettingsNotConfigured)?;
+    let credentials = read_smtp_credentials(config_dir)
+        .await
+        .map_err(|_| MailError::CredentialsUnavailable)?;
+    let transport = build_smtp_transport(&settings, credentials)?;
+    match tokio::time::timeout(SMTP_OPERATION_TIMEOUT, transport.test_connection()).await {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false) | Err(_)) | Err(_) => Err(MailError::ConnectionFailed),
+    }
 }
 
 pub(crate) async fn read_smtp_credentials(
