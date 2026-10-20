@@ -54,7 +54,7 @@ describe("AdminUsersPage account preference copy", () => {
       sourceVersion: 4,
       sourceSnapshot: {
         appearance: { theme: "dark", accentColor: "berry" },
-        playback: { audioLanguage: "日语", subtitleLanguage: "简体中文", autoPlayNextEpisode: true, playedPercent: 67 },
+        playback: { audioLanguage: "日语", subtitleLanguage: "简体中文", autoPlayNextEpisode: true, optimizedImages: true, playedPercent: 67 },
         libraryOrder: ["movies", "series"],
       },
       targets: [
@@ -143,7 +143,7 @@ describe("AdminUsersPage account preference copy", () => {
       sourceVersion: 1,
       sourceSnapshot: {
         appearance: { theme: "light", accentColor: "silver" },
-        playback: { audioLanguage: "原始音轨", subtitleLanguage: "简体中文", autoPlayNextEpisode: true, playedPercent: 95 },
+        playback: { audioLanguage: "原始音轨", subtitleLanguage: "简体中文", autoPlayNextEpisode: true, optimizedImages: false, playedPercent: 95 },
         libraryOrder: [],
       },
       targets: [{ userId: target.id, expectedVersion: 0 }],

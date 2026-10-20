@@ -11,6 +11,7 @@ export type AccountSettings = {
   audioLanguage: string;
   subtitleLanguage: string;
   autoPlayNextEpisode: boolean;
+  optimizedImages: boolean;
   playedPercent: number;
 };
 
@@ -25,6 +26,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   audioLanguage: "原始音轨",
   subtitleLanguage: "简体中文",
   autoPlayNextEpisode: true,
+  optimizedImages: false,
   playedPercent: 95,
 };
 
@@ -57,6 +59,7 @@ export function readStoredAccountSettings(userId?: string): AccountSettings | nu
       audioLanguage: typeof stored.audioLanguage === "string" ? stored.audioLanguage : DEFAULT_ACCOUNT_SETTINGS.audioLanguage,
       subtitleLanguage: typeof stored.subtitleLanguage === "string" ? stored.subtitleLanguage : DEFAULT_ACCOUNT_SETTINGS.subtitleLanguage,
       autoPlayNextEpisode: stored.autoPlayNextEpisode !== false,
+      optimizedImages: stored.optimizedImages === true,
       playedPercent: typeof stored.playedPercent === "number" && stored.playedPercent >= 1 && stored.playedPercent <= 100
         ? Math.trunc(stored.playedPercent)
         : DEFAULT_ACCOUNT_SETTINGS.playedPercent,

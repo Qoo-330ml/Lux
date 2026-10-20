@@ -31,6 +31,7 @@ pub mod emby_migration;
 pub mod emby_migration_service;
 pub mod home;
 pub mod identification;
+pub(crate) mod image_variants;
 pub mod image_repairs;
 pub mod images;
 pub(crate) mod internal_write;

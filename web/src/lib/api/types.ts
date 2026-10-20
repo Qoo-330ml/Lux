@@ -55,6 +55,7 @@ export type AccountPreferences = {
   audioLanguage: string;
   subtitleLanguage: string;
   autoPlayNextEpisode: boolean;
+  optimizedImages: boolean;
   libraryOrder: string[];
   playedPercent: number;
   version: number;
@@ -82,6 +83,10 @@ export type UserPasswordChangeInput = {
 export type AuthSession = {
   user: LuxUser;
   serverName?: string | null;
+  /** The server-level experiment switch is on. */
+  imageVariantsAvailable?: boolean;
+  /** Server switch and the current user's preference are both on. */
+  imageVariantsEnabled?: boolean;
 };
 
 export type UserInvitationAcceptanceInput = {
@@ -1599,6 +1604,7 @@ export type AdminAccountPreferenceCopyPreview = {
       audioLanguage: string;
       subtitleLanguage: string;
       autoPlayNextEpisode: boolean;
+      optimizedImages: boolean;
       playedPercent: number;
     };
     libraryOrder?: string[];
@@ -1701,6 +1707,13 @@ export type MediaStrategySettings = {
   subtitles: MediaSubtitleStrategySettings;
 };
 
+export type MediaImageVariantCacheSettings = {
+  enabled: boolean;
+  maxFiles: number;
+  maxBytes: number;
+  concurrency: number;
+};
+
 export type MediaImageStrategySettings = {
   poster: boolean;
   artwork: boolean;
@@ -1713,6 +1726,7 @@ export type MediaImageStrategySettings = {
   writeToMetadata: boolean;
   maxBackdropCount: number;
   minDownloadWidth: number;
+  variantCache?: MediaImageVariantCacheSettings;
 };
 
 export type MediaSubtitleStrategySettings = {

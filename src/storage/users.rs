@@ -4064,7 +4064,7 @@ impl Database {
             .query(
                 "SELECT theme, accent_color, show_media_libraries,
                         show_continue_watching, audio_language, subtitle_language,
-                        auto_play_next_episode, version, updated_at
+                        auto_play_next_episode, optimized_images, version, updated_at
                  FROM user_account_preferences WHERE user_id = ?",
             )
             .bind(user_id)
@@ -4087,11 +4087,29 @@ impl Database {
             audio_language: row.get("audio_language"),
             subtitle_language: row.get("subtitle_language"),
             auto_play_next_episode: row.get::<i64, _>("auto_play_next_episode") != 0,
+            optimized_images: row.get::<i64, _>("optimized_images") != 0,
             library_order,
             played_percent,
             version: row.get("version"),
             updated_at: row.get("updated_at"),
         }))
+    }
+
+    pub(crate) async fn user_optimized_images_enabled(
+        &self,
+        user_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar::<i64>(
+            "SELECT optimized_images FROM user_account_preferences WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value| value.unwrap_or_default() != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     #[allow(dead_code)]
@@ -4117,9 +4135,9 @@ impl Database {
                 "INSERT INTO user_account_preferences (
                     user_id, theme, accent_color, show_media_libraries,
                     show_continue_watching, audio_language, subtitle_language,
-                    auto_play_next_episode, version, updated_at
+                    auto_play_next_episode, optimized_images, version, updated_at
                  )
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch()
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch()
                  WHERE EXISTS (
                     SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
                  )
@@ -4133,6 +4151,7 @@ impl Database {
             .bind(preferences.audio_language)
             .bind(preferences.subtitle_language)
             .bind(database_flag(preferences.auto_play_next_episode))
+            .bind(database_flag(preferences.optimized_images))
             .bind(user_id)
             .execute(&mut *transaction)
             .await
@@ -4141,7 +4160,8 @@ impl Database {
                 "UPDATE user_account_preferences
                  SET theme = ?, accent_color = ?, show_media_libraries = ?,
                      show_continue_watching = ?, audio_language = ?, subtitle_language = ?,
-                     auto_play_next_episode = ?, version = version + 1, updated_at = unixepoch()
+                     auto_play_next_episode = ?, optimized_images = ?,
+                     version = version + 1, updated_at = unixepoch()
                  WHERE user_id = ? AND version = ?
                    AND EXISTS (
                        SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
@@ -4154,6 +4174,7 @@ impl Database {
             .bind(preferences.audio_language)
             .bind(preferences.subtitle_language)
             .bind(database_flag(preferences.auto_play_next_episode))
+            .bind(database_flag(preferences.optimized_images))
             .bind(user_id)
             .bind(expected_version)
             .bind(user_id)

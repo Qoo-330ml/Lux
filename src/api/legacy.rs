@@ -66,6 +66,7 @@ use crate::{
         emby_migration_service::{
             CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
         },
+        image_variants::ImageVariantService,
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
             ImageWriteService, normalize_image_type, read_image_dimensions,
@@ -166,6 +167,7 @@ pub struct AppState {
     catalog: Option<CatalogService>,
     home: Option<HomeService>,
     images: Option<ImageService>,
+    image_variants: Option<Arc<ImageVariantService>>,
     image_writes: Option<ImageWriteService>,
     image_candidates: Option<ImageCandidateService>,
     library_covers: Option<LibraryCoverService>,
@@ -256,6 +258,25 @@ impl AppState {
         let log_store = LogStore::new(&config_dir);
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
+        let image_variants = Some(Arc::new(ImageVariantService::new(
+            &config.config_dir,
+            crate::application::settings::ImageVariantCacheSettings::default(),
+        )));
+        if let Some(service) = image_variants.as_ref()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let service = Arc::clone(service);
+            let settings_database = database.clone();
+            handle.spawn(async move {
+                if let Ok(settings) =
+                    crate::application::settings::read_media_strategy_settings(&settings_database)
+                        .await
+                {
+                    service.apply_initial_settings(settings.images.variant_cache);
+                }
+                service.startup_scan();
+            });
+        }
         let database_setup = Some(DatabaseSetupService::new(
             config.clone(),
             database.backend(),
@@ -422,6 +443,7 @@ impl AppState {
                 access.clone(),
                 config.config_dir.clone(),
             )),
+            image_variants,
             image_writes,
             image_candidates,
             library_covers: library_covers.clone(),

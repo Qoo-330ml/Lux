@@ -17116,6 +17116,41 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 短计划：先建立设计验收项到任务/测试的交叉表；再修正遗漏与状态；最后运行该目标规定的最终门禁并记录限制。
 
+#### LUX-826：按显示尺寸提供派生图片变体缓存
+
+来源方案：`LUX-IMAGE-VARIANTS-PLAN.md`（2026-10-20）。方案中的任务编号建议为 LUX-826，项目所有者要求按方案实施。
+
+范围：Web 图片端点新增可选 `w=360|720|1280`，按长边生成 JPEG 派生变体并缓存到 `/config/image-cache/v1/`。原图只读，永不改写或删除媒体库文件；默认关闭时响应字节、ETag 与 `Cache-Control` 与实施前一致。仅处理 POSTER、THUMB、FANART；按方案 §13 风险表，LOGO 首版不生成变体以避免透明背景压成黑底。变体按 `content_tag + 宽度` 命名，使用 `image` crate 在 `spawn_blocking` 中解码、应用 EXIF 方向、Lanczos3 缩放、JPEG q80 编码并原子落盘；生成失败、超时、缓存不可写或超限时一律回退原图。
+
+配置：`server_settings.media_strategy.images.variantCache` 新增 `enabled`（默认 `false`）、`maxFiles`（100–1,000,000，默认 20,000）、`maxBytes`（64 MiB–64 GiB，默认 2 GiB）、`concurrency`（1–4，默认 2）。旧 JSON 缺失该对象时由 serde 默认关闭，不需要 migration。管理员保存全局策略后热更新服务开关与并发，无需重启。
+
+用户偏好：`user_account_preferences.optimized_images` 新增列（migration `0204_user_optimized_images.sql`，SQLite 与 PostgreSQL），默认 `false`；纳入账户偏好 CAS 和管理员偏好复制的 playback 组。`/api/v1/auth/me` 返回 `imageVariantsAvailable`（仅主开关）与 `imageVariantsEnabled`（主开关与用户偏好同时开启）。方案 §5.3 只用单一字段同时决定“是否显示账户开关”和“是否拼 `w=`”，会导致用户偏好关闭时开关被隐藏、无法再次开启；因此额外增加 `imageVariantsAvailable`，`imageVariantsEnabled` 仍保持方案定义的组合语义。
+
+缓存保护：内存 LRU（文件数与字节双上限）、启动后台扫描（按 mtime 恢复顺序，清理 0 字节与 `.lux-*.tmp`）、同 key 并发只生成一次、失败 key 冷却 60 秒、单张源图上限 30 MB / 40 MP、响应预算 300 ms、生成超时 10 秒、全局生成并发默认 2。日志只记录宽度、字节数、耗时、错误类别与 item/image 类型，不记录本地路径或用户数据。
+
+验收：
+
+- [x] 默认关闭时图片响应字节、ETag 与 `Cache-Control` 与实施前一致；开关关闭时忽略 `w`。
+- [x] 主开关与用户偏好同时开启时，`w=360/720/1280` 返回长边对应、保持宽高比的 JPEG 变体；ETag 含 `content_tag` 与宽度，`Cache-Control` 为 `private, max-age=31536000, immutable`；`If-None-Match` 返回 304，HEAD 无 body。
+- [x] 主开关开启时非法 `w` 返回 `400 INVALID_REQUEST`；关闭时忽略。
+- [x] 原图只读；变体写入 `/config/image-cache/v1/`；`content_tag` 必须为 64 位小写十六进制，路径不使用用户输入。
+- [x] EXIF 方向、只缩小不放大、40 MP / 30 MB 上限、失败回退与 60 秒冷却有单元测试覆盖。
+- [x] 同一 key 并发 8 个请求只生成 1 次；LRU 在文件数与字节上限下淘汰最旧文件；启动扫描清理 0 字节与临时文件。
+- [x] 缓存目录不可写、损坏图片、尺寸不足、内容标签缺失时返回原图且不产生错误响应。
+- [x] 管理端全局策略可保存 `variantCache` 并热更新；账户端仅在主开关开启时显示“使用优化图片”，保存到账户偏好并在跨设备读取后生效。
+- [x] Web 卡片、继续观看、Hero、详情海报/背景、季度/单集、剧照分别拼接 360 / 1280 / 720 宽度；关闭时不改 URL。
+- [x] 定向 Rust/Web 测试、`cargo build --locked`、`cargo fmt --all -- --check`、`pnpm --dir web build` 通过；全量门禁结果与既有基线失败在实施结果中记录。
+
+预计文件：`src/application/image_variants.rs`（新增）、`src/application/images.rs`、`src/application/settings.rs`、`src/application/user_account_preferences.rs`、`src/application/mod.rs`、`src/api/media.rs`、`src/api/legacy.rs`、`src/api/users.rs`、`src/api/admin/admin_settings.rs`、`src/storage/catalog.rs`、`src/storage/users.rs`、`src/storage/repository.rs`、`migrations/0204_user_optimized_images.sql`、`migrations-postgres/0204_user_optimized_images.sql`、`tests/image_variants.rs`（新增）、`web/src/lib/api/types.ts`、`web/src/app/App.tsx`、`web/src/features/home/image-variants.ts`（新增）、`web/src/features/home/media-display.tsx`、`web/src/features/home/media-card-visual.tsx`、`web/src/features/home/media.tsx`、`web/src/features/home/HomePage.tsx`、`web/src/features/detail/MediaDetailHero.tsx`、`web/src/features/detail/MediaEpisodesSection.tsx`、`web/src/features/detail/MediaStills.tsx`、`web/src/features/detail/CollectionDetailPage.tsx`、`web/src/features/account/AccountPage.tsx`、`web/src/features/account/account-settings.ts`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/AdminUserPreferenceCopyDialog.tsx`、`web/tests/image-variants.test.ts`（新增）、`web/tests/image-variants-render.test.tsx`（新增）、`web/tests/account-settings.test.tsx`、`web/tests/admin-libraries.test.tsx`、`web/tests/admin-user-preference-copy.test.tsx`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：无新增依赖，复用 `image` crate 与既有 SQLite/PostgreSQL 迁移机制。明确不做：全量预热、裁剪、AVIF/HEIC、CDN、多进程共享缓存、Emby 图片路由变体、视频缩略图与字幕变更。
+
+实施结果（2026-10-21）：按方案完成 A–E 阶段。新增 `ImageVariantService`，在 `spawn_blocking` 中解码、`apply_orientation`、Lanczos3 缩放、JPEG q80 编码并原子写 `/config/image-cache/v1/<tag前两位>/<content_tag>-w<width>.jpg`；LRU 同时限制文件数与字节，启动后台按 mtime 扫描并清理 0 字节与 `.lux-*.tmp`。服务仅在主开关与用户偏好同时开启时生成，其他情况、非法/不支持尺寸、尺寸不足、解码失败、缓存不可写或超时均返回原图。管理端全局策略保存后立即热更新开关、并发和容量；`auth/me` 同时返回 `imageVariantsAvailable`（仅主开关，用于显示账户开关）与 `imageVariantsEnabled`（主开关与偏好同时开启，用于拼 `w=`）。方案 §5.3 的单一组合字段无法在用户关闭偏好后再次显示开关，因此新增 `imageVariantsAvailable`；这是对方案的一处必要补充。按方案 §13 风险表，LOGO 首版不生成变体（方案 §6 的列表包含 LOGO，两处冲突时采用风险表），FANART/THUMB/POSTER 之外的类型保持原图。服务端同时校验用户偏好，避免已选择关闭的用户仍消耗生成 CPU；这与方案 §5.1“客户端不传 w”一致，并满足 §10.2“用户偏好关闭返回原图”。
+
+验证：`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过；`pnpm --dir web build` 通过。定向测试：`cargo test --locked --lib application::image_variants` 11/11、`cargo test --locked --lib application::settings::variant_cache_tests` 2/2、`cargo test --locked --lib application::user_account_preferences` 10/10、`cargo test --locked --test image_variants` 9/9、`cargo test --locked --test images --test image_api` 3/3 通过。Web 定向测试 `tests/image-variants` 5/5、`tests/image-variants-render` 2/2、`tests/account-settings` 34/34、`tests/admin-libraries` 新增用例通过。全量 `cargo test --locked --all-targets` 结果 1151 通过 / 5 失败：`application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`storage::repository::repository_tests::automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost` 在实施前提交 `8d032103` 上同样失败；`storage::repository::jobs::tests::shutdown_cancels_legacy_scan_jobs_in_one_bounded_update` 在提交 `8d032103` 上通过，但当前工作区并行的媒体库删除改动在 `src/storage/jobs/shutdown.rs` 增加了第 10 条 UPDATE，使既有断言（期望 9 条）失败，不属于 LUX-826。全量 `pnpm --dir web test` 最近一次 836 通过 / 1 失败：`tests/admin-libraries.test.tsx` 的“删除成功后移除媒体库卡片”在提交 `8d032103` 上通过，当前工作区并行删除改动把卡片移除改为后台清理后该旧断言失败，不属于 LUX-826。全目标 Clippy 仍有 19 项既有告警（管理员 API、Emby/media、播放会话、权限复制、数据库维护与存储测试）；LUX-826 新增和修改的文件未产生新的 Clippy 诊断（`serve_image` 参数已收敛为 7 个）。
+
+限制与剩余风险：未在 FNOS/x86_64 或真实 NAS 上验证；未执行方案阶段 F 的 1,000 张真实图片、20 Mbps / 40 ms 网络基准，因此 §12 的生成 p95、首字节和首屏总字节仍以方案中的本机测量为参考，未在本任务复测。PostgreSQL migration 未在本机真实 PostgreSQL 上执行（SQLite 空库升级由全部集成测试覆盖）。冷缓存首次请求仍按 300 ms 预算回退原图，由后台完成生成；这是方案设计行为。LOGO 透明背景未处理。缓存目录当前按单实例文件锁与原子写设计，多实例共享 `/config` 不在支持范围。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

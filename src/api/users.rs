@@ -1430,6 +1430,8 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
                         },
                     },
                     "serverName": server_name,
+                    "imageVariantsAvailable": false,
+                    "imageVariantsEnabled": false,
                 }))
                 .into_response();
             }
@@ -1450,9 +1452,22 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
         Err(response) => return response,
     };
     let server_name = current_emby_server_name(&state).await;
+    let image_variants_available = state
+        .image_variants
+        .as_ref()
+        .is_some_and(|variants| variants.enabled());
+    let user_optimized_images = match state.database.as_ref() {
+        Some(database) => database
+            .user_optimized_images_enabled(&user.id.to_string())
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
     Json(json!({
         "user": user_json(&user),
         "serverName": server_name,
+        "imageVariantsAvailable": image_variants_available,
+        "imageVariantsEnabled": image_variants_available && user_optimized_images,
     }))
     .into_response()
 }
@@ -2237,6 +2252,7 @@ pub(super) async fn auth_update_settings(
                 audio_language: preferences.audio_language.clone(),
                 subtitle_language: preferences.subtitle_language.clone(),
                 auto_play_next_episode: preferences.auto_play_next_episode,
+                optimized_images: Some(preferences.optimized_images),
                 library_order: None,
                 played_percent: Some(played_percent),
             },
@@ -2517,6 +2533,7 @@ pub(super) async fn auth_update_library_order(
             audio_language: preferences.audio_language,
             subtitle_language: preferences.subtitle_language,
             auto_play_next_episode: preferences.auto_play_next_episode,
+            optimized_images: Some(preferences.optimized_images),
             library_order: Some(library_order),
             played_percent: None,
         },

@@ -4826,6 +4826,7 @@ pub(crate) struct UserAccountPreferences {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
+    pub(crate) optimized_images: bool,
     pub(crate) library_order: Vec<String>,
     pub(crate) played_percent: i64,
     pub(crate) version: i64,
@@ -4842,6 +4843,7 @@ pub(crate) struct NewUserAccountPreferences<'a> {
     pub(crate) audio_language: &'a str,
     pub(crate) subtitle_language: &'a str,
     pub(crate) auto_play_next_episode: bool,
+    pub(crate) optimized_images: bool,
     pub(crate) library_order: Option<&'a [String]>,
     pub(crate) played_percent: Option<i64>,
 }
@@ -6818,8 +6820,12 @@ pub(crate) struct StoredSubtitleStream {
 #[derive(Debug)]
 pub(crate) struct StoredItemImageCandidate {
     pub(crate) id: String,
+    pub(crate) image_type: String,
     pub(crate) local_path: String,
     pub(crate) root_path: String,
+    pub(crate) content_tag: Option<String>,
+    pub(crate) width: Option<i64>,
+    pub(crate) height: Option<i64>,
 }
 
 pub(crate) struct ItemImageMetadata<'a> {

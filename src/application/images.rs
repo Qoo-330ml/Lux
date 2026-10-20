@@ -2497,10 +2497,14 @@ impl ImageService {
             );
             return Ok(Some(ResolvedImage {
                 id: candidate.id,
+                image_type: candidate.image_type,
                 path: canonical_path,
                 content_type,
                 content_length: metadata.len(),
                 etag,
+                content_tag: candidate.content_tag,
+                width: candidate.width,
+                height: candidate.height,
             }));
         }
 
@@ -2514,10 +2518,14 @@ impl ImageService {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedImage {
     pub id: String,
+    pub image_type: String,
     pub path: PathBuf,
     pub content_type: &'static str,
     pub content_length: u64,
     pub etag: String,
+    pub content_tag: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
 }
 
 pub fn normalize_image_type(value: &str) -> Option<&'static str> {

@@ -104,6 +104,48 @@ pub(crate) struct MediaImageStrategySettings {
     pub(crate) write_to_metadata: bool,
     pub(crate) max_backdrop_count: i64,
     pub(crate) min_download_width: i64,
+    #[serde(default)]
+    pub(crate) variant_cache: ImageVariantCacheSettings,
+}
+
+pub(crate) const MIN_IMAGE_VARIANT_CACHE_FILES: u64 = 100;
+pub(crate) const MAX_IMAGE_VARIANT_CACHE_FILES: u64 = 1_000_000;
+pub(crate) const MIN_IMAGE_VARIANT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_VARIANT_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const MIN_IMAGE_VARIANT_CONCURRENCY: usize = 1;
+pub(crate) const MAX_IMAGE_VARIANT_CONCURRENCY: usize = 4;
+pub(crate) const DEFAULT_IMAGE_VARIANT_CACHE_FILES: u64 = 20_000;
+pub(crate) const DEFAULT_IMAGE_VARIANT_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_IMAGE_VARIANT_CONCURRENCY: usize = 2;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct ImageVariantCacheSettings {
+    pub(crate) enabled: bool,
+    pub(crate) max_files: u64,
+    pub(crate) max_bytes: u64,
+    pub(crate) concurrency: usize,
+}
+
+impl Default for ImageVariantCacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_files: DEFAULT_IMAGE_VARIANT_CACHE_FILES,
+            max_bytes: DEFAULT_IMAGE_VARIANT_CACHE_BYTES,
+            concurrency: DEFAULT_IMAGE_VARIANT_CONCURRENCY,
+        }
+    }
+}
+
+impl ImageVariantCacheSettings {
+    pub(crate) fn is_valid(&self) -> bool {
+        (MIN_IMAGE_VARIANT_CACHE_FILES..=MAX_IMAGE_VARIANT_CACHE_FILES).contains(&self.max_files)
+            && (MIN_IMAGE_VARIANT_CACHE_BYTES..=MAX_IMAGE_VARIANT_CACHE_BYTES)
+                .contains(&self.max_bytes)
+            && (MIN_IMAGE_VARIANT_CONCURRENCY..=MAX_IMAGE_VARIANT_CONCURRENCY)
+                .contains(&self.concurrency)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -138,6 +180,7 @@ impl Default for MediaStrategySettings {
                 write_to_metadata: false,
                 max_backdrop_count: 1,
                 min_download_width: 1280,
+                variant_cache: ImageVariantCacheSettings::default(),
             },
             subtitles: MediaSubtitleStrategySettings {
                 auto_download: false,
@@ -770,6 +813,7 @@ pub(crate) fn validate_media_strategy(settings: &MediaStrategySettings) -> bool 
         )
         && (0..=20).contains(&settings.images.max_backdrop_count)
         && (0..=8192).contains(&settings.images.min_download_width)
+        && settings.images.variant_cache.is_valid()
         && (1..=8).contains(&settings.subtitles.languages.len())
         && settings
             .subtitles
@@ -914,4 +958,77 @@ async fn write_secret_file(
     })
     .await
     .map_err(|error| std::io::Error::other(error.to_string()))?
+}
+
+#[cfg(test)]
+mod variant_cache_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_media_strategy_json_defaults_the_variant_cache_to_off() {
+        let value = serde_json::json!({
+            "metadataLanguage": "zh-CN",
+            "imageLanguage": "zh-CN",
+            "region": "CN",
+            "scraperId": null,
+            "applyScope": "NEW_CONTENT",
+            "images": {
+                "poster": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 1,
+                "minDownloadWidth": 1280
+            },
+            "subtitles": {
+                "autoDownload": false,
+                "languages": ["zh-CN"],
+                "forcedOnly": false,
+                "hearingImpaired": false
+            }
+        });
+        let settings: MediaStrategySettings = serde_json::from_value(value).expect("legacy json");
+        assert_eq!(
+            settings.images.variant_cache,
+            ImageVariantCacheSettings::default()
+        );
+        assert!(!settings.images.variant_cache.enabled);
+        assert_eq!(settings.images.variant_cache.max_files, 20_000);
+        assert_eq!(
+            settings.images.variant_cache.max_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(settings.images.variant_cache.concurrency, 2);
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn variant_cache_ranges_are_validated() {
+        let mut settings = MediaStrategySettings::default();
+        assert!(validate_media_strategy(&settings));
+
+        settings.images.variant_cache.max_files = 99;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_files = 1_000_001;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_files = 20_000;
+
+        settings.images.variant_cache.max_bytes = 64 * 1024 * 1024 - 1;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_bytes = 64 * 1024 * 1024 * 1024 + 1;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_bytes = 2 * 1024 * 1024 * 1024;
+
+        settings.images.variant_cache.concurrency = 0;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.concurrency = 5;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.concurrency = 4;
+        assert!(validate_media_strategy(&settings));
+    }
 }

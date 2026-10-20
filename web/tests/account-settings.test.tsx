@@ -10,6 +10,7 @@ import { LuxShell } from "../src/components/layout/LuxShell";
 import { ApiError, api } from "../src/lib/api/client";
 import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings, readStoredAccountSettings } from "../src/features/account/account-settings";
 import { calculateAvatarCrop } from "../src/features/account/avatar-image";
+import { ImageVariantsContext } from "../src/features/home/image-variants";
 import type { AccountPreferences, AccountPreferencesUpdate } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -28,6 +29,7 @@ const defaultServerPreferences: AccountPreferences = {
   audioLanguage: "原始音轨",
   subtitleLanguage: "简体中文",
   autoPlayNextEpisode: true,
+  optimizedImages: false,
   libraryOrder: [],
   playedPercent: 95,
   version: 0,
@@ -88,6 +90,7 @@ describe("account settings", () => {
       audioLanguage: input.audioLanguage,
       subtitleLanguage: input.subtitleLanguage,
       autoPlayNextEpisode: input.autoPlayNextEpisode,
+      optimizedImages: input.optimizedImages,
       libraryOrder: input.libraryOrder,
       playedPercent: input.playedPercent,
       version: input.expectedVersion + 1,
@@ -304,6 +307,7 @@ describe("account settings", () => {
       audioLanguage: "日本語",
       subtitleLanguage: "关闭字幕",
       autoPlayNextEpisode: false,
+      optimizedImages: false,
       libraryOrder: ["series", "movies"],
       playedPercent: 95,
     });
@@ -901,5 +905,47 @@ describe("account settings", () => {
     });
 
     expect(container.querySelector(".lux-account-library-row")?.textContent).toContain("剧集");
+  });
+
+  it("hides the optimized image preference unless the server enables variants", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ImageVariantsContext.Provider value={{ available: false, enabled: false }}>
+              <AccountPage user={user} />
+            </ImageVariantsContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+    expect(container.querySelector('[aria-label="使用优化图片"]')).toBeNull();
+  });
+
+  it("saves the optimized image preference through account preferences", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ImageVariantsContext.Provider value={{ available: true, enabled: false }}>
+              <AccountPage user={user} />
+            </ImageVariantsContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForPreferencesLoaded();
+    const toggle = container.querySelector<HTMLInputElement>('[aria-label="使用优化图片"]');
+    expect(toggle).toBeTruthy();
+    expect(toggle?.checked).toBe(false);
+    await act(async () => toggle?.click());
+    await waitForPreferenceUpdateCalls(1);
+    expect(api.updateAccountPreferences).toHaveBeenCalledWith(expect.objectContaining({
+      optimizedImages: true,
+    }));
+    expect(toggle?.checked).toBe(true);
   });
 });

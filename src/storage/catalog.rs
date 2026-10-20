@@ -9104,7 +9104,8 @@ impl Database {
         image_index: i64,
     ) -> Result<Vec<StoredItemImageCandidate>, StorageError> {
         self.query(
-            "SELECT ii.id, ii.local_path, lr.canonical_path AS root_path
+            "SELECT ii.id, ii.image_type, ii.local_path, lr.canonical_path AS root_path,
+                    ii.content_tag, ii.width, ii.height
              FROM item_images ii
              JOIN media_items mi ON mi.id = ii.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -9121,8 +9122,12 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredItemImageCandidate {
                     id: row.get("id"),
+                    image_type: row.get("image_type"),
                     local_path: row.get("local_path"),
                     root_path: row.get("root_path"),
+                    content_tag: row.get("content_tag"),
+                    width: row.get("width"),
+                    height: row.get("height"),
                 })
                 .collect()
         })

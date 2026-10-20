@@ -20,6 +20,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { AccountPreferences, AccountPreferencesUpdate, AuthSession, Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
 import { useAvatar } from "../../components/layout/LuxShell";
+import { useImageVariants } from "../home/image-variants";
 import { calculateAvatarCrop, cropAvatarImage, DEFAULT_AVATAR_CROP, type AvatarCrop } from "./avatar-image";
 import {
   applyAccountTheme,
@@ -43,6 +44,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const playbackSettings = useQuery({ queryKey: queryKeys.userSettings, queryFn: () => api.userSettings() });
   const { avatarUrl, setAvatarUrl } = useAvatar();
+  const { available: imageVariantsAvailable } = useImageVariants();
   const [settings, setSettings] = useState<AccountSettings>(() => readAccountSettings(user.id));
   const settingsRef = useRef(settings);
   const accountPreferencesVersion = useRef<number | null>(null);
@@ -622,7 +624,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
             <ToggleRow title="显示继续观看区块" description="在首页保留最近播放但尚未看完的内容。" checked={settings.showContinueWatching} disabled={accountPreferencesDisabled} onChange={(checked) => updateSettings({ showContinueWatching: checked })} />
           </SettingsSection>
 
-          <SettingsSection id="playback" icon={<PlayCircle size={18} />} title="播放">
+          <SettingsSection id="playback" icon={<PlayCircle size={18} />} title="播放与显示">
             <div className="lux-setting-form-grid">
               <label className="lux-setting-field">
                 <span>默认音轨语言</span>
@@ -649,6 +651,18 @@ export function AccountPage({ user }: { user: LuxUser }) {
             </div>
             <div className="lux-setting-divider" />
             <ToggleRow title="自动播放下一集" description="一集结束后自动开始播放下一集。" checked={settings.autoPlayNextEpisode} disabled={accountPreferencesDisabled} onChange={(checked) => updateSettings({ autoPlayNextEpisode: checked })} />
+            {imageVariantsAvailable ? (
+              <>
+                <div className="lux-setting-divider" />
+                <ToggleRow
+                  title="使用优化图片"
+                  description="按卡片和详情页的显示尺寸加载图片，减少流量。原图不会被修改，可随时关闭。"
+                  checked={settings.optimizedImages}
+                  disabled={accountPreferencesDisabled}
+                  onChange={(checked) => updateSettings({ optimizedImages: checked })}
+                />
+              </>
+            ) : null}
             <div className="lux-setting-divider" />
             <div className="lux-setting-row">
               <div>
@@ -837,6 +851,7 @@ function accountPreferencesUpdateFor(settings: AccountSettings, expectedVersion:
     audioLanguage: settings.audioLanguage,
     subtitleLanguage: settings.subtitleLanguage,
     autoPlayNextEpisode: settings.autoPlayNextEpisode,
+    optimizedImages: settings.optimizedImages,
     libraryOrder: settings.libraryOrder,
     playedPercent: settings.playedPercent,
   };
@@ -852,6 +867,7 @@ function accountSettingsFromPreferences(preferences: AccountPreferences): Accoun
     audioLanguage: preferences.audioLanguage,
     subtitleLanguage: preferences.subtitleLanguage,
     autoPlayNextEpisode: preferences.autoPlayNextEpisode,
+    optimizedImages: preferences.optimizedImages === true,
     playedPercent: preferences.playedPercent,
   };
 }

@@ -15,6 +15,7 @@ import {
   readHomeCarouselCache,
   writeHomeCarouselCache,
 } from "./carousel";
+import { useImageVariants } from "./image-variants";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
@@ -197,6 +198,7 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   showEmptyState: boolean;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
+  const { enabled } = useImageVariants();
   const slideKey = useMemo(() => items.map((item) => item.id).join("|"), [items]);
 
   useEffect(() => setActiveIndex(0), [slideKey]);
@@ -213,7 +215,10 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   const safeIndex = items.length ? activeIndex % items.length : 0;
   const item = items[safeIndex];
   const logo = item ? imageUrl(item, "logo") : undefined;
-  const image = item ? imageUrl(item, "fanart") ?? imageUrl(item) : undefined;
+  const image = item
+    ? imageUrl(item, "fanart", enabled ? 1280 : undefined)
+      ?? imageUrl(item, "poster", enabled ? 1280 : undefined)
+    : undefined;
   const title = item ? mediaTitle(item) : "你的私人影院";
   const titleClassName = logo
     ? "lux-hero-title has-logo"

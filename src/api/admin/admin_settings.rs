@@ -642,6 +642,9 @@ pub(crate) async fn admin_update_settings(
             return plugin_error(&headers, error);
         }
     };
+    if let Some(variants) = state.image_variants.as_ref() {
+        variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
+    }
     record_audit_event(
         &state,
         &headers,

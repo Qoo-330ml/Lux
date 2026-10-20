@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { Play } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback } from "../home/media-display";
+import { useImageVariants } from "../home/image-variants";
 import { useMediaEpisodes } from "./useMediaEpisodes";
 
 const EpisodesContext = createContext<ReturnType<typeof useMediaEpisodes> | undefined>(undefined);
@@ -90,6 +91,7 @@ function SeriesChildren({
   seasons: MediaItem[];
   series: MediaItem;
 }) {
+  const { enabled } = useImageVariants();
   return (
     <section className="lux-series-children" aria-labelledby="series-children-heading">
       <div className="lux-section-heading">
@@ -101,7 +103,7 @@ function SeriesChildren({
       </div>
       <div className="lux-season-rail" role="list" aria-label="播出季">
         {seasons.map((season) => {
-          const poster = posterUrlWithFallback(season, series);
+          const poster = posterUrlWithFallback(season, series, enabled ? 720 : undefined);
           return (
             <Link
               className="lux-season-card"
@@ -180,7 +182,9 @@ function SeasonEpisodes({
 }
 
 function SeasonEpisodeRow({ episode, seasonNumber, fallbackNumber }: { episode: MediaItem; seasonNumber?: number | null; fallbackNumber: number }) {
-  const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
+  const { enabled } = useImageVariants();
+  const image = imageUrl(episode, "fanart", enabled ? 720 : undefined)
+    ?? imageUrl(episode, "poster", enabled ? 720 : undefined);
   const number = episode.indexNumber ?? fallbackNumber;
   const detailHref = `/items/${episode.id}`;
   const watchHref = `/watch/${episode.id}`;
@@ -211,6 +215,7 @@ function EpisodeRail({
   seasonNumber?: number | null;
   episodesPending: boolean;
 }) {
+  const { enabled } = useImageVariants();
   const otherEpisodes = episodes.filter((episode) => episode.id !== currentEpisodeId);
   if (episodesPending || !otherEpisodes.length) return null;
   return (
@@ -224,7 +229,8 @@ function EpisodeRail({
       </div>
       <div className="lux-episode-card-rail" role="list">
         {otherEpisodes.map((episode) => {
-          const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
+          const image = imageUrl(episode, "fanart", enabled ? 720 : undefined)
+            ?? imageUrl(episode, "poster", enabled ? 720 : undefined);
           const detailHref = `/items/${episode.id}`;
           return (
             <article className="lux-episode-card" role="listitem" key={episode.id}>

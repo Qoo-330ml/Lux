@@ -12,6 +12,7 @@ import { AcceptInvitationPage } from "../features/auth/AcceptInvitationPage";
 import { RegisterPage } from "../features/auth/RegisterPage";
 import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
+import { ImageVariantsContext } from "../features/home/image-variants";
 import {
   loadAdminChangelogPage,
   loadAdminDashboardPage,
@@ -90,7 +91,16 @@ function SessionRoutes() {
     );
   }
 
-  return <AuthenticatedRoutes user={me.data.user} serverName={me.data.serverName} />;
+  return (
+    <ImageVariantsContext.Provider
+      value={{
+        available: me.data.imageVariantsAvailable === true,
+        enabled: me.data.imageVariantsEnabled === true,
+      }}
+    >
+      <AuthenticatedRoutes user={me.data.user} serverName={me.data.serverName} />
+    </ImageVariantsContext.Provider>
+  );
 }
 
 function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {

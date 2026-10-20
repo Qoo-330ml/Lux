@@ -25,7 +25,7 @@ import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminLibrary, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
+import type { AdminLibrary, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
 import { orderLibraries } from "../account/account-settings";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -279,6 +279,15 @@ function GlobalStrategyPanel({
   const updateSubtitles = (key: keyof MediaStrategySettings["subtitles"], value: boolean | string[]) => {
     onChange({ ...strategy, subtitles: { ...strategy.subtitles, [key]: value } });
   };
+  const variantCache: MediaImageVariantCacheSettings = strategy.images.variantCache ?? {
+    enabled: false,
+    maxFiles: 20000,
+    maxBytes: 2 * 1024 * 1024 * 1024,
+    concurrency: 2,
+  };
+  const updateVariantCache = (patch: Partial<MediaImageVariantCacheSettings>) => {
+    onChange({ ...strategy, images: { ...strategy.images, variantCache: { ...variantCache, ...patch } } });
+  };
   const estimate = estimateStrategyStorage(strategy);
 
   return (
@@ -326,6 +335,20 @@ function GlobalStrategyPanel({
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
             <label>每项最大背景图数量<input type="number" min="0" max="20" value={strategy.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))} /></label>
             <label>最小下载宽度<input type="number" min="0" max="8192" step="128" value={strategy.images.minDownloadWidth} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))} /><small>设为 0 表示不限制</small></label>
+          </div>
+          <div className="lux-setting-divider" />
+          <div className="lux-library-strategy-image-variants">
+            <StrategyToggle
+              label="按显示尺寸提供图片（实验性）"
+              description="为海报、缩略图、艺术图按需生成 360 / 720 / 1280 像素变体，写入 /config 缓存。原图不会被修改；关闭时完全使用原图。"
+              checked={variantCache.enabled}
+              onChange={(enabled) => updateVariantCache({ enabled })}
+            />
+            <div className="lux-library-strategy-form-grid lux-library-strategy-variant-limits">
+              <label>缓存文件上限<input type="number" min="100" max="1000000" step="100" value={variantCache.maxFiles} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ maxFiles: Math.min(1000000, Math.max(100, Number(event.target.value) || 100)) })} /><small>100 – 1,000,000 个文件</small></label>
+              <label>缓存容量上限 (MB)<input type="number" min="64" max="65536" step="64" value={Math.round(variantCache.maxBytes / (1024 * 1024))} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ maxBytes: Math.min(64 * 1024 * 1024 * 1024, Math.max(64, Number(event.target.value) || 64)) * 1024 * 1024 })} /><small>64 MB – 64 GB</small></label>
+              <label>生成并发<input type="number" min="1" max="4" value={variantCache.concurrency} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ concurrency: Math.min(4, Math.max(1, Number(event.target.value) || 1)) })} /><small>1 – 4，默认 2</small></label>
+            </div>
           </div>
         </section>
 

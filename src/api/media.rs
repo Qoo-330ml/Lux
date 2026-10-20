@@ -6,6 +6,15 @@ const MAX_HOME_LATEST_LIBRARY_IDS: usize = 100;
 const HOME_LATEST_ITEMS_PER_LIBRARY: i64 = 12;
 
 #[derive(Deserialize, Default)]
+pub(super) struct LuxImageQuery {
+    #[serde(default)]
+    #[allow(dead_code)]
+    tag: Option<String>,
+    #[serde(default)]
+    w: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
 pub(super) struct LuxPageQuery {
     #[serde(default)]
     page: Option<i64>,
@@ -1598,10 +1607,15 @@ pub(super) async fn lux_image(
     headers: HeaderMap,
     method: Method,
     Path((item_id, image_type)): Path<(String, String)>,
+    Query(query): Query<LuxImageQuery>,
     State(state): State<AppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
+        Err(response) => return response,
+    };
+    let width = match lux_image_variant_width(&state, &headers, &user, query.w.as_deref()).await {
+        Ok(width) => width,
         Err(response) => return response,
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
@@ -1610,12 +1624,16 @@ pub(super) async fn lux_image(
     };
     serve_image(
         images,
+        state.image_variants.as_ref(),
         principal,
         &headers,
         &method,
-        &item_id,
-        &image_type,
-        0,
+        ServeImageTarget {
+            item_id: &item_id,
+            image_type: &image_type,
+            image_index: 0,
+        },
+        width,
     )
     .await
 }
@@ -1624,29 +1642,83 @@ pub(super) async fn lux_image_at_index(
     headers: HeaderMap,
     method: Method,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<LuxImageQuery>,
     State(state): State<AppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let width = match lux_image_variant_width(&state, &headers, &user, query.w.as_deref()).await {
+        Ok(width) => width,
+        Err(response) => return response,
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     serve_image(
         images,
+        state.image_variants.as_ref(),
         principal,
         &headers,
         &method,
-        &item_id,
-        &image_type,
-        image_index,
+        ServeImageTarget {
+            item_id: &item_id,
+            image_type: &image_type,
+            image_index,
+        },
+        width,
     )
     .await
+}
+
+async fn lux_image_variant_width(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &crate::auth::users::UserRecord,
+    requested: Option<&str>,
+) -> Result<Option<u32>, Response> {
+    let Some(variants) = state.image_variants.as_ref() else {
+        return Ok(None);
+    };
+    if !variants.enabled() {
+        return Ok(None);
+    }
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let Ok(width) = requested.parse::<u32>() else {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "图片宽度无效",
+        )
+        .into_response());
+    };
+    if !crate::application::image_variants::IMAGE_VARIANT_WIDTHS.contains(&width) {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "图片宽度无效",
+        )
+        .into_response());
+    }
+    let Some(database) = state.database.as_ref() else {
+        return Ok(None);
+    };
+    match database
+        .user_optimized_images_enabled(&user.id.to_string())
+        .await
+    {
+        Ok(true) => Ok(Some(width)),
+        _ => Ok(None),
+    }
 }
 
 pub(super) async fn lux_list_item_images(
@@ -2076,12 +2148,16 @@ pub(super) async fn emby_image(
         Some(principal) => {
             serve_image(
                 images,
+                None,
                 principal,
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                0,
+                ServeImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index: 0,
+                },
+                None,
             )
             .await
         }
@@ -2195,12 +2271,16 @@ pub(super) async fn emby_image_at_index(
         Some(principal) => {
             serve_image(
                 images,
+                None,
                 principal,
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                image_index,
+                ServeImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index,
+                },
+                None,
             )
             .await
         }
@@ -3465,15 +3545,26 @@ fn embedded_subtitle_error(
     status.into_response()
 }
 
+pub(super) struct ServeImageTarget<'a> {
+    pub item_id: &'a str,
+    pub image_type: &'a str,
+    pub image_index: i64,
+}
+
 pub(super) async fn serve_image(
     images: &ImageService,
+    variants: Option<&Arc<crate::application::image_variants::ImageVariantService>>,
     principal: AccessPrincipal,
     headers: &HeaderMap,
     method: &Method,
-    item_id: &str,
-    image_type: &str,
-    image_index: i64,
+    target: ServeImageTarget<'_>,
+    width: Option<u32>,
 ) -> Response {
+    let ServeImageTarget {
+        item_id,
+        image_type,
+        image_index,
+    } = target;
     let Some(image_type) = normalize_image_type(image_type) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -3503,6 +3594,12 @@ pub(super) async fn serve_image(
         Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if let (Some(width), Some(variants)) = (width, variants)
+        && let Some(variant) = variants.resolve_variant(&image, width).await
+        && let Some(response) = serve_variant_file(&variant, headers, method).await
+    {
+        return response;
+    }
     serve_image_file(
         &image.path,
         image.content_type,
@@ -3704,6 +3801,47 @@ pub(super) async fn serve_image_file(
         .header("Cache-Control", "private, max-age=3600")
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn serve_variant_file(
+    variant: &crate::application::image_variants::VariantFile,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Option<Response> {
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == variant.etag))
+    {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", &variant.etag)
+                .header("Cache-Control", "private, max-age=31536000, immutable")
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        // A concurrent startup scan or LRU eviction can delete the cache file
+        // between resolution and opening it; fall back to the original image.
+        let Ok(file) = tokio::fs::File::open(&variant.path).await else {
+            return None;
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "image/jpeg")
+            .header("Content-Length", variant.content_length)
+            .header("ETag", &variant.etag)
+            .header("Cache-Control", "private, max-age=31536000, immutable")
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 pub(super) fn lux_page_params(query: &LuxPageQuery) -> Result<(i64, i64), &'static str> {

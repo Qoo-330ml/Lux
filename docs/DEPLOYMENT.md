@@ -4,7 +4,7 @@
 
 ## Docker Compose
 
-生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放数据库选择文件、内置 SQLite（如使用）、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
+生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放数据库选择文件、内置 SQLite（如使用）、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；启用“按显示尺寸提供图片”后，派生的图片变体存放在 `/config/image-cache/v1/`，属于可删除、可重建的运行缓存，不需要纳入备份，也不会改写 `/media` 中的原图；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
 
 ```bash
 mkdir -p config media

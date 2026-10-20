@@ -1,5 +1,6 @@
 import { Folder, LoaderCircle } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
+import { withImageWidth } from "./image-variants";
 
 export function mediaTitle(item: MediaItem) {
   return item.title || item.name || "未命名媒体";
@@ -37,7 +38,11 @@ export function mediaTypeLabel(itemType?: string | null) {
   }
 }
 
-export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" | "logo" = "poster") {
+export function imageUrl(
+  item: MediaItem,
+  type: "poster" | "fanart" | "thumb" | "logo" = "poster",
+  width?: number,
+) {
   const resolvedType = item.imageTags?.[type]
     ? type
     : type === "fanart" && item.imageTags?.thumb
@@ -47,12 +52,16 @@ export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" | 
   const tag = item.imageTags?.[resolvedType];
   const imageItemId = resolvedType === "poster" ? item.posterItemId ?? item.id : item.id;
   const path = `/api/v1/items/${encodeURIComponent(imageItemId)}/images/${resolvedType}`;
-  return tag ? `${path}?tag=${encodeURIComponent(tag)}` : path;
+  return withImageWidth(tag ? `${path}?tag=${encodeURIComponent(tag)}` : path, width);
 }
 
-export function posterUrlWithFallback(item: MediaItem, series?: MediaItem) {
-  return imageUrl(item)
-    ?? (item.itemType === "SEASON" && series?.itemType === "SERIES" ? imageUrl(series) : undefined);
+export function posterUrlWithFallback(item: MediaItem, series?: MediaItem, width?: number) {
+  return imageUrl(item, "poster", width)
+    ?? (item.itemType === "SEASON" && series?.itemType === "SERIES" ? imageUrl(series, "poster", width) : undefined);
+}
+
+export function stillImageUrl(url: string, width?: number) {
+  return withImageWidth(url, width);
 }
 
 export function runtimeLabel(ticks?: number | null) {

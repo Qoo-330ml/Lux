@@ -1114,4 +1114,63 @@ describe("AdminLibrariesPage library cards", () => {
       }),
     }));
   });
+
+  it("saves the experimental display-sized image variant cache", async () => {
+    const updateSettings = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: {
+        metadataLanguage: "zh-CN",
+        imageLanguage: "zh-CN",
+        region: "CN",
+        scraperId: null,
+        applyScope: "NEW_CONTENT",
+        images: {
+          poster: true,
+          artwork: false,
+          banner: false,
+          logo: true,
+          thumbnail: true,
+          thumbnailScrapingMode: "SCRAPER_FIRST",
+          disc: false,
+          wallpaper: false,
+          writeToMetadata: false,
+          maxBackdropCount: 1,
+          minDownloadWidth: 1280,
+          variantCache: { enabled: true, maxFiles: 20000, maxBytes: 2147483648, concurrency: 2 },
+        },
+        subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
+      },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+    const toggle = [...container.querySelectorAll<HTMLLabelElement>(".lux-library-strategy-toggle")]
+      .find((label) => label.textContent?.includes("按显示尺寸提供图片"))
+      ?.querySelector<HTMLInputElement>("input");
+    expect(toggle).toBeTruthy();
+    await act(async () => toggle?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存全局策略"))
+        ?.click();
+    });
+
+    expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      mediaStrategy: expect.objectContaining({
+        images: expect.objectContaining({
+          variantCache: expect.objectContaining({
+            enabled: true,
+            maxFiles: 20000,
+            maxBytes: 2147483648,
+            concurrency: 2,
+          }),
+        }),
+      }),
+    }));
+  });
 });
