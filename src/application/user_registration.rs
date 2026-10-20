@@ -186,6 +186,51 @@ pub(crate) async fn submit_public_user_registration(
     }
 }
 
+pub(crate) async fn resend_public_user_registration_email(
+    database: &Database,
+    rate_limiter: &DevicePairingRateLimiter,
+    connection_peer: IpAddr,
+    email: &str,
+    idempotency_key: &str,
+    now: i64,
+) -> Result<(), UserRegistrationError> {
+    if now < 0
+        || idempotency_key.trim() != idempotency_key
+        || !(1..=256).contains(&idempotency_key.len())
+        || idempotency_key.chars().any(char::is_control)
+    {
+        return Err(UserRegistrationError::InvalidInput);
+    }
+    let recipient_email = normalize_registration_email(email)?;
+    let mode = read_registration_mode(database)
+        .await
+        .map_err(|_| UserRegistrationError::SettingsUnavailable)?;
+    if mode.mode != RegistrationMode::PublicEmail {
+        return Err(UserRegistrationError::RegistrationClosed);
+    }
+
+    let email_rate_key = format!("public-registration:email:{recipient_email}");
+    if !rate_limiter
+        .try_acquire(&email_rate_key, USER_REGISTRATION_EMAIL_RATE_LIMIT)
+        .await
+    {
+        return Err(UserRegistrationError::RateLimited);
+    }
+    let peer_rate_key = format!("public-registration:peer:{connection_peer}");
+    if !rate_limiter
+        .try_acquire(&peer_rate_key, USER_REGISTRATION_PEER_RATE_LIMIT)
+        .await
+    {
+        return Err(UserRegistrationError::RateLimited);
+    }
+
+    database
+        .queue_user_registration_resend(&recipient_email, idempotency_key, now)
+        .await
+        .map_err(|_| UserRegistrationError::StorageUnavailable)?;
+    Ok(())
+}
+
 fn normalize_registration_email(value: &str) -> Result<String, UserRegistrationError> {
     if value.chars().any(char::is_control) {
         return Err(UserRegistrationError::InvalidEmail);
@@ -665,6 +710,148 @@ mod tests {
                 "peer-next@example.test",
                 "peer-next-user",
                 2_100,
+            )
+            .await,
+            Err(UserRegistrationError::RateLimited)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resend_reuses_the_original_challenge_and_hides_missing_applications()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, database) = test_database().await?;
+        enable_public_registration(&database).await?;
+        let limiter = DevicePairingRateLimiter::default();
+        let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+        submit(
+            &database,
+            &directory,
+            &limiter,
+            peer,
+            "resend@example.test",
+            "resend-user",
+            1_000,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE mail_outbox SET status = 'SENT', sent_at = 1_000
+             WHERE recipient_email = 'resend@example.test'",
+        )
+        .execute(database.pool())
+        .await?;
+        let before_challenge: (String, Vec<u8>, i64, i64) = sqlx::query_as(
+            "SELECT id, token_hash, expires_at, created_at FROM mail_challenges
+             WHERE recipient_email = 'resend@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        let before_request: (String, i64) = sqlx::query_as(
+            "SELECT permission_snapshot_json, expires_at FROM user_registration_requests
+             WHERE recipient_email = 'resend@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+
+        resend_public_user_registration_email(
+            &database,
+            &limiter,
+            peer,
+            "resend@example.test",
+            "resend-attempt-1",
+            1_001,
+        )
+        .await?;
+        resend_public_user_registration_email(
+            &database,
+            &limiter,
+            peer,
+            "resend@example.test",
+            "resend-attempt-1",
+            1_002,
+        )
+        .await?;
+        resend_public_user_registration_email(
+            &database,
+            &limiter,
+            peer,
+            "unknown@example.test",
+            "resend-unknown",
+            1_003,
+        )
+        .await?;
+
+        let after_challenge: (String, Vec<u8>, i64, i64) = sqlx::query_as(
+            "SELECT id, token_hash, expires_at, created_at FROM mail_challenges
+             WHERE recipient_email = 'resend@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        let after_request: (String, i64) = sqlx::query_as(
+            "SELECT permission_snapshot_json, expires_at FROM user_registration_requests
+             WHERE recipient_email = 'resend@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(after_challenge, before_challenge);
+        assert_eq!(after_request, before_request);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = 'resend@example.test'
+                   AND template_kind = 'EMAIL_VERIFICATION'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mail_outbox WHERE recipient_email = 'unknown@example.test'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resend_applies_registration_rate_limits() -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, database) = test_database().await?;
+        enable_public_registration(&database).await?;
+        let limiter = DevicePairingRateLimiter::default();
+        let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21));
+        submit(
+            &database,
+            &directory,
+            &limiter,
+            peer,
+            "rate-limited-resend@example.test",
+            "rate-limited-resend-user",
+            1_000,
+        )
+        .await?;
+
+        for index in 0..USER_REGISTRATION_EMAIL_RATE_LIMIT - 1 {
+            resend_public_user_registration_email(
+                &database,
+                &limiter,
+                peer,
+                "rate-limited-resend@example.test",
+                &format!("resend-limit-{index}"),
+                1_001 + i64::from(index),
+            )
+            .await?;
+        }
+        assert_eq!(
+            resend_public_user_registration_email(
+                &database,
+                &limiter,
+                peer,
+                "rate-limited-resend@example.test",
+                "resend-limit-overflow",
+                1_010,
             )
             .await,
             Err(UserRegistrationError::RateLimited)

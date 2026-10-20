@@ -109,6 +109,13 @@ pub(crate) enum UserRegistrationCreateResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationResendResult {
+    Queued,
+    NotResendable,
+    RateLimited,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserRegistrationVerifyResult {
     Verified,
     NotAcceptable,

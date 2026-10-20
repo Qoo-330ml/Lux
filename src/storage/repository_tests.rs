@@ -11,7 +11,7 @@ use crate::storage::{
     UserDevicePageQuery, UserInvitationAcceptResult, UserInvitationCreateResult,
     UserInvitationStatus, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
     UserRegistrationApproveResult, UserRegistrationCreateResult, UserRegistrationRejectResult,
-    UserRegistrationStatus, UserRegistrationVerifyResult,
+    UserRegistrationResendResult, UserRegistrationStatus, UserRegistrationVerifyResult,
 };
 
 #[tokio::test]
@@ -28508,19 +28508,6 @@ async fn exercise_user_registration_storage(
             .await?,
         UserRegistrationCreateResult::Created
     );
-    let stored_challenge = database
-        .get_user_registration_challenge_by_token_hash(&main_hash, 1_000)
-        .await?
-        .ok_or("valid registration challenge was not found by token hash")?;
-    assert_eq!(stored_challenge.id, "registration-main-challenge");
-    assert_eq!(stored_challenge.expires_at, 5_000);
-    assert!(
-        database
-            .get_user_registration_challenge_by_token_hash(&[99_u8; 32], 1_000)
-            .await?
-            .is_none()
-    );
-
     let duplicate_hash = [52_u8; 32];
     let (request, challenge, outbox) = registration_storage_bundle(
         "registration-duplicate",
@@ -28541,6 +28528,173 @@ async fn exercise_user_registration_storage(
     assert!(
         database
             .get_mail_challenge("registration-duplicate-challenge")
+            .await?
+            .is_none()
+    );
+    database
+        .query(
+            "UPDATE mail_outbox SET status = 'SENT', sent_at = 1_000
+             WHERE idempotency_key = 'registration-main-mail'",
+        )
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-1",
+                1_001,
+            )
+            .await?,
+        UserRegistrationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-1",
+                1_002,
+            )
+            .await?,
+        UserRegistrationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = 'registration-main@example.test'
+                   AND template_kind = 'EMAIL_VERIFICATION'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        2
+    );
+    for (idempotency_key, previous_key, now) in [
+        (
+            "registration-main-resend-2",
+            "registration-main-resend-1",
+            1_003_i64,
+        ),
+        (
+            "registration-main-resend-3",
+            "registration-main-resend-2",
+            1_004_i64,
+        ),
+        (
+            "registration-main-resend-4",
+            "registration-main-resend-3",
+            1_005_i64,
+        ),
+    ] {
+        database
+            .query("UPDATE mail_outbox SET status = 'SENT', sent_at = ? WHERE idempotency_key = ?")
+            .bind(now - 1)
+            .bind(previous_key)
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            database
+                .queue_user_registration_resend(
+                    "registration-main@example.test",
+                    idempotency_key,
+                    now,
+                )
+                .await?,
+            UserRegistrationResendResult::Queued
+        );
+    }
+    database
+        .query(
+            "UPDATE mail_outbox SET status = 'SENT', sent_at = 1_005
+             WHERE idempotency_key = 'registration-main-resend-4'",
+        )
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-5",
+                1_006,
+            )
+            .await?,
+        UserRegistrationResendResult::RateLimited
+    );
+    let challenge_before_verify: (i64, i64, Option<i64>, Option<i64>) = database
+        .query_as(
+            "SELECT expires_at, created_at, consumed_at, revoked_at FROM mail_challenges
+             WHERE id = 'registration-main-challenge'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(challenge_before_verify, (5_000, 1_000, None, None));
+    let main_snapshot: (String, String, i64) = database
+        .query_as(
+            "SELECT permission_snapshot_json, status, expires_at
+             FROM user_registration_requests WHERE id = 'registration-main'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(main_snapshot.0, REGISTRATION_TEST_PERMISSION_SNAPSHOT);
+    assert_eq!(main_snapshot.1, "PENDING_EMAIL");
+    assert_eq!(main_snapshot.2, 5_000);
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "missing-registration@example.test",
+                "missing-resend",
+                1_007
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
+    let conflict_hash = [59_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-resend-conflict",
+        "registration-resend-conflict@example.test",
+        "registration-resend-conflict",
+        "registration-resend-conflict-challenge",
+        "registration-resend-conflict-mail",
+        5_000,
+        1_008,
+        &conflict_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_008)
+            .await?,
+        UserRegistrationCreateResult::Created
+    );
+    assert!(
+        database
+            .queue_user_registration_resend(
+                "registration-resend-conflict@example.test",
+                "registration-main-resend-1",
+                1_009,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = 'registration-resend-conflict@example.test'
+                   AND template_kind = 'EMAIL_VERIFICATION'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let stored_challenge = database
+        .get_user_registration_challenge_by_token_hash(&main_hash, 1_000)
+        .await?
+        .ok_or("valid registration challenge was not found by token hash")?;
+    assert_eq!(stored_challenge.id, "registration-main-challenge");
+    assert_eq!(stored_challenge.expires_at, 5_000);
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&[99_u8; 32], 1_000)
             .await?
             .is_none()
     );
@@ -28598,6 +28752,16 @@ async fn exercise_user_registration_storage(
         .await?;
     assert_eq!(
         database
+            .queue_user_registration_resend(
+                "registration-revoked@example.test",
+                "registration-revoked-resend",
+                1_005,
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
+    assert_eq!(
+        database
             .verify_user_registration_email("registration-revoked-challenge", &revoked_hash, 1_005)
             .await?,
         UserRegistrationVerifyResult::NotAcceptable
@@ -28623,6 +28787,16 @@ async fn exercise_user_registration_storage(
             .verify_user_registration_email("registration-main-challenge", &main_hash, 1_010)
             .await?,
         UserRegistrationVerifyResult::Verified
+    );
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-after-verify",
+                1_010,
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
     );
     assert_eq!(
         database
@@ -28887,8 +29061,15 @@ async fn exercise_user_registration_storage(
             1_100,
         )
         .await?;
-    assert_eq!(pending_email_page.total_count, 1);
-    assert_eq!(pending_email_page.requests[0].id, "registration-revoked");
+    assert_eq!(pending_email_page.total_count, 2);
+    assert!(pending_email_page.requests.iter().any(|request| {
+        request.id == "registration-revoked"
+            && request.status == UserRegistrationStatus::PendingEmail
+    }));
+    assert!(pending_email_page.requests.iter().any(|request| {
+        request.id == "registration-resend-conflict"
+            && request.status == UserRegistrationStatus::PendingEmail
+    }));
     assert_eq!(
         database.expire_user_registration_requests(1_100, 1).await?,
         1
@@ -28918,6 +29099,16 @@ async fn exercise_user_registration_storage(
         assert_eq!(status, "EXPIRED");
         assert!(password_hash.is_none());
     }
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-expiring-a@example.test",
+                "registration-expiring-resend",
+                1_100,
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
     assert_eq!(
         database
             .query_scalar::<String>(

@@ -14,9 +14,9 @@ use super::sql_templates::SqlTemplateCache;
 use super::{
     NewInvitationUserAccount, NewUserRegistrationRequest, StoredUserInvitationAcceptance,
     StoredUserRegistrationChallenge, StoredUserRegistrationRequest, UserInvitationAcceptResult,
-    UserRegistrationApproveResult,
-    UserRegistrationCreateResult, UserRegistrationRejectResult, UserRegistrationRequestPage,
-    UserRegistrationStatus, UserRegistrationVerifyResult,
+    UserRegistrationApproveResult, UserRegistrationCreateResult, UserRegistrationRejectResult,
+    UserRegistrationRequestPage, UserRegistrationResendResult, UserRegistrationStatus,
+    UserRegistrationVerifyResult,
 };
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
@@ -3125,6 +3125,202 @@ impl Database {
 
 #[allow(dead_code)] // LUX-808 and LUX-812 consume these registration transitions.
 impl Database {
+    pub(crate) async fn queue_user_registration_resend(
+        &self,
+        recipient_email: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<UserRegistrationResendResult, StorageError> {
+        if now < 0
+            || recipient_email.trim() != recipient_email
+            || recipient_email != recipient_email.to_lowercase()
+            || !(3..=254).contains(&recipient_email.chars().count())
+            || recipient_email
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+            || idempotency_key.trim() != idempotency_key
+            || !(1..=256).contains(&idempotency_key.len())
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user registration resend".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let request_statement = format!(
+            "SELECT id, expires_at FROM user_registration_requests
+             WHERE recipient_email = ? AND status = 'PENDING_EMAIL'
+               AND email_verified_at IS NULL AND password_hash IS NOT NULL
+               AND expires_at > ? AND created_at <= ?
+             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
+        );
+        let request: Option<(String, i64)> = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(request_statement))
+            .bind(recipient_email)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((request_id, request_expires_at)) = request else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::NotResendable);
+        };
+
+        let challenge_statement = format!(
+            "SELECT id FROM mail_challenges
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND recipient_email = ? AND expires_at = ? AND expires_at > ?
+               AND created_at <= ? AND consumed_at IS NULL AND revoked_at IS NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
+        );
+        let challenge_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
+            .bind(&request_id)
+            .bind(recipient_email)
+            .bind(request_expires_at)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(challenge_id) = challenge_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::NotResendable);
+        };
+
+        let existing_message: Option<(String, String, String)> = self
+            .query_as(
+                "SELECT recipient_email, template_kind, reference_id FROM mail_outbox
+                 WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some((existing_email, existing_template, existing_reference)) = existing_message {
+            if existing_email != recipient_email
+                || existing_template != MailOutboxTemplateKind::EmailVerification.as_str()
+                || existing_reference != challenge_id
+            {
+                return Err(StorageError::Conflict(
+                    "mail outbox idempotency key already used".to_owned(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::Queued);
+        }
+
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'EMAIL_VERIFICATION'
+                   AND created_at > ?",
+            )
+            .bind(recipient_email)
+            .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::RateLimited);
+        }
+
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'EMAIL_VERIFICATION', ?, 'PENDING', 0, ?, ?, ?)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(idempotency_key)
+        .bind(recipient_email)
+        .bind(&challenge_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let stored_message: (String, String, String) = self
+            .query_as(
+                "SELECT recipient_email, template_kind, reference_id FROM mail_outbox
+                 WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if stored_message.0 != recipient_email
+            || stored_message.1 != MailOutboxTemplateKind::EmailVerification.as_str()
+            || stored_message.2 != challenge_id
+        {
+            return Err(StorageError::Conflict(
+                "mail outbox idempotency key already used".to_owned(),
+            ));
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserRegistrationResendResult::Queued)
+    }
+
     pub(crate) async fn get_user_registration_challenge_by_token_hash(
         &self,
         token_hash: &[u8],

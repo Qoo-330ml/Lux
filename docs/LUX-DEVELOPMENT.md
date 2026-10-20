@@ -16776,11 +16776,15 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] SQLite 与 PostgreSQL 在单个存储事务中校验申请与原挑战并入队；并发和幂等重试不更改申请、凭证或过期时间。
-- [ ] 每邮箱小时上限原子执行；无效/已验证/过期/撤销申请均无副作用且不暴露存在状态。
-- [ ] service 与双后端定向回归、build、fmt 和 diff check 通过；服务不返回 token。
+- [x] SQLite 与 PostgreSQL 在单个存储事务中校验申请与原挑战并入队；并发和幂等重试不更改申请、凭证或过期时间。
+- [x] 每邮箱小时上限原子执行；无效/已验证/过期/撤销申请均无副作用且不暴露存在状态。
+- [x] service 与双后端定向回归、build、fmt 和 diff check 通过；服务不返回 token。
 
 短计划：先为有效重发、状态冲突、限额、原 token/过期时间不变和失败回滚添加 RED；再实现 storage 事务与 service；最后运行定向 SQLite/PostgreSQL 测试及常规检查。
+
+结果（2026-10-20）：注册重发只选择未过期、未验证且仍保留密码哈希的 PENDING_EMAIL 申请，并复用其 EMAIL_VERIFICATION challenge 入队；请求不创建新 challenge、不改 token 摘要、创建时间、申请权限快照或到期时间。缺少申请或有效 challenge 时返回相同的成功 service 结果。幂等键重复使用不会重复入队，跨邮箱/凭证复用会回滚并返回存储错误；每邮箱一小时最多 5 封（含首次验证邮件）在事务内检查。SQLite 与 PostgreSQL 按相同状态机执行。
+
+验证：TDD RED 在新增存储合同后因缺少结果类型和方法而编译失败；实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_registration_storage_contract -- --include-ignored --test-threads=1` SQLite/PostgreSQL 2/2 通过，覆盖幂等、小时限额、失效申请、幂等键冲突、凭证和权限快照不变；`cargo test --locked --lib application::user_registration::tests` 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Clippy 被既有 11 项未修改文件诊断阻断。本机 arm64；未连接 SMTP 或部署。
 
 #### LUX-809：开放公开注册与邮箱验证 API
 
