@@ -16457,6 +16457,22 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：新增 SQLite 回归先因缺少重发存储方法而编译失败；实现后 `cargo test --locked --lib user_invitation_storage_` 5/5 通过，忽略的 PostgreSQL 生命周期目标 `cargo test --locked --lib postgres_user_invitation_storage_covers_lifecycle_and_atomicity -- --ignored` 1/1 通过。`cargo build --locked`、fmt 与 diff check 通过。全目标全 feature Clippy 仍被 11 项既有库代码与 15 项既有测试代码诊断阻断，均不在本任务新增代码中。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
 
+#### LUX-792：限制邀请邮件发送频率
+
+范围：对同一规范化收件邮箱实施持久化滚动频率限制：每小时最多排入 5 封邀请邮件，涵盖新邀请和重发；达到上限后新请求不创建邀请、挑战或 outbox 项，并通过 Lux API 返回 429。额度从持久化 outbox 记录计算，发送失败和等待重试也占额度；重复使用同一重发幂等键只返回原结果，不占新额度。此任务不限制公开注册邮件，不开放重发路由，不修改 schema。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`src/application/user_invitations.rs`、`src/api/admin/admin_user_invitations.rs`。
+
+验收标准：
+
+- [x] 新邀请与重发共用每邮箱每小时 5 封上限；并发入队不能超过限额，重复幂等调用不增加邮件数。
+- [x] 达到限额后新邀请写入事务回滚、重发不入队，并返回稳定的 RATE_LIMITED/429；窗口过期后可以再次发送。
+- [x] SQLite 与 PostgreSQL 回归覆盖上限、窗口恢复、重发幂等和无副作用拒绝；相关存储目标、build、fmt 与 diff check 通过。
+
+短计划：先为存储和应用层限额补充 SQLite/PostgreSQL 回归并确认 RED；再让邀请创建与重发在锁定事务内使用同一 outbox 计数规则，映射为 HTTP 429；最后运行定向存储、应用和 HTTP 回归，build、fmt、Clippy 和 diff check。
+
+验证（2026-10-20）：新增回归先因缺少频率结果类型而编译失败；实现后 `cargo test --locked --lib user_invitation_` 7/7、应用层限额传播 1/1、HTTP 429 映射 1/1、管理员邀请 HTTP 集成 1/1、忽略的 PostgreSQL 生命周期/频率回归 1/1 通过。PostgreSQL 回归还覆盖并发重发下只允许一封进入队列、幂等重试不重复计数及一小时窗口恢复。`cargo build --locked`、fmt 与 diff check 通过。全目标全 feature Clippy 仍被 11 项既有库代码与 15 项既有测试代码诊断阻断，没有诊断指向本任务新增实现。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

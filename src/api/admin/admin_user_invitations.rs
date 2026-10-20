@@ -220,6 +220,13 @@ fn invitation_error(headers: &HeaderMap, error: UserInvitationError) -> Response
             "邀请请求无效",
         )
         .into_response(),
+        UserInvitationError::RateLimited => api_error(
+            headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            lux::ApiErrorCode::RateLimited,
+            "邀请邮件发送过于频繁，请稍后重试",
+        )
+        .into_response(),
         UserInvitationError::InvalidPreset | UserInvitationError::NotFound => api_error(
             headers,
             StatusCode::NOT_FOUND,
@@ -244,4 +251,18 @@ fn current_unix_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invitation_rate_limit_maps_to_http_429() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            invitation_error(&headers, UserInvitationError::RateLimited).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
 }

@@ -20754,20 +20754,23 @@ async fn user_invitation_storage_requeues_valid_challenge_idempotently()
         .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
         .await?;
 
-    assert!(
+    assert_eq!(
         database
             .queue_user_invitation_resend("resend-active-invitation", "resend-mail-1", 1_001)
-            .await?
+            .await?,
+        UserInvitationResendResult::Queued
     );
-    assert!(
+    assert_eq!(
         database
             .queue_user_invitation_resend("resend-active-invitation", "resend-mail-1", 1_002)
-            .await?
+            .await?,
+        UserInvitationResendResult::Queued
     );
-    assert!(
+    assert_eq!(
         database
             .queue_user_invitation_resend("resend-active-invitation", "resend-mail-2", 1_003)
-            .await?
+            .await?,
+        UserInvitationResendResult::Queued
     );
     assert!(
         database
@@ -20888,10 +20891,11 @@ async fn user_invitation_storage_does_not_resend_inactive_challenges()
             .await?;
     }
 
-    assert!(
-        !database
+    assert_eq!(
+        database
             .queue_user_invitation_resend("resend-expired-invitation", "resend-x1", 1_100)
-            .await?
+            .await?,
+        UserInvitationResendResult::NotResendable
     );
     assert!(
         database
@@ -20933,10 +20937,11 @@ async fn user_invitation_storage_does_not_resend_inactive_challenges()
         ("resend-challenge-expired-invitation", "resend-x6"),
         ("resend-challenge-missing-invitation", "resend-x7"),
     ] {
-        assert!(
-            !database
+        assert_eq!(
+            database
                 .queue_user_invitation_resend(invitation_id, idempotency_key, 1_201)
-                .await?
+                .await?,
+            UserInvitationResendResult::NotResendable
         );
     }
     assert_eq!(
@@ -20944,6 +20949,181 @@ async fn user_invitation_storage_does_not_resend_inactive_challenges()
             .fetch_one(database.pool())
             .await?,
         7
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_enforces_rolling_email_mail_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [25_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "rate-limit-resend-invitation",
+        "rate-limit@example.test",
+        "rate-limit-resend-challenge",
+        "rate-limit-initial-mail",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+
+    for index in 1..=3 {
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(
+                    "rate-limit-resend-invitation",
+                    &format!("rate-limit-resend-{index}"),
+                    1_000 + index,
+                )
+                .await?,
+            UserInvitationResendResult::Queued
+        );
+    }
+    let (first_result, second_result) = tokio::join!(
+        database.queue_user_invitation_resend(
+            "rate-limit-resend-invitation",
+            "rate-limit-resend-4",
+            1_004,
+        ),
+        database.queue_user_invitation_resend(
+            "rate-limit-resend-invitation",
+            "rate-limit-resend-5",
+            1_005,
+        ),
+    );
+    let first_result = first_result?;
+    let second_result = second_result?;
+    assert_eq!(
+        [first_result, second_result]
+            .into_iter()
+            .filter(|result| *result == UserInvitationResendResult::Queued)
+            .count(),
+        1
+    );
+    assert_eq!(
+        [first_result, second_result]
+            .into_iter()
+            .filter(|result| *result == UserInvitationResendResult::RateLimited)
+            .count(),
+        1
+    );
+    let idempotent_key = if first_result == UserInvitationResendResult::Queued {
+        "rate-limit-resend-4"
+    } else {
+        "rate-limit-resend-5"
+    };
+    assert_eq!(
+        database
+            .queue_user_invitation_resend("rate-limit-resend-invitation", idempotent_key, 1_006)
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .queue_user_invitation_resend(
+                "rate-limit-resend-invitation",
+                "rate-limit-resend-after-window",
+                4_601,
+            )
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox WHERE recipient_email = 'rate-limit@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        6
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_creation_enforces_rolling_email_mail_limit_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for index in 0..=5 {
+        let invitation_id = format!("rate-create-invitation-{index}");
+        let challenge_id = format!("rate-create-challenge-{index}");
+        let mail_key = format!("rate-create-mail-{index}");
+        let token_hash = [index as u8 + 26; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            &invitation_id,
+            "rate-create@example.test",
+            &challenge_id,
+            &mail_key,
+            10_000,
+            1_000 + index,
+            &token_hash,
+        );
+        let result = database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000 + index)
+            .await?;
+        if index < 5 {
+            assert_eq!(result, UserInvitationCreateResult::Created);
+            sqlx::query(
+                "UPDATE user_invitations SET status = 'ACCEPTED', accepted_at = ?
+                 WHERE id = ?",
+            )
+            .bind(1_000 + index)
+            .bind(&invitation_id)
+            .execute(database.pool())
+            .await?;
+        } else {
+            assert_eq!(result, UserInvitationCreateResult::RateLimited);
+        }
+    }
+    assert!(
+        database
+            .get_user_invitation("rate-create-invitation-5", 1_005)
+            .await?
+            .is_none()
+    );
+    assert!(
+        database
+            .get_mail_challenge("rate-create-challenge-5")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox WHERE recipient_email = 'rate-create@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        5
+    );
+
+    let token_hash = [31_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "rate-create-after-window",
+        "rate-create@example.test",
+        "rate-create-after-window-challenge",
+        "rate-create-after-window-mail",
+        20_000,
+        4_600,
+        &token_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 4_600)
+            .await?,
+        UserInvitationCreateResult::Created
     );
     Ok(())
 }
@@ -21392,32 +21572,35 @@ async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
             .await?,
             "FAILED"
         );
-        assert!(
-            !database
+        assert_eq!(
+            database
                 .queue_user_invitation_resend(
                     "postgres-revocable-invitation",
                     "postgres-resend-revoked",
                     1_502
                 )
-                .await?
+                .await?,
+            UserInvitationResendResult::NotResendable
         );
-        assert!(
-            !database
+        assert_eq!(
+            database
                 .queue_user_invitation_resend(
                     "postgres-expiring-invitation",
                     "postgres-resend-expired",
                     1_501
                 )
-                .await?
+                .await?,
+            UserInvitationResendResult::NotResendable
         );
-        assert!(
-            !database
+        assert_eq!(
+            database
                 .queue_user_invitation_resend(
                     "postgres-accepted-invitation",
                     "postgres-resend-accepted",
                     1_501
                 )
-                .await?
+                .await?,
+            UserInvitationResendResult::NotResendable
         );
 
         let resend_hash = [24_u8; 32];
@@ -21433,32 +21616,61 @@ async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
         database
             .create_user_invitation_with_mail(invitation, challenge, outbox, 1_600)
             .await?;
-        assert!(
-            database
-                .queue_user_invitation_resend(
-                    "postgres-resend-invitation",
-                    "postgres-resend-mail-1",
-                    1_601
-                )
-                .await?
+        for (key, now) in [
+            ("postgres-resend-mail-1", 1_601),
+            ("postgres-resend-mail-1", 1_602),
+            ("postgres-resend-mail-2", 1_603),
+            ("postgres-resend-mail-3", 1_604),
+        ] {
+            assert_eq!(
+                database
+                    .queue_user_invitation_resend("postgres-resend-invitation", key, now)
+                    .await?,
+                UserInvitationResendResult::Queued
+            );
+        }
+        let (first_result, second_result) = tokio::join!(
+            database.queue_user_invitation_resend(
+                "postgres-resend-invitation",
+                "postgres-resend-mail-4",
+                1_605,
+            ),
+            database.queue_user_invitation_resend(
+                "postgres-resend-invitation",
+                "postgres-resend-mail-5",
+                1_606,
+            ),
         );
-        assert!(
-            database
-                .queue_user_invitation_resend(
-                    "postgres-resend-invitation",
-                    "postgres-resend-mail-1",
-                    1_602
-                )
-                .await?
+        let first_result = first_result?;
+        let second_result = second_result?;
+        assert_eq!(
+            [first_result, second_result]
+                .into_iter()
+                .filter(|result| *result == UserInvitationResendResult::Queued)
+                .count(),
+            1
         );
-        assert!(
+        assert_eq!(
+            [first_result, second_result]
+                .into_iter()
+                .filter(|result| *result == UserInvitationResendResult::RateLimited)
+                .count(),
+            1
+        );
+        let successful_idempotency_key = if first_result == UserInvitationResendResult::Queued {
+            "postgres-resend-mail-4"
+        } else {
+            "postgres-resend-mail-5"
+        };
+        assert_eq!(
             database
                 .queue_user_invitation_resend(
                     "postgres-resend-invitation",
-                    "postgres-resend-mail-2",
-                    1_603
+                    successful_idempotency_key,
+                    1_607,
                 )
-                .await?
+                .await?,
+            UserInvitationResendResult::Queued
         );
         let resend_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM mail_outbox
@@ -21466,7 +21678,51 @@ async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
         )
         .fetch_one(database.pool())
         .await?;
-        assert_eq!(resend_count, 3);
+        assert_eq!(resend_count, 5);
+        sqlx::query(
+            "UPDATE user_invitations SET status = 'ACCEPTED', accepted_at = 1608
+             WHERE id = 'postgres-resend-invitation'",
+        )
+        .execute(database.pool())
+        .await?;
+        let rate_limited_hash = [25_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-rate-limited-invitation",
+            "postgres-resend@example.test",
+            "postgres-rate-limited-challenge",
+            "postgres-rate-limited-mail",
+            20_000,
+            1_608,
+            &rate_limited_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_608)
+                .await?,
+            UserInvitationCreateResult::RateLimited
+        );
+        assert!(
+            database
+                .get_user_invitation("postgres-rate-limited-invitation", 1_608)
+                .await?
+                .is_none()
+        );
+        let recovered_hash = [26_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-rate-window-recovered",
+            "postgres-resend@example.test",
+            "postgres-rate-window-recovered-challenge",
+            "postgres-rate-window-recovered-mail",
+            20_000,
+            5_208,
+            &recovered_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 5_208)
+                .await?,
+            UserInvitationCreateResult::Created
+        );
         database.close().await;
         Ok::<(), Box<dyn std::error::Error>>(())
     }

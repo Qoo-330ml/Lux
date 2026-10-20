@@ -599,7 +599,18 @@ pub(crate) struct NewUserInvitation<'a> {
 pub(crate) enum UserInvitationCreateResult {
     Created,
     AlreadyPending,
+    RateLimited,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserInvitationResendResult {
+    Queued,
+    NotResendable,
+    RateLimited,
+}
+
+const INVITATION_EMAIL_RATE_LIMIT_PER_HOUR: i64 = 5;
+const INVITATION_EMAIL_RATE_WINDOW_SECONDS: i64 = 60 * 60;
 
 #[allow(dead_code)] // LUX-789 consumes the full invitation profile in its admin API.
 pub(crate) struct StoredUserInvitation {
@@ -1889,6 +1900,31 @@ impl Database {
             };
         }
 
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'INVITATION'
+                   AND created_at > ?",
+            )
+            .bind(invitation.recipient_email)
+            .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationCreateResult::RateLimited);
+        }
+
         self.query(
             "INSERT INTO mail_challenges (
                  id, challenge_kind, recipient_email, reference_id, token_hash,
@@ -1946,7 +1982,7 @@ impl Database {
         invitation_id: &str,
         idempotency_key: &str,
         now: i64,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<UserInvitationResendResult, StorageError> {
         if now < 0
             || invitation_id.trim() != invitation_id
             || !(1..=128).contains(&invitation_id.len())
@@ -1988,7 +2024,7 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            return Ok(false);
+            return Ok(UserInvitationResendResult::NotResendable);
         };
 
         let challenge_statement = format!(
@@ -2019,8 +2055,66 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            return Ok(false);
+            return Ok(UserInvitationResendResult::NotResendable);
         };
+
+        let existing_message = self
+            .query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some(existing_message) = existing_message {
+            if existing_message.recipient_email != recipient_email
+                || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
+                || existing_message.reference_id != challenge_id
+            {
+                return Err(StorageError::Conflict(
+                    "mail outbox idempotency key already used".to_owned(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationResendResult::Queued);
+        }
+
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'INVITATION'
+                   AND created_at > ?",
+            )
+            .bind(&recipient_email)
+            .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationResendResult::RateLimited);
+        }
 
         let outbox_id = Uuid::now_v7().to_string();
         self.query(
@@ -2074,7 +2168,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(true)
+        Ok(UserInvitationResendResult::Queued)
     }
 
     pub(crate) async fn get_user_invitation(

@@ -25,6 +25,7 @@ pub(crate) enum UserInvitationError {
     InvalidPreset,
     NotFound,
     NotRevocable,
+    RateLimited,
     SigningUnavailable,
     PresetUnavailable,
     Storage(StorageError),
@@ -39,6 +40,7 @@ impl fmt::Display for UserInvitationError {
             Self::InvalidPreset => formatter.write_str("permission preset is unavailable"),
             Self::NotFound => formatter.write_str("invitation was not found"),
             Self::NotRevocable => formatter.write_str("invitation is not revocable"),
+            Self::RateLimited => formatter.write_str("invitation email rate limit exceeded"),
             Self::SigningUnavailable => formatter.write_str("invitation signing is unavailable"),
             Self::PresetUnavailable => {
                 formatter.write_str("permission preset storage is unavailable")
@@ -157,6 +159,9 @@ pub(crate) async fn create_user_invitation(
         UserInvitationCreateResult::Created => {}
         UserInvitationCreateResult::AlreadyPending => {
             return Err(UserInvitationError::AlreadyPending);
+        }
+        UserInvitationCreateResult::RateLimited => {
+            return Err(UserInvitationError::RateLimited);
         }
     }
     let invitation = database
@@ -419,6 +424,55 @@ mod tests {
         .await?;
         assert_eq!(expired.total_count, 1);
         assert_eq!(expired.entries[0].id, second.invitation.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn email_rate_limit_is_propagated_without_creating_an_invitation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, database) = test_database().await?;
+        for index in 0..5 {
+            let now = 1_000 + index * 2;
+            let invitation = create(
+                &database,
+                &directory,
+                "limited@example.test",
+                "builtin-user",
+                now,
+            )
+            .await?;
+            revoke_user_invitation(&database, &invitation.invitation.id, now + 1).await?;
+        }
+
+        assert!(matches!(
+            create(
+                &database,
+                &directory,
+                "LIMITED@example.test",
+                "builtin-user",
+                1_010,
+            )
+            .await,
+            Err(UserInvitationError::RateLimited)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM user_invitations
+                 WHERE recipient_email = 'limited@example.test'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+            5
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = 'limited@example.test'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+            5
+        );
         Ok(())
     }
 
