@@ -82,6 +82,11 @@ import type {
   CreateAdminUserInvitationResponse,
   ResendAdminUserInvitationResponse,
   RevokeAdminUserInvitationResponse,
+  AdminUserRegistrationApprovalInput,
+  AdminUserRegistrationApprovalResponse,
+  AdminUserRegistrationListQuery,
+  AdminUserRegistrationPage,
+  AdminUserRegistrationRejectionResponse,
   AdminUserListQuery,
   AdminUserListResponse,
   AdminMetadataCandidate,
@@ -1306,6 +1311,33 @@ export class LuxApiClient {
   revokeAdminUserInvitation(invitationId: string) {
     return this.request<RevokeAdminUserInvitationResponse>(
       `/api/v1/admin/user-invitations/${encodeURIComponent(invitationId)}/revoke`,
+      { method: "POST" },
+    );
+  }
+
+  adminUserRegistrations(options: AdminUserRegistrationListQuery = {}) {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      pageSize: String(options.pageSize ?? 20),
+    });
+    return this.request<AdminUserRegistrationPage>(
+      `/api/v1/admin/user-registrations?${params}`,
+    );
+  }
+
+  approveAdminUserRegistration(
+    requestId: string,
+    input: AdminUserRegistrationApprovalInput,
+  ) {
+    return this.request<AdminUserRegistrationApprovalResponse>(
+      `/api/v1/admin/user-registrations/${encodeURIComponent(requestId)}/approve`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  rejectAdminUserRegistration(requestId: string) {
+    return this.request<AdminUserRegistrationRejectionResponse>(
+      `/api/v1/admin/user-registrations/${encodeURIComponent(requestId)}/reject`,
       { method: "POST" },
     );
   }

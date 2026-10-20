@@ -2579,4 +2579,63 @@ describe("LuxApiClient", () => {
       cookie.restore();
     }
   });
+
+  it("sends admin registration review list, approval, and rejection through the typed API client", async () => {
+    const permissions = {
+      libraryAccessMode: "SELECTED",
+      libraryIds: ["library-1"],
+      canDownload: false,
+      canPlay: true,
+      maxSimultaneousPlaybacks: 2,
+      allowRemux: true,
+      allowAudioTranscode: true,
+      allowVideoTranscode: false,
+    };
+    const page = {
+      requests: [{
+        id: "registration/1",
+        recipientEmail: "person@example.test",
+        status: "PENDING_APPROVAL",
+        createdAt: 1_790_000_000,
+        emailVerifiedAt: 1_790_000_100,
+        permissions,
+      }],
+      page: 1,
+      pageSize: 20,
+      totalCount: 1,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify(page), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ approved: true, userId: "user-1" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ rejected: true }), { status: 200 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserRegistrations({ page: 1, pageSize: 20 })).resolves.toEqual(page);
+      const [listPath, listOptions] = fetchMock.mock.calls[0] ?? [];
+      const listUrl = new URL(String(listPath), "https://lux.example.test");
+      expect(listUrl.pathname).toBe("/api/v1/admin/user-registrations");
+      expect(listUrl.searchParams.get("page")).toBe("1");
+      expect(listUrl.searchParams.get("pageSize")).toBe("20");
+      expect(listOptions?.method).toBeUndefined();
+
+      await expect(client.approveAdminUserRegistration("registration/1", { permissions }))
+        .resolves.toEqual({ approved: true, userId: "user-1" });
+      const [approvePath, approveOptions] = fetchMock.mock.calls[1] ?? [];
+      expect(approvePath).toBe("/api/v1/admin/user-registrations/registration%2F1/approve");
+      expect(approveOptions?.method).toBe("POST");
+      expect(JSON.parse(String(approveOptions?.body))).toEqual({ permissions });
+      expect((approveOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+
+      await expect(client.rejectAdminUserRegistration("registration/1")).resolves.toEqual({ rejected: true });
+      const [rejectPath, rejectOptions] = fetchMock.mock.calls[2] ?? [];
+      expect(rejectPath).toBe("/api/v1/admin/user-registrations/registration%2F1/reject");
+      expect(rejectOptions?.method).toBe("POST");
+      expect((rejectOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      cookie.restore();
+    }
+  });
 });

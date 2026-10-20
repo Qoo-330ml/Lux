@@ -827,6 +827,40 @@ export type RevokeAdminUserInvitationResponse = {
   revoked: boolean;
 };
 
+export type AdminUserRegistration = {
+  id: string;
+  recipientEmail: string;
+  status: "PENDING_APPROVAL";
+  createdAt: number;
+  emailVerifiedAt: number;
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserRegistrationListQuery = {
+  page?: number;
+  pageSize?: number;
+};
+
+export type AdminUserRegistrationPage = {
+  requests: AdminUserRegistration[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserRegistrationApprovalInput = {
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserRegistrationApprovalResponse = {
+  approved: true;
+  userId: string;
+};
+
+export type AdminUserRegistrationRejectionResponse = {
+  rejected: true;
+};
+
 export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
 export type AdminUserSortBy = "createdAt" | "lastLoginAt" | "lastActivityAt";
 export type AdminUserSortOrder = "asc" | "desc";
