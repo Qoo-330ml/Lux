@@ -9,6 +9,7 @@ import { LuxShell } from "../components/layout/LuxShell";
 import { attachTouchCardHoverTracking } from "./touch-card-hover";
 import { LoginPage } from "../features/auth/LoginPage";
 import { AcceptInvitationPage } from "../features/auth/AcceptInvitationPage";
+import { RegisterPage } from "../features/auth/RegisterPage";
 import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
 import {
@@ -45,8 +46,12 @@ const AdminUserSettingsPage = lazy(() => import("../features/admin/AdminUserMana
 
 export function App() {
   const location = useLocation();
-  if (location.pathname.replace(/\/+$/, "").endsWith("/register/invitation")) {
+  const pathname = location.pathname.replace(/\/+$/, "");
+  if (pathname.endsWith("/register/invitation")) {
     return <AcceptInvitationPage />;
+  }
+  if (pathname.endsWith("/register") || pathname.endsWith("/register/verify-email")) {
+    return <RegisterPage />;
   }
   return <ServerApp />;
 }

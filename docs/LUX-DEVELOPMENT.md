@@ -16873,13 +16873,17 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 邀请模式不暴露可提交表单；公开模式表单校验、等待/成功/错误状态可访问。
-- [ ] 邮件验证成功显示“等待管理员审批”，token 被清理且不写入持久化。
-- [ ] 定向 Vitest、Web build 与真实浏览器路由/fragment 验证通过。
+- [x] 邀请模式不暴露可提交表单；公开模式表单校验、等待/成功/错误状态可访问。
+- [x] 邮件验证成功显示“等待管理员审批”，token 被清理且不写入持久化。
+- [x] 定向 Vitest、Web build 与真实浏览器路由/fragment 验证通过。
 
 依赖：LUX-810、LUX-811A、LUX-811B。
 
 短计划：先增加模式、提交及验证页面回归；再添加页面路由与状态；最后运行 Vitest、Web build 和浏览器检查。
+
+实施结果（2026-10-20）：`/register` 与 `/register/verify-email` 在 setup/session 查询前独立路由，兼容反向代理子路径。页面只在公开注册模式展示表单，提交成功后说明需验证邮箱及管理员审批；验证 token 从 fragment 读取后立即清理地址栏，只短暂保存在组件内存，完成后显示等待审批状态。
+
+验证：`pnpm --dir web exec vitest run tests/register-page.test.tsx` 5/5、`pnpm --dir web build` 与 `git diff --check` 通过。隔离 Chromium 本地浏览器用 mock API 验证代理子路径公开模式表单、邀请模式隐藏表单、邮箱验证 POST 前 fragment 已清理以及成功后的待审批说明；浏览器控制台 0 error / 0 warning。未提交真实注册申请或连接 SMTP。
 
 #### LUX-812：开放注册申请审批管理员 API
 
