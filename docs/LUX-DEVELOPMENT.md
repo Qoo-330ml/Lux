@@ -16186,6 +16186,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 因 PlaybackInfo 没有创建 `emby_direct_playback_tickets` 上下文行而失败；实现后 `cargo test --locked --test playback -- --test-threads=1` 4/4 通过，其中回归覆盖认证 token 的 `playback-admin`/`PlaybackTest` 值优先于伪造请求头、所有媒体源 URL 共用数据库过期时间、没有并发准入记录，以及注入数据库写失败时返回 503 且不新增票据。`cargo build --locked`、fmt 与 `git diff --check` 通过。未存储 token、签名或 URL。Cargo 使用 Toshiba target 目录。
 
+#### LUX-777：Emby 直放票据逐请求执行黑名单
+
+范围：在验证新 v2 或兼容旧无版本 HMAC 后，要求播放会话票据记录存在、用户/会话/过期时间一致且未撤销。旧版有效链接首次访问时写入一次 NULL 设备/客户端上下文。每次媒体资源请求都检查签发时绑定的设备/客户端及当前可信来源 IP；命中永久撤销票据、停止已活动的播放记录并释放对应并发准入，解除规则后不得复活。上下文缺失但对应设备/客户端规则启用时 fail closed 并撤销。记录命中维度但不记录凭证、URL 或 IP 明文。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/media.rs`、`src/storage/sessions.rs`、`tests/playback.rs`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-activity.test.tsx`。
+
+验收标准：
+
+- [x] 每条直放资源请求先校验签名，再确认存储票据的用户、播放会话、过期时间和撤销状态；v2 缺行拒绝，旧无版本票据在有效期内按原 HMAC 兼容并只写一次空上下文。
+- [x] 全站/用户级设备、客户端、IP/CIDR 命中立即撤销直放票据，释放该用户/播放会话的并发准入并停止活动播放记录；规则删除后同一票据仍不可用。
+- [x] 缺少设备/客户端上下文且相应规则启用时拒绝并撤销；缺少来源 IP/坏规则/超限规则及存储或代理设置错误 fail closed。
+- [x] 命中活动记录包含设备、客户端或 IP 维度，不含 token、签名、URL 或 IP 明文；播放请求定向回归、build、fmt 与 diff check 通过。
+
+短计划：先为已签发直放链接添加客户端/设备/IP 新规则阻断、撤销持久化、解除规则不复活和命中原因回归，并确认当前票据仍然可用；再加入签名后票据状态校验、旧链接空上下文兼容、访问规则检查及撤销/准入清理；最后运行 `playback` 与授权逻辑单测、build、fmt 与 diff check。
+
+验证（2026-10-20）：Rust 授权单测 2/2、`cargo test --locked --test playback -- --test-threads=1` 4/4、`cargo build --locked`、fmt 和 diff check 通过。Web 活动记录定向测试 2/2、`pnpm --dir web build` 通过；完整 Web 套件 746/750，4 项失败位于未修改的首页/媒体库卡片预取、虚拟集合链接和媒体详情离线轮询测试。活动页只显示白名单元数据。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

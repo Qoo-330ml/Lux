@@ -23,22 +23,34 @@ describe("AdminUserDetailPage activity timeline", () => {
 
   it("filters and paginates safe activity summaries for this user", async () => {
     const firstPage: AdminUserActivityPage = {
-      events: [{
-        id: "event-1",
-        userId: "user-1",
-        actorUserId: "user-1",
-        eventType: "PLAYBACK_STARTED",
-        targetType: "media_item",
-        targetId: "item-1",
-        metadata: {
-          client: "Lux",
-          deviceName: "Web",
-          state: "PLAYING",
-          remoteIp: "192.0.2.10",
-          accessToken: "must-not-render",
+      events: [
+        {
+          id: "event-1",
+          userId: "user-1",
+          actorUserId: "user-1",
+          eventType: "PLAYBACK_STARTED",
+          targetType: "media_item",
+          targetId: "item-1",
+          metadata: {
+            client: "Lux",
+            deviceName: "Web",
+            state: "PLAYING",
+            remoteIp: "192.0.2.10",
+            accessToken: "must-not-render",
+          },
+          occurredAt: 1_792_000_000,
         },
-        occurredAt: 1_792_000_000,
-      }],
+        {
+          id: "event-blacklist-hit",
+          userId: "user-1",
+          actorUserId: null,
+          eventType: "USER_ACCESS_BLACKLIST_HIT",
+          targetType: "playback_session",
+          targetId: "session-1",
+          metadata: { reason: "CLIENT", source: "EMBY_DIRECT_TICKET", signature: "must-not-render" },
+          occurredAt: 1_792_000_001,
+        },
+      ],
       page: 1,
       pageSize: 20,
       totalCount: 21,
@@ -57,6 +69,9 @@ describe("AdminUserDetailPage activity timeline", () => {
       await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", { page: 1, pageSize: 20 }));
     });
     expect(container.textContent).toContain("开始播放");
+    expect(container.textContent).toContain("访问黑名单命中");
+    expect(container.textContent).toContain("命中原因");
+    expect(container.textContent).toContain("CLIENT");
     expect(container.textContent).toContain("Web");
     expect(container.textContent).toContain("192.0.2.10");
     expect(container.textContent).not.toContain("must-not-render");

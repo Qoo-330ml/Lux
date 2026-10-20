@@ -13,10 +13,11 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::storage::{
-    Database, NewEmbyDirectPlaybackTicket, NewWebPlaybackEvent, NewWebPlaybackSession,
-    PlaybackAdmissionResult, StorageError, StoredWebPlaybackSession,
-    UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy,
-    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    Database, NewAuditEvent, NewEmbyDirectPlaybackTicket, NewUserActivityEvent,
+    NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
+    StoredEmbyDirectPlaybackTicket, StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery,
+    UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails,
 };
 
 use crate::application::user_access_rules::{
@@ -227,6 +228,29 @@ impl WebPlaybackSessionService {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn sign_emby_direct_stream_legacy(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        item_id: &str,
+        media_source_id: &str,
+        play_session_id: &str,
+        expires_at: i64,
+    ) -> Option<String> {
+        self.signer.sign(
+            EMBY_DIRECT_STREAM_SESSION_ID,
+            &emby_direct_stream_resource(
+                user_id,
+                is_admin,
+                item_id,
+                media_source_id,
+                play_session_id,
+            ),
+            expires_at,
+        )
+    }
+
     pub(crate) async fn check_playback_admission(
         &self,
         user_id: &str,
@@ -416,6 +440,246 @@ impl WebPlaybackSessionService {
                 created_at,
             })
             .await
+    }
+
+    pub(crate) async fn authorize_emby_direct_playback_ticket_with_ip(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        expires_at: i64,
+        legacy_ticket: bool,
+        client_ip: Option<IpAddr>,
+    ) -> Result<(), WebPlaybackSessionError> {
+        let now = unix_timestamp();
+        if legacy_ticket {
+            self.database
+                .ensure_legacy_emby_direct_playback_ticket(
+                    user_id,
+                    play_session_id,
+                    expires_at,
+                    now,
+                )
+                .await?;
+        }
+        let Some(ticket) = self
+            .database
+            .find_emby_direct_playback_ticket(user_id, play_session_id)
+            .await?
+        else {
+            return Err(WebPlaybackSessionError::NotFound);
+        };
+        if ticket.user_id != user_id || ticket.expires_at != expires_at {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        if ticket.revoked_at.is_some() {
+            return Err(WebPlaybackSessionError::NotActive);
+        }
+        if ticket.expires_at < now {
+            return Err(WebPlaybackSessionError::Expired);
+        }
+        if ticket.created_at > now {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        self.enforce_emby_direct_ticket_access_rules(&ticket, client_ip)
+            .await
+    }
+
+    async fn enforce_emby_direct_ticket_access_rules(
+        &self,
+        ticket: &StoredEmbyDirectPlaybackTicket,
+        client_ip: Option<IpAddr>,
+    ) -> Result<(), WebPlaybackSessionError> {
+        let device_id = ticket
+            .authorization_device_id
+            .as_deref()
+            .map(|value| {
+                normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Device, value)
+                    .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
+            })
+            .transpose()?;
+        let client_name = ticket
+            .authorization_client_name
+            .as_deref()
+            .map(|value| {
+                normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Client, value)
+                    .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
+            })
+            .transpose()?;
+
+        if device_id.is_none() || client_name.is_none() {
+            let (device_rules_active, client_rules_active) = self
+                .database
+                .active_user_access_device_client_blacklist_rules(&ticket.user_id)
+                .await?;
+            if device_id.is_none() && device_rules_active {
+                self.revoke_emby_direct_ticket_after_rule_hit(ticket, "DEVICE_CONTEXT_MISSING")
+                    .await?;
+                return Err(WebPlaybackSessionError::NotActive);
+            }
+            if client_name.is_none() && client_rules_active {
+                self.revoke_emby_direct_ticket_after_rule_hit(ticket, "CLIENT_CONTEXT_MISSING")
+                    .await?;
+                return Err(WebPlaybackSessionError::NotActive);
+            }
+        }
+
+        if let Some(device_id) = device_id.as_deref()
+            && self
+                .database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id: &ticket.user_id,
+                    device_id: Some(device_id),
+                    client_name: None,
+                })
+                .await?
+        {
+            self.revoke_emby_direct_ticket_after_rule_hit(ticket, "DEVICE")
+                .await?;
+            return Err(WebPlaybackSessionError::NotActive);
+        }
+        if let Some(client_name) = client_name.as_deref()
+            && self
+                .database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id: &ticket.user_id,
+                    device_id: None,
+                    client_name: Some(client_name),
+                })
+                .await?
+        {
+            self.revoke_emby_direct_ticket_after_rule_hit(ticket, "CLIENT")
+                .await?;
+            return Err(WebPlaybackSessionError::NotActive);
+        }
+
+        let ip_rules = self
+            .database
+            .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                user_id: &ticket.user_id,
+                limit: MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST as i64 + 1,
+            })
+            .await?;
+        if ip_rules.is_empty() {
+            return Ok(());
+        }
+        let Some(client_ip) = client_ip else {
+            self.revoke_emby_direct_ticket_after_rule_hit(ticket, "IP_CONTEXT_MISSING")
+                .await?;
+            return Err(WebPlaybackSessionError::AccessRulesUnavailable);
+        };
+        match ip_blacklist_rules_match_address(client_ip, &ip_rules) {
+            Ok(true) => {
+                self.revoke_emby_direct_ticket_after_rule_hit(ticket, "IP")
+                    .await?;
+                Err(WebPlaybackSessionError::NotActive)
+            }
+            Ok(false) => Ok(()),
+            Err(IpBlacklistEvaluationError::InvalidStoredRule) => {
+                self.revoke_emby_direct_ticket_after_rule_hit(ticket, "IP_RULE_INVALID")
+                    .await?;
+                Err(WebPlaybackSessionError::AccessRulesUnavailable)
+            }
+            Err(IpBlacklistEvaluationError::TooManyRules) => {
+                self.revoke_emby_direct_ticket_after_rule_hit(ticket, "IP_RULE_LIMIT")
+                    .await?;
+                Err(WebPlaybackSessionError::AccessRulesUnavailable)
+            }
+        }
+    }
+
+    async fn revoke_emby_direct_ticket_after_rule_hit(
+        &self,
+        ticket: &StoredEmbyDirectPlaybackTicket,
+        reason: &str,
+    ) -> Result<(), WebPlaybackSessionError> {
+        let now = unix_timestamp();
+        let revoked = self
+            .database
+            .revoke_emby_direct_playback_ticket(&ticket.user_id, &ticket.play_session_id, now)
+            .await?;
+        self.stop_emby_playback_session(&ticket.user_id, &ticket.play_session_id, now)
+            .await;
+        if revoked {
+            self.record_emby_direct_ticket_rule_hit(ticket, reason, now)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn stop_emby_playback_session(&self, user_id: &str, play_session_id: &str, now: i64) {
+        match self
+            .database
+            .find_playback_session(user_id, play_session_id)
+            .await
+        {
+            Ok(Some(session)) if session.state != "STOPPED" => {
+                if let Err(error) = self.database.stop_playback_session(&session.id, now).await {
+                    tracing::warn!(%error, "failed to stop playback after direct ticket rejection");
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to find playback after direct ticket rejection");
+            }
+        }
+        if let Err(error) = self
+            .database
+            .release_playback_admission(user_id, play_session_id, now)
+            .await
+        {
+            tracing::warn!(%error, "failed to release admission after direct ticket rejection");
+        }
+    }
+
+    async fn record_emby_direct_ticket_rule_hit(
+        &self,
+        ticket: &StoredEmbyDirectPlaybackTicket,
+        reason: &str,
+        occurred_at: i64,
+    ) {
+        let event_type = if matches!(reason, "DEVICE" | "CLIENT" | "IP") {
+            "USER_ACCESS_BLACKLIST_HIT"
+        } else {
+            "USER_ACCESS_RULES_DENIED"
+        };
+        let metadata_json = serde_json::json!({
+            "reason": reason,
+            "source": "EMBY_DIRECT_TICKET",
+        })
+        .to_string();
+        if let Err(error) = self
+            .database
+            .insert_user_activity_event(NewUserActivityEvent {
+                user_id: &ticket.user_id,
+                actor_user_id: None,
+                event_type,
+                target_type: Some("playback_session"),
+                target_id: Some(&ticket.play_session_id),
+                metadata_json: &metadata_json,
+            })
+            .await
+        {
+            tracing::warn!(event_type, %error, "failed to record playback blacklist activity");
+        }
+        if let Err(error) = self
+            .database
+            .insert_audit_event(NewAuditEvent {
+                actor_user_id: None,
+                event_type,
+                target_type: Some("playback_session"),
+                target_id: Some(&ticket.play_session_id),
+                metadata_json: &metadata_json,
+            })
+            .await
+        {
+            tracing::warn!(event_type, %error, "failed to record playback blacklist audit");
+        }
+        tracing::warn!(
+            event = event_type,
+            reason,
+            occurred_at,
+            "Emby direct playback ticket revoked by access blacklist"
+        );
     }
 
     pub(crate) fn sign_resource(

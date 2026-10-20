@@ -2579,9 +2579,11 @@ pub(super) async fn emby_stream_principal(
         let Some(service) = state.web_playback.as_ref() else {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         };
+        let ticket_user_id = user_id.to_string();
+        let legacy_ticket = query.playback_ticket_version.is_none();
         let is_valid = match query.playback_ticket_version.as_deref() {
             None => service.verify_emby_direct_stream(
-                &user_id.to_string(),
+                &ticket_user_id,
                 is_admin,
                 item_id,
                 source_id,
@@ -2590,7 +2592,7 @@ pub(super) async fn emby_stream_principal(
                 signature,
             ),
             Some(EMBY_DIRECT_STREAM_TICKET_VERSION) => service.verify_emby_direct_stream_v2(
-                &user_id.to_string(),
+                &ticket_user_id,
                 is_admin,
                 item_id,
                 source_id,
@@ -2602,6 +2604,33 @@ pub(super) async fn emby_stream_principal(
         };
         if !is_valid {
             return Err(StatusCode::UNAUTHORIZED);
+        }
+        let client_ip = super::request_access_ip(headers, state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        match service
+            .authorize_emby_direct_playback_ticket_with_ip(
+                &ticket_user_id,
+                play_session_id,
+                expires_at,
+                legacy_ticket,
+                client_ip,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::application::playback::session::WebPlaybackSessionError::NotFound) => {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Err(
+                crate::application::playback::session::WebPlaybackSessionError::Expired
+                | crate::application::playback::session::WebPlaybackSessionError::NotActive,
+            ) => return Err(StatusCode::GONE),
+            Err(
+                crate::application::playback::session::WebPlaybackSessionError::AccessRulesUnavailable
+                | crate::application::playback::session::WebPlaybackSessionError::Storage(_),
+            ) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
         }
         return Ok(AccessPrincipal::new(user_id, is_admin));
     }
@@ -3972,4 +4001,224 @@ pub(super) fn lux_catalog_chapter_json(
         "markerType": chapter.marker_type,
         "chapterIndex": chapter.chapter_index,
     })
+}
+
+#[cfg(test)]
+mod direct_ticket_tests {
+    use super::*;
+    use crate::{
+        api::AppState,
+        application::setup::SetupService,
+        auth::{emby::EmbyAuthService, sessions::WebAuthService},
+        config::Config,
+        storage::Database,
+    };
+
+    #[tokio::test]
+    async fn legacy_direct_ticket_initializes_empty_context_then_fails_closed_on_client_rule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let state = AppState::ready(
+            config,
+            database.clone(),
+            setup,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database.clone())?,
+        );
+        let service = state
+            .web_playback
+            .as_ref()
+            .ok_or("missing Web playback service")?;
+        let user_id = user.id.to_string();
+        let item_id = uuid::Uuid::now_v7().to_string();
+        let source_id = uuid::Uuid::now_v7().to_string();
+        let play_session_id = "legacy-direct-ticket-session";
+        let expires_at = crate::application::playback::session::unix_timestamp() + 60;
+        let signature = service
+            .sign_emby_direct_stream_legacy(
+                &user_id,
+                user.is_admin,
+                &item_id,
+                &source_id,
+                play_session_id,
+                expires_at,
+            )
+            .ok_or("could not sign legacy direct ticket")?;
+        let query = emby_stream_query_from_raw(RawQuery(Some(format!(
+            "luxPlaybackUserId={user_id}&luxPlaybackAdmin=1&PlaySessionId={play_session_id}&luxPlaybackExpires={expires_at}&luxPlaybackSignature={signature}"
+        ))));
+
+        assert!(query.playback_ticket_version.is_none());
+        assert!(
+            emby_stream_principal(
+                &HeaderMap::new(),
+                &state,
+                &query,
+                &item_id,
+                Some(&source_id),
+            )
+            .await
+            .is_ok()
+        );
+        let stored_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, play_session_id)
+            .await?
+            .ok_or("legacy direct ticket context was not initialized")?;
+        assert_eq!(stored_ticket.authorization_device_id, None);
+        assert_eq!(stored_ticket.authorization_client_name, None);
+
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by
+             ) VALUES ('legacy-direct-ticket-client-rule', NULL, 'CLIENT', 'playbacktest', 1, ?)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+        let blocked = emby_stream_principal(
+            &HeaderMap::new(),
+            &state,
+            &query,
+            &item_id,
+            Some(&source_id),
+        )
+        .await;
+        assert!(matches!(blocked, Err(StatusCode::GONE)));
+        let stored_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, play_session_id)
+            .await?
+            .ok_or("legacy direct ticket row disappeared")?;
+        assert!(stored_ticket.revoked_at.is_some());
+
+        state.shutdown_background_workers().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_ticket_with_ip_rule_fails_closed_without_peer_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let state = AppState::ready(
+            config,
+            database.clone(),
+            setup,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database.clone())?,
+        );
+        let service = state
+            .web_playback
+            .as_ref()
+            .ok_or("missing Web playback service")?;
+        let user_id = user.id.to_string();
+        let item_id = uuid::Uuid::now_v7().to_string();
+        let source_id = uuid::Uuid::now_v7().to_string();
+        let play_session_id = "direct-ticket-missing-peer-session";
+        let expires_at = crate::application::playback::session::unix_timestamp() + 60;
+        let signature = service
+            .sign_emby_direct_stream_v2(
+                &user_id,
+                user.is_admin,
+                &item_id,
+                &source_id,
+                play_session_id,
+                expires_at,
+            )
+            .ok_or("could not sign v2 direct ticket")?;
+        service
+            .register_emby_direct_playback_ticket(
+                &user_id,
+                play_session_id,
+                Some("device-id"),
+                Some("PlaybackTest"),
+                expires_at,
+                crate::application::playback::session::unix_timestamp(),
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by
+             ) VALUES ('direct-ticket-missing-peer-rule', NULL, 'IP_CIDR', '192.0.2.0/24', 1, ?)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+        let query = emby_stream_query_from_raw(RawQuery(Some(format!(
+            "luxPlaybackUserId={user_id}&luxPlaybackAdmin=1&PlaySessionId={play_session_id}&luxPlaybackTicketVersion=2&luxPlaybackExpires={expires_at}&luxPlaybackSignature={signature}"
+        ))));
+
+        let denied = emby_stream_principal(
+            &HeaderMap::new(),
+            &state,
+            &query,
+            &item_id,
+            Some(&source_id),
+        )
+        .await;
+        assert!(matches!(denied, Err(StatusCode::SERVICE_UNAVAILABLE)));
+        let stored_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, play_session_id)
+            .await?
+            .ok_or("direct ticket context was not persisted")?;
+        assert!(stored_ticket.revoked_at.is_some());
+        sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+            .bind("direct-ticket-missing-peer-rule")
+            .execute(database.pool())
+            .await?;
+
+        let invalid_rule_session_id = "direct-ticket-invalid-ip-rule-session";
+        let invalid_rule_expires_at = crate::application::playback::session::unix_timestamp() + 60;
+        service
+            .register_emby_direct_playback_ticket(
+                &user_id,
+                invalid_rule_session_id,
+                Some("device-id"),
+                Some("PlaybackTest"),
+                invalid_rule_expires_at,
+                crate::application::playback::session::unix_timestamp(),
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by
+             ) VALUES ('direct-ticket-invalid-ip-rule', NULL, 'IP_CIDR', 'not-a-cidr', 1, ?)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+        let invalid_rule_result = service
+            .authorize_emby_direct_playback_ticket_with_ip(
+                &user_id,
+                invalid_rule_session_id,
+                invalid_rule_expires_at,
+                false,
+                Some("192.0.2.1".parse()?),
+            )
+            .await;
+        assert!(matches!(
+            invalid_rule_result,
+            Err(crate::application::playback::session::WebPlaybackSessionError::AccessRulesUnavailable)
+        ));
+        let invalid_rule_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, invalid_rule_session_id)
+            .await?
+            .ok_or("invalid-rule ticket context was not persisted")?;
+        assert!(invalid_rule_ticket.revoked_at.is_some());
+
+        state.shutdown_background_workers().await;
+        Ok(())
+    }
 }

@@ -989,6 +989,8 @@ const activityEventLabels: Record<string, string> = {
   PLAYBACK_STARTED: "开始播放",
   PLAYBACK_PAUSED: "暂停播放",
   PLAYBACK_STOPPED: "停止播放",
+  USER_ACCESS_BLACKLIST_HIT: "访问黑名单命中",
+  USER_ACCESS_RULES_DENIED: "访问规则拒绝",
 };
 
 const activityMetadataFields = [
@@ -998,6 +1000,7 @@ const activityMetadataFields = [
   ["clientVersion", "客户端版本"],
   ["state", "播放状态"],
   ["remoteIp", "IP"],
+  ["reason", "命中原因"],
 ] as const;
 
 function AdminUserActivityPanel({ user }: { user: AdminUser }) {

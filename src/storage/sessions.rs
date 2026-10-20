@@ -1005,7 +1005,6 @@ impl Database {
         })
     }
 
-    #[allow(dead_code)] // LUX-776 initializes context for pre-migration direct URLs.
     pub(crate) async fn ensure_legacy_emby_direct_playback_ticket(
         &self,
         user_id: &str,
@@ -1033,7 +1032,6 @@ impl Database {
         })
     }
 
-    #[allow(dead_code)] // LUX-776 uses this bounded point lookup for ticket authorization.
     pub(crate) async fn find_emby_direct_playback_ticket(
         &self,
         user_id: &str,
@@ -1066,7 +1064,6 @@ impl Database {
         })
     }
 
-    #[allow(dead_code)] // LUX-776 persists a blacklist hit so a ticket cannot revive.
     pub(crate) async fn revoke_emby_direct_playback_ticket(
         &self,
         user_id: &str,
