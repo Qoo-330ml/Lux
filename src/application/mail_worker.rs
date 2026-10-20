@@ -249,7 +249,18 @@ async fn prepare_mail(
     if !bool::from(challenge.token_hash.as_slice().ct_eq(token_hash.as_slice())) {
         return Ok(PreparedMail::Fail(MailDeliveryErrorCode::ReferenceMissing));
     }
-    let message = match render_message(&settings, outbox, &token) {
+    let account_user_id = if outbox.template_kind == MailOutboxTemplateKind::EmailVerification {
+        match database.find_user_by_id(&challenge.reference_id).await? {
+            Some(user) if !user.is_disabled && user.deleted_at.is_none() => {
+                Some(challenge.reference_id.as_str())
+            }
+            Some(_) => return Ok(PreparedMail::Fail(MailDeliveryErrorCode::ReferenceMissing)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let message = match render_message(&settings, outbox, &token, account_user_id) {
         Ok(message) => message,
         Err(error_code) => return Ok(PreparedMail::Fail(error_code)),
     };
@@ -264,21 +275,26 @@ fn render_message(
     settings: &MailSettings,
     outbox: &crate::storage::StoredMailOutboxMessage,
     token: &str,
+    account_user_id: Option<&str>,
 ) -> Result<Message, MailDeliveryErrorCode> {
-    let (path, subject, body_intro) = match outbox.template_kind {
-        MailOutboxTemplateKind::Invitation => (
-            ["register", "invitation"],
-            "你收到加入 Lux 的邀请",
-            "请打开以下链接完成邀请注册：",
-        ),
-        MailOutboxTemplateKind::EmailVerification => (
-            ["register", "verify-email"],
-            "验证你的 Lux 邮箱",
-            "请打开以下链接完成邮箱验证：",
-        ),
+    let (subject, body_intro) = match outbox.template_kind {
+        MailOutboxTemplateKind::Invitation => {
+            ("你收到加入 Lux 的邀请", "请打开以下链接完成邀请注册：")
+        }
+        MailOutboxTemplateKind::EmailVerification => {
+            ("验证你的 Lux 邮箱", "请打开以下链接完成邮箱验证：")
+        }
     };
-    let link = registration_link(&settings.site_url, &path, token)
-        .ok_or(MailDeliveryErrorCode::TemplateMissing)?;
+    let link = match outbox.template_kind {
+        MailOutboxTemplateKind::Invitation => {
+            registration_link(&settings.site_url, &["register", "invitation"], token)
+        }
+        MailOutboxTemplateKind::EmailVerification => match account_user_id {
+            Some(user_id) => account_email_verification_link(&settings.site_url, user_id, token),
+            None => registration_link(&settings.site_url, &["register", "verify-email"], token),
+        },
+    }
+    .ok_or(MailDeliveryErrorCode::TemplateMissing)?;
     let sender_address = settings
         .sender_email
         .parse()
@@ -305,6 +321,16 @@ fn registration_link(site_url: &str, path: &[&str; 2], token: &str) -> Option<Ur
     {
         let mut path_segments = url.path_segments_mut().ok()?;
         path_segments.pop_if_empty().push(path[0]).push(path[1]);
+    }
+    url.set_fragment(Some(&format!("token={token}")));
+    Some(url)
+}
+
+fn account_email_verification_link(site_url: &str, user_id: &str, token: &str) -> Option<Url> {
+    let mut url = Url::parse(site_url).ok()?;
+    {
+        let mut path_segments = url.path_segments_mut().ok()?;
+        path_segments.pop_if_empty().push("account").push(user_id);
     }
     url.set_fragment(Some(&format!("token={token}")));
     Some(url)
@@ -379,7 +405,7 @@ mod tests {
         config::Config,
         storage::{
             Database, MailChallengeKind, MailDeliveryErrorCode, MailOutboxStatus,
-            MailOutboxTemplateKind, NewMailChallenge, NewMailOutboxMessage,
+            MailOutboxTemplateKind, NewMailChallenge, NewMailOutboxMessage, NewStoredUser,
             StoredMailOutboxMessage,
         },
     };
@@ -572,6 +598,102 @@ mod tests {
             MailOutboxStatus::Sent
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_routes_existing_account_email_verification_to_account_page()
+    -> Result<(), Box<dyn Error>> {
+        let (_directory, database, config_dir) = test_context().await?;
+        let now = 2_000;
+        database
+            .insert_user_with_email(NewStoredUser {
+                id: "account-email-user",
+                username_normalized: "account-email-user",
+                display_name: "Account Email User",
+                password_hash: "test-hash",
+                is_admin: false,
+                has_password: true,
+                email: Some("old@example.test"),
+            })
+            .await?;
+        let (outbox_id, token) = enqueue_account_email_change(
+            &database,
+            &config_dir,
+            "account-email-user",
+            now,
+            now + 3_600,
+        )
+        .await?;
+        let sender = RecordingSender::default();
+
+        let outcome =
+            process_next_mail(&database, &config_dir, now, |_, _| Ok(sender.clone())).await?;
+
+        assert_eq!(outcome, MailWorkerStep::Sent);
+        let messages = sender
+            .messages
+            .lock()
+            .map_err(|_| "sender lock poisoned")?
+            .clone();
+        let message = String::from_utf8_lossy(&messages[0]);
+        let encoded_body = message
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.lines().collect::<String>())
+            .ok_or("email body was missing")?;
+        let body = String::from_utf8(STANDARD.decode(encoded_body.as_bytes())?)?;
+        assert!(body.contains("https://lux.example.test/media/account/account-email-user#token="));
+        assert!(body.contains(&token));
+        assert_eq!(
+            read_outbox(&database, &outbox_id).await?.status,
+            MailOutboxStatus::Sent
+        );
+        Ok(())
+    }
+
+    async fn enqueue_account_email_change(
+        database: &Database,
+        config_dir: &Path,
+        user_id: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> Result<(String, String), Box<dyn Error>> {
+        let signer = MailChallengeSigner::load_or_create(config_dir).await?;
+        let challenge_id = uuid::Uuid::now_v7().to_string();
+        let token = signer
+            .token_for(
+                &challenge_id,
+                MailChallengeKind::EmailVerification,
+                expires_at,
+            )
+            .ok_or("test token could not be derived")?;
+        let token_hash = hash_mail_challenge_token(&token);
+        let challenge = database
+            .create_mail_challenge(
+                NewMailChallenge {
+                    id: &challenge_id,
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "new-address@example.test",
+                    reference_id: user_id,
+                    token_hash: &token_hash,
+                    expires_at,
+                },
+                now,
+            )
+            .await?;
+        let idempotency_key = format!("mail-worker:{}", uuid::Uuid::now_v7());
+        let outbox = database
+            .enqueue_mail_outbox(
+                NewMailOutboxMessage {
+                    idempotency_key: &idempotency_key,
+                    recipient_email: "new-address@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: &challenge.id,
+                    available_at: now,
+                },
+                now,
+            )
+            .await?;
+        Ok((outbox.id, token))
     }
 
     #[tokio::test]

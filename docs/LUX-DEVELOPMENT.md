@@ -16943,15 +16943,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：当前登录用户提出邮箱变更时生成有界有效期验证邮件；应用层验证仅消费该用户对应的 challenge。发送限额按账号/邮箱执行；邮件发送失败不改变原邮箱。本任务不开放 HTTP endpoint。
 
-预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_email_verification.rs`、`src/application/mod.rs`（service 回归内置于模块）。
+预计修改文件（7 个，按存储合同与应用/邮件 worker 拆为两个增量）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`src/application/user_email_verification.rs`、`src/application/mod.rs`、`src/application/mail_worker.rs`。
 
 验收标准：
 
-- [ ] 变更邮箱后当前 API 仍返回原邮箱及未完成状态；验证成功后更新至新邮箱并显示已验证。
-- [ ] 用户不能消费其他账号 challenge；过期/重放/冲突/速率限制失败稳定且无信息泄漏。
-- [ ] service 使用 LUX-814 原子 storage 合同；定向 application 回归、build、fmt 与 diff check 通过。
+- [x] 变更邮箱后原邮箱和验证时间保持不变，服务端可恢复待验证地址；验证成功后更新邮箱及验证时间。
+- [x] 用户不能消费其他账号 challenge；过期/重放/冲突/速率限制失败统一映射为稳定错误。
+- [x] service 使用 LUX-814 原子 storage 合同；定向 application/storage 回归、build、fmt 与 diff check 通过。
 
-短计划：先增加邮箱申请、签发与消费 service 回归；再连接 LUX-814 和邮件 outbox；最后运行定向测试及常规检查。
+短计划：先建立账号邮箱变更的原子存储/outbox 合同；再接入 service 与邮件链接分流；最后运行定向测试及常规检查。
+
+实施结果（2026-10-20）：新增账户邮箱变更 application service，规范化并验证邮箱输入，按账号与目标邮箱分别限流；challenge 有效期为 24 小时，原始 token 只进入邮件 fragment，存储仅保存摘要。存储事务在确认账号启用后原子写入 challenge/outbox、撤销该账号旧 challenge 并取消旧队列消息；队列插入失败会回滚整个事务，当前邮箱和验证时间保持不变。service 只允许当前账号消费其有效 challenge，并复用 LUX-814 原子邮箱切换事务；邮箱冲突、错误账号、过期和重放返回相同不可接受结果。邮件 worker 按引用账号区分公开注册与账号邮箱变更：注册邮件仍指向注册页，账号邮件指向 `/account/{userId}#token=...`。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_email_verification -- --nocapture` 3/3 通过；`cargo test --locked --lib user_email_change_storage_contract -- --nocapture` SQLite 1/1 通过；`NO_PROXY=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib postgres_user_email_change_storage_contract_is_atomic -- --include-ignored --nocapture` PostgreSQL 1/1 通过；邮件 worker 账号链接回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --lib --all-features -- -D warnings` 被 11 条已有 lint 阻断，涉及 `admin_users.rs`、Emby/media/playback、`user_permission_copy.rs` 与 `storage/users.rs`；本任务修改位置没有对应诊断。测试与构建使用 Toshiba target 目录；本机为 macOS arm64。没有连接真实 SMTP 服务，本任务不包含 HTTP endpoint，API 和账户页留待 LUX-816/817。
 
 #### LUX-816：开放账户邮箱验证 API
 
