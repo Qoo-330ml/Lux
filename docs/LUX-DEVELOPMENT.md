@@ -16563,6 +16563,388 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 结果（2026-10-20）：SQLite 接受流程在单事务内写入已验证活动账户、角色、下载/播放/转码策略和指定媒体库授权，并同时接受邀请、消费挑战；并发接受仅一个调用成功，重复消费返回不可接受。邮箱或期限不匹配、过期、撤销、错误摘要、用户名冲突和已注册邮箱均不会创建部分账户；授权 FK 写入失败会回滚账户、邀请和挑战状态。定向 SQLite storage 回归 8/8 通过；隔离 PostgreSQL 生命周期与接受回归 1/1 通过，验证 PostgreSQL 权限快照、并发单次消费、注册邮箱冲突及授权失败回滚。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。最新 `cargo test --locked --all-targets` 为 1119 passed、5 failed、27 ignored，库测试失败后未运行后续集成 targets。失败为：三个已在干净基线记录的 fill-missing 测试；`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`（单独复跑仍失败，先前任务已有记录）；`shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（并行 LUX-794 新增一条 shutdown 更新后实际查询数 10，旧断言期望 9）。全目标 Clippy 被 15 条既有告警阻断（管理 API、播放、权限复制、用户存储和旧测试），未报告本任务新增告警。
 
+### 用户管理剩余实施任务（模块八除外）
+
+按 `docs/USER-MANAGEMENT-DESIGN.md` 与当前实现记录审计后，模块四、模块五的访问执行、模块六以及模块七的服务端存储/认证执行已由此前任务覆盖。仍需补齐邀请接受公开流程、公开注册审批、已登录用户邮箱重验、访问黑名单管理界面与当前管理员自锁保护；并修正模块五索引页中已过期的“尚未拦截”说明。模块八继续废除。本清单不提前实现后续任务，每次仍只执行一个 `LUX-*`。
+
+#### LUX-798：实现邀请接受 application service
+
+范围：消费 LUX-797 的原子 storage 合同，按凭证摘要查找仍有效的邀请，验证 HMAC 挑战，规范化账户资料并使用现有 Argon2id 服务哈希密码，再原子创建已验证活动账户。错误凭证、重放、过期邀请、用户名冲突及已注册邮箱映射为稳定业务错误；不开放 HTTP API 或 Web 页面。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_invitations.rs`（定向测试内置于模块）。
+
+验收标准：
+
+- [ ] 仅有效邀请 token 可创建账户；Token、密码和摘要不进入日志或错误响应。
+- [ ] 用户名、显示名称和密码有界校验，密码仅以 Argon2id 哈希交给 storage。
+- [ ] 过期、重放、无效签名、用户名冲突和已注册邮箱均返回稳定错误且不改变账户或邀请。
+- [ ] application 定向回归、`cargo build --locked`、fmt 与 diff check 通过；Cargo 使用 Toshiba target 目录。
+
+短计划：先添加 service 成功/失败与重放回归并确认 RED；再连接 signer、密码哈希与原子 storage 接口；最后运行定向测试、build、fmt 和 diff check。
+
+#### LUX-799：开放公开邀请接受 API
+
+范围：新增不需登录的 `POST /api/v1/auth/invitations/accept`，接受 token、用户名、显示名称和密码，并调用 LUX-798。请求体设有上限；响应只报告成功或固定业务错误，不返回 token、邀请快照或其他账户信息。Token 只允许放在请求体，不放在 URL、query、审计或日志。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] 未登录用户可完成有效邀请；错误 token、冲突、重复消费及数据库不可用映射为稳定脱敏响应。
+- [ ] 请求体大小、字段长度与 HTTP body 日志边界受限；成功创建账户后可用新凭证登录。
+- [ ] HTTP 回归覆盖成功、过期/撤销/错误 token、用户名或邮箱冲突、重复提交、请求体上限和不泄漏凭证。
+- [ ] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先在 `tests/users.rs` 写公开路由合同并确认 404；再连接 LUX-798 service 与显式 DTO；最后运行定向集成目标、build、fmt 和 diff check。
+
+#### LUX-800：建立邀请接受 Web API 客户端合同
+
+范围：为公开邀请接受端点提供安全 TypeScript 请求类型与 API 方法。Token、密码只作为直接请求参数传递，不进入 React Query mutation cache、浏览器持久化或日志；不实现表单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [ ] 客户端按 POST JSON 调用 LUX-799，错误码具备显式类型映射。
+- [ ] Token 与密码请求不进入 query cache 或持久化，测试覆盖方法、字段和失败响应。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先添加客户端合同回归并确认方法缺失；再实现类型和请求；最后运行定向 Vitest、Web build 与 diff check。
+
+#### LUX-801：实现受邀用户账户创建页面
+
+范围：实现 `/register/invitation` 页面，从 URL fragment 读取 token 后立即清理地址栏，仅保存在组件内存；用户设置用户名、显示名称和密码并调用 LUX-800。页面展示固定错误和成功状态，不暴露邀请是否存在于列表或有效期细节。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/App.tsx`、`web/src/features/auth/AcceptInvitationPage.tsx`、`web/tests/accept-invitation.test.tsx`。
+
+验收标准：
+
+- [ ] URL fragment token 不发送到服务器日志、不存入本地/会话存储，完成或失败后不留在地址栏。
+- [ ] 表单具备可访问标签、提交中状态、固定错误反馈和创建成功后的登录入口。
+- [ ] 组件回归、Web build 与 diff check 通过；真实浏览器验证 token 清理和子路径路由。
+
+短计划：先写页面加载、fragment 清理和提交回归；再注册路由与实现表单；最后运行 Vitest、Web build 和本地浏览器检查。
+
+#### LUX-802：持久化公开注册模式
+
+范围：在现有 server settings 键值存储中增加 `INVITATION_ONLY`/`PUBLIC_EMAIL` 注册模式读取、更新与默认值，默认 `INVITATION_ONLY`。不开放 API 或 UI。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [ ] 空设置、损坏值和未知值安全回退为邀请制；有效更新可读回且版本并发写入不覆盖新值。
+- [ ] 无效模式拒绝，不影响邮件设置或其他 server settings。
+- [ ] 定向 storage/application 回归、build、fmt 与 diff check 通过；无需 schema migration。
+
+短计划：先添加默认、合法/非法值及并发回归；再增加版本化读写合同；最后运行定向测试、build、fmt 和 diff check。
+
+#### LUX-803：开放公开注册模式管理员 API
+
+范围：通过受管理员认证与 CSRF 保护的设置 API 读取和修改 LUX-802 注册模式；响应仅返回模式枚举，不混入 SMTP 凭据。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_settings.rs`、`tests/admin_settings.rs`。
+
+验收标准：
+
+- [ ] 默认与已保存模式可读取；无效枚举拒绝，省略字段不改变当前值。
+- [ ] 未认证、非管理员及缺失 CSRF 的写请求拒绝；测试确认模式切换不触及 SMTP 凭据。
+- [ ] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先增加管理员设置 HTTP 回归并确认字段缺失；再连接 LUX-802 storage/application 合同；最后运行定向目标、build、fmt 和 diff check。
+
+#### LUX-804：在用户管理中配置公开注册模式
+
+范围：在用户管理全局设置展示注册模式开关，默认邀请制；开启公开邮箱注册时说明申请须经邮箱验证和管理员批准。关闭后不影响仍有效的已发邀请。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-registration-settings.test.tsx`。
+
+验收标准：
+
+- [ ] 设置读取/保存状态明确，模式切换成功后更新缓存，错误时保留草稿并可重试。
+- [ ] 页面清楚显示公开注册默认关闭和审批边界；权限只由管理员设置，不由访客控制。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先新增设置组件回归；再连接 LUX-803 client 与表单；最后运行定向 Vitest、Web build 和 diff check。
+
+#### LUX-805：建立 SQLite 公开注册申请表
+
+范围：新增 SQLite `user_registration_requests` migration，保存邮箱、用户名/显示名称、密码哈希、权限默认快照、申请状态、创建/验证/审核时间与稳定错误状态；不保存原始凭证或密码。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0203_user_registration_requests.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [ ] migration 可从空库和当前 schema 升级；状态及唯一性约束防止重复待处理邮箱申请。
+- [ ] 表不含明文密码或 token 字段，拒绝非法状态与越界字段。
+- [ ] SQLite migration 回归、build、fmt 与 diff check 通过。
+
+短计划：先扩展空库/升级 schema 回归并确认表缺失；再新增 migration；最后运行目标 migration 测试、build、fmt 和 diff check。
+
+#### LUX-806：建立 PostgreSQL 公开注册申请表
+
+范围：为 LUX-805 增加等价 PostgreSQL migration 与空库/升级合同，不改变 SQLite 行为或注册业务。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations-postgres/0203_user_registration_requests.sql`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [ ] PostgreSQL 空库与当前 schema 均可迁移；约束、索引和外键动作与 SQLite 等价。
+- [ ] 本机 PostgreSQL 定向迁移回归、build、fmt 与 diff check 通过。
+
+短计划：先增加 PostgreSQL schema 断言并确认 RED；再添加 migration；最后运行本机隔离数据库测试和常规检查。
+
+#### LUX-807：建立注册申请原子存储合同
+
+范围：为注册申请提供创建、验证邮箱、管理员分页查询、批准、拒绝和过期清理 storage 操作。批准事务从请求中取出经验证邮箱与密码哈希，按管理员确认的权限快照创建活动账户并终结申请；并发审批只能成功一次。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [ ] SQLite 与 PostgreSQL 的创建/验证/审批事务原子；并发批准仅一个用户成功。
+- [ ] 重复邮箱、过期/撤销 challenge、重复审批、拒绝和权限 FK 错误均无部分账户或凭证消费。
+- [ ] 分页上限 100，查询只返回申请摘要；定向 SQLite/PostgreSQL 回归、build、fmt 与 diff check 通过。
+
+短计划：先为状态机与回滚写存储回归；再实现双后端查询和事务；最后运行 SQLite/PostgreSQL 定向目标、build、fmt 和 diff check。
+
+#### LUX-808：实现公开注册与邮箱验证 application service
+
+范围：仅在 LUX-802 模式为 `PUBLIC_EMAIL` 时接收邮箱、用户名、显示名称和密码；使用管理员新用户默认权限快照创建申请、生成 EMAIL_VERIFICATION challenge 并原子入队。返回不区分已存在邮箱的固定成功文案，避免账号枚举。验证凭证只保留 HMAC/摘要，邮件失败不激活账户。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_registration.rs`、`src/application/mod.rs`（测试内置于 service 模块）。
+
+验收标准：
+
+- [ ] 注册关闭、输入非法、重复邮箱和数据库错误均不泄漏账户存在状态；有效申请不创建可登录用户。
+- [ ] 邮件频率上限按邮箱与连接 peer 执行；不信任未经验证的转发头作为 rate-limit 身份。
+- [ ] 邮箱验证成功只将申请转为待审批；重复、过期、撤销 token 无副作用。
+- [ ] application 定向回归、build、fmt 与 diff check 通过。
+
+短计划：先补注册/验证及重复邮箱回归；再加入有界 service、token 与 outbox 原子流；最后运行定向测试和常规检查。
+
+#### LUX-809：开放公开注册与邮箱验证 API
+
+范围：新增公开注册提交、邮箱验证和验证邮件重发 API。三者均执行有界请求频率、请求体上限及固定脱敏响应；重发不更改原申请权限快照或过期时间。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] 邀请模式下拒绝公开注册；公开模式下提交返回固定响应且用户未验证/未审批前不能登录或访问媒体。
+- [ ] 邮件验证、重复提交、重发限额、无效/过期 token 和邮件队列失败均有稳定响应与集成覆盖。
+- [ ] Token 不在 URL/query/log 中；更新 API 文档，定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先添加公开端点合同并确认 RED；再连接 LUX-808 service 与访问限额；最后运行用户认证集成目标、build、fmt 和 diff check。
+
+#### LUX-810：建立公开注册 Web API 客户端
+
+范围：为公开注册、邮箱验证和重发添加类型化 Web client；提交密码和 token 时绕过 query/mutation cache，Token 由调用方放在请求体。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [ ] 请求路径、字段、CSRF/无会话公开语义和错误码映射与 LUX-809 一致。
+- [ ] 密码与 token 不进入 React Query cache；定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先写 client RED 回归，再实现显式 DTO/方法，最后运行定向 Vitest 和 Web build。
+
+#### LUX-811：实现公开注册与邮箱验证页面
+
+范围：增加公开注册申请及邮箱验证页面；仅在服务端允许公开注册时显示提交表单。邮箱链接 token 从 fragment 读取后清除地址栏，并只在验证请求期间存于内存。说明邮箱验证后仍须管理员批准。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/App.tsx`、`web/src/features/auth/RegisterPage.tsx`、`web/tests/register-page.test.tsx`。
+
+验收标准：
+
+- [ ] 邀请模式不暴露可提交表单；公开模式表单校验、等待/成功/错误状态可访问。
+- [ ] 邮件验证成功显示“等待管理员审批”，token 被清理且不写入持久化。
+- [ ] 定向 Vitest、Web build 与真实浏览器路由/fragment 验证通过。
+
+短计划：先增加模式、提交及验证页面回归；再添加页面路由与状态；最后运行 Vitest、Web build 和浏览器检查。
+
+#### LUX-812：开放注册申请审批管理员 API
+
+范围：管理员分页查询已验证待审批申请，并通过单次事务批准或拒绝。批准请求携带管理员最终确认的权限快照；审批会创建活动用户并标记已批准，拒绝会撤销凭证/待投邮件并清除密码哈希。所有写操作需管理员认证与 CSRF，并产生脱敏审计记录。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_user_registrations.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] API 仅向管理员展示邮箱、申请时间、邮箱验证状态和拟分配权限，不返回 password hash/token。
+- [ ] 未验证申请不可批准；批准并发仅创建一个用户；拒绝和权限错误无部分写入。
+- [ ] CSRF、用户枚举、管理员保护、审计脱敏与分页上限均有回归；更新 API 文档并通过定向测试/build/fmt/diff check。
+
+短计划：先加管理员 API 回归并确认路由缺失；再连接 LUX-807 storage/application；最后运行 `tests/users` 定向目标和常规检查。
+
+#### LUX-813：在用户管理页审批注册申请
+
+范围：在用户列表增加待审批入口，展示已验证申请并允许管理员审核拟分配的媒体库、播放、下载和转码权限，再批准或拒绝。仅显示服务端分页结果；每次操作需确认，完成后刷新申请和用户列表。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`/`types.ts`、`web/src/features/admin/AdminUserRegistrationsPanel.tsx`、`web/tests/admin-user-registrations.test.tsx`。
+
+验收标准：
+
+- [ ] 待审批空态、分页、预设权限快照/修改、批准、拒绝、加载与错误重试均可访问。
+- [ ] 成功审批后列表与用户缓存刷新；失败时保留申请并显示脱敏结果。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先写审批面板合同；再接 LUX-812 API 和用户列表入口；最后运行组件回归与 Web build。
+
+#### LUX-814：为已登录用户建立邮箱重验存储事务
+
+范围：对已登录用户邮箱变更创建 EMAIL_VERIFICATION challenge 时，暂不更改当前邮箱；消费有效 challenge 时以单个事务更新邮箱及验证时间、撤销同用户旧 challenge。新邮箱冲突、用户删除/禁用、token 重放或过期均不产生部分更新。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [ ] SQLite 与 PostgreSQL 均原子保留 pending email、验证后切换邮箱并设 `email_verified_at`。
+- [ ] 原邮箱在验证前继续有效；新邮箱唯一冲突和无效 challenge 不消费凭证。
+- [ ] 定向存储回归、build、fmt 与 diff check 通过。
+
+短计划：先加 pending/consume/冲突/并发回归；再实现双后端事务；最后运行 SQLite/PostgreSQL 定向检查。
+
+#### LUX-815：实现账户邮箱验证 application service
+
+范围：当前登录用户提出邮箱变更时生成有界有效期验证邮件；应用层验证仅消费该用户对应的 challenge。发送限额按账号/邮箱执行；邮件发送失败不改变原邮箱。本任务不开放 HTTP endpoint。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_email_verification.rs`、`src/application/mod.rs`（service 回归内置于模块）。
+
+验收标准：
+
+- [ ] 变更邮箱后当前 API 仍返回原邮箱及未完成状态；验证成功后更新至新邮箱并显示已验证。
+- [ ] 用户不能消费其他账号 challenge；过期/重放/冲突/速率限制失败稳定且无信息泄漏。
+- [ ] service 使用 LUX-814 原子 storage 合同；定向 application 回归、build、fmt 与 diff check 通过。
+
+短计划：先增加邮箱申请、签发与消费 service 回归；再连接 LUX-814 和邮件 outbox；最后运行定向测试及常规检查。
+
+#### LUX-816：开放账户邮箱验证 API
+
+范围：新增受会话认证和 CSRF 保护的邮箱验证邮件创建、重发及 token 消费 API。endpoint 仅接受当前用户对应的 challenge；邮件发送失败不改变当前邮箱。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] 未认证/缺失 CSRF 请求拒绝；申请/验证结果不泄漏其他用户或邮箱状态。
+- [ ] 仅当前用户的有效 challenge 可更新邮箱；成功、过期、重放、冲突与发送限额均有 HTTP 回归。
+- [ ] 定向集成目标、build、fmt 与 diff check 通过，API 文档更新。
+
+短计划：先添加账户资料/验证 HTTP 回归并确认路由缺失；再连接 LUX-815 service；最后运行 `tests/users` 定向目标和常规检查。
+
+#### LUX-817：为账户页接入邮箱验证
+
+范围：账户资料页显示邮箱未验证状态，提供发送/重发验证邮件并处理完成链接；保持原邮箱直到验证成功。Token 仅从 fragment 读取并在地址栏立即清理。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`/`types.ts`、`web/src/features/account/AccountPage.tsx`、`web/tests/account-email-verification.test.tsx`。
+
+验收标准：
+
+- [ ] 邮箱变更显示待验证目标和发送结果；重载后由服务端状态恢复，页面不误报已验证。
+- [ ] Token 不留在地址栏、cache 或持久化；加载、重发、成功及失败有组件回归。
+- [ ] 定向 Vitest、Web build 和真实浏览器验证通过。
+
+短计划：先添加账户邮箱流程回归；再连接 LUX-815 client/service；最后运行组件测试、Web build 和浏览器检查。
+
+#### LUX-818：管理全站访问黑名单
+
+范围：在用户管理全局设置增加全站黑名单视图，分页列出并创建、启停、删除设备、客户端和 IP/CIDR 规则。保存前给出命中会阻止登录、已有 session 与播放授权的明确说明。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserGlobalAccessRulesPanel.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-access-rules.test.tsx`。
+
+验收标准：
+
+- [ ] 三种规则支持有界分页、创建、启停与确认删除；输入约束与服务端规范化一致。
+- [ ] 请求/加载/错误/空态清晰，修改成功刷新；说明 IP 依据仅来自连接 peer 或已配置可信代理链。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先补全站规则组件合同；再接 LUX-757/764 已有 client；最后运行定向 Vitest 和 Web build。
+
+#### LUX-819：管理单用户访问黑名单
+
+范围：在用户详情“设备与登录”页增加指定用户黑名单面板，管理该用户的设备、客户端和 IP/CIDR 规则。该页不能读取或修改全站规则或其他用户规则。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserAccessRulesPanel.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-access-rules.test.tsx`。
+
+验收标准：
+
+- [ ] 仅操作当前用户 scope；设备规则可由已记录设备选择，其他值由管理员明确输入。
+- [ ] 创建、启停、删除和失败重试有反馈；规则生效边界明确。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先添加用户 scope 组件回归；再接既有用户规则 client；最后运行组件目标与 Web build。
+
+#### LUX-820：防止黑名单规则封禁当前管理员入口
+
+范围：在创建或启用全站及用户级规则前，比较当前管理请求的设备、客户端与可信访问 IP；若规则将阻断当前管理员会话则返回稳定冲突。IP 比较必须调用 LUX-766 可信代理解析结果，不能直接信任 XFF；无法安全判定时拒绝高风险 IP 规则启用。共享 API Key 的既有策略单独保持明确。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] 设备/客户端/IP 自封禁规则被拒绝，未命中当前入口的规则仍可管理。
+- [ ] 代理伪造、peer 缺失、可信代理多跳和 API Key 请求有回归；拒绝不新增或启用规则。
+- [ ] 定向集成测试、build、fmt 与 diff check 通过。
+
+短计划：先构造可信/伪造 peer 的规则 API 回归；再在写入前执行访问上下文匹配；最后运行 `tests/users` 目标与常规检查。
+
+#### LUX-821：为用户设备摘要补充可用 IP 归属地
+
+范围：用户设备列表在已配置 IP 位置插件且缓存命中时提供可选归属地摘要；未命中由既有 `IpLocationService` 异步安排查询。未安装插件、私有地址或查询失败保持为空，不阻塞设备查询，不新增外部服务依赖。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [ ] Device DTO 仅增加 nullable safe location metadata；不返回原始外部 provider 响应。
+- [ ] 缓存命中、未安装插件、非公网地址和 lookup 失败路径均有回归，列表仍有界。
+- [ ] 定向 API 测试、build、fmt 与 diff check 通过。
+
+短计划：先增加设备响应归属地映射测试；再连接已有位置缓存服务；最后运行定向用户测试、build 与 diff check。
+
+#### LUX-822：在设备清单展示 IP 归属地
+
+范围：在 LUX-820 设备行中显示可用的 IP 归属地；没有位置数据时显示“未知”，不把展示 IP 或归属地用作 ACL 判定。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-devices.test.tsx`。
+
+验收标准：
+
+- [ ] 设备表安全显示国家/地区/运营商摘要和未知状态；窄屏仍由表格容器滚动。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先为有/无归属地添加行级回归；再扩展 DTO 与展示；最后运行设备 Vitest 和 Web build。
+
+#### LUX-823：修正内容限制索引页的过期说明
+
+范围：核对 LUX-692 至 LUX-704 对列表、详情、图片、下载、字幕及播放的访问检查后，删除内容限制页中“媒体访问拦截尚未接入，策略目前不会过滤媒体”的过期文案，替换为准确说明分级/标签限制及索引就绪状态。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-content-restrictions.test.tsx`。
+
+验收标准：
+
+- [ ] 源码核验与回归证明受限媒体入口执行服务端策略；文案不声称未实现或过度承诺。
+- [ ] 页面测试确认索引未就绪提示与已启用策略说明互不混淆。
+- [ ] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先复核访问路径并添加文案断言；再修正面板说明；最后运行定向 Vitest 与 Web build。
+
+#### LUX-824：核对并关闭用户管理模块一至七
+
+范围：按 `docs/USER-MANAGEMENT-DESIGN.md` §5.2 的逐项验收清单，对照实现、自动化测试和 API/兼容性文档，标记模块一至七已完成项与明确限制。模块八维持已取消。执行用户管理相关 Rust/Web 全量门，并分别记录现有基线失败、当前工作区并行 LUX-794 影响、本机架构和未覆盖的真实浏览器/部署证据。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`docs/API.md`。
+
+验收标准：
+
+- [ ] 模块一至七的每项验收都有可定位的代码/测试证据或明确标记限制；模块八未实现。
+- [ ] SQLite、PostgreSQL、用户/API、内容限制、播放/访问、Web 管理全链路和完整门禁记录可复现结果。
+- [ ] 设计清单状态与实际证据一致；没有以本机 ARM 结果代替 FNOS/x86_64 或真实客户端验证。
+
+短计划：先建立设计验收项到任务/测试的交叉表；再修正遗漏与状态；最后运行该目标规定的最终门禁并记录限制。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
