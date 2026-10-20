@@ -259,161 +259,190 @@ pub(super) async fn emby_playback_info(
         .as_ref()
         .map(|session| session.play_session_id.clone())
         .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let direct_ticket_expires_at =
+        current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
+    let mut direct_ticket_issued = false;
+    let media_sources = sources
+        .into_iter()
+        .map(|(source_item, source)| {
+            let mut value = emby_media_source_json_with_resolver(
+                &source_item.id,
+                source,
+                true,
+                strm_resolver_available,
+            );
+            let source_transcode_session = transcode_session
+                .as_ref()
+                .filter(|session| session.media_source_id == source.id);
+            let source_can_transcode = source.source_kind == "LOCAL_FILE"
+                && (source_transcode_session.is_some()
+                    || request.enable_transcoding != Some(false)
+                        && (request.enable_transcoding == Some(true)
+                            || request
+                                .device_profile
+                                .as_ref()
+                                .is_some_and(EmbyDeviceProfile::supports_lux_hls)));
+            let direct_play_disabled = request.enable_direct_play == Some(false)
+                || force_transcode
+                || source_transcode_session.is_some();
+            if let Value::Object(object) = &mut value {
+                object.insert(
+                    "RunTimeTicks".to_owned(),
+                    super::emby_catalog::emby_source_runtime_ticks(source_item, source)
+                        .map(Value::from)
+                        .unwrap_or(Value::Null),
+                );
+                if source_can_transcode {
+                    // Emby advertises the device's available transcoding
+                    // profiles even when direct play wins this request.
+                    // Clients need this capability bit to offer a
+                    // transcoding fallback on a later request.
+                    object.insert("SupportsTranscoding".to_owned(), json!(true));
+                }
+                if direct_play_disabled {
+                    // A transcoding offer must not leave direct play enabled,
+                    // otherwise clients can ignore TranscodingUrl.
+                    object.insert("SupportsDirectPlay".to_owned(), json!(false));
+                    if source_transcode_session.is_some() {
+                        object.insert("SupportsDirectStream".to_owned(), json!(false));
+                    }
+                }
+            }
+            let has_direct_stream_url = value.get("DirectStreamUrl").is_some_and(Value::is_string);
+            let transcoding_url = source_transcode_session.as_ref().and_then(|session| {
+                state.web_playback.as_ref().and_then(|service| {
+                    emby_transcoding_url(
+                        service,
+                        &source_item.id,
+                        source,
+                        session,
+                        EmbyTranscodingUrlOptions {
+                            request: &request,
+                            hls: HlsStartOptions {
+                                segment_container: transcode_container
+                                    .unwrap_or(HlsSegmentContainer::MpegTs),
+                                start_time_ticks: transcode_start_time_ticks,
+                                runtime_ticks,
+                            },
+                            device_id: &device_id,
+                        },
+                    )
+                })
+            });
+            if let Value::Object(object) = &mut value {
+                if source_transcode_session.is_none()
+                    && has_direct_stream_url
+                    && let Some(service) = state.web_playback.as_ref()
+                    && let Some(url) = emby_signed_direct_stream_url(
+                        service,
+                        &source_item.id,
+                        source,
+                        &user,
+                        &play_session_id,
+                        direct_ticket_expires_at,
+                        if emby_source_needs_proxy_identity(source) {
+                            standard_api_key.as_deref()
+                        } else {
+                            None
+                        },
+                        &device_id,
+                    )
+                {
+                    direct_ticket_issued = true;
+                    object.insert("DirectStreamUrl".to_owned(), json!(url));
+                    // External proxies use the standard Emby token to identify
+                    // the proxy user, while Lux requires the signed ticket.
+                    // URL/path STRM sources already carry the token for clients
+                    // that ignore AddApiKeyToDirectStreamUrl.
+                    object.insert(
+                        "AddApiKeyToDirectStreamUrl".to_owned(),
+                        json!(emby_source_needs_proxy_identity(source)),
+                    );
+                }
+                if let Some(url) = transcoding_url {
+                    let segment_container =
+                        transcode_container.unwrap_or(HlsSegmentContainer::MpegTs);
+                    object.insert("SupportsTranscoding".to_owned(), json!(true));
+                    object.insert("TranscodingUrl".to_owned(), json!(url));
+                    object.insert("TranscodingSubProtocol".to_owned(), json!("hls"));
+                    object.insert(
+                        "TranscodingContainer".to_owned(),
+                        json!(segment_container.emby_container()),
+                    );
+                    object.insert(
+                        "TranscodingMimeType".to_owned(),
+                        json!(segment_container.mime_type()),
+                    );
+                    // Emby keeps DirectStreamUrl and TranscodingUrl pointed at
+                    // the same HLS manifest during transcoding.
+                    object.insert("DirectStreamUrl".to_owned(), json!(url.clone()));
+                    object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
+                }
+            }
+            if let Some(session) = transcode_session
+                .as_ref()
+                .filter(|session| session.media_source_id == source.id)
+            {
+                tracing::info!(
+                    event = "emby_transcoding_offer",
+                    item_id_prefix = %playback_identifier_prefix(&source_item.id),
+                    source_id_prefix = %playback_identifier_prefix(&source.id),
+                    session_id_prefix = %playback_identifier_prefix(&session.id),
+                    transcoding_url_present = value
+                        .get("TranscodingUrl")
+                        .is_some_and(|value| value.is_string()),
+                    supports_direct_play = value
+                        .get("SupportsDirectPlay")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                    supports_direct_stream = value
+                        .get("SupportsDirectStream")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                    "prepared Emby transcoding offer"
+                );
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    if direct_ticket_issued {
+        let authorization_context = match emby_playback_authorization_context(
+            &headers,
+            query.api_key.as_deref(),
+            query.client.as_deref(),
+            &state,
+            &device_id,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(status) => return status.into_response(),
+        };
+        let Some(service) = state.web_playback.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let user_id = user.id.to_string();
+        if service
+            .register_emby_direct_playback_ticket(
+                &user_id,
+                &play_session_id,
+                authorization_context.0.as_deref(),
+                authorization_context.1.as_deref(),
+                direct_ticket_expires_at,
+                current_unix_timestamp(),
+            )
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
     Json(json!({
         "PlaySessionId": play_session_id,
         // Emby clients use this item-level duration as the canonical media
         // duration alongside the VOD HLS manifest and playback callbacks.
         "RunTimeTicks": runtime_ticks,
-        "MediaSources": sources
-            .into_iter()
-            .map(|(source_item, source)| {
-                let mut value = emby_media_source_json_with_resolver(
-                    &source_item.id,
-                    source,
-                    true,
-                    strm_resolver_available,
-                );
-                let source_transcode_session = transcode_session
-                    .as_ref()
-                    .filter(|session| session.media_source_id == source.id);
-                let source_can_transcode = source.source_kind == "LOCAL_FILE"
-                    && (source_transcode_session.is_some()
-                        || request.enable_transcoding != Some(false)
-                            && (request.enable_transcoding == Some(true)
-                                || request
-                                    .device_profile
-                                    .as_ref()
-                                    .is_some_and(EmbyDeviceProfile::supports_lux_hls)));
-                let direct_play_disabled = request.enable_direct_play == Some(false)
-                    || force_transcode
-                    || source_transcode_session.is_some();
-                if let Value::Object(object) = &mut value {
-                    object.insert(
-                        "RunTimeTicks".to_owned(),
-                        super::emby_catalog::emby_source_runtime_ticks(source_item, source)
-                            .map(Value::from)
-                            .unwrap_or(Value::Null),
-                    );
-                    if source_can_transcode {
-                        // Emby advertises the device's available transcoding
-                        // profiles even when direct play wins this request.
-                        // Clients need this capability bit to offer a
-                        // transcoding fallback on a later request.
-                        object.insert("SupportsTranscoding".to_owned(), json!(true));
-                    }
-                    if direct_play_disabled {
-                        // A transcoding offer must not leave the original
-                        // direct-play capability set, otherwise many Emby
-                        // clients ignore TranscodingUrl and open DirectStreamUrl.
-                        object.insert("SupportsDirectPlay".to_owned(), json!(false));
-                        if source_transcode_session.is_some() {
-                            object.insert("SupportsDirectStream".to_owned(), json!(false));
-                        }
-                    }
-                }
-                let has_direct_stream_url = value
-                    .get("DirectStreamUrl")
-                    .is_some_and(Value::is_string);
-                let transcoding_url = source_transcode_session
-                    .as_ref()
-                    .and_then(|session| {
-                        state.web_playback.as_ref().and_then(|service| {
-                            emby_transcoding_url(
-                                service,
-                                &source_item.id,
-                                source,
-                                session,
-                                EmbyTranscodingUrlOptions {
-                                    request: &request,
-                                    hls: HlsStartOptions {
-                                        segment_container: transcode_container
-                                            .unwrap_or(HlsSegmentContainer::MpegTs),
-                                        start_time_ticks: transcode_start_time_ticks,
-                                        runtime_ticks,
-                                    },
-                                    device_id: &device_id,
-                                },
-                            )
-                        })
-                    });
-                if let Value::Object(object) = &mut value {
-                    if source_transcode_session.is_none()
-                        && has_direct_stream_url
-                        && let Some(service) = state.web_playback.as_ref()
-                        && let Some(url) = emby_signed_direct_stream_url(
-                            service,
-                            &source_item.id,
-                            source,
-                            &user,
-                            &play_session_id,
-                            if emby_source_needs_proxy_identity(source) {
-                                standard_api_key.as_deref()
-                            } else {
-                                None
-                            },
-                            &device_id,
-                        )
-                    {
-                        object.insert("DirectStreamUrl".to_owned(), json!(url));
-                        // Third-party clients may send the media request through
-                        // an independent stack. External proxies use the
-                        // standard Emby token to identify the proxy user, while
-                        // Lux still requires the signed ticket. For URL/path STRM
-                        // sources the token is already embedded for clients that
-                        // ignore AddApiKeyToDirectStreamUrl.
-                        object.insert(
-                            "AddApiKeyToDirectStreamUrl".to_owned(),
-                            json!(emby_source_needs_proxy_identity(source)),
-                        );
-                    }
-                    if let Some(url) = transcoding_url {
-                        let segment_container = transcode_container
-                            .unwrap_or(HlsSegmentContainer::MpegTs);
-                        object.insert("SupportsTranscoding".to_owned(), json!(true));
-                        object.insert("TranscodingUrl".to_owned(), json!(url));
-                        object.insert("TranscodingSubProtocol".to_owned(), json!("hls"));
-                        object.insert(
-                            "TranscodingContainer".to_owned(),
-                            json!(segment_container.emby_container()),
-                        );
-                        object.insert(
-                            "TranscodingMimeType".to_owned(),
-                            json!(segment_container.mime_type()),
-                        );
-                        // Emby keeps DirectStreamUrl and TranscodingUrl pointed
-                        // at the same HLS manifest during transcoding. Harbor
-                        // follows DirectStreamUrl, even when the capability bit
-                        // says direct stream is unavailable.
-                        object.insert("DirectStreamUrl".to_owned(), json!(url.clone()));
-                        object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
-                    }
-                }
-                if let Some(session) = transcode_session
-                    .as_ref()
-                    .filter(|session| session.media_source_id == source.id)
-                {
-                    tracing::info!(
-                        event = "emby_transcoding_offer",
-                        item_id_prefix = %playback_identifier_prefix(&source_item.id),
-                        source_id_prefix = %playback_identifier_prefix(&source.id),
-                        session_id_prefix = %playback_identifier_prefix(&session.id),
-                        transcoding_url_present = value
-                            .get("TranscodingUrl")
-                            .is_some_and(|value| value.is_string()),
-                        supports_direct_play = value
-                            .get("SupportsDirectPlay")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false),
-                        supports_direct_stream = value
-                            .get("SupportsDirectStream")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false),
-                        "prepared Emby transcoding offer"
-                    );
-                }
-                value
-            })
-            .collect::<Vec<_>>(),
+        "MediaSources": media_sources,
     }))
     .into_response()
 }

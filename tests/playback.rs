@@ -10,6 +10,7 @@ use luxd::{
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::net::TcpListener;
 
 fn emby_public_id(id: &str) -> String {
@@ -134,6 +135,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 
     let playback_info = client
         .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .header(
+            "X-Emby-Authorization",
+            r#"Emby Client="SpoofedPlaybackClient", Device="Unknown", DeviceId="spoofed-device", Version="99""#,
+        )
         .query(&[("api_key", token.as_str())])
         .send()
         .await?;
@@ -147,6 +152,42 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     );
     assert_eq!(playback_body["MediaSources"][0]["Quality"], Value::Null);
     assert_eq!(playback_body["MediaSources"][1]["Quality"], "2160p");
+    let direct_play_session_id = playback_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing direct playback session ID")?;
+    let direct_ticket_context = sqlx::query(
+        "SELECT authorization_device_id, authorization_client_name, expires_at
+         FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_optional(database.pool())
+    .await?;
+    let direct_ticket_context =
+        direct_ticket_context.ok_or("missing persisted direct playback ticket context")?;
+    assert_eq!(
+        direct_ticket_context
+            .get::<Option<String>, _>("authorization_device_id")
+            .as_deref(),
+        Some("playback-admin")
+    );
+    assert_eq!(
+        direct_ticket_context
+            .get::<Option<String>, _>("authorization_client_name")
+            .as_deref(),
+        Some("PlaybackTest")
+    );
+    let direct_ticket_expires_at = direct_ticket_context.get::<i64, _>("expires_at");
+    let direct_playback_admission_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(direct_playback_admission_count, 0);
     assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(
         playback_body["MediaSources"][0]["SupportsDirectStream"],
@@ -167,7 +208,16 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert!(generic_direct_url.contains("&static=true"));
     assert!(generic_direct_url.contains("&UserId="));
     assert!(generic_direct_url.contains("&luxPlayback"));
+    assert!(
+        generic_direct_url.contains(&format!("&luxPlaybackExpires={direct_ticket_expires_at}&"))
+    );
     assert!(!generic_direct_url.contains(&token));
+    let second_direct_url = playback_body["MediaSources"][1]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing second direct stream URL")?;
+    assert!(
+        second_direct_url.contains(&format!("&luxPlaybackExpires={direct_ticket_expires_at}&"))
+    );
     assert_eq!(
         playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
         false
@@ -242,6 +292,31 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         missing_play_session_stream.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
+    sqlx::query(
+        "CREATE TRIGGER fail_emby_direct_playback_ticket_insert
+         BEFORE INSERT ON emby_direct_playback_tickets
+         BEGIN SELECT RAISE(ABORT, 'injected ticket write failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let failed_ticket_response = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(
+        failed_ticket_response.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let direct_ticket_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM emby_direct_playback_tickets WHERE user_id = ?")
+            .bind(admin.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(direct_ticket_count, 1);
+    sqlx::query("DROP TRIGGER fail_emby_direct_playback_ticket_insert")
+        .execute(database.pool())
+        .await?;
     let yamby_playback = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .header(

@@ -13,9 +13,10 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::storage::{
-    Database, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
-    StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
-    UserPlaybackPolicy, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    Database, NewEmbyDirectPlaybackTicket, NewWebPlaybackEvent, NewWebPlaybackSession,
+    PlaybackAdmissionResult, StorageError, StoredWebPlaybackSession,
+    UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy,
+    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
 };
 
 use crate::application::user_access_rules::{
@@ -394,6 +395,27 @@ impl WebPlaybackSessionService {
             return Err(WebPlaybackSessionError::NotFound);
         }
         Ok(())
+    }
+
+    pub(crate) async fn register_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        authorization_device_id: Option<&str>,
+        authorization_client_name: Option<&str>,
+        expires_at: i64,
+        created_at: i64,
+    ) -> Result<(), StorageError> {
+        self.database
+            .insert_emby_direct_playback_ticket(NewEmbyDirectPlaybackTicket {
+                user_id,
+                play_session_id,
+                authorization_device_id,
+                authorization_client_name,
+                expires_at,
+                created_at,
+            })
+            .await
     }
 
     pub(crate) fn sign_resource(

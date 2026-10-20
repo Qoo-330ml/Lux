@@ -16169,6 +16169,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证：TDD RED 时新直放 URL 缺少版本标记，新增断言失败；实现后 `cargo test --locked --test playback -- --test-threads=1` 4/4 通过，覆盖 v2 读取、删改版本及篡改播放会话/媒体源拒绝；`cargo test --locked --lib application::playback::session::tests::emby_direct_stream_v2_signature_is_separate_from_legacy_domain -- --exact` 1/1 通过，确认旧签名与 v2 域不能互验，旧无版本请求保留原验证路径。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Cargo 使用 Toshiba target 目录。
 
+#### LUX-776：签发 Emby 直放票据时保存授权上下文
+
+范围：为每个新 v2 Emby 直放播放会话，在返回 PlaybackInfo 前保存用户、播放会话 ID、过期时间及认证凭证绑定的设备/客户端摘要。多个媒体源共用同一过期时间和一条会话记录。只有凭证未记录的字段才回退至客户端声明；写入失败时不返回任何包含该票据的响应。GET PlaybackInfo 仅签发/持久化票据，不创建播放并发准入。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/emby_catalog.rs`、`src/api/playback.rs`、`src/storage/sessions.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 新直放链接返回前，按用户与播放会话保存已认证的设备/客户端上下文及精确匹配的过期时间；查询/写入失败时不返回链接。
+- [x] 已绑定 Emby 凭证中的设备/客户端值优先于本次请求头声明；仅缺失字段回退至声明值；不存储凭证、签名或 URL。
+- [x] 同一 PlaybackInfo 中的直放媒体源共用播放会话及过期时间；被动协商不写入播放准入记录。
+- [x] `playback` 定向集成目标、Rust build、fmt 与 diff check 通过。
+
+短计划：先为 PlaybackInfo 新签发链接增加票据上下文、token 绑定设备/客户端优先级及零准入回归并确认当前表没有记录；再在一个共享过期时间下生成所有来源 URL、于响应前写入单条上下文并处理失败；最后运行 `playback` 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 因 PlaybackInfo 没有创建 `emby_direct_playback_tickets` 上下文行而失败；实现后 `cargo test --locked --test playback -- --test-threads=1` 4/4 通过，其中回归覆盖认证 token 的 `playback-admin`/`PlaybackTest` 值优先于伪造请求头、所有媒体源 URL 共用数据库过期时间、没有并发准入记录，以及注入数据库写失败时返回 503 且不新增票据。`cargo build --locked`、fmt 与 `git diff --check` 通过。未存储 token、签名或 URL。Cargo 使用 Toshiba target 目录。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

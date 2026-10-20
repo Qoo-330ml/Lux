@@ -980,7 +980,6 @@ impl Database {
         })
     }
 
-    #[allow(dead_code)] // LUX-775 persists the context before returning direct URLs.
     pub(crate) async fn insert_emby_direct_playback_ticket(
         &self,
         ticket: NewEmbyDirectPlaybackTicket<'_>,

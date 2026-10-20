@@ -4657,10 +4657,10 @@ pub(super) fn emby_signed_direct_stream_url(
     source: &crate::application::catalog::CatalogSource,
     user: &UserRecord,
     play_session_id: &str,
+    expires_at: i64,
     api_key: Option<&str>,
     device_id: &str,
 ) -> Option<String> {
-    let expires_at = current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
     let user_id = user.id.to_string();
     let signature = service.sign_emby_direct_stream_v2(
         &user_id,
