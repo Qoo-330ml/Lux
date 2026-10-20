@@ -92,6 +92,30 @@ pub(crate) struct NewStoredUserPermissions<'a> {
     pub(crate) allow_video_transcode: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUserInvitationAcceptance {
+    pub(crate) invitation_id: String,
+    pub(crate) challenge_id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) expires_at: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewInvitationUserAccount<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) username_normalized: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password_hash: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserInvitationAcceptResult {
+    Accepted,
+    NotAcceptable,
+    UsernameTaken,
+    EmailAlreadyRegistered,
+}
+
 // LUX-645 consumes this contract in the preset application service.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]

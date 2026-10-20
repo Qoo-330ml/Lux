@@ -2,14 +2,14 @@ use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
-    MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewMailChallenge,
-    NewMailOutboxMessage, NewStoredUserPermissions, NewUserAccessBlacklistRule,
+    MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewInvitationUserAccount,
+    NewMailChallenge, NewMailOutboxMessage, NewStoredUserPermissions, NewUserAccessBlacklistRule,
     NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation, NewUserInvitation,
     PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, StoredUserActivityEvent,
     UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
     UserAccessBlacklistRuleScope, UserActivityEventQuery, UserContentRestrictionsCasResult,
-    UserDevicePageQuery, UserInvitationCreateResult, UserInvitationStatus,
-    UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
+    UserDevicePageQuery, UserInvitationAcceptResult, UserInvitationCreateResult,
+    UserInvitationStatus, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
 };
 
 #[tokio::test]
@@ -20954,6 +20954,512 @@ async fn user_invitation_storage_does_not_resend_inactive_challenges()
 }
 
 #[tokio::test]
+async fn user_invitation_storage_accepts_once_and_creates_verified_user_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [31_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "accept-invitation",
+        "accept@example.test",
+        "accept-challenge",
+        "accept-mail",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('accept-library', 'Accept', 'MOVIE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE user_invitations SET permission_snapshot_json = ? WHERE id = ?",
+    )
+    .bind(
+        r#"{"isAdmin":true,"canManageServer":true,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["accept-library"],"canDownload":true,"canPlay":true,"maxSimultaneousPlaybacks":4,"allowRemux":false,"allowAudioTranscode":true,"allowVideoTranscode":false}}"#,
+    )
+    .bind("accept-invitation")
+    .execute(database.pool())
+    .await?;
+
+    let context = database
+        .get_user_invitation_for_challenge_hash(&token_hash, 1_001)
+        .await?
+        .ok_or("active invitation was not found by its token digest")?;
+    assert_eq!(context.invitation_id, "accept-invitation");
+    assert_eq!(context.challenge_id, "accept-challenge");
+    assert_eq!(context.recipient_email, "accept@example.test");
+    assert_eq!(context.expires_at, 10_000);
+    assert!(
+        database
+            .get_user_invitation_for_challenge_hash(&[32_u8; 32], 1_001)
+            .await?
+            .is_none()
+    );
+
+    let account = NewInvitationUserAccount {
+        id: "accepted-user",
+        username_normalized: "accepted-user",
+        display_name: "Accepted User",
+        password_hash: "$argon2id$test-hash",
+    };
+    let (first_acceptance, second_acceptance) = tokio::join!(
+        database.accept_user_invitation(&context.challenge_id, &token_hash, account, 1_001),
+        database.accept_user_invitation(&context.challenge_id, &token_hash, account, 1_001),
+    );
+    let results = [first_acceptance?, second_acceptance?];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == UserInvitationAcceptResult::Accepted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == UserInvitationAcceptResult::NotAcceptable)
+            .count(),
+        1
+    );
+
+    let accepted_user: InvitationAcceptanceUserSnapshot = sqlx::query_as(
+        "SELECT email, email_verified_at, is_disabled, has_password, is_admin, can_manage_server,
+                can_download, can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode, library_access_mode
+         FROM users WHERE id = 'accepted-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(accepted_user.email, "accept@example.test");
+    assert_eq!(accepted_user.email_verified_at, Some(1_001));
+    assert_eq!(accepted_user.is_disabled, 0);
+    assert_eq!(accepted_user.has_password, 1);
+    assert_eq!(accepted_user.is_admin, 1);
+    assert_eq!(accepted_user.can_manage_server, 1);
+    assert_eq!(accepted_user.can_download, 1);
+    assert_eq!(accepted_user.can_play, 1);
+    assert_eq!(accepted_user.max_simultaneous_playbacks, 4);
+    assert_eq!(accepted_user.allow_remux, 0);
+    assert_eq!(accepted_user.allow_audio_transcode, 1);
+    assert_eq!(accepted_user.allow_video_transcode, 0);
+    assert_eq!(accepted_user.library_access_mode, "SELECTED");
+    let (library_id, can_view): (String, i64) = sqlx::query_as(
+        "SELECT library_id, can_view FROM user_library_access WHERE user_id = 'accepted-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(library_id, "accept-library");
+    assert_eq!(can_view, 1);
+    assert_eq!(
+        database
+            .get_user_invitation("accept-invitation", 1_001)
+            .await?
+            .ok_or("accepted invitation disappeared")?
+            .status,
+        UserInvitationStatus::Accepted
+    );
+    assert_eq!(
+        database
+            .get_mail_challenge("accept-challenge")
+            .await?
+            .ok_or("accepted challenge disappeared")?
+            .consumed_at,
+        Some(1_001)
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(&context.challenge_id, &token_hash, account, 1_002)
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct InvitationAcceptanceUserSnapshot {
+    email: String,
+    email_verified_at: Option<i64>,
+    is_disabled: i64,
+    has_password: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_download: i64,
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+    allow_remux: i64,
+    allow_audio_transcode: i64,
+    allow_video_transcode: i64,
+    library_access_mode: String,
+}
+
+#[tokio::test]
+async fn user_invitation_storage_rejects_inactive_challenges_and_username_conflicts_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    for (id, email, challenge_id, mail_key, expires_at, byte) in [
+        (
+            "reject-expired-invitation",
+            "reject-expired@example.test",
+            "reject-expired-challenge",
+            "reject-expired-mail",
+            1_100,
+            41_u8,
+        ),
+        (
+            "reject-revoked-invitation",
+            "reject-revoked@example.test",
+            "reject-revoked-challenge",
+            "reject-revoked-mail",
+            10_000,
+            42_u8,
+        ),
+        (
+            "reject-mismatch-invitation",
+            "reject-mismatch@example.test",
+            "reject-mismatch-challenge",
+            "reject-mismatch-mail",
+            10_000,
+            43_u8,
+        ),
+        (
+            "reject-conflict-invitation",
+            "reject-conflict@example.test",
+            "reject-conflict-challenge",
+            "reject-conflict-mail",
+            10_000,
+            44_u8,
+        ),
+        (
+            "reject-library-rollback-invitation",
+            "reject-library-rollback@example.test",
+            "reject-library-rollback-challenge",
+            "reject-library-rollback-mail",
+            10_000,
+            45_u8,
+        ),
+        (
+            "reject-email-mismatch-invitation",
+            "reject-email-mismatch@example.test",
+            "reject-email-mismatch-challenge",
+            "reject-email-mismatch-mail",
+            10_000,
+            46_u8,
+        ),
+        (
+            "reject-expiry-mismatch-invitation",
+            "reject-expiry-mismatch@example.test",
+            "reject-expiry-mismatch-challenge",
+            "reject-expiry-mismatch-mail",
+            10_000,
+            47_u8,
+        ),
+        (
+            "reject-registered-email-invitation",
+            "registered@example.test",
+            "reject-registered-email-challenge",
+            "reject-registered-email-mail",
+            10_000,
+            48_u8,
+        ),
+    ] {
+        let token_hash = [byte; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            id,
+            email,
+            challenge_id,
+            mail_key,
+            expires_at,
+            1_000,
+            &token_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE user_invitations SET permission_snapshot_json = ? WHERE id = ?",
+    )
+    .bind(
+        r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["missing-library"],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#,
+    )
+    .bind("reject-library-rollback-invitation")
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash, email)
+         VALUES ('existing-email-user', 'existing-email-user', 'Existing Email User', 'hash',
+                 'registered@example.test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE mail_challenges SET recipient_email = ? WHERE id = ?")
+        .bind("other-email@example.test")
+        .bind("reject-email-mismatch-challenge")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE mail_challenges SET expires_at = ? WHERE id = ?")
+        .bind(9_000_i64)
+        .bind("reject-expiry-mismatch-challenge")
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[41_u8; 32], 1_100)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[46_u8; 32], 1_102)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[47_u8; 32], 1_102)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-expired-challenge",
+                &[41_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-expired-user",
+                    username_normalized: "reject-expired-user",
+                    display_name: "Expired User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_100,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+
+    assert!(
+        database
+            .revoke_user_invitation("reject-revoked-invitation", 1_101)
+            .await?
+    );
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[42_u8; 32], 1_102)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-revoked-challenge",
+                &[42_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-revoked-user",
+                    username_normalized: "reject-revoked-user",
+                    display_name: "Revoked User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_102,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-mismatch-challenge",
+                &[99_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-mismatch-user",
+                    username_normalized: "reject-mismatch-user",
+                    display_name: "Mismatch User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_103,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('existing-username-user', 'already-used', 'Existing User', 'hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-email-mismatch-challenge",
+                &[46_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-email-mismatch-user",
+                    username_normalized: "reject-email-mismatch-user",
+                    display_name: "Email Mismatch User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_103,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-expiry-mismatch-challenge",
+                &[47_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-expiry-mismatch-user",
+                    username_normalized: "reject-expiry-mismatch-user",
+                    display_name: "Expiry Mismatch User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_103,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-conflict-challenge",
+                &[44_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-conflict-new-user",
+                    username_normalized: "already-used",
+                    display_name: "Conflicting User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_104,
+            )
+            .await?,
+        UserInvitationAcceptResult::UsernameTaken
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-registered-email-challenge",
+                &[48_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-registered-email-user",
+                    username_normalized: "reject-registered-email-user",
+                    display_name: "Registered Email User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_104,
+            )
+            .await?,
+        UserInvitationAcceptResult::EmailAlreadyRegistered
+    );
+    assert!(
+        database
+            .accept_user_invitation(
+                "reject-library-rollback-challenge",
+                &[45_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-library-rollback-user",
+                    username_normalized: "reject-library-rollback-user",
+                    display_name: "Library Rollback User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_104,
+            )
+            .await
+            .is_err()
+    );
+
+    for id in [
+        "reject-expired-user",
+        "reject-revoked-user",
+        "reject-mismatch-user",
+        "reject-conflict-new-user",
+        "reject-library-rollback-user",
+        "reject-email-mismatch-user",
+        "reject-expiry-mismatch-user",
+        "reject-registered-email-user",
+    ] {
+        let user_exists: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
+                .bind(id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(user_exists, 0, "rejected acceptance created {id}");
+    }
+    for (challenge_id, expected_consumed_at) in [
+        ("reject-expired-challenge", None),
+        ("reject-revoked-challenge", None),
+        ("reject-mismatch-challenge", None),
+        ("reject-conflict-challenge", None),
+        ("reject-library-rollback-challenge", None),
+        ("reject-email-mismatch-challenge", None),
+        ("reject-expiry-mismatch-challenge", None),
+        ("reject-registered-email-challenge", None),
+    ] {
+        let challenge = database
+            .get_mail_challenge(challenge_id)
+            .await?
+            .ok_or("rejected challenge disappeared")?;
+        assert_eq!(challenge.consumed_at, expected_consumed_at);
+    }
+    assert_eq!(
+        database
+            .get_user_invitation("reject-revoked-invitation", 1_105)
+            .await?
+            .ok_or("revoked invitation disappeared")?
+            .status,
+        UserInvitationStatus::Revoked
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("reject-mismatch-invitation", 1_105)
+            .await?
+            .ok_or("mismatched invitation disappeared")?
+            .status,
+        UserInvitationStatus::Pending
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("reject-conflict-invitation", 1_105)
+            .await?
+            .ok_or("username-conflict invitation disappeared")?
+            .status,
+        UserInvitationStatus::Pending
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("reject-library-rollback-invitation", 1_105)
+            .await?
+            .ok_or("library rollback invitation disappeared")?
+            .status,
+        UserInvitationStatus::Pending
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_library_access")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_invitation_storage_enforces_rolling_email_mail_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -21722,6 +22228,245 @@ async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
                 .create_user_invitation_with_mail(invitation, challenge, outbox, 5_208)
                 .await?,
             UserInvitationCreateResult::Created
+        );
+
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ($1, $2, 'MOVIE')")
+            .bind("postgres-accept-library")
+            .bind("Postgres Accept")
+            .execute(database.pool())
+            .await?;
+        let acceptance_hash = [27_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-acceptance-invitation",
+            "postgres-acceptance@example.test",
+            "postgres-acceptance-challenge",
+            "postgres-acceptance-mail",
+            20_000,
+            5_209,
+            &acceptance_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 5_209)
+            .await?;
+        sqlx::query(
+            "UPDATE user_invitations SET permission_snapshot_json = $1 WHERE id = $2",
+        )
+        .bind(
+            r#"{"isAdmin":true,"canManageServer":true,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["postgres-accept-library"],"canDownload":true,"canPlay":false,"maxSimultaneousPlaybacks":3,"allowRemux":false,"allowAudioTranscode":true,"allowVideoTranscode":false}}"#,
+        )
+        .bind("postgres-acceptance-invitation")
+        .execute(database.pool())
+        .await?;
+        let acceptance = database
+            .get_user_invitation_for_challenge_hash(&acceptance_hash, 5_210)
+            .await?
+            .ok_or("PostgreSQL invitation was not found by its challenge digest")?;
+        let (first_acceptance, second_acceptance) = tokio::join!(
+            database.accept_user_invitation(
+                    &acceptance.challenge_id,
+                    &acceptance_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-accepted-user",
+                        username_normalized: "postgres-accepted-user",
+                        display_name: "Postgres Accepted User",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_210,
+                ),
+            database.accept_user_invitation(
+                &acceptance.challenge_id,
+                &acceptance_hash,
+                NewInvitationUserAccount {
+                    id: "postgres-accepted-user",
+                    username_normalized: "postgres-accepted-user",
+                    display_name: "Postgres Accepted User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                5_210,
+            ),
+        );
+        let results = [first_acceptance?, second_acceptance?];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == UserInvitationAcceptResult::Accepted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == UserInvitationAcceptResult::NotAcceptable)
+                .count(),
+            1
+        );
+        let (email_verified_at, is_admin, can_manage_server, can_download, can_play): (
+            Option<i64>,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT email_verified_at, is_admin, can_manage_server, can_download, can_play
+             FROM users WHERE id = $1",
+        )
+        .bind("postgres-accepted-user")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(email_verified_at, Some(5_210));
+        assert_eq!((is_admin, can_manage_server, can_download, can_play), (1, 1, 1, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM user_library_access
+                 WHERE user_id = $1 AND library_id = $2 AND can_view = 1",
+            )
+            .bind("postgres-accepted-user")
+            .bind("postgres-accept-library")
+            .fetch_one(database.pool())
+            .await?,
+            1
+        );
+        assert_eq!(
+            database
+                .accept_user_invitation(
+                    &acceptance.challenge_id,
+                    &acceptance_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-accepted-user-retry",
+                        username_normalized: "postgres-accepted-user-retry",
+                        display_name: "Postgres Accepted Retry",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_211,
+                )
+                .await?,
+            UserInvitationAcceptResult::NotAcceptable
+        );
+
+        let library_failure_hash = [28_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-library-rollback-invitation",
+            "postgres-library-rollback@example.test",
+            "postgres-library-rollback-challenge",
+            "postgres-library-rollback-mail",
+            20_000,
+            5_212,
+            &library_failure_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 5_212)
+            .await?;
+        sqlx::query(
+            "UPDATE user_invitations SET permission_snapshot_json = $1 WHERE id = $2",
+        )
+        .bind(
+            r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["missing-library"],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#,
+        )
+        .bind("postgres-library-rollback-invitation")
+        .execute(database.pool())
+        .await?;
+        assert!(
+            database
+                .accept_user_invitation(
+                    "postgres-library-rollback-challenge",
+                    &library_failure_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-library-rollback-user",
+                        username_normalized: "postgres-library-rollback-user",
+                        display_name: "Postgres Rollback User",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_213,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE id = $1")
+                .bind("postgres-library-rollback-user")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-library-rollback-invitation", 5_213)
+                .await?
+                .ok_or("PostgreSQL rollback invitation disappeared")?
+                .status,
+            UserInvitationStatus::Pending
+        );
+        assert_eq!(
+            database
+                .get_mail_challenge("postgres-library-rollback-challenge")
+                .await?
+                .ok_or("PostgreSQL rollback challenge disappeared")?
+                .consumed_at,
+            None
+        );
+
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash, email)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("postgres-existing-email-user")
+        .bind("postgres-existing-email-user")
+        .bind("Existing Email User")
+        .bind("hash")
+        .bind("postgres-registered@example.test")
+        .execute(database.pool())
+        .await?;
+        let registered_email_hash = [29_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-registered-email-invitation",
+            "postgres-registered@example.test",
+            "postgres-registered-email-challenge",
+            "postgres-registered-email-mail",
+            20_000,
+            5_214,
+            &registered_email_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 5_214)
+            .await?;
+        assert_eq!(
+            database
+                .accept_user_invitation(
+                    "postgres-registered-email-challenge",
+                    &registered_email_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-registered-email-new-user",
+                        username_normalized: "postgres-registered-email-new-user",
+                        display_name: "Registered Email User",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_215,
+                )
+                .await?,
+            UserInvitationAcceptResult::EmailAlreadyRegistered
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE id = $1")
+                .bind("postgres-registered-email-new-user")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-registered-email-invitation", 5_215)
+                .await?
+                .ok_or("PostgreSQL registered-email invitation disappeared")?
+                .status,
+            UserInvitationStatus::Pending
+        );
+        assert_eq!(
+            database
+                .get_mail_challenge("postgres-registered-email-challenge")
+                .await?
+                .ok_or("PostgreSQL registered-email challenge disappeared")?
+                .consumed_at,
+            None
         );
         database.close().await;
         Ok::<(), Box<dyn std::error::Error>>(())

@@ -11,6 +11,7 @@ use std::{
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use super::sql_templates::SqlTemplateCache;
+use super::{NewInvitationUserAccount, StoredUserInvitationAcceptance, UserInvitationAcceptResult};
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
@@ -760,6 +761,27 @@ struct UserInvitationRecord {
     revoked_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserInvitationPermissionSnapshot {
+    is_admin: bool,
+    can_manage_server: bool,
+    permissions: UserInvitationPermissionSnapshotFields,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserInvitationPermissionSnapshotFields {
+    library_access_mode: String,
+    library_ids: Vec<String>,
+    can_download: bool,
+    can_play: bool,
+    max_simultaneous_playbacks: i64,
+    allow_remux: bool,
+    allow_audio_transcode: bool,
+    allow_video_transcode: bool,
 }
 
 impl TryFrom<MailOutboxRecord> for StoredMailOutboxMessage {
@@ -2199,6 +2221,312 @@ impl Database {
         })?
         .map(TryInto::try_into)
         .transpose()
+    }
+
+    pub(crate) async fn get_user_invitation_for_challenge_hash(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<StoredUserInvitationAcceptance>, StorageError> {
+        if now < 0 || token_hash.len() != 32 {
+            return Err(StorageError::Conflict(
+                "invalid invitation challenge lookup".to_owned(),
+            ));
+        }
+        let row = self
+            .query_as::<(String, String, String, i64)>(
+                "SELECT i.id, c.id, c.recipient_email, c.expires_at
+                 FROM mail_challenges c
+                 JOIN user_invitations i ON i.id = c.reference_id
+                 WHERE c.challenge_kind = 'INVITATION' AND c.token_hash = ?
+                   AND c.expires_at > ? AND c.created_at <= ?
+                   AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+                   AND i.status = 'PENDING' AND i.expires_at > ?
+                   AND i.recipient_email = c.recipient_email
+                   AND i.expires_at = c.expires_at
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+            )
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.map(
+            |(invitation_id, challenge_id, recipient_email, expires_at)| {
+                StoredUserInvitationAcceptance {
+                    invitation_id,
+                    challenge_id,
+                    recipient_email,
+                    expires_at,
+                }
+            },
+        ))
+    }
+
+    pub(crate) async fn accept_user_invitation(
+        &self,
+        challenge_id: &str,
+        token_hash: &[u8],
+        account: NewInvitationUserAccount<'_>,
+        now: i64,
+    ) -> Result<UserInvitationAcceptResult, StorageError> {
+        if now < 0
+            || challenge_id.trim() != challenge_id
+            || !(1..=128).contains(&challenge_id.len())
+            || challenge_id.chars().any(char::is_control)
+            || token_hash.len() != 32
+            || account.id.trim() != account.id
+            || !(1..=128).contains(&account.id.len())
+            || account.id.chars().any(char::is_control)
+            || account.username_normalized.trim() != account.username_normalized
+            || account.username_normalized.is_empty()
+            || account.username_normalized.chars().count() > 128
+            || account.username_normalized != account.username_normalized.to_lowercase()
+            || account.display_name.trim().is_empty()
+            || account.display_name.chars().count() > 128
+            || account.password_hash.trim().is_empty()
+            || account.password_hash.len() > 512
+        {
+            return Err(StorageError::Conflict(
+                "invalid invitation acceptance".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let invitation_statement = format!(
+            "SELECT i.id, i.recipient_email, i.permission_snapshot_json FROM user_invitations i
+             JOIN mail_challenges c ON c.reference_id = i.id
+             WHERE c.id = ? AND c.challenge_kind = 'INVITATION' AND c.token_hash = ?
+               AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND i.status = 'PENDING' AND i.expires_at > ?
+               AND i.recipient_email = c.recipient_email
+               AND i.expires_at = c.expires_at{lock_clause}"
+        );
+        let invitation: Option<(String, String, String)> = self
+            .query_as(sqlx::AssertSqlSafe(invitation_statement))
+            .bind(challenge_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((invitation_id, recipient_email, permission_snapshot_json)) = invitation else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationAcceptResult::NotAcceptable);
+        };
+
+        let permission_snapshot: UserInvitationPermissionSnapshot =
+            serde_json::from_str(&permission_snapshot_json).map_err(|_| {
+                StorageError::Serialization("invitation permission snapshot is invalid".to_owned())
+            })?;
+        let permissions = permission_snapshot.permissions;
+        if !matches!(
+            permissions.library_access_mode.as_str(),
+            "ALL" | "SELECTED" | "NONE"
+        ) || permissions.max_simultaneous_playbacks < 0
+        {
+            return Err(StorageError::Serialization(
+                "invitation permission snapshot is invalid".to_owned(),
+            ));
+        }
+
+        let username_taken = self
+            .query_scalar::<String>("SELECT id FROM users WHERE username_normalized = ? LIMIT 1")
+            .bind(account.username_normalized)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if username_taken {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationAcceptResult::UsernameTaken);
+        }
+
+        let insert_user = self
+            .query(
+                "INSERT INTO users (
+                    id, username_normalized, display_name, password_hash,
+                    is_admin, can_manage_server, has_password, email, email_verified_at,
+                    can_download, can_play, max_simultaneous_playbacks,
+                    allow_remux, allow_audio_transcode, allow_video_transcode,
+                    library_access_mode
+                 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(account.username_normalized)
+            .bind(account.display_name)
+            .bind(account.password_hash)
+            .bind(database_flag(permission_snapshot.is_admin))
+            .bind(database_flag(permission_snapshot.can_manage_server))
+            .bind(&recipient_email)
+            .bind(now)
+            .bind(database_flag(permissions.can_download))
+            .bind(database_flag(permissions.can_play))
+            .bind(permissions.max_simultaneous_playbacks)
+            .bind(database_flag(permissions.allow_remux))
+            .bind(database_flag(permissions.allow_audio_transcode))
+            .bind(database_flag(permissions.allow_video_transcode))
+            .bind(&permissions.library_access_mode)
+            .execute(&mut *transaction)
+            .await;
+        if let Err(source) = insert_user {
+            let unique_violation = source
+                .as_database_error()
+                .is_some_and(|error| error.is_unique_violation());
+            if unique_violation {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|rollback_error| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source: rollback_error,
+                    })?;
+
+                let username_taken = self
+                    .query_scalar::<String>(
+                        "SELECT id FROM users WHERE username_normalized = ? LIMIT 1",
+                    )
+                    .bind(account.username_normalized)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some();
+                if username_taken {
+                    return Ok(UserInvitationAcceptResult::UsernameTaken);
+                }
+
+                let email_already_registered = self
+                    .query_scalar::<String>(
+                        "SELECT id FROM users
+                         WHERE email IS NOT NULL AND email <> ''
+                           AND LOWER(email) = LOWER(?)
+                         LIMIT 1",
+                    )
+                    .bind(&recipient_email)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some();
+                if email_already_registered {
+                    return Ok(UserInvitationAcceptResult::EmailAlreadyRegistered);
+                }
+            }
+            return Err(StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            });
+        }
+
+        if permissions.library_access_mode == "SELECTED" {
+            for library_id in &permissions.library_ids {
+                self.query(
+                    "INSERT INTO user_library_access (user_id, library_id, can_view)
+                     VALUES (?, ?, 1)",
+                )
+                .bind(account.id)
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
+        let invitation_updated = self
+            .query(
+                "UPDATE user_invitations
+                 SET status = 'ACCEPTED', accepted_user_id = ?, accepted_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING' AND expires_at > ?",
+            )
+            .bind(account.id)
+            .bind(now)
+            .bind(now)
+            .bind(&invitation_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        let challenge_consumed = self
+            .query(
+                "UPDATE mail_challenges SET consumed_at = ?
+                 WHERE id = ? AND token_hash = ? AND challenge_kind = 'INVITATION'
+                   AND consumed_at IS NULL AND revoked_at IS NULL
+                   AND expires_at > ? AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(challenge_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        if invitation_updated != 1 || challenge_consumed != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationAcceptResult::NotAcceptable);
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserInvitationAcceptResult::Accepted)
     }
 
     pub(crate) async fn list_user_invitations_page(

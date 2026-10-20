@@ -16546,6 +16546,23 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验证（2026-10-20）：邀请组件回归 `pnpm --dir web exec vitest run tests/admin-user-invitations.test.tsx` 4/4 通过，覆盖配置 `siteUrl` 子路径、链接复制及剪贴板不可用时手动选择；`pnpm --dir web build` 和 `git diff --check` 通过。此前依赖安装 `pnpm --dir web install --frozen-lockfile` 通过。隔离的本地浏览器预览确认邀请视图、预设媒体库范围、表格和操作可见，控制台无 error/warning。全量 `pnpm --dir web test` 中 Vitest 755/760 通过；5 项失败为 LUX-794 删除媒体库旧断言，以及未由本任务修改的首页/媒体卡片预取、虚拟合集链接和媒体详情轮询测试。此次未改动其余 LUX-794 文件。
 
+#### LUX-797：原子接受邀请并创建已验证账户
+
+范围：建立受邀用户激活的 storage 合同。凭证摘要仅解析有效的邀请挑战和对应待处理邀请；接受操作在单个事务内验证挑战/邀请状态，创建带已验证邮箱与邀请权限快照的活动用户、写入指定媒体库授权、标记邀请已接受并消费凭证。本任务不开放 HTTP API 或 Web 表单，不实现公开邮箱注册/审批。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 按凭证摘要读取时仅返回未消费、未撤销、未过期且与待处理邀请邮箱/期限匹配的邀请快照，不返回原始凭证。
+- [x] SQLite 与 PostgreSQL 均在一个事务内创建已验证活动用户、复制角色/播放/媒体库权限、接受邀请并消费凭证。
+- [x] 过期、撤销、重复消费、摘要不匹配或用户名冲突不会留下用户、权限关联、接受状态或已消费凭证等部分写入。
+- [x] 定向 storage 回归、`cargo build --locked`、格式检查和 diff check 通过；Cargo 使用 Toshiba 共享 target 目录。
+
+短计划：先在 storage 回归中覆盖成功接受、单次消费、错误凭证和冲突回滚并确认 RED；再增加查找与原子接受 storage 方法；最后运行定向 SQLite/PostgreSQL 回归、build、fmt 与 diff check。
+
+结果（2026-10-20）：SQLite 接受流程在单事务内写入已验证活动账户、角色、下载/播放/转码策略和指定媒体库授权，并同时接受邀请、消费挑战；并发接受仅一个调用成功，重复消费返回不可接受。邮箱或期限不匹配、过期、撤销、错误摘要、用户名冲突和已注册邮箱均不会创建部分账户；授权 FK 写入失败会回滚账户、邀请和挑战状态。定向 SQLite storage 回归 8/8 通过；隔离 PostgreSQL 生命周期与接受回归 1/1 通过，验证 PostgreSQL 权限快照、并发单次消费、注册邮箱冲突及授权失败回滚。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。最新 `cargo test --locked --all-targets` 为 1119 passed、5 failed、27 ignored，库测试失败后未运行后续集成 targets。失败为：三个已在干净基线记录的 fill-missing 测试；`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`（单独复跑仍失败，先前任务已有记录）；`shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（并行 LUX-794 新增一条 shutdown 更新后实际查询数 10，旧断言期望 9）。全目标 Clippy 被 15 条既有告警阻断（管理 API、播放、权限复制、用户存储和旧测试），未报告本任务新增告警。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
