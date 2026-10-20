@@ -41,6 +41,22 @@ pub(crate) enum MetadataAutoMatchPolicy {
     Disabled,
 }
 
+// Registration settings are consumed by LUX-803's administrator API.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum RegistrationMode {
+    InvitationOnly,
+    PublicEmail,
+}
+
+#[allow(dead_code)]
+pub(crate) struct StoredRegistrationMode {
+    pub(crate) mode: RegistrationMode,
+    pub(crate) version: i64,
+    raw_value: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UserPlaybackPolicy {
     pub(crate) can_play: bool,

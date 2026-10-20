@@ -2782,6 +2782,80 @@ impl Database {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationModeRecord {
+    mode: super::RegistrationMode,
+    version: i64,
+}
+
+// LUX-803 consumes these versioned settings without changing the other settings keys.
+#[allow(dead_code)]
+impl Database {
+    pub(crate) async fn registration_mode(
+        &self,
+    ) -> Result<super::StoredRegistrationMode, StorageError> {
+        let raw_value: Option<String> = self
+            .query_scalar("SELECT value FROM server_settings WHERE key = 'registration_mode'")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let parsed = raw_value
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<RegistrationModeRecord>(value).ok())
+            .filter(|record| record.version > 0);
+        let (mode, version) = parsed
+            .map_or((super::RegistrationMode::InvitationOnly, 0), |record| {
+                (record.mode, record.version)
+            });
+        Ok(super::StoredRegistrationMode {
+            mode,
+            version,
+            raw_value,
+        })
+    }
+
+    pub(crate) async fn compare_and_set_registration_mode(
+        &self,
+        expected: &super::StoredRegistrationMode,
+        mode: super::RegistrationMode,
+    ) -> Result<bool, StorageError> {
+        let version = expected.version.checked_add(1).ok_or_else(|| {
+            StorageError::Conflict("registration setting version exhausted".to_owned())
+        })?;
+        let value =
+            serde_json::to_string(&RegistrationModeRecord { mode, version }).map_err(|_| {
+                StorageError::Serialization("registration setting serialization failed".to_owned())
+            })?;
+        let result = if let Some(raw_value) = expected.raw_value.as_deref() {
+            self.query(
+                "UPDATE server_settings SET value = ?, updated_at = unixepoch()
+                        WHERE key = 'registration_mode' AND value = ?",
+            )
+            .bind(&value)
+            .bind(raw_value)
+            .execute(&self.pool)
+            .await
+        } else {
+            self.query(
+                "INSERT INTO server_settings (key, value) VALUES ('registration_mode', ?)
+                        ON CONFLICT(key) DO NOTHING",
+            )
+            .bind(&value)
+            .execute(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+}
+
 async fn sqlite_has_legacy_timestamp_migration_checksum(
     pool: &AnyPool,
 ) -> Result<bool, sqlx::Error> {

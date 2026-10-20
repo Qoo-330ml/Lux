@@ -16649,11 +16649,15 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 空设置、损坏值和未知值安全回退为邀请制；有效更新可读回且版本并发写入不覆盖新值。
-- [ ] 无效模式拒绝，不影响邮件设置或其他 server settings。
-- [ ] 定向 storage/application 回归、build、fmt 与 diff check 通过；无需 schema migration。
+- [x] 空设置、损坏值和未知值安全回退为邀请制；有效更新可读回且版本并发写入不覆盖新值。
+- [x] 无效模式拒绝，不影响邮件设置或其他 server settings。
+- [x] 定向 storage/application 回归、build、fmt 与 diff check 通过；无需 schema migration。
 
 短计划：先添加默认、合法/非法值及并发回归；再增加版本化读写合同；最后运行定向测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：注册模式使用现有 `server_settings.registration_mode` JSON 保存模式和单调版本；未配置、JSON 损坏、未知枚举和非正版本均回退为邀请制。写入只接受两个已定义模式，先检查客户端版本，再以原始快照执行单条 CAS；陈旧或并发写入仅一个成功，不覆盖其他设置键。无需 schema migration。
+
+验证：TDD RED 确认模式类型和读写合同缺失；SQLite 与隔离 PostgreSQL 复用的默认/非法值/并发/损坏值修复回归 2/2 通过（`cargo test --locked --lib registration_mode -- --include-ignored`）。`cargo build --locked`、fmt 与 diff check 通过，Cargo 使用 Toshiba target，本机 arm64。库 Clippy 仍被此前已记录的 11 条管理 API、播放、权限复制和用户存储告警阻断；本任务文件没有新增诊断。未部署。
 
 #### LUX-803：开放公开注册模式管理员 API
 

@@ -16,6 +16,54 @@ use crate::{
 };
 use tokio::fs;
 
+// The following versioned contract is exposed by LUX-803.
+#[allow(dead_code)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RegistrationModeError {
+    InvalidMode,
+    Conflict,
+    Unavailable,
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_registration_mode(
+    database: &Database,
+) -> Result<crate::storage::StoredRegistrationMode, RegistrationModeError> {
+    database
+        .registration_mode()
+        .await
+        .map_err(|_| RegistrationModeError::Unavailable)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn update_registration_mode(
+    database: &Database,
+    mode: &str,
+    expected_version: i64,
+) -> Result<crate::storage::StoredRegistrationMode, RegistrationModeError> {
+    use crate::storage::RegistrationMode;
+    let mode = match mode {
+        "INVITATION_ONLY" => RegistrationMode::InvitationOnly,
+        "PUBLIC_EMAIL" => RegistrationMode::PublicEmail,
+        _ => return Err(RegistrationModeError::InvalidMode),
+    };
+    if expected_version < 0 {
+        return Err(RegistrationModeError::InvalidMode);
+    }
+    let current = read_registration_mode(database).await?;
+    if current.version != expected_version {
+        return Err(RegistrationModeError::Conflict);
+    }
+    if !database
+        .compare_and_set_registration_mode(&current, mode)
+        .await
+        .map_err(|_| RegistrationModeError::Unavailable)?
+    {
+        return Err(RegistrationModeError::Conflict);
+    }
+    read_registration_mode(database).await
+}
+
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
 const MAX_TRUSTED_PROXY_CIDRS: usize = 100;
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";

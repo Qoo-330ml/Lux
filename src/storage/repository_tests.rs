@@ -28274,3 +28274,158 @@ async fn postgres_scan_job_retry_diagnostics() -> Result<(), Box<dyn std::error:
     drop_database?;
     Ok(())
 }
+
+#[tokio::test]
+async fn registration_mode_defaults_validates_and_uses_versioned_updates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    assert_registration_mode_contract(&database).await
+}
+
+async fn assert_registration_mode_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::settings::{
+        RegistrationModeError, read_registration_mode, update_registration_mode,
+    };
+    use crate::storage::RegistrationMode;
+
+    let initial = read_registration_mode(database)
+        .await
+        .map_err(|_| "read failed")?;
+    assert_eq!(initial.mode, RegistrationMode::InvitationOnly);
+    assert_eq!(initial.version, 0);
+    database
+        .query(
+            "INSERT INTO server_settings (key, value) VALUES ('mail-test-sentinel', 'untouched')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    assert!(matches!(
+        update_registration_mode(database, "PUBLIC", 0).await,
+        Err(RegistrationModeError::InvalidMode)
+    ));
+    assert!(matches!(
+        update_registration_mode(database, "PUBLIC_EMAIL", -1).await,
+        Err(RegistrationModeError::InvalidMode)
+    ));
+    let saved = update_registration_mode(database, "PUBLIC_EMAIL", 0)
+        .await
+        .map_err(|_| "update failed")?;
+    assert_eq!(saved.mode, RegistrationMode::PublicEmail);
+    assert_eq!(saved.version, 1);
+    assert!(matches!(
+        update_registration_mode(database, "INVITATION_ONLY", 0).await,
+        Err(RegistrationModeError::Conflict)
+    ));
+
+    assert!(
+        !database
+            .compare_and_set_registration_mode(&initial, RegistrationMode::InvitationOnly)
+            .await?
+    );
+    let snapshot = database.registration_mode().await?;
+    let other_snapshot = database.registration_mode().await?;
+    let (one, two) = tokio::join!(
+        database.compare_and_set_registration_mode(&snapshot, RegistrationMode::InvitationOnly),
+        database.compare_and_set_registration_mode(&other_snapshot, RegistrationMode::PublicEmail),
+    );
+    assert_eq!(usize::from(one?) + usize::from(two?), 1);
+    assert_eq!(
+        read_registration_mode(database)
+            .await
+            .map_err(|_| "read failed")?
+            .version,
+        2
+    );
+    let sentinel: String = database
+        .query_scalar("SELECT value FROM server_settings WHERE key = 'mail-test-sentinel'")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(sentinel, "untouched");
+
+    for damaged in [
+        "broken",
+        r#"{"mode":"FUTURE","version":5}"#,
+        r#"{"mode":"PUBLIC_EMAIL","version":-1}"#,
+        r#"{"mode":"PUBLIC_EMAIL","version":0}"#,
+    ] {
+        database
+            .query("UPDATE server_settings SET value = ? WHERE key = 'registration_mode'")
+            .bind(damaged)
+            .execute(database.pool())
+            .await?;
+        let fallback = read_registration_mode(database)
+            .await
+            .map_err(|_| "read failed")?;
+        assert_eq!(fallback.mode, RegistrationMode::InvitationOnly);
+        assert_eq!(fallback.version, 0);
+        let repaired = update_registration_mode(database, "INVITATION_ONLY", 0)
+            .await
+            .map_err(|_| "repair failed")?;
+        assert_eq!(repaired.version, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_registration_mode_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let result = async {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: database_name.clone(),
+                ..admin_connection
+            }),
+        )
+        .await?;
+        let result = assert_registration_mode_contract(&database).await;
+        database.close().await;
+        result
+    }
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    result
+}
