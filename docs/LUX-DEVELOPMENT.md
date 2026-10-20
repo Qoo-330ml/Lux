@@ -16741,12 +16741,13 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 - [x] SQLite 与 PostgreSQL 的创建/验证/审批事务原子；并发批准仅一个用户成功。
 - [x] 重复邮箱、过期/撤销 challenge、重复审批、拒绝和权限 FK 错误均无部分账户或凭证消费。
 - [x] 分页上限 100，查询只返回申请摘要；定向 SQLite/PostgreSQL 回归、build、fmt 与 diff check 通过。
+- [x] 有效公开注册 token 摘要可解析为待验证 challenge 标识和期限；无效、过期或已消费摘要不返回 challenge。
 
 短计划：先为状态机与回滚写存储回归；再实现双后端查询和事务；最后运行 SQLite/PostgreSQL 定向目标、build、fmt 和 diff check。
 
-结果（2026-10-20）：SQLite 与 PostgreSQL 共用原子注册申请存储合同。创建申请、邮箱 challenge 和 outbox 使用同一事务；邮箱验证只消费匹配的有效摘要；管理员批准在一个事务内创建活动用户及权限关联并终结申请，拒绝则撤销待投邮件并清除密码哈希。申请列表限制最多 100 条，只返回脱敏摘要；对已到期但尚未由后台清理的申请，状态筛选与分页结果立即显示 `EXPIRED`。有界清理按批处理并取消对应邮件，SQLite/PostgreSQL 并发审批均只允许一个成功。
+结果（2026-10-20）：SQLite 与 PostgreSQL 共用原子注册申请存储合同。创建申请、邮箱 challenge 和 outbox 使用同一事务；邮箱验证只消费匹配的有效摘要；管理员批准在一个事务内创建活动用户及权限关联并终结申请，拒绝则撤销待投邮件并清除密码哈希。为支持公开链接仅携带一次性 token 的接口，storage 可通过 token 摘要查找有效的待验证 challenge，但只返回 challenge ID 和期限；无效、过期、已消费或已撤销摘要不返回 challenge。申请列表限制最多 100 条，只返回脱敏摘要；对已到期但尚未由后台清理的申请，状态筛选与分页结果立即显示 `EXPIRED`。有界清理按批处理并取消对应邮件，SQLite/PostgreSQL 并发审批均只允许一个成功。
 
-验证：新增 SQLite/PostgreSQL 共用状态机回归覆盖重复邮箱、challenge 失效/错误摘要、邮件 outbox 回滚、即时过期分页、权限外键回滚、并发批准、拒绝和有界清理；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_registration_storage_contract -- --include-ignored --test-threads=1` 2/2、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check` 通过。构建无 warning。全目标 Clippy 尚未作为本任务门禁；此前 Clippy 定向尝试被工作区其他未修改文件中的 11 项诊断阻断，本任务新增代码未有单独无告警 Clippy 结果。
+验证：新增 SQLite/PostgreSQL 共用状态机回归覆盖有效/无效/过期/已消费 challenge 摘要、重复邮箱、challenge 失效、邮件 outbox 回滚、即时过期分页、权限外键回滚、并发批准、拒绝和有界清理；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_registration_storage_contract -- --include-ignored --test-threads=1` 2/2、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check` 通过。构建无 warning。全目标 Clippy 尚未作为本任务门禁；此前 Clippy 定向尝试被工作区其他未修改文件中的 11 项诊断阻断，本任务新增代码未有单独无告警 Clippy 结果。
 
 #### LUX-808：实现公开注册与邮箱验证 application service
 

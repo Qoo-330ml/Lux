@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use super::sql_templates::SqlTemplateCache;
 use super::{
     NewInvitationUserAccount, NewUserRegistrationRequest, StoredUserInvitationAcceptance,
-    StoredUserRegistrationRequest, UserInvitationAcceptResult, UserRegistrationApproveResult,
+    StoredUserRegistrationChallenge, StoredUserRegistrationRequest, UserInvitationAcceptResult,
+    UserRegistrationApproveResult,
     UserRegistrationCreateResult, UserRegistrationRejectResult, UserRegistrationRequestPage,
     UserRegistrationStatus, UserRegistrationVerifyResult,
 };
@@ -3124,6 +3125,41 @@ impl Database {
 
 #[allow(dead_code)] // LUX-808 and LUX-812 consume these registration transitions.
 impl Database {
+    pub(crate) async fn get_user_registration_challenge_by_token_hash(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<StoredUserRegistrationChallenge>, StorageError> {
+        if now < 0 || token_hash.len() != 32 {
+            return Err(StorageError::Conflict(
+                "invalid user registration challenge lookup".to_owned(),
+            ));
+        }
+        let record: Option<(String, i64)> = self
+            .query_as(
+                "SELECT c.id, c.expires_at
+                 FROM mail_challenges c
+                 JOIN user_registration_requests r ON r.id = c.reference_id
+                 WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.token_hash = ?
+                   AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+                   AND c.expires_at > ? AND c.created_at <= ?
+                   AND r.status = 'PENDING_EMAIL' AND r.expires_at > ?
+                   AND r.recipient_email = c.recipient_email AND r.expires_at = c.expires_at
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+            )
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(record.map(|(id, expires_at)| StoredUserRegistrationChallenge { id, expires_at }))
+    }
+
     pub(crate) async fn verify_user_registration_email(
         &self,
         challenge_id: &str,

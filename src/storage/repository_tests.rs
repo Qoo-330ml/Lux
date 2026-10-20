@@ -28508,6 +28508,18 @@ async fn exercise_user_registration_storage(
             .await?,
         UserRegistrationCreateResult::Created
     );
+    let stored_challenge = database
+        .get_user_registration_challenge_by_token_hash(&main_hash, 1_000)
+        .await?
+        .ok_or("valid registration challenge was not found by token hash")?;
+    assert_eq!(stored_challenge.id, "registration-main-challenge");
+    assert_eq!(stored_challenge.expires_at, 5_000);
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&[99_u8; 32], 1_000)
+            .await?
+            .is_none()
+    );
 
     let duplicate_hash = [52_u8; 32];
     let (request, challenge, outbox) = registration_storage_bundle(
@@ -28617,6 +28629,12 @@ async fn exercise_user_registration_storage(
             .verify_user_registration_email("registration-main-challenge", &main_hash, 1_011)
             .await?,
         UserRegistrationVerifyResult::NotAcceptable
+    );
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&main_hash, 1_011)
+            .await?
+            .is_none()
     );
     let page = database
         .list_user_registration_requests_page(
@@ -28835,6 +28853,12 @@ async fn exercise_user_registration_storage(
             .create_user_registration_request_with_mail(request, challenge, outbox, 1_070)
             .await?;
     }
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&[57_u8; 32], 1_100)
+            .await?
+            .is_none()
+    );
     assert_eq!(
         database
             .verify_user_registration_email(

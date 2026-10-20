@@ -153,6 +153,12 @@ pub(crate) struct UserRegistrationRequestPage {
     pub(crate) total_count: i64,
 }
 
+#[allow(dead_code)] // LUX-808 resolves a submitted verification token to its challenge.
+pub(crate) struct StoredUserRegistrationChallenge {
+    pub(crate) id: String,
+    pub(crate) expires_at: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UserPlaybackPolicy {
     pub(crate) can_play: bool,
