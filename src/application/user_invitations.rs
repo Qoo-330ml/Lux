@@ -8,10 +8,12 @@ use crate::{
         mail::{MailChallengeSigner, hash_mail_challenge_token},
         user_presets::list_user_permission_presets,
     },
+    auth::password::PasswordService,
     storage::{
-        Database, MailChallengeKind, MailOutboxTemplateKind, NewMailChallenge,
-        NewMailOutboxMessage, NewUserInvitation, StorageError, StoredUserInvitation,
-        UserInvitationCreateResult, UserInvitationResendResult, UserInvitationStatus,
+        Database, MailChallengeKind, MailOutboxTemplateKind, NewInvitationUserAccount,
+        NewMailChallenge, NewMailOutboxMessage, NewUserInvitation, StorageError,
+        StoredUserInvitation, UserInvitationAcceptResult, UserInvitationCreateResult,
+        UserInvitationResendResult, UserInvitationStatus,
     },
 };
 
@@ -62,6 +64,49 @@ impl From<StorageError> for UserInvitationError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum UserInvitationAcceptanceError {
+    InvalidInput,
+    NotAcceptable,
+    UsernameTaken,
+    EmailAlreadyRegistered,
+    SigningUnavailable,
+    PasswordUnavailable,
+    Storage(StorageError),
+}
+
+impl fmt::Display for UserInvitationAcceptanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput => formatter.write_str("invitation account input is invalid"),
+            Self::NotAcceptable => formatter.write_str("invitation cannot be accepted"),
+            Self::UsernameTaken => formatter.write_str("username is already in use"),
+            Self::EmailAlreadyRegistered => {
+                formatter.write_str("invitation email is already registered")
+            }
+            Self::SigningUnavailable => formatter.write_str("invitation signing is unavailable"),
+            Self::PasswordUnavailable => formatter.write_str("password hashing is unavailable"),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for UserInvitationAcceptanceError {}
+
+impl From<StorageError> for UserInvitationAcceptanceError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptUserInvitationInput<'a> {
+    pub(crate) token: &'a str,
+    pub(crate) username: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password: &'a str,
+}
+
 pub(crate) struct CreateUserInvitationInput<'a> {
     pub(crate) recipient_email: &'a str,
     pub(crate) created_by_user_id: Option<&'a str>,
@@ -71,6 +116,84 @@ pub(crate) struct CreateUserInvitationInput<'a> {
 pub(crate) struct CreatedUserInvitation {
     pub(crate) invitation: StoredUserInvitation,
     pub(crate) invitation_url: String,
+}
+
+pub(crate) async fn accept_user_invitation(
+    database: &Database,
+    config_dir: &Path,
+    input: AcceptUserInvitationInput<'_>,
+    now: i64,
+) -> Result<(), UserInvitationAcceptanceError> {
+    let username_normalized = input.username.trim().to_lowercase();
+    let display_name = input.display_name.trim();
+    if now < 0
+        || input.token.trim() != input.token
+        || !(1..=128).contains(&input.token.len())
+        || input.token.chars().any(char::is_control)
+        || username_normalized.is_empty()
+        || username_normalized.chars().count() > 128
+        || username_normalized.chars().any(char::is_control)
+        || display_name.chars().count() > 128
+        || display_name.chars().any(char::is_control)
+        || input.password.is_empty()
+        || input.password.len() > 1_024
+    {
+        return Err(UserInvitationAcceptanceError::InvalidInput);
+    }
+
+    let token_hash = hash_mail_challenge_token(input.token);
+    let Some(acceptance) = database
+        .get_user_invitation_for_challenge_hash(&token_hash, now)
+        .await?
+    else {
+        return Err(UserInvitationAcceptanceError::NotAcceptable);
+    };
+    let signer = MailChallengeSigner::load_or_create(config_dir)
+        .await
+        .map_err(|_| UserInvitationAcceptanceError::SigningUnavailable)?;
+    if !signer.verify(
+        &acceptance.challenge_id,
+        MailChallengeKind::Invitation,
+        acceptance.expires_at,
+        input.token,
+    ) {
+        return Err(UserInvitationAcceptanceError::NotAcceptable);
+    }
+
+    let password_hash = PasswordService::new()
+        .and_then(|passwords| passwords.hash_password(input.password))
+        .map_err(|_| UserInvitationAcceptanceError::PasswordUnavailable)?;
+    let user_id = uuid::Uuid::now_v7().to_string();
+    let display_name = if display_name.is_empty() {
+        username_normalized.as_str()
+    } else {
+        display_name
+    };
+    match database
+        .accept_user_invitation(
+            &acceptance.challenge_id,
+            &token_hash,
+            NewInvitationUserAccount {
+                id: &user_id,
+                username_normalized: &username_normalized,
+                display_name,
+                password_hash: &password_hash,
+            },
+            now,
+        )
+        .await?
+    {
+        UserInvitationAcceptResult::Accepted => Ok(()),
+        UserInvitationAcceptResult::NotAcceptable => {
+            Err(UserInvitationAcceptanceError::NotAcceptable)
+        }
+        UserInvitationAcceptResult::UsernameTaken => {
+            Err(UserInvitationAcceptanceError::UsernameTaken)
+        }
+        UserInvitationAcceptResult::EmailAlreadyRegistered => {
+            Err(UserInvitationAcceptanceError::EmailAlreadyRegistered)
+        }
+    }
 }
 
 pub(crate) struct UserInvitationListPage {
@@ -540,6 +663,166 @@ mod tests {
                 .await?
                 .messages
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invitation_acceptance_verifies_token_and_creates_argon2_user_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, database) = test_database().await?;
+        let invitation = create(
+            &database,
+            &directory,
+            "accept-service@example.test",
+            "builtin-user",
+            2_000,
+        )
+        .await?;
+        let token = invitation
+            .invitation_url
+            .strip_prefix("/register/invitation#token=")
+            .ok_or("invitation token missing from fragment URL")?;
+        let input = AcceptUserInvitationInput {
+            token,
+            username: "  Invitation User ",
+            display_name: "  Invitation Display  ",
+            password: "correct horse battery staple",
+        };
+
+        assert!(matches!(
+            accept_user_invitation(
+                &database,
+                &directory.path().join("config"),
+                AcceptUserInvitationInput {
+                    token: "invalid-token",
+                    ..input
+                },
+                2_001,
+            )
+            .await,
+            Err(UserInvitationAcceptanceError::NotAcceptable)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        let oversized_password = "x".repeat(1_025);
+        assert!(matches!(
+            accept_user_invitation(
+                &database,
+                &directory.path().join("config"),
+                AcceptUserInvitationInput {
+                    password: &oversized_password,
+                    ..input
+                },
+                2_001,
+            )
+            .await,
+            Err(UserInvitationAcceptanceError::InvalidInput)
+        ));
+
+        accept_user_invitation(&database, &directory.path().join("config"), input, 2_001).await?;
+
+        let (email, display_name, email_verified_at, is_disabled, password_hash): (
+            String,
+            String,
+            Option<i64>,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT email, display_name, email_verified_at, is_disabled, password_hash FROM users
+             WHERE username_normalized = 'invitation user'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(email, "accept-service@example.test");
+        assert_eq!(display_name, "Invitation Display");
+        assert_eq!(email_verified_at, Some(2_001));
+        assert_eq!(is_disabled, 0);
+        assert!(!password_hash.contains("correct horse battery staple"));
+        assert!(
+            crate::auth::password::PasswordService::new()?
+                .verify_password(Some(&password_hash), "correct horse battery staple")?
+        );
+        assert!(matches!(
+            accept_user_invitation(&database, &directory.path().join("config"), input, 2_002,)
+                .await,
+            Err(UserInvitationAcceptanceError::NotAcceptable)
+        ));
+
+        let username_conflict = create(
+            &database,
+            &directory,
+            "username-conflict@example.test",
+            "builtin-user",
+            3_000,
+        )
+        .await?;
+        let username_conflict_token = username_conflict
+            .invitation_url
+            .strip_prefix("/register/invitation#token=")
+            .ok_or("username-conflict token missing")?;
+        assert!(matches!(
+            accept_user_invitation(
+                &database,
+                &directory.path().join("config"),
+                AcceptUserInvitationInput {
+                    token: username_conflict_token,
+                    username: "INVITATION USER",
+                    display_name: "Conflict",
+                    password: "another valid password",
+                },
+                3_001,
+            )
+            .await,
+            Err(UserInvitationAcceptanceError::UsernameTaken)
+        ));
+        assert_eq!(
+            database
+                .get_user_invitation(&username_conflict.invitation.id, 3_001)
+                .await?
+                .ok_or("username-conflict invitation disappeared")?
+                .status,
+            UserInvitationStatus::Pending
+        );
+
+        let email_conflict = create(
+            &database,
+            &directory,
+            "accept-service@example.test",
+            "builtin-user",
+            4_000,
+        )
+        .await?;
+        let email_conflict_token = email_conflict
+            .invitation_url
+            .strip_prefix("/register/invitation#token=")
+            .ok_or("email-conflict token missing")?;
+        assert!(matches!(
+            accept_user_invitation(
+                &database,
+                &directory.path().join("config"),
+                AcceptUserInvitationInput {
+                    token: email_conflict_token,
+                    username: "new-account",
+                    display_name: "New Account",
+                    password: "another valid password",
+                },
+                4_001,
+            )
+            .await,
+            Err(UserInvitationAcceptanceError::EmailAlreadyRegistered)
+        ));
+        assert_eq!(
+            database
+                .get_user_invitation(&email_conflict.invitation.id, 4_001)
+                .await?
+                .ok_or("email-conflict invitation disappeared")?
+                .status,
+            UserInvitationStatus::Pending
         );
         Ok(())
     }

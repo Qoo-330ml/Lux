@@ -16575,12 +16575,16 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 仅有效邀请 token 可创建账户；Token、密码和摘要不进入日志或错误响应。
-- [ ] 用户名、显示名称和密码有界校验，密码仅以 Argon2id 哈希交给 storage。
-- [ ] 过期、重放、无效签名、用户名冲突和已注册邮箱均返回稳定错误且不改变账户或邀请。
-- [ ] application 定向回归、`cargo build --locked`、fmt 与 diff check 通过；Cargo 使用 Toshiba target 目录。
+- [x] 仅有效邀请 token 可创建账户；Token、密码和摘要不进入日志或错误响应。
+- [x] 用户名、显示名称和密码有界校验，密码仅以 Argon2id 哈希交给 storage。
+- [x] 过期、重放、无效签名、用户名冲突和已注册邮箱均返回稳定错误且不改变账户或邀请。
+- [x] application 定向回归、`cargo build --locked`、fmt 与 diff check 通过；Cargo 使用 Toshiba target 目录。
 
 短计划：先添加 service 成功/失败与重放回归并确认 RED；再连接 signer、密码哈希与原子 storage 接口；最后运行定向测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：邀请 service 通过挑战摘要查找有效待处理邀请，并再次验证 HMAC；之后规范化用户名/显示名称、限制输入长度，以 Argon2id 哈希密码并调用 LUX-797 的单事务接受接口。无效 token、重放、超长密码、用户名冲突和已注册邮箱不会部分创建账户；冲突时邀请保持待处理。没有在错误中返回 token、密码或摘要。
+
+验证：TDD RED 因 application 输入类型与接受服务缺失而编译失败；实现后 `cargo test --locked --lib application::user_invitations::tests::invitation_acceptance_verifies_token_and_creates_argon2_user_once` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。`cargo clippy --locked --lib -- -D warnings` 仍被 11 项未修改文件诊断阻断（管理员 API、Emby 播放、权限复制和用户存储）；本任务文件无 Clippy 诊断。未连接 SMTP 或开放 HTTP/UI。
 
 #### LUX-799：开放公开邀请接受 API
 
