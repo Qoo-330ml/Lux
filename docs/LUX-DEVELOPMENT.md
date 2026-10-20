@@ -16845,11 +16845,31 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验证：新增集成回归先因路由缺失得到 404；实现后匿名默认模式及切换为公开注册的响应均通过，且响应严格只含 `registrationMode`。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users -- --test-threads=1` 29/29、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Toshiba 已挂载，本机 macOS arm64；未连接 SMTP、未部署。
 
+#### LUX-811B：建立公开注册模式 Web 客户端
+
+范围：为 LUX-811 页面提供匿名读取注册模式的类型化 client 方法；支持部署子路径，不发送会话 Cookie、CSRF 或设备 ID。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 方法读取 LUX-811A 端点并返回 `RegistrationMode`；验证路径、匿名请求选项及错误映射。
+- [x] 部署子路径规范化和非法路径拒绝有回归。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先新增 client 合同回归并确认方法缺失；再实现匿名读取方法；最后运行 API client Vitest、Web build 和 diff check。
+
+依赖：LUX-811A。
+
+实施结果（2026-10-20）：新增 `publicRegistrationSettings` 类型化方法，使用公开请求路径构造器处理反向代理子路径，发送匿名 GET，不附带会话 Cookie、CSRF 或设备标识；非法外部路径通过 Promise 形式返回固定 `INVALID_REQUEST`。
+
+验证：TDD RED 确认方法缺失；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 102/102、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 和 `git diff --check` 通过。
+
 #### LUX-811：实现公开注册与邮箱验证页面
 
 范围：增加公开注册申请及邮箱验证页面；通过 LUX-811A 匿名读取当前模式，仅在服务端允许公开注册时显示提交表单。邮箱链接 token 从 fragment 读取后清除地址栏，并只在验证请求期间存于内存。说明邮箱验证后仍须管理员批准。
 
-预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/auth/RegisterPage.tsx`、`web/src/lib/api/client.ts`、`web/tests/register-page.test.tsx`。
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/auth/RegisterPage.tsx`、`web/tests/register-page.test.tsx`。
 
 验收标准：
 
@@ -16857,7 +16877,7 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 - [ ] 邮件验证成功显示“等待管理员审批”，token 被清理且不写入持久化。
 - [ ] 定向 Vitest、Web build 与真实浏览器路由/fragment 验证通过。
 
-依赖：LUX-810、LUX-811A。
+依赖：LUX-810、LUX-811A、LUX-811B。
 
 短计划：先增加模式、提交及验证页面回归；再添加页面路由与状态；最后运行 Vitest、Web build 和浏览器检查。
 

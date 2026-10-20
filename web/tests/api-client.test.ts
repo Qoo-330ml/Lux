@@ -2023,6 +2023,40 @@ describe("LuxApiClient", () => {
     }
   });
 
+  it("reads the public registration mode anonymously with its deployment path", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ registrationMode: "PUBLIC_EMAIL" }), { status: 200 }),
+    );
+    const storage = installLocalStorage(null);
+    const cookie = installCookieDocument("lux_csrf=csrf-secret");
+    try {
+      await expect(new LuxApiClient().publicRegistrationSettings("/proxy/lux/"))
+        .resolves.toEqual({ registrationMode: "PUBLIC_EMAIL" });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      const headers = options?.headers as Headers;
+      expect(path).toBe("/proxy/lux/api/v1/auth/registrations/settings");
+      expect(options?.method).toBeUndefined();
+      expect(options?.credentials).toBe("omit");
+      expect(headers.has("X-CSRF-Token")).toBe(false);
+      expect(headers.has("X-Lux-Device-Id")).toBe(false);
+      expect(storage.writes()).toHaveLength(0);
+      expect(cookie.current()).toBe("lux_csrf=csrf-secret");
+    } finally {
+      storage.restore();
+      cookie.restore();
+    }
+  });
+
+  it.each(["//other.example.test", "https://other.example.test"])(
+    "rejects an external public registration settings path %s",
+    async (sitePath) => {
+      const fetchMock = vi.spyOn(globalThis, "fetch");
+      await expect(new LuxApiClient().publicRegistrationSettings(sitePath))
+        .rejects.toMatchObject({ code: "INVALID_REQUEST", status: 400 });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("verifies public registration with a body-only token and no session", async () => {
     const token = "email-verification-secret";
     const storage = installLocalStorage(null);

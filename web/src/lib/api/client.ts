@@ -10,6 +10,7 @@ import type {
   PublicUserRegistrationEmailVerificationInput,
   PublicUserRegistrationEmailVerificationResponse,
   PublicUserRegistrationResendInput,
+  RegistrationMode,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -451,6 +452,18 @@ export class LuxApiClient {
     return this.requestPublic<PublicUserRegistrationResponse>(
       publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations"),
       { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  publicRegistrationSettings(sitePath = "") {
+    let path: string;
+    try {
+      path = publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations/settings");
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.requestPublic<{ registrationMode: RegistrationMode }>(
+      path,
     );
   }
 
