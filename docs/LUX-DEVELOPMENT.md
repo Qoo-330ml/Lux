@@ -16401,6 +16401,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：`cargo test --locked --lib user_invitation_storage_` 3/3；本机 PostgreSQL 16 定向用例 `cargo test --locked --lib postgres_user_invitation_storage_covers_lifecycle_and_atomicity -- --ignored` 1/1；`cargo build --locked`（最终验证无 warning）、`cargo fmt --all -- --check` 与 `git diff --check` 通过。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
 
+#### LUX-789：建立邀请注册 application service
+
+范围：为管理员邀请建立 application service，按已选权限预设复制不可变快照，规范化并验证目标邮箱，创建 7 天有效的单次挑战凭证并将邮件原子入队；提供有界、可筛选的邀请分页和待处理邀请撤销。创建结果仅在当前操作返回可复制的相对邀请链接，原始 token 不写入持久化数据或日志。本任务不开放 HTTP API，不实现公开注册/账号激活或 Web 页面，不实际发送邮件。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_invitations.rs`（测试内置于新 service 模块）。
+
+验收标准：
+
+- [x] 邮箱在服务层校验并规范为小写；有效邀请必须绑定现存权限预设和创建时权限快照，默认期限为 7 天。
+- [x] 创建同时写入邀请、HMAC 挑战摘要和 outbox 项；重复待处理邮箱得到稳定冲突；仅响应包含可复制链接，数据库只存摘要。
+- [x] 邀请列表支持状态筛选、稳定排序和最多 100 条分页；撤销只作用于尚未到期的待处理邀请，并沿用 storage 的挑战/outbox 原子失效。
+- [x] SQLite 测试覆盖创建快照、链接校验、重复邮箱、状态筛选分页、撤销和 token 不落库；build、fmt、diff check 通过。
+
+短计划：先登记服务合同并添加 SQLite 回归；再实现邮箱/预设校验、7 天快照与邮件入队、分页和撤销；最后运行 `cargo test --locked --lib application::user_invitations::tests`、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib application::user_invitations::tests` 3/3、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；本机 `arm64`，Cargo 使用 Toshiba target 目录。测试未连接 SMTP；服务返回的单次邀请 URL 使用片段携带 token，存储仅保留 HMAC 验证所需的摘要。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -81,6 +81,9 @@ pub(crate) mod user_account_preferences;
 pub mod user_avatars;
 pub(crate) mod user_cleanup;
 pub(crate) mod user_content_restrictions;
+// LUX-790 consumes these invitation operations in the admin API.
+#[allow(dead_code)]
+pub(crate) mod user_invitations;
 // The next API task consumes this service; keep this task limited to its storage and business model.
 pub(crate) mod user_permission_copy;
 #[allow(dead_code)]
