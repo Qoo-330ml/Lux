@@ -7,13 +7,14 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminUser, AdminUserListStatus, AdminUserPermissionPresetBatchErrorCode, AdminUserSortBy, AdminUserSortOrder, AdminUserStatusBatchErrorCode } from "../../lib/api/types";
 import { AdminUserPermissionCopyDialog } from "./AdminUserPermissionCopyDialog";
 import { AdminUserPreferenceCopyDialog } from "./AdminUserPreferenceCopyDialog";
+import { AdminUserInvitationsPanel } from "./AdminUserInvitationsPanel";
 import "./user-management.css";
 
 export function AdminUsersPage() {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedView = searchParams.get("view");
-  const view = requestedView === "pending" || requestedView === "deleted" ? requestedView : "users";
+  const view = requestedView === "pending" || requestedView === "deleted" || requestedView === "invitations" ? requestedView : "users";
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [searchInput, setSearchInput] = useState("");
@@ -30,9 +31,9 @@ export function AdminUsersPage() {
   const users = useQuery({
     queryKey: queryKeys.adminUsersPage(page, pageSize, search, queryStatus, sortBy, sortOrder),
     queryFn: () => api.adminUsers({ page, pageSize, search, status: queryStatus, sortBy, sortOrder }),
-    enabled: view !== "pending",
+    enabled: view === "users" || view === "deleted",
   });
-  const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings(), enabled: view === "users" || view === "deleted" });
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const permissionPresets = useQuery({
     queryKey: ["admin", "user-permission-presets"],
@@ -99,8 +100,8 @@ export function AdminUsersPage() {
     setBatchStatusError("");
   }, [view, page, pageSize, searchInput, status, sortBy, sortOrder]);
 
-  if (view !== "pending" && users.error && !users.data) return <AdminUserState label={users.error.message || "用户数据加载失败"} error />;
-  if (view !== "pending" && users.isPending) return <AdminUserState label="正在读取用户列表…" />;
+  if ((view === "users" || view === "deleted") && users.error && !users.data) return <AdminUserState label={users.error.message || "用户数据加载失败"} error />;
+  if ((view === "users" || view === "deleted") && users.isPending) return <AdminUserState label="正在读取用户列表…" />;
   function submit(event: FormEvent) { event.preventDefault(); if (!form.username.trim() || !form.password) { setFormError("用户名和密码不能为空"); return; } create.mutate(); }
 
   function toggleUserSelection(userId: string, selected: boolean) {
@@ -178,6 +179,7 @@ export function AdminUsersPage() {
       <nav className="lux-admin-users-nav" aria-label="用户管理视图">
         {[
           ["users", "用户列表"],
+          ["invitations", "注册邀请"],
           ["pending", "待审批"],
           ["deleted", "回收站"],
         ].map(([key, label]) => (
@@ -188,9 +190,9 @@ export function AdminUsersPage() {
         <section className="lux-admin-users-placeholder" aria-labelledby="lux-admin-users-placeholder-title">
           <span className="lux-admin-eyebrow">后续任务</span>
           <h2 id="lux-admin-users-placeholder-title">待审批用户</h2>
-          <p>注册申请和审批将在注册邀请任务中启用。</p>
+          <p>公开注册申请和审批将在后续任务中启用。</p>
         </section>
-      ) : <>
+      ) : view === "invitations" ? <AdminUserInvitationsPanel /> : <>
       <div className="lux-admin-user-query-controls">
         <label className="lux-admin-user-search"><span>搜索用户</span><div><Search size={16} aria-hidden="true" /><input value={searchInput} onChange={(event) => setSearchInput(event.target.value)} placeholder="用户名、显示名称或邮箱" /></div></label>
         {view === "users" ? <label><span>账号状态</span><select value={status} onChange={(event) => setStatus(event.target.value as AdminUserListStatus)}><option value="all">全部状态</option><option value="active">正常</option><option value="disabled">已禁用</option></select></label> : <div className="lux-admin-deleted-hint"><span>回收站</span><small>账号将在显示的期限后自动清理</small></div>}

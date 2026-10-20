@@ -16527,6 +16527,25 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验证（2026-10-20）：新增 API 客户端回归先因列表方法缺失而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 82/82 通过，`pnpm --dir web build`（含 `tsc --noEmit`）与 `git diff --check` 通过。客户端请求字段与管理员邀请 API 的实际 handler/DTO 对齐。
 
+#### LUX-796：实现管理员邀请管理界面
+
+范围：在用户管理中增加注册邀请视图，支持管理员按状态分页查询邀请、指定邮箱并选择权限预设创建邀请、查看当前邮件入队结果、复制一次性邀请链接、重新发送和撤销待处理邀请。创建时沿用所选预设的媒体库权限快照，不额外选择或覆盖媒体库。复制链接时使用邮件设置中的 `siteUrl` 生成绝对地址并保留站点子路径；一次性链接只保留在当前组件内存，不进入 React Query 数据、浏览器持久化存储或日志；复制能力不可用时提供可手动选择的链接。重发失败后再次点击沿用原 `Idempotency-Key`，成功后新的发送请求生成新键。本任务不实现受邀用户激活、公开注册/审批或邮件队列管理页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserInvitationsPanel.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/admin-user-invitations.test.tsx`。
+
+验收标准：
+
+- [x] 用户管理页提供邀请视图，按状态及服务端页码读取邀请，并显示邮箱、预设、状态和有效期。
+- [x] 创建邀请要求有效邮箱和现存权限预设；表单明确展示预设的媒体库访问范围，创建成功显示邮件入队结果和一次性链接。
+- [x] 一次性链接仅在组件内存中提供复制/手动选择，不进入查询缓存或浏览器持久化存储。
+- [x] 复制链接按邮件设置中的 `siteUrl` 生成绝对地址，并保留反向代理部署的子路径。
+- [x] 仅待处理邀请提供重发和撤销；重发幂等键在失败重试时保持一致，撤销需确认，成功操作刷新邀请列表。
+- [x] 新增组件回归覆盖筛选、分页、创建/链接复制、重发幂等重试、撤销确认与刷新；定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先新增邀请面板回归并确认 RED；再接入用户管理导航和邀请 API，按状态与页码查询并在组件状态中处理一次性链接及重发幂等键；最后运行定向回归、Web build 与 diff check。
+
+验证（2026-10-20）：邀请组件回归 `pnpm --dir web exec vitest run tests/admin-user-invitations.test.tsx` 4/4 通过，覆盖配置 `siteUrl` 子路径、链接复制及剪贴板不可用时手动选择；`pnpm --dir web build` 和 `git diff --check` 通过。此前依赖安装 `pnpm --dir web install --frozen-lockfile` 通过。隔离的本地浏览器预览确认邀请视图、预设媒体库范围、表格和操作可见，控制台无 error/warning。全量 `pnpm --dir web test` 中 Vitest 755/760 通过；5 项失败为 LUX-794 删除媒体库旧断言，以及未由本任务修改的首页/媒体卡片预取、虚拟合集链接和媒体详情轮询测试。此次未改动其余 LUX-794 文件。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
