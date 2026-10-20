@@ -13,6 +13,10 @@ use crate::{
     application::user_invitations::{
         AcceptUserInvitationInput, UserInvitationAcceptanceError, accept_user_invitation,
     },
+    application::user_registration::{
+        SubmitUserRegistrationInput, UserRegistrationError, resend_public_user_registration_email,
+        submit_public_user_registration, verify_public_user_registration_email,
+    },
     auth::sessions::AuthenticatedSession,
     security::{
         DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
@@ -765,6 +769,28 @@ pub(super) struct AuthInvitationAcceptRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AuthUserRegistrationRequest {
+    email: String,
+    username: String,
+    #[serde(default)]
+    display_name: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthUserRegistrationTokenRequest {
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthUserRegistrationResendRequest {
+    email: String,
+}
+
 fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
     let header_id = header_str(headers, "x-lux-device-id")?;
     let device_id = uuid::Uuid::parse_str(header_id).ok()?;
@@ -1078,6 +1104,241 @@ pub(super) async fn auth_accept_user_invitation(
             "邀请暂时无法处理",
         )
         .into_response(),
+    }
+}
+
+fn user_registration_error(headers: &HeaderMap, error: UserRegistrationError) -> Response {
+    match error {
+        UserRegistrationError::InvalidEmail
+        | UserRegistrationError::InvalidInput
+        | UserRegistrationError::NotAcceptable => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册请求无效或已失效",
+        )
+        .into_response(),
+        UserRegistrationError::RegistrationClosed => api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "公开注册当前不可用",
+        )
+        .into_response(),
+        UserRegistrationError::RateLimited => api_error(
+            headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            lux::ApiErrorCode::RateLimited,
+            "注册请求过于频繁，请稍后重试",
+        )
+        .into_response(),
+        UserRegistrationError::PasswordUnavailable | UserRegistrationError::SigningUnavailable => {
+            api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::Internal,
+                "注册服务暂时不可用",
+            )
+            .into_response()
+        }
+        UserRegistrationError::SettingsUnavailable | UserRegistrationError::StorageUnavailable => {
+            api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "注册服务暂时不可用",
+            )
+            .into_response()
+        }
+    }
+}
+
+fn registration_request_body_error(headers: &HeaderMap, too_large: bool) -> Response {
+    if too_large {
+        api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册请求内容过大",
+        )
+        .into_response()
+    } else {
+        api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册请求无效",
+        )
+        .into_response()
+    }
+}
+
+fn registration_connection_peer(headers: &HeaderMap) -> Option<std::net::IpAddr> {
+    header_str(headers, "x-lux-peer-ip")?.parse().ok()
+}
+
+pub(super) async fn auth_submit_public_user_registration(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<Json<AuthUserRegistrationRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return registration_request_body_error(
+                &headers,
+                rejection.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            );
+        }
+    };
+    let (Some(database), Some(config_dir), Some(connection_peer)) = (
+        state.database.as_ref(),
+        state.config_dir.as_deref(),
+        registration_connection_peer(&headers),
+    ) else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "注册服务暂时不可用",
+        )
+        .into_response();
+    };
+
+    match submit_public_user_registration(
+        database,
+        config_dir,
+        &state.device_pairing_rate_limiter,
+        connection_peer,
+        SubmitUserRegistrationInput {
+            email: &request.email,
+            username: &request.username,
+            display_name: &request.display_name,
+            password: &request.password,
+        },
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "message": "若申请符合条件，我们会发送邮件"
+            })),
+        )
+            .into_response(),
+        Err(error) => user_registration_error(&headers, error),
+    }
+}
+
+pub(super) async fn auth_verify_public_user_registration_email(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<
+        Json<AuthUserRegistrationTokenRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return registration_request_body_error(
+                &headers,
+                rejection.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            );
+        }
+    };
+    let (Some(database), Some(config_dir), Some(connection_peer)) = (
+        state.database.as_ref(),
+        state.config_dir.as_deref(),
+        registration_connection_peer(&headers),
+    ) else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "邮箱验证暂时无法处理",
+        )
+        .into_response();
+    };
+    match verify_public_user_registration_email(
+        database,
+        config_dir,
+        &state.device_pairing_rate_limiter,
+        connection_peer,
+        &request.token,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "verified": true, "status": "PENDING_APPROVAL" })),
+        )
+            .into_response(),
+        Err(error) => user_registration_error(&headers, error),
+    }
+}
+
+pub(super) async fn auth_resend_public_user_registration_email(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<
+        Json<AuthUserRegistrationResendRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return registration_request_body_error(
+                &headers,
+                rejection.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            );
+        }
+    };
+    let Some(idempotency_key) = header_str(&headers, "idempotency-key") else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "重发请求缺少幂等键",
+        )
+        .into_response();
+    };
+    let (Some(database), Some(connection_peer)) = (
+        state.database.as_ref(),
+        registration_connection_peer(&headers),
+    ) else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "注册服务暂时不可用",
+        )
+        .into_response();
+    };
+
+    match resend_public_user_registration_email(
+        database,
+        &state.device_pairing_rate_limiter,
+        connection_peer,
+        &request.email,
+        idempotency_key,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "message": "若申请符合条件，我们会发送邮件"
+            })),
+        )
+            .into_response(),
+        Err(error) => user_registration_error(&headers, error),
     }
 }
 
@@ -2673,6 +2934,21 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/invitations/accept",
             post(users::auth_accept_user_invitation).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations",
+            post(users::auth_submit_public_user_registration)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations/verify-email",
+            post(users::auth_verify_public_user_registration_email)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations/resend",
+            post(users::auth_resend_public_user_registration_email)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/v1/auth/logout", post(users::auth_logout))
         .route("/api/v1/auth/me", get(users::auth_me))

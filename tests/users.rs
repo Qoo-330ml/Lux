@@ -1,3 +1,5 @@
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
@@ -13,7 +15,29 @@ use luxd::{
 use reqwest::header::COOKIE;
 use serde_json::{Value, json};
 use sha2::Digest;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
+
+fn registration_verification_token(
+    config_dir: &std::path::Path,
+    challenge_id: &str,
+    expires_at: i64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let key = std::fs::read(config_dir.join("mail_challenge_signing_key"))?;
+    let mut mac = HmacSha256::new_from_slice(&key)
+        .map_err(|_| std::io::Error::other("invalid registration signing key"))?;
+    let kind = b"EMAIL_VERIFICATION";
+    mac.update(b"lux-mail-challenge-token-v1\0");
+    mac.update(&(challenge_id.len() as u64).to_be_bytes());
+    mac.update(challenge_id.as_bytes());
+    mac.update(&(kind.len() as u64).to_be_bytes());
+    mac.update(kind);
+    mac.update(&expires_at.to_be_bytes());
+    let signature: [u8; 32] = mac.finalize().into_bytes().into();
+    Ok(URL_SAFE_NO_PAD.encode(signature))
+}
 
 #[tokio::test]
 async fn successful_login_is_written_to_the_user_activity_index()
@@ -5370,6 +5394,469 @@ async fn admin_can_manage_emby_login_sessions() -> Result<(), Box<dyn std::error
         assert!(!audit_json.contains(&session.token));
     }
     assert!(!audit_json.contains(&other_session.token));
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_registration_submission_api_is_mode_gated_and_uses_a_fixed_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("registration-admin", "Registration Admin", "admin password")
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let registration_url = format!("{base_url}/api/v1/auth/registrations");
+    let input = json!({
+        "email": "public-applicant@example.test",
+        "username": "public-applicant",
+        "displayName": "Public Applicant",
+        "password": "long registration password"
+    });
+
+    let closed = client.post(&registration_url).json(&input).send().await?;
+    assert_eq!(closed.status(), reqwest::StatusCode::FORBIDDEN);
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('registration_mode', '{\"mode\":\"PUBLIC_EMAIL\",\"version\":1}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let submitted = client
+        .post(&registration_url)
+        .header("x-lux-peer-ip", "198.51.100.99")
+        .header("x-forwarded-for", "203.0.113.99")
+        .json(&input)
+        .send()
+        .await?;
+    assert_eq!(submitted.status(), reqwest::StatusCode::ACCEPTED);
+    let submitted_body: Value = submitted.json().await?;
+    assert_eq!(submitted_body["accepted"], true);
+    assert!(
+        !submitted_body
+            .to_string()
+            .contains("public-applicant@example.test")
+    );
+    assert!(
+        !submitted_body
+            .to_string()
+            .contains("long registration password")
+    );
+
+    let repeated = client.post(&registration_url).json(&input).send().await?;
+    assert_eq!(repeated.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(repeated.json::<Value>().await?, submitted_body);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_registration_requests
+             WHERE recipient_email = 'public-applicant@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        1
+    );
+    let (challenge_id, expires_at): (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE recipient_email = 'public-applicant@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let token = registration_verification_token(
+        &temp_dir.path().join("config"),
+        &challenge_id,
+        expires_at,
+    )?;
+    let verification_url = format!("{base_url}/api/v1/auth/registrations/verify-email");
+    let invalid_token = "not-a-valid-registration-token";
+    let invalid = client
+        .post(&verification_url)
+        .json(&json!({ "token": invalid_token }))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(!invalid.text().await?.contains(invalid_token));
+
+    let verified = client
+        .post(&verification_url)
+        .json(&json!({ "token": token }))
+        .send()
+        .await?;
+    assert_eq!(verified.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        verified.json::<Value>().await?,
+        json!({ "verified": true, "status": "PENDING_APPROVAL" })
+    );
+    let replayed = client
+        .post(&verification_url)
+        .json(&json!({ "token": token }))
+        .send()
+        .await?;
+    assert_eq!(replayed.status(), reqwest::StatusCode::BAD_REQUEST);
+    let replayed_body = replayed.text().await?;
+    assert!(!replayed_body.contains(&token));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE email = 'public-applicant@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "public-applicant",
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let expired_registration = client
+        .post(&registration_url)
+        .json(&json!({
+            "email": "expired-applicant@example.test",
+            "username": "expired-applicant",
+            "displayName": "Expired Applicant",
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(expired_registration.status(), reqwest::StatusCode::ACCEPTED);
+    let (
+        expired_challenge_id,
+        expired_registration_id,
+        registration_created_at,
+        challenge_created_at,
+    ): (String, String, i64, i64) = sqlx::query_as(
+        "SELECT c.id, r.id, r.created_at, c.created_at
+         FROM mail_challenges c
+         JOIN user_registration_requests r ON r.id = c.reference_id
+         WHERE r.recipient_email = 'expired-applicant@example.test'
+           AND c.challenge_kind = 'EMAIL_VERIFICATION'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let expired_at = registration_created_at
+        .max(challenge_created_at)
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("registration expiry overflow"))?;
+    let expired_token = registration_verification_token(
+        &temp_dir.path().join("config"),
+        &expired_challenge_id,
+        expired_at,
+    )?;
+    let expired_token_hash = sha2::Sha256::digest(expired_token.as_bytes());
+    sqlx::query("UPDATE user_registration_requests SET expires_at = ? WHERE id = ?")
+        .bind(expired_at)
+        .bind(&expired_registration_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE mail_challenges SET expires_at = ?, token_hash = ? WHERE id = ?")
+        .bind(expired_at)
+        .bind(expired_token_hash.to_vec())
+        .bind(&expired_challenge_id)
+        .execute(database.pool())
+        .await?;
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    let wait_seconds = expired_at.saturating_sub(now).saturating_add(1).max(1) as u64;
+    tokio::time::sleep(Duration::from_secs(wait_seconds)).await;
+    let expired = client
+        .post(&verification_url)
+        .json(&json!({ "token": expired_token }))
+        .send()
+        .await?;
+    assert_eq!(expired.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(!expired.text().await?.contains(&expired_token));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_registration_email_verification_api_is_rate_limited_by_connection_peer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete(
+            "registration-verify-rate-limit-admin",
+            "Registration Admin",
+            "admin password",
+        )
+        .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('registration_mode', '{\"mode\":\"PUBLIC_EMAIL\",\"version\":1}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let verification_url = format!("http://{address}/api/v1/auth/registrations/verify-email");
+    let token = "x".repeat(43);
+
+    for index in 0..20 {
+        let response = client
+            .post(&verification_url)
+            .header("x-lux-peer-ip", format!("198.51.100.{index}"))
+            .json(&json!({ "token": token }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let limited = client
+        .post(&verification_url)
+        .header("x-lux-peer-ip", "203.0.113.200")
+        .json(&json!({ "token": token }))
+        .send()
+        .await?;
+    assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert!(!limited.text().await?.contains(&token));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_registration_resend_api_is_generic_bounded_and_rate_limited()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete(
+            "registration-resend-admin",
+            "Registration Admin",
+            "admin password",
+        )
+        .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('registration_mode', '{\"mode\":\"PUBLIC_EMAIL\",\"version\":1}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let registration_url = format!("{base_url}/api/v1/auth/registrations");
+    let resend_url = format!("{base_url}/api/v1/auth/registrations/resend");
+
+    let submitted = client
+        .post(&registration_url)
+        .json(&json!({
+            "email": "resend-applicant@example.test",
+            "username": "resend-applicant",
+            "displayName": "Resend Applicant",
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(submitted.status(), reqwest::StatusCode::ACCEPTED);
+    let generic_response: Value = submitted.json().await?;
+
+    let resend = client
+        .post(&resend_url)
+        .header("idempotency-key", "resend-applicant-request-1")
+        .json(&json!({ "email": "resend-applicant@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(resend.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(resend.json::<Value>().await?, generic_response);
+    let retry = client
+        .post(&resend_url)
+        .header("idempotency-key", "resend-applicant-request-1")
+        .json(&json!({ "email": "resend-applicant@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(retry.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(retry.json::<Value>().await?, generic_response);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox
+             WHERE recipient_email = 'resend-applicant@example.test'
+               AND template_kind = 'EMAIL_VERIFICATION'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        2
+    );
+
+    let unknown = client
+        .post(&resend_url)
+        .header("idempotency-key", "unknown-resend-request-1")
+        .json(&json!({ "email": "unknown-applicant@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(unknown.json::<Value>().await?, generic_response);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox
+             WHERE recipient_email = 'unknown-applicant@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
+    let missing_idempotency_key = client
+        .post(&resend_url)
+        .json(&json!({ "email": "resend-applicant@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_idempotency_key.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let too_large = client
+        .post(&registration_url)
+        .json(&json!({
+            "email": "too-large@example.test",
+            "username": "too-large",
+            "displayName": "x".repeat(20_000),
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(too_large.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+    let limited_submit = client
+        .post(&registration_url)
+        .json(&json!({
+            "email": "hour-limited@example.test",
+            "username": "hour-limited",
+            "displayName": "Hour Limited",
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(limited_submit.status(), reqwest::StatusCode::ACCEPTED);
+    for index in 0..4 {
+        let response = client
+            .post(&resend_url)
+            .header("idempotency-key", format!("hour-limited-resend-{index}"))
+            .json(&json!({ "email": "hour-limited@example.test" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    }
+    let limited = client
+        .post(&resend_url)
+        .header("idempotency-key", "hour-limited-resend-overflow")
+        .json(&json!({ "email": "hour-limited@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox
+             WHERE recipient_email = 'hour-limited@example.test'
+               AND template_kind = 'EMAIL_VERIFICATION'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        5
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_registration_mail
+         BEFORE INSERT ON mail_outbox
+         WHEN NEW.template_kind = 'EMAIL_VERIFICATION'
+         BEGIN SELECT RAISE(ABORT, 'mail queue unavailable'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let queue_failure = client
+        .post(&registration_url)
+        .json(&json!({
+            "email": "queue-failure@example.test",
+            "username": "queue-failure",
+            "displayName": "Queue Failure",
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        queue_failure.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_registration_requests
+             WHERE recipient_email = 'queue-failure@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
     server.abort();
     Ok(())
 }

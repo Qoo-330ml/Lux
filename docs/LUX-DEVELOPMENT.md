@@ -16790,17 +16790,21 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：新增公开注册提交、邮箱验证和验证邮件重发 API。三者均执行有界请求频率、请求体上限及固定脱敏响应；重发不更改原申请权限快照或过期时间。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_registration.rs`、`src/api/users.rs`、`tests/users.rs`。
 
 验收标准：
 
-- [ ] 邀请模式下拒绝公开注册；公开模式下提交返回固定响应且用户未验证/未审批前不能登录或访问媒体。
-- [ ] 邮件验证、重复提交、重发限额、无效/过期 token 和邮件队列失败均有稳定响应与集成覆盖。
-- [ ] Token 不在 URL/query/log 中；更新 API 文档，定向集成目标、build、fmt 与 diff check 通过。
+- [x] 邀请模式下拒绝公开注册；公开模式下提交返回固定响应且用户未验证/未审批前不能登录或访问媒体。
+- [x] 邮件验证、重复提交、重发限额、无效/过期 token 和邮件队列失败均有稳定响应与集成覆盖。
+- [x] Token 不在 URL/query/log 中；更新 API 文档，定向集成目标、build、fmt 与 diff check 通过。
 
 依赖：LUX-808、LUX-808B。
 
 短计划：先添加公开端点合同并确认 RED；再连接 LUX-808/LUX-808B service 与访问限额；最后运行用户认证集成目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增公开注册提交、邮箱验证和验证邮件重发三个无需会话/CSRF 的路由，JSON 请求体均限制 16 KiB。公开注册只在 `PUBLIC_EMAIL` 模式执行；邀请模式拒绝。注册与重发共用固定脱敏 `202` 响应，涵盖有效、重复和不可重发邮箱；注册提交与重发按规范化邮箱及 middleware 注入的 TCP peer 做分钟级限流，邮箱验证与两者共享 TCP peer 分钟限额，存储层另按邮箱每小时最多 5 封（含首次邮件）限额。重发要求 `Idempotency-Key`，重试沿用 LUX-808B 原 challenge，不重建申请、凭证或权限快照。邮箱验证成功只把申请置于 `PENDING_APPROVAL`，不创建用户；无效、过期、撤销或已消费 token 均映射为不回显 token 的固定 `400`。HTTP middleware 先删除请求方传入的 `x-lux-peer-ip`，再从 `ConnectInfo` 注入 TCP peer；token 和密码只从 JSON body 读取，跟踪只记录 URI path。
+
+验证：TDD RED 确认公开路由尚不存在时请求落入 SPA fallback 并返回 `405`；新增验证频率回归先因第 21 次请求仍返回 `400` 而失败，接入 peer 限额后通过。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_registration::tests -- --test-threads=1` 6/6 与 `cargo test --locked --test users -- --test-threads=1` 28/28 通过，覆盖邀请模式拒绝、重复提交固定响应、成功/无效/已过期/重放 token、未创建用户/登录拒绝、重发幂等与枚举保护、请求体上限、验证/提交/重发限流及邮件队列失败回滚。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --test users --all-features -- -D warnings` 被 11 项位于 LUX-809 范围外的既有诊断阻断（管理用户 API、Emby/媒体、播放会话、权限复制和用户存储）；本任务变更位置没有报告诊断。Toshiba 上的 macOS arm64 验证；未连接 SMTP、未部署。
 
 #### LUX-810：建立公开注册 Web API 客户端
 

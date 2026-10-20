@@ -245,11 +245,22 @@ fn normalize_registration_email(value: &str) -> Result<String, UserRegistrationE
 pub(crate) async fn verify_public_user_registration_email(
     database: &Database,
     config_dir: &Path,
+    rate_limiter: &DevicePairingRateLimiter,
+    connection_peer: IpAddr,
     token: &str,
     now: i64,
 ) -> Result<(), UserRegistrationError> {
-    if now < 0 || token.trim() != token || token.len() != 43 || token.chars().any(char::is_control)
+    if now < 0 {
+        return Err(UserRegistrationError::NotAcceptable);
+    }
+    let peer_rate_key = format!("public-registration:peer:{connection_peer}");
+    if !rate_limiter
+        .try_acquire(&peer_rate_key, USER_REGISTRATION_PEER_RATE_LIMIT)
+        .await
     {
+        return Err(UserRegistrationError::RateLimited);
+    }
+    if token.trim() != token || token.len() != 43 || token.chars().any(char::is_control) {
         return Err(UserRegistrationError::NotAcceptable);
     }
     let token_hash = hash_mail_challenge_token(token);
@@ -470,15 +481,36 @@ mod tests {
         let verified_token =
             token_for_email(&database, &config_dir, "verified@example.test").await?;
         assert_eq!(
-            verify_public_user_registration_email(&database, &config_dir, "invalid-token", 1_010,)
-                .await,
+            verify_public_user_registration_email(
+                &database,
+                &config_dir,
+                &limiter,
+                peer,
+                "invalid-token",
+                1_010,
+            )
+            .await,
             Err(UserRegistrationError::NotAcceptable)
         );
-        verify_public_user_registration_email(&database, &config_dir, &verified_token, 1_010)
-            .await?;
+        verify_public_user_registration_email(
+            &database,
+            &config_dir,
+            &limiter,
+            peer,
+            &verified_token,
+            1_010,
+        )
+        .await?;
         assert_eq!(
-            verify_public_user_registration_email(&database, &config_dir, &verified_token, 1_011)
-                .await,
+            verify_public_user_registration_email(
+                &database,
+                &config_dir,
+                &limiter,
+                peer,
+                &verified_token,
+                1_011,
+            )
+            .await,
             Err(UserRegistrationError::NotAcceptable)
         );
         let (verified_status, verified_at): (String, Option<i64>) = sqlx::query_as(
@@ -495,6 +527,8 @@ mod tests {
             verify_public_user_registration_email(
                 &database,
                 &config_dir,
+                &limiter,
+                peer,
                 &expired_token,
                 2_000 + USER_REGISTRATION_LIFETIME.as_secs() as i64,
             )
@@ -515,8 +549,15 @@ mod tests {
             )
             .await?;
         assert_eq!(
-            verify_public_user_registration_email(&database, &config_dir, &revoked_token, 3_011)
-                .await,
+            verify_public_user_registration_email(
+                &database,
+                &config_dir,
+                &limiter,
+                peer,
+                &revoked_token,
+                3_011,
+            )
+            .await,
             Err(UserRegistrationError::NotAcceptable)
         );
         assert_eq!(
