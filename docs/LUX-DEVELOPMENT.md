@@ -16594,12 +16594,16 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 未登录用户可完成有效邀请；错误 token、冲突、重复消费及数据库不可用映射为稳定脱敏响应。
-- [ ] 请求体大小、字段长度与 HTTP body 日志边界受限；成功创建账户后可用新凭证登录。
-- [ ] HTTP 回归覆盖成功、过期/撤销/错误 token、用户名或邮箱冲突、重复提交、请求体上限和不泄漏凭证。
-- [ ] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
+- [x] 未登录用户可完成有效邀请；错误 token、冲突、重复消费及数据库不可用映射为稳定脱敏响应。
+- [x] 请求体大小、字段长度与 HTTP body 日志边界受限；成功创建账户后可用新凭证登录。
+- [x] HTTP 回归覆盖成功、过期/撤销/错误 token、用户名或邮箱冲突、重复提交、请求体上限和不泄漏凭证。
+- [x] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
 
-短计划：先在 `tests/users.rs` 写公开路由合同并确认 404；再连接 LUX-798 service 与显式 DTO；最后运行定向集成目标、build、fmt 和 diff check。
+短计划：先在 `tests/users.rs` 写公开路由合同并确认端点尚未注册（请求返回 405）；再连接 LUX-798 service 与显式 DTO；最后运行定向集成目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：公开端点只接受 JSON 中的 token、用户名、显示名称和密码，路由请求体上限为 16 KiB，DTO 拒绝未知字段。成功只返回 `{ "created": true }`；无效、过期、撤销和重放凭证使用固定错误，用户名或邮箱冲突使用统一脱敏文案，数据库故障映射为 503。请求跟踪不记录 query 或请求体；错误不会返回凭证或密码。
+
+验证：TDD RED 的集成回归确认路由未注册（405）；实现后 `cargo test --locked --test users public_invitation_acceptance_api_creates_verified_login_once` 1/1 通过，覆盖有效接受并登录、错误/过期/撤销/重复 token、用户名和邮箱冲突、16 KiB 限制、数据库不可用及响应脱敏。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 输出写入 `/Volumes/Toshiba/mywork/Lux/target`，Toshiba 已挂载；本机架构 `arm64`。
 
 #### LUX-800：建立邀请接受 Web API 客户端合同
 

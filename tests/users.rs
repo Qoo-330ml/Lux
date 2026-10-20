@@ -5373,3 +5373,278 @@ async fn admin_can_manage_emby_login_sessions() -> Result<(), Box<dyn std::error
     server.abort();
     Ok(())
 }
+
+async fn create_admin_invitation_for_test(
+    client: &reqwest::Client,
+    base_url: &str,
+    admin_cookie: &str,
+    csrf_token: &str,
+    email: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/user-invitations"))
+        .header(COOKIE, admin_cookie)
+        .header("x-csrf-token", csrf_token)
+        .json(&json!({ "recipientEmail": email, "presetId": "builtin-user" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: Value = response.json().await?;
+    let invitation_id = body["invitation"]["id"]
+        .as_str()
+        .ok_or("missing invitation ID")?
+        .to_owned();
+    let invitation_url = body["invitationUrl"]
+        .as_str()
+        .ok_or("missing invitation URL")?;
+    let token = invitation_url
+        .strip_prefix("/register/invitation#token=")
+        .ok_or("invitation token is not in the URL fragment")?
+        .to_owned();
+    Ok((invitation_id, token))
+}
+
+#[tokio::test]
+async fn public_invitation_acceptance_api_creates_verified_login_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("invitation-admin", "Invitation Admin", "admin password")
+        .await?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "invitation-admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let admin_csrf = cookie_value(login.headers(), "lux_csrf");
+
+    let (_, accepted_token) = create_admin_invitation_for_test(
+        &client,
+        &base_url,
+        &admin_cookie,
+        &admin_csrf,
+        "accepted@example.test",
+    )
+    .await?;
+    let (_, conflict_token) = create_admin_invitation_for_test(
+        &client,
+        &base_url,
+        &admin_cookie,
+        &admin_csrf,
+        "username-conflict@example.test",
+    )
+    .await?;
+    let (revoked_invitation_id, revoked_token) = create_admin_invitation_for_test(
+        &client,
+        &base_url,
+        &admin_cookie,
+        &admin_csrf,
+        "revoked@example.test",
+    )
+    .await?;
+    let (expired_invitation_id, expired_token) = create_admin_invitation_for_test(
+        &client,
+        &base_url,
+        &admin_cookie,
+        &admin_csrf,
+        "expired@example.test",
+    )
+    .await?;
+    let (_, unavailable_token) = create_admin_invitation_for_test(
+        &client,
+        &base_url,
+        &admin_cookie,
+        &admin_csrf,
+        "unavailable@example.test",
+    )
+    .await?;
+    let (_, email_conflict_token) = create_admin_invitation_for_test(
+        &client,
+        &base_url,
+        &admin_cookie,
+        &admin_csrf,
+        "email-conflict@example.test",
+    )
+    .await?;
+
+    let revoked = client
+        .post(format!(
+            "{base_url}/api/v1/admin/user-invitations/{revoked_invitation_id}/revoke"
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(revoked.status(), reqwest::StatusCode::OK);
+    sqlx::query("UPDATE user_invitations SET created_at = 0, expires_at = 1 WHERE id = ?")
+        .bind(&expired_invitation_id)
+        .execute(database.pool())
+        .await?;
+
+    let accept_url = format!("{base_url}/api/v1/auth/invitations/accept");
+    let invalid_token = "invalid-invitation-secret";
+    let invalid = client
+        .post(&accept_url)
+        .json(&json!({
+            "token": invalid_token,
+            "username": "invalid-user",
+            "displayName": "Invalid User",
+            "password": "invalid password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_text = invalid.text().await?;
+    assert!(!invalid_text.contains(invalid_token));
+    assert!(!invalid_text.contains("invalid password"));
+
+    for token in [&revoked_token, &expired_token] {
+        let response = client
+            .post(&accept_url)
+            .json(&json!({
+                "token": token,
+                "username": "unavailable-user",
+                "displayName": "Unavailable User",
+                "password": "unavailable password"
+            }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = response.text().await?;
+        assert!(!body.contains(token));
+        assert!(!body.contains("unavailable password"));
+    }
+
+    let accepted = client
+        .post(&accept_url)
+        .json(&json!({
+            "token": accepted_token,
+            "username": "new-invited-user",
+            "displayName": "New Invited User",
+            "password": "invited user password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(accepted.status(), reqwest::StatusCode::CREATED);
+    let accepted_text = accepted.text().await?;
+    assert!(!accepted_text.contains(&accepted_token));
+    assert!(!accepted_text.contains("invited user password"));
+
+    let login_after_acceptance = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "new-invited-user",
+            "password": "invited user password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login_after_acceptance.status(), reqwest::StatusCode::OK);
+
+    let username_conflict = client
+        .post(&accept_url)
+        .json(&json!({
+            "token": conflict_token,
+            "username": "new-invited-user",
+            "displayName": "Duplicate Username",
+            "password": "another password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(username_conflict.status(), reqwest::StatusCode::CONFLICT);
+    let conflict_body = username_conflict.text().await?;
+    assert!(!conflict_body.contains(&conflict_token));
+    assert!(!conflict_body.contains("another password"));
+
+    sqlx::query(
+        "UPDATE users SET email = 'email-conflict@example.test', email_verified_at = 1
+         WHERE username_normalized = 'invitation-admin'",
+    )
+    .execute(database.pool())
+    .await?;
+    let email_conflict = client
+        .post(&accept_url)
+        .json(&json!({
+            "token": email_conflict_token,
+            "username": "email-conflict-user",
+            "displayName": "Email Conflict User",
+            "password": "another email password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(email_conflict.status(), reqwest::StatusCode::CONFLICT);
+    let email_conflict_body = email_conflict.text().await?;
+    assert!(!email_conflict_body.contains(&email_conflict_token));
+    assert!(!email_conflict_body.contains("another email password"));
+
+    let repeated = client
+        .post(&accept_url)
+        .json(&json!({
+            "token": accepted_token,
+            "username": "new-invited-user",
+            "displayName": "New Invited User",
+            "password": "invited user password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(repeated.status(), reqwest::StatusCode::BAD_REQUEST);
+    let repeated_body = repeated.text().await?;
+    assert!(!repeated_body.contains(&accepted_token));
+    assert!(!repeated_body.contains("invited user password"));
+
+    let oversized_body = json!({
+        "token": "too-large",
+        "username": "large-user",
+        "displayName": "x".repeat(20_000),
+        "password": "large password"
+    });
+    let oversized = client
+        .post(&accept_url)
+        .json(&oversized_body)
+        .send()
+        .await?;
+    assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+    database.close().await;
+    let unavailable = client
+        .post(&accept_url)
+        .json(&json!({
+            "token": unavailable_token,
+            "username": "unavailable-database-user",
+            "displayName": "Unavailable Database User",
+            "password": "unavailable password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unavailable_body = unavailable.text().await?;
+    assert!(!unavailable_body.contains(&unavailable_token));
+    assert!(!unavailable_body.contains("unavailable password"));
+
+    server.abort();
+    Ok(())
+}

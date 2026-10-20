@@ -10,6 +10,9 @@ use crate::{
         AccountPreferencesError, UpdateAccountPreferences, get_account_preferences,
         update_account_preferences,
     },
+    application::user_invitations::{
+        AcceptUserInvitationInput, UserInvitationAcceptanceError, accept_user_invitation,
+    },
     auth::sessions::AuthenticatedSession,
     security::{
         DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
@@ -752,6 +755,16 @@ pub(super) struct AuthLoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AuthInvitationAcceptRequest {
+    token: String,
+    username: String,
+    #[serde(default)]
+    display_name: String,
+    password: String,
+}
+
 fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
     let header_id = header_str(headers, "x-lux-device-id")?;
     let device_id = uuid::Uuid::parse_str(header_id).ok()?;
@@ -981,6 +994,91 @@ pub(super) async fn auth_login(
         Json(json!({ "user": user_json(&session.user), "csrfToken": session.csrf_token })),
     )
         .into_response()
+}
+
+pub(super) async fn auth_accept_user_invitation(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<Json<AuthInvitationAcceptRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return api_error(
+                &headers,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                lux::ApiErrorCode::InvalidRequest,
+                "邀请请求内容过大",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "邀请请求无效",
+            )
+            .into_response();
+        }
+    };
+    let (Some(database), Some(config_dir)) = (state.database.as_ref(), state.config_dir.as_ref())
+    else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "邀请暂时无法处理",
+        )
+        .into_response();
+    };
+
+    match accept_user_invitation(
+        database,
+        config_dir,
+        AcceptUserInvitationInput {
+            token: &request.token,
+            username: &request.username,
+            display_name: &request.display_name,
+            password: &request.password,
+        },
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::CREATED, Json(json!({ "created": true }))).into_response(),
+        Err(UserInvitationAcceptanceError::UsernameTaken)
+        | Err(UserInvitationAcceptanceError::EmailAlreadyRegistered) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户名或邮箱不可用",
+        )
+        .into_response(),
+        Err(UserInvitationAcceptanceError::InvalidInput)
+        | Err(UserInvitationAcceptanceError::NotAcceptable) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "邀请请求无效或已失效",
+        )
+        .into_response(),
+        Err(UserInvitationAcceptanceError::SigningUnavailable)
+        | Err(UserInvitationAcceptanceError::PasswordUnavailable) => api_error(
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "邀请暂时无法处理",
+        )
+        .into_response(),
+        Err(UserInvitationAcceptanceError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "邀请暂时无法处理",
+        )
+        .into_response(),
+    }
 }
 
 pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -2572,6 +2670,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
         .route("/api/v1/auth/login", post(users::auth_login))
+        .route(
+            "/api/v1/auth/invitations/accept",
+            post(users::auth_accept_user_invitation).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .route("/api/v1/auth/logout", post(users::auth_logout))
         .route("/api/v1/auth/me", get(users::auth_me))
         .route(

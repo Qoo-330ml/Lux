@@ -24,6 +24,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## Web 会话
 
 - `POST /api/v1/auth/login`：校验用户名和密码，成功后设置 `lux_session` 与 `lux_csrf` cookie。
+- `POST /api/v1/auth/invitations/accept`：公开接受管理员已发出的邀请，不需要登录或 CSRF。JSON 请求体为 `{ "token": "<邀请凭证>", "username": "<用户名>", "displayName": "<显示名称>", "password": "<密码>" }`，整体大小最多 16 KiB；未知字段、无效或过期/撤销/已消费凭证返回固定的 `400 INVALID_REQUEST`，用户名或邮箱冲突返回脱敏的 `409 INVALID_REQUEST`，过大请求返回 `413 INVALID_REQUEST`，数据库不可用返回 `503 DATABASE_UNAVAILABLE`，签名或密码服务不可用返回 `500 INTERNAL`。成功返回 `201 { "created": true }`，不返回账户、邀请快照或凭证。Token 和密码只放在 JSON 请求体中；Lux HTTP 跟踪不会记录 query 或请求体。
 - `GET /api/v1/auth/login-background`：公开读取登录页背景，不要求 session。固定海报墙返回 `source: "STATIC"`；媒体库来源最多返回 40 个电影/剧集海报 URL。插件来源只有在其已安装、启用且可用并且缓存未超过 48 小时时，才返回 `PLUGIN:<pluginId>`、经校验的 `contentKind`、署名和图片 URL；接口只读持久化缓存，不启动插件或访问上游。插件不可用、缓存缺失/过期或读取失败时回退 `STATIC`。
 - `GET/HEAD /api/v1/auth/login-background/custom-image`：公开读取当前自定义登录背景图片，不要求 session。只有 `org.lux.login-background` 已安装、启用、可用，且其是当前服务器背景来源、配置 `source: "CUSTOM_IMAGE"`、`customImageRightsConfirmed: true` 并存在通过校验的上传图片时才返回图像；这个许可确认由宿主独立检查，其他状态返回 404。只返回 Lux 专用配置目录中的单张文件，不接受路径参数、不做代理。返回 magic bytes 检测出的 JPEG/PNG/WebP Content-Type、`X-Content-Type-Options: nosniff`、内容 SHA-256 ETag 和 `Cache-Control: no-cache, must-revalidate`；支持 `If-None-Match` 304 和无 body 的 HEAD。
 - 远程请求只需通过用户认证和媒体库 ACL；Lux 不再依据来源 IP 或 `can_remote_access` 阻止反代后的请求。
