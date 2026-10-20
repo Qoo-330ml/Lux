@@ -93,6 +93,139 @@ async fn user_activity_events_migration_runs_from_an_empty_database()
 }
 
 #[tokio::test]
+async fn user_invitations_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert_eq!(database.schema_version().await?, 201);
+
+    let column_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('user_invitations')")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(column_count, 14);
+    let foreign_key_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('user_invitations')")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(foreign_key_count, 2);
+    let delete_set_null_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_invitations')
+         WHERE \"table\" = 'users' AND on_delete = 'SET NULL'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(delete_set_null_count, 2);
+    let pending_email_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'ux_user_invitations_pending_email' AND sql LIKE '%UNIQUE%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(pending_email_index, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('invitation-owner', 'invitation-owner', 'Owner', 'test-hash'),
+                ('invitation-user', 'invitation-user', 'Invited', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    let invite_insert = "INSERT INTO user_invitations (
+            id, recipient_email, created_by_user_id, accepted_user_id, status,
+            preset_id, preset_name, preset_version, permission_snapshot_json,
+            expires_at, accepted_at, revoked_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    let insert_invitation = |id: &'static str, status: &'static str| {
+        sqlx::query(invite_insert)
+            .bind(id)
+            .bind("invitee@example.test")
+            .bind("invitation-owner")
+            .bind(if status == "ACCEPTED" {
+                Some("invitation-user")
+            } else {
+                None
+            })
+            .bind(status)
+            .bind("viewer")
+            .bind("Viewer")
+            .bind(1_i64)
+            .bind("{}")
+            .bind(10_000_i64)
+            .bind(if status == "ACCEPTED" {
+                Some(20_i64)
+            } else {
+                None
+            })
+            .bind(None::<i64>)
+            .bind(1_i64)
+            .bind(1_i64)
+    };
+    insert_invitation("invitation-pending", "PENDING")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        insert_invitation("invitation-duplicate", "PENDING")
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query(invite_insert)
+            .bind("invitation-invalid")
+            .bind("bad@example.test")
+            .bind("invitation-owner")
+            .bind(None::<&str>)
+            .bind("UNKNOWN")
+            .bind("viewer")
+            .bind("Viewer")
+            .bind(1_i64)
+            .bind("[]")
+            .bind(10_000_i64)
+            .bind(None::<i64>)
+            .bind(None::<i64>)
+            .bind(1_i64)
+            .bind(1_i64)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+
+    sqlx::query(
+        "UPDATE user_invitations
+         SET status = 'ACCEPTED', accepted_user_id = 'invitation-user', accepted_at = 20
+         WHERE id = 'invitation-pending'",
+    )
+    .execute(database.pool())
+    .await?;
+    insert_invitation("invitation-next", "PENDING")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id IN ('invitation-owner', 'invitation-user')")
+        .execute(database.pool())
+        .await?;
+    let preserved_links: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT created_by_user_id, accepted_user_id FROM user_invitations
+         WHERE id = 'invitation-pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preserved_links, (None, None));
+
+    let postgres_migration = fs::read_to_string("migrations-postgres/0201_user_invitations.sql")?;
+    assert!(postgres_migration.contains("permission_snapshot_json TEXT NOT NULL"));
+    assert!(postgres_migration.contains("ON DELETE SET NULL"));
+    assert!(postgres_migration.contains("ux_user_invitations_pending_email"));
+    assert!(!postgres_migration.contains("token"));
+    assert!(!postgres_migration.contains("password"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_device_inventory_migration_runs_from_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

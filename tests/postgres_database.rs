@@ -690,7 +690,7 @@ async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_mail_challenge_migration_applies_to_an_empty_database()
+async fn postgres_mail_and_invitation_migrations_apply_to_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -700,8 +700,8 @@ async fn postgres_mail_challenge_migration_applies_to_an_empty_database()
     let (connection, database_name) = create_postgres_test_database().await?;
     let result = async {
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        if database.schema_version().await? < 200 {
-            return Err("mail challenge migration was not applied".into());
+        if database.schema_version().await? < 201 {
+            return Err("invitation migration was not applied".into());
         }
         let column_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.columns
@@ -740,6 +740,44 @@ async fn postgres_mail_challenge_migration_applies_to_an_empty_database()
         .await?;
         if sensitive_challenge_column_count != 0 {
             return Err("mail challenge schema contains raw credential data".into());
+        }
+        let invitation_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'user_invitations'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_column_count != 14 {
+            return Err("unexpected invitation schema".into());
+        }
+        let invitation_sensitive_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'user_invitations'
+               AND column_name IN ('token', 'raw_token', 'password', 'body', 'html_body', 'text_body')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_sensitive_column_count != 0 {
+            return Err("invitation schema contains sensitive material".into());
+        }
+        let invitation_unique_index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND indexname = 'ux_user_invitations_pending_email'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_unique_index_count != 1 {
+            return Err("invitation pending-email uniqueness index is missing".into());
+        }
+        let invitation_set_null_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_constraint
+             WHERE conrelid = 'user_invitations'::regclass AND contype = 'f' AND confdeltype = 'n'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_set_null_count != 2 {
+            return Err("invitation history foreign keys must preserve rows".into());
         }
         database.close().await;
         Ok::<(), Box<dyn std::error::Error>>(())

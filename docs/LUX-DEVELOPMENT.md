@@ -16367,6 +16367,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：`cargo test --locked --lib application::mail_worker::tests` 5/5、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。邮件正文仅包含纯文本链接；链接 token 位于 fragment。过期挑战不会交给发送器，SMTP 错误在 5 次尝试后转为 FAILED；worker 在关闭信号下及时退出。SMTP 凭据、收件地址、正文和错误详情均不写入日志。此前全目标全 feature Clippy 检查仍有 15 项既有诊断，涉及未修改的管理员 API、Emby 播放、权限复制及用户存储文件；本任务文件没有新增诊断。
 
+#### LUX-787：持久化邀请权限快照与生命周期
+
+范围：为邀请注册建立 SQLite/PostgreSQL 表，保存规范化收件邮箱、可选创建者、明确生命周期状态、7 天有效期、所选权限预设来源和创建时权限快照。支持单次接受、撤销和过期状态；本任务只修改 schema 并验证迁移，不提供 storage API、管理员接口或注册页面，不保存邮件凭证。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0201_user_invitations.sql`、`migrations-postgres/0201_user_invitations.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 邀请行记录邮箱、创建者、状态、有效期、权限预设标识与版本、权限 JSON 快照及接受/撤销时间；创建者和已接受用户删除时保留邀请历史。
+- [x] 数据库约束拒绝无效状态、时间和非对象快照；同一规范化邮箱最多有一条待处理邀请，终态记录可保留审计。
+- [x] SQLite 与 PostgreSQL 空库迁移建立同等 schema、索引和外键规则；不加入 token、密码或邮件正文列。
+- [x] 运行 SQLite 迁移定向测试、PostgreSQL schema 合同检查、Rust build、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先添加 SQLite 空库和 PostgreSQL 空库的邀请 schema 失败测试；再分别新增迁移及索引/约束；最后运行定向迁移测试、build、fmt 与 diff check。
+
+验证（2026-10-20）：SQLite 空库定向测试 `cargo test --locked --test storage user_invitations_migration_runs_from_an_empty_database -- --exact` 1/1，PostgreSQL 16 空库迁移 `cargo test --locked --test postgres_database postgres_mail_and_invitation_migrations_apply_to_an_empty_database -- --ignored --exact` 1/1；`cargo build --locked`、fmt 与 diff check 通过。测试覆盖待处理邮箱唯一索引、无效状态/非对象快照拒绝、终态后可再次邀请，以及用户删除后邀请历史保留。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
