@@ -25,7 +25,7 @@ describe("AdminUserDetailPage content restriction index status", () => {
     vi.restoreAllMocks();
   });
 
-  it("shows partial index progress and explains the unfinished access behavior", async () => {
+  it("shows partial index progress without implying that policy enforcement is disabled", async () => {
     const getStatus = vi.spyOn(api, "adminContentRestrictionIndexStatus").mockResolvedValue({
       totalItems: 8,
       indexedItems: 6,
@@ -40,10 +40,45 @@ describe("AdminUserDetailPage content restriction index status", () => {
     expect(getStatus).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("待就绪 2 条");
     expect(container.textContent).toContain("正在回填");
-    expect(container.textContent).toContain("访问拦截尚未接入");
+    const indexPanel = container.querySelector(".lux-admin-user-content-index");
+    expect(indexPanel?.textContent).toContain("媒体分类索引回填进度");
+    expect(indexPanel?.textContent).toContain("尚无分类索引的条目会在受限策略下被服务端按不可见处理");
+    expect(indexPanel?.textContent).not.toContain("访问拦截尚未接入");
+    expect(indexPanel?.textContent).not.toContain("策略目前不会过滤媒体");
     const progress = container.querySelector("progress");
     expect(progress?.value).toBe(6);
     expect(progress?.max).toBe(8);
+  });
+
+  it("keeps saved policy enforcement separate from pending index work", async () => {
+    const activePolicy: AdminUserContentRestrictionPolicy = {
+      ratingSystem: "MPA",
+      maximumRating: "PG",
+      allowUnrated: false,
+      allowedTags: ["family"],
+      blockedTags: ["horror"],
+      version: 7,
+      updatedAt: 1_792_382_400,
+    };
+    vi.spyOn(api, "adminContentRestrictionIndexStatus").mockResolvedValue({
+      totalItems: 8,
+      indexedItems: 6,
+      pendingItems: 2,
+    });
+    renderContentSection(activePolicy);
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("当前版本 7"));
+      await vi.waitFor(() => expect(container.textContent).toContain("6 / 8"));
+    });
+
+    const policyPanel = container.querySelector(".lux-admin-user-content-policy");
+    const indexPanel = container.querySelector(".lux-admin-user-content-index");
+    expect(policyPanel?.textContent).toContain("已保存的分级和标签限制由服务端用于列表筛选及详情、图片、下载、字幕和播放访问校验");
+    expect(policyPanel?.textContent).not.toContain("待就绪 2 条");
+    expect(indexPanel?.textContent).toContain("正在回填");
+    expect(indexPanel?.textContent).toContain("待就绪 2 条");
+    expect(indexPanel?.textContent).not.toContain("已保存的分级和标签限制由服务端");
   });
 
   it("shows an empty-library state when no media items need indexing", async () => {
@@ -98,9 +133,9 @@ describe("AdminUserDetailPage content restriction index status", () => {
     expect(getStatus).toHaveBeenCalledTimes(2);
   });
 
-  function renderContentSection() {
+  function renderContentSection(policy: AdminUserContentRestrictionPolicy | null = null) {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user: makeUser() });
-    vi.spyOn(api, "adminUserContentRestrictions").mockResolvedValue({ policy: null });
+    vi.spyOn(api, "adminUserContentRestrictions").mockResolvedValue({ policy });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);

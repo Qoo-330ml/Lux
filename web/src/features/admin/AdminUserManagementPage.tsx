@@ -290,7 +290,7 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
             <span className="lux-admin-muted">禁止标签优先，命中后拒绝访问。</span>
           </label>
         </div>
-        <p className="lux-admin-muted">标签按媒体分类索引匹配；每组最多 100 项。保存后策略已存储，但媒体访问拦截尚未接入。</p>
+        <p className="lux-admin-muted">标签按媒体分类索引匹配；每组最多 100 项。已保存的分级和标签限制由服务端用于列表筛选及详情、图片、下载、字幕和播放访问校验；缺少分类索引的条目在受限策略下按不可见处理。</p>
         <div className="lux-admin-user-profile-actions">
           <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || save.isPending || versionConflict}>
             {save.isPending ? "保存中…" : "保存内容限制"}
@@ -372,7 +372,7 @@ function AdminUserContentIndexStatus() {
           <p className="lux-admin-muted">待就绪 {pendingItems.toLocaleString()} 条。索引会在后台分批更新。</p>
         </div>
       )}
-      <p className="lux-admin-muted lux-admin-user-content-index-note">此页可保存用户限制并展示索引回填状态；媒体访问拦截尚未接入，策略目前不会过滤媒体。</p>
+      <p className="lux-admin-muted lux-admin-user-content-index-note">此面板只展示媒体分类索引回填进度；尚无分类索引的条目会在受限策略下被服务端按不可见处理。</p>
     </section>
   );
 }

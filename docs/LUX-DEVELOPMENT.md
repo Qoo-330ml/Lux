@@ -17086,15 +17086,21 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：核对 LUX-692 至 LUX-704 对列表、详情、图片、下载、字幕及播放的访问检查后，删除内容限制页中“媒体访问拦截尚未接入，策略目前不会过滤媒体”的过期文案，替换为准确说明分级/标签限制及索引就绪状态。
 
-预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-content-restrictions.test.tsx`。
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-content-restriction.test.tsx`。
 
 验收标准：
 
-- [ ] 源码核验与回归证明受限媒体入口执行服务端策略；文案不声称未实现或过度承诺。
-- [ ] 页面测试确认索引未就绪提示与已启用策略说明互不混淆。
-- [ ] 定向 Vitest、Web build 与 diff check 通过。
+- [x] 源码核验与回归证明受限媒体入口执行服务端策略；文案不声称未实现或过度承诺。
+- [x] 页面测试确认索引未就绪提示与已启用策略说明互不混淆。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
 
 短计划：先复核访问路径并添加文案断言；再修正面板说明；最后运行定向 Vitest 与 Web build。
+
+实施结果（2026-10-21）：删除策略表单和索引面板中“媒体访问拦截尚未接入”的过期说法。策略表单现在准确说明服务端先过滤媒体列表，并在详情、图片、下载、字幕和播放访问时检查条目；索引说明单独描述回填进度，以及限制生效时缺少分类索引的条目按不可见处理。
+
+源码核验：`src/application/access.rs::MediaAccessService::can_view_item` 先执行媒体库 ACL，再读取当前用户内容策略与条目/系列/季度分类；受限策略遇到分类缺失时返回不可见。LUX-692、LUX-695 至 LUX-704 的 catalog/storage 查询在排序、计数和分页前过滤；LUX-694 已记录的 `content_policy_denies_direct_item_access_and_inherits_parent_restrictions` 回归覆盖直接访问拒绝与父级限制继承。媒体文件、图片、字幕和播放 API 均调用同一访问服务，因此沿用该服务端判定。
+
+验证：`vitest run tests/admin-user-content-restriction.test.tsx` 10/10 通过，覆盖索引部分回填与已保存策略说明分区呈现；`pnpm --dir web build` 通过；`git diff --check` 通过。补跑的 `cargo test --locked --lib content_policy_denies_direct_item_access_and_inherits_parent_restrictions` 被共享工作区并行 LUX-794 未完成修改阻断：编译在 `src/api/users.rs` 与 `src/storage/repository_tests.rs` 报 8 处 `optimized_images` 缺字段，本任务未改动这些文件。没有进行部署验证。
 
 #### LUX-824：核对并关闭用户管理模块一至七
 
