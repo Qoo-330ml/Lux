@@ -551,6 +551,93 @@ pub(crate) struct MailOutboxPage {
     pub(crate) total_count: i64,
 }
 
+// LUX-784 uses this type to rebuild a stable, non-persisted mail link token.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailChallengeKind {
+    Invitation,
+    EmailVerification,
+}
+
+#[allow(dead_code)]
+impl MailChallengeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invitation => "INVITATION",
+            Self::EmailVerification => "EMAIL_VERIFICATION",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "INVITATION" => Ok(Self::Invitation),
+            "EMAIL_VERIFICATION" => Ok(Self::EmailVerification),
+            _ => Err(StorageError::Serialization(
+                "unknown mail challenge kind".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewMailChallenge<'a> {
+    pub(crate) kind: MailChallengeKind,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) reference_id: &'a str,
+    pub(crate) token_hash: &'a [u8],
+    pub(crate) expires_at: i64,
+}
+
+// The digest is internal storage state and must never be mapped into an API DTO.
+#[allow(dead_code)]
+pub(crate) struct StoredMailChallenge {
+    pub(crate) id: String,
+    pub(crate) kind: MailChallengeKind,
+    pub(crate) recipient_email: String,
+    pub(crate) reference_id: String,
+    pub(crate) token_hash: Vec<u8>,
+    pub(crate) expires_at: i64,
+    pub(crate) consumed_at: Option<i64>,
+    pub(crate) revoked_at: Option<i64>,
+    pub(crate) created_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+struct MailChallengeRecord {
+    id: String,
+    challenge_kind: String,
+    recipient_email: String,
+    reference_id: String,
+    token_hash: Vec<u8>,
+    expires_at: i64,
+    consumed_at: Option<i64>,
+    revoked_at: Option<i64>,
+    created_at: i64,
+}
+
+impl TryFrom<MailChallengeRecord> for StoredMailChallenge {
+    type Error = StorageError;
+
+    fn try_from(record: MailChallengeRecord) -> Result<Self, Self::Error> {
+        if record.token_hash.len() != 32 {
+            return Err(StorageError::Serialization(
+                "mail challenge digest has invalid length".to_owned(),
+            ));
+        }
+        Ok(Self {
+            id: record.id,
+            kind: MailChallengeKind::parse(&record.challenge_kind)?,
+            recipient_email: record.recipient_email,
+            reference_id: record.reference_id,
+            token_hash: record.token_hash,
+            expires_at: record.expires_at,
+            consumed_at: record.consumed_at,
+            revoked_at: record.revoked_at,
+            created_at: record.created_at,
+        })
+    }
+}
+
 #[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct MailOutboxRecord {
@@ -1509,6 +1596,138 @@ impl Database {
             messages,
             total_count,
         })
+    }
+}
+
+// LUX-784 consumes these methods while resolving queued invitation and verification mail.
+#[allow(dead_code)]
+impl Database {
+    pub(crate) async fn create_mail_challenge(
+        &self,
+        challenge: NewMailChallenge<'_>,
+        now: i64,
+    ) -> Result<StoredMailChallenge, StorageError> {
+        if now < 0
+            || challenge.expires_at <= now
+            || challenge.token_hash.len() != 32
+            || challenge.recipient_email.trim() != challenge.recipient_email
+            || !(3..=320).contains(&challenge.recipient_email.len())
+            || challenge.recipient_email.chars().any(char::is_control)
+            || challenge.reference_id.trim() != challenge.reference_id
+            || !(1..=128).contains(&challenge.reference_id.len())
+            || challenge.reference_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict("invalid mail challenge".to_owned()));
+        }
+
+        let id = Uuid::now_v7().to_string();
+        self.query_as::<MailChallengeRecord>(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             RETURNING id, challenge_kind, recipient_email, reference_id, token_hash,
+                       expires_at, consumed_at, revoked_at, created_at",
+        )
+        .bind(id)
+        .bind(challenge.kind.as_str())
+        .bind(challenge.recipient_email)
+        .bind(challenge.reference_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .try_into()
+    }
+
+    pub(crate) async fn get_mail_challenge(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredMailChallenge>, StorageError> {
+        self.query_as::<MailChallengeRecord>(
+            "SELECT id, challenge_kind, recipient_email, reference_id, token_hash,
+                    expires_at, consumed_at, revoked_at, created_at
+             FROM mail_challenges WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn consume_mail_challenge(
+        &self,
+        id: &str,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0 || token_hash.len() != 32 {
+            return Err(StorageError::Conflict(
+                "invalid mail challenge consumption".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_challenges SET consumed_at = ?
+                 WHERE id = ? AND token_hash = ? AND consumed_at IS NULL
+                   AND revoked_at IS NULL AND expires_at > ? AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn revoke_mail_challenges(
+        &self,
+        kind: MailChallengeKind,
+        reference_id: &str,
+        now: i64,
+    ) -> Result<u64, StorageError> {
+        if now < 0
+            || reference_id.trim() != reference_id
+            || !(1..=128).contains(&reference_id.len())
+            || reference_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid mail challenge revocation".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_challenges SET revoked_at = ?
+                 WHERE challenge_kind = ? AND reference_id = ?
+                   AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(kind.as_str())
+            .bind(reference_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -5118,6 +5337,22 @@ mod mail_outbox_tests {
         }
     }
 
+    fn new_challenge<'a>(
+        kind: MailChallengeKind,
+        recipient_email: &'a str,
+        reference_id: &'a str,
+        token_hash: &'a [u8],
+        expires_at: i64,
+    ) -> NewMailChallenge<'a> {
+        NewMailChallenge {
+            kind,
+            recipient_email,
+            reference_id,
+            token_hash,
+            expires_at,
+        }
+    }
+
     #[tokio::test]
     async fn mail_outbox_migration_applies_to_an_empty_sqlite_database()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5142,6 +5377,138 @@ mod mail_outbox_tests {
                 "body" | "html_body" | "text_body" | "payload" | "token" | "password"
             )
         }));
+        let challenge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_challenges")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(challenge_count, 0);
+        let challenge_columns = sqlx::query("PRAGMA table_info(mail_challenges)")
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(challenge_columns.len(), 9);
+        assert!(challenge_columns.contains(&"token_hash".to_owned()));
+        assert!(!challenge_columns.iter().any(|column| {
+            matches!(column.as_str(), "token" | "raw_token" | "body" | "password")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_is_single_use_and_rejects_expired_or_revoked_tokens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let invitation_hash = [7_u8; 32];
+        let invitation = database
+            .create_mail_challenge(
+                new_challenge(
+                    MailChallengeKind::Invitation,
+                    "one@example.test",
+                    "invite-record-1",
+                    &invitation_hash,
+                    20,
+                ),
+                10,
+            )
+            .await?;
+        assert_eq!(invitation.kind, MailChallengeKind::Invitation);
+        assert_eq!(invitation.token_hash, invitation_hash);
+        assert!(database.get_mail_challenge(&invitation.id).await?.is_some());
+        assert!(
+            !database
+                .consume_mail_challenge(&invitation.id, &[8_u8; 32], 11)
+                .await?
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&invitation.id, &invitation_hash, 20)
+                .await?
+        );
+        assert!(
+            database
+                .consume_mail_challenge(&invitation.id, &invitation_hash, 19)
+                .await?
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&invitation.id, &invitation_hash, 19)
+                .await?
+        );
+
+        let verification_hash = [9_u8; 32];
+        let verification = database
+            .create_mail_challenge(
+                new_challenge(
+                    MailChallengeKind::EmailVerification,
+                    "two@example.test",
+                    "registration-2",
+                    &verification_hash,
+                    30,
+                ),
+                20,
+            )
+            .await?;
+        assert_eq!(verification.kind, MailChallengeKind::EmailVerification);
+        assert_eq!(
+            database
+                .revoke_mail_challenges(MailChallengeKind::EmailVerification, "registration-2", 21,)
+                .await?,
+            1
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&verification.id, &verification_hash, 22)
+                .await?
+        );
+        let revoked = database
+            .get_mail_challenge(&verification.id)
+            .await?
+            .ok_or("revoked challenge disappeared")?;
+        assert_eq!(revoked.revoked_at, Some(21));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_storage_rejects_invalid_hashes_and_times()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        assert!(matches!(
+            database
+                .create_mail_challenge(
+                    new_challenge(
+                        MailChallengeKind::Invitation,
+                        "one@example.test",
+                        "invite-record-1",
+                        &[1_u8; 31],
+                        20,
+                    ),
+                    10,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            database
+                .create_mail_challenge(
+                    new_challenge(
+                        MailChallengeKind::Invitation,
+                        "one@example.test",
+                        "invite-record-1",
+                        &[1_u8; 32],
+                        10,
+                    ),
+                    10,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            database
+                .consume_mail_challenge("missing", &[1_u8; 31], 11)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
         Ok(())
     }
 

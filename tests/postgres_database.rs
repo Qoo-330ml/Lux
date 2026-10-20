@@ -690,7 +690,7 @@ async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_mail_outbox_migration_applies_to_an_empty_database()
+async fn postgres_mail_challenge_migration_applies_to_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -700,8 +700,8 @@ async fn postgres_mail_outbox_migration_applies_to_an_empty_database()
     let (connection, database_name) = create_postgres_test_database().await?;
     let result = async {
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        if database.schema_version().await? != 199 {
-            return Err("mail outbox migration was not applied".into());
+        if database.schema_version().await? < 200 {
+            return Err("mail challenge migration was not applied".into());
         }
         let column_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.columns
@@ -721,6 +721,25 @@ async fn postgres_mail_outbox_migration_applies_to_an_empty_database()
         .await?;
         if sensitive_column_count != 0 {
             return Err("mail outbox schema contains a sensitive payload column".into());
+        }
+        let challenge_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_challenges'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if challenge_column_count != 9 {
+            return Err("unexpected mail challenge schema".into());
+        }
+        let sensitive_challenge_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_challenges'
+               AND column_name IN ('token', 'raw_token', 'body', 'password')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if sensitive_challenge_column_count != 0 {
+            return Err("mail challenge schema contains raw credential data".into());
         }
         database.close().await;
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -759,7 +778,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 199);
+    assert!(database.schema_version().await? >= 200);
     let mail_outbox_column_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_schema = current_schema() AND table_name = 'mail_outbox'",

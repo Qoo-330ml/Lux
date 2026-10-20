@@ -16296,6 +16296,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：`cargo test --locked --lib storage::repository::mail_outbox_tests` 5/5、忽略的 PostgreSQL 空库专项 `postgres_mail_outbox_migration_applies_to_an_empty_database` 1/1、`cargo build --locked`、fmt 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。PostgreSQL 测试确认新库迁移到 schema 199、outbox 有 13 列且不含正文/密码/token 字段。`cargo clippy --locked --lib -- -D warnings` 仍被 11 项既有诊断阻断，分布于未修改的 admin user API、Emby 播放、user permission copy 与 user storage；本任务文件无新增 Clippy 诊断。旧的 PostgreSQL 全 bootstrap 用例已更新 schema 断言，但继续执行时在未修改的 `src/storage/users.rs:1937` 因 `BOOLEAN` 被解码为 `i64` 而 panic；独立 outbox 空库 migration 用例通过。
 
+#### LUX-783：建立注册邮件凭证存储
+
+范围：新增与邮件模板引用关联的一次性注册凭证存储，覆盖邀请和邮箱验证。持久化只保存随机凭证的 32 字节校验摘要、收件邮箱、凭证类型、业务记录引用与有效/消费/撤销时间；不保存原始凭证、密码或邮件正文。本任务不创建邀请或注册业务记录、不发送邮件、不提供 API/UI。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0200_mail_challenges.sql`、`migrations-postgres/0200_mail_challenges.sql`、`src/storage/mod.rs`、`src/storage/repository.rs`（存储测试内置于 repository 模块）、`tests/postgres_database.rs`（验证空库 migration 和凭证表结构）。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL migration 从空数据库建立凭证表；凭证类型有限，摘要必须为 32 字节，邮箱、业务引用和时间字段有界。
+- [x] 存储接口支持创建凭证、按 ID 读取、只消费一次、撤销指定目标的凭证；过期、已消费、已撤销凭证不能再次消费。
+- [x] 表中仅保存凭证摘要，不保存原始 token、密码或正文；创建与消费校验固定错误，不回显摘要。
+- [x] 自动化测试覆盖两种凭证类型、一次性消费、过期/撤销拒绝、摘要长度约束以及空库 migration。
+- [x] 运行指定存储库测试、PostgreSQL 空库凭证 migration 测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先在 SQLite 存储测试和 PostgreSQL 空库测试中写凭证表与消费合同并确认 RED；再新增 SQLite/PostgreSQL migration 和存储方法；最后运行两个定向目标、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib storage::repository::mail_outbox_tests` 7/7、忽略的 PostgreSQL 空库专项 `postgres_mail_challenge_migration_applies_to_an_empty_database` 1/1、`cargo build --locked`、fmt 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。测试覆盖两类凭证、错误摘要、到期、撤销、单次消费、数据库列约束和空库迁移。`cargo clippy --locked --lib -- -D warnings` 被 11 项既有诊断阻断，均位于未修改的 admin user API、Emby 播放、user permission copy 与 user storage；本任务文件无新增 Clippy 诊断。未发送邮件。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
