@@ -16278,6 +16278,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：组件测试先因 SMTP 密码仍保留在 React Query mutation cache 而失败；改为直接执行凭据请求后，`tests/admin-user-mail-settings.test.tsx` 5/5 通过，并确认 mutation cache 不含密码。`pnpm --dir web build` 通过。完整 `pnpm --dir web test` 连续运行两次，最终均稳定为 751 passed、4 failed：`home-page.test.tsx` 首页媒体库预取 1 项、`library-card.test.tsx` 预取与虚拟集合链接 2 项、`media-query-polling.test.tsx` 图片查询调用次数 1 项；均为既有基线失败，与本任务文件无关。第一次全量运行另有 1 项头像裁切失败，单独重跑通过，第二次全量运行未复现。Playwright 在本机临时配置上确认邮件设置保存成功；390×844 移动视口页面宽度无横向溢出。未执行 SMTP NOOP 或联系外部邮件服务器。
 
+#### LUX-782：建立持久化邮件队列存储合同
+
+范围：新增 SQLite 与 PostgreSQL 邮件 outbox 表及内部存储接口，为之后 SMTP worker 提供持久化排队、原子领取、租约恢复、完成/失败状态和有界分页查询。本任务不启动投递 worker、不提供 API/UI，也不发送邮件。Outbox 仅保存收件地址、模板类型和关联业务记录 ID；不保存渲染正文、SMTP 凭据或一次性验证凭证。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0199_mail_outbox.sql`、`migrations-postgres/0199_mail_outbox.sql`、`src/storage/mod.rs`、`src/storage/repository.rs`（存储测试内置于 repository 模块）、`tests/postgres_database.rs`（更新空库迁移版本断言并检查 mail outbox schema）。
+
+验收标准：
+
+- [x] 新 migration 可从空 SQLite 与 PostgreSQL 数据库运行，定义有限状态、幂等键、尝试次数、下次可投递时间和领取租约，并建立适用索引。
+- [x] 存储接口支持幂等入队、原子领取到期项、租约超时恢复、标记完成/失败、排定下一次尝试及有上限的分页查询。
+- [x] 持久化行不包含正文、SMTP 凭据或明文一次性 token；错误字段只接受安全错误代码。
+- [x] 自动化测试覆盖并发领取、重复入队、租约恢复、状态迁移、分页上限以及空库 migration。
+- [x] 运行指定存储库测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先为 outbox 表和存储合同补回归测试并运行 RED；再新增两种数据库 migration 与存储实现；最后运行目标测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib storage::repository::mail_outbox_tests` 5/5、忽略的 PostgreSQL 空库专项 `postgres_mail_outbox_migration_applies_to_an_empty_database` 1/1、`cargo build --locked`、fmt 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。PostgreSQL 测试确认新库迁移到 schema 199、outbox 有 13 列且不含正文/密码/token 字段。`cargo clippy --locked --lib -- -D warnings` 仍被 11 项既有诊断阻断，分布于未修改的 admin user API、Emby 播放、user permission copy 与 user storage；本任务文件无新增 Clippy 诊断。旧的 PostgreSQL 全 bootstrap 用例已更新 schema 断言，但继续执行时在未修改的 `src/storage/users.rs:1937` 因 `BOOLEAN` 被解码为 `i64` 而 panic；独立 outbox 空库 migration 用例通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

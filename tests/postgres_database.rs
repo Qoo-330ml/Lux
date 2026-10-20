@@ -690,6 +690,49 @@ async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_mail_outbox_migration_applies_to_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        if database.schema_version().await? != 199 {
+            return Err("mail outbox migration was not applied".into());
+        }
+        let column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_outbox'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if column_count != 13 {
+            return Err("unexpected mail outbox schema".into());
+        }
+        let sensitive_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_outbox'
+               AND column_name IN ('body', 'html_body', 'text_body', 'payload', 'token', 'password')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if sensitive_column_count != 0 {
+            return Err("mail outbox schema contains a sensitive payload column".into());
+        }
+        database.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -716,7 +759,22 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 190);
+    assert_eq!(database.schema_version().await?, 199);
+    let mail_outbox_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'mail_outbox'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(mail_outbox_column_count, 13);
+    let sensitive_mail_outbox_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'mail_outbox'
+           AND column_name IN ('body', 'html_body', 'text_body', 'payload', 'token', 'password')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(sensitive_mail_outbox_column_count, 0);
     let setup = SetupService::new(database.clone())?;
     setup
         .complete("postgres-admin", "PostgreSQL Admin", "test-password")

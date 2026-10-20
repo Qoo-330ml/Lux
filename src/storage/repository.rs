@@ -419,6 +419,182 @@ pub(crate) struct DatabasePoolSnapshot {
     pub saturated: bool,
 }
 
+// LUX-783 constructs these templates in the delivery worker.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailOutboxTemplateKind {
+    Invitation,
+    EmailVerification,
+}
+
+#[allow(dead_code)]
+impl MailOutboxTemplateKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invitation => "INVITATION",
+            Self::EmailVerification => "EMAIL_VERIFICATION",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "INVITATION" => Ok(Self::Invitation),
+            "EMAIL_VERIFICATION" => Ok(Self::EmailVerification),
+            _ => Err(StorageError::Serialization(
+                "unknown mail template kind".to_owned(),
+            )),
+        }
+    }
+}
+
+// LUX-783 and LUX-784 consume these states in delivery and queue administration.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailOutboxStatus {
+    Pending,
+    Sending,
+    RetryWait,
+    Sent,
+    Failed,
+}
+
+#[allow(dead_code)]
+impl MailOutboxStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Sending => "SENDING",
+            Self::RetryWait => "RETRY_WAIT",
+            Self::Sent => "SENT",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "SENDING" => Ok(Self::Sending),
+            "RETRY_WAIT" => Ok(Self::RetryWait),
+            "SENT" => Ok(Self::Sent),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(StorageError::Serialization(
+                "unknown mail outbox status".to_owned(),
+            )),
+        }
+    }
+}
+
+// LUX-783 maps transport failures to these fixed, non-sensitive values.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailDeliveryErrorCode {
+    SmtpUnavailable,
+    SettingsMissing,
+    TemplateMissing,
+    ReferenceMissing,
+}
+
+#[allow(dead_code)]
+impl MailDeliveryErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SmtpUnavailable => "SMTP_UNAVAILABLE",
+            Self::SettingsMissing => "SETTINGS_UNAVAILABLE",
+            Self::TemplateMissing => "TEMPLATE_UNAVAILABLE",
+            Self::ReferenceMissing => "REFERENCE_UNAVAILABLE",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "SMTP_UNAVAILABLE" => Ok(Self::SmtpUnavailable),
+            "SETTINGS_UNAVAILABLE" => Ok(Self::SettingsMissing),
+            "TEMPLATE_UNAVAILABLE" => Ok(Self::TemplateMissing),
+            "REFERENCE_UNAVAILABLE" => Ok(Self::ReferenceMissing),
+            _ => Err(StorageError::Serialization(
+                "unknown mail delivery error code".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewMailOutboxMessage<'a> {
+    pub(crate) idempotency_key: &'a str,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) template_kind: MailOutboxTemplateKind,
+    pub(crate) reference_id: &'a str,
+    pub(crate) available_at: i64,
+}
+
+// LUX-783 consumes the delivery fields and LUX-784 exposes the safe status fields.
+#[allow(dead_code)]
+pub(crate) struct StoredMailOutboxMessage {
+    pub(crate) id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) recipient_email: String,
+    pub(crate) template_kind: MailOutboxTemplateKind,
+    pub(crate) reference_id: String,
+    pub(crate) status: MailOutboxStatus,
+    pub(crate) attempt_count: i64,
+    pub(crate) available_at: i64,
+    pub(crate) lease_expires_at: Option<i64>,
+    pub(crate) last_error_code: Option<MailDeliveryErrorCode>,
+    pub(crate) sent_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+// LUX-784 maps this bounded page to the admin queue API.
+#[allow(dead_code)]
+pub(crate) struct MailOutboxPage {
+    pub(crate) messages: Vec<StoredMailOutboxMessage>,
+    pub(crate) total_count: i64,
+}
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+struct MailOutboxRecord {
+    id: String,
+    idempotency_key: String,
+    recipient_email: String,
+    template_kind: String,
+    reference_id: String,
+    status: String,
+    attempt_count: i64,
+    available_at: i64,
+    lease_expires_at: Option<i64>,
+    last_error_code: Option<String>,
+    sent_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl TryFrom<MailOutboxRecord> for StoredMailOutboxMessage {
+    type Error = StorageError;
+
+    fn try_from(record: MailOutboxRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: record.id,
+            idempotency_key: record.idempotency_key,
+            recipient_email: record.recipient_email,
+            template_kind: MailOutboxTemplateKind::parse(&record.template_kind)?,
+            reference_id: record.reference_id,
+            status: MailOutboxStatus::parse(&record.status)?,
+            attempt_count: record.attempt_count,
+            available_at: record.available_at,
+            lease_expires_at: record.lease_expires_at,
+            last_error_code: record
+                .last_error_code
+                .as_deref()
+                .map(MailDeliveryErrorCode::parse)
+                .transpose()?,
+            sent_at: record.sent_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        })
+    }
+}
+
 impl Database {
     pub async fn connect(config: &Config) -> Result<Self, StorageError> {
         Self::connect_with_configuration(config, &DatabaseConfiguration::Sqlite).await
@@ -1005,6 +1181,334 @@ impl Database {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
+    }
+}
+
+// LUX-783 wires the worker and LUX-784 wires the admin queue API to this storage contract.
+#[allow(dead_code)]
+impl Database {
+    pub(crate) async fn enqueue_mail_outbox(
+        &self,
+        message: NewMailOutboxMessage<'_>,
+        now: i64,
+    ) -> Result<StoredMailOutboxMessage, StorageError> {
+        if now < 0
+            || message.available_at < 0
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email.trim() != message.recipient_email
+            || !(3..=320).contains(&message.recipient_email.len())
+            || message.recipient_email.chars().any(char::is_control)
+            || message.reference_id.trim() != message.reference_id
+            || !(1..=128).contains(&message.reference_id.len())
+            || message.reference_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox message".to_owned(),
+            ));
+        }
+
+        let id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.template_kind.as_str())
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let record = self
+            .query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE idempotency_key = ?",
+            )
+            .bind(message.idempotency_key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if record.recipient_email != message.recipient_email
+            || record.template_kind != message.template_kind.as_str()
+            || record.reference_id != message.reference_id
+        {
+            return Err(StorageError::Conflict(
+                "mail outbox idempotency key already used".to_owned(),
+            ));
+        }
+        record.try_into()
+    }
+
+    pub(crate) async fn claim_mail_outbox(
+        &self,
+        now: i64,
+        lease_seconds: i64,
+    ) -> Result<Option<StoredMailOutboxMessage>, StorageError> {
+        if now < 0 || !(1..=900).contains(&lease_seconds) {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox lease".to_owned(),
+            ));
+        }
+        let lease_expires_at = now.saturating_add(lease_seconds);
+        let statement = match self.backend {
+            DatabaseBackend::Sqlite => {
+                "UPDATE mail_outbox
+                 SET status = 'SENDING', attempt_count = attempt_count + 1,
+                     lease_expires_at = ?, last_error_code = NULL,
+                     sent_at = NULL, updated_at = ?
+                 WHERE id = (
+                     SELECT id FROM mail_outbox
+                     WHERE (status IN ('PENDING', 'RETRY_WAIT') AND available_at <= ?)
+                        OR (status = 'SENDING' AND lease_expires_at <= ?)
+                     ORDER BY available_at, created_at, id
+                     LIMIT 1
+                 )
+                 RETURNING id, idempotency_key, recipient_email, template_kind,
+                           reference_id, status, attempt_count, available_at,
+                           lease_expires_at, last_error_code, sent_at, created_at, updated_at"
+            }
+            DatabaseBackend::Postgres => {
+                "WITH candidate AS (
+                     SELECT id FROM mail_outbox
+                     WHERE (status IN ('PENDING', 'RETRY_WAIT') AND available_at <= ?)
+                        OR (status = 'SENDING' AND lease_expires_at <= ?)
+                     ORDER BY available_at, created_at, id
+                     LIMIT 1 FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE mail_outbox AS outbox
+                 SET status = 'SENDING', attempt_count = outbox.attempt_count + 1,
+                     lease_expires_at = ?, last_error_code = NULL,
+                     sent_at = NULL, updated_at = ?
+                 FROM candidate
+                 WHERE outbox.id = candidate.id
+                 RETURNING outbox.id, outbox.idempotency_key, outbox.recipient_email,
+                           outbox.template_kind, outbox.reference_id, outbox.status,
+                           outbox.attempt_count, outbox.available_at,
+                           outbox.lease_expires_at, outbox.last_error_code,
+                           outbox.sent_at, outbox.created_at, outbox.updated_at"
+            }
+        };
+        let mut query = self.query_as::<MailOutboxRecord>(statement);
+        if self.backend == DatabaseBackend::Postgres {
+            query = query.bind(now).bind(now);
+        }
+        query = query.bind(lease_expires_at).bind(now);
+        if self.backend == DatabaseBackend::Sqlite {
+            query = query.bind(now).bind(now);
+        }
+        query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .map(TryInto::try_into)
+            .transpose()
+    }
+
+    pub(crate) async fn mark_mail_outbox_sent(
+        &self,
+        id: &str,
+        attempt_count: i64,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if attempt_count <= 0 || now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox completion".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'SENT', lease_expires_at = NULL, last_error_code = NULL,
+                     sent_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .bind(attempt_count)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn defer_mail_outbox(
+        &self,
+        id: &str,
+        attempt_count: i64,
+        available_at: i64,
+        error_code: MailDeliveryErrorCode,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if attempt_count <= 0 || now < 0 || available_at < now {
+            return Err(StorageError::Conflict("invalid mail retry time".to_owned()));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'RETRY_WAIT', available_at = ?, lease_expires_at = NULL,
+                     last_error_code = ?, sent_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
+            )
+            .bind(available_at)
+            .bind(error_code.as_str())
+            .bind(now)
+            .bind(id)
+            .bind(attempt_count)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn fail_mail_outbox(
+        &self,
+        id: &str,
+        attempt_count: i64,
+        error_code: MailDeliveryErrorCode,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if attempt_count <= 0 || now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox failure".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'FAILED', lease_expires_at = NULL, last_error_code = ?,
+                     sent_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
+            )
+            .bind(error_code.as_str())
+            .bind(now)
+            .bind(id)
+            .bind(attempt_count)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn retry_failed_mail_outbox(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox retry time".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'PENDING', attempt_count = 0, available_at = ?,
+                     last_error_code = NULL, sent_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'FAILED'",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn list_mail_outbox_page(
+        &self,
+        status: Option<MailOutboxStatus>,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<MailOutboxPage, StorageError> {
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let total_count = if let Some(status) = status {
+            self.query_scalar::<i64>("SELECT COUNT(*) FROM mail_outbox WHERE status = ?")
+                .bind(status.as_str())
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            self.query_scalar::<i64>("SELECT COUNT(*) FROM mail_outbox")
+                .fetch_one(&self.pool)
+                .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let records = if let Some(status) = status {
+            self.query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status.as_str())
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let messages = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<StoredMailOutboxMessage>, StorageError>>()?;
+        Ok(MailOutboxPage {
+            messages,
+            total_count,
+        })
     }
 }
 
@@ -4582,6 +5086,274 @@ impl std::error::Error for StorageError {
             Self::Migration { source, .. } => Some(source),
             Self::Conflict(_) | Self::LastManager | Self::Serialization(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod mail_outbox_tests {
+    use super::*;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8100".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        Ok((directory, database))
+    }
+
+    fn new_message<'a>(
+        idempotency_key: &'a str,
+        recipient_email: &'a str,
+        reference_id: &'a str,
+        available_at: i64,
+    ) -> NewMailOutboxMessage<'a> {
+        NewMailOutboxMessage {
+            idempotency_key,
+            recipient_email,
+            template_kind: MailOutboxTemplateKind::Invitation,
+            reference_id,
+            available_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_migration_applies_to_an_empty_sqlite_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(count, 0);
+        let columns = sqlx::query("PRAGMA table_info(mail_outbox)")
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert!(columns.contains(&"recipient_email".to_owned()));
+        assert!(columns.contains(&"template_kind".to_owned()));
+        assert!(columns.contains(&"reference_id".to_owned()));
+        assert!(!columns.iter().any(|column| {
+            matches!(
+                column.as_str(),
+                "body" | "html_body" | "text_body" | "payload" | "token" | "password"
+            )
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_enqueue_is_idempotent_and_rejects_key_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let first = database
+            .enqueue_mail_outbox(
+                new_message("invite:abc", "one@example.test", "invite-abc", 10),
+                10,
+            )
+            .await?;
+        let duplicate = database
+            .enqueue_mail_outbox(
+                new_message("invite:abc", "one@example.test", "invite-abc", 10),
+                11,
+            )
+            .await?;
+        assert_eq!(first.id, duplicate.id);
+        assert_eq!(duplicate.status, MailOutboxStatus::Pending);
+
+        let conflicting = database
+            .enqueue_mail_outbox(
+                new_message("invite:abc", "other@example.test", "invite-abc", 10),
+                12,
+            )
+            .await;
+        assert!(matches!(conflicting, Err(StorageError::Conflict(_))));
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(total, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_claim_is_atomic_and_recovers_expired_leases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let first = database
+            .enqueue_mail_outbox(
+                new_message("invite:first", "one@example.test", "invite-first", 10),
+                10,
+            )
+            .await?;
+        database
+            .enqueue_mail_outbox(
+                new_message("invite:second", "two@example.test", "invite-second", 10),
+                10,
+            )
+            .await?;
+
+        let (left, right) = tokio::join!(
+            database.claim_mail_outbox(10, 5),
+            database.claim_mail_outbox(10, 5),
+        );
+        let left = left?.ok_or("first worker did not claim a message")?;
+        let right = right?.ok_or("second worker did not claim a message")?;
+        assert_ne!(left.id, right.id);
+        assert_eq!(left.attempt_count, 1);
+        assert_eq!(left.status, MailOutboxStatus::Sending);
+        assert_eq!(left.lease_expires_at, Some(15));
+
+        assert!(database.claim_mail_outbox(14, 5).await?.is_none());
+        let reclaimed = database
+            .claim_mail_outbox(15, 5)
+            .await?
+            .ok_or("expired lease was not recovered")?;
+        assert_eq!(reclaimed.id, first.id);
+        assert_eq!(reclaimed.attempt_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_transitions_are_fenced_and_error_codes_are_sanitized()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let created = database
+            .enqueue_mail_outbox(
+                new_message("verify:abc", "one@example.test", "challenge-abc", 10),
+                10,
+            )
+            .await?;
+        let claimed = database
+            .claim_mail_outbox(10, 5)
+            .await?
+            .ok_or("message was not claimable")?;
+        assert!(!database.mark_mail_outbox_sent(&created.id, 9, 11).await?);
+        assert!(matches!(
+            database
+                .mark_mail_outbox_sent(&created.id, claimed.attempt_count, -1)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            database
+                .defer_mail_outbox(
+                    &created.id,
+                    0,
+                    20,
+                    MailDeliveryErrorCode::SmtpUnavailable,
+                    11,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(
+            database
+                .defer_mail_outbox(
+                    &created.id,
+                    claimed.attempt_count,
+                    20,
+                    MailDeliveryErrorCode::SmtpUnavailable,
+                    11,
+                )
+                .await?
+        );
+        let deferred = database.list_mail_outbox_page(None, 20, 0).await?;
+        assert_eq!(deferred.messages[0].status, MailOutboxStatus::RetryWait);
+        assert_eq!(
+            deferred.messages[0].last_error_code,
+            Some(MailDeliveryErrorCode::SmtpUnavailable)
+        );
+
+        let retry = database
+            .claim_mail_outbox(20, 5)
+            .await?
+            .ok_or("deferred message was not claimable")?;
+        assert_eq!(retry.attempt_count, 2);
+        assert!(
+            database
+                .mark_mail_outbox_sent(&retry.id, retry.attempt_count, 21)
+                .await?
+        );
+        let sent = database.list_mail_outbox_page(None, 20, 0).await?;
+        assert_eq!(sent.messages[0].status, MailOutboxStatus::Sent);
+        assert_eq!(sent.messages[0].sent_at, Some(21));
+        assert_eq!(sent.messages[0].last_error_code, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_failure_can_be_manually_retried_and_pages_are_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let created = database
+            .enqueue_mail_outbox(
+                new_message("invite:retry", "one@example.test", "invite-retry", 1),
+                1,
+            )
+            .await?;
+        let claimed = database
+            .claim_mail_outbox(1, 5)
+            .await?
+            .ok_or("message was not claimable")?;
+        assert!(matches!(
+            database
+                .fail_mail_outbox(
+                    &claimed.id,
+                    claimed.attempt_count,
+                    MailDeliveryErrorCode::TemplateMissing,
+                    -1,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(
+            database
+                .fail_mail_outbox(
+                    &claimed.id,
+                    claimed.attempt_count,
+                    MailDeliveryErrorCode::TemplateMissing,
+                    2,
+                )
+                .await?
+        );
+        assert!(matches!(
+            database.retry_failed_mail_outbox(&created.id, -1).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(database.retry_failed_mail_outbox(&created.id, 3).await?);
+        assert!(!database.retry_failed_mail_outbox(&created.id, 3).await?);
+
+        for index in 0..101 {
+            let key = format!("verify:{index}");
+            let reference = format!("challenge-{index}");
+            database
+                .enqueue_mail_outbox(new_message(&key, "one@example.test", &reference, 4), 4)
+                .await?;
+        }
+        let page = database
+            .list_mail_outbox_page(Some(MailOutboxStatus::Pending), 1_000, 0)
+            .await?;
+        assert_eq!(page.total_count, 102);
+        assert_eq!(page.messages.len(), 100);
+        assert!(
+            page.messages
+                .iter()
+                .all(|message| message.status == MailOutboxStatus::Pending)
+        );
+        let next_page = database
+            .list_mail_outbox_page(Some(MailOutboxStatus::Pending), 100, 100)
+            .await?;
+        assert_eq!(next_page.messages.len(), 2);
+        assert!(
+            !page
+                .messages
+                .iter()
+                .any(|message| message.id == next_page.messages[0].id)
+        );
+        Ok(())
     }
 }
 
