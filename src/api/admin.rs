@@ -12,6 +12,8 @@ mod admin_users;
 pub(super) use admin_users::user_json;
 #[path = "admin/admin_settings.rs"]
 mod admin_settings;
+#[path = "admin/admin_user_invitations.rs"]
+mod admin_user_invitations;
 pub(super) use crate::application::settings::{
     MediaStrategySettings, read_media_strategy_settings, validate_media_strategy,
 };
@@ -68,6 +70,7 @@ pub(super) use admin_logs_events::{
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(users_routes())
+        .merge(admin_user_invitations::api_routes())
         .merge(settings_routes())
         .merge(libraries_routes())
         .merge(items_routes())

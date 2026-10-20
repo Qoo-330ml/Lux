@@ -254,6 +254,10 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 3.10 用户、会话和权限
 
+> 待实施专项设计：[Lux 用户管理设计方案](USER-MANAGEMENT-DESIGN.md)（2026-10-19）。
+> 覆盖账号生命周期、注册邀请、用户查询、权限预设、内容限制、播放控制、设备与活动七个模块。原模块八“外挂字幕权限”已于 2026-10-19 取消，不新增用户级字幕权限或字幕文件管理功能；现有字幕播放、媒体字幕属性编辑及扫描能力保持既有规则。
+> 当前仅登记方案，不代表功能已上线；公开注册、显式媒体库权限模式和 IP 黑名单等条文在对应 `LUX-*` 任务实施前同步更新。
+
 - 第一次启动进入初始化引导。
 - 第一个完成初始化的账户为管理员。
 - 默认采用指定邮箱邀请注册；邀请用户完成邮箱验证、设置用户名和密码后激活。
@@ -12547,6 +12551,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 本机为 macOS `arm64`，全部 Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 在库测试阶段得到 973 passed、3 failed、25 ignored，后续集成 targets 未运行；相关集成 targets 已按上述定向命令独立通过。三个失败分别为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`（实际 0、预期 1）、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`（空集合越界）和 `changed_local_fill_request_during_running_item_is_not_lost`（实际 0、预期 1）。三项均在干净基线 `842f9870` 以各自完整测试名和 `--lib -- --exact` 单独复现相同失败，临时 worktree 已清理；完整 Rust 门禁仍未通过。
 
 真实 Lucky、FNOS/x86_64 和第三方播放器尚未验证，本任务未推送或部署。请求头全部缺失时仍无法恢复客户端地址，兼容合同见 `docs/COMPATIBILITY.md`。
+
 #### LUX-593：用户管理页面结构
 
 范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码和活动记录入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。原外挂字幕权限模块不属于此导航范围。
@@ -16280,7 +16285,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 #### LUX-782：建立持久化邮件队列存储合同
 
-范围：新增 SQLite 与 PostgreSQL 邮件 outbox 表及内部存储接口，为之后 SMTP worker 提供持久化排队、原子领取、租约恢复、完成/失败状态和有界分页查询。本任务不启动投递 worker、不提供 API/UI，也不发送邮件。Outbox 仅保存收件地址、模板类型和关联业务记录 ID；不保存渲染正文、SMTP 凭据或一次性验证凭证。
+范围：新增 SQLite 与 PostgreSQL 邮件 outbox 表及内部存储接口，为之后 SMTP worker 提供持久化排队、原子领取、租约恢复、完成/失败状态和有界分页查询。本任务不启动投递 worker、不提供 API/UI，也不发送邮件。Outbox 仅保存收件地址、模板类型和邮件挑战记录 ID（挑战再关联邀请/注册业务记录）；不保存渲染正文、SMTP 凭据或一次性验证凭证。
 
 预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0199_mail_outbox.sql`、`migrations-postgres/0199_mail_outbox.sql`、`src/storage/mod.rs`、`src/storage/repository.rs`（存储测试内置于 repository 模块）、`tests/postgres_database.rs`（更新空库迁移版本断言并检查 mail outbox schema）。
 
@@ -16417,6 +16422,23 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 短计划：先登记服务合同并添加 SQLite 回归；再实现邮箱/预设校验、7 天快照与邮件入队、分页和撤销；最后运行 `cargo test --locked --lib application::user_invitations::tests`、build、fmt 与 diff check。
 
 验证（2026-10-20）：`cargo test --locked --lib application::user_invitations::tests` 3/3、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；本机 `arm64`，Cargo 使用 Toshiba target 目录。测试未连接 SMTP；服务返回的单次邀请 URL 使用片段携带 token，存储仅保留 HMAC 验证所需的摘要。
+
+#### LUX-790：开放管理员邀请管理 API
+
+范围：在 Lux 管理 API 提供邀请创建、状态筛选分页与撤销端点。创建和撤销要求管理员身份与适用的 CSRF 校验，记录不含邮箱、邀请链接或凭证的审计事件；DTO 仅暴露邀请状态与权限预设来源，不序列化权限快照或挑战摘要。创建响应一次性返回可复制邀请链接。本任务不做邮件重发端点、公开注册 API 或 Web 界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin.rs`、`src/api/admin/admin_user_invitations.rs`、`tests/admin_user_invitations.rs`。
+
+验收标准：
+
+- [x] 管理员可创建邀请、按状态分页查询和撤销；页大小默认 20、上限 100，服务端拒绝无效状态筛选。
+- [x] 创建请求经过管理员与 CSRF 校验；重复待处理邮箱返回 409；创建和撤销写入不含 PII、凭证或链接的审计事件。
+- [x] 列表 DTO 不包含权限快照、token 摘要或 token；只有创建响应含一次性链接，链接 token 位于 URL fragment。
+- [x] HTTP 回归覆盖未认证/缺失 CSRF、创建、重复冲突、状态过滤分页、撤销和响应敏感字段；定向集成测试、build、fmt、diff check 通过。
+
+短计划：先添加 HTTP 集成回归并确认路由返回 404；再添加隔离的 admin handler 模块和显式 DTO，连接 LUX-789 service；最后运行定向测试、build、fmt、Clippy 和 diff check。
+
+验证（2026-10-20）：路由实现前，HTTP 回归因端点返回 404 失败；实现后 `cargo test --locked --test admin_user_invitations` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。回归覆盖未认证、缺失 CSRF、邀请创建/重复冲突、默认与上限分页、状态筛选、撤销、DTO 字段缺席和审计脱敏。全目标全 feature Clippy 被 11 项既有库代码与 15 项既有测试代码诊断阻断，均在本任务文件之外。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
 
 ## 29. 参考资料
 
