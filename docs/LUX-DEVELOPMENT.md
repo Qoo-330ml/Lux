@@ -16907,15 +16907,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：在用户列表增加待审批入口，展示已验证申请并允许管理员审核拟分配的媒体库、播放、下载和转码权限，再批准或拒绝。仅显示服务端分页结果；每次操作需确认，完成后刷新申请和用户列表。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`/`types.ts`、`web/src/features/admin/AdminUserRegistrationsPanel.tsx`、`web/tests/admin-user-registrations.test.tsx`。
+预计修改文件（8 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserRegistrationsPanel.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/api-client.test.ts`、`web/tests/admin-user-registrations.test.tsx`。
 
 验收标准：
 
-- [ ] 待审批空态、分页、预设权限快照/修改、批准、拒绝、加载与错误重试均可访问。
-- [ ] 成功审批后列表与用户缓存刷新；失败时保留申请并显示脱敏结果。
-- [ ] 定向 Vitest、Web build 与 diff check 通过。
+- [x] 待审批空态、分页、申请权限快照/修改、批准、拒绝、加载与错误重试均可访问。
+- [x] 成功审批后列表与用户缓存刷新；失败时保留申请并显示脱敏结果。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
 
 短计划：先写审批面板合同；再接 LUX-812 API 和用户列表入口；最后运行组件回归与 Web build。
+
+实施结果（2026-10-20）：用户管理“待审批”视图接入 LUX-812 API，按服务端每页 20 条展示已验证申请、申请时的权限快照和邮箱验证时间。管理员可编辑媒体库范围、播放/下载、并发上限及三项转码权限；已停用或不可用的快照媒体库会明确标出，移除前禁止批准。批准与拒绝均需确认；错误只显示固定脱敏文案，失败申请保留；成功后刷新审批页及所有用户列表缓存。
+
+验证：新增 API client 与页面回归先确认客户端方法和审批视图缺失；实现后 `pnpm --dir web exec vitest run tests/admin-user-registrations.test.tsx tests/api-client.test.ts` 108/108、`pnpm --dir web build`、`git diff --check` 通过。隔离 Chromium 本地 mock 页面实际渲染审批视图、权限快照及完整编辑控件；323px 视口下文档宽度 320px，无横向溢出，控制台无错误或警告。浏览器只使用本地 mock，没有提交真实申请或调用审批 API。
 
 #### LUX-814：为已登录用户建立邮箱重验存储事务
 

@@ -8,6 +8,7 @@ import type { AdminUser, AdminUserListStatus, AdminUserPermissionPresetBatchErro
 import { AdminUserPermissionCopyDialog } from "./AdminUserPermissionCopyDialog";
 import { AdminUserPreferenceCopyDialog } from "./AdminUserPreferenceCopyDialog";
 import { AdminUserInvitationsPanel } from "./AdminUserInvitationsPanel";
+import { AdminUserRegistrationsPanel } from "./AdminUserRegistrationsPanel";
 import "./user-management.css";
 
 export function AdminUsersPage() {
@@ -186,13 +187,7 @@ export function AdminUsersPage() {
           <button key={key} className={view === key ? "is-active" : undefined} type="button" aria-current={view === key ? "page" : undefined} onClick={() => { setPage(1); setSearchParams(key === "users" ? {} : { view: key }); }}>{label}</button>
         ))}
       </nav>
-      {view === "pending" ? (
-        <section className="lux-admin-users-placeholder" aria-labelledby="lux-admin-users-placeholder-title">
-          <span className="lux-admin-eyebrow">后续任务</span>
-          <h2 id="lux-admin-users-placeholder-title">待审批用户</h2>
-          <p>公开注册申请和审批将在后续任务中启用。</p>
-        </section>
-      ) : view === "invitations" ? <AdminUserInvitationsPanel /> : <>
+      {view === "pending" ? <AdminUserRegistrationsPanel /> : view === "invitations" ? <AdminUserInvitationsPanel /> : <>
       <div className="lux-admin-user-query-controls">
         <label className="lux-admin-user-search"><span>搜索用户</span><div><Search size={16} aria-hidden="true" /><input value={searchInput} onChange={(event) => setSearchInput(event.target.value)} placeholder="用户名、显示名称或邮箱" /></div></label>
         {view === "users" ? <label><span>账号状态</span><select value={status} onChange={(event) => setStatus(event.target.value as AdminUserListStatus)}><option value="all">全部状态</option><option value="active">正常</option><option value="disabled">已禁用</option></select></label> : <div className="lux-admin-deleted-hint"><span>回收站</span><small>账号将在显示的期限后自动清理</small></div>}
