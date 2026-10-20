@@ -739,6 +739,58 @@ export type AdminUserLibraryAccessUpdateResult = AdminUserLibraryAccess & {
   userId: string;
 };
 
+export type AdminUserInvitationStatus = "PENDING" | "ACCEPTED" | "REVOKED" | "EXPIRED";
+
+export type AdminUserInvitation = {
+  id: string;
+  recipientEmail: string;
+  createdByUserId: string | null;
+  acceptedUserId: string | null;
+  status: AdminUserInvitationStatus;
+  presetId: string;
+  presetName: string;
+  presetVersion: number;
+  expiresAt: number;
+  acceptedAt: number | null;
+  revokedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AdminUserInvitationStatusFilter = "all" | "pending" | "accepted" | "revoked" | "expired";
+
+export type AdminUserInvitationListQuery = {
+  page?: number;
+  pageSize?: number;
+  status?: AdminUserInvitationStatusFilter;
+};
+
+export type AdminUserInvitationPage = {
+  invitations: AdminUserInvitation[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type CreateAdminUserInvitationInput = {
+  recipientEmail: string;
+  presetId: string;
+};
+
+export type CreateAdminUserInvitationResponse = {
+  invitation: AdminUserInvitation;
+  invitationUrl: string;
+  emailQueued: boolean;
+};
+
+export type ResendAdminUserInvitationResponse = {
+  emailQueued: boolean;
+};
+
+export type RevokeAdminUserInvitationResponse = {
+  revoked: boolean;
+};
+
 export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
 export type AdminUserSortBy = "createdAt" | "lastLoginAt" | "lastActivityAt";
 export type AdminUserSortOrder = "asc" | "desc";

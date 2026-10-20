@@ -67,6 +67,12 @@ import type {
   AdminUserLibraryAccess,
   AdminUserLibraryAccessUpdateResult,
   AdminUserPlaybackPolicy,
+  AdminUserInvitationListQuery,
+  AdminUserInvitationPage,
+  CreateAdminUserInvitationInput,
+  CreateAdminUserInvitationResponse,
+  ResendAdminUserInvitationResponse,
+  RevokeAdminUserInvitationResponse,
   AdminUserListQuery,
   AdminUserListResponse,
   AdminMetadataCandidate,
@@ -1179,6 +1185,38 @@ export class LuxApiClient {
     return this.request<AdminMetadataReidentifyStart>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/metadata/refresh`,
       { method: "POST", body: JSON.stringify({ mode }) },
+    );
+  }
+
+  adminUserInvitations(options: AdminUserInvitationListQuery = {}) {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      pageSize: String(options.pageSize ?? 20),
+    });
+    if (options.status) params.set("status", options.status);
+    return this.request<AdminUserInvitationPage>(
+      `/api/v1/admin/user-invitations?${params}`,
+    );
+  }
+
+  createAdminUserInvitation(input: CreateAdminUserInvitationInput) {
+    return this.request<CreateAdminUserInvitationResponse>(
+      "/api/v1/admin/user-invitations",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  resendAdminUserInvitation(invitationId: string, idempotencyKey: string) {
+    return this.request<ResendAdminUserInvitationResponse>(
+      `/api/v1/admin/user-invitations/${encodeURIComponent(invitationId)}/resend`,
+      { method: "POST", headers: { "Idempotency-Key": idempotencyKey } },
+    );
+  }
+
+  revokeAdminUserInvitation(invitationId: string) {
+    return this.request<RevokeAdminUserInvitationResponse>(
+      `/api/v1/admin/user-invitations/${encodeURIComponent(invitationId)}/revoke`,
+      { method: "POST" },
     );
   }
 

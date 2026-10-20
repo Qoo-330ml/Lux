@@ -16510,6 +16510,23 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 短计划：先新增双后端迁移和存储任务状态/批次操作；再增加生命周期访问栅栏、后台 worker 与重启取消/重试；随后接入管理员 API 和任务审计；最后接入 Web 删除反馈、任务进度和重试，并运行相应检查。
 
+#### LUX-795：建立管理员邀请 Web API 客户端合同
+
+范围：为管理员邀请页面提供有类型的分页查询、邀请创建、重发和撤销客户端方法。创建响应中的一次性邀请链接仅作为调用结果返回；客户端不持久化链接或 token。重发请求必须传入调用方生成的稳定 `Idempotency-Key`。本任务不实现邀请页面或公开注册流程。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 邀请状态、记录、分页响应和创建响应具有显式类型；列表过滤与分页参数符合管理员 API。
+- [x] 客户端提供查询、创建、重发和撤销方法；写请求使用现有 same-origin/CSRF 行为，重发正确设置 `Idempotency-Key`。
+- [x] 客户端测试覆盖路径、方法、查询参数、请求体、CSRF 与幂等请求头。
+- [x] 定向 Vitest 与 `pnpm --dir web build` 通过。
+
+短计划：先在 `api-client.test.ts` 添加邀请方法合同并确认 RED；再定义 DTO 类型和四个客户端方法；最后运行定向 Vitest、Web build 与 diff check。
+
+验证（2026-10-20）：新增 API 客户端回归先因列表方法缺失而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 82/82 通过，`pnpm --dir web build`（含 `tsc --noEmit`）与 `git diff --check` 通过。客户端请求字段与管理员邀请 API 的实际 handler/DTO 对齐。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

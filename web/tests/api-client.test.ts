@@ -2310,4 +2310,74 @@ describe("LuxApiClient", () => {
       "/api/v1/items/item-1/danmaku?sourceId=source%20%2F%204k",
     );
   });
+
+  it("sends admin invitation list and lifecycle requests through the typed API client", async () => {
+    const invitation = {
+      id: "invitation-1",
+      recipientEmail: "person@example.test",
+      createdByUserId: "admin-1",
+      acceptedUserId: null,
+      status: "PENDING",
+      presetId: "builtin-user",
+      presetName: "普通用户",
+      presetVersion: 1,
+      expiresAt: 1_800_000_000,
+      acceptedAt: null,
+      revokedAt: null,
+      createdAt: 1_790_000_000,
+      updatedAt: 1_790_000_000,
+    };
+    const page = { invitations: [invitation], page: 2, pageSize: 50, totalCount: 61 };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify(page), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        invitation,
+        invitationUrl: "/register/invitation#token=one-time-token",
+        emailQueued: true,
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ emailQueued: true }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ revoked: true }), { status: 200 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserInvitations({ page: 2, pageSize: 50, status: "pending" }))
+        .resolves.toEqual(page);
+      const [listPath, listOptions] = fetchMock.mock.calls[0] ?? [];
+      const listUrl = new URL(String(listPath), "https://lux.example.test");
+      expect(listUrl.pathname).toBe("/api/v1/admin/user-invitations");
+      expect(listUrl.searchParams.get("page")).toBe("2");
+      expect(listUrl.searchParams.get("pageSize")).toBe("50");
+      expect(listUrl.searchParams.get("status")).toBe("pending");
+      expect(listOptions?.method).toBeUndefined();
+
+      const createInput = { recipientEmail: "person@example.test", presetId: "builtin-user" };
+      await expect(client.createAdminUserInvitation(createInput)).resolves.toMatchObject({
+        invitation,
+        emailQueued: true,
+      });
+      const [createPath, createOptions] = fetchMock.mock.calls[1] ?? [];
+      expect(createPath).toBe("/api/v1/admin/user-invitations");
+      expect(createOptions?.method).toBe("POST");
+      expect(JSON.parse(String(createOptions?.body))).toEqual(createInput);
+      expect((createOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+
+      await expect(client.resendAdminUserInvitation("invitation/1", "retry-key-1"))
+        .resolves.toEqual({ emailQueued: true });
+      const [resendPath, resendOptions] = fetchMock.mock.calls[2] ?? [];
+      expect(resendPath).toBe("/api/v1/admin/user-invitations/invitation%2F1/resend");
+      expect(resendOptions?.method).toBe("POST");
+      expect((resendOptions?.headers as Headers).get("Idempotency-Key")).toBe("retry-key-1");
+      expect((resendOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+
+      await client.revokeAdminUserInvitation("invitation/1");
+      const [revokePath, revokeOptions] = fetchMock.mock.calls[3] ?? [];
+      expect(revokePath).toBe("/api/v1/admin/user-invitations/invitation%2F1/revoke");
+      expect(revokeOptions?.method).toBe("POST");
+      expect((revokeOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    } finally {
+      cookie.restore();
+    }
+  });
 });
