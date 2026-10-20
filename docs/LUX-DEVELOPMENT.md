@@ -16314,6 +16314,24 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：`cargo test --locked --lib storage::repository::mail_outbox_tests` 7/7、忽略的 PostgreSQL 空库专项 `postgres_mail_challenge_migration_applies_to_an_empty_database` 1/1、`cargo build --locked`、fmt 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。测试覆盖两类凭证、错误摘要、到期、撤销、单次消费、数据库列约束和空库迁移。`cargo clippy --locked --lib -- -D warnings` 被 11 项既有诊断阻断，均位于未修改的 admin user API、Emby 播放、user permission copy 与 user storage；本任务文件无新增 Clippy 诊断。未发送邮件。
 
+#### LUX-784：建立可重建的注册邮件凭证
+
+范围：为持久化 mail challenge 提供稳定的 HMAC 凭证派生器，使邮件 worker 在重试或重启后重建同一链接 token，同时数据库只保存摘要。派生密钥单独保存在 config 目录 0600 文件；拒绝符号链接、错误权限或非 32 字节密钥。本任务不接入 SMTP 投递、不创建挑战或业务记录、不开放 API。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mail.rs`（定向测试内置于 mail 模块）。
+
+验收标准：
+
+- [x] 首次读取生成并私有保存 32 字节密钥；后续读取及并发初始化使用同一密钥，拒绝符号链接、错误权限和损坏密钥。
+- [x] 凭证按挑战 ID、类型和过期时间进行 HMAC-SHA256 域隔离，URL-safe 且在进程重启后稳定；其他 ID/类型/过期时间得到不同凭证。
+- [x] 数据库存储摘要由 SHA-256 计算；验证使用常量时间比较；原始 token 不写入文件或日志。
+- [x] 自动化测试覆盖持久化、并发初始化、域隔离、摘要验证和密钥文件权限。
+- [x] 运行 mail 模块定向测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先为稳定派生、密钥文件权限和并发初始化增加失败测试；再实现私有密钥的读写与 HMAC token 派生；最后运行邮件模块测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib application::mail::tests` 9/9、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。测试覆盖首次私有创建、密钥重载稳定性、并发初始化、权限/符号链接/长度拒绝、凭证域隔离、URL-safe 编码、摘要和验证。全目标全 feature Clippy 仍失败于 15 项既有诊断（11 项库代码、4 项测试代码），均位于未修改的管理员 API、Emby 播放、权限复制或用户存储文件；`src/application/mail.rs` 无 Clippy 诊断。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

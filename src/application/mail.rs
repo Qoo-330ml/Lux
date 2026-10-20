@@ -4,23 +4,37 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use lettre::{
     Address, AsyncSmtpTransport, Tokio1Executor, transport::smtp::authentication::Credentials,
 };
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use tokio::{fs, task::spawn_blocking};
 use url::Url;
+
+use crate::storage::MailChallengeKind;
 
 const SMTP_CREDENTIALS_FILE: &str = "smtp_credentials.json";
 const SMTP_SETTINGS_FILE: &str = "smtp_settings.json";
+const MAIL_CHALLENGE_SIGNING_KEY_FILE: &str = "mail_challenge_signing_key";
 const MAX_SMTP_HOST_LENGTH: usize = 253;
 const MAX_SMTP_USERNAME_LENGTH: usize = 320;
 const MAX_SENDER_NAME_LENGTH: usize = 128;
 const MAX_SMTP_PASSWORD_LENGTH: usize = 4_096;
 const SMTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+const MAIL_CHALLENGE_TOKEN_DOMAIN: &[u8] = b"lux-mail-challenge-token-v1\0";
+
+type HmacSha256 = Hmac<Sha256>;
+
+static MAIL_CHALLENGE_SIGNING_KEY_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -121,6 +135,75 @@ pub(crate) enum MailError {
     SettingsNotConfigured,
     ConnectionFailed,
     TransportUnavailable,
+}
+
+pub(crate) struct MailChallengeSigner {
+    key: [u8; 32],
+}
+
+impl MailChallengeSigner {
+    pub(crate) async fn load_or_create(config_dir: &Path) -> io::Result<Self> {
+        fs::create_dir_all(config_dir).await?;
+        let key_path = config_dir.join(MAIL_CHALLENGE_SIGNING_KEY_FILE);
+        let key = spawn_blocking(move || {
+            let _guard = MAIL_CHALLENGE_SIGNING_KEY_LOCK
+                .lock()
+                .map_err(|_| io::Error::other("mail challenge signing key lock failed"))?;
+            read_or_create_mail_challenge_signing_key(&key_path)
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))??;
+        Ok(Self { key })
+    }
+
+    pub(crate) fn token_for(
+        &self,
+        challenge_id: &str,
+        kind: MailChallengeKind,
+        expires_at: i64,
+    ) -> Option<String> {
+        if challenge_id.trim() != challenge_id
+            || !(1..=128).contains(&challenge_id.len())
+            || challenge_id.chars().any(char::is_control)
+            || expires_at < 0
+        {
+            return None;
+        }
+        let mut mac = HmacSha256::new_from_slice(&self.key).ok()?;
+        mac.update(MAIL_CHALLENGE_TOKEN_DOMAIN);
+        mac.update(&(challenge_id.len() as u64).to_be_bytes());
+        mac.update(challenge_id.as_bytes());
+        let kind_tag: &[u8] = match kind {
+            MailChallengeKind::Invitation => b"INVITATION",
+            MailChallengeKind::EmailVerification => b"EMAIL_VERIFICATION",
+        };
+        mac.update(&(kind_tag.len() as u64).to_be_bytes());
+        mac.update(kind_tag);
+        mac.update(&expires_at.to_be_bytes());
+        Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    }
+
+    pub(crate) fn verify(
+        &self,
+        challenge_id: &str,
+        kind: MailChallengeKind,
+        expires_at: i64,
+        supplied_token: &str,
+    ) -> bool {
+        if supplied_token.len() != 43 {
+            return false;
+        }
+        let Some(expected_token) = self.token_for(challenge_id, kind, expires_at) else {
+            return false;
+        };
+        hash_mail_challenge_token(&expected_token)
+            .ct_eq(&hash_mail_challenge_token(supplied_token))
+            .into()
+    }
+}
+
+pub(crate) fn hash_mail_challenge_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 pub(crate) fn build_smtp_transport(
@@ -275,6 +358,95 @@ pub(crate) async fn write_smtp_credentials(
     Ok(())
 }
 
+fn read_or_create_mail_challenge_signing_key(path: &Path) -> io::Result<[u8; 32]> {
+    match read_private_mail_challenge_signing_key(path) {
+        Ok(key) => return Ok(key),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut generated = [0_u8; 32];
+    OsRng.fill_bytes(&mut generated);
+    if create_private_file_if_absent(path, &generated)? {
+        Ok(generated)
+    } else {
+        read_private_mail_challenge_signing_key(path)
+    }
+}
+
+fn read_private_mail_challenge_signing_key(path: &Path) -> io::Result<[u8; 32]> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mail challenge signing key must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "mail challenge signing key permissions must be 0600",
+            ));
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    bytes.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mail challenge signing key has invalid length",
+        )
+    })
+}
+
+fn create_private_file_if_absent(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing key directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid key file name"))?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::now_v7()));
+    let install_result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::File::open(parent)?.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    })();
+    if let Err(error) = std::fs::remove_file(&temporary)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error);
+    }
+    install_result
+}
+
 fn write_private_file_atomically(
     target: &PathBuf,
     temporary: &PathBuf,
@@ -318,9 +490,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MailSettings, SmtpCredentials, SmtpTlsMode, build_smtp_transport, read_mail_settings,
-        read_smtp_credentials, write_mail_settings, write_smtp_credentials,
+        MailChallengeSigner, MailSettings, SmtpCredentials, SmtpTlsMode, build_smtp_transport,
+        hash_mail_challenge_token, read_mail_settings, read_smtp_credentials, write_mail_settings,
+        write_smtp_credentials,
     };
+    use crate::storage::MailChallengeKind;
 
     fn valid_settings() -> MailSettings {
         MailSettings {
@@ -489,5 +663,133 @@ mod tests {
         settings.tls_mode = SmtpTlsMode::StartTls;
         settings.port = 587;
         assert!(build_smtp_transport(&settings, Some(credentials)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_token_is_stable_scoped_and_hashable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let signer = MailChallengeSigner::load_or_create(directory.path())
+            .await
+            .map_err(|_| "mail challenge signer could not be loaded")?;
+        let token = signer
+            .token_for("challenge-1", MailChallengeKind::Invitation, 1234)
+            .ok_or("could not derive invitation token")?;
+        let verification_token = signer
+            .token_for("challenge-1", MailChallengeKind::EmailVerification, 1234)
+            .ok_or("could not derive verification token")?;
+        assert_ne!(token, verification_token);
+        assert_ne!(
+            token,
+            signer
+                .token_for("challenge-2", MailChallengeKind::Invitation, 1234)
+                .ok_or("could not derive second token")?
+        );
+        assert_ne!(
+            token,
+            signer
+                .token_for("challenge-1", MailChallengeKind::Invitation, 1235)
+                .ok_or("could not derive renewed token")?
+        );
+        assert!(signer.verify("challenge-1", MailChallengeKind::Invitation, 1234, &token));
+        assert!(!signer.verify(
+            "challenge-1",
+            MailChallengeKind::Invitation,
+            1234,
+            &verification_token
+        ));
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+        let digest = hash_mail_challenge_token(&token);
+        assert_eq!(digest.len(), 32);
+        assert_ne!(digest.as_slice(), token.as_bytes());
+
+        let loaded_again = MailChallengeSigner::load_or_create(directory.path())
+            .await
+            .map_err(|_| "mail challenge signer could not be reloaded")?;
+        assert_eq!(
+            token,
+            loaded_again
+                .token_for("challenge-1", MailChallengeKind::Invitation, 1234)
+                .ok_or("could not derive reloaded token")?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_mail_challenge_signer_initialization_uses_one_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut loads = Vec::new();
+        for _ in 0..8 {
+            let config_dir = directory.path().to_owned();
+            loads.push(tokio::spawn(async move {
+                MailChallengeSigner::load_or_create(&config_dir).await
+            }));
+        }
+        let mut tokens = Vec::new();
+        for load in loads {
+            let signer = load
+                .await?
+                .map_err(|_| "mail challenge signer could not be loaded")?;
+            tokens.push(
+                signer
+                    .token_for("challenge-1", MailChallengeKind::Invitation, 1234)
+                    .ok_or("could not derive concurrent token")?,
+            );
+        }
+        assert!(tokens.windows(2).all(|pair| pair[0] == pair[1]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_signing_key_is_private_and_rejects_invalid_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let key_path = directory.path().join("mail_challenge_signing_key");
+        MailChallengeSigner::load_or_create(directory.path())
+            .await
+            .map_err(|_| "mail challenge signer could not be loaded")?;
+        let key = tokio::fs::read(&key_path).await?;
+        assert_eq!(key.len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&key_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640))?;
+            assert!(
+                MailChallengeSigner::load_or_create(directory.path())
+                    .await
+                    .is_err()
+            );
+            std::fs::remove_file(&key_path)?;
+            let external_key = directory.path().join("external-key");
+            tokio::fs::write(&external_key, [5_u8; 32]).await?;
+            std::os::unix::fs::symlink(&external_key, &key_path)?;
+            assert!(
+                MailChallengeSigner::load_or_create(directory.path())
+                    .await
+                    .is_err()
+            );
+        }
+        std::fs::remove_file(&key_path)?;
+        tokio::fs::write(&key_path, b"short").await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        assert!(
+            MailChallengeSigner::load_or_create(directory.path())
+                .await
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        Ok(())
     }
 }
