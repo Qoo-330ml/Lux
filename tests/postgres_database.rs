@@ -4066,3 +4066,280 @@ async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_registration_requests_migration_runs_from_empty_and_upgrades_existing_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+
+    let (configuration, database_name) = create_postgres_test_database().await?;
+    let empty_migration_dir = source_dir.clone();
+    let empty_result = tokio::spawn(async move {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(
+                &configuration
+                    .postgres_url()?
+                    .ok_or("missing PostgreSQL URL")?,
+            )
+            .await?;
+        Migrator::new(empty_migration_dir).await?.run(&pool).await?;
+        assert_postgres_registration_request_schema(&pool).await?;
+        pool.close().await;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    if let Err(error) = empty_result? {
+        return Err(error.to_string().into());
+    }
+
+    let temp = tempfile::tempdir()?;
+    let old_migration_dir = temp.path().join("migrations-through-0202");
+    fs::create_dir(&old_migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 202 {
+            fs::copy(entry.path(), old_migration_dir.join(filename))?;
+        }
+    }
+
+    let (configuration, database_name) = create_postgres_test_database().await?;
+    let upgrade_source_dir = source_dir.clone();
+    let upgrade_migration_dir = old_migration_dir.clone();
+    let upgrade_result = tokio::spawn(async move {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(
+                &configuration
+                    .postgres_url()?
+                    .ok_or("missing PostgreSQL URL")?,
+            )
+            .await?;
+        Migrator::new(upgrade_migration_dir)
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('preserved-registration-owner', 'preserved-registration-owner', 'Preserved', 'test-hash')",
+        )
+        .execute(&pool)
+        .await?;
+        Migrator::new(upgrade_source_dir)
+            .await?
+            .run(&pool)
+            .await?;
+        assert_postgres_registration_request_schema(&pool).await?;
+        let preserved_name: String = sqlx::query_scalar(
+            "SELECT display_name FROM users WHERE id = 'preserved-registration-owner'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(preserved_name, "Preserved");
+        pool.close().await;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    if let Err(error) = upgrade_result? {
+        return Err(error.to_string().into());
+    }
+    Ok(())
+}
+
+async fn assert_postgres_registration_request_schema(
+    pool: &sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'user_registration_requests'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(columns.len(), 15);
+    for column in [
+        "id",
+        "recipient_email",
+        "username_normalized",
+        "display_name",
+        "password_hash",
+        "permission_snapshot_json",
+        "status",
+        "expires_at",
+        "email_verified_at",
+        "reviewed_at",
+        "reviewed_by_user_id",
+        "approved_user_id",
+        "last_error_code",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            columns.iter().any(|existing| existing == column),
+            "missing {column}"
+        );
+    }
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema()
+         AND indexname IN (
+             'ux_user_registration_requests_pending_email',
+             'idx_user_registration_requests_status_created',
+             'idx_user_registration_requests_expiry'
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(index_count, 3);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('registration-reviewer', 'registration-reviewer', 'Reviewer', 'test-hash')",
+    )
+    .execute(pool)
+    .await?;
+    let insert = "INSERT INTO user_registration_requests (
+        id, recipient_email, username_normalized, display_name, password_hash,
+        permission_snapshot_json, expires_at, created_at, updated_at
+    ) VALUES ($1, 'registration@example.test', 'registration-user', 'Registration User',
+        '$argon2id$test-hash', '{}', 20, 10, 10)";
+    sqlx::query(insert)
+        .bind("registration-main")
+        .execute(pool)
+        .await?;
+    assert!(
+        sqlx::query(insert)
+            .bind("registration-duplicate")
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    for (query, value) in [
+        (
+            "UPDATE user_registration_requests SET recipient_email = $1 WHERE id = 'registration-main'",
+            "UPPER@example.test",
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = $1 WHERE id = 'registration-main'",
+            "plaintext",
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = $1 WHERE id = 'registration-main'",
+            "$ARGON2ID$test-hash",
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = $1 WHERE id = 'registration-main'",
+            "[]",
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = $1 WHERE id = 'registration-main'",
+            "not-json",
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = $1 WHERE id = 'registration-main'",
+            &format!(r#"{{"x":"{}"}}"#, "界".repeat(12_000)),
+        ),
+    ] {
+        assert!(
+            sqlx::query(query).bind(value).execute(pool).await.is_err(),
+            "accepted invalid update: {query}"
+        );
+    }
+    for query in [
+        "UPDATE user_registration_requests SET id = repeat('x', 129) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET recipient_email = repeat('x', 255) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET recipient_email = ' registration@example.test' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET username_normalized = repeat('x', 129) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET display_name = repeat('x', 129) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'UNKNOWN' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'PENDING_APPROVAL' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'REJECTED' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET password_hash = NULL WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET expires_at = 10 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET updated_at = 9 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET email_verified_at = 9 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET reviewed_by_user_id = 'unknown' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET last_error_code = 'private error' WHERE id = 'registration-main'",
+    ] {
+        assert!(
+            sqlx::query(query).execute(pool).await.is_err(),
+            "accepted invalid transition: {query}"
+        );
+    }
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'PENDING_APPROVAL', email_verified_at = 11, updated_at = 11
+         WHERE id = 'registration-main'",
+    )
+    .execute(pool)
+    .await?;
+    assert!(
+        sqlx::query(insert)
+            .bind("registration-approval-duplicate")
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'REJECTED', reviewed_at = 12, updated_at = 12,
+             reviewed_by_user_id = 'registration-reviewer', password_hash = NULL
+         WHERE id = 'registration-main'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(insert)
+        .bind("registration-next")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'APPROVED', email_verified_at = 11, reviewed_at = 12, updated_at = 12,
+             reviewed_by_user_id = 'registration-reviewer', approved_user_id = 'registration-reviewer',
+             password_hash = NULL
+         WHERE id = 'registration-next'",
+    )
+    .execute(pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "UPDATE user_registration_requests SET approved_user_id = 'unknown'
+             WHERE id = 'registration-next'",
+        )
+        .execute(pool)
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'registration-reviewer'")
+        .execute(pool)
+        .await?;
+    let cleared_user_refs: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT reviewed_by_user_id, approved_user_id
+         FROM user_registration_requests WHERE id = 'registration-next'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(cleared_user_refs, (None, None));
+    sqlx::query(insert)
+        .bind("registration-expired")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'EXPIRED', updated_at = 21, password_hash = NULL
+         WHERE id = 'registration-expired'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}

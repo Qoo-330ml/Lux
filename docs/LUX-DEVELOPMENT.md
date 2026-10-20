@@ -16721,10 +16721,14 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] PostgreSQL 空库与当前 schema 均可迁移；约束、索引和外键动作与 SQLite 等价。
-- [ ] 本机 PostgreSQL 定向迁移回归、build、fmt 与 diff check 通过。
+- [x] PostgreSQL 空库与当前 schema 均可迁移；约束、索引和外键动作与 SQLite 等价。
+- [x] 本机 PostgreSQL 定向迁移回归、build、fmt 与 diff check 通过。
 
 短计划：先增加 PostgreSQL schema 断言并确认 RED；再添加 migration；最后运行本机隔离数据库测试和常规检查。
+
+实施结果（2026-10-20）：新增 PostgreSQL 申请表 migration，与 SQLite 保持相同列、状态和时间约束、Argon2id 前缀检查、JSON 对象及 32 KiB 限制、pending 邮箱唯一索引、到期/分页索引和两个 `ON DELETE SET NULL` 外键。
+
+验证：TDD RED 在空库迁移后确认申请表缺失；实现后本机 PostgreSQL 定向回归以两个隔离数据库分别验证空库和从 0202 升级，覆盖 schema、约束、索引、状态唯一性、终态释放邮箱和外键清空，1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；Cargo 使用 Toshiba target，本机 arm64。`cargo clippy --locked --test postgres_database -- -D warnings` 因 11 项现有诊断失败，均位于本任务未修改文件；本次 migration 与测试没有对应告警。未实现申请业务逻辑。
 
 #### LUX-807：建立注册申请原子存储合同
 
