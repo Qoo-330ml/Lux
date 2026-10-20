@@ -39,6 +39,10 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - 远程请求只需通过用户认证和媒体库 ACL；Lux 不再依据来源 IP 或 `can_remote_access` 阻止反代后的请求。
 - 登录失败按来源和用户名限流；失败响应不区分用户不存在、密码错误或暂时封锁。
 - `GET /api/v1/auth/me`：读取当前 Web session，返回用户和权限。
+- `GET /api/v1/auth/profile`：需要当前 Web session，只返回当前账户资料；`user` 包含当前邮箱、`emailVerifiedAt` 和可空的 `pendingEmail`，不会读取其他用户的待验证地址。响应设置 `Cache-Control: no-store`。
+- `PATCH /api/v1/auth/profile`：需要当前 Web session 与 `X-CSRF-Token`，接受可选的 `displayName` 和 `email`。未提供 `email` 或将其设为 `null` 时不修改邮箱；提交新的非空邮箱会创建 24 小时有效的验证 challenge 并排队发送邮件；成功响应仍返回当前已保存邮箱，同时用 `pendingEmail` 显示待验证目标。邮箱只在当前用户提交有效 token 后更新。提交空字符串可清除当前邮箱，并在同一存储事务中撤销未消费验证 challenge、取消关联的待发送邮件。重复的当前已验证邮箱不创建 challenge；无效邮箱返回 `400 INVALID_REQUEST`，请求过频返回 `429 RATE_LIMITED`，验证签名/存储不可用返回 `503`。邮箱冲突在验证时与其他不可接受凭证一样返回固定 `400 INVALID_REQUEST`。响应设置 `Cache-Control: no-store`。
+- `POST /api/v1/auth/profile/email-verification/resend`：需要当前 Web session 与 `X-CSRF-Token`，无请求体。为当前账户的待验证邮箱重新排队验证邮件并撤销旧 challenge；若读取后 challenge 已被替换或消费，则不创建邮件。无论有无待验证地址都返回 `202 { "accepted": true }`，不泄漏账户邮箱状态；响应设置 `Cache-Control: no-store`。请求过频返回 `429 RATE_LIMITED`。
+- `POST /api/v1/auth/profile/email-verification/verify`：需要当前 Web session 与 `X-CSRF-Token`，JSON 请求体 `{ "token": "<验证凭证>" }`，最多 16 KiB。只消费当前登录账户的有效 challenge；成功返回 `200 { "verified": true }`，响应禁止缓存。跨账户、无效、过期、重放及邮箱冲突统一返回固定 `400 INVALID_REQUEST`。Token 不得放入 URL/query。
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
 - `PATCH /api/v1/auth/password`：需要当前 Web session 和 `X-CSRF-Token`，不接受用户级客户端令牌。请求体为 `{ "currentPassword": "旧密码", "newPassword": "新密码" }`；当前密码验证成功后写入新的 Argon2id 哈希，成功返回 204，当前密码错误返回 `401 INVALID_CREDENTIALS`。
 

@@ -46,8 +46,29 @@ impl Error for UserEmailVerificationError {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PendingUserEmailChange {
+    pub(crate) challenge_id: String,
     pub(crate) pending_email: String,
     pub(crate) expires_at: i64,
+}
+
+pub(crate) async fn clear_user_email_change(
+    database: &Database,
+    user_id: &str,
+    now: i64,
+) -> Result<(), UserEmailVerificationError> {
+    if now < 0
+        || user_id.trim() != user_id
+        || !(1..=128).contains(&user_id.len())
+        || user_id.chars().any(char::is_control)
+    {
+        return Err(UserEmailVerificationError::InvalidInput);
+    }
+    database
+        .clear_user_email_change(user_id, now)
+        .await
+        .map_err(|_| UserEmailVerificationError::StorageUnavailable)?
+        .then_some(())
+        .ok_or(UserEmailVerificationError::NotAcceptable)
 }
 
 pub(crate) async fn request_user_email_change(
@@ -58,6 +79,49 @@ pub(crate) async fn request_user_email_change(
     email: &str,
     now: i64,
 ) -> Result<PendingUserEmailChange, UserEmailVerificationError> {
+    request_user_email_change_with_expected_pending(
+        database,
+        config_dir,
+        rate_limiter,
+        user_id,
+        email,
+        None,
+        now,
+    )
+    .await?
+    .ok_or(UserEmailVerificationError::NotAcceptable)
+}
+
+pub(crate) async fn resend_user_email_change(
+    database: &Database,
+    config_dir: &Path,
+    rate_limiter: &DevicePairingRateLimiter,
+    user_id: &str,
+    pending: &PendingUserEmailChange,
+    now: i64,
+) -> Result<(), UserEmailVerificationError> {
+    request_user_email_change_with_expected_pending(
+        database,
+        config_dir,
+        rate_limiter,
+        user_id,
+        &pending.pending_email,
+        Some(&pending.challenge_id),
+        now,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn request_user_email_change_with_expected_pending(
+    database: &Database,
+    config_dir: &Path,
+    rate_limiter: &DevicePairingRateLimiter,
+    user_id: &str,
+    email: &str,
+    expected_pending_challenge_id: Option<&str>,
+    now: i64,
+) -> Result<Option<PendingUserEmailChange>, UserEmailVerificationError> {
     if now < 0
         || user_id.trim() != user_id
         || !(1..=128).contains(&user_id.len())
@@ -72,9 +136,11 @@ pub(crate) async fn request_user_email_change(
         .map_err(|_| UserEmailVerificationError::StorageUnavailable)?
         .filter(|user| !user.is_disabled && user.deleted_at.is_none())
         .ok_or(UserEmailVerificationError::NotAcceptable)?;
-    if user.email.as_deref().is_some_and(|current| {
-        user.email_verified_at.is_some() && current.eq_ignore_ascii_case(&pending_email)
-    }) {
+    if expected_pending_challenge_id.is_none()
+        && user.email.as_deref().is_some_and(|current| {
+            user.email_verified_at.is_some() && current.eq_ignore_ascii_case(&pending_email)
+        })
+    {
         return Err(UserEmailVerificationError::NotAcceptable);
     }
 
@@ -128,15 +194,20 @@ pub(crate) async fn request_user_email_change(
                 reference_id: &challenge_id,
                 available_at: now,
             },
+            expected_pending_challenge_id,
             now,
         )
         .await
         .map_err(|_| UserEmailVerificationError::StorageUnavailable)?
     {
-        UserEmailChangeCreateResult::Created => Ok(PendingUserEmailChange {
+        UserEmailChangeCreateResult::Created => Ok(Some(PendingUserEmailChange {
+            challenge_id,
             pending_email,
             expires_at,
-        }),
+        })),
+        UserEmailChangeCreateResult::NotAcceptable if expected_pending_challenge_id.is_some() => {
+            Ok(None)
+        }
         UserEmailChangeCreateResult::NotAcceptable => {
             Err(UserEmailVerificationError::NotAcceptable)
         }
@@ -160,6 +231,7 @@ pub(crate) async fn pending_user_email_change(
         .await
         .map(|challenge| {
             challenge.map(|challenge| PendingUserEmailChange {
+                challenge_id: challenge.id,
                 pending_email: challenge.recipient_email,
                 expires_at: challenge.expires_at,
             })

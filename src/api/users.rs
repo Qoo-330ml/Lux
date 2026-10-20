@@ -10,6 +10,10 @@ use crate::{
         AccountPreferencesError, UpdateAccountPreferences, get_account_preferences,
         update_account_preferences,
     },
+    application::user_email_verification::{
+        UserEmailVerificationError, clear_user_email_change, pending_user_email_change,
+        request_user_email_change, resend_user_email_change, verify_user_email_change,
+    },
     application::user_invitations::{
         AcceptUserInvitationInput, UserInvitationAcceptanceError, accept_user_invitation,
     },
@@ -1153,6 +1157,44 @@ fn user_registration_error(headers: &HeaderMap, error: UserRegistrationError) ->
     }
 }
 
+fn user_email_verification_error(
+    headers: &HeaderMap,
+    error: UserEmailVerificationError,
+) -> Response {
+    match error {
+        UserEmailVerificationError::InvalidEmail
+        | UserEmailVerificationError::InvalidInput
+        | UserEmailVerificationError::NotAcceptable => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "邮箱验证请求无效或已失效",
+        )
+        .into_response(),
+        UserEmailVerificationError::RateLimited => api_error(
+            headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            lux::ApiErrorCode::RateLimited,
+            "邮箱验证请求过于频繁，请稍后重试",
+        )
+        .into_response(),
+        UserEmailVerificationError::SigningUnavailable => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "邮箱验证服务暂时不可用",
+        )
+        .into_response(),
+        UserEmailVerificationError::StorageUnavailable => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "邮箱验证服务暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
 fn registration_request_body_error(headers: &HeaderMap, too_large: bool) -> Response {
     if too_large {
         api_error(
@@ -1422,10 +1464,14 @@ pub(super) struct AuthProfilePatch {
     email: Option<String>,
 }
 
-fn account_profile_json(profile: &crate::auth::users::AdminUserProfile) -> Value {
+fn account_profile_json(
+    profile: &crate::auth::users::AdminUserProfile,
+    pending_email: Option<&str>,
+) -> Value {
     let mut user = user_json(&profile.user);
     user["email"] = json!(profile.email);
     user["emailVerifiedAt"] = json!(profile.email_verified_at);
+    user["pendingEmail"] = json!(pending_email);
     json!({ "user": user })
 }
 
@@ -1445,7 +1491,23 @@ pub(super) async fn auth_account_profile(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users.find_admin_profile_by_id(&user.id.to_string()).await {
-        Ok(Some(profile)) => Json(account_profile_json(&profile)).into_response(),
+        Ok(Some(profile)) => {
+            let pending_email = match pending_user_email_change(
+                database,
+                &user.id.to_string(),
+                super::playback::current_unix_timestamp(),
+            )
+            .await
+            {
+                Ok(pending) => pending.map(|pending| pending.pending_email),
+                Err(error) => return user_email_verification_error(&headers, error),
+            };
+            (
+                [("Cache-Control", "no-store")],
+                Json(account_profile_json(&profile, pending_email.as_deref())),
+            )
+                .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -1467,41 +1529,179 @@ pub(super) async fn auth_update_account_profile(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let email = request.email.as_deref().map(|email| {
-        let email = email.trim();
-        if email.is_empty() { None } else { Some(email) }
-    });
-    match users
-        .update_profile(
-            &session.user.id.to_string(),
-            request.display_name.as_deref(),
-            email,
-        )
-        .await
+    let user_id = session.user.id.to_string();
+    let current_profile = match users.find_admin_profile_by_id(&user_id).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if let Some(email) = request.email.as_deref().map(str::trim) {
+        if email.is_empty() {
+            if let Err(error) = clear_user_email_change(
+                database,
+                &user_id,
+                super::playback::current_unix_timestamp(),
+            )
+            .await
+            {
+                return user_email_verification_error(&headers, error);
+            }
+        } else {
+            let is_unchanged_verified_email =
+                current_profile.email.as_deref().is_some_and(|current| {
+                    current_profile.email_verified_at.is_some()
+                        && current.eq_ignore_ascii_case(email)
+                });
+            if !is_unchanged_verified_email {
+                let Some(config_dir) = state.config_dir.as_deref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                if let Err(error) = request_user_email_change(
+                    database,
+                    config_dir,
+                    &state.device_pairing_rate_limiter,
+                    &user_id,
+                    email,
+                    super::playback::current_unix_timestamp(),
+                )
+                .await
+                {
+                    return user_email_verification_error(&headers, error);
+                }
+            }
+        }
+    }
+    let profile = if let Some(display_name) = request.display_name.as_deref() {
+        match users
+            .update_profile(&user_id, Some(display_name), None)
+            .await
+        {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "账户资料暂时无法保存",
+                )
+                .into_response();
+            }
+        }
+    } else {
+        match users.find_admin_profile_by_id(&user_id).await {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    };
+    let pending_email = match pending_user_email_change(
+        database,
+        &user_id,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
     {
-        Ok(Some(profile)) => Json(account_profile_json(&profile)).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(UserStoreError::InvalidEmail) => api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "邮箱格式无效",
+        Ok(pending) => pending.map(|pending| pending.pending_email),
+        Err(error) => return user_email_verification_error(&headers, error),
+    };
+    (
+        [("Cache-Control", "no-store")],
+        Json(account_profile_json(&profile, pending_email.as_deref())),
+    )
+        .into_response()
+}
+
+pub(super) async fn auth_resend_account_email_change(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user_id = session.user.id.to_string();
+    let pending = match pending_user_email_change(
+        database,
+        &user_id,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(pending) => pending,
+        Err(error) => return user_email_verification_error(&headers, error),
+    };
+    let Some(pending) = pending else {
+        return (
+            StatusCode::ACCEPTED,
+            [("Cache-Control", "no-store")],
+            Json(json!({ "accepted": true })),
         )
-        .into_response(),
-        Err(UserStoreError::Storage(error)) if error.is_unique_violation() => api_error(
-            &headers,
-            StatusCode::CONFLICT,
-            lux::ApiErrorCode::InvalidRequest,
-            "该邮箱已被其他账户使用",
+            .into_response();
+    };
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match resend_user_email_change(
+        database,
+        config_dir,
+        &state.device_pairing_rate_limiter,
+        &user_id,
+        &pending,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            [("Cache-Control", "no-store")],
+            Json(json!({ "accepted": true })),
         )
-        .into_response(),
-        Err(_) => api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "账户资料暂时无法保存",
+            .into_response(),
+        Err(error) => user_email_verification_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthAccountEmailVerificationRequest {
+    token: String,
+}
+
+pub(super) async fn auth_verify_account_email_change(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AuthAccountEmailVerificationRequest>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match verify_user_email_change(
+        database,
+        config_dir,
+        &session.user.id.to_string(),
+        &request.token,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            [("Cache-Control", "no-store")],
+            Json(json!({ "verified": true })),
         )
-        .into_response(),
+            .into_response(),
+        Err(error) => user_email_verification_error(&headers, error),
     }
 }
 
@@ -2969,6 +3169,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/profile",
             get(users::auth_account_profile).patch(users::auth_update_account_profile),
+        )
+        .route(
+            "/api/v1/auth/profile/email-verification/resend",
+            post(users::auth_resend_account_email_change),
+        )
+        .route(
+            "/api/v1/auth/profile/email-verification/verify",
+            post(users::auth_verify_account_email_change).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/auth/device-pairings",

@@ -16961,15 +16961,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：新增受会话认证和 CSRF 保护的邮箱验证邮件创建、重发及 token 消费 API。endpoint 仅接受当前用户对应的 challenge；邮件发送失败不改变当前邮箱。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+预计修改文件（7 个，按邮箱清除和重发并发两个切片实施）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`src/application/user_email_verification.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`tests/users.rs`。
 
 验收标准：
 
-- [ ] 未认证/缺失 CSRF 请求拒绝；申请/验证结果不泄漏其他用户或邮箱状态。
-- [ ] 仅当前用户的有效 challenge 可更新邮箱；成功、过期、重放、冲突与发送限额均有 HTTP 回归。
-- [ ] 定向集成目标、build、fmt 与 diff check 通过，API 文档更新。
+- [x] 未认证/缺失 CSRF 请求拒绝；申请/验证结果不泄漏其他用户或邮箱状态。
+- [x] 仅当前用户的有效 challenge 可更新邮箱；成功、清空邮箱、过期、重放、冲突与发送限额均有 HTTP 回归；跨账户和限流失败不改变 challenge/outbox 状态。
+- [x] 定向集成目标、build、fmt 与 diff check 通过，API 文档更新。
 
-短计划：先添加账户资料/验证 HTTP 回归并确认路由缺失；再连接 LUX-815 service；最后运行 `tests/users` 定向目标和常规检查。
+短计划：先添加账户资料/验证 HTTP 回归并确认路由缺失；再连接 LUX-815 service；随后用存储事务恢复安全的邮箱清空语义，并让重发按读取到的 challenge ID 做事务内比较；最后运行 `tests/users`、双后端存储回归和常规检查。
+
+实施结果（2026-10-20）：账户资料 PATCH 的非空邮箱变更现在创建 24 小时有效的验证 challenge，并通过持久邮件 outbox 投递；验证前保留当前邮箱，资料响应仅向当前 Web session 返回 `pendingEmail`。显式提交空字符串会在单个存储事务中清空邮箱及验证时间、撤销未消费 challenge 并取消相关待发送邮件；未提供或传 `null` 不修改邮箱。重发携带读取到的 pending challenge ID，存储事务再次确认它仍是当前有效 challenge 后才创建新邮件，因此与较新的邮箱请求或并发重发冲突时不会覆盖新状态；响应仍保持固定 202。Token 只从受会话和 CSRF 保护的 JSON 请求体消费。邮箱资料 GET/PATCH 与验证响应均禁止缓存；无效、跨账户、过期、重放及邮箱冲突使用同一固定错误。
+
+验证：TDD 先确认新路由缺失；清空邮箱回归先稳定复现 400，加入事务实现后通过，并覆盖旧 token 不能恢复邮箱及名称仍可更新。串行 `cargo test --locked --test users -- --test-threads=1` 32/32、`cargo test --locked --lib application::user_email_verification` 3/3、SQLite `user_email_change_storage_contract` 1/1、PostgreSQL `postgres_user_email_change_storage_contract_is_atomic -- --include-ignored` 1/1 通过；回归包含 challenge ID 竞态、跨账户不变及 429 不写入 challenge/outbox。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 仍失败于 19 项其他未修改位置的告警（管理员 API、Emby/media/playback、权限复制、用户存储、注册测试、数据库维护及存储测试）；LUX-816 新增/修改行未产生诊断。Cargo 使用 Toshiba 共享 target，本机 `arm64`；未连接真实 SMTP，未在 FNOS/x86_64 部署。
 
 #### LUX-817：为账户页接入邮箱验证
 

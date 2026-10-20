@@ -29512,6 +29512,7 @@ async fn exercise_user_email_change_storage_contract(
                 reference_id: "email-request-first",
                 available_at: 100,
             },
+            None,
             100,
         )
         .await?;
@@ -29559,6 +29560,7 @@ async fn exercise_user_email_change_storage_contract(
                     reference_id: "email-request-second",
                     available_at: 200,
                 },
+                None,
                 200,
             )
             .await?,
@@ -29580,6 +29582,98 @@ async fn exercise_user_email_change_storage_contract(
         .await?
         .ok_or("second pending email change was not found")?;
     assert_eq!(second_pending.recipient_email, "request-next@example.test");
+
+    let stale_resend_hash = [10_u8; 32];
+    assert_eq!(
+        database
+            .create_user_email_change_with_mail(
+                "email-request",
+                NewMailChallenge {
+                    id: "email-request-stale-resend",
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "request-new@example.test",
+                    reference_id: "email-request",
+                    token_hash: &stale_resend_hash,
+                    expires_at: 3_900,
+                },
+                NewMailOutboxMessage {
+                    idempotency_key: "email-request-mail-stale-resend",
+                    recipient_email: "request-new@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: "email-request-stale-resend",
+                    available_at: 300,
+                },
+                Some("email-request-first"),
+                300,
+            )
+            .await?,
+        UserEmailChangeCreateResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .get_mail_challenge("email-request-stale-resend")
+            .await?
+            .map(|challenge| challenge.id),
+        None
+    );
+    let stale_outbox_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM mail_outbox WHERE idempotency_key = ?")
+        .bind("email-request-mail-stale-resend")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(stale_outbox_count, 0);
+    let still_pending = database
+        .get_pending_user_email_change("email-request", 301)
+        .await?
+        .ok_or("pending email change disappeared after stale resend")?;
+    assert_eq!(still_pending.id, "email-request-second");
+    assert_eq!(still_pending.recipient_email, "request-next@example.test");
+
+    seed_email_change_user(database, "email-clear", "clear-old@example.test", 100).await?;
+    let clear_hash = [11_u8; 32];
+    assert_eq!(
+        database
+            .create_user_email_change_with_mail(
+                "email-clear",
+                NewMailChallenge {
+                    id: "email-clear-challenge",
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "clear-pending@example.test",
+                    reference_id: "email-clear",
+                    token_hash: &clear_hash,
+                    expires_at: 3_700,
+                },
+                NewMailOutboxMessage {
+                    idempotency_key: "email-clear-outbox",
+                    recipient_email: "clear-pending@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: "email-clear-challenge",
+                    available_at: 100,
+                },
+                None,
+                100,
+            )
+            .await?,
+        UserEmailChangeCreateResult::Created
+    );
+    assert!(database.clear_user_email_change("email-clear", 150).await?);
+    let cleared_user: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-clear")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cleared_user, (None, None));
+    let cleared_challenge = database
+        .get_mail_challenge("email-clear-challenge")
+        .await?
+        .ok_or("cleared email challenge disappeared")?;
+    assert_eq!(cleared_challenge.revoked_at, Some(150));
+    let cleared_outbox_status: String = database
+        .query_scalar("SELECT status FROM mail_outbox WHERE idempotency_key = ?")
+        .bind("email-clear-outbox")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cleared_outbox_status, "FAILED");
     Ok(())
 }
 

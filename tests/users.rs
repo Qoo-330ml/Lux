@@ -3560,6 +3560,507 @@ async fn admin_user_profile_api_normalizes_email_and_preserves_verification_stat
 }
 
 #[tokio::test]
+async fn auth_account_profile_can_clear_email_and_revoke_pending_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let config_dir = config.config_dir.clone();
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Email Clear Owner", "Email Clear Owner", "owner password")
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "email clear owner",
+            "password": "owner password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let profile_url = format!("{base_url}/api/v1/auth/profile");
+    let profile = client
+        .get(&profile_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let user_id = profile["user"]["id"]
+        .as_str()
+        .ok_or("missing account user id")?;
+    sqlx::query(
+        "UPDATE users SET email = 'old-address@example.test',
+         email_verified_at = unixepoch() WHERE id = ?",
+    )
+    .bind(user_id)
+    .execute(database.pool())
+    .await?;
+
+    let pending = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": "pending-address@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(pending.status(), reqwest::StatusCode::OK);
+    let challenge: (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'pending-address@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_one(database.pool())
+    .await?;
+    let token = registration_verification_token(&config_dir, &challenge.0, challenge.1)?;
+
+    let cleared = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "email": "",
+            "displayName": "Cleared Email Owner"
+        }))
+        .send()
+        .await?;
+    assert_eq!(cleared.status(), reqwest::StatusCode::OK);
+    let cleared_user = cleared.json::<Value>().await?["user"].clone();
+    assert_eq!(cleared_user["email"], Value::Null);
+    assert_eq!(cleared_user["emailVerifiedAt"], Value::Null);
+    assert_eq!(cleared_user["pendingEmail"], Value::Null);
+    assert_eq!(cleared_user["displayName"], "Cleared Email Owner");
+
+    let revoked: (Option<i64>, String) = sqlx::query_as(
+        "SELECT c.revoked_at, o.status FROM mail_challenges c
+         JOIN mail_outbox o ON o.reference_id = c.id WHERE c.id = ?",
+    )
+    .bind(&challenge.0)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(revoked.0.is_some());
+    assert_eq!(revoked.1, "FAILED");
+
+    let stale_verification = client
+        .post(format!(
+            "{base_url}/api/v1/auth/profile/email-verification/verify"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": token }))
+        .send()
+        .await?;
+    assert_eq!(
+        stale_verification.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let final_profile = client
+        .get(&profile_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(final_profile["user"]["email"], Value::Null);
+    assert_eq!(final_profile["user"]["pendingEmail"], Value::Null);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_account_email_verification_requires_session_csrf_and_scopes_tokens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let config_dir = config.config_dir.clone();
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Email Owner", "Email Owner", "owner password")
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let verify_url = format!("{base_url}/api/v1/auth/profile/email-verification/verify");
+    let resend_url = format!("{base_url}/api/v1/auth/profile/email-verification/resend");
+
+    let unauthenticated = client
+        .post(&verify_url)
+        .json(&json!({ "token": "invalid-token" }))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "email owner",
+            "password": "owner password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let profile_url = format!("{base_url}/api/v1/auth/profile");
+
+    let missing_csrf = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .json(&json!({ "email": "new-address@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let missing_verify_csrf = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .json(&json!({ "token": "invalid-token" }))
+        .send()
+        .await?;
+    assert_eq!(missing_verify_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let missing_resend_csrf = client
+        .post(&resend_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_resend_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let request = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": " New-Address@Example.Test " }))
+        .send()
+        .await?;
+    assert_eq!(request.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        request
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let user_id = request.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing account user id")?
+        .to_owned();
+    let pending_profile = client
+        .get(&profile_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(pending_profile.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        pending_profile
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let pending_user = pending_profile.json::<Value>().await?["user"].clone();
+    assert_eq!(pending_user["email"], Value::Null);
+    assert_eq!(pending_user["emailVerifiedAt"], Value::Null);
+    assert_eq!(pending_user["pendingEmail"], "new-address@example.test");
+
+    let first_challenge: (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'new-address@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    let first_token =
+        registration_verification_token(&config_dir, &first_challenge.0, first_challenge.1)?;
+
+    let second_user = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "second-email-owner",
+            "displayName": "Second Email Owner",
+            "password": "second password",
+            "email": "claimed-address@example.test"
+        }))
+        .send()
+        .await?;
+    assert_eq!(second_user.status(), reqwest::StatusCode::CREATED);
+    let second_user_id = second_user.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing second user id")?
+        .to_owned();
+    let second_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "second-email-owner",
+            "password": "second password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(second_login.status(), reqwest::StatusCode::OK);
+    let second_cookie = cookie_pair(second_login.headers());
+    let second_csrf = cookie_value(second_login.headers(), "lux_csrf");
+    let second_request = client
+        .patch(&profile_url)
+        .header(COOKIE, &second_cookie)
+        .header("x-csrf-token", &second_csrf)
+        .json(&json!({ "email": "second-new-address@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(second_request.status(), reqwest::StatusCode::OK);
+    let second_challenge: (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'second-new-address@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&second_user_id)
+    .fetch_one(database.pool())
+    .await?;
+    let second_token =
+        registration_verification_token(&config_dir, &second_challenge.0, second_challenge.1)?;
+    let cross_account = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": second_token }))
+        .send()
+        .await?;
+    assert_eq!(cross_account.status(), reqwest::StatusCode::BAD_REQUEST);
+    let cross_account_error = cross_account.json::<Value>().await?["error"].clone();
+    let second_profile = client
+        .get(&profile_url)
+        .header(COOKIE, &second_cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(
+        second_profile["user"]["email"],
+        "claimed-address@example.test"
+    );
+    assert_eq!(second_profile["user"]["emailVerifiedAt"], Value::Null);
+    assert_eq!(
+        second_profile["user"]["pendingEmail"],
+        "second-new-address@example.test"
+    );
+    let second_challenge_state: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT consumed_at, revoked_at FROM mail_challenges WHERE id = ?")
+            .bind(&second_challenge.0)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(second_challenge_state, (None, None));
+
+    let resend = client
+        .post(&resend_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(resend.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(resend.json::<Value>().await?["accepted"], true);
+    let stale_token = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": first_token }))
+        .send()
+        .await?;
+    assert_eq!(stale_token.status(), reqwest::StatusCode::BAD_REQUEST);
+    let stale_token_error = stale_token.json::<Value>().await?["error"].clone();
+    assert_eq!(stale_token_error["code"], cross_account_error["code"]);
+    assert_eq!(stale_token_error["message"], cross_account_error["message"]);
+
+    let resent_challenge: (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'new-address@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'
+           AND consumed_at IS NULL AND revoked_at IS NULL
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    let resent_token =
+        registration_verification_token(&config_dir, &resent_challenge.0, resent_challenge.1)?;
+    let verified = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": resent_token }))
+        .send()
+        .await?;
+    assert_eq!(verified.status(), reqwest::StatusCode::OK);
+    assert_eq!(verified.json::<Value>().await?["verified"], true);
+    let replay = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": resent_token }))
+        .send()
+        .await?;
+    assert_eq!(replay.status(), reqwest::StatusCode::BAD_REQUEST);
+    let replay_error = replay.json::<Value>().await?["error"].clone();
+    assert_eq!(replay_error["code"], cross_account_error["code"]);
+    assert_eq!(replay_error["message"], cross_account_error["message"]);
+
+    let expired_request = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": "expired-address@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(expired_request.status(), reqwest::StatusCode::OK);
+    let expired_challenge: (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'expired-address@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    let expired_token =
+        registration_verification_token(&config_dir, &expired_challenge.0, expired_challenge.1)?;
+    sqlx::query(
+        "UPDATE mail_challenges
+         SET created_at = unixepoch() - 7200, expires_at = unixepoch() - 3600
+         WHERE id = ?",
+    )
+    .bind(&expired_challenge.0)
+    .execute(database.pool())
+    .await?;
+    let expired = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": expired_token }))
+        .send()
+        .await?;
+    assert_eq!(expired.status(), reqwest::StatusCode::BAD_REQUEST);
+    let expired_error = expired.json::<Value>().await?["error"].clone();
+    assert_eq!(expired_error["code"], cross_account_error["code"]);
+    assert_eq!(expired_error["message"], cross_account_error["message"]);
+
+    let conflicting_request = client
+        .patch(&profile_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "email": "claimed-address@example.test" }))
+        .send()
+        .await?;
+    assert_eq!(conflicting_request.status(), reqwest::StatusCode::OK);
+    let conflicting_challenge: (String, i64) = sqlx::query_as(
+        "SELECT id, expires_at FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'claimed-address@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    let conflicting_token = registration_verification_token(
+        &config_dir,
+        &conflicting_challenge.0,
+        conflicting_challenge.1,
+    )?;
+    let conflict = client
+        .post(&verify_url)
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "token": conflicting_token }))
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), reqwest::StatusCode::BAD_REQUEST);
+    let conflict_error = conflict.json::<Value>().await?["error"].clone();
+    assert_eq!(conflict_error["code"], cross_account_error["code"]);
+    assert_eq!(conflict_error["message"], cross_account_error["message"]);
+
+    for email in ["rate-five@example.test", "rate-six@example.test"] {
+        let response = client
+            .patch(&profile_url)
+            .header(COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "email": email }))
+            .send()
+            .await?;
+        if email.starts_with("rate-five") {
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        } else {
+            assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+    let limited_challenge_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mail_challenges
+         WHERE reference_id = ? AND recipient_email = 'rate-six@example.test'
+           AND challenge_kind = 'EMAIL_VERIFICATION'",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(limited_challenge_count, 0);
+    let limited_outbox_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mail_outbox
+         WHERE recipient_email = 'rate-six@example.test'
+           AND template_kind = 'EMAIL_VERIFICATION'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(limited_outbox_count, 0);
+
+    let final_profile = client
+        .get(&profile_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    let final_user = final_profile.json::<Value>().await?["user"].clone();
+    assert_eq!(final_user["email"], "new-address@example.test");
+    assert!(final_user["emailVerifiedAt"].is_number());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_read_content_restriction_index_readiness()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
