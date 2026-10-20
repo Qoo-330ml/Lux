@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaActor, MediaItem, MediaSource } from "../../lib/api/types";
+import { useSseConnectionState } from "../activity/useUserEvents";
 import { detailAddedAt, useSeriesContext } from "./MediaDetailHero";
 import { mediaTitle } from "../home/media-display";
 import { MediaCast } from "./MediaCast";
@@ -16,10 +17,12 @@ export const MediaCastSection = memo(function MediaCastSection({ actors }: { act
 });
 
 export const MediaStillsSection = memo(function MediaStillsSection({ itemId, title }: { itemId: string; title: string }) {
+  const sseState = useSseConnectionState();
   const images = useQuery({
     queryKey: queryKeys.itemImages(itemId),
     queryFn: () => api.itemImages(itemId),
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval: sseState === "connected" ? false : queryRefreshIntervals.mediaSurface,
+    refetchIntervalInBackground: false,
   });
   return <MediaStills images={images.data?.images ?? []} title={title} />;
 });
