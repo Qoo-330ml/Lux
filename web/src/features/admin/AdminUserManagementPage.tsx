@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
+import { AdminUserAccessRulesPanel } from "./AdminUserAccessRulesPanel";
 import { AdminUserGlobalAccessRulesPanel } from "./AdminUserGlobalAccessRulesPanel";
 import "./user-management.css";
 
@@ -380,6 +381,7 @@ function AdminUserSessionsSection({ user }: { user: AdminUser }) {
   return (
     <>
       <AdminUserDevicePanel user={user} />
+      <AdminUserAccessRulesPanel userId={user.id} />
       <AdminUserWebSessionsPanel user={user} />
       <AdminUserEmbySessionsPanel user={user} />
       <AdminUserPlaybackSessionsPanel user={user} />
