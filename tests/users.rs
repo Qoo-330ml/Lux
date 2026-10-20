@@ -1776,6 +1776,444 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
         .unwrap_or_default()
 }
 
+async fn create_registration_for_review(
+    client: &reqwest::Client,
+    base_url: &str,
+    config_dir: &std::path::Path,
+    database: &Database,
+    email: &str,
+    username: &str,
+    verify_email: bool,
+) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+    let registration = client
+        .post(format!("{base_url}/api/v1/auth/registrations"))
+        .json(&json!({
+            "email": email,
+            "username": username,
+            "displayName": username,
+            "password": "long registration password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(registration.status(), reqwest::StatusCode::ACCEPTED);
+
+    let (request_id, challenge_id, expires_at, password_hash): (
+        String,
+        String,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT r.id, c.id, c.expires_at, r.password_hash
+         FROM user_registration_requests r
+         JOIN mail_challenges c ON c.reference_id = r.id
+         WHERE r.recipient_email = ? AND c.challenge_kind = 'EMAIL_VERIFICATION'",
+    )
+    .bind(email)
+    .fetch_one(database.pool())
+    .await?;
+    let token = registration_verification_token(config_dir, &challenge_id, expires_at)?;
+    if verify_email {
+        let verification = client
+            .post(format!("{base_url}/api/v1/auth/registrations/verify-email"))
+            .json(&json!({ "token": token }))
+            .send()
+            .await?;
+        assert_eq!(verification.status(), reqwest::StatusCode::OK);
+    }
+    Ok((request_id, token, password_hash.unwrap_or_default()))
+}
+
+#[tokio::test]
+async fn admin_user_registration_review_api_is_bounded_redacted_and_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let selected_library = LibraryService::new(database.clone())
+        .create_library("Registration Review Library", LibraryKind::Movie, false)
+        .await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin_user = setup
+        .complete(
+            "registration-review-admin",
+            "Registration Review Admin",
+            "admin password",
+        )
+        .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('registration_mode', '{\"mode\":\"PUBLIC_EMAIL\",\"version\":1}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let registration_config_dir = temp_dir.path().join("config");
+
+    let (approved_request_id, approved_token, approved_password_hash) =
+        create_registration_for_review(
+            &client,
+            &base_url,
+            &registration_config_dir,
+            &database,
+            "review-approved@example.test",
+            "review-approved",
+            true,
+        )
+        .await?;
+    let (rejected_request_id, rejected_token, _) = create_registration_for_review(
+        &client,
+        &base_url,
+        &registration_config_dir,
+        &database,
+        "review-rejected@example.test",
+        "review-rejected",
+        true,
+    )
+    .await?;
+    let (unverified_request_id, unverified_token, _) = create_registration_for_review(
+        &client,
+        &base_url,
+        &registration_config_dir,
+        &database,
+        "review-unverified@example.test",
+        "review-unverified",
+        false,
+    )
+    .await?;
+
+    let registrations_url = format!("{base_url}/api/v1/admin/user-registrations");
+    let anonymous_list = client.get(&registrations_url).send().await?;
+    assert_eq!(anonymous_list.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "registration-review-admin",
+            "password": "admin password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+
+    let reader_created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "username": "registration-review-reader",
+            "password": "reader password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(reader_created.status(), reqwest::StatusCode::CREATED);
+    let reader_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "registration-review-reader",
+            "password": "reader password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(reader_login.status(), reqwest::StatusCode::OK);
+    let reader_cookie = cookie_pair(reader_login.headers());
+    let reader_csrf = cookie_value(reader_login.headers(), "lux_csrf");
+    let reader_list = client
+        .get(&registrations_url)
+        .header(COOKIE, &reader_cookie)
+        .send()
+        .await?;
+    assert_eq!(reader_list.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let list_response = client
+        .get(format!("{registrations_url}?page=1&pageSize=5000"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(list_response.status(), reqwest::StatusCode::OK);
+    let list: Value = list_response.json().await?;
+    assert_eq!(list["page"], 1);
+    assert_eq!(list["pageSize"], 100);
+    assert_eq!(list["totalCount"], 2);
+    let requests = list["requests"].as_array().ok_or("missing requests")?;
+    assert_eq!(requests.len(), 2);
+    let list_json = list.to_string();
+    assert!(list_json.contains("review-approved@example.test"));
+    assert!(list_json.contains("review-rejected@example.test"));
+    assert!(!list_json.contains("review-unverified@example.test"));
+    assert!(!list_json.contains(&approved_password_hash));
+    assert!(!list_json.contains(&approved_token));
+    assert!(!list_json.contains(&rejected_token));
+    assert!(!list_json.contains(&unverified_token));
+    assert!(requests.iter().all(|request| {
+        request["status"] == "PENDING_APPROVAL"
+            && request["emailVerifiedAt"].is_number()
+            && request["createdAt"].is_number()
+            && request["permissions"].is_object()
+            && request.get("passwordHash").is_none()
+            && request.get("username").is_none()
+            && request.get("displayName").is_none()
+            && request.get("token").is_none()
+    }));
+
+    let approval_url = |request_id: &str| format!("{registrations_url}/{request_id}/approve");
+    let valid_permissions = json!({
+        "libraryAccessMode": "SELECTED",
+        "libraryIds": [selected_library.id.to_string()],
+        "canDownload": true,
+        "canPlay": false,
+        "maxSimultaneousPlaybacks": 0,
+        "allowRemux": false,
+        "allowAudioTranscode": false,
+        "allowVideoTranscode": false
+    });
+    let approval_body = json!({ "permissions": valid_permissions });
+
+    let missing_csrf = client
+        .post(approval_url(&approved_request_id))
+        .header(COOKIE, &admin_cookie)
+        .json(&approval_body)
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let missing_reject_csrf = client
+        .post(format!("{registrations_url}/{rejected_request_id}/reject"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_reject_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let reader_approve = client
+        .post(approval_url(&approved_request_id))
+        .header(COOKIE, &reader_cookie)
+        .header("x-csrf-token", &reader_csrf)
+        .json(&approval_body)
+        .send()
+        .await?;
+    assert_eq!(reader_approve.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let invalid_permissions = client
+        .post(approval_url(&approved_request_id))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "permissions": {
+                "libraryAccessMode": "NONE",
+                "libraryIds": [],
+                "canDownload": true,
+                "canPlay": true,
+                "maxSimultaneousPlaybacks": -1,
+                "allowRemux": true,
+                "allowAudioTranscode": true,
+                "allowVideoTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_permissions.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let unavailable_library = client
+        .post(approval_url(&approved_request_id))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "permissions": {
+                "libraryAccessMode": "SELECTED",
+                "libraryIds": ["missing-library"],
+                "canDownload": true,
+                "canPlay": true,
+                "maxSimultaneousPlaybacks": 1,
+                "allowRemux": true,
+                "allowAudioTranscode": true,
+                "allowVideoTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        unavailable_library.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?")
+            .bind("review-approved@example.test")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+
+    let unverified_approval = client
+        .post(approval_url(&unverified_request_id))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&approval_body)
+        .send()
+        .await?;
+    let missing_approval = client
+        .post(approval_url("missing-registration-id"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&approval_body)
+        .send()
+        .await?;
+    assert_eq!(unverified_approval.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(missing_approval.status(), reqwest::StatusCode::CONFLICT);
+    let unverified_error: Value = unverified_approval.json().await?;
+    let missing_error: Value = missing_approval.json().await?;
+    assert_eq!(
+        unverified_error["error"]["code"],
+        missing_error["error"]["code"]
+    );
+    assert_eq!(
+        unverified_error["error"]["message"],
+        missing_error["error"]["message"]
+    );
+
+    let approve_one = client
+        .post(approval_url(&approved_request_id))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&approval_body)
+        .send();
+    let approve_two = client
+        .post(approval_url(&approved_request_id))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&approval_body)
+        .send();
+    let (approve_one, approve_two) = tokio::join!(approve_one, approve_two);
+    let approve_one = approve_one?;
+    let approve_two = approve_two?;
+    let statuses = [approve_one.status(), approve_two.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::OK)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+    let (approved_status, approved_hash, reviewer_id): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT r.status, r.password_hash, r.reviewed_by_user_id
+             FROM user_registration_requests r WHERE r.id = ?",
+        )
+        .bind(&approved_request_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(approved_status, "APPROVED");
+    assert!(approved_hash.is_none());
+    let admin_user_id = admin_user.id.to_string();
+    assert_eq!(reviewer_id.as_deref(), Some(admin_user_id.as_str()));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ?")
+            .bind("review-approved@example.test")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let approved_permissions: (String, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT library_access_mode, can_download, can_play,
+                max_simultaneous_playbacks, allow_video_transcode
+         FROM users WHERE email = ?",
+    )
+    .bind("review-approved@example.test")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(approved_permissions, ("SELECTED".to_owned(), 1, 0, 0, 0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_library_access
+             WHERE user_id = (SELECT id FROM users WHERE email = ?)
+               AND library_id = ? AND can_view = 1",
+        )
+        .bind("review-approved@example.test")
+        .bind(selected_library.id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+        1
+    );
+
+    let rejected = client
+        .post(format!("{registrations_url}/{rejected_request_id}/reject"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), reqwest::StatusCode::OK);
+    assert_eq!(rejected.json::<Value>().await?, json!({ "rejected": true }));
+    let rejected_state: (String, Option<String>, Option<i64>, Option<i64>, String) =
+        sqlx::query_as(
+            "SELECT r.status, r.password_hash, c.revoked_at, c.consumed_at, o.status
+         FROM user_registration_requests r
+         JOIN mail_challenges c ON c.reference_id = r.id
+         JOIN mail_outbox o ON o.reference_id = c.id
+         WHERE r.id = ?",
+        )
+        .bind(&rejected_request_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(rejected_state.0, "REJECTED");
+    assert!(rejected_state.1.is_none());
+    assert!(rejected_state.2.is_some() || rejected_state.3.is_some());
+    assert_eq!(rejected_state.4, "FAILED");
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit: Value = audit.json().await?;
+    let audit_events = audit["events"].as_array().ok_or("missing audit events")?;
+    assert!(audit_events.iter().any(|event| {
+        event["eventType"] == "USER_REGISTRATION_APPROVED"
+            && event["targetId"] == approved_request_id
+    }));
+    assert!(audit_events.iter().any(|event| {
+        event["eventType"] == "USER_REGISTRATION_REJECTED"
+            && event["targetId"] == rejected_request_id
+    }));
+    let audit_json = audit.to_string();
+    assert!(!audit_json.contains("review-approved@example.test"));
+    assert!(!audit_json.contains("review-rejected@example.test"));
+    assert!(!audit_json.contains(&approved_token));
+    assert!(!audit_json.contains(&rejected_token));
+    assert!(!audit_json.contains(&approved_password_hash));
+
+    server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_user_creation_applies_configured_permission_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {

@@ -16889,15 +16889,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：管理员分页查询已验证待审批申请，并通过单次事务批准或拒绝。批准请求携带管理员最终确认的权限快照；审批会创建活动用户并标记已批准，拒绝会撤销凭证/待投邮件并清除密码哈希。所有写操作需管理员认证与 CSRF，并产生脱敏审计记录。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_user_registrations.rs`、`tests/users.rs`。
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin.rs`、`src/api/admin/admin_user_registrations.rs`、`src/application/user_registration.rs`、`tests/users.rs`。
 
 验收标准：
 
-- [ ] API 仅向管理员展示邮箱、申请时间、邮箱验证状态和拟分配权限，不返回 password hash/token。
-- [ ] 未验证申请不可批准；批准并发仅创建一个用户；拒绝和权限错误无部分写入。
-- [ ] CSRF、用户枚举、管理员保护、审计脱敏与分页上限均有回归；更新 API 文档并通过定向测试/build/fmt/diff check。
+- [x] API 仅向管理员展示邮箱、申请时间、邮箱验证状态和拟分配权限，不返回 password hash/token。
+- [x] 未验证申请不可批准；批准并发仅创建一个用户；拒绝和权限错误无部分写入。
+- [x] CSRF、用户枚举、管理员保护、审计脱敏与分页上限均有回归；更新 API 文档并通过定向测试/build/fmt/diff check。
 
 短计划：先加管理员 API 回归并确认路由缺失；再连接 LUX-807 storage/application；最后运行 `tests/users` 定向目标和常规检查。
+
+实施结果（2026-10-20）：新增管理员注册申请分页、批准和拒绝 API。列表只包含待审批且已验证申请，并只返回申请 ID、邮箱、状态、申请时间、验证时间与权限快照；应用层拒绝权限快照中的管理员角色，校验媒体库选择必须来自仍启用的库。批准/拒绝通过 LUX-807 单事务存储合同执行；未验证、过期、已处理和账户冲突统一映射为相同 409 响应。写操作只允许管理员 Web session、要求 CSRF，并将审核人绑定到 session 用户；共享 API Key 不可审核。成功操作记录不包含邮箱、密码或验证凭证的审计事件。
+
+验证：TDD RED 的新回归因路由缺失返回 404。最终 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users -- --test-threads=1` 30/30、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。全目标 Clippy 未通过：当前共享工作区有 19 条诊断，集中在管理员用户管理、播放、权限复制、用户存储、数据库维护并行改动和既有测试；本次新增审核函数没有诊断，同文件中唯一诊断位于 HEAD 已存在的 `user_registration` 单测。Toshiba 已挂载，本机 `uname -m` 为 `arm64`；未连接真实 SMTP，未部署。
 
 #### LUX-813：在用户管理页审批注册申请
 

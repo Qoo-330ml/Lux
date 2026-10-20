@@ -13,7 +13,8 @@ use crate::{
     storage::{
         Database, MailChallengeKind, MailOutboxTemplateKind, NewMailChallenge,
         NewMailOutboxMessage, NewUserRegistrationRequest, RegistrationMode,
-        UserRegistrationCreateResult,
+        StoredUserRegistrationRequest, UserRegistrationApproveResult, UserRegistrationCreateResult,
+        UserRegistrationRejectResult, UserRegistrationStatus,
     },
 };
 
@@ -59,6 +60,188 @@ pub(crate) struct SubmitUserRegistrationInput<'a> {
     pub(crate) username: &'a str,
     pub(crate) display_name: &'a str,
     pub(crate) password: &'a str,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationReviewError {
+    InvalidRequest,
+    InvalidPermissions,
+    NotReviewable,
+    StorageUnavailable,
+}
+
+pub(crate) struct UserRegistrationReviewItem {
+    pub(crate) id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) status: UserRegistrationStatus,
+    pub(crate) created_at: i64,
+    pub(crate) email_verified_at: i64,
+    pub(crate) permissions: NewUserPermissions,
+}
+
+pub(crate) struct UserRegistrationReviewPage {
+    pub(crate) requests: Vec<UserRegistrationReviewItem>,
+    pub(crate) page: i64,
+    pub(crate) page_size: i64,
+    pub(crate) total_count: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserRegistrationPermissionSnapshot {
+    is_admin: bool,
+    can_manage_server: bool,
+    permissions: NewUserPermissions,
+}
+
+pub(crate) async fn list_pending_user_registrations(
+    database: &Database,
+    page: i64,
+    page_size: i64,
+    now: i64,
+) -> Result<UserRegistrationReviewPage, UserRegistrationReviewError> {
+    if now < 0 {
+        return Err(UserRegistrationReviewError::InvalidRequest);
+    }
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 100);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let stored_page = database
+        .list_user_registration_requests_page(
+            Some(UserRegistrationStatus::PendingApproval),
+            page_size,
+            offset,
+            now,
+        )
+        .await
+        .map_err(|_| UserRegistrationReviewError::StorageUnavailable)?;
+    let requests = stored_page
+        .requests
+        .into_iter()
+        .map(map_registration_review_item)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(UserRegistrationReviewPage {
+        requests,
+        page,
+        page_size: stored_page.page_size,
+        total_count: stored_page.total_count,
+    })
+}
+
+fn map_registration_review_item(
+    request: StoredUserRegistrationRequest,
+) -> Result<Option<UserRegistrationReviewItem>, UserRegistrationReviewError> {
+    let Some(email_verified_at) = request.email_verified_at else {
+        return Ok(None);
+    };
+    let snapshot: UserRegistrationPermissionSnapshot =
+        serde_json::from_str(&request.permission_snapshot_json)
+            .map_err(|_| UserRegistrationReviewError::StorageUnavailable)?;
+    if snapshot.is_admin || snapshot.can_manage_server || !snapshot.permissions.has_valid_shape() {
+        return Err(UserRegistrationReviewError::StorageUnavailable);
+    }
+    Ok(Some(UserRegistrationReviewItem {
+        id: request.id,
+        recipient_email: request.recipient_email,
+        status: request.status,
+        created_at: request.created_at,
+        email_verified_at,
+        permissions: snapshot.permissions,
+    }))
+}
+
+pub(crate) async fn approve_pending_user_registration(
+    database: &Database,
+    request_id: &str,
+    reviewer_user_id: &str,
+    mut permissions: NewUserPermissions,
+    now: i64,
+) -> Result<String, UserRegistrationReviewError> {
+    if now < 0
+        || request_id.trim() != request_id
+        || !(1..=128).contains(&request_id.len())
+        || request_id.chars().any(char::is_control)
+        || reviewer_user_id.trim() != reviewer_user_id
+        || !(1..=128).contains(&reviewer_user_id.len())
+        || reviewer_user_id.chars().any(char::is_control)
+    {
+        return Err(UserRegistrationReviewError::InvalidRequest);
+    }
+    permissions.normalize_empty_selection();
+    if !permissions.has_valid_shape()
+        || permissions.library_ids.iter().any(|id| {
+            id.trim() != id || !(1..=128).contains(&id.len()) || id.chars().any(char::is_control)
+        })
+    {
+        return Err(UserRegistrationReviewError::InvalidPermissions);
+    }
+    if permissions.library_access_mode == "SELECTED" {
+        let enabled_library_ids = database
+            .list_enabled_library_ids()
+            .await
+            .map_err(|_| UserRegistrationReviewError::StorageUnavailable)?;
+        if permissions
+            .library_ids
+            .iter()
+            .any(|id| !enabled_library_ids.contains(id))
+        {
+            return Err(UserRegistrationReviewError::InvalidPermissions);
+        }
+    }
+    let permission_snapshot_json = serde_json::to_string(&serde_json::json!({
+        "isAdmin": false,
+        "canManageServer": false,
+        "permissions": permissions,
+    }))
+    .map_err(|_| UserRegistrationReviewError::InvalidPermissions)?;
+    match database
+        .approve_user_registration_request(
+            request_id,
+            reviewer_user_id,
+            &permission_snapshot_json,
+            now,
+        )
+        .await
+        .map_err(|_| UserRegistrationReviewError::StorageUnavailable)?
+    {
+        UserRegistrationApproveResult::Approved(user_id) => Ok(user_id),
+        UserRegistrationApproveResult::NotReviewable
+        | UserRegistrationApproveResult::EmailConflict
+        | UserRegistrationApproveResult::UsernameConflict => {
+            Err(UserRegistrationReviewError::NotReviewable)
+        }
+    }
+}
+
+pub(crate) async fn reject_pending_user_registration(
+    database: &Database,
+    request_id: &str,
+    reviewer_user_id: &str,
+    now: i64,
+) -> Result<(), UserRegistrationReviewError> {
+    if now < 0
+        || request_id.trim() != request_id
+        || !(1..=128).contains(&request_id.len())
+        || request_id.chars().any(char::is_control)
+        || reviewer_user_id.trim() != reviewer_user_id
+        || !(1..=128).contains(&reviewer_user_id.len())
+        || reviewer_user_id.chars().any(char::is_control)
+    {
+        return Err(UserRegistrationReviewError::InvalidRequest);
+    }
+    match database
+        .reject_user_registration_request(request_id, reviewer_user_id, now)
+        .await
+        .map_err(|_| UserRegistrationReviewError::StorageUnavailable)?
+    {
+        UserRegistrationRejectResult::Rejected => Ok(()),
+        UserRegistrationRejectResult::NotReviewable => {
+            Err(UserRegistrationReviewError::NotReviewable)
+        }
+    }
 }
 
 pub(crate) async fn submit_public_user_registration(
