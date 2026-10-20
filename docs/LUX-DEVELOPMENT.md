@@ -16473,6 +16473,43 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验证（2026-10-20）：新增回归先因缺少频率结果类型而编译失败；实现后 `cargo test --locked --lib user_invitation_` 7/7、应用层限额传播 1/1、HTTP 429 映射 1/1、管理员邀请 HTTP 集成 1/1、忽略的 PostgreSQL 生命周期/频率回归 1/1 通过。PostgreSQL 回归还覆盖并发重发下只允许一封进入队列、幂等重试不重复计数及一小时窗口恢复。`cargo build --locked`、fmt 与 diff check 通过。全目标全 feature Clippy 仍被 11 项既有库代码与 15 项既有测试代码诊断阻断，没有诊断指向本任务新增实现。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
 
+#### LUX-793：开放管理员邀请邮件重发 API
+
+范围：为仍有效的待处理邀请开放管理员重发端点，将现有邀请挑战对应的邮件原子加入 outbox，不创建新邀请或挑战、不延长有效期，也不再次返回邀请 token。请求要求管理员身份、CSRF 和 `Idempotency-Key`；同一幂等键重试返回成功但不重复入队，不同键表示新的发送请求并继续受 LUX-792 的每邮箱频率限制。记录脱敏审计事件。本任务不增加邀请管理 Web 操作，也不实现受邀用户激活。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/storage/mod.rs`、`src/application/user_invitations.rs`、`src/api/admin/admin_user_invitations.rs`、`tests/admin_user_invitations.rs`。
+
+验收标准：
+
+- [x] `POST /api/v1/admin/user-invitations/{id}/resend` 仅接受管理员和有效 CSRF；缺少或格式错误的 `Idempotency-Key` 拒绝且不写入 outbox。
+- [x] 有效待处理邀请排入引用原挑战的邮件并返回 202；重复幂等键不新增 outbox，邀请链接、凭证及有效期不返回或改变。
+- [x] 不存在、已接受、已撤销或过期邀请返回稳定状态错误；超出 LUX-792 额度映射为脱敏 429，不产生新邮件。
+- [x] 审计事件只包含邀请 ID 与固定事件类型，不记录邮箱、幂等键、邀请链接或凭证；集成回归覆盖权限、CSRF、入队、幂等、拒绝与脱敏。
+- [x] 更新 `docs/API.md`；定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先在管理员邀请 HTTP 集成目标添加重发路由回归并确认 RED；再增加 application service、管理员 handler 和 API 合同文档；最后运行定向集成测试、build、fmt、Clippy 与 diff check。
+
+验证（2026-10-20）：RED 回归在新增路由前收到 405；实现后 `cargo test --locked --test admin_user_invitations` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成覆盖未认证、缺失 CSRF/幂等键、空白幂等键、重复和冲突键、同邮箱 5 封上限、链接/挑战/期限不变、撤销/接受/过期/不存在邀请拒绝及审计脱敏。全目标全 feature Clippy 仍被 11 项既有库代码和 15 项既有测试代码诊断阻断，诊断均位于本任务文件之外。Cargo 使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-794：异步分批删除媒体库
+
+范围：管理员删除媒体库时，在一个短事务中将媒体库置为 `DELETING` 并持久化删除任务，接口返回 `202 Accepted` 和任务 ID。媒体库立即从管理员可用库列表、普通用户及 Emby 的库访问中隐藏，并拒绝新的扫描和写入；后台 worker 取消并等待现有扫描退出，按有界批次提交媒体条目、文件索引和扫描任务数据的删除，全部完成后才删除媒体库行并清理插件配置。原媒体文件保留。管理员可以分页查看任务状态、阶段、已处理记录数和稳定错误码，并重试失败或重启后取消的任务；重试从已提交的数据状态继续。服务重启遵循全局标准，将运行任务标为 `CANCELLED`，不自动续跑。
+
+HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ job }`；`GET /api/v1/admin/library-deletion-jobs?page=&pageSize=&status=` 返回有界分页；`POST /api/v1/admin/library-deletion-jobs/{jobId}/retry` 返回 `202`。重复提交正在运行的删除请求返回现有任务。删除任务记录不对普通用户开放。
+
+预计修改文件（20 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`migrations/0202_library_deletion_jobs.sql`、`migrations-postgres/0202_library_deletion_jobs.sql`、`src/domain/ids.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/library.rs`、`src/storage/users.rs`、`src/storage/catalog.rs`、`src/storage/jobs/shutdown.rs`、`src/storage/library_deletion.rs`、`src/application/mod.rs`、`src/application/library_deletion.rs`、`src/api/admin/admin_libraries.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/AdminOperationsPage.tsx`。
+
+验收标准：
+
+- [ ] SQLite 与 PostgreSQL 从空库升级后均创建任务表、`ACTIVE/DELETING` 生命周期字段及删除外键索引。
+- [ ] 删除请求不等待扫描退出或大级联删除；任务记录和 `DELETING` 状态原子写入，重复请求不会创建第二个活动任务。
+- [ ] 删除中的库对管理员可用库列表、用户库列表、Emby 库枚举和条目访问不可见；新扫描被拒绝；已有扫描在后台取消并退出后才开始清理。
+- [ ] 大型关系数据按有界批次和独立事务删除，批次结果与进度原子提交；最终事务删除媒体库并完成任务。任务失败或重启后媒体库保持隐藏，可从已提交数据重试。
+- [ ] 管理员任务列表分页并显示阶段、已处理数、状态和稳定错误码；Web 接受 `202` 后立即从活动库列表移除该库，并在“任务与日志”显示后台进度及重试操作。
+- [ ] 更新 `docs/API.md`；`cargo build --locked`、格式检查、Web 测试/构建及 diff 检查通过。所有 Cargo 命令使用 Toshiba 共享 target 目录。
+
+短计划：先新增双后端迁移和存储任务状态/批次操作；再增加生命周期访问栅栏、后台 worker 与重启取消/重试；随后接入管理员 API 和任务审计；最后接入 Web 删除反馈、任务进度和重试，并运行相应检查。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

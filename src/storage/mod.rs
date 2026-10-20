@@ -743,6 +743,7 @@ pub(crate) use repository::{
     UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserAccountPreferences,
     UserAccountPreferencesCasResult, UserActivityEventQuery, UserContentRestrictions,
     UserContentRestrictionsCasResult, UserDevicePageQuery, UserInvitationCreateResult,
-    UserInvitationPage, UserInvitationStatus, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
-    is_lite_manifest_discovery, movie_parent_folder_identity, recommendation_batch_key_at,
+    UserInvitationPage, UserInvitationResendResult, UserInvitationStatus, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails, is_lite_manifest_discovery, movie_parent_folder_identity,
+    recommendation_batch_key_at,
 };

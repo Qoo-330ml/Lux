@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     application::user_invitations::{
         CreateUserInvitationInput, UserInvitationError, create_user_invitation,
-        list_user_invitations, revoke_user_invitation,
+        list_user_invitations, queue_user_invitation_resend, revoke_user_invitation,
     },
     storage::UserInvitationStatus,
 };
@@ -34,6 +34,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/user-invitations/{invitation_id}/revoke",
             post(admin_revoke_user_invitation),
+        )
+        .route(
+            "/api/v1/admin/user-invitations/{invitation_id}/resend",
+            post(admin_resend_user_invitation),
         )
 }
 
@@ -162,6 +166,45 @@ async fn admin_revoke_user_invitation(
     }
 }
 
+async fn admin_resend_user_invitation(
+    headers: HeaderMap,
+    Path(invitation_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match queue_user_invitation_resend(
+        database,
+        &invitation_id,
+        idempotency_key,
+        current_unix_time(),
+    )
+    .await
+    {
+        Ok(()) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "USER_INVITATION_RESEND_QUEUED",
+                Some("user_invitation"),
+                Some(&invitation_id),
+                "{}",
+            )
+            .await;
+            (StatusCode::ACCEPTED, Json(json!({ "emailQueued": true }))).into_response()
+        }
+        Err(error) => invitation_error(&headers, error),
+    }
+}
+
 async fn admin_invitation_creator(headers: &HeaderMap, state: &AppState) -> Option<String> {
     if lux_api_key_from_headers(headers).is_some() {
         return None;
@@ -218,6 +261,13 @@ fn invitation_error(headers: &HeaderMap, error: UserInvitationError) -> Response
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "邀请请求无效",
+        )
+        .into_response(),
+        UserInvitationError::IdempotencyConflict => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "幂等键已用于其他重发请求",
         )
         .into_response(),
         UserInvitationError::RateLimited => api_error(

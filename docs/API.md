@@ -190,6 +190,12 @@ Lux 提供一个服务器级共享管理员 API Key，行为与 Emby API Key 兼
 - 共享 Key 同时适用于已实现的 `/api/v1` 和 Emby 兼容路由。Key 本身不能查看、轮换或撤销 API Key；这些操作必须使用 Web session。
 - Key 持久化于 `/config/lux_admin_api_key` 的受限文件，至少使用 256 bit 随机熵。明文不会写入数据库、日志、审计事件或错误响应；轮换会使所有旧调用方立即失效。
 
+## 用户邀请邮件（LUX-793）
+
+以下写操作要求管理员权限；使用 Web session 时还需要 `X-CSRF-Token`：
+
+- `POST /api/v1/admin/user-invitations/{invitationId}/resend`：请求头必须包含 `Idempotency-Key`（1–256 个非空且不含控制字符的字符）；有效的待处理邀请会将原挑战关联邮件加入持久化队列，返回 202 和 `{ "emailQueued": true }`。此操作不会更改邀请期限、创建新凭证或再次返回邀请链接。相同幂等键重试不会重复入队；同邮箱一小时内超过 5 封邀请邮件时返回 `429 RATE_LIMITED`。不存在的邀请返回 404，不可重发的邀请或跨请求复用幂等键返回 409。
+
 ## 当前边界
 
 `GET /health/ready` 在数据库可读但事务写入探针失败时返回 503 和 `reason=database_write_unavailable`；`/api/v1` 的写入接口统一返回 `DATABASE_UNAVAILABLE` 错误契约并包含 requestId。

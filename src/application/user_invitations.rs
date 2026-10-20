@@ -11,7 +11,7 @@ use crate::{
     storage::{
         Database, MailChallengeKind, MailOutboxTemplateKind, NewMailChallenge,
         NewMailOutboxMessage, NewUserInvitation, StorageError, StoredUserInvitation,
-        UserInvitationCreateResult, UserInvitationStatus,
+        UserInvitationCreateResult, UserInvitationResendResult, UserInvitationStatus,
     },
 };
 
@@ -25,6 +25,7 @@ pub(crate) enum UserInvitationError {
     InvalidPreset,
     NotFound,
     NotRevocable,
+    IdempotencyConflict,
     RateLimited,
     SigningUnavailable,
     PresetUnavailable,
@@ -40,6 +41,9 @@ impl fmt::Display for UserInvitationError {
             Self::InvalidPreset => formatter.write_str("permission preset is unavailable"),
             Self::NotFound => formatter.write_str("invitation was not found"),
             Self::NotRevocable => formatter.write_str("invitation is not revocable"),
+            Self::IdempotencyConflict => {
+                formatter.write_str("invitation resend key is already used")
+            }
             Self::RateLimited => formatter.write_str("invitation email rate limit exceeded"),
             Self::SigningUnavailable => formatter.write_str("invitation signing is unavailable"),
             Self::PresetUnavailable => {
@@ -221,6 +225,41 @@ pub(crate) async fn revoke_user_invitation(
         return Err(UserInvitationError::NotRevocable);
     }
     Ok(())
+}
+
+pub(crate) async fn queue_user_invitation_resend(
+    database: &Database,
+    invitation_id: &str,
+    idempotency_key: &str,
+    now: i64,
+) -> Result<(), UserInvitationError> {
+    if now < 0
+        || invitation_id.trim() != invitation_id
+        || !(1..=128).contains(&invitation_id.len())
+        || invitation_id.chars().any(char::is_control)
+        || idempotency_key.trim() != idempotency_key
+        || !(1..=256).contains(&idempotency_key.len())
+        || idempotency_key.chars().any(char::is_control)
+    {
+        return Err(UserInvitationError::InvalidInput);
+    }
+    let invitation = database
+        .get_user_invitation(invitation_id, now)
+        .await?
+        .ok_or(UserInvitationError::NotFound)?;
+    if invitation.status != UserInvitationStatus::Pending || invitation.expires_at <= now {
+        return Err(UserInvitationError::NotRevocable);
+    }
+    match database
+        .queue_user_invitation_resend(invitation_id, idempotency_key, now)
+        .await
+    {
+        Ok(UserInvitationResendResult::Queued) => Ok(()),
+        Ok(UserInvitationResendResult::NotResendable) => Err(UserInvitationError::NotRevocable),
+        Ok(UserInvitationResendResult::RateLimited) => Err(UserInvitationError::RateLimited),
+        Err(StorageError::Conflict(_)) => Err(UserInvitationError::IdempotencyConflict),
+        Err(error) => Err(UserInvitationError::Storage(error)),
+    }
 }
 
 fn normalize_email(value: &str) -> Result<String, UserInvitationError> {

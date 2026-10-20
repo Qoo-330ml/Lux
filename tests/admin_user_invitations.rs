@@ -108,6 +108,9 @@ async fn admin_invitation_api_enforces_auth_csrf_and_redacts_sensitive_fields()
     let invitation_id = created["invitation"]["id"]
         .as_str()
         .ok_or("missing invitation ID")?;
+    let original_expires_at = created["invitation"]["expiresAt"]
+        .as_i64()
+        .ok_or("missing invitation expiry")?;
     let invitation_url = created["invitationUrl"]
         .as_str()
         .ok_or("missing one-time invitation URL")?;
@@ -136,6 +139,125 @@ async fn admin_invitation_api_enforces_auth_csrf_and_redacts_sensitive_fields()
             .fetch_one(database.pool())
             .await?,
         1
+    );
+
+    let resend_url = format!("{collection_url}/{invitation_id}/resend");
+    let unauthenticated_resend = client
+        .post(&resend_url)
+        .header("Idempotency-Key", "admin-resend-1")
+        .send()
+        .await?;
+    assert_eq!(
+        unauthenticated_resend.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let resend_missing_csrf = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("Idempotency-Key", "admin-resend-1")
+        .send()
+        .await?;
+    assert_eq!(resend_missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let resend_missing_key = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(
+        resend_missing_key.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let resend_blank_key = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "   ")
+        .send()
+        .await?;
+    assert_eq!(resend_blank_key.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let first_resend = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-1")
+        .send()
+        .await?;
+    assert_eq!(first_resend.status(), reqwest::StatusCode::ACCEPTED);
+    let first_resend_body = first_resend.text().await?;
+    assert!(!first_resend_body.contains(token));
+    assert!(!first_resend_body.contains(invitation_url));
+    assert_eq!(
+        serde_json::from_str::<Value>(&first_resend_body)?["emailQueued"],
+        true
+    );
+    for idempotency_key in ["admin-resend-1", "admin-resend-2", "admin-resend-3"] {
+        let response = client
+            .post(&resend_url)
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf)
+            .header("Idempotency-Key", idempotency_key)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    }
+    let fourth_resend = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-4")
+        .send()
+        .await?;
+    assert_eq!(fourth_resend.status(), reqwest::StatusCode::ACCEPTED);
+    let limited_resend = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-5")
+        .send()
+        .await?;
+    assert_eq!(
+        limited_resend.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    let limited_resend_body = limited_resend.text().await?;
+    assert!(!limited_resend_body.contains("recipient@example.test"));
+    assert!(!limited_resend_body.contains(token));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        5
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox WHERE reference_id = ?")
+            .bind(&challenge_id)
+            .fetch_one(database.pool())
+            .await?,
+        5
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_challenges
+             WHERE challenge_kind = 'INVITATION' AND reference_id = ?",
+        )
+        .bind(invitation_id)
+        .fetch_one(database.pool())
+        .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT expires_at FROM user_invitations WHERE id = ?")
+            .bind(invitation_id)
+            .fetch_one(database.pool())
+            .await?,
+        original_expires_at
     );
 
     let default_page = client
@@ -199,6 +321,124 @@ async fn admin_invitation_api_enforces_auth_csrf_and_redacts_sensitive_fields()
         .send()
         .await?;
     assert_eq!(revoked.status(), reqwest::StatusCode::OK);
+    let resend_revoked = client
+        .post(&resend_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-revoked")
+        .send()
+        .await?;
+    assert_eq!(resend_revoked.status(), reqwest::StatusCode::CONFLICT);
+    let resend_missing = client
+        .post(format!("{collection_url}/missing-invitation/resend"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-missing")
+        .send()
+        .await?;
+    assert_eq!(resend_missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let accepted_creation = client
+        .post(&collection_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "recipientEmail": "accepted@example.test",
+            "presetId": "builtin-user"
+        }))
+        .send()
+        .await?;
+    assert_eq!(accepted_creation.status(), reqwest::StatusCode::CREATED);
+    let accepted_creation: Value = accepted_creation.json().await?;
+    let accepted_invitation_id = accepted_creation["invitation"]["id"]
+        .as_str()
+        .ok_or("missing accepted invitation ID")?;
+    let before_conflicting_key_resend: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+        .fetch_one(database.pool())
+        .await?;
+    let conflicting_key_resend = client
+        .post(format!("{collection_url}/{accepted_invitation_id}/resend"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-1")
+        .send()
+        .await?;
+    assert_eq!(
+        conflicting_key_resend.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        before_conflicting_key_resend
+    );
+    sqlx::query(
+        "UPDATE user_invitations
+         SET status = 'ACCEPTED', accepted_at = created_at, updated_at = created_at
+         WHERE id = ?",
+    )
+    .bind(accepted_invitation_id)
+    .execute(database.pool())
+    .await?;
+    let before_accepted_resend: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+        .fetch_one(database.pool())
+        .await?;
+    let resend_accepted = client
+        .post(format!("{collection_url}/{accepted_invitation_id}/resend"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-accepted")
+        .send()
+        .await?;
+    assert_eq!(resend_accepted.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        before_accepted_resend
+    );
+
+    let expired_creation = client
+        .post(&collection_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "recipientEmail": "expired@example.test",
+            "presetId": "builtin-user"
+        }))
+        .send()
+        .await?;
+    assert_eq!(expired_creation.status(), reqwest::StatusCode::CREATED);
+    let expired_creation: Value = expired_creation.json().await?;
+    let expired_invitation_id = expired_creation["invitation"]["id"]
+        .as_str()
+        .ok_or("missing expired invitation ID")?;
+    sqlx::query(
+        "UPDATE user_invitations
+         SET status = 'EXPIRED', expires_at = created_at + 1, updated_at = created_at + 1
+         WHERE id = ?",
+    )
+    .bind(expired_invitation_id)
+    .execute(database.pool())
+    .await?;
+    let before_expired_resend: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+        .fetch_one(database.pool())
+        .await?;
+    let resend_expired = client
+        .post(format!("{collection_url}/{expired_invitation_id}/resend"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Idempotency-Key", "admin-resend-expired")
+        .send()
+        .await?;
+    assert_eq!(resend_expired.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        before_expired_resend
+    );
 
     let revoked_list = client
         .get(format!("{collection_url}?status=revoked"))
@@ -216,20 +456,28 @@ async fn admin_invitation_api_enforces_auth_csrf_and_redacts_sensitive_fields()
             .await?;
     assert!(challenge_revoked_at.is_some());
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT status FROM mail_outbox WHERE reference_id = ?",)
-            .bind(&challenge_id)
-            .fetch_one(database.pool())
-            .await?,
-        "FAILED"
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox WHERE reference_id = ? AND status = 'FAILED'",
+        )
+        .bind(&challenge_id)
+        .fetch_one(database.pool())
+        .await?,
+        5
     );
 
     let (_, audit_events) = luxd::observability::logs::LogStore::new(&config_dir)
         .list_audit_events(0, 20)
         .await?;
-    for event_type in ["USER_INVITATION_CREATED", "USER_INVITATION_REVOKED"] {
+    for event_type in [
+        "USER_INVITATION_CREATED",
+        "USER_INVITATION_RESEND_QUEUED",
+        "USER_INVITATION_REVOKED",
+    ] {
         let event = audit_events
             .iter()
-            .find(|event| event.event_type == event_type)
+            .find(|event| {
+                event.event_type == event_type && event.target_id.as_deref() == Some(invitation_id)
+            })
             .ok_or("missing invitation audit event")?;
         assert_eq!(event.target_id.as_deref(), Some(invitation_id));
         assert_eq!(event.metadata_json, "{}");
@@ -251,6 +499,7 @@ async fn admin_invitation_api_enforces_auth_csrf_and_redacts_sensitive_fields()
     assert!(!audit_text.contains("recipient@example.test"));
     assert!(!audit_text.contains(token));
     assert!(!audit_text.contains(invitation_url));
+    assert!(!audit_text.contains("admin-resend-"));
 
     server.abort();
     database.close().await;
