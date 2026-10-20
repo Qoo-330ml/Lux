@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
+import { AdminUserGlobalAccessRulesPanel } from "./AdminUserGlobalAccessRulesPanel";
 import "./user-management.css";
 
 const detailSections = [
@@ -1756,7 +1757,7 @@ export function AdminUserSettingsPage() {
           </button>
         ))}
       </nav>
-      {section.id === "registration" ? <AdminUserRegistrationSettings /> : section.id === "mail" ? <AdminUserMailSettings /> : section.id === "retention" ? <AdminUserRetentionSettings /> : section.id === "defaults" ? <AdminUserDefaultPermissionsSettings /> : section.id === "presets" ? <AdminUserPermissionPresetsSettings /> : (
+      {section.id === "registration" ? <AdminUserRegistrationSettings /> : section.id === "mail" ? <AdminUserMailSettings /> : section.id === "retention" ? <AdminUserRetentionSettings /> : section.id === "defaults" ? <AdminUserDefaultPermissionsSettings /> : section.id === "presets" ? <AdminUserPermissionPresetsSettings /> : section.id === "blocklist" ? <AdminUserGlobalAccessRulesPanel /> : (
         <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-settings-title">
           <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
           <div><span className="lux-admin-eyebrow">{section.module}</span><h2 id="lux-admin-user-settings-title">{section.label}</h2><p>全局设置结构已预留，配置和保存能力将在对应任务中实现。</p></div>

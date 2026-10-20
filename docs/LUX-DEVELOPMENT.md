@@ -17001,11 +17001,15 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] 三种规则支持有界分页、创建、启停与确认删除；输入约束与服务端规范化一致。
-- [ ] 请求/加载/错误/空态清晰，修改成功刷新；说明 IP 依据仅来自连接 peer 或已配置可信代理链。
-- [ ] 定向 Vitest、Web build 与 diff check 通过。
+- [x] 三种规则支持有界分页、创建、启停与确认删除；输入约束与服务端规范化一致。
+- [x] 请求/加载/错误/空态清晰，修改成功刷新；说明 IP 依据仅来自连接 peer 或已配置可信代理链。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
 
 短计划：先补全站规则组件合同；再接 LUX-757/764 已有 client；最后运行定向 Vitest 和 Web build。
+
+实施结果（2026-10-20）：全局设置中的“全站黑名单”页已接入既有全站规则 API，按每页 20 条读取设备、客户端和 IP/CIDR 规则，支持创建、启停、确认删除、分页及修改后刷新。客户端输入先校验控制字符、UTF-8 长度和 IP/CIDR 结构；客户端名称在提交前按服务端规则折叠空白并转小写，IP/CIDR 的权威规范化仍由服务端执行。页面提供加载、错误重试、空态和修改结果反馈，并说明已启用规则会影响登录、现有会话与播放授权，IP 判断只采用连接 peer 或已配置的可信代理链。
+
+验证：定向 `vitest run tests/admin-user-access-rules.test.tsx`、TypeScript `tsc --noEmit`、Vite production build 与 `git diff --check` 通过。测试覆盖全站 scope、分页上限、空/加载/错误状态、输入校验与客户端规范化、创建/启用/删除确认及成功刷新。未触及 Rust 行为或数据库 schema。
 
 #### LUX-819：管理单用户访问黑名单
 
