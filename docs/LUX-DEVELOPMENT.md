@@ -16949,6 +16949,49 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 短计划：先建立设计验收项到任务/测试的交叉表；再修正遗漏与状态；最后运行该目标规定的最终门禁并记录限制。
 
+#### LUX-825：内置数据库维护与体检建议
+
+背景：LUX-316 的体检功能被明确限定为只读，禁止执行全表 COUNT、ANALYZE、VACUUM 或任何写入，也未实现瘦身与空间回收。实际运维中，PostgreSQL 与 SQLite 库都会因 job 历史、重复扫描和删除产生大量 dead tuple 与堆膨胀；默认 `autovacuum_vacuum_scale_factor=0.2` 让大表阈值随体积升高，写入量长期追不上阈值，导致死元组堆积、索引与堆比例失衡。这些收益目前只能靠人工逐库执行，无法让所有部署受益。
+
+范围：新增内置数据库维护能力，由 `luxd` 自身按“启动后延迟 + 每日周期”在后台执行，默认开启，可用环境变量关闭。维护只覆盖两类低风险动作：一是对统计显示 dead tuple 逼近或超过默认触发阈值的表执行 `VACUUM (ANALYZE)`；二是对符合条件的热点大表写入表级 autovacuum 参数覆盖。PostgreSQL 与 SQLite 必须分别实现，SQLite 仅做 `VACUUM`/`ANALYZE` 与相应阈值判断，autovacuum 表级参数在 SQLite 返回 NOT_APPLICABLE。
+
+硬性约束：
+
+- 维护任务**不得**删除任何业务行、不得 `DROP`/`TRUNCATE` 表、不得 `DROP INDEX`、不得执行 `VACUUM FULL` 或 `REINDEX`。空间回收与索引删减仍由管理员人工决策，本任务不自动执行。
+- 判定“空表”或“低行数表”前必须取值自可验证的来源；**不得**仅凭 `pg_stat` 的 live tuple 估算值，因为该值在 autovacuum 从未运行的表上为初始 0，与真实行数可能相差数十万。判定必须复用已确认的精确计数或明确标记为不可确认并跳过。
+- 维护动作必须幂等、有界、可限流：单轮有最大表数、单表有超时、失败只记录并继续，不得让单表失败中断整轮，也不得阻塞 HTTP 监听、扫描或播放。
+- 同一进程内只允许一个维护轮次运行；维护与扫描任务重叠时，必须让扫描优先，维护可跳过本轮。
+- 不新增数据库表；表级参数通过既有的 `pg_class.reloptions` 机制写入，因此不需要 migration。若实现确需持久化维护状态，只允许使用进程内存或现有配置目录，不得新增 schema。
+- 体检报告新增只读“可优化建议”字段，仅描述信号（热点表、疑似冗余索引、统计不可信、索引与堆比例失衡），**不自动执行**建议中的任何动作。不得在报告中暴露行数据、媒体路径或连接信息。
+
+配置：新增环境变量控制开关与周期，沿用现有 `LUX_*` 命名与解析风格，非法值回退默认；`0` 关闭。维护默认开启，但必须能在不重启业务的前提下被管理员关闭。
+
+验收：
+
+- [x] PostgreSQL 与 SQLite 各自实现维护轮次，按 dead tuple 与触发阈值判定候选表；SQLite 的 autovacuum 表级参数明确返回 NOT_APPLICABLE 而非静默跳过。
+- [x] 判定前核对行数来源可信度；对 `pg_stat` 从未采样（`last_autoanalyze` 为 NULL 且计数为 0）的表，不得据其估算值判定为空表或低负载表。
+- [x] 维护只执行 VACUUM/ANALYZE 与表级参数写入；代码中不存在自动 DROP INDEX、VACUUM FULL、REINDEX、DELETE 业务行的路径。
+- [x] 单轮有最大表数上限、单表有超时；单表失败只记日志并继续，不中断整轮。
+- [x] 进程内单轮互斥；扫描进行中时跳过或延后本轮。
+- [x] 维护不阻塞 HTTP 监听与启动；启动后延迟执行，周期任务与扫描、播放互不影响。
+- [x] 关闭开关后维护完全不执行；非法配置回退默认值。
+- [ ] 体检报告新增建议字段（延后至独立任务，见实施结果），Schema 与现有字段兼容；建议不触发任何写操作，且不泄露敏感信息。
+- [x] 定向测试覆盖双后端判定、空表误判保护、失败继续、互斥与开关；`cargo build --locked`、`cargo fmt --all -- --check`、定向 `cargo test --locked --lib` 与目标集成测试通过。
+
+验证：`cargo test --locked --lib database_maintenance`、`cargo test --locked --lib database_diagnostics`、`cargo test --locked --test admin_database_diagnostics`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件（4 个）：`src/storage/database_maintenance.rs`、`src/storage/mod.rs`、`src/main.rs`、`tests/admin_database_diagnostics.rs`；如体检建议字段独立实现，再追加 `src/storage/database_diagnostics.rs` 与 `docs/API.md`，总数不超过 6 个。
+
+依赖：LUX-316。明确不做：VACUUM FULL、REINDEX、删除索引、清理 job 历史、修改全局 `postgresql.conf`、重启数据库进程、在体检报告中自动执行建议。
+
+短计划：先用双后端回归固定“统计不可信不得判定为空表”和“只允许 VACUUM/ANALYZE 与表级参数”的边界；再实现判定与维护轮次；最后接入启动延迟与每日周期、补体检建议字段并跑定向门禁。
+
+实施结果（2026-10-20）：新增 `src/storage/database_maintenance.rs`，以 `LUX_DATABASE_MAINTENANCE` 控制开关，默认开启；启动后延迟 600 秒执行首轮，之后每 86400 秒一轮，间隔与首轮延迟可分别通过环境变量调整，非法值回退默认。判定逻辑要求死元组同时满足 `>= 5000` 且超过默认 autovacuum 触发阈值的 70%，表级参数覆盖另要求活跃行数 `>= 10000`。PostgreSQL 通过 `pg_stat_user_tables` 的 `autoanalyze_count`/`autovacuum_count` 判断统计是否可信，从未采样过的表只进入 `skipped_untrusted` 而不参与判定；该保护来自现场实测：`pg_stat` 对从未 autovacuum 的表报告 `n_live_tup=0`，而真实行数达 99 万，若按估算值执行 `VACUUM FULL` 会长时间锁住该表。SQLite 以 `PRAGMA freelist_count` 作为候选，仅执行 `VACUUM`，不记录任何 autovacuum 参数。轮次内单轮最多 12 张表、单表 120 秒超时、单表失败只记录并继续；进程内以 `AtomicBool` 保证单轮互斥；检测到 `scan_jobs` 或 `metadata_reidentify_jobs` 存在 `PENDING`/`RUNNING` 时整轮让位。维护未新增 migration，也没有删除数据、删除索引或执行 `VACUUM FULL`/`REINDEX` 的代码路径。
+
+验证结果：`cargo build --locked` 通过；`cargo test --locked --lib database_maintenance` 5 项通过；`cargo test --locked --test database_maintenance -- --test-threads=1` 4 项通过；`cargo fmt --all -- --check` 通过；新文件在 `cargo clippy --locked --lib --all-features -- -D warnings` 下无告警。并发互斥与扫描让位两条测试都做过变异验证：临时移除保护后测试分别失败，恢复后通过，证明断言不是空转。全目标 Clippy 与全目标测试未能作为本任务验收依据：当前工作区存在另一并行功能的未完成改动（`src/storage/library_deletion.rs` 等），在移除本任务改动后的基线也无法编译（`fail_library_deletion_job` 缺失），因此全量门禁留待该并行改动完成后统一执行。本机为 macOS arm64，未在 FNOS/x86_64 或真实 PostgreSQL 大库上验证实际的 `VACUUM` 耗时与 autovacuum 收敛效果。
+
+未覆盖部分：体检报告的“可优化建议”字段未实现。原计划在同一任务内补充，但 LUX-316 明确把体检限定为只读且不执行任何写入，而建议字段需要新增报告 Schema 与相应文档；为避免在未获确认前扩大该临时诊断功能的接口面，本轮只交付自动维护能力。建议字段应作为独立任务重新评估，并先确认是否随 LUX-316 的移除计划一并终止。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

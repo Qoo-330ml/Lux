@@ -27,6 +27,12 @@ mod database_cleanup;
 #[path = "database_diagnostics.rs"]
 mod database_diagnostics;
 pub use database_diagnostics::DatabaseDiagnosticsSnapshot;
+#[path = "database_maintenance.rs"]
+mod database_maintenance;
+pub use database_maintenance::{
+    DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    MaintenanceCandidate, MaintenanceReport,
+};
 #[path = "device_pairings.rs"]
 mod device_pairings;
 #[path = "emby_migration.rs"]
