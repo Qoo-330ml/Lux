@@ -5,11 +5,13 @@ use crate::storage::{
     MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewInvitationUserAccount,
     NewMailChallenge, NewMailOutboxMessage, NewStoredUserPermissions, NewUserAccessBlacklistRule,
     NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation, NewUserInvitation,
-    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, StoredUserActivityEvent,
-    UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
+    NewUserRegistrationRequest, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+    StoredUserActivityEvent, UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
     UserAccessBlacklistRuleScope, UserActivityEventQuery, UserContentRestrictionsCasResult,
     UserDevicePageQuery, UserInvitationAcceptResult, UserInvitationCreateResult,
     UserInvitationStatus, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
+    UserRegistrationApproveResult, UserRegistrationCreateResult, UserRegistrationRejectResult,
+    UserRegistrationStatus, UserRegistrationVerifyResult,
 };
 
 #[tokio::test]
@@ -28428,4 +28430,557 @@ async fn postgres_registration_mode_contract() -> Result<(), Box<dyn std::error:
     .await?;
     admin_pool.close().await;
     result
+}
+
+const REGISTRATION_TEST_PERMISSION_SNAPSHOT: &str = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"NONE","libraryIds":[],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#;
+
+fn registration_storage_bundle<'a>(
+    id: &'a str,
+    recipient_email: &'a str,
+    username_normalized: &'a str,
+    challenge_id: &'a str,
+    idempotency_key: &'a str,
+    expires_at: i64,
+    now: i64,
+    token_hash: &'a [u8],
+) -> (
+    NewUserRegistrationRequest<'a>,
+    NewMailChallenge<'a>,
+    NewMailOutboxMessage<'a>,
+) {
+    (
+        NewUserRegistrationRequest {
+            id,
+            recipient_email,
+            username_normalized,
+            display_name: "Registration Applicant",
+            password_hash: "$argon2id$registration-test-hash",
+            permission_snapshot_json: REGISTRATION_TEST_PERMISSION_SNAPSHOT,
+            expires_at,
+        },
+        NewMailChallenge {
+            id: challenge_id,
+            kind: MailChallengeKind::EmailVerification,
+            recipient_email,
+            reference_id: id,
+            token_hash,
+            expires_at,
+        },
+        NewMailOutboxMessage {
+            idempotency_key,
+            recipient_email,
+            template_kind: MailOutboxTemplateKind::EmailVerification,
+            reference_id: challenge_id,
+            available_at: now,
+        },
+    )
+}
+
+async fn exercise_user_registration_storage(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('registration-reviewer', 'registration-reviewer', 'Reviewer', 'test-hash')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('registration-library', 'Registration', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+
+    let main_hash = [51_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-main",
+        "registration-main@example.test",
+        "registration-main",
+        "registration-main-challenge",
+        "registration-main-mail",
+        5_000,
+        1_000,
+        &main_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_000)
+            .await?,
+        UserRegistrationCreateResult::Created
+    );
+
+    let duplicate_hash = [52_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-duplicate",
+        "registration-main@example.test",
+        "registration-duplicate",
+        "registration-duplicate-challenge",
+        "registration-duplicate-mail",
+        5_000,
+        1_001,
+        &duplicate_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_001)
+            .await?,
+        UserRegistrationCreateResult::AlreadyExists
+    );
+    assert!(
+        database
+            .get_mail_challenge("registration-duplicate-challenge")
+            .await?
+            .is_none()
+    );
+
+    let rollback_hash = [53_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-rollback",
+        "registration-rollback@example.test",
+        "registration-rollback",
+        "registration-rollback-challenge",
+        "registration-main-mail",
+        5_000,
+        1_002,
+        &rollback_hash,
+    );
+    assert!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_002)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM user_registration_requests WHERE id = 'registration-rollback'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    assert!(
+        database
+            .get_mail_challenge("registration-rollback-challenge")
+            .await?
+            .is_none()
+    );
+
+    let revoked_hash = [54_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-revoked",
+        "registration-revoked@example.test",
+        "registration-revoked",
+        "registration-revoked-challenge",
+        "registration-revoked-mail",
+        5_000,
+        1_003,
+        &revoked_hash,
+    );
+    database
+        .create_user_registration_request_with_mail(request, challenge, outbox, 1_003)
+        .await?;
+    database
+        .query("UPDATE mail_challenges SET revoked_at = 1_004 WHERE id = 'registration-revoked-challenge'")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-revoked-challenge", &revoked_hash, 1_005)
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    let (revoked_status, revoked_hash): (String, Option<String>) = database
+        .query_as(
+            "SELECT status, password_hash FROM user_registration_requests WHERE id = 'registration-revoked'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(revoked_status, "PENDING_EMAIL");
+    assert!(revoked_hash.is_some());
+
+    let invalid_digest = [55_u8; 32];
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-main-challenge", &invalid_digest, 1_010)
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-main-challenge", &main_hash, 1_010)
+            .await?,
+        UserRegistrationVerifyResult::Verified
+    );
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-main-challenge", &main_hash, 1_011)
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    let page = database
+        .list_user_registration_requests_page(
+            Some(UserRegistrationStatus::PendingApproval),
+            1_000,
+            0,
+            1_011,
+        )
+        .await?;
+    assert_eq!(page.page_size, 100);
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.requests[0].id, "registration-main");
+    assert_eq!(
+        page.requests[0].status,
+        UserRegistrationStatus::PendingApproval
+    );
+    assert_eq!(page.requests[0].email_verified_at, Some(1_010));
+    assert_eq!(
+        page.requests[0].permission_snapshot_json,
+        REGISTRATION_TEST_PERMISSION_SNAPSHOT
+    );
+
+    let missing_library_permissions = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["missing-registration-library"],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#;
+    assert!(
+        database
+            .approve_user_registration_request(
+                "registration-main",
+                "registration-reviewer",
+                missing_library_permissions,
+                1_020,
+            )
+            .await
+            .is_err()
+    );
+    let (pending_status, pending_hash): (String, Option<String>) = database
+        .query_as(
+            "SELECT status, password_hash FROM user_registration_requests WHERE id = 'registration-main'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(pending_status, "PENDING_APPROVAL");
+    assert!(pending_hash.is_some());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM users WHERE email = 'registration-main@example.test'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+
+    let approved_permissions = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["registration-library"],"canDownload":true,"canPlay":true,"maxSimultaneousPlaybacks":3,"allowRemux":false,"allowAudioTranscode":true,"allowVideoTranscode":false}}"#;
+    let (first_approval, second_approval) = tokio::join!(
+        database.approve_user_registration_request(
+            "registration-main",
+            "registration-reviewer",
+            approved_permissions,
+            1_030,
+        ),
+        database.approve_user_registration_request(
+            "registration-main",
+            "registration-reviewer",
+            approved_permissions,
+            1_030,
+        ),
+    );
+    let approvals = [first_approval?, second_approval?];
+    let approved_user_id = approvals
+        .iter()
+        .find_map(|result| match result {
+            UserRegistrationApproveResult::Approved(user_id) => Some(user_id.clone()),
+            _ => None,
+        })
+        .ok_or("registration was not approved")?;
+    assert_eq!(
+        approvals
+            .iter()
+            .filter(|result| matches!(result, UserRegistrationApproveResult::Approved(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        approvals
+            .iter()
+            .filter(|result| **result == UserRegistrationApproveResult::NotReviewable)
+            .count(),
+        1
+    );
+    let account: (String, Option<i64>, i64, i64, i64, String) = database
+        .query_as(
+            "SELECT email, email_verified_at, is_disabled, has_password, can_download, library_access_mode
+             FROM users WHERE id = ?",
+        )
+        .bind(&approved_user_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        account,
+        (
+            "registration-main@example.test".to_owned(),
+            Some(1_010),
+            0,
+            1,
+            1,
+            "SELECTED".to_owned()
+        )
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM user_library_access WHERE user_id = ? AND library_id = 'registration-library' AND can_view = 1",
+            )
+            .bind(&approved_user_id)
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .approve_user_registration_request(
+                "registration-main",
+                "registration-reviewer",
+                approved_permissions,
+                1_031,
+            )
+            .await?,
+        UserRegistrationApproveResult::NotReviewable
+    );
+
+    let reject_hash = [56_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-rejected",
+        "registration-rejected@example.test",
+        "registration-rejected",
+        "registration-rejected-challenge",
+        "registration-rejected-mail",
+        5_000,
+        1_040,
+        &reject_hash,
+    );
+    database
+        .create_user_registration_request_with_mail(request, challenge, outbox, 1_040)
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-rejected-challenge", &reject_hash, 1_050)
+            .await?,
+        UserRegistrationVerifyResult::Verified
+    );
+    assert_eq!(
+        database
+            .reject_user_registration_request(
+                "registration-rejected",
+                "registration-reviewer",
+                1_060
+            )
+            .await?,
+        UserRegistrationRejectResult::Rejected
+    );
+    assert_eq!(
+        database
+            .reject_user_registration_request(
+                "registration-rejected",
+                "registration-reviewer",
+                1_061
+            )
+            .await?,
+        UserRegistrationRejectResult::NotReviewable
+    );
+    let rejected: (String, Option<String>, Option<String>) = database
+        .query_as(
+            "SELECT status, password_hash, reviewed_by_user_id
+             FROM user_registration_requests WHERE id = 'registration-rejected'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        rejected,
+        (
+            "REJECTED".to_owned(),
+            None,
+            Some("registration-reviewer".to_owned())
+        )
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT status FROM mail_outbox WHERE idempotency_key = 'registration-rejected-mail'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        "FAILED"
+    );
+
+    for (id, byte) in [
+        ("registration-expiring-a", 57_u8),
+        ("registration-expiring-b", 58_u8),
+    ] {
+        let email = format!("{id}@example.test");
+        let challenge_id = format!("{id}-challenge");
+        let mail_id = format!("{id}-mail");
+        let username = id;
+        let token_hash = [byte; 32];
+        let (request, challenge, outbox) = registration_storage_bundle(
+            id,
+            &email,
+            username,
+            &challenge_id,
+            &mail_id,
+            1_100,
+            1_070,
+            &token_hash,
+        );
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_070)
+            .await?;
+    }
+    assert_eq!(
+        database
+            .verify_user_registration_email(
+                "registration-expiring-a-challenge",
+                &[57_u8; 32],
+                1_100
+            )
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    let expired_page = database
+        .list_user_registration_requests_page(Some(UserRegistrationStatus::Expired), 100, 0, 1_100)
+        .await?;
+    assert_eq!(expired_page.total_count, 2);
+    assert!(expired_page.requests.iter().all(|request| {
+        matches!(
+            request.id.as_str(),
+            "registration-expiring-a" | "registration-expiring-b"
+        ) && request.status == UserRegistrationStatus::Expired
+    }));
+    let pending_email_page = database
+        .list_user_registration_requests_page(
+            Some(UserRegistrationStatus::PendingEmail),
+            100,
+            0,
+            1_100,
+        )
+        .await?;
+    assert_eq!(pending_email_page.total_count, 1);
+    assert_eq!(pending_email_page.requests[0].id, "registration-revoked");
+    assert_eq!(
+        database.expire_user_registration_requests(1_100, 1).await?,
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM user_registration_requests
+                 WHERE status = 'PENDING_EMAIL' AND expires_at <= 1100",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .expire_user_registration_requests(1_100, 100)
+            .await?,
+        1
+    );
+    for id in ["registration-expiring-a", "registration-expiring-b"] {
+        let (status, password_hash): (String, Option<String>) = database
+            .query_as("SELECT status, password_hash FROM user_registration_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(status, "EXPIRED");
+        assert!(password_hash.is_none());
+    }
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT status FROM mail_outbox WHERE idempotency_key = 'registration-expiring-a-mail'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        "FAILED"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_registration_storage_contract_is_atomic_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    exercise_user_registration_storage(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_registration_storage_contract_is_atomic_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{DatabaseConfiguration, PostgresConnection};
+
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let test_database_name = database_name.clone();
+    let task = tokio::spawn(async move {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(crate::config::PostgresConnection {
+                database: test_database_name,
+                ..admin_connection
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = exercise_user_registration_storage(&database)
+            .await
+            .map_err(|error| error.to_string());
+        database.close().await;
+        result
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    match task {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(error.into()),
+    }
 }

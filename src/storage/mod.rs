@@ -58,6 +58,102 @@ pub(crate) struct StoredRegistrationMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationStatus {
+    PendingEmail,
+    PendingApproval,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl UserRegistrationStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingEmail => "PENDING_EMAIL",
+            Self::PendingApproval => "PENDING_APPROVAL",
+            Self::Approved => "APPROVED",
+            Self::Rejected => "REJECTED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "PENDING_EMAIL" => Ok(Self::PendingEmail),
+            "PENDING_APPROVAL" => Ok(Self::PendingApproval),
+            "APPROVED" => Ok(Self::Approved),
+            "REJECTED" => Ok(Self::Rejected),
+            "EXPIRED" => Ok(Self::Expired),
+            _ => Err(StorageError::Serialization(
+                "unknown user registration status".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewUserRegistrationRequest<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) username_normalized: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password_hash: &'a str,
+    pub(crate) permission_snapshot_json: &'a str,
+    pub(crate) expires_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationCreateResult {
+    Created,
+    AlreadyExists,
+    RateLimited,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationVerifyResult {
+    Verified,
+    NotAcceptable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationApproveResult {
+    Approved(String),
+    NotReviewable,
+    EmailConflict,
+    UsernameConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationRejectResult {
+    Rejected,
+    NotReviewable,
+}
+
+#[allow(dead_code)] // LUX-812 maps this redacted summary to the administrator API.
+pub(crate) struct StoredUserRegistrationRequest {
+    pub(crate) id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) username_normalized: String,
+    pub(crate) display_name: String,
+    pub(crate) status: UserRegistrationStatus,
+    pub(crate) permission_snapshot_json: String,
+    pub(crate) expires_at: i64,
+    pub(crate) email_verified_at: Option<i64>,
+    pub(crate) reviewed_at: Option<i64>,
+    pub(crate) reviewed_by_user_id: Option<String>,
+    pub(crate) approved_user_id: Option<String>,
+    pub(crate) last_error_code: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)] // LUX-812 maps this bounded storage result to the administrator API.
+pub(crate) struct UserRegistrationRequestPage {
+    pub(crate) requests: Vec<StoredUserRegistrationRequest>,
+    pub(crate) page_size: i64,
+    pub(crate) total_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UserPlaybackPolicy {
     pub(crate) can_play: bool,
     pub(crate) max_simultaneous_playbacks: i64,
