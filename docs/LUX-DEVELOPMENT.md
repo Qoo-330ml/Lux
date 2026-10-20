@@ -16929,11 +16929,15 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 验收标准：
 
-- [ ] SQLite 与 PostgreSQL 均原子保留 pending email、验证后切换邮箱并设 `email_verified_at`。
-- [ ] 原邮箱在验证前继续有效；新邮箱唯一冲突和无效 challenge 不消费凭证。
-- [ ] 定向存储回归、build、fmt 与 diff check 通过。
+- [x] SQLite 与 PostgreSQL 均原子保留 pending email、验证后切换邮箱并设 `email_verified_at`。
+- [x] 原邮箱在验证前继续有效；新邮箱唯一冲突和无效 challenge 不消费凭证。
+- [x] 定向存储回归、build、fmt 与 diff check 通过。
 
 短计划：先加 pending/consume/冲突/并发回归；再实现双后端事务；最后运行 SQLite/PostgreSQL 定向检查。
+
+实施结果：新增邮箱变更 challenge 消费事务，先锁定启用且未删除的账户，再锁定其 `EMAIL_VERIFICATION` challenge。验证成功时在同一事务更新邮箱及 `email_verified_at`、消费当前 challenge 并撤销该用户其他未消费 challenge；邮箱冲突、无效/过期/重放凭证、跨用户凭证和不可用账户均不改变邮箱或消费凭证。唯一索引并发冲突会回滚整个事务。待验证邮箱保存在 challenge 的 `recipient_email`，当前账户邮箱在验证前保持不变；无需迁移。
+
+验证：TDD RED 先因存储结果类型和方法缺失而编译失败。实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_email_change_storage_contract -- --include-ignored --test-threads=1` SQLite/PostgreSQL 2/2 通过，覆盖大小写不敏感邮箱冲突、跨用户与无效/过期凭证、禁用/删除用户、成功后撤销旧 challenge、重放及并发单次消费。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Toshiba 已挂载，本机架构 `arm64`；邮件发送与 HTTP/API 留待 LUX-815/816。
 
 #### LUX-815：实现账户邮箱验证 application service
 

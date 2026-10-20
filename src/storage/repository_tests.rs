@@ -1,5 +1,6 @@
 use super::*;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
+use crate::storage::UserEmailChangeVerifyResult;
 use crate::storage::{
     ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
     MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewInvitationUserAccount,
@@ -29181,6 +29182,379 @@ async fn postgres_user_registration_storage_contract_is_atomic_and_bounded()
         .await
         .map_err(|error| error.to_string())?;
         let result = exercise_user_registration_storage(&database)
+            .await
+            .map_err(|error| error.to_string());
+        database.close().await;
+        result
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    match task {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn seed_email_change_user(
+    database: &Database,
+    id: &str,
+    email: &str,
+    verified_at: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .insert_user_with_email(NewStoredUser {
+            id,
+            username_normalized: id,
+            display_name: id,
+            password_hash: "test-hash",
+            is_admin: false,
+            has_password: true,
+            email: Some(email),
+        })
+        .await?;
+    database
+        .query("UPDATE users SET email_verified_at = ? WHERE id = ?")
+        .bind(verified_at)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
+async fn seed_email_change_challenge(
+    database: &Database,
+    id: &str,
+    user_id: &str,
+    email: &str,
+    token_hash: &[u8],
+    created_at: i64,
+    expires_at: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .create_mail_challenge(
+            NewMailChallenge {
+                id,
+                kind: MailChallengeKind::EmailVerification,
+                recipient_email: email,
+                reference_id: user_id,
+                token_hash,
+                expires_at,
+            },
+            created_at,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn exercise_user_email_change_storage_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    seed_email_change_user(database, "email-owner", "old@example.test", 100).await?;
+    seed_email_change_user(database, "email-conflict", "claimed@example.test", 100).await?;
+    let old_hash = [1_u8; 32];
+    let valid_hash = [2_u8; 32];
+    let conflict_hash = [3_u8; 32];
+    let expired_hash = [4_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-old",
+        "email-owner",
+        "previous-pending@example.test",
+        &old_hash,
+        110,
+        300,
+    )
+    .await?;
+    seed_email_change_challenge(
+        database,
+        "email-change-valid",
+        "email-owner",
+        "new@example.test",
+        &valid_hash,
+        111,
+        300,
+    )
+    .await?;
+    seed_email_change_challenge(
+        database,
+        "email-change-conflict",
+        "email-owner",
+        "CLAIMED@example.test",
+        &conflict_hash,
+        112,
+        300,
+    )
+    .await?;
+    seed_email_change_challenge(
+        database,
+        "email-change-expired",
+        "email-owner",
+        "expired@example.test",
+        &expired_hash,
+        113,
+        120,
+    )
+    .await?;
+
+    let before: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-owner")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(before, (Some("old@example.test".to_owned()), Some(100)));
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-valid", &[9_u8; 32], 150)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_email_change("email-conflict", "email-change-valid", &valid_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-expired", &expired_hash, 120)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-conflict", &conflict_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::EmailConflict
+    );
+    for id in [
+        "email-change-valid",
+        "email-change-expired",
+        "email-change-conflict",
+    ] {
+        let challenge = database
+            .get_mail_challenge(id)
+            .await?
+            .ok_or("pending email challenge disappeared")?;
+        assert_eq!(challenge.consumed_at, None);
+    }
+    let after_rejections: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-owner")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(after_rejections, before);
+
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-valid", &valid_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::Verified
+    );
+    let updated: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-owner")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(updated, (Some("new@example.test".to_owned()), Some(150)));
+    let consumed = database
+        .get_mail_challenge("email-change-valid")
+        .await?
+        .ok_or("consumed challenge disappeared")?;
+    assert_eq!(consumed.consumed_at, Some(150));
+    let revoked_old = database
+        .get_mail_challenge("email-change-old")
+        .await?
+        .ok_or("old challenge disappeared")?;
+    assert_eq!(revoked_old.revoked_at, Some(150));
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-valid", &valid_hash, 151)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+
+    seed_email_change_user(database, "email-disabled", "disabled@example.test", 100).await?;
+    let disabled_hash = [5_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-disabled",
+        "email-disabled",
+        "disabled-new@example.test",
+        &disabled_hash,
+        120,
+        300,
+    )
+    .await?;
+    database
+        .query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind("email-disabled")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_email_change(
+                "email-disabled",
+                "email-change-disabled",
+                &disabled_hash,
+                150,
+            )
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    let disabled_challenge = database
+        .get_mail_challenge("email-change-disabled")
+        .await?
+        .ok_or("disabled user's challenge disappeared")?;
+    assert_eq!(disabled_challenge.consumed_at, None);
+    let disabled_user: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-disabled")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        disabled_user,
+        (Some("disabled@example.test".to_owned()), Some(100))
+    );
+
+    seed_email_change_user(database, "email-deleted", "deleted@example.test", 100).await?;
+    let deleted_hash = [6_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-deleted",
+        "email-deleted",
+        "deleted-new@example.test",
+        &deleted_hash,
+        120,
+        300,
+    )
+    .await?;
+    database
+        .query("DELETE FROM users WHERE id = ?")
+        .bind("email-deleted")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_email_change("email-deleted", "email-change-deleted", &deleted_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    let deleted_challenge = database
+        .get_mail_challenge("email-change-deleted")
+        .await?
+        .ok_or("deleted user's challenge disappeared")?;
+    assert_eq!(deleted_challenge.consumed_at, None);
+
+    seed_email_change_user(database, "email-race", "race-old@example.test", 100).await?;
+    let race_hash = [7_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-race",
+        "email-race",
+        "race-new@example.test",
+        &race_hash,
+        120,
+        300,
+    )
+    .await?;
+    let (first, second) = tokio::join!(
+        database.verify_user_email_change("email-race", "email-change-race", &race_hash, 150,),
+        database.verify_user_email_change("email-race", "email-change-race", &race_hash, 150,)
+    );
+    let outcomes = [first?, second?];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == UserEmailChangeVerifyResult::Verified)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == UserEmailChangeVerifyResult::NotAcceptable)
+            .count(),
+        1
+    );
+    let race_user: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-race")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        race_user,
+        (Some("race-new@example.test".to_owned()), Some(150))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_email_change_storage_contract_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    exercise_user_email_change_storage_contract(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_email_change_storage_contract_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
+
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let test_database_name = database_name.clone();
+    let task = tokio::spawn(async move {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: test_database_name,
+                ..admin_connection
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = exercise_user_email_change_storage_contract(&database)
             .await
             .map_err(|error| error.to_string());
         database.close().await;

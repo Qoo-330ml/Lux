@@ -121,6 +121,13 @@ pub(crate) enum UserRegistrationVerifyResult {
     NotAcceptable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserEmailChangeVerifyResult {
+    Verified,
+    NotAcceptable,
+    EmailConflict,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UserRegistrationApproveResult {
     Approved(String),
