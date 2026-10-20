@@ -17051,15 +17051,19 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 范围：用户设备列表在已配置 IP 位置插件且缓存命中时提供可选归属地摘要；未命中由既有 `IpLocationService` 异步安排查询。未安装插件、私有地址或查询失败保持为空，不阻塞设备查询，不新增外部服务依赖。
 
-预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。用户设备响应是公开 API 合同，因此同步补充 API 文档。
 
 验收标准：
 
-- [ ] Device DTO 仅增加 nullable safe location metadata；不返回原始外部 provider 响应。
-- [ ] 缓存命中、未安装插件、非公网地址和 lookup 失败路径均有回归，列表仍有界。
-- [ ] 定向 API 测试、build、fmt 与 diff check 通过。
+- [x] Device DTO 仅增加 nullable safe location metadata；不返回原始外部 provider 响应。
+- [x] 缓存命中、未安装插件、非公网地址和 lookup 失败路径均有回归，列表仍有界。
+- [x] 定向 API 测试、build、fmt 与 diff check 通过。
 
-短计划：先增加设备响应归属地映射测试；再连接已有位置缓存服务；最后运行定向用户测试、build 与 diff check。
+短计划：先增加设备响应归属地映射测试；再连接已有位置缓存服务并只序列化安全摘要；最后更新 API 合同，运行定向用户测试、build、fmt 与 diff check。
+
+实施结果（2026-10-21）：管理员设备项新增 nullable `lastRemoteIpLocation`，只映射缓存中的 `country`、`province`、`city`、`isp`；不序列化位置服务返回的 IP、区县、街道或经纬度。缓存未命中复用既有有界异步查询，不等待插件；未配置 provider、私有地址和 lookup 失败均返回 `null`，设备分页与排序保持不变。`docs/API.md` 同步记录该响应合同。
+
+验证：新 API 归属地回归先因字段缺失失败；实现后 `cargo test --locked --test users -- --test-threads=1` 36/36 通过，覆盖已缓存位置、未安装 provider、非公网地址、provider 返回错误 IP、原始字段不外泄及有界分页。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。全目标 Clippy 被 19 项既有 `-D warnings` 诊断阻断，本任务新增代码未产生诊断；本机 `arm64`，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`。外部插件由本地 fake process 提供响应，未调用真实 IP 位置服务，未部署。
 
 #### LUX-822：在设备清单展示 IP 归属地
 

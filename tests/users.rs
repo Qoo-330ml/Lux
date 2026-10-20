@@ -21,6 +21,56 @@ use tokio::net::TcpListener;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
+#[cfg(unix)]
+fn write_test_ip_location_plugin(
+    config_dir: &std::path::Path,
+    lookup_marker: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = config_dir.join("plugins/org.lux.qoo-ip138");
+    std::fs::create_dir_all(plugin_dir.join("binaries"))?;
+    let marker = format!(
+        "'{}'",
+        lookup_marker.to_string_lossy().replace('\'', "'\\''")
+    );
+    let script = r#"#!/bin/sh
+marker=__LOOKUP_MARKER__
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  ip=$(printf '%s' "$line" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+  printf '%s\n' "$ip" >> "$marker"
+  if [ "$ip" = "8.8.8.8" ]; then
+    result='{"ip":"8.8.8.8","country":"测试国家","province":"测试省","city":"测试城市","district":"不应返回","street":"不应返回","isp":"测试运营商","latitude":"1","longitude":"2"}'
+  else
+    result='{"ip":"1.1.1.1","country":"错误结果","isp":"不应返回"}'
+  fi
+  printf '{"id":"%s","result":%s}\n' "$id" "$result"
+done
+"#
+    .replace("__LOOKUP_MARKER__", &marker);
+    let binary_path = plugin_dir.join("binaries/plugin");
+    std::fs::write(&binary_path, script)?;
+    std::fs::set_permissions(binary_path, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.qoo-ip138",
+            "name": "Test IP Location",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "ip_location",
+            "category": "NETWORK",
+            "capabilities": ["ip.location"],
+            "permissions": {"network": ["example.invalid"]},
+            "files": []
+        }))?,
+    )?;
+    Ok(())
+}
+
 fn registration_verification_token(
     config_dir: &std::path::Path,
     challenge_id: &str,
@@ -4948,16 +4998,16 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
         .await?;
     assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
 
-    for (device_id, name, client_name, seen_at) in [
-        ("device-b", "Phone B", "Infuse", 300_i64),
-        ("device-a", "Phone A", "Lux Web", 300_i64),
-        ("device-c", "Tablet C", "Kodi", 200_i64),
+    for (device_id, name, client_name, seen_at, remote_ip) in [
+        ("device-b", "Phone B", "Infuse", 300_i64, "8.8.8.8"),
+        ("device-a", "Phone A", "Lux Web", 300_i64, "10.0.0.8"),
+        ("device-c", "Tablet C", "Kodi", 200_i64, "192.168.1.8"),
     ] {
         sqlx::query(
             "INSERT INTO user_devices (
                  user_id, device_id, device_name, device_type, client_name,
                  client_version, first_seen_at, last_seen_at, last_remote_ip
-             ) VALUES (?, ?, ?, 'TEST', ?, '1.2.3', ?, ?, '203.0.113.10')",
+             ) VALUES (?, ?, ?, 'TEST', ?, '1.2.3', ?, ?, ?)",
         )
         .bind(target.id.to_string())
         .bind(device_id)
@@ -4965,6 +5015,7 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
         .bind(client_name)
         .bind(seen_at - 10)
         .bind(seen_at)
+        .bind(remote_ip)
         .execute(database.pool())
         .await?;
     }
@@ -5019,7 +5070,9 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
     assert_eq!(device["clientVersion"], "1.2.3");
     assert_eq!(device["firstSeenAt"], 290);
     assert_eq!(device["lastSeenAt"], 300);
-    assert_eq!(device["lastRemoteIp"], "203.0.113.10");
+    assert_eq!(device["lastRemoteIp"], "10.0.0.8");
+    assert!(device.get("lastRemoteIpLocation").is_some());
+    assert_eq!(device["lastRemoteIpLocation"], Value::Null);
     assert!(device.get("token").is_none());
     assert!(device.get("userId").is_none());
 
@@ -5032,6 +5085,15 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
     assert_eq!(second_body["totalCount"], 3);
     assert_eq!(second_body["devices"][0]["deviceId"], "device-b");
     assert_eq!(second_body["devices"][0]["hasActiveLogin"], true);
+    assert!(
+        second_body["devices"][0]
+            .get("lastRemoteIpLocation")
+            .is_some()
+    );
+    assert_eq!(
+        second_body["devices"][0]["lastRemoteIpLocation"],
+        Value::Null
+    );
 
     let third_page = client
         .get(format!("{path}?page=3&pageSize=1"))
@@ -5041,6 +5103,10 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
     let third_body = third_page.json::<Value>().await?;
     assert_eq!(third_body["devices"][0]["deviceId"], "device-c");
     assert_eq!(third_body["devices"][0]["hasActiveLogin"], false);
+    assert_eq!(
+        third_body["devices"][0]["lastRemoteIpLocation"],
+        Value::Null
+    );
 
     let clamped = client
         .get(format!("{path}?page=0&pageSize=101"))
@@ -5067,6 +5133,135 @@ async fn admin_can_list_user_devices_with_pagination_and_auth()
         .send()
         .await?;
     assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn admin_device_list_returns_only_cached_safe_ip_location_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let lookup_marker = temp_dir.path().join("ip-location-lookups.txt");
+    write_test_ip_location_plugin(&config.config_dir, &lookup_marker)?;
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "admin password").await?;
+    let target = UserStore::new(database.clone())?
+        .create_user(
+            "ip-location-target",
+            "IP Location Target",
+            "target password",
+            false,
+        )
+        .await?;
+    for (device_id, remote_ip, last_seen_at) in [
+        ("location-ok", "8.8.8.8", 300_i64),
+        ("location-failure", "8.8.4.4", 200_i64),
+        ("location-private", "10.0.0.8", 100_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, client_name, first_seen_at, last_seen_at, last_remote_ip
+             ) VALUES (?, ?, 'Lux Web', 1, ?, ?)",
+        )
+        .bind(target.id.to_string())
+        .bind(device_id)
+        .bind(last_seen_at)
+        .bind(remote_ip)
+        .execute(database.pool())
+        .await?;
+    }
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let admin_cookie = cookie_pair(login.headers());
+    let path = format!(
+        "{base_url}/api/v1/admin/users/{}/devices?pageSize=20",
+        target.id
+    );
+
+    let initial = client
+        .get(&path)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), reqwest::StatusCode::OK);
+    let initial_body = initial.json::<Value>().await?;
+    assert!(
+        initial_body["devices"][0]
+            .get("lastRemoteIpLocation")
+            .is_some()
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let marker = std::fs::read_to_string(&lookup_marker).unwrap_or_default();
+            if marker.lines().any(|ip| ip == "8.8.8.8") && marker.lines().any(|ip| ip == "8.8.4.4")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let cached = client
+        .get(&path)
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    let cached_body = cached.json::<Value>().await?;
+    let devices = cached_body["devices"]
+        .as_array()
+        .ok_or("device list missing")?;
+    let find_device = |device_id: &str| {
+        devices
+            .iter()
+            .find(|device| device["deviceId"] == device_id)
+            .ok_or("device missing")
+    };
+    let located_device = find_device("location-ok")?;
+    let location = &located_device["lastRemoteIpLocation"];
+    assert_eq!(location["country"], "测试国家");
+    assert_eq!(location["province"], "测试省");
+    assert_eq!(location["city"], "测试城市");
+    assert_eq!(location["isp"], "测试运营商");
+    for provider_field in ["ip", "district", "street", "latitude", "longitude"] {
+        assert!(location.get(provider_field).is_none());
+    }
+    assert_eq!(
+        find_device("location-failure")?["lastRemoteIpLocation"],
+        Value::Null
+    );
+    assert_eq!(
+        find_device("location-private")?["lastRemoteIpLocation"],
+        Value::Null
+    );
+    let lookups = std::fs::read_to_string(&lookup_marker)?;
+    assert_eq!(lookups.lines().count(), 2);
+    assert!(!lookups.lines().any(|ip| ip == "10.0.0.8"));
 
     server.abort();
     Ok(())

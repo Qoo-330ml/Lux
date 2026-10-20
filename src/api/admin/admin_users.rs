@@ -817,17 +817,35 @@ async fn admin_list_user_devices(
         .await
     {
         Ok((devices, total_count)) => Json(json!({
-            "devices": devices.iter().map(|device| json!({
-                "deviceId": device.device_id,
-                "hasActiveLogin": device.has_active_login,
-                "deviceName": device.device_name,
-                "deviceType": device.device_type,
-                "clientName": device.client_name,
-                "clientVersion": device.client_version,
-                "firstSeenAt": device.first_seen_at,
-                "lastSeenAt": device.last_seen_at,
-                "lastRemoteIp": device.last_remote_ip,
-            })).collect::<Vec<_>>(),
+            "devices": devices.iter().map(|device| {
+                let last_remote_ip_location = device
+                    .last_remote_ip
+                    .as_deref()
+                    .and_then(|remote_ip| {
+                        state
+                            .ip_location
+                            .as_ref()
+                            .and_then(|service| service.cached_or_schedule(remote_ip))
+                    })
+                    .map(|location| json!({
+                        "country": location.country,
+                        "province": location.province,
+                        "city": location.city,
+                        "isp": location.isp,
+                    }));
+                json!({
+                    "deviceId": device.device_id,
+                    "hasActiveLogin": device.has_active_login,
+                    "deviceName": device.device_name,
+                    "deviceType": device.device_type,
+                    "clientName": device.client_name,
+                    "clientVersion": device.client_version,
+                    "firstSeenAt": device.first_seen_at,
+                    "lastSeenAt": device.last_seen_at,
+                    "lastRemoteIp": device.last_remote_ip,
+                    "lastRemoteIpLocation": last_remote_ip_location,
+                })
+            }).collect::<Vec<_>>(),
             "page": page,
             "pageSize": page_size,
             "totalCount": total_count,
