@@ -776,7 +776,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const libraryLink = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    const libraryLink = container.querySelector<HTMLAnchorElement>(".lux-library-card-copy-link");
     expect(libraryLink).not.toBeNull();
     await act(async () => {
       libraryLink?.focus();
