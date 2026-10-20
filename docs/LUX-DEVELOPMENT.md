@@ -16697,17 +16697,21 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 #### LUX-805：建立 SQLite 公开注册申请表
 
-范围：新增 SQLite `user_registration_requests` migration，保存邮箱、用户名/显示名称、密码哈希、权限默认快照、申请状态、创建/验证/审核时间与稳定错误状态；不保存原始凭证或密码。
+范围：新增 SQLite `user_registration_requests` migration，保存邮箱、用户名/显示名称、密码哈希、权限默认快照、申请状态、创建/验证/审核时间与稳定错误状态；不保存原始凭证或密码。状态为 `PENDING_EMAIL`、`PENDING_APPROVAL`、`APPROVED`、`REJECTED`、`EXPIRED`；前两个状态使用邮箱部分唯一索引。申请保留到期时间，待处理状态必须有 Argon2id 哈希，终态清除哈希；审核人和已创建用户外键删除后置空。错误只允许 `EMAIL_CONFLICT`、`USERNAME_CONFLICT`、`MAIL_DELIVERY_FAILED`、`PERMISSIONS_UNAVAILABLE` 或空值。
 
 预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0203_user_registration_requests.sql`、`tests/storage.rs`。
 
 验收标准：
 
-- [ ] migration 可从空库和当前 schema 升级；状态及唯一性约束防止重复待处理邮箱申请。
-- [ ] 表不含明文密码或 token 字段，拒绝非法状态与越界字段。
-- [ ] SQLite migration 回归、build、fmt 与 diff check 通过。
+- [x] migration 可从空库和当前 schema 升级；状态及唯一性约束防止重复待处理邮箱申请。
+- [x] 表不含明文密码或 token 字段，拒绝非法状态与越界字段。
+- [x] SQLite migration 回归、build、fmt 与 diff check 通过。
 
 短计划：先扩展空库/升级 schema 回归并确认表缺失；再新增 migration；最后运行目标 migration 测试、build、fmt 和 diff check。
+
+实施结果（2026-10-20）：新增 SQLite 申请表及状态/时间/字段约束，涵盖五种状态、Argon2id 密码哈希与终态清理、JSON 对象型权限快照（32 KiB 上限）、pending 邮箱唯一索引、到期查询索引和审核人/已创建用户 `ON DELETE SET NULL` 外键。migration 不保存原始 token 或密码。
+
+验证：TDD RED 先确认空库缺表且缺少 migration；`cargo test --locked --test storage user_registration_requests_migration` 2/2 通过，覆盖空库与从当前 schema 升级、既有用户保留、重复 pending 邮箱、状态转移及字段约束、非法外键和删除置空。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；Cargo 使用 Toshiba target，本机 arm64。`cargo clippy --locked --test storage -- -D warnings` 因 lib 中 11 项既有诊断失败，诊断均位于本任务未修改文件，没有指向 migration 或本次新增测试。未实现注册业务接口。
 
 #### LUX-806：建立 PostgreSQL 公开注册申请表
 
