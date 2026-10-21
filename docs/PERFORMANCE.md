@@ -137,9 +137,16 @@ M1 相对基线下降 63.1%，达到方案“改善 ≥40%”的阶段目标；M
 | admin 懒加载 CSS | 48,719 B | 88,578 B |
 | detail 懒加载 CSS | 21,142 B | 41,129 B |
 
-gzip 侧已达到 ≤35 KB 目标，原始体积仍高于 ≤150 KB：剩余主要是 Tailwind preflight 与工具类（约 15 KB）、library/auth 路由样式（不在首屏懒加载链路）与跨路由共享规则。
+gzip 侧已达到 ≤35 KB 目标，原始体积仍高于 ≤150 KB。第三次拆分把带 `@media` 覆盖的路由类名也整组迁出（判定条件扩展为「提及该类名的所有规则只归一个路由」），主 CSS 进一步降到 123,840 B / gzip 22,672 B，两项目标同时达标。
 
-等价性验证没有用截图，而是对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style 的 23 项（颜色、字号、内外边距、display、gap、圆角、transform、字体栈、行高等），与改动前构建逐条比对，全部一致；唯一差异是首页 hero 进度条的一帧动画 transform（`matrix(0.241652…)` ↔ `matrix(0.24166…)`）。该验证只覆盖本机 Chromium 1280×900 与一个媒体库夹具，不覆盖其他视口、Safari/Firefox 或真实弱网。
+| 指标 | 一次拆分 | 二次拆分 | 三次拆分 |
+|---|---:|---:|---:|
+| 主 CSS 原始 | 229,689 B | 164,828 B | 123,840 B |
+| 主 CSS gzip | 37,545 B | 28,472 B | 22,672 B |
+| admin 懒加载 | 48,719 B | 88,578 B | 122,104 B |
+| detail 懒加载 | 21,142 B | 41,129 B | 53,467 B |
+
+等价性验证没有用截图，而是对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style 的 23 项（颜色、字号、内外边距、display、gap、圆角、transform、字体栈、行高等），与改动前构建逐条比对：三次拆分后桌面 1280×900 与移动 390×844 两个视口全部一致，唯一差异是首页 hero 进度条的一帧动画 transform。该验证只覆盖本机 Chromium 与一个媒体库夹具，不覆盖 320/768/1024/1440 全视口、Safari/Firefox 或真实弱网。
 
 ## LUX-834 静态资源预压缩（2026-10-21）
 

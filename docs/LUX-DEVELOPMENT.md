@@ -17363,7 +17363,7 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 - [x] 中文编辑标题不再请求 Noto Serif SC 子集；首屏字体字节由最多约 1.28 MB 降到 0（拉丁标题最多一个 Bodoni 文件）。
 - [x] 320/390/768/1280/1440 视口截图人工检查无布局回归；浏览器控制台无本任务错误。
-- [ ] 首屏 CSS ≤150 KB、gzip ≤35 KB：二次拆分后主 CSS 164,828 B / gzip 28,472 B；gzip 已达标，raw 仍高于 150 KB（Tailwind 整包与 library/auth/home 样式仍在主 CSS）。
+- [x] 首屏 CSS ≤150 KB、gzip ≤35 KB：三次拆分后主 CSS 123,840 B / gzip 22,672 B，两项均达标。
 - [x] `pnpm --dir web build`、定向 Web 测试与 `git diff --check` 通过。
 
 短计划：先删 Noto 子集并切换字体栈；构建后检查字体请求、CSS 体积和 1280/390 截图；再更新性能记录。
@@ -17380,7 +17380,11 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 验证方式：用 Playwright 对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style（颜色、字号、内外边距、display、gap、圆角、变换、字体、行高等 23 项），与改动前构建逐条比对：全部一致，唯一差异是首页 hero 进度条的一帧动画变换值（`matrix(0.241652…)` 对 `matrix(0.24166…)`）。
 
-限制：raw 体积仍高于 150 KB，剩余主要来自 Tailwind preflight/工具类（约 15 KB）、library 与 auth 路由样式（未拆，因为媒体库与登录页不在首屏懒加载链路上）以及 route-agnostic 的共享规则。本次未使用全视口逐像素截图，只做了 computed style 等价性验证；也未在真实弱网下复测 CSS 请求瀑布。
+第三次拆分（同日）：前两次只迁顶层规则，因此凡是另有 `@media` 覆盖的 admin/detail 类名都留在了主 CSS。这次把「类名归属」的判定扩展到媒体块内的规则：只有当提及某类名的**所有**规则（基础、`:hover`、浅色主题、断点）都归同一路由时，才整组迁出；迁出的基础规则前置、断点块按原顺序追加，保持 react.css 原本的「先基础、后断点」结构。
+
+结果：`react.css` 162,447 → 118,119 B；构建后主 CSS 164,828 → 123,840 B（gzip 28,472 → 22,672 B），**raw ≤150 KB 与 gzip ≤35 KB 两项均达标**。admin/detail 懒加载 CSS 分别为 122,104 / 53,467 B。等价性验证重复了桌面 11 条路由，并对同一 11 条路由在 390×844 移动视口各导出一次 computed style 比对，全部一致（唯一差异仍是首页 hero 进度条的一帧动画 transform）。
+
+限制：剩余体积主要来自 Tailwind preflight/工具类（约 15 KB）与 library/auth/home 的共享规则；未拆 library/auth 是因为媒体库与登录页不在首屏懒加载链路上，拆出只会把字节挪到另一个首屏请求。未做逐像素截图或 320/768/1024/1440 全视口对比，也未在真实弱网下复测 CSS 请求瀑布。
 
 #### LUX-832：列表跳过每页 COUNT 并返回 hasNext
 
