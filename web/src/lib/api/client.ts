@@ -1460,6 +1460,12 @@ export class LuxApiClient {
     );
   }
 
+  adminUserAccountPreferences(userId: string) {
+    return this.request<AccountPreferences>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/account-preferences`,
+    );
+  }
+
   adminContentRestrictionIndexStatus() {
     return this.request<AdminContentRestrictionIndexStatus>(
       "/api/v1/admin/content-restriction-index",

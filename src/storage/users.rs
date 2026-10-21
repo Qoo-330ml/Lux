@@ -3604,10 +3604,10 @@ impl Database {
 
         let mut transaction = self.begin_metadata_write_transaction().await?;
         if self.backend() == crate::config::DatabaseBackend::Postgres {
-            let mut lock_ids = vec![source_user_id.to_owned(), target_user_id.to_owned()];
+            let mut lock_ids = [source_user_id.to_owned(), target_user_id.to_owned()];
             lock_ids.sort_unstable();
             let lock_sql =
-                format!("SELECT id FROM users WHERE id IN (?, ?) ORDER BY id FOR UPDATE");
+                "SELECT id FROM users WHERE id IN (?, ?) ORDER BY id FOR UPDATE".to_owned();
             let lock_query = self
                 .query(sqlx::AssertSqlSafe(lock_sql))
                 .bind(&lock_ids[0])
@@ -3984,9 +3984,9 @@ impl Database {
         if result.rows_affected() == 0 {
             let user_available: i64 = self
                 .query_scalar(
-                    "SELECT EXISTS(
+                    "SELECT CAST(CASE WHEN EXISTS(
                         SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
-                    )",
+                    ) THEN 1 ELSE 0 END AS BIGINT)",
                 )
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
@@ -4188,9 +4188,9 @@ impl Database {
         if result.rows_affected() == 0 {
             let user_available: i64 = self
                 .query_scalar(
-                    "SELECT EXISTS(
+                    "SELECT CAST(CASE WHEN EXISTS(
                         SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL
-                    )",
+                    ) THEN 1 ELSE 0 END AS BIGINT)",
                 )
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
