@@ -3,9 +3,10 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const styles = readFileSync(resolve(here, "../src/react.css"), "utf8");
+const styles = allStyles;
 const operationsPage = readFileSync(resolve(here, "../src/features/admin/AdminOperationsPage.tsx"), "utf8");
 
 test("admin operations restores visible loading and page heading states", () => {

@@ -1,16 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheetPaths = [
-  "../src/react.css",
-  "../src/features/admin/plugin-library.css",
-  "../src/features/media/MediaSubtitleEditor.css",
-];
-
-const stylesheets = stylesheetPaths
-  .map((path) => fs.readFileSync(new URL(path, import.meta.url), "utf8"))
-  .join("\n");
+const stylesheets = allStyles;
 
 function withoutThemeDefinitions(styles) {
   return styles

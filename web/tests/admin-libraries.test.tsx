@@ -9,6 +9,7 @@ import { MemoryRouter } from "react-router-dom";
 import { AdminLibrariesPage } from "../src/features/admin/AdminLibrariesPage";
 import { api } from "../src/lib/api/client";
 import type { AdminPlugin } from "../src/lib/api/types";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -335,7 +336,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(rootForm?.querySelector("[aria-label='添加新媒体库路径']")).toBeNull();
     expect(rootInput?.parentElement).toBe(rootForm);
     expect(browseButton?.parentElement).toBe(rootForm);
-    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    const stylesheet = allStyles;
     expect(stylesheet).toContain(".lux-library-root-form { display: grid; grid-template-columns: minmax(0, 1fr) 40px; gap: 8px; margin-top: 14px; }");
   });
 
@@ -363,7 +364,7 @@ describe("AdminLibrariesPage library cards", () => {
 
     const form = container.querySelector<HTMLFormElement>(".lux-library-create-dialog form");
     expect(form).toBeTruthy();
-    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    const stylesheet = allStyles;
     expect(stylesheet).toContain(".lux-library-create-dialog > .lux-library-dialog-form { min-height: 0; overflow-y: auto; }");
   });
 
@@ -921,7 +922,7 @@ describe("AdminLibrariesPage library cards", () => {
   });
 
   it("keeps scraper row actions inline and the clear action readable", () => {
-    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    const stylesheet = allStyles;
 
     expect(stylesheet).toMatch(/\.lux-admin-scraper-actions\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s);
     expect(stylesheet).toMatch(/\.lux-admin-scraper-field\s+\.lux-admin-scraper-clear\s*\{[^}]*width:\s*auto;[^}]*min-height:\s*32px;[^}]*white-space:\s*nowrap;/s);

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = fs.readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 const pluginStyles = fs.readFileSync(new URL("../src/features/admin/plugin-library.css", import.meta.url), "utf8");
 const pluginsPage = fs.readFileSync(new URL("../src/features/admin/AdminPluginsPage.tsx", import.meta.url), "utf8");
 const usersPage = fs.readFileSync(new URL("../src/features/admin/AdminUsersPage.tsx", import.meta.url), "utf8");

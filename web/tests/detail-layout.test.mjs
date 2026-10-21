@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
+import { mediaStyles, stylesheet as allStyles } from "./style-source.mjs";
 
 test("detail copy starts at the poster top with the logo above its title", () => {
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const titleRowStart = source.indexOf('className="lux-detail-title-row"');
   const titleRowEnd = source.indexOf("</div>", titleRowStart);
   const titleRow = titleRowStart >= 0 && titleRowEnd > titleRowStart ? source.slice(titleRowStart, titleRowEnd) : "";
@@ -18,7 +19,7 @@ test("detail copy starts at the poster top with the logo above its title", () =>
 });
 
 test("detail actions leave space below the overview", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const actionRule = stylesheet.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(actionRule, /margin-top:\s*24px/);
@@ -28,7 +29,7 @@ test("detail actions center controls instead of stretching around tall artwork",
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const actionRule = stylesheet.match(/^\.lux-hero-actions\s*\{([^}]*)\}/m)?.[1] ?? "";
   const artworkRule = stylesheet.match(/^\.lux-hero-actions\s*>\s*img,\s*\.lux-hero-actions\s*>\s*\.lux-theme-logo\s*\{([^}]*)\}/m)?.[1] ?? "";
   const actionsStart = source.indexOf('className="lux-hero-actions"');
@@ -41,8 +42,8 @@ test("detail actions center controls instead of stretching around tall artwork",
 });
 
 test("mobile detail hero keeps the immersive poster compact", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const posterRule = mobileStyles.match(/\.lux-detail-poster\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(posterRule, /height:\s*clamp\(384px,\s*120vw,\s*520px\)/);
@@ -52,8 +53,8 @@ test("mobile detail hero keeps the immersive poster compact", () => {
 });
 
 test("mobile detail poster fades broadly into the content surface", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const posterFadeRule = mobileStyles.match(/\.lux-detail-poster::after\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(posterFadeRule, /transparent\s+18%/);
@@ -63,16 +64,16 @@ test("mobile detail poster fades broadly into the content surface", () => {
 });
 
 test("mobile detail identity pulls above the poster edge", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const titleRowRule = mobileStyles.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(titleRowRule, /margin-top:\s*-168px/);
 });
 
 test("mobile detail identity stays above the poster fade", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const titleRowRule = mobileStyles.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
   const copyRule = mobileStyles.match(/\.lux-detail-copy\s*\{([^}]*)\}/)?.[1] ?? "";
   const posterFadeRule = mobileStyles.match(/\.lux-detail-poster::after\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -85,8 +86,8 @@ test("mobile detail identity stays above the poster fade", () => {
 });
 
 test("mobile detail header keeps the desktop shadow and fade above its controls", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const mobileHeaderRule = mobileStyles.match(/\.lux-detail-mobile-header\s*\{([^}]*)\}/)?.[1] ?? "";
   const mobileFadeRule = mobileStyles.match(/\.lux-detail-mobile-header::before\s*\{([^}]*)\}/)?.[1] ?? "";
   const desktopFadeRule = stylesheet.match(/\.lux-header::before\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -104,7 +105,7 @@ test("mobile detail header keeps the desktop shadow and fade above its controls"
 });
 
 test("detail grid fills the container so left and right outer spacing match", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const detailGridRule = stylesheet.match(/\.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";
   const episodeGridRule = stylesheet.match(/\.lux-detail-page-episode \.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -123,7 +124,7 @@ test("active React pages do not render global back controls", () => {
 });
 
 test("detail page uses a compact title and a three-line expandable overview", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
 
   assert.match(stylesheet, /\.lux-detail-copy h1\s*\{[^}]*font-size:\s*28px/);
   assert.match(stylesheet, /\.lux-detail-overview-text\s*\{[^}]*max-height:\s*calc\(1\.7em\s*\*\s*3\)/);
@@ -131,14 +132,14 @@ test("detail page uses a compact title and a three-line expandable overview", ()
 });
 
 test("detail copy stretches its overview to the available right edge", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const overviewRule = stylesheet.match(/\.lux-detail-overview\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(overviewRule, /max-width:\s*none/);
 });
 
 test("media stream cards keep a compact width on wide detail pages", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const streamGridRule = stylesheet.match(/\.lux-media-stream-grid\s*\{([^}]*)\}/)?.[1] ?? "";
   const streamCardRule = stylesheet.match(/\.lux-media-stream-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const scrollViewportRule = stylesheet.match(/^\.lux-horizontal-scroll-viewport\s*\{([^}]*)\}/m)?.[1] ?? "";
@@ -150,7 +151,7 @@ test("media stream cards keep a compact width on wide detail pages", () => {
 });
 
 test("shared horizontal rails hide native scrollbars while preserving horizontal scrolling", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const scrollViewportRule = stylesheet.match(/^\.lux-horizontal-scroll-viewport\s*\{([^}]*)\}/m)?.[1] ?? "";
   const webkitScrollbarRule = stylesheet.match(/\.lux-horizontal-scroll-viewport::\-webkit-scrollbar\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -161,7 +162,7 @@ test("shared horizontal rails hide native scrollbars while preserving horizontal
 });
 
 test("shared horizontal scroll arrows are larger controls with a visible shadow", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const arrowRule = stylesheet.match(/\.lux-horizontal-scroll-arrow\s*\{([^}]*)\}/)?.[1] ?? "";
   const hoverRule = stylesheet.match(/\.lux-horizontal-scroll-arrow:hover\s*\{([^}]*)\}/)?.[1] ?? "";
   const arrowIconRule = stylesheet.match(/\.lux-horizontal-scroll-arrow\s+svg\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -177,14 +178,14 @@ test("shared horizontal scroll arrows are larger controls with a visible shadow"
 });
 
 test("media cast has no separator line", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const castRule = stylesheet.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.doesNotMatch(castRule, /border-top/);
 });
 
 test("media metadata uses an unframed surface with compact spacing", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const component = readFileSync(new URL("../src/features/detail/MediaNfoPanel.tsx", import.meta.url), "utf8");
   const taxonomyRule = stylesheet.match(/\.lux-media-nfo-taxonomy\s*\{([^}]*)\}/)?.[1] ?? "";
   const secondaryRule = stylesheet.match(/\.lux-media-nfo-secondary\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -211,7 +212,7 @@ test("media metadata uses an unframed surface with compact spacing", () => {
 });
 
 test("media file address and summary share one surface with an unboxed toggle", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const fileFactsRule = stylesheet.match(/^\.lux-media-file-facts\s*\{([^}]*)\}/m)?.[1] ?? "";
   const addressRule = stylesheet.match(/^\.lux-media-address-row\s*\{([^}]*)\}/m)?.[1] ?? "";
   const toggleRule = stylesheet.match(/^\.lux-media-details-toggle\s*\{([^}]*)\}/m)?.[1] ?? "";
@@ -225,14 +226,14 @@ test("media file address and summary share one surface with an unboxed toggle", 
 });
 
 test("series seasons follow the cast without a separator line", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const seriesChildrenRule = stylesheet.match(/\.lux-series-children(?:,\s*\.lux-season-episodes,\s*\.lux-episode-rail)?\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.doesNotMatch(seriesChildrenRule, /border-top/);
 });
 
 test("season poster placeholder styles do not stretch rating or episode badges", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
@@ -243,7 +244,7 @@ test("season poster placeholder styles do not stretch rating or episode badges",
 });
 
 test("detail lower sections use the full content width", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const castRule = stylesheet.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";
   const infoRule = stylesheet.match(/\.lux-media-info\s*\{([^}]*)\}/)?.[1] ?? "";
   const infoExtraRule = stylesheet.match(/\.lux-media-info-extra\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -260,7 +261,7 @@ test("detail lower sections use the full content width", () => {
 });
 
 test("media detail track selectors fit without overlap and use compact controls", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const selectorsRule = stylesheet.match(/^\.lux-track-selectors\s*\{([^}]*)\}/m)?.[1] ?? "";
   const selectorRule = stylesheet.match(/^\.lux-track-selector\s*\{([^}]*)\}/m)?.[1] ?? "";
   const selectRule = stylesheet.match(/^\.lux-track-select\s*\{([^}]*)\}/m)?.[1] ?? "";
@@ -293,8 +294,8 @@ test("mobile detail pages use a full-bleed portrait poster and keep the logo abo
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const posterRule = mobileStyles.match(/\.lux-detail-poster\s*\{([^}]*)\}/)?.[1] ?? "";
   const posterColumnRule = mobileStyles.match(/\.lux-detail-poster-column\s*\{([^}]*)\}/)?.[1] ?? "";
   const contentRule = mobileStyles.match(/\.lux-detail-content\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -315,7 +316,7 @@ test("detail logos use a separate row above the bilingual title group", () => {
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const titleRowStart = source.indexOf('className="lux-detail-title-row"');
   const logoStart = source.indexOf('className="lux-detail-logo"', titleRowStart);
   const titleNamesStart = source.indexOf('className="lux-detail-title-names"', titleRowStart);
@@ -335,8 +336,8 @@ test("series seasons sit between cast and stills with a gap before more informat
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const desktopSeasonRule = stylesheet.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
   const desktopNfoRule = stylesheet.match(/\.lux-detail-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
   const mobileSeasonRule = mobileStyles.match(/\.lux-detail-series-seasons\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -353,8 +354,8 @@ test("mobile episode details switch their landscape hero to a portrait poster wh
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
 
   assert.match(source, /className="lux-detail-poster-landscape"/);
   assert.match(source, /className="lux-detail-poster-portrait"/);
@@ -365,16 +366,16 @@ test("mobile episode details switch their landscape hero to a portrait poster wh
 });
 
 test("mobile episode detail uses a single-column hero grid", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const episodeGridRule = mobileStyles.match(/\.lux-detail-page-episode\s+\.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(episodeGridRule, /grid-template-columns:\s*1fr/);
 });
 
 test("mobile detail sections put hierarchy before cast and metadata", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
 
   assert.match(mobileStyles, /\.lux-detail-sections\s*\{[^}]*display:\s*flex/);
   assert.match(mobileStyles, /\.lux-detail-hierarchy\s*\{[^}]*order:\s*1/);
@@ -385,8 +386,8 @@ test("mobile detail sections put hierarchy before cast and metadata", () => {
 });
 
 test("mobile detail actions share one row and sit directly above the hierarchy", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const actionRule = mobileStyles.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*\{([^}]*)\}/)?.[1] ?? "";
   const primaryRule = mobileStyles.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*>\s*\.lux-button-primary\s*\{([^}]*)\}/)?.[1] ?? "";
   const hierarchyRule = mobileStyles.match(/\.lux-detail-hierarchy\s*>\s*\.lux-series-children,\s*\.lux-detail-hierarchy\s*>\s*\.lux-season-episodes,\s*\.lux-detail-hierarchy\s*>\s*\.lux-episode-rail\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -404,8 +405,8 @@ test("mobile detail actions fit a compact more action beside favorite and watche
   const source = readdirSync(new URL("../src/features/detail/", import.meta.url))
     .filter((name) => /^MediaDetail.*\.tsx$|^MediaEpisodesSection\.tsx$/.test(name))
     .map((name) => readFileSync(new URL(`../src/features/detail/${name}`, import.meta.url), "utf8")).join("\n");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const actionRule = mobileStyles.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*\{([^}]*)\}/)?.[1] ?? "";
   const inlineMenuRule = mobileStyles.match(/\.lux-detail-inline-menu\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -417,8 +418,8 @@ test("mobile detail actions fit a compact more action beside favorite and watche
 });
 
 test("mobile detail lower sections use tighter vertical spacing", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const castRule = mobileStyles.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";
   const nfoRule = mobileStyles.match(/\.lux-media-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -429,8 +430,8 @@ test("mobile detail lower sections use tighter vertical spacing", () => {
 });
 
 test("mobile detail lower sections reuse the page gutter", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const stylesheet = allStyles;
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const sectionRule = mobileStyles.match(/\.lux-detail-sections\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(sectionRule, /width:\s*92%/);
@@ -438,7 +439,7 @@ test("mobile detail lower sections reuse the page gutter", () => {
 });
 
 test("detail section headings share the same type scale", () => {
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const headingRule = stylesheet.match(/\.lux-detail-page \.lux-media-cast-heading h2,\s*\.lux-detail-page \.lux-media-stills-heading h2,\s*\.lux-detail-page \.lux-section-heading h2,\s*\.lux-detail-page \.lux-media-nfo-heading h2,\s*\.lux-detail-page \.lux-media-nfo-media-heading h3\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.ok(headingRule, "cast, stills, detail sections, more information, and media file headings share one rule");

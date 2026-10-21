@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { mediaStyles, stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 const identifierStyles = readFileSync(new URL("../src/features/media/MediaIdentifier.css", import.meta.url), "utf8");
 const luxSelectSource = readFileSync(new URL("../src/components/LuxSelect.tsx", import.meta.url), "utf8");
 const pluginStyles = readFileSync(new URL("../src/features/admin/plugin-library.css", import.meta.url), "utf8");
@@ -116,7 +117,7 @@ test("mobile navigation stays attached below the fixed header", () => {
 });
 
 test("mobile task activity popover stays inside the viewport and wraps its content", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const popoverRule = mobileStyles.match(/\.lux-scan-activity-popover\s*\{([^}]*)\}/)?.[1] ?? "";
   const headingRule = mobileStyles.match(/\.lux-scan-activity-row-heading\s*\{([^}]*)\}/)?.[1] ?? "";
   const actionRule = mobileStyles.match(/\.lux-scan-activity-actions\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -131,7 +132,7 @@ test("mobile task activity popover stays inside the viewport and wraps its conte
 });
 
 test("mobile person details use the same horizontal page gutter", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 700px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 700px)");
   const personRule = mobileStyles.match(/\.lux-person-detail-page\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(personRule, /width:\s*92%/);
@@ -139,10 +140,10 @@ test("mobile person details use the same horizontal page gutter", () => {
 });
 
 test("touch media cards expose their action controls", () => {
-  const touchStyles = stylesheet.match(/@media \(hover: none\), \(pointer: coarse\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const touchStyles = stylesheet.match(/@media \(hover: none\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
 
-  assert.match(touchStyles, /\.lux-media-art-shell > \.lux-media-actions\s*\{[^}]*opacity:\s*1[^}]*pointer-events:\s*auto/s);
-  assert.match(touchStyles, /\.lux-library-card-menu-trigger\s*\{[^}]*opacity:\s*1/s);
+  assert.match(touchStyles, /\.lux-media-art-shell\.is-touch-hovered > \.lux-media-actions[^}]*opacity:\s*1[^}]*pointer-events:\s*auto/s);
+  assert.match(touchStyles, /\.lux-library-card-cover-shell\.is-touch-hovered \.lux-library-card-menu-trigger/s);
 });
 
 test("touch text controls keep a 16px floor above page-specific font sizes", () => {
@@ -161,14 +162,14 @@ test("touch text sizing preserves large editable titles and manual page zoom", (
 });
 
 test("mobile library batch actions wrap instead of overflowing", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const selectionRule = mobileStyles.match(/\.lux-library-selection-toolbar\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(selectionRule, /flex-wrap:\s*wrap/);
 });
 
 test("mobile image editing controls stay usable in a narrow dialog", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const tabsRule = mobileStyles.match(/\.lux-image-type-tabs\s*\{([^}]*)\}/)?.[1] ?? "";
   const toolbarRule = mobileStyles.match(/\.lux-image-editor-toolbar\s*\{([^}]*)\}/)?.[1] ?? "";
   const buttonRule = mobileStyles.match(/\.lux-image-editor-toolbar > \.lux-button\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -180,7 +181,7 @@ test("mobile image editing controls stay usable in a narrow dialog", () => {
 });
 
 test("mobile player controls use the remaining width", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const controlsRule = mobileStyles.match(/\.lux-player-controls-right\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(controlsRule, /flex:\s*1 1 auto/);
@@ -199,12 +200,12 @@ test("mobile action surfaces scroll within the dynamic viewport", () => {
 });
 
 test("mobile metadata identifier results keep a usable landscape height", () => {
-  const mobileRules = identifierStyles.slice(identifierStyles.indexOf("@media (max-width: 560px)"));
+  const mobileRules = mediaStyles("@media (max-width: 560px)");
   assert.match(mobileRules, /\.lux-identifier-results\s*\{[^}]*max-height:\s*[^;]*100dvh[^;]*-\s*180px/s);
 });
 
 test("mobile header reserves the safe-area inset", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const headerRule = mobileStyles.match(/\.lux-header\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(headerRule, /padding-top:\s*max\([^)]*safe-area-inset-top/);
@@ -212,7 +213,7 @@ test("mobile header reserves the safe-area inset", () => {
 });
 
 test("mobile admin operations tabs stay usable without clipping", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const tabsRule = mobileStyles.match(/\.lux-operations-tabs\s*\{([^}]*)\}/)?.[1] ?? "";
   const tabRule = mobileStyles.match(/\.lux-operations-tab\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -229,7 +230,7 @@ test("admin mobile dialogs use dynamic viewport and safe-area insets", () => {
 });
 
 test("admin mobile controls use the touch target token", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 900px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 900px)");
   assert.match(mobileStyles, /\.lux-admin-nav-link\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
   assert.match(mobileStyles, /\.lux-admin-filter-select \.lux-select-trigger\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
   assert.match(mobileStyles, /\.lux-admin-user-actions \.lux-icon-button-small[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
@@ -239,14 +240,14 @@ test("admin mobile controls use the touch target token", () => {
 });
 
 test("admin mobile dashboard metadata remains readable", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   assert.match(mobileStyles, /\.lux-now-playing-account\s*\{[^}]*font-size:\s*\.68rem/);
   assert.match(mobileStyles, /\.lux-now-playing-progress-label\s*\{[^}]*font-size:\s*\.66rem/);
   assert.match(mobileStyles, /\.lux-now-playing-fact small[^}]*font-size:\s*\.64rem/);
 });
 
 test("admin permission toggles collapse to one column on narrow phones", () => {
-  const narrowStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 460px)"));
+  const narrowStyles = mediaStyles("@media (max-width: 460px)");
   assert.match(narrowStyles, /\.lux-admin-permission-grid\s*\{[^}]*grid-template-columns:\s*1fr/);
   assert.match(narrowStyles, /\.lux-admin-permission-toggle\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
 });
@@ -259,7 +260,7 @@ test("LuxSelect tracks the visual viewport while its menu is open", () => {
 });
 
 test("mobile detail pages keep their vertical content scrollable", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const detailRule = mobileStyles.match(/\.lux-detail-page\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(detailRule, /overflow-x:\s*clip/);
@@ -269,7 +270,7 @@ test("mobile detail pages keep their vertical content scrollable", () => {
 test("mobile viewport metadata and auth shell respect browser chrome", () => {
   assert.match(indexHtml, /viewport-fit=cover/);
   assert.match(indexHtml, /interactive-widget=resizes-content/);
-  const authStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 1024px)"));
+  const authStyles = mediaStyles("@media (max-width: 1024px)");
   assert.match(authStyles, /\.lux-auth-screen\s*\{[^}]*min-height:\s*100dvh/);
   assert.match(authStyles, /\.lux-auth-screen\s*\{[^}]*overflow-y:\s*auto/);
   assert.match(authStyles, /safe-area-inset-top/);
@@ -290,7 +291,7 @@ test("detail and media editor overlays reserve safe areas and dynamic height", (
 });
 
 test("narrow media editor footers wrap their actions", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const footerRule = mobileStyles.match(/\.lux-media-editor-footer\s*\{([^}]*)\}/)?.[1] ?? "";
   const footerActionsRule = mobileStyles.match(/\.lux-media-editor-footer\s*>\s*div\s*\{([^}]*)\}/)?.[1] ?? "";
 
@@ -299,14 +300,14 @@ test("narrow media editor footers wrap their actions", () => {
 });
 
 test("touch account controls retain a usable hit area", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 900px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 900px)");
 
   assert.match(mobileStyles, /\.lux-account-settings-nav a\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
   assert.match(mobileStyles, /\.lux-account-library-actions button\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
 });
 
 test("mobile admin library surface expands with its negative outer gutter", () => {
-  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 720px)"));
+  const mobileStyles = mediaStyles("@media (max-width: 720px)");
   const libraryPageRule = mobileStyles.match(/\.lux-admin-library-page\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(libraryPageRule, /width:\s*auto/);
