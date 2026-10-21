@@ -2510,6 +2510,11 @@ impl Database {
             return Ok((Vec::new(), 0));
         }
         let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
+        let (query, list_binds) = filtered_catalog_list_query(filter);
+        if !filter.include_total {
+            let rows = self.fetch_catalog_rows(&query, &list_binds).await?;
+            return Ok((rows, 0));
+        }
         let count_query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -2532,7 +2537,6 @@ impl Database {
                     source,
                 })
         };
-        let (query, list_binds) = filtered_catalog_list_query(filter);
         let rows_future = self.fetch_catalog_rows(&query, &list_binds);
         let (total, rows) = tokio::try_join!(total_future, rows_future)?;
         Ok((rows, total))
@@ -9901,7 +9905,12 @@ fn filtered_catalog_list_query<'a>(
          LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
          ORDER BY {item_order}, ms.id, mt.stream_index"
     );
-    binds.push(CatalogBind::Integer(filter.limit));
+    let fetch_limit = if filter.include_total {
+        filter.limit
+    } else {
+        filter.limit.saturating_add(1)
+    };
+    binds.push(CatalogBind::Integer(fetch_limit));
     binds.push(CatalogBind::Integer(filter.offset));
     (query, binds)
 }

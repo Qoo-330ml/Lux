@@ -280,6 +280,7 @@ pub(super) fn catalog_filter_from_values(
         metadata_pending,
         sort_by: catalog_sort_from_value(sort_by),
         descending: sort_order.is_some_and(|value| value.eq_ignore_ascii_case("Descending")),
+        include_total: true,
     }
 }
 
@@ -1269,6 +1270,7 @@ pub(super) async fn emby_group_latest_page(
             metadata_pending: false,
             sort_by: CatalogSort::Name,
             descending: false,
+            include_total: true,
         };
         let series_page = catalog
             .list_all_items_filtered(principal, &filter, 0, series_ids.len() as i64)
@@ -1299,12 +1301,7 @@ pub(super) async fn emby_group_latest_page(
     }
     let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
     Ok((
-        CatalogPage {
-            items,
-            total,
-            offset: page.offset,
-            limit: page.limit,
-        },
+        CatalogPage::new(items, total, page.offset, page.limit),
         resolved_group_counts,
     ))
 }
@@ -2092,12 +2089,7 @@ async fn emby_global_collection_root_items_response(
         Ok(page) => page,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog_page = CatalogPage {
-        items: page.cards.iter().map(|card| card.item.clone()).collect(),
-        total: page.total,
-        offset,
-        limit,
-    };
+    let catalog_page = CatalogPage::new(page.cards.iter().map(|card| card.item.clone()).collect(), page.total, offset, limit);
     let mut items = match emby_catalog_items_for_user(
         state,
         user_id,
@@ -2364,12 +2356,7 @@ pub(super) async fn emby_catalog_page_from_query(
             normalize_search_query(raw_query),
             normalize_search_like_query(raw_query),
         ) else {
-            return Ok(CatalogPage {
-                items: Vec::new(),
-                total: 0,
-                offset,
-                limit,
-            });
+            return Ok(CatalogPage::new(Vec::new(), 0, offset, limit));
         };
         let item_types = query
             .include_item_types
@@ -2488,24 +2475,14 @@ pub(super) async fn emby_catalog_page_for_item_parent(
         if is_home_videos {
             "FOLDER,VIDEO".to_owned()
         } else {
-            return Ok(CatalogPage {
-                items: Vec::new(),
-                total: 0,
-                offset,
-                limit,
-            });
+            return Ok(CatalogPage::new(Vec::new(), 0, offset, limit));
         }
     } else {
         let child_type = match parent.item_type.as_str() {
             "SERIES" => "SEASON",
             "SEASON" => "EPISODE",
             _ => {
-                return Ok(CatalogPage {
-                    items: Vec::new(),
-                    total: 0,
-                    offset,
-                    limit,
-                });
+                return Ok(CatalogPage::new(Vec::new(), 0, offset, limit));
             }
         };
         child_type.to_owned()
@@ -3009,12 +2986,7 @@ async fn emby_global_collection_item_detail(
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let page = CatalogPage {
-        items: vec![card.item],
-        total: 1,
-        offset: 0,
-        limit: 1,
-    };
+    let page = CatalogPage::new(vec![card.item], 1, 0, 1);
     let mut items = match emby_catalog_items_for_user(
         state,
         &principal.user_id_string(),

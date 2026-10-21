@@ -17268,6 +17268,29 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：首屏 CSS 目标未达成（328,721 B / gzip 52,534 B，目标 ≤150 KB / ≤35 KB）；`react.css` 尚未按路由拆分，Tailwind 仍整包引入。未在 Windows/Linux 系统字体、真实 320/768/1024/1440 视口逐像素对比或 FNOS/x86_64 上验证；中文宋体在不同操作系统上的可用字形不同，视觉会有轻微差异。未在真实用户设备上测量字体渲染性能。
 
+#### LUX-832：列表跳过每页 COUNT 并返回 hasNext
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-829：首屏去掉重复 COUNT 与详情二次查询”（编号顺延）。
+
+范围：`CatalogFilter`/`CatalogFilterQuery` 新增 `include_total`；`count=false` 时列表内层取 `limit+1` 判断 `hasNext`、跳过 `COUNT(*)`，`CatalogPage` 增加 `hasNext` 与 `total_included`，HTTP 响应省略 `total`。Web 媒体库首屏与预取传 `count=false`，并用 `hasNext` 判断下一页；Emby、搜索、收藏、详情等继续使用完整计数。本任务不改变列表 DTO 字段，卡片投影由 LUX-831 提供。
+
+预计文件（9 个）：`src/storage/repository.rs`、`src/storage/catalog.rs`、`src/application/catalog.rs`、`src/api/media.rs`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`tests/catalog.rs`（另含 docs）。
+
+验收标准：
+
+- [x] `count=false` 跳过 COUNT，响应无 `total`、有 `hasNext`；最后一页 `hasNext=false`；`count=true`/缺省保持完整 `total`。
+- [x] Emby 与其他 Lux 列表响应不变；Web 无限滚动翻页、排序和空结果不回归。
+- [x] 100 万条夹具上 `count=false` 单页 warm p95 ≤10 ms；M1/M2 相对基线下降并记录剩余瓶颈。
+- [x] Rust `catalog` 定向回归、Web 库页/客户端测试、build 与 fmt 通过。
+
+短规划：先写 `count=false` 的 HTTP 回归（无 total、hasNext、末页）；再改 storage/application/page DTO；最后接入 Web 并复测。
+
+实施结果（2026-10-21）：新增 `include_total` 与 `CatalogPage::without_total`；`list_filtered_catalog_rows` 在 `include_total=false` 时跳过 COUNT，并把内层 `LIMIT` 加一用于 `hasNext`；`assemble_items` 后截断多余条目。HTTP 响应在 `count=false` 时省略 `total`、始终返回 `hasNext`；`Emby` 与所有未显式关闭计数的调用保持完整 `total`。Web 媒体库首屏和预取同时传 `fields=card&count=false`，`PageResponse` 增加 `hasNext`，无限查询优先使用它。
+
+验证：`cargo test --locked --test catalog lux_and_emby_catalogs_list_page_and_show_movie_details` 1/1（新增 `count=false` 无 total、首页 hasNext=true、末页 hasNext=false 断言）；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/api-client.test.ts` 123/123；`pnpm --dir web build` 与 `cargo build --release --locked` 通过。100 万条夹具、20 Mbps / 40 ms、三次冷启动：M1 1,669.3→712.3 ms（-57.3%），M2 1,638.5→652.1 ms（-60.2%），列表请求自身 736–768→51–54 ms（约 -93%），M3 中位数 1,268.2→314.9 ms（单轮波动 CV 52.9%），M5 19,257,462→18,535,204 B。单页 `count=false` 冷启动首请求约 12 ms，10 次热请求最小 1.5 ms、中位 1.5 ms、最大 1.7 ms；同页 `count=true` 约 443 ms。
+
+限制：M2 仍未达到 ≤300 ms 绝对目标，剩余成本是 setup→me→libraries 引导链与 20 Mbps / 40 ms 网络（后续 LUX-836）；M3 单轮波动大；未在 PostgreSQL、真实浏览器弱网、FNOS/x86_64 上复测。Web 依赖 `hasNext` 的新字段，旧服务器仍走 `total` 回退。所有数字仅代表本机 macOS arm64。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

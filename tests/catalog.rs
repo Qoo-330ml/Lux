@@ -1656,6 +1656,33 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(invalid_fields.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    let count_skipped = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&fields=card&count=false&sort_by=Name&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(count_skipped.status(), reqwest::StatusCode::OK);
+    let count_skipped_body: Value = count_skipped.json().await?;
+    assert_eq!(count_skipped_body["items"].as_array().map(Vec::len), Some(1));
+    assert!(count_skipped_body.get("total").is_none());
+    assert_eq!(count_skipped_body["hasNext"], true);
+
+    let last_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?page=3&pageSize=2&fields=card&count=false&sort_by=Name&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(last_page.status(), reqwest::StatusCode::OK);
+    let last_page_body: Value = last_page.json().await?;
+    assert!(last_page_body.get("total").is_none());
+    assert_eq!(last_page_body["hasNext"], false);
+
     let favorites = client
         .get(format!("{base_url}/api/v1/favorites?pageSize=1"))
         .header(COOKIE, &cookies)

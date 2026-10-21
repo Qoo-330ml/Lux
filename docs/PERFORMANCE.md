@@ -2,6 +2,20 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-832 列表跳过 COUNT 复测（2026-10-21）
+
+`GET /api/v1/libraries/{libraryId}/items` 新增 `count=false`：跳过每页全库 `COUNT(*)`，内层查询取 `limit+1` 判断 `hasNext`，响应省略 `total`。Web 媒体库首屏与预取同时使用 `fields=card&count=false`；Emby 与其他 Lux 列表仍包含完整计数。
+
+| 指标 | LUX-830 索引后 | `count=false` + card | 相对 LUX-829 基线 |
+|---|---:|---:|---:|
+| M1 首卡可见中位数 | 1,365.5 ms | 712.3 ms | -57.3%（基线 1,669.3 ms） |
+| M2 列表 TTFB 中位数 | 1,335.9 ms | 652.1 ms | -60.2%（基线 1,638.5 ms） |
+| 列表请求自身耗时 | 434–442 ms | 51–54 ms | 约 -93% |
+| M3 排序后首卡中位数 | 772.7 ms | 314.9 ms（CV 52.9%） | -75.2%（基线 1,268.2 ms） |
+| M5 首屏字节 | 19,257,462 B | 18,535,204 B | -3.8% |
+
+单页 `count=false` 请求：冷启动后首次约 12 ms，连续 10 次热请求最小 1.5 ms、中位 1.5 ms、最大 1.7 ms；同页 `count=true` 约 443 ms。M2 仍未达到方案“≤300 ms”的绝对目标，剩余成本来自 setup→me→libraries 引导链和 20 Mbps / 40 ms 网络；留给 LUX-836（首屏并行）处理。Emby 路由和其他未传 `count=false` 的调用保持原响应。以上只代表本机 arm64 与直接写库夹具。
+
 ## LUX-835 系统宋体栈与字体字节（2026-10-21）
 
 删除 101 个 Noto Serif SC 子集（约 111 KB CSS、6.0 MB 字体资产），保留 3 个 Libre Bodoni 拉丁字体；中文编辑标题改用系统 `"Songti SC", "STSong", "SimSun", serif` 栈。

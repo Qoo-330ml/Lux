@@ -211,6 +211,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       sortBy,
       sortOrder,
       fields: "card",
+      count: false,
       ...(metadataStatus ? { metadataStatus } : {}),
       ...(parentId ? { parentId } : {}),
     }),
@@ -218,6 +219,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     enabled: Boolean(libraryId && library),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
+      if (typeof lastPage.hasNext === "boolean") return lastPage.hasNext ? page + 1 : undefined;
       const pageSize = lastPage.pageSize ?? 24;
       const total = lastPage.total ?? 0;
       return page * pageSize < total ? page + 1 : undefined;

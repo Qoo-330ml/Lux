@@ -7493,6 +7493,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) descending: bool,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
+    pub(crate) include_total: bool,
 }
 
 pub(crate) struct ResumeItemsQuery<'a> {

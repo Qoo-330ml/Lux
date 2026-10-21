@@ -201,6 +201,7 @@ export type LibraryItemsOptions = {
   pageSize?: number;
   parentId?: string;
   fields?: "card";
+  count?: boolean;
 };
 
 function withHomeRequestTimeout<T>(
@@ -678,6 +679,7 @@ export class LuxApiClient {
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
     if (options.parentId) params.set("parentId", options.parentId);
     if (options.fields) params.set("fields", options.fields);
+    if (options.count === false) params.set("count", "false");
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );

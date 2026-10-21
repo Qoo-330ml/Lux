@@ -151,6 +151,7 @@ describe("LibraryPage infinite scroll", () => {
 
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
       fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "root",
@@ -169,6 +170,7 @@ describe("LibraryPage infinite scroll", () => {
     });
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
       fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "folder-trips",
@@ -182,6 +184,7 @@ describe("LibraryPage infinite scroll", () => {
     });
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
       fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "folder-2024",
@@ -401,6 +404,7 @@ describe("LibraryPage infinite scroll", () => {
 
     expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "SERIES", {
       fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
     });
@@ -413,6 +417,7 @@ describe("LibraryPage infinite scroll", () => {
 
     expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "SERIES", {
       fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
     });
@@ -553,6 +558,7 @@ describe("LibraryPage infinite scroll", () => {
     await act(async () => {
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
         fields: "card",
+      count: false,
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -608,6 +614,7 @@ describe("LibraryPage infinite scroll", () => {
       releaseDateOption.click();
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
         fields: "card",
+      count: false,
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -622,6 +629,7 @@ describe("LibraryPage infinite scroll", () => {
     await act(async () => {
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
         fields: "card",
+      count: false,
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -664,6 +672,7 @@ describe("LibraryPage infinite scroll", () => {
     await act(async () => {
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
         fields: "card",
+      count: false,
         sortBy: "Name",
         sortOrder: "Ascending",
         metadataStatus: "PENDING",
@@ -936,6 +945,7 @@ describe("LibraryPage infinite scroll", () => {
 
     expect(libraryItems).toHaveBeenCalledWith(collectionLibraryId, 1, "BOX_SET", {
       fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
     });

@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CatalogFilter {
     pub item_types: Vec<String>,
     pub excluded_item_types: Vec<String>,
@@ -39,6 +39,28 @@ pub struct CatalogFilter {
     pub metadata_pending: bool,
     pub sort_by: CatalogSort,
     pub descending: bool,
+    pub include_total: bool,
+}
+
+impl Default for CatalogFilter {
+    fn default() -> Self {
+        Self {
+            item_types: Vec::new(),
+            excluded_item_types: Vec::new(),
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: Vec::new(),
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            sort_by: CatalogSort::default(),
+            descending: false,
+            include_total: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -868,12 +890,7 @@ impl CatalogService {
         let content_restrictions = self.content_restrictions_for_principal(principal).await?;
         self.populate_episode_counts(&mut items, content_restrictions.as_ref())
             .await?;
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(items, total, offset, limit))
     }
 
     pub async fn list_library_items_filtered(
@@ -960,6 +977,7 @@ impl CatalogService {
                 CatalogSort::Rating => StorageCatalogSort::Rating,
             },
             descending: filter.descending,
+            include_total: filter.include_total,
             offset: request.offset,
             limit: request.limit,
         };
@@ -970,12 +988,20 @@ impl CatalogService {
             request.content_restrictions.as_ref(),
         )
         .await?;
-        Ok(CatalogPage {
-            items,
-            total,
-            offset: request.offset,
-            limit: request.limit,
-        })
+        if filter.include_total {
+            Ok(CatalogPage::new(items, total, request.offset, request.limit))
+        } else {
+            let has_next = items.len() as i64 > request.limit;
+            if has_next {
+                items.truncate(request.limit as usize);
+            }
+            Ok(CatalogPage::without_total(
+                items,
+                request.offset,
+                request.limit,
+                has_next,
+            ))
+        }
     }
 
     pub async fn list_all_items_filtered(
@@ -1017,6 +1043,7 @@ impl CatalogService {
                 CatalogSort::Rating => StorageCatalogSort::Rating,
             },
             descending: filter.descending,
+            include_total: filter.include_total,
             offset,
             limit,
         };
@@ -1024,12 +1051,15 @@ impl CatalogService {
         let mut items = assemble_items(rows);
         self.populate_item_details_and_episode_counts(&mut items, content_restrictions.as_ref())
             .await?;
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
+        if filter.include_total {
+            Ok(CatalogPage::new(items, total, offset, limit))
+        } else {
+            let has_next = items.len() as i64 > limit;
+            if has_next {
+                items.truncate(limit as usize);
+            }
+            Ok(CatalogPage::without_total(items, offset, limit, has_next))
+        }
     }
 
     pub async fn list_children(
@@ -1107,12 +1137,7 @@ impl CatalogService {
             self.populate_episode_counts(&mut items, content_restrictions.as_ref())
                 .await?;
         }
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(items, total, offset, limit))
     }
 
     pub async fn list_series_episodes(
@@ -1180,12 +1205,7 @@ impl CatalogService {
             .filter_map(|item_id| items_by_id.get(item_id).cloned())
             .collect::<Vec<_>>();
         self.populate_item_details(&mut items).await?;
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(items, total, offset, limit))
     }
 
     pub async fn list_collection_items(
@@ -1286,12 +1306,7 @@ impl CatalogService {
                 items.push(item);
             }
         }
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(items, total, offset, limit))
     }
 
     pub async fn list_next_up(
@@ -1456,12 +1471,7 @@ impl CatalogService {
                 .list_resume_items_with_total(&query, true)
                 .await?
         };
-        Ok(CatalogPage {
-            items: assemble_items(rows),
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(assemble_items(rows), total, offset, limit))
     }
 
     async fn list_progress_items(
@@ -1482,12 +1492,7 @@ impl CatalogService {
             .database
             .list_progress_items(user_id, &library_ids, item_types, series_id, offset, limit)
             .await?;
-        Ok(CatalogPage {
-            items: assemble_items(rows),
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(assemble_items(rows), total, offset, limit))
     }
 
     pub async fn list_recently_added(
@@ -1561,12 +1566,7 @@ impl CatalogService {
             }
         }
         let items = reorder_catalog_items(items, &item_ids);
-        Ok(CatalogPage {
-            items,
-            total,
-            offset,
-            limit,
-        })
+        Ok(CatalogPage::new(items, total, offset, limit))
     }
 
     pub async fn list_recently_added_by_library(
@@ -2257,12 +2257,7 @@ impl CatalogService {
             }
             items.push(item);
         }
-        Ok(CatalogPage {
-            items,
-            total,
-            offset: search.offset,
-            limit: search.limit,
-        })
+        Ok(CatalogPage::new(items, total, search.offset, search.limit))
     }
 }
 
@@ -2300,6 +2295,38 @@ pub struct CatalogPage {
     pub total: i64,
     pub offset: i64,
     pub limit: i64,
+    pub has_next: bool,
+    pub total_included: bool,
+}
+
+impl CatalogPage {
+    pub fn new(items: Vec<CatalogItem>, total: i64, offset: i64, limit: i64) -> Self {
+        let has_next = offset.saturating_add(items.len() as i64) < total;
+        Self {
+            items,
+            total,
+            offset,
+            limit,
+            has_next,
+            total_included: true,
+        }
+    }
+
+    pub fn without_total(
+        items: Vec<CatalogItem>,
+        offset: i64,
+        limit: i64,
+        has_next: bool,
+    ) -> Self {
+        Self {
+            items,
+            total: 0,
+            offset,
+            limit,
+            has_next,
+            total_included: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

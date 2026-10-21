@@ -412,6 +412,7 @@ export type PageResponse<T> = {
   page?: number;
   pageSize?: number;
   total?: number;
+  hasNext?: boolean;
 };
 
 export type AdminMetadataBatchConfirmation = {

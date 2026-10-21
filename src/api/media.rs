@@ -38,6 +38,8 @@ pub(super) struct LuxPageQuery {
     metadata_status: Option<String>,
     #[serde(default)]
     fields: Option<String>,
+    #[serde(default)]
+    count: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1000,6 +1002,9 @@ pub(super) async fn lux_list_library_items(
             parent_id.to_owned(),
         )),
     };
+    if query.count == Some(false) {
+        filter.include_total = false;
+    }
     if parent_scope.is_some() {
         if filter.item_types.is_empty() {
             filter.item_types = vec!["FOLDER".to_owned(), "VIDEO".to_owned()];
@@ -1410,12 +1415,7 @@ pub(super) async fn lux_get_children(
                 .list_children(principal, &item_id, "SEASON", offset, limit)
                 .await
         }
-        _ => Ok(CatalogPage {
-            items: Vec::new(),
-            total: 0,
-            offset,
-            limit,
-        }),
+        _ => Ok(CatalogPage::new(Vec::new(), 0, offset, limit)),
     };
     match result {
         Ok(page) => {
@@ -4013,12 +4013,16 @@ pub(super) async fn lux_catalog_page_json_for_user_with_projection(
     let items =
         lux_catalog_items_json_for_user_with_projection(database, user_id, &page.items, projection)
             .await?;
-    Ok(json!({
+    let mut body = json!({
         "items": items,
-        "total": page.total,
         "page": page.offset / page.limit + 1,
         "pageSize": page.limit,
-    }))
+        "hasNext": page.has_next,
+    });
+    if page.total_included {
+        body["total"] = json!(page.total);
+    }
+    Ok(body)
 }
 
 pub(super) fn lux_catalog_item_json(item: &CatalogItem) -> Value {
