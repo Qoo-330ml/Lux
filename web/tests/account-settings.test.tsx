@@ -907,13 +907,13 @@ describe("account settings", () => {
     expect(container.querySelector(".lux-account-library-row")?.textContent).toContain("剧集");
   });
 
-  it("hides the optimized image preference unless the server enables variants", async () => {
+  it.each([false, true])("never shows a personal optimized image switch (global=%s)", async (enabled) => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
-            <ImageVariantsContext.Provider value={{ available: false, enabled: false }}>
+            <ImageVariantsContext.Provider value={{ available: enabled, enabled }}>
               <AccountPage user={user} />
             </ImageVariantsContext.Provider>
           </MemoryRouter>
@@ -922,30 +922,5 @@ describe("account settings", () => {
     });
     await waitForPreferencesLoaded();
     expect(container.querySelector('[aria-label="使用优化图片"]')).toBeNull();
-  });
-
-  it("saves the optimized image preference through account preferences", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => {
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <ImageVariantsContext.Provider value={{ available: true, enabled: false }}>
-              <AccountPage user={user} />
-            </ImageVariantsContext.Provider>
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await waitForPreferencesLoaded();
-    const toggle = container.querySelector<HTMLInputElement>('[aria-label="使用优化图片"]');
-    expect(toggle).toBeTruthy();
-    expect(toggle?.checked).toBe(false);
-    await act(async () => toggle?.click());
-    await waitForPreferenceUpdateCalls(1);
-    expect(api.updateAccountPreferences).toHaveBeenCalledWith(expect.objectContaining({
-      optimizedImages: true,
-    }));
-    expect(toggle?.checked).toBe(true);
   });
 });
