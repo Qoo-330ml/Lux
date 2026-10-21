@@ -20,7 +20,7 @@
 未完成/部分完成：
 
 - **LUX-833 图片热路径缓存**：未改认证/ACL 代码。本机 release 图片端点 10 次热请求为 min 1.6 ms / median 1.9 ms / max 2.9 ms，已低于方案 5 ms 目标；方案中的 23 ms/张来自不同环境。会话/黑名单/撤销缓存需要新的失效设计，本轮不在缺少真实部署证据时修改安全边界。
-- **CSS 路由拆分与 Tailwind 移除**（LUX-835 后半）：admin/player/detail/account 已拆出，主 CSS 229,689 B / gzip 37,545 B；Tailwind 与 library/auth/home 样式仍在主包，未达到 ≤150 KB / ≤35 KB。
+- **CSS 路由拆分与 Tailwind 移除**（LUX-835 后半）：admin/player/detail/account 已拆出并做二次收敛，主 CSS 164,828 B / gzip 28,472 B；gzip 已达 ≤35 KB，原始体积仍高于 ≤150 KB，Tailwind 与 library/auth/home 样式仍在主包。
 - **SSE 请求上限**：活跃媒体库重取受 `maxPages: 5` 限制，未达到方案 ≤2 个请求；非活跃库不重取。
 - **图片变体灰度与内存**：未实施灰度策略，未测并发 2 峰值内存；变体仍默认关闭，M5 未包含变体开启场景。
 
@@ -113,6 +113,19 @@ M1 相对基线下降 63.1%，达到方案“改善 ≥40%”的阶段目标；M
 | 库页字体请求 | 视中文标题命中可达 18 个子集（约 1.28 MB） | 1 个 Bodoni 子集（约 18–26 KB），中文 0 |
 
 路由拆分后主 CSS 为 229,689 B / gzip 37,545 B；admin/player/detail/account 的懒加载 CSS 分别为 48,719 / 18,790 / 21,142 / 8,860 B。Playwright 1280×900 检查首页、媒体库、详情、账户和管理页，控制台 0 error，详情/账户/管理布局正常；媒体库页 M5 CSS 从 18,535,200 的组成中降至 37,899 B，M5 总量 18,521,016 B。主 CSS 仍未达到 ≤150 KB / ≤35 KB，Tailwind 与 library/auth/home 共享样式仍在主包。该结果只代表本机 macOS arm64 Chromium，不代表 Windows/Linux 系统字体差异或真实低端设备。
+
+第二次拆分（同日）把主 CSS 里仍只属于 admin/detail/player 路由的规则整体迁入对应懒加载表。判定条件是「该类名在 react.css 中的所有规则都只归一个路由」，因此基础规则、`:hover` 与浅色覆盖一起迁移；跨路由复用的组件（`AdminApiKeyPanel` 在 `/admin/settings` 渲染）不迁；迁出规则前置写入目标表，因为 react.css 总是先加载。
+
+| 指标 | 一次拆分 | 二次拆分 |
+|---|---:|---:|
+| 主 CSS 原始 | 229,689 B | 164,828 B（-28.2%） |
+| 主 CSS gzip | 37,545 B | 28,472 B（-24.2%） |
+| admin 懒加载 CSS | 48,719 B | 88,578 B |
+| detail 懒加载 CSS | 21,142 B | 41,129 B |
+
+gzip 侧已达到 ≤35 KB 目标，原始体积仍高于 ≤150 KB：剩余主要是 Tailwind preflight 与工具类（约 15 KB）、library/auth 路由样式（不在首屏懒加载链路）与跨路由共享规则。
+
+等价性验证没有用截图，而是对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style 的 23 项（颜色、字号、内外边距、display、gap、圆角、transform、字体栈、行高等），与改动前构建逐条比对，全部一致；唯一差异是首页 hero 进度条的一帧动画 transform（`matrix(0.241652…)` ↔ `matrix(0.24166…)`）。该验证只覆盖本机 Chromium 1280×900 与一个媒体库夹具，不覆盖其他视口、Safari/Firefox 或真实弱网。
 
 ## LUX-834 静态资源预压缩（2026-10-21）
 
