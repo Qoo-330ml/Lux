@@ -27,7 +27,7 @@
 最终门禁（2026-10-21）：
 
 - `cargo build --locked`、`cargo fmt --all -- --check` 通过；`--test catalog` 3/3。
-- `cargo test --locked --all-targets`：1154 通过 / 5 失败 / 31 忽略。5 个失败与实施前基线一致：`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、3 个 FILL_MISSING 队列用例，以及受并行媒体库删除改动影响的 `shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（10 vs 9）。
+- `cargo test --locked --all-targets`：1155 通过 / 4 失败 / 31 忽略。4 个失败均为既有基线：3 个 FILL_MISSING 队列用例，以及受并行媒体库删除改动影响的 `shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（10 vs 9）。此前记录的 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 已随并行修复转为通过。
 - 全目标 Clippy 仍报 14 项既有/并行代码诊断（`emby_catalog`、`media`、`playback/session`、`database_maintenance`、存储测试）；本次新增/修改文件未发现新诊断。
 - `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 通过；全量 Web 测试 844 通过 / 1 失败，唯一失败为并行媒体库删除改动的 `admin-libraries` 旧断言（LUX-826 已记录）。
 
