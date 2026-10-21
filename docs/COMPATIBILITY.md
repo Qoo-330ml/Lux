@@ -10,19 +10,22 @@
 
 ## LUX-592 反向代理客户端 IP（2026-10-19）
 
-播放会话和登录/播放活动的客户端 IP 按有效 `X-Forwarded-For`、`X-Real-IP`、
+播放会话、设备和登录/播放活动中展示的客户端 IP 按有效 `X-Forwarded-For`、`X-Real-IP`、
 `Forwarded` 顺序回退。`X-Forwarded-For` 沿用首个地址规则；`X-Real-IP` 接受单个
 IPv4/IPv6；`Forwarded` 按 [RFC 7239](https://www.rfc-editor.org/rfc/rfc7239.html)
 读取首个代理元素中的 `for`，支持引号、大小写不敏感参数名、IPv6 方括号和可选端口。
-`unknown`、混淆节点、重复 `for` 或异常地址不作为客户端 IP；首个元素不可用时不采用后续代理 IP。
+`unknown`、混淆节点、重复 `for` 或异常地址不作为展示 IP；首个元素不可用时不采用后续代理 IP。
 
-转发头全部缺失或无效时不把连接对端 IP 当作真实客户端 IP；既有会话仍沿用已记录的地址。
-这些地址继续仅用于展示和活动元数据，账号认证、媒体库 ACL、限流和 `X-Forwarded-Proto`
-的 HTTPS 判断保持原有行为。反代需要实际传递上述 IP 请求头之一；本功能无法恢复未传递的客户端地址。
+访问控制使用独立的可信来源解析：从服务端中间件附加的连接对端地址开始，只有对端属于管理员配置的
+`trustedProxyCidrs` 时才解析完整 `X-Forwarded-For` 链，并从右向左跳过可信代理。未配置可信代理或连接对端不可信时，
+转发头不改变 ACL 使用的 IP；`X-Real-IP`、`Forwarded` 和 `X-Forwarded-Proto` 不参与 IP 黑名单判定。
+因此展示的 `remoteIp` 与 IP/CIDR 封禁所用访问 IP 可能不同，显示为真实地址本身不能证明黑名单已命中。
+反向代理未传递可验证的对端/转发链时，Lux 无法恢复未提供的客户端地址。
 
 自动化验证范围：本机 ARM64/SQLite，真实回环 HTTP 的根路径及 `/emby` 播放回调、
-数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`。真实 Lucky、
-FNOS/x86_64 及第三方播放器部署验证待进行；Rust 检查结果见开发规格 LUX-592。
+数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`；可信代理链、伪造头和 IP 黑名单另有解析/认证/播放回归，
+具体见开发规格 LUX-592、LUX-761–772、LUX-818–820。真实 Lucky、FNOS/x86_64 及第三方播放器部署验证仍未进行；
+本机结果不能替代目标反向代理拓扑的验收。
 
 ## LUX-146 STRM 媒体源探测状态
 

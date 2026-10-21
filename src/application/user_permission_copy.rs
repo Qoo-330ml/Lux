@@ -379,7 +379,7 @@ fn copy_snapshot_view(
                     version: policy.version,
                 })
         }),
-        playback: groups.playback.then(|| PermissionCopyPlaybackSnapshot {
+        playback: groups.playback.then_some(PermissionCopyPlaybackSnapshot {
             can_download: snapshot.can_download,
             can_play: snapshot.playback_policy.can_play,
             max_simultaneous_playbacks: snapshot.playback_policy.max_simultaneous_playbacks,
@@ -654,7 +654,7 @@ mod tests {
             Err(PermissionCopyApplicationError::SourceVersionConflict)
         ));
         let target = database
-            .user_permission_copy_snapshots(&[target_id.clone()])
+            .user_permission_copy_snapshots(std::slice::from_ref(&target_id))
             .await?;
         assert!(!target[&target_id].playback_policy.can_play);
         assert_eq!(

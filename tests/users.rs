@@ -3446,6 +3446,198 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
+async fn admin_can_read_user_account_preferences_and_reject_non_admin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Preferences Admin", "Preferences Admin", "correct password")
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "preferences admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let reader_created = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "preferences reader",
+            "displayName": "Preferences Reader",
+            "password": "reader password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(reader_created.status(), reqwest::StatusCode::CREATED);
+    let reader_id = reader_created.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing created preference reader ID")?
+        .to_owned();
+    let preferences_url = format!(
+        "{base_url}/api/v1/admin/users/{}/account-preferences",
+        reader_id
+    );
+
+    let unauthenticated = client.get(&preferences_url).send().await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let reader_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "preferences reader", "password": "reader password" }))
+        .send()
+        .await?;
+    assert_eq!(reader_login.status(), reqwest::StatusCode::OK);
+    let reader_cookie = cookie_pair(reader_login.headers());
+    let reader_csrf = cookie_value(reader_login.headers(), "lux_csrf");
+    let forbidden = client
+        .get(&preferences_url)
+        .header(COOKIE, &reader_cookie)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    let invalid_id = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/invalid/account-preferences"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(invalid_id.status(), reqwest::StatusCode::BAD_REQUEST);
+    let missing_user = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/00000000-0000-4000-8000-000000000000/account-preferences"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(missing_user.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let response = client
+        .get(&preferences_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(reqwest::header::CACHE_CONTROL),
+        Some(&reqwest::header::HeaderValue::from_static(
+            "private, no-store"
+        ))
+    );
+    let preferences = response.json::<Value>().await?;
+    assert_eq!(preferences["theme"], "dark");
+    assert_eq!(preferences["accentColor"], "silver");
+    assert_eq!(preferences["showMediaLibraries"], true);
+    assert_eq!(preferences["showContinueWatching"], true);
+    assert_eq!(preferences["audioLanguage"], "原始音轨");
+    assert_eq!(preferences["subtitleLanguage"], "简体中文");
+    assert_eq!(preferences["autoPlayNextEpisode"], true);
+    assert_eq!(preferences["optimizedImages"], false);
+    assert_eq!(preferences["libraryOrder"], json!([]));
+    assert_eq!(preferences["playedPercent"], 95);
+    assert_eq!(preferences["version"], 0);
+    assert_eq!(preferences["updatedAt"], Value::Null);
+
+    let saved = client
+        .patch(format!("{base_url}/api/v1/auth/account-preferences"))
+        .header(COOKIE, &reader_cookie)
+        .header("x-csrf-token", reader_csrf)
+        .json(&json!({
+            "expectedVersion": 0,
+            "theme": "light",
+            "accentColor": "ocean",
+            "showMediaLibraries": false,
+            "showContinueWatching": true,
+            "audioLanguage": "日语",
+            "subtitleLanguage": "English",
+            "autoPlayNextEpisode": false,
+            "optimizedImages": true,
+            "libraryOrder": [],
+            "playedPercent": 87
+        }))
+        .send()
+        .await?;
+    assert_eq!(saved.status(), reqwest::StatusCode::OK);
+
+    let accessible_library = LibraryService::new(database.clone())
+        .create_library("Preference Visible Library", LibraryKind::Movie, false)
+        .await?;
+    let inaccessible_library = LibraryService::new(database.clone())
+        .create_library("Preference Hidden Library", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(&reader_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(&reader_id)
+    .bind(accessible_library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_order (user_id, library_id, position)
+         VALUES (?, ?, 0), (?, ?, 1)",
+    )
+    .bind(&reader_id)
+    .bind(accessible_library.id.to_string())
+    .bind(&reader_id)
+    .bind(inaccessible_library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let persisted = client
+        .get(&preferences_url)
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(persisted.status(), reqwest::StatusCode::OK);
+    let persisted = persisted.json::<Value>().await?;
+    assert_eq!(persisted["theme"], "light");
+    assert_eq!(persisted["accentColor"], "ocean");
+    assert_eq!(persisted["showMediaLibraries"], false);
+    assert_eq!(persisted["showContinueWatching"], true);
+    assert_eq!(persisted["audioLanguage"], "日语");
+    assert_eq!(persisted["subtitleLanguage"], "English");
+    assert_eq!(persisted["autoPlayNextEpisode"], false);
+    assert_eq!(persisted["optimizedImages"], true);
+    assert_eq!(
+        persisted["libraryOrder"],
+        json!([accessible_library.id.to_string()])
+    );
+    assert_eq!(persisted["playedPercent"], 87);
+    assert_eq!(persisted["version"], 1);
+    assert!(persisted["updatedAt"].as_i64().is_some());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_user_profile_api_normalizes_email_and_preserves_verification_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -56,6 +56,15 @@ describe("AdminUserDetailPage account lifecycle", () => {
     });
   });
 
+  it("explains how users verify an email changed by an administrator", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const profileText = container.querySelector(".lux-admin-user-profile-form")?.textContent ?? "";
+    expect(profileText).toContain("管理员修改邮箱会清除验证状态；用户可在账户设置保存当前邮箱以发送验证邮件。");
+    expect(profileText).not.toContain("验证流程将在邮件功能中接入");
+  });
+
   it("uses the configured retention period when confirming account deletion", async () => {
     const queryClient = renderDetail(makeUser(), 14);
     const remove = vi.spyOn(api, "deleteAdminUser").mockResolvedValue({

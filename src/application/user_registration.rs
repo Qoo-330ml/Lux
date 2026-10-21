@@ -562,9 +562,11 @@ mod tests {
         crate::application::settings::update_registration_mode(&database, "PUBLIC_EMAIL", 0)
             .await
             .map_err(|_| "could not enable public email registration")?;
-        let mut permissions = NewUserPermissions::default();
-        permissions.can_download = true;
-        permissions.max_simultaneous_playbacks = 4;
+        let permissions = NewUserPermissions {
+            can_download: true,
+            max_simultaneous_playbacks: 4,
+            ..NewUserPermissions::default()
+        };
         let permissions_json = serde_json::to_string(&permissions)?;
         database
             .set_new_user_permissions_json(&permissions_json)

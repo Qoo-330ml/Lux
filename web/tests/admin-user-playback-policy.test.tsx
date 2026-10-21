@@ -42,7 +42,8 @@ describe("AdminUserDetailPage playback policy", () => {
     expect(findCheckbox("允许封装转换").checked).toBe(true);
     expect(findCheckbox("允许音频转码").checked).toBe(true);
     expect(findCheckbox("允许视频转码").checked).toBe(true);
-    expect(container.textContent).toContain("播放准入策略将在下一步生效");
+    expect(container.textContent).toContain("新建播放会话会按当前策略校验准入、并发和转码");
+    expect(container.textContent).not.toContain("播放准入策略将在下一步生效");
 
     await act(async () => {
       changeInput(findLimit(), "3");

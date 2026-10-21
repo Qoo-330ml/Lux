@@ -459,6 +459,14 @@ describe("AdminUserDetailPage Web session management", () => {
         totalCount: 0,
       });
     }
+    if (!vi.isMockFunction(api.adminUserAccessBlacklistRules)) {
+      vi.spyOn(api, "adminUserAccessBlacklistRules").mockResolvedValue({
+        rules: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+    }
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);

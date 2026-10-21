@@ -511,7 +511,7 @@ async fn admin_preview_user_permission_copy(
     >(&headers, &body)
     {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -537,7 +537,7 @@ async fn admin_apply_user_permission_copy(
     >(&headers, &body)
     {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -572,7 +572,10 @@ async fn admin_apply_user_permission_copy(
     }
 }
 
-fn parse_user_permission_copy_request<T>(headers: &HeaderMap, body: &Bytes) -> Result<T, Response>
+fn parse_user_permission_copy_request<T>(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<T, Box<Response>>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -585,9 +588,10 @@ where
         .next()
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
     {
-        return Err(invalid_user_permission_copy_request(headers));
+        return Err(Box::new(invalid_user_permission_copy_request(headers)));
     }
-    serde_json::from_slice(body).map_err(|_| invalid_user_permission_copy_request(headers))
+    serde_json::from_slice(body)
+        .map_err(|_| Box::new(invalid_user_permission_copy_request(headers)))
 }
 
 fn invalid_user_permission_copy_request(headers: &HeaderMap) -> Response {
@@ -890,7 +894,7 @@ async fn list_user_access_blacklist_rules(
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(i64::from(page_size));
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
-        |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
+        crate::storage::UserAccessBlacklistRuleScope::User,
     );
     match database
         .list_user_access_blacklist_rules_page(crate::storage::UserAccessBlacklistRulePageQuery {
@@ -1055,7 +1059,7 @@ async fn set_user_access_blacklist_rule_enabled(
     };
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
-        |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
+        crate::storage::UserAccessBlacklistRuleScope::User,
     );
     if request.is_enabled {
         let rule = match database
@@ -1244,7 +1248,7 @@ async fn delete_user_access_blacklist_rule(
     };
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
-        |user_id| crate::storage::UserAccessBlacklistRuleScope::User(user_id),
+        crate::storage::UserAccessBlacklistRuleScope::User,
     );
     match database
         .delete_user_access_blacklist_rule(scope, &rule_id)
@@ -2170,6 +2174,91 @@ pub(crate) async fn admin_get_user(
         .into_response(),
         Err(error) => user_store_error(&headers, error),
     }
+}
+
+pub(crate) async fn admin_get_user_account_preferences(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let profile = match users.find_admin_profile_by_id(&user_id.to_string()).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(error) => return user_store_error(&headers, error),
+    };
+    let mut preferences = match crate::application::user_account_preferences::get_account_preferences(
+        database,
+        &user_id.to_string(),
+    )
+    .await
+    {
+        Ok(preferences) => preferences,
+        Err(crate::application::user_account_preferences::AccountPreferencesError::UserUnavailable) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "用户不存在",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let principal =
+        crate::application::access::AccessPrincipal::new(profile.user.id, profile.user.is_admin);
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let collections = match catalog.list_global_collection_cards(principal, 0, 1).await {
+        Ok(collections) => collections,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if collections.total > 0 {
+        accessible_library_ids.push(crate::storage::GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
+    }
+    preferences
+        .library_order
+        .retain(|library_id| accessible_library_ids.contains(library_id));
+    let mut response = Json(preferences).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 #[derive(Deserialize, Default)]
@@ -3200,6 +3289,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_get_user)
                 .patch(admin_update_user)
                 .delete(admin_delete_user),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/account-preferences",
+            get(admin_get_user_account_preferences),
         )
         .route(
             "/api/v1/admin/users/{user_id}/profile",

@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
+import type { AccountPreferences, AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
 import { AdminUserAccessRulesPanel } from "./AdminUserAccessRulesPanel";
 import { AdminUserGlobalAccessRulesPanel } from "./AdminUserGlobalAccessRulesPanel";
 import "./user-management.css";
@@ -61,7 +61,6 @@ export function AdminUserDetailPage() {
 
   const displayName = user.displayName || user.usernameNormalized;
   const statusLabel = user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常";
-  const Icon = section.icon;
 
   return (
     <div className="lux-admin-page lux-admin-user-management-page">
@@ -88,6 +87,8 @@ export function AdminUserDetailPage() {
         </>
       ) : section.id === "permissions" ? (
         <AdminUserPermissionsSection key={user.id} user={user} />
+      ) : section.id === "preferences" ? (
+        <AdminUserPreferencesSection key={user.id} user={user} />
       ) : section.id === "content" ? (
         <AdminUserContentRestrictionSection user={user} />
       ) : section.id === "playback" ? (
@@ -96,16 +97,7 @@ export function AdminUserDetailPage() {
         <AdminUserSessionsSection key={user.id} user={user} />
       ) : section.id === "activity" ? (
         <AdminUserActivityPanel key={user.id} user={user} />
-      ) : (
-        <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-module-title">
-          <span className="lux-admin-user-module-icon"><Icon size={19} /></span>
-          <div>
-            <span className="lux-admin-eyebrow">{section.module}</span>
-            <h2 id="lux-admin-user-module-title">{section.label}</h2>
-            <p>页面结构已预留。此模块将在对应的用户管理任务中接入服务端数据和操作。</p>
-          </div>
-        </section>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -118,6 +110,96 @@ function AdminUserContentRestrictionSection({ user }: { user: AdminUser }) {
     </div>
   );
 }
+
+function AdminUserPreferencesSection({ user }: { user: AdminUser }) {
+  const preferencesQuery = useQuery({
+    queryKey: ["admin", "user", user.id, "account-preferences"],
+    queryFn: () => api.adminUserAccountPreferences(user.id),
+  });
+  const preferences = preferencesQuery.data;
+  const librariesQuery = useQuery({
+    queryKey: ["admin", "libraries"],
+    queryFn: () => api.adminLibraries(),
+    enabled: Boolean(preferences?.libraryOrder.length),
+  });
+
+  if (preferencesQuery.isPending) {
+    return <section className="lux-admin-panel lux-admin-user-preferences-panel lux-admin-user-profile-panel" role="status" aria-busy="true">正在读取账户偏好…</section>;
+  }
+  if (preferencesQuery.error || !preferences) {
+    return (
+      <section className="lux-admin-panel lux-admin-user-preferences-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-preferences-title">
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-preferences-title">账户偏好</h2></div></div>
+        <p className="lux-admin-user-preferences-error" role="alert">{preferencesQuery.error instanceof Error ? preferencesQuery.error.message : "账户偏好读取失败，请重试。"}</p>
+        <button className="lux-button lux-button-secondary" type="button" onClick={() => { void preferencesQuery.refetch(); }}>重试读取偏好</button>
+      </section>
+    );
+  }
+
+  const libraryNames = new Map((librariesQuery.data?.libraries ?? []).map((library) => [library.id, library.name]));
+  const updatedAt = preferences.updatedAt == null
+    ? "尚未保存过偏好"
+    : new Date(preferences.updatedAt * 1000).toLocaleString();
+
+  return (
+    <section className="lux-admin-panel lux-admin-user-preferences-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-preferences-title">
+      <div className="lux-admin-panel-heading">
+        <div>
+          <h2 id="lux-admin-user-preferences-title">账户偏好</h2>
+          <p className="lux-admin-user-preferences-meta">版本 {preferences.version} · {updatedAt}</p>
+        </div>
+      </div>
+      <p className="lux-admin-user-preferences-note">
+        本页只读。管理员如需把其他账号的偏好应用到此账号，请在用户列表选择目标并使用“复制偏好”预览。
+        {user.deletedAt != null ? " 回收站账号的偏好保持只读。" : ""}
+      </p>
+      <div className="lux-admin-user-preferences-groups">
+        <section className="lux-admin-user-preferences-group" aria-labelledby="lux-admin-user-preferences-appearance">
+          <h3 id="lux-admin-user-preferences-appearance">外观</h3>
+          <dl className="lux-admin-user-preferences-values">
+            <div><dt>主题</dt><dd>{preferences.theme === "light" ? "浅色" : "深色"}</dd></div>
+            <div><dt>强调色</dt><dd>{accountAccentColorLabels[preferences.accentColor] ?? preferences.accentColor}</dd></div>
+          </dl>
+        </section>
+        <section className="lux-admin-user-preferences-group" aria-labelledby="lux-admin-user-preferences-home">
+          <h3 id="lux-admin-user-preferences-home">首页</h3>
+          <dl className="lux-admin-user-preferences-values">
+            <div><dt>媒体库分区</dt><dd>{preferences.showMediaLibraries ? "显示" : "隐藏"}</dd></div>
+            <div><dt>继续观看</dt><dd>{preferences.showContinueWatching ? "显示" : "隐藏"}</dd></div>
+            <div>
+              <dt>媒体库顺序</dt>
+              <dd>
+                {preferences.libraryOrder.length ? (
+                  <ol className="lux-admin-user-preferences-order" aria-label="媒体库排序">
+                    {preferences.libraryOrder.map((libraryId) => <li key={libraryId}>{libraryNames.get(libraryId) ?? `未知媒体库（${libraryId}）`}</li>)}
+                  </ol>
+                ) : "未设置个人排序"}
+              </dd>
+            </div>
+          </dl>
+        </section>
+        <section className="lux-admin-user-preferences-group" aria-labelledby="lux-admin-user-preferences-playback">
+          <h3 id="lux-admin-user-preferences-playback">播放</h3>
+          <dl className="lux-admin-user-preferences-values">
+            <div><dt>默认音轨</dt><dd>{preferences.audioLanguage}</dd></div>
+            <div><dt>默认字幕</dt><dd>{preferences.subtitleLanguage}</dd></div>
+            <div><dt>自动连播</dt><dd>{preferences.autoPlayNextEpisode ? "开启" : "关闭"}</dd></div>
+            <div><dt>优化图片</dt><dd>{preferences.optimizedImages ? "开启" : "关闭"}</dd></div>
+            <div><dt>播放完成阈值</dt><dd>{preferences.playedPercent}%</dd></div>
+          </dl>
+        </section>
+      </div>
+    </section>
+  );
+}
+
+const accountAccentColorLabels: Record<AccountPreferences["accentColor"], string> = {
+  silver: "银灰",
+  berry: "莓果",
+  ocean: "海蓝",
+  amber: "琥珀",
+  mint: "薄荷",
+};
 
 function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
   const queryClient = useQueryClient();
@@ -1578,7 +1660,7 @@ function AdminUserPlaybackPolicyEditor({ user }: { user: AdminUser }) {
           />
         </label>
         <p id="lux-admin-user-playback-limit-help" className="lux-admin-muted">0 表示不限。并发上限只控制此账号的同时播放数。</p>
-        <p className="lux-admin-muted">播放准入策略将在下一步生效；目前保存的设置尚未影响播放请求。</p>
+        <p className="lux-admin-muted">新建播放会话会按当前策略校验准入、并发和转码；已签发的服务端 HLS 资源会在每次请求时重新检查，STRM 只允许直放。</p>
         {limitInput.trim() === "" || !validLimit ? <p className="lux-admin-user-playback-validation" role="alert">请输入非负整数。</p> : null}
         <div className="lux-admin-user-profile-actions">
           <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || !validLimit || save.isPending}>
@@ -1680,7 +1762,7 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
           邮箱
           <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" disabled={user.deletedAt != null} />
         </label>
-        <p className="lux-admin-muted">{user.deletedAt != null ? "回收站中的账号资料为只读。" : `邮箱状态：${emailStatus}。邮箱变更会清除验证状态；验证流程将在邮件功能中接入。`}</p>
+        <p className="lux-admin-muted">{user.deletedAt != null ? "回收站中的账号资料为只读。" : `邮箱状态：${emailStatus}。管理员修改邮箱会清除验证状态；用户可在账户设置保存当前邮箱以发送验证邮件。`}</p>
         <div className="lux-admin-user-profile-actions">
           <button className="lux-button lux-button-primary" type="submit" disabled={user.deletedAt != null || !hasChanges || update.isPending}>
             {update.isPending ? "保存中…" : "保存资料"}

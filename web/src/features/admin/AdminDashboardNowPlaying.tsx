@@ -1,4 +1,4 @@
-import { AudioLines, CircleAlert, MapPin, Monitor, Pause, Play, Radio, UserRound, Video } from "lucide-react";
+import { CircleAlert, MapPin, Monitor, Pause, Play } from "lucide-react";
 import { Link } from "react-router-dom";
 import type { CSSProperties, ReactNode } from "react";
 import type { AdminPlaybackSession } from "../../lib/api/types";
@@ -26,6 +26,11 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
     ? `/api/v1/items/${encodeURIComponent(session.itemId)}/images/poster`
     : undefined;
 
+  const playMethod = playMethodLabel(session.playMethod);
+  const playDetail = playMethodDetail(session);
+  const sourceValue = sourceDetail(source);
+  const ipValue = session.remoteIp || "—";
+
   return (
     <article className="lux-now-playing-card">
       <div className="lux-now-playing-body">
@@ -47,22 +52,9 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
           </div>
 
           <div className="lux-now-playing-account">
-            <DeviceField
-              icon={<UserRound size={15} />}
-              label="用户"
-              value={session.userName || "未知账户"}
-            />
-            <DeviceField
-              icon={<Monitor size={15} />}
-              label="设备"
-              value={session.deviceName || "—"}
-            />
-            <DeviceField
-              icon={<Radio size={15} />}
-              label="客户端"
-              value={session.client || "—"}
-              detail={session.clientVersion ? `v${session.clientVersion}` : undefined}
-            />
+            <InfoLine label="用户" value={session.userName || "未知账户"} bold />
+            <InfoLine label="设备" value={session.deviceName || "—"} />
+            <InfoLine label="客户端" value={session.client || "—"} detail={session.clientVersion ? `v${session.clientVersion}` : undefined} />
           </div>
 
           <div className="lux-now-playing-progress-block">
@@ -77,17 +69,17 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
         </div>
       </div>
 
-      <div className="lux-now-playing-facts">
-        <Fact icon={<Radio size={17} />} label="播放" value={playMethodLabel(session.playMethod)} detail={playMethodDetail(session)} />
-        <Fact icon={<Radio size={17} />} label="来源" value={source?.qualityLabel || "—"} detail={sourceDetail(source)} />
-        <Fact icon={<Video size={17} />} label="视频" value={videoLabel(session)} detail={videoDetail(session)} />
-        <Fact icon={<AudioLines size={17} />} label="音频" value={audioLabel(session)} detail={audioDetail(session)} />
+      <div className="lux-now-playing-facts lux-now-playing-details">
+        <Fact label="播放" value={playMethod} detail={playDetail} accent="play" method={session.playMethod} />
+        <Fact label="来源" value={source?.qualityLabel || "—"} detail={sourceValue} accent="source" />
+        <Fact label="视频" value={videoLabel(session)} detail={videoDetail(session)} accent="video" />
+        <Fact label="音频" value={audioLabel(session)} detail={audioDetail(session)} accent="audio" />
       </div>
 
       <div className="lux-now-playing-network">
-        <NetworkField icon={<CircleAlert size={15} />} label="IP 地址" value={session.remoteIp || "—"} />
+        <NetworkField icon={<CircleAlert size={14} />} label="IP 地址" value={ipValue} />
         <NetworkField
-          icon={<MapPin size={15} />}
+          icon={<MapPin size={14} />}
           label="IP 归属地"
           value={session.remoteIpLocation?.location || "—"}
           detail={locationDetail(session.remoteIpLocation)}
@@ -97,16 +89,50 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
   );
 }
 
-function Fact({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail: string }) {
-  return <div className="lux-now-playing-fact"><span className="lux-now-playing-fact-icon">{icon}</span><div className="lux-now-playing-fact-copy"><small>{label}：</small><strong>{value}</strong>{detail !== "—" ? <span> · {detail}</span> : null}</div></div>;
+function InfoLine({ label, value, detail, bold }: { label: string; value: string; detail?: string | null; bold?: boolean }) {
+  return (
+    <div className="lux-now-playing-info-line lux-now-playing-account-entry">
+      <span className="lux-now-playing-info-label"><small>{label}</small></span>
+      {bold ? <strong>{value}</strong> : <span>{value}</span>}
+      {detail ? <span className="lux-now-playing-info-detail"><em>{detail}</em></span> : null}
+    </div>
+  );
 }
 
-function DeviceField({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail?: string | null }) {
-  return <span className="lux-now-playing-account-entry"><span className="lux-now-playing-account-entry-icon">{icon}</span><span><small>{label}</small><strong>{value}</strong>{detail ? <em>{detail}</em> : null}</span></span>;
+function Fact({ label, value, detail, accent, method }: { label: string; value: string; detail: string; accent?: string; method?: string | null }) {
+  const isDirectPlay = accent === "play" && (method === "DirectPlay" || method === "DirectStream");
+  const isTranscode = accent === "play" && method === "Transcode";
+  const valueClass = [
+    "lux-now-playing-kv-value",
+    accent === "play" ? "is-play" : "",
+    accent === "source" ? "is-source" : "",
+    accent === "video" || accent === "audio" ? "is-av" : "",
+    isDirectPlay ? "is-direct" : "",
+    isTranscode ? "is-transcode" : "",
+  ].filter(Boolean).join(" ");
+
+  return (
+    <div className="lux-now-playing-fact lux-now-playing-kv-row">
+      <span className="lux-now-playing-kv-label"><small>{label}：</small></span>
+      <span className={valueClass}>
+        {accent === "play" ? <span className={`lux-now-playing-kv-dot${isDirectPlay ? " is-direct" : isTranscode ? " is-transcode" : ""}`} /> : null}
+        <strong>{value}</strong>
+        {detail !== "—" ? <span className="lux-now-playing-kv-detail"> · {detail}</span> : null}
+      </span>
+    </div>
+  );
 }
 
 function NetworkField({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail?: string }) {
-  return <div className="lux-now-playing-network-field" role="group" aria-label={label}><span className="lux-now-playing-network-icon">{icon}</span><div><strong className={value === "—" ? "lux-now-playing-placeholder" : undefined}>{value}</strong>{detail ? <small>{detail}</small> : null}</div></div>;
+  return (
+    <div className="lux-now-playing-network-field lux-now-playing-kv-row" role="group" aria-label={label}>
+      <span className="lux-now-playing-network-icon" aria-hidden="true">{icon}</span>
+      <div className="lux-now-playing-kv-value is-ip">
+        <strong className={value === "—" ? "lux-now-playing-placeholder" : undefined}>{value}</strong>
+        {detail ? <small className="lux-now-playing-kv-detail"> · {detail}</small> : null}
+      </div>
+    </div>
+  );
 }
 
 function locationDetail(location: AdminPlaybackSession["remoteIpLocation"]) {
@@ -175,6 +201,11 @@ function audioDetail(session: AdminPlaybackSession) {
     .join(" · ") || "—";
 }
 
+function formatTrackBitrate(bitsPerSecond: number) {
+  if (bitsPerSecond < 1_000_000) return `${Math.round(bitsPerSecond / 1_000)} kbps`;
+  return formatBitrate(bitsPerSecond);
+}
+
 function formatCodec(codec: string | null | undefined) {
   if (!codec) return "—";
   const normalized = codec.trim().toLowerCase();
@@ -182,11 +213,6 @@ function formatCodec(codec: string | null | undefined) {
   if (normalized === "hevc" || normalized === "h265") return "HEVC";
   if (normalized === "aac") return "AAC";
   return codec.toUpperCase();
-}
-
-function formatTrackBitrate(bitsPerSecond: number) {
-  if (bitsPerSecond < 1_000_000) return `${Math.round(bitsPerSecond / 1_000)} kbps`;
-  return formatBitrate(bitsPerSecond);
 }
 
 function sourceDetail(source: AdminPlaybackSession["source"]) {

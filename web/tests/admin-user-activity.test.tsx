@@ -68,6 +68,9 @@ describe("AdminUserDetailPage activity timeline", () => {
     await act(async () => {
       await vi.waitFor(() => expect(list).toHaveBeenCalledWith("user-1", { page: 1, pageSize: 20 }));
     });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("访问黑名单命中"));
+    });
     expect(container.textContent).toContain("开始播放");
     expect(container.textContent).toContain("访问黑名单命中");
     expect(container.textContent).toContain("命中原因");
