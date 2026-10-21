@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 
 test("now-playing cards use fixed compact columns and expandable episode subtitles", () => {
   const headingRule = stylesheet.match(/\.lux-now-playing-heading\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -11,7 +12,7 @@ test("now-playing cards use fixed compact columns and expandable episode subtitl
 
   assert.match(headingRule, /display:\s*grid/);
   assert.match(headingRule, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/);
-  assert.match(gridRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*288px\),\s*288px\)\)/);
+  assert.match(gridRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*310px\),\s*1fr\)\)/);
   assert.match(gridRule, /width:\s*100%/);
   assert.match(subtitleRule, /display:\s*-webkit-box/);
   assert.match(subtitleRule, /grid-column:\s*1\s*\/\s*-1/);

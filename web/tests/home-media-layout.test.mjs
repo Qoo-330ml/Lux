@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 const mediaSource = readFileSync(new URL("../src/features/home/media.tsx", import.meta.url), "utf8");
 const mediaVisualSource = readFileSync(new URL("../src/features/home/media-card-visual.tsx", import.meta.url), "utf8");
 const homeSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
@@ -73,7 +74,7 @@ test("homepage library cards stay compact in one horizontal row with shared scro
   assert.match(mobileLibraryRule, /display:\s*flex/);
   assert.match(mobileLibraryRule, /width:\s*max-content/);
   assert.match(mobileLibraryRule, /min-width:\s*100%/);
-  assert.match(mobileLibraryCardRule, /flex:\s*0 0 min\(170px,\s*52vw\)/);
+  assert.match(mobileLibraryCardRule, /flex:\s*0 0 min\(180px,\s*56vw\)/);
   assert.match(libraryCardRule, /flex:\s*0 0 235px/);
 });
 
