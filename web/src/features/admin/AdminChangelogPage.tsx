@@ -9,11 +9,35 @@ type ChangelogSection = {
 
 type ChangelogRelease = {
   version: string;
-  date: string;
+  date?: string;
   sections: ChangelogSection[];
 };
 
 export const changelogReleases: ChangelogRelease[] = [
+  {
+    version: "Unreleased",
+    sections: [
+      { kind: "added", items: [
+        "支持邀请码注册与开放注册、邮箱验证和管理员审批；管理员可配置邮件服务并管理邀请。",
+        "用户权限支持明确的媒体库访问模式、默认权限与版本化预设，并可批量复制权限和账户偏好。",
+        "管理员可查看用户设备、登录与播放活动，以及 Web/Emby 会话，并执行会话撤销和访问黑名单管理。",
+        "支持按用户设置内容分级限制，并在媒体列表、搜索、首页、继续观看和合集等入口统一执行。",
+        "媒体库删除改为持久化后台任务，支持查看进度和重试；数据库维护可按周期运行，并提供默认关闭的图片尺寸变体缓存。",
+        "符合插件配置的 STRM 媒体在实际播放时可异步补全缺失信息，不阻塞播放请求，也不改变客户端直连播放。",
+      ] },
+      { kind: "changed", items: [
+        "优化 Web 媒体展示性能：虚拟化更多媒体网格、减少目录查询与缓存刷新开销，并启用预压缩静态资源。",
+        "访问黑名单可用于 Web、Emby 和播放授权流程；代理 IP 解析按显式信任的代理链处理。",
+        "图片尺寸变体缓存按媒体条目归档；管理员全局开关统一启用，移除用户个人设置。",
+      ] },
+      { kind: "fixed", items: [
+        "强化邮箱变更和验证邮件重发的并发保护，避免旧验证请求覆盖较新的账户状态。",
+        "SSE 更新时避免重复轮询详情剧照；媒体库变更只刷新受影响的活跃查询。",
+        "STRM 探测重试与其他 STRM 作业共用创建锁，避免并发绕过单活动作业限制。",
+        "修复 PostgreSQL 下访问黑名单查询的兼容性。",
+      ] },
+    ],
+  },
   {
     version: "0.6.12",
     date: "2026-10-19",
@@ -1529,7 +1553,8 @@ const sectionMeta: Record<ChangelogSectionKind, { label: string; icon: typeof Sp
 };
 
 export function AdminChangelogPage() {
-  const latestRelease = changelogReleases[0];
+  const latestRelease = changelogReleases.find((release) => release.version !== "Unreleased") ?? changelogReleases[0];
+  const releaseCount = changelogReleases.filter((release) => release.version !== "Unreleased").length;
 
   return (
     <main className="lux-admin-page lux-changelog-page">
@@ -1550,7 +1575,7 @@ export function AdminChangelogPage() {
       <div className="lux-changelog-intro">
         <div className="lux-changelog-intro-line" aria-hidden="true"><GitBranch size={16} /></div>
         <p>从 <strong>0.1.0</strong> 开始，按版本倒序整理项目主要的用户可见变化。</p>
-        <span>{changelogReleases.length} 个版本</span>
+        <span>{releaseCount} 个版本</span>
       </div>
 
       <div className="lux-changelog-timeline">
@@ -1560,10 +1585,10 @@ export function AdminChangelogPage() {
             <div className="lux-changelog-release-body">
               <header className="lux-changelog-release-header">
                 <div>
-                  <span className="lux-changelog-release-kicker">RELEASE</span>
-                  <h2>v{release.version}</h2>
+                  <span className="lux-changelog-release-kicker">{release.version === "Unreleased" ? "UNRELEASED" : "RELEASE"}</span>
+                  <h2>{release.version === "Unreleased" ? "未发布" : `v${release.version}`}</h2>
                 </div>
-                <time dateTime={release.date}>{release.date}</time>
+                {release.date && <time dateTime={release.date}>{release.date}</time>}
               </header>
               <div className="lux-changelog-sections">
                 {release.sections.map((section) => {
