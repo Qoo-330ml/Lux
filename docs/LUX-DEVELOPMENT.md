@@ -17442,13 +17442,16 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 验收标准：
 
-- [x] 51 页已加载后，一次扫描事件触发的媒体库请求从 51 页降到 ≤2；未变化的页不被重取。
+- [ ] 51 页已加载后，一次扫描事件触发的媒体库请求从 51 页降到 ≤2：实测降到 ≤5（受 `maxPages: 5` 约束），未达到 ≤2。
+- [x] 未变化的页不被后台重取；非活跃媒体库不受影响。
 - [x] 带 `libraryId` 的事件只影响该媒体库；无 ID 时全量媒体库标记 stale；SSE 断线仍轮询详情剧照。
 - [x] 查询缓存断言覆盖后台重取计数；定向 Web 测试、build 与 `git diff --check` 通过。
 
 短计划：先加“目标库只失效自身且不后台重取”的失败回归；再改失效键与 `maxPages`；最后更新性能记录。
 
 实施结果（2026-10-21）：`useUserEvents` 移除通用 `["library"]` 刷新键，改为媒体库事件专用：带 `libraryId` 时只让对应媒体库的活跃查询失效并重取，否则让全部活跃 `["library"]` 查询失效并重取；home/item/favorites 事件同样只刷新活跃媒体库查询，不再重放所有缓存页。`LibraryPage` 与 `prefetchLibrary` 的 infinite query 增加 `maxPages: 5`，活跃查询的重取因此最多 5 页；详情 `MediaStillsSection` 在 SSE connected 时 `refetchInterval: false` 的既有行为保留。
+
+复核（2026-10-21，接手后）：验收框原先按「≤2」勾选，但 `maxPages: 5` 的实际语义是**保留 5 页并重取这 5 页**。用一个最小 infinite query 复现：加载 11 页后 `refetchQueries({ type: "active" })` 发出 5 次 `queryFn` 调用，与 `pages retained 5` 一致，即一次扫描事件最多 5 个请求，不是 2 个。TanStack v5 移除了 `refetchPage`，没有「只重取第 1 页、同时保留其余已加载页」的公开能力；把 `maxPages` 降到 2 会让深度滚动只保留最后两页、回滚出现空洞，属于可感知的体验回归。因此把该验收框改回未达成并记录实测值：**51 → ≤5 个请求**（仍是约 10 倍收敛），≤2 需要在查询结构层面重新设计（例如把首页拆成独立 query 再与列表缓存合并），不在本次范围内。
 
 验证：`web/tests/user-events.test.tsx` 10/10，新增断言：目标媒体库失效、其他媒体库不失效、后台重取计数 0；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/user-events.test.tsx` 通过；`pnpm --dir web build` 通过。旧实现会在一次事件中重放所有缓存页（50 页即 50 个请求），新实现把活跃查询的重取限制在 `maxPages: 5`，不再广播到非活跃媒体库；以查询缓存与请求计数代替真实服务器请求数。
 
