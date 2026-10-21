@@ -575,7 +575,7 @@ impl Database {
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
              FROM libraries
-             WHERE system_kind IS NULL
+             WHERE system_kind IS NULL AND deletion_state = 'ACTIVE'
              ORDER BY name, id",
                 )
                 .fetch_all(&self.pool)
@@ -634,6 +634,7 @@ impl Database {
                  FROM libraries l
                  LEFT JOIN library_roots r ON r.library_id = l.id
                  WHERE l.is_enabled = 1 AND l.system_kind IS NULL
+                   AND l.deletion_state = 'ACTIVE'
                  ORDER BY l.name, l.id, r.canonical_path, r.id",
             )
             .fetch_all(&self.pool)
@@ -675,7 +676,7 @@ impl Database {
                     scan_concurrency, probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
                     cover_image_path, cover_image_content_type, cover_image_size, cover_image_tag,
                     media_strategy_json
-             FROM libraries WHERE id = ?",
+             FROM libraries WHERE id = ? AND deletion_state = 'ACTIVE'",
             )
             .bind(id)
             .fetch_optional(&self.pool)
@@ -1102,18 +1103,26 @@ impl Database {
                 source,
             })?;
 
-        let exists: i64 = self
-            .query_scalar(
-                "SELECT CASE WHEN EXISTS(SELECT 1 FROM libraries WHERE id = ?) THEN 1 ELSE 0 END",
+        let active_library = self
+            .query(
+                "UPDATE libraries SET updated_at = updated_at
+                 WHERE id = ? AND deletion_state = 'ACTIVE'",
             )
             .bind(library_id)
-            .fetch_one(&mut *transaction)
+            .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        if exists == 0 {
+        if active_library.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
             return Ok(false);
         }
 
@@ -3140,7 +3149,7 @@ impl Database {
                  cover_image_size = ?,
                  cover_image_tag = ?,
                  updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ? AND deletion_state = 'ACTIVE'",
         )
         .bind(path)
         .bind(content_type)
@@ -3171,7 +3180,7 @@ impl Database {
                  cover_image_size = ?,
                  cover_image_tag = ?,
                  updated_at = unixepoch()
-             WHERE id = ? AND cover_image_path IS NULL",
+             WHERE id = ? AND cover_image_path IS NULL AND deletion_state = 'ACTIVE'",
         )
         .bind(path)
         .bind(content_type)
@@ -3202,7 +3211,8 @@ impl Database {
                  cover_image_size = ?,
                  cover_image_tag = ?,
                  updated_at = unixepoch()
-             WHERE id = ? AND (cover_image_path IS NULL OR cover_image_path = ?)",
+             WHERE id = ? AND deletion_state = 'ACTIVE'
+               AND (cover_image_path IS NULL OR cover_image_path = ?)",
         )
         .bind(path)
         .bind(content_type)

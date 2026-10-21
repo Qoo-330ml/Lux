@@ -512,6 +512,27 @@ export type AdminLibrary = Library & {
   roots: AdminRoot[];
 };
 
+export type AdminLibraryDeletionJob = {
+  id: string;
+  libraryId: string;
+  libraryName: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  stage: string;
+  processedCount: number;
+  errorCode?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+};
+
+export type AdminLibraryDeletionJobsPage = {
+  jobs: AdminLibraryDeletionJob[];
+  page: number;
+  pageSize: number;
+  total: number;
+};
+
 export type AdminLibraryScraperRole = "PRIMARY" | "SUPPLEMENT" | "BACKUP" | "BOTH" | string;
 
 export type AdminLibraryScraper = {

@@ -989,7 +989,12 @@ impl CatalogService {
         )
         .await?;
         if filter.include_total {
-            Ok(CatalogPage::new(items, total, request.offset, request.limit))
+            Ok(CatalogPage::new(
+                items,
+                total,
+                request.offset,
+                request.limit,
+            ))
         } else {
             let has_next = items.len() as i64 > request.limit;
             if has_next {
@@ -2312,12 +2317,7 @@ impl CatalogPage {
         }
     }
 
-    pub fn without_total(
-        items: Vec<CatalogItem>,
-        offset: i64,
-        limit: i64,
-        has_next: bool,
-    ) -> Self {
+    pub fn without_total(items: Vec<CatalogItem>, offset: i64, limit: i64, has_next: bool) -> Self {
         Self {
             items,
             total: 0,

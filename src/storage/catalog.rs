@@ -16,6 +16,13 @@ const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
 fn user_library_access_filter(library_id_expression: &str, include_admin: bool) -> String {
+    let active_library = format!(
+        "EXISTS (
+            SELECT 1 FROM libraries active_library
+            WHERE active_library.id = {library_id_expression}
+              AND active_library.deletion_state = 'ACTIVE'
+        )"
+    );
     let selected_access = format!(
         "EXISTS (
             SELECT 1 FROM users access_mode_user
@@ -32,9 +39,9 @@ fn user_library_access_filter(library_id_expression: &str, include_admin: bool) 
         )"
     );
     if include_admin {
-        format!("(? = 1 OR {selected_access})")
+        format!("({active_library} AND (? = 1 OR {selected_access}))")
     } else {
-        selected_access
+        format!("({active_library} AND {selected_access})")
     }
 }
 

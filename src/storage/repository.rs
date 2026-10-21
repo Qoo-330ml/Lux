@@ -33,6 +33,12 @@ mod database_cleanup;
 #[path = "database_diagnostics.rs"]
 mod database_diagnostics;
 pub use database_diagnostics::DatabaseDiagnosticsSnapshot;
+#[path = "database_maintenance.rs"]
+mod database_maintenance;
+pub use database_maintenance::{
+    DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    MaintenanceCandidate, MaintenanceReport,
+};
 #[path = "device_pairings.rs"]
 mod device_pairings;
 #[path = "emby_migration.rs"]
@@ -55,6 +61,9 @@ mod media_sources;
 
 #[path = "library.rs"]
 mod library;
+#[path = "library_deletion.rs"]
+mod library_deletion;
+pub(crate) use library_deletion::LibraryDeletionBatch;
 #[path = "library_roots.rs"]
 mod library_roots;
 #[path = "subtitles.rs"]
@@ -5192,6 +5201,21 @@ pub(crate) struct StoredLibraryIdentity {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) root_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredLibraryDeletionJob {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) library_name: String,
+    pub(crate) status: String,
+    pub(crate) stage: String,
+    pub(crate) processed_count: i64,
+    pub(crate) error_code: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
 }
 
 #[derive(Debug)]

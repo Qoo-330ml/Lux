@@ -1606,9 +1606,15 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         assert!(card.get(field).is_some(), "card projection lacks {field}");
     }
     for field in ["productionYear", "rating", "runtimeTicks"] {
-        let full_value = full_page_body["items"][0].get(field).cloned().unwrap_or(Value::Null);
+        let full_value = full_page_body["items"][0]
+            .get(field)
+            .cloned()
+            .unwrap_or(Value::Null);
         let card_value = card.get(field).cloned().unwrap_or(Value::Null);
-        assert_eq!(card_value, full_value, "card field {field} diverges from full DTO");
+        assert_eq!(
+            card_value, full_value,
+            "card field {field} diverges from full DTO"
+        );
     }
     let full_sources = full_page_body["items"][0]["mediaSources"]
         .as_array()
@@ -1666,7 +1672,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(count_skipped.status(), reqwest::StatusCode::OK);
     let count_skipped_body: Value = count_skipped.json().await?;
-    assert_eq!(count_skipped_body["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        count_skipped_body["items"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert!(count_skipped_body.get("total").is_none());
     assert_eq!(count_skipped_body["hasNext"], true);
 

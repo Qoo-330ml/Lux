@@ -29,6 +29,8 @@ import type {
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
   AdminLibraryCoverJob,
+  AdminLibraryDeletionJob,
+  AdminLibraryDeletionJobsPage,
   AdminLibraryPipelineActivityPage,
   AdminLibrary,
   AdminRoot,
@@ -1258,9 +1260,22 @@ export class LuxApiClient {
   }
 
   deleteAdminLibrary(libraryId: string) {
-    return this.request<void>(`/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`, {
+    return this.request<{ job: AdminLibraryDeletionJob }>(`/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`, {
       method: "DELETE",
     });
+  }
+
+  adminLibraryDeletionJobs(status?: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    if (status) params.set("status", status);
+    return this.request<AdminLibraryDeletionJobsPage>(`/api/v1/admin/library-deletion-jobs?${params}`);
+  }
+
+  retryAdminLibraryDeletion(jobId: string) {
+    return this.request<{ job: AdminLibraryDeletionJob }>(
+      `/api/v1/admin/library-deletion-jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: "POST" },
+    );
   }
 
   addAdminLibraryRoot(libraryId: string, path: string) {

@@ -2089,7 +2089,12 @@ async fn emby_global_collection_root_items_response(
         Ok(page) => page,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog_page = CatalogPage::new(page.cards.iter().map(|card| card.item.clone()).collect(), page.total, offset, limit);
+    let catalog_page = CatalogPage::new(
+        page.cards.iter().map(|card| card.item.clone()).collect(),
+        page.total,
+        offset,
+        limit,
+    );
     let mut items = match emby_catalog_items_for_user(
         state,
         user_id,

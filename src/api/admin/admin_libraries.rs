@@ -12,6 +12,14 @@ pub(super) fn api_routes() -> Router<AppState> {
             patch(admin_update_library).delete(admin_delete_library),
         )
         .route(
+            "/api/v1/admin/library-deletion-jobs",
+            get(admin_list_library_deletion_jobs),
+        )
+        .route(
+            "/api/v1/admin/library-deletion-jobs/{job_id}/retry",
+            post(admin_retry_library_deletion),
+        )
+        .route(
             "/api/v1/admin/libraries/{library_id}/cover",
             put(admin_update_library_cover)
                 .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
@@ -849,47 +857,248 @@ pub(crate) async fn admin_delete_library(
             );
         }
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let _deletion_guard = match crate::application::admin_library_settings::delete_library(
-        libraries,
-        state.scan_jobs.as_ref(),
-        state.plugins.as_ref(),
-        state.home.as_ref(),
-        library_id,
-    )
-    .await
-    {
-        Ok(guard) => guard,
-        Err(crate::application::admin_library_settings::DeleteLibraryError::Library(error)) => {
-            return library_error(&headers, error);
+    let service = crate::application::library_deletion::LibraryDeletionService::new(
+        database.clone(),
+        state.scan_jobs.clone(),
+        state.plugins.clone(),
+        state.home.clone(),
+    );
+    let job = match service.request(library_id).await {
+        Ok(job) => job,
+        Err(crate::application::library_deletion::LibraryDeletionError::LibraryNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response();
         }
-        Err(crate::application::admin_library_settings::DeleteLibraryError::Scan(
-            ScanJobError::Storage(error),
-        )) => return library_error(&headers, LibraryServiceError::Storage(error)),
-        Err(crate::application::admin_library_settings::DeleteLibraryError::Scan(error)) => {
-            tracing::error!(library_id = %library_id, %error, "failed to prepare library deletion");
+        Err(crate::application::library_deletion::LibraryDeletionError::RetryRequired) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::VersionConflict,
+                "该媒体库的删除任务已停止，请在任务与日志中重试",
+            )
+            .into_response();
+        }
+        Err(crate::application::library_deletion::LibraryDeletionError::Storage(error)) => {
+            tracing::error!(library_id = %library_id, %error, "failed to enqueue library deletion");
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
                 lux::ApiErrorCode::DatabaseUnavailable,
-                "媒体库删除准备失败",
+                "媒体库删除任务提交失败",
+            )
+            .into_response();
+        }
+        Err(error) => {
+            tracing::error!(library_id = %library_id, %error, "failed to enqueue library deletion");
+            return api_error(
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                lux::ApiErrorCode::Internal,
+                "媒体库删除任务提交失败",
             )
             .into_response();
         }
     };
     let target_id = library_id.to_string();
+    libraries.notify_library_changed();
+    if let Some(home) = state.home.as_ref() {
+        home.invalidate();
+    }
+    service.spawn_worker(&job.id);
     record_audit_event(
         &state,
         &headers,
-        "LIBRARY_DELETED",
+        "LIBRARY_DELETION_REQUESTED",
         Some("library"),
         Some(&target_id),
+        &format!(r#"{{"jobId":"{}"}}"#, job.id),
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"job": library_deletion_job_json(&job)})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryDeletionJobsQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    status: Option<String>,
+}
+
+pub(crate) async fn admin_list_library_deletion_jobs(
+    headers: HeaderMap,
+    Query(query): Query<LibraryDeletionJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let status = query.status.map(|value| value.to_ascii_uppercase());
+    if status.as_deref().is_some_and(|status| {
+        !matches!(
+            status,
+            "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED"
+        )
+    }) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "删除任务状态筛选无效",
+        )
+        .into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let service = crate::application::library_deletion::LibraryDeletionService::new(
+        database.clone(),
+        state.scan_jobs.clone(),
+        state.plugins.clone(),
+        state.home.clone(),
+    );
+    match service.list(offset, limit, status.as_deref()).await {
+        Ok((jobs, total)) => (
+            StatusCode::OK,
+            Json(json!({
+                "jobs": jobs.iter().map(library_deletion_job_json).collect::<Vec<_>>(),
+                "page": query.page.unwrap_or(1),
+                "pageSize": limit,
+                "total": total,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list library deletion jobs");
+            api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "删除任务暂时不可用",
+            )
+            .into_response()
+        }
+    }
+}
+
+pub(crate) async fn admin_retry_library_deletion(
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let job_id = match job_id.parse::<crate::domain::ids::LibraryDeletionJobId>() {
+        Ok(job_id) => job_id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "删除任务 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let service = crate::application::library_deletion::LibraryDeletionService::new(
+        database.clone(),
+        state.scan_jobs.clone(),
+        state.plugins.clone(),
+        state.home.clone(),
+    );
+    let job = match service.retry(&job_id).await {
+        Ok(job) => job,
+        Err(crate::application::library_deletion::LibraryDeletionError::JobNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "删除任务不存在",
+            )
+            .into_response();
+        }
+        Err(crate::application::library_deletion::LibraryDeletionError::JobNotRetryable) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::VersionConflict,
+                "该删除任务当前不可重试",
+            )
+            .into_response();
+        }
+        Err(error) => {
+            tracing::error!(job_id, %error, "failed to retry library deletion");
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "删除任务重试失败",
+            )
+            .into_response();
+        }
+    };
+    service.spawn_worker(&job.id);
+    record_audit_event(
+        &state,
+        &headers,
+        "LIBRARY_DELETION_RETRIED",
+        Some("library_deletion_job"),
+        Some(&job.id),
         "{}",
     )
     .await;
-    StatusCode::NO_CONTENT.into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"job": library_deletion_job_json(&job)})),
+    )
+        .into_response()
+}
+
+fn library_deletion_job_json(job: &crate::storage::StoredLibraryDeletionJob) -> Value {
+    json!({
+        "id": job.id,
+        "libraryId": job.library_id,
+        "libraryName": job.library_name,
+        "status": job.status,
+        "stage": job.stage,
+        "processedCount": job.processed_count,
+        "errorCode": job.error_code,
+        "createdAt": job.created_at,
+        "updatedAt": job.updated_at,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+    })
 }
 
 pub(crate) async fn admin_add_library_root(

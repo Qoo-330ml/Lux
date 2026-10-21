@@ -63,7 +63,7 @@ async fn shutdown_cancels_legacy_scan_jobs_in_one_bounded_update()
 
     database.reset_query_count();
     assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 205);
-    assert_eq!(database.query_count(), 9);
+    assert_eq!(database.query_count(), 10);
     let cancelled: i64 = database
         .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE status = 'CANCELLED'")
         .fetch_one(database.pool())

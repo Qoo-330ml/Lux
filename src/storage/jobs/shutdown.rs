@@ -87,6 +87,10 @@ impl Database {
              SET status = 'CANCELLED', cancel_requested = 0, run_token = NULL, error = ?,
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE status IN ('QUEUED', 'RUNNING')",
+            "UPDATE library_deletion_jobs
+             SET status = 'CANCELLED', error_code = ?,
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE status IN ('PENDING', 'RUNNING')",
         ] {
             let result = self
                 .query(query)

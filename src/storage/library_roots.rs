@@ -4,7 +4,37 @@ impl Database {
     pub(crate) async fn insert_library_root(
         &self,
         root: NewLibraryRoot<'_>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let active_library = self
+            .query(
+                "UPDATE libraries SET updated_at = updated_at
+                 WHERE id = ? AND deletion_state = 'ACTIVE'",
+            )
+            .bind(root.library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_library.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
         self.query(
             "INSERT INTO library_roots (
                 id, library_id, canonical_path, display_path, is_available, is_writable
@@ -16,13 +46,20 @@ impl Database {
         .bind(root.display_path)
         .bind(database_flag(root.is_available))
         .bind(database_flag(root.is_writable))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
     }
 
     pub(crate) async fn list_library_roots(
@@ -141,6 +178,28 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let active_library = self
+            .query(
+                "UPDATE libraries SET updated_at = updated_at
+                 WHERE id = ? AND deletion_state = 'ACTIVE'",
+            )
+            .bind(library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_library.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
         let history = self
             .query(
                 "INSERT INTO library_root_history (library_id, canonical_path, root_id)

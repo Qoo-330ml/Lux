@@ -83,6 +83,10 @@ impl LibraryService {
         self.change_notifier.clone()
     }
 
+    pub(crate) fn notify_library_changed(&self) {
+        self.change_notifier.notify();
+    }
+
     pub async fn create_library(
         &self,
         name: &str,
@@ -517,7 +521,8 @@ impl LibraryService {
             })
             .transpose()?
             .unwrap_or_else(LibraryRootId::new);
-        self.database
+        if !self
+            .database
             .insert_library_root(NewLibraryRoot {
                 id: &id.to_string(),
                 library_id: &library_id_text,
@@ -526,7 +531,10 @@ impl LibraryService {
                 is_available: inspection.is_available,
                 is_writable: inspection.is_writable,
             })
-            .await?;
+            .await?
+        {
+            return Err(LibraryServiceError::LibraryNotFound);
+        }
         self.database
             .delete_library_root_history(&library_id_text, &canonical_path)
             .await?;

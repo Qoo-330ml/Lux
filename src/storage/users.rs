@@ -2676,7 +2676,8 @@ impl Database {
     ) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
-                SELECT 1 FROM libraries WHERE id = ? AND is_enabled = 1
+                SELECT 1 FROM libraries
+                WHERE id = ? AND is_enabled = 1 AND deletion_state = 'ACTIVE'
             ) AND EXISTS(
                 SELECT 1 FROM users access_user
                 WHERE access_user.id = ?
@@ -2713,6 +2714,7 @@ impl Database {
              FROM libraries l
              WHERE l.is_enabled = 1
                AND l.system_kind IS NULL
+               AND l.deletion_state = 'ACTIVE'
                AND EXISTS (
                    SELECT 1 FROM users access_user
                    WHERE access_user.id = ?
@@ -2746,6 +2748,7 @@ impl Database {
              FROM user_library_access ula
              JOIN libraries l ON l.id = ula.library_id
              WHERE ula.user_id = ? AND ula.can_view = 1
+               AND l.deletion_state = 'ACTIVE'
              ORDER BY l.name, l.id",
         )
         .bind(user_id)
@@ -2761,6 +2764,7 @@ impl Database {
         self.query_scalar(
             "SELECT id FROM libraries
              WHERE is_enabled = 1 AND system_kind IS NULL
+               AND deletion_state = 'ACTIVE'
              ORDER BY name, id",
         )
         .fetch_all(&self.pool)

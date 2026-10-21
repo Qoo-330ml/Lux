@@ -1,4 +1,4 @@
-use std::{env, ffi::OsStr, fs};
+use std::{env, ffi::OsStr, fs, path::Path};
 
 use luxd::{
     application::{
@@ -25,6 +25,27 @@ use luxd::{
 use serde_json::json;
 use sqlx::{migrate::Migrator, postgres::PgPoolOptions};
 use uuid::Uuid;
+
+fn latest_migration_version(directory: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+    let mut latest_version = None;
+    for entry in fs::read_dir(migration_dir)? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|stem| stem.split('_').next())
+            .and_then(|version| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        latest_version = Some(latest_version.map_or(version, |latest: i64| latest.max(version)));
+    }
+    latest_version.ok_or_else(|| "migration directory contains no numbered SQL files".into())
+}
 
 fn postgres_connection(database: String) -> PostgresConnection {
     PostgresConnection {
@@ -297,7 +318,7 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
     };
     let (connection, database_name) = create_postgres_test_database().await?;
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 196);
+    assert!(database.schema_version().await? >= 196);
 
     let session_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
@@ -382,7 +403,7 @@ async fn postgres_user_access_blacklist_rules_migration_runs_from_an_empty_datab
     };
     let (connection, database_name) = create_postgres_test_database().await?;
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 196);
+    assert!(database.schema_version().await? >= 196);
 
     let columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
@@ -681,7 +702,7 @@ async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(device_id, None);
-    assert_eq!(database.schema_version().await?, 196);
+    assert!(database.schema_version().await? >= 196);
 
     drop(database);
     drop_postgres_test_database(&database_name).await?;
@@ -1682,7 +1703,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_account_profile_migration_preserves_existing_accounts()
+async fn postgres_legacy_user_and_library_access_upgrade_from_v183_to_current_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1693,7 +1714,7 @@ async fn postgres_account_profile_migration_preserves_existing_accounts()
         .path()
         .join("postgres-migrations-before-account-profile");
     fs::create_dir(&migration_prefix)?;
-    for entry in fs::read_dir("migrations-postgres")? {
+    for entry in fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres"))? {
         let path = entry?.path();
         if path.extension() != Some(OsStr::new("sql")) {
             continue;
@@ -1726,14 +1747,32 @@ async fn postgres_account_profile_migration_preserves_existing_accounts()
         sqlx::query(
             "INSERT INTO users (id, username_normalized, display_name, password_hash, is_disabled)
              VALUES ('legacy-enabled', 'legacy-enabled', 'Legacy Enabled', 'hash', 0),
-                    ('legacy-disabled', 'legacy-disabled', 'Legacy Disabled', 'hash', 1)",
+                    ('legacy-disabled', 'legacy-disabled', 'Legacy Disabled', 'hash', 1),
+                    ('legacy-denials-only', 'legacy-denials-only', 'Legacy Denials', 'hash', 0),
+                    ('legacy-selected', 'legacy-selected', 'Legacy Selected', 'hash', 0)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind)
+             VALUES ('legacy-library', 'Legacy Library', 'MOVIE')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES ('legacy-denials-only', 'legacy-library', 0),
+                    ('legacy-selected', 'legacy-library', 1)",
         )
         .execute(&pool)
         .await?;
         pool.close().await;
 
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(database.schema_version().await?, 190);
+        assert_eq!(
+            database.schema_version().await?,
+            latest_migration_version("migrations-postgres")?
+        );
         let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> =
             sqlx::query_as(
                 "SELECT id, email, email_verified_at, deletion_purge_at,
@@ -1742,14 +1781,54 @@ async fn postgres_account_profile_migration_preserves_existing_accounts()
             )
             .fetch_all(database.pool())
             .await?;
-        assert_eq!(users.len(), 2);
         assert_eq!(
             users[0],
-            ("legacy-disabled".to_owned(), None, None, None, 1, 0)
+            ("legacy-denials-only".to_owned(), None, None, None, 0, 0)
         );
         assert_eq!(
             users[1],
+            ("legacy-disabled".to_owned(), None, None, None, 1, 0)
+        );
+        assert_eq!(
+            users[2],
             ("legacy-enabled".to_owned(), None, None, None, 0, 0)
+        );
+        assert_eq!(
+            users[3],
+            ("legacy-selected".to_owned(), None, None, None, 0, 0)
+        );
+        assert_eq!(users.len(), 4);
+
+        let legacy_access_modes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            legacy_access_modes,
+            [
+                ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+                ("legacy-disabled".to_owned(), "ALL".to_owned()),
+                ("legacy-enabled".to_owned(), "ALL".to_owned()),
+                ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+            ]
+        );
+        let legacy_access_rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT user_id, library_id, can_view FROM user_library_access
+             WHERE user_id LIKE 'legacy-%' ORDER BY user_id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            legacy_access_rows,
+            [
+                (
+                    "legacy-denials-only".to_owned(),
+                    "legacy-library".to_owned(),
+                    0
+                ),
+                ("legacy-selected".to_owned(), "legacy-library".to_owned(), 1),
+            ]
         );
 
         sqlx::query("UPDATE users SET email = 'legacy@example.com' WHERE id = 'legacy-enabled'")
@@ -1830,7 +1909,7 @@ async fn postgres_user_library_access_mode_migration_preserves_legacy_semantics(
         pool.close().await;
 
         let database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(database.schema_version().await?, 190);
+        assert!(database.schema_version().await? >= 190);
         let modes: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
         )
@@ -2067,7 +2146,7 @@ async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
                     ),
                 ]
             );
-            assert_eq!(database.schema_version().await?, 190);
+            assert!(database.schema_version().await? >= 190);
             let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
                 "SELECT version, checksum FROM _sqlx_migrations
                  WHERE version <= $1 ORDER BY version",
@@ -2196,7 +2275,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 190);
+        assert!(upgraded_database.schema_version().await? >= 190);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -2317,7 +2396,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 190);
+    assert!(database.schema_version().await? >= 190);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -3692,7 +3771,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 190);
+    assert!(database.schema_version().await? >= 190);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)

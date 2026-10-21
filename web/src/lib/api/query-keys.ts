@@ -59,6 +59,7 @@ export const queryKeys = {
   adminChapterDetectionJobs: (status?: string) => ["admin", "chapter-detection-jobs", status ?? "all"] as const,
   adminDanmakuMatchJobs: (status?: string) => ["admin", "danmaku-match-jobs", status ?? "all"] as const,
   adminLibraryCoverJobs: (status?: string) => ["admin", "library-cover-jobs", status ?? "all"] as const,
+  adminLibraryDeletionJobs: (status?: string, page = 1) => ["admin", "library-deletion-jobs", status ?? "all", page] as const,
   adminUserInvitations: (status?: string, page = 1) => ["admin", "user-invitations", status ?? "all", page] as const,
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,

@@ -17660,6 +17660,275 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     Ok(())
 }
 
+async fn exercise_user_management_concurrency_storage_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let user_id = "user-management-concurrency-user";
+    database
+        .insert_user(
+            user_id,
+            user_id,
+            "Concurrency Contract",
+            "test-hash",
+            false,
+            true,
+        )
+        .await?;
+
+    let initial_preferences = database
+        .compare_and_swap_user_account_preferences(
+            user_id,
+            0,
+            NewUserAccountPreferences {
+                theme: "dark",
+                accent_color: "silver",
+                show_media_libraries: true,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                optimized_images: false,
+                library_order: None,
+                played_percent: None,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        initial_preferences,
+        UserAccountPreferencesCasResult::Updated(ref saved) if saved.version == 1
+    ));
+    let (preference_a, preference_b) = tokio::join!(
+        database.compare_and_swap_user_account_preferences(
+            user_id,
+            1,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "berry",
+                show_media_libraries: false,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                optimized_images: false,
+                library_order: None,
+                played_percent: None,
+            },
+        ),
+        database.compare_and_swap_user_account_preferences(
+            user_id,
+            1,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "ocean",
+                show_media_libraries: false,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                optimized_images: false,
+                library_order: None,
+                played_percent: None,
+            },
+        ),
+    );
+    assert!(matches!(
+        (preference_a?, preference_b?),
+        (
+            UserAccountPreferencesCasResult::Updated(_),
+            UserAccountPreferencesCasResult::Conflict
+        ) | (
+            UserAccountPreferencesCasResult::Conflict,
+            UserAccountPreferencesCasResult::Updated(_)
+        )
+    ));
+    let saved_preferences = database
+        .user_account_preferences(user_id)
+        .await?
+        .ok_or("concurrent preference update was not stored")?;
+    assert_eq!(saved_preferences.version, 2);
+
+    let no_tags = Vec::new();
+    let initial_restrictions = database
+        .compare_and_swap_user_content_restrictions(
+            user_id,
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: None,
+                allow_unrated: true,
+                allowed_tags: &no_tags,
+                blocked_tags: &no_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        initial_restrictions,
+        UserContentRestrictionsCasResult::Updated(ref saved) if saved.version == 1
+    ));
+    let allowed_a = vec!["Family".to_owned()];
+    let blocked_a = vec!["Horror".to_owned()];
+    let allowed_b = vec!["Documentary".to_owned()];
+    let blocked_b = vec!["Violence".to_owned()];
+    let (restriction_a, restriction_b) = tokio::join!(
+        database.compare_and_swap_user_content_restrictions(
+            user_id,
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed_a,
+                blocked_tags: &blocked_a,
+            },
+        ),
+        database.compare_and_swap_user_content_restrictions(
+            user_id,
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("R"),
+                allow_unrated: false,
+                allowed_tags: &allowed_b,
+                blocked_tags: &blocked_b,
+            },
+        ),
+    );
+    assert!(matches!(
+        (restriction_a?, restriction_b?),
+        (
+            UserContentRestrictionsCasResult::Updated(_),
+            UserContentRestrictionsCasResult::Conflict
+        ) | (
+            UserContentRestrictionsCasResult::Conflict,
+            UserContentRestrictionsCasResult::Updated(_)
+        )
+    ));
+    let saved_restrictions = database
+        .user_content_restrictions(user_id)
+        .await?
+        .ok_or("concurrent content restriction update was not stored")?;
+    assert_eq!(saved_restrictions.version, 2);
+    assert!(
+        (saved_restrictions.allowed_tags == ["family"]
+            && saved_restrictions.blocked_tags == ["horror"])
+            || (saved_restrictions.allowed_tags == ["documentary"]
+                && saved_restrictions.blocked_tags == ["violence"]),
+        "stored restriction tags must come from one complete winning update"
+    );
+
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    let (admission_a, admission_b) = tokio::join!(
+        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000),
+        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000),
+    );
+    let admission_a = admission_a?.ok_or("playback user disappeared")?;
+    let admission_b = admission_b?.ok_or("playback user disappeared")?;
+    assert!(matches!(
+        (admission_a.decision, admission_b.decision),
+        (
+            PlaybackAdmissionDecision::Admitted,
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+        ) | (
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit),
+            PlaybackAdmissionDecision::Admitted
+        )
+    ));
+    assert_eq!(admission_a.active_playback_count, 1);
+    assert_eq!(admission_b.active_playback_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_management_concurrency_storage_contract_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    exercise_user_management_concurrency_storage_contract(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_management_concurrency_storage_contract_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
+
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let test_database_name = database_name.clone();
+    let task = tokio::spawn(async move {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: test_database_name,
+                ..admin_connection
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = exercise_user_management_concurrency_storage_contract(&database)
+            .await
+            .map_err(|error| error.to_string());
+        database.close().await;
+        result
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    match task {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[tokio::test]
 async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservations()
 -> Result<(), Box<dyn std::error::Error>> {

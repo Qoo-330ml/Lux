@@ -28,6 +28,7 @@ import type {
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
   AdminLibraryCoverJob,
+  AdminLibraryDeletionJob,
   AdminJob,
   AdminLibrary,
   AdminMetadataReidentifyJob,
@@ -154,6 +155,7 @@ export function AdminOperationsPage() {
   const [logExportSuccess, setLogExportSuccess] = useState(false);
   const [taskPage, setTaskPage] = useState(1);
   const [taskPlanPage, setTaskPlanPage] = useState(1);
+  const [libraryDeletionPage, setLibraryDeletionPage] = useState(1);
   const [taskPlanSearch, setTaskPlanSearch] = useState("");
   const [creatingPlan, setCreatingPlan] = useState(false);
   const tasks = useQuery({
@@ -204,6 +206,13 @@ export function AdminOperationsPage() {
     enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
+  const libraryDeletionJobs = useQuery({
+    queryKey: queryKeys.adminLibraryDeletionJobs(libraryDeletionStatusFilter(status), libraryDeletionPage),
+    queryFn: () => api.adminLibraryDeletionJobs(libraryDeletionStatusFilter(status), libraryDeletionPage),
+    enabled: tab === "runs",
+    refetchInterval: tab === "runs" ? 5_000 : false,
+    retry: false,
+  });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
     mutationFn: (jobId: string) => api.cancelAdminJob(jobId),
@@ -250,6 +259,10 @@ export function AdminOperationsPage() {
   const retryDanmaku = useMutation({
     mutationFn: (jobId: string) => api.retryDanmakuMatch(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "danmaku-match-jobs"] }),
+  });
+  const retryLibraryDeletion = useMutation({
+    mutationFn: (jobId: string) => api.retryAdminLibraryDeletion(jobId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "library-deletion-jobs"] }),
   });
 
   const jobItems: OperationsJob[] = [
@@ -383,16 +396,29 @@ export function AdminOperationsPage() {
         />
       ) : null}
       {tab === "runs" ? (
-        runtimeLoading ? <AdminOperationsState label="正在读取运行记录…" /> : <RunsSection
+        runtimeLoading ? <AdminOperationsState label="正在读取运行记录…" /> : <>
+        <LibraryDeletionJobsSection
+          jobs={libraryDeletionJobs.data?.jobs ?? []}
+          page={libraryDeletionJobs.data?.page ?? libraryDeletionPage}
+          pageSize={libraryDeletionJobs.data?.pageSize ?? 20}
+          total={libraryDeletionJobs.data?.total ?? 0}
+          loading={libraryDeletionJobs.isLoading}
+          error={libraryDeletionJobs.error?.message || retryLibraryDeletion.error?.message}
+          retrying={retryLibraryDeletion.isPending}
+          onPageChange={setLibraryDeletionPage}
+          onRetry={(jobId) => retryLibraryDeletion.mutate(jobId)}
+        />
+        <RunsSection
           jobs={jobItems}
           libraryNames={libraryNames}
           libraryKinds={libraryKinds}
           status={status}
-          onStatusChange={setStatus}
+          onStatusChange={(nextStatus) => { setStatus(nextStatus); setLibraryDeletionPage(1); }}
           onCancel={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : job.kind === "chapter" ? cancelChapter.mutate(job.id) : job.kind === "danmaku" ? cancelDanmaku.mutate(job.id) : cancel.mutate(job.id)}
           onRetry={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : job.kind === "chapter" ? retryChapter.mutate(job.id) : job.kind === "danmaku" ? retryDanmaku.mutate(job.id) : retry.mutate(job.id)}
           busy={cancel.isPending || cancelMetadata.isPending || cancelStrm.isPending || cancelChapter.isPending || cancelDanmaku.isPending || retry.isPending || retryMetadata.isPending || retryStrm.isPending || retryChapter.isPending || retryDanmaku.isPending}
         />
+        </>
       ) : null}
       {tab === "logs" ? (
         logsLoading ? <AdminOperationsState label="正在读取系统日志…" /> : <LogsSection
@@ -752,6 +778,94 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
       {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
     </article>
   );
+}
+
+function LibraryDeletionJobsSection({
+  jobs,
+  page,
+  pageSize,
+  total,
+  loading,
+  error,
+  retrying,
+  onPageChange,
+  onRetry,
+}: {
+  jobs: AdminLibraryDeletionJob[];
+  page: number;
+  pageSize: number;
+  total: number;
+  loading: boolean;
+  error?: string;
+  retrying: boolean;
+  onPageChange: (page: number) => void;
+  onRetry: (jobId: string) => void;
+}) {
+  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="library-deletion-jobs-title">
+    <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">后台清理</span><h2 id="library-deletion-jobs-title">媒体库删除</h2><p>媒体库已立即从可用列表移除；数据库内容在后台分批清理，原媒体文件会保留。</p></div></div>
+    {error ? <p className="lux-error-copy" role="alert">{error}</p> : null}
+    {loading ? <AdminOperationsState label="正在读取媒体库删除任务…" /> : error ? <AdminOperationsState label={error} error /> : jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无媒体库删除任务</strong><p>确认删除媒体库后，后台进度会显示在这里。</p></div></div> : <div className="lux-admin-job-list">{jobs.map((job) => <LibraryDeletionJobRow key={job.id} job={job} retrying={retrying} onRetry={() => onRetry(job.id)} />)}</div>}
+    {!loading && total > pageSize ? <Pagination page={page} pageSize={pageSize} total={total} onPageChange={onPageChange} /> : null}
+  </section>;
+}
+
+function LibraryDeletionJobRow({ job, retrying, onRetry }: { job: AdminLibraryDeletionJob; retrying: boolean; onRetry: () => void }) {
+  const active = job.status === "PENDING" || job.status === "RUNNING";
+  const retryable = job.status === "FAILED" || job.status === "CANCELLED";
+  const message = job.errorCode ? libraryDeletionErrorLabel(job.errorCode) : null;
+  return <article className="lux-admin-job-row">
+    <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
+    <div className="lux-admin-job-main">
+      <div className="lux-admin-job-heading"><strong>{job.libraryName}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{libraryDeletionStatusLabel(job.status)}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{job.status === "PENDING" ? "等待后台处理" : libraryDeletionStageLabel(job.stage)}</span><span className="lux-admin-job-count">已清理 {job.processedCount.toLocaleString("zh-CN")} 条数据库记录</span></div>
+      {message ? <div className="lux-admin-job-error" role="alert"><strong>{message}</strong><code>{job.errorCode}</code></div> : null}
+      <time className="lux-admin-job-finished-at">{active ? `最近更新：${formatAdminDate(job.updatedAt)}` : `完成时间：${job.finishedAt == null ? "—" : formatAdminDate(job.finishedAt)}`}</time>
+      {job.status === "RUNNING" ? <div className="lux-job-progress is-indeterminate" aria-label="正在后台清理"><span /></div> : null}
+    </div>
+    <div className="lux-admin-job-actions">{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={`重试删除媒体库“${job.libraryName}”`} onClick={onRetry} disabled={retrying}><RotateCcw size={15} /></button> : null}</div>
+  </article>;
+}
+
+function libraryDeletionStatusLabel(status: AdminLibraryDeletionJob["status"]) {
+  switch (status) {
+    case "PENDING": return "等待中";
+    case "RUNNING": return "清理中";
+    case "COMPLETED": return "已删除";
+    case "FAILED": return "失败";
+    case "CANCELLED": return "已暂停";
+    default: return "处理中";
+  }
+}
+
+function libraryDeletionStageLabel(stage: string) {
+  switch (stage) {
+    case "CANCELLING_SCANS": return "正在停止扫描任务";
+    case "MEDIA_ITEMS": return "正在清理媒体条目";
+    case "FILESYSTEM_ENTRIES": return "正在清理文件索引";
+    case "STRM_PROBE_JOBS": return "正在清理 STRM 探测任务";
+    case "SCAN_JOB_DATA": return "正在清理扫描数据";
+    case "SCAN_JOBS": return "正在清理扫描任务";
+    case "FINALIZING": return "正在完成删除";
+    case "COMPLETED": return "删除完成";
+    default: return "正在后台清理";
+  }
+}
+
+function libraryDeletionErrorLabel(errorCode: string) {
+  switch (errorCode) {
+    case "SERVER_SHUTDOWN": return "服务重启后任务已暂停，可重试继续清理。";
+    case "SCAN_CANCEL_TIMEOUT": return "等待扫描停止超时，可重试清理。";
+    case "SCAN_SHUTDOWN_FAILED": return "停止扫描任务失败，可重试清理。";
+    case "DATABASE_ERROR": return "数据库清理失败，可重试。";
+    case "PLUGIN_CLEANUP_FAILED": return "插件配置清理失败，可重试。";
+    case "INVALID_LIBRARY_ID": return "删除任务中的媒体库 ID 无效，请联系管理员。";
+    case "LIBRARY_RECORD_MISSING": return "媒体库记录已不存在，任务无法完成。";
+    default: return "删除任务未完成，可重试；错误码：" + errorCode;
+  }
+}
+
+function libraryDeletionStatusFilter(status: string) {
+  return ["PENDING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"].includes(status) ? status : undefined;
 }
 
 function RunsSection({
