@@ -19,7 +19,6 @@ pub(crate) struct AccountPreferences {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
-    pub(crate) optimized_images: bool,
     pub(crate) library_order: Vec<String>,
     pub(crate) played_percent: i64,
     pub(crate) version: i64,
@@ -36,7 +35,6 @@ impl Default for AccountPreferences {
             audio_language: "原始音轨".to_owned(),
             subtitle_language: "简体中文".to_owned(),
             auto_play_next_episode: true,
-            optimized_images: false,
             library_order: Vec::new(),
             played_percent: 95,
             version: 0,
@@ -56,8 +54,6 @@ pub(crate) struct UpdateAccountPreferences {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
-    #[serde(default)]
-    pub(crate) optimized_images: Option<bool>,
     pub(crate) library_order: Option<Vec<String>>,
     pub(crate) played_percent: Option<i64>,
 }
@@ -179,7 +175,6 @@ pub(crate) struct AccountPreferencesPlaybackSnapshot {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
-    pub(crate) optimized_images: bool,
     pub(crate) played_percent: i64,
 }
 
@@ -286,7 +281,6 @@ pub(crate) async fn update_account_preferences(
                 audio_language: &input.audio_language,
                 subtitle_language: &input.subtitle_language,
                 auto_play_next_episode: input.auto_play_next_episode,
-                optimized_images: input.optimized_images.unwrap_or(false),
                 library_order: input.library_order.as_deref(),
                 played_percent: input.played_percent,
             },
@@ -394,7 +388,6 @@ fn copy_snapshot(
             audio_language: preferences.audio_language.clone(),
             subtitle_language: preferences.subtitle_language.clone(),
             auto_play_next_episode: preferences.auto_play_next_episode,
-            optimized_images: preferences.optimized_images,
             played_percent: preferences.played_percent,
         }),
         library_order: groups
@@ -538,11 +531,6 @@ async fn copy_preferences_to_target(
         } else {
             current.auto_play_next_episode
         },
-        optimized_images: Some(if groups.playback {
-            source.optimized_images
-        } else {
-            current.optimized_images
-        }),
         library_order,
         played_percent: groups.playback.then_some(source.played_percent),
     };
@@ -629,7 +617,6 @@ impl From<StoredPreferences> for AccountPreferences {
             audio_language: preferences.audio_language,
             subtitle_language: preferences.subtitle_language,
             auto_play_next_episode: preferences.auto_play_next_episode,
-            optimized_images: preferences.optimized_images,
             library_order: preferences.library_order,
             played_percent: preferences.played_percent,
             version: preferences.version,
@@ -667,7 +654,6 @@ mod tests {
             audio_language: "日本語".to_owned(),
             subtitle_language: "关闭".to_owned(),
             auto_play_next_episode: false,
-            optimized_images: Some(false),
             library_order: None,
             played_percent: None,
         }
@@ -697,7 +683,6 @@ mod tests {
         assert_eq!(preferences.audio_language, "原始音轨");
         assert_eq!(preferences.subtitle_language, "简体中文");
         assert!(preferences.auto_play_next_episode);
-        assert!(!preferences.optimized_images);
         assert_eq!(preferences.version, 0);
         assert_eq!(preferences.updated_at, None);
         Ok(())
@@ -740,40 +725,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_the_optimized_images_preference() -> Result<(), Box<dyn std::error::Error>> {
+    async fn image_optimization_is_not_an_account_preference()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database) = test_database().await?;
         database
-            .insert_user(
-                "preferences-images-user",
-                "preferences-images-user",
-                "Images",
-                "test",
-                false,
-                true,
-            )
+            .insert_user("images-user", "images-user", "Images", "test", false, true)
             .await?;
-
-        let mut input = valid_update(0);
-        input.optimized_images = Some(true);
-        let created =
-            update_account_preferences(&database, "preferences-images-user", input).await?;
-        assert!(created.optimized_images);
+        let saved = update_account_preferences(&database, "images-user", valid_update(0)).await?;
         assert!(
-            database
-                .user_optimized_images_enabled("preferences-images-user")
-                .await?
+            serde_json::to_value(&saved)?
+                .get("optimizedImages")
+                .is_none()
         );
-
-        let mut input = valid_update(created.version);
-        input.optimized_images = Some(false);
-        let updated =
-            update_account_preferences(&database, "preferences-images-user", input).await?;
-        assert!(!updated.optimized_images);
-        assert!(
-            !database
-                .user_optimized_images_enabled("preferences-images-user")
-                .await?
+        assert_eq!(
+            get_account_preferences(&database, "images-user").await?,
+            saved
         );
+        let obsolete_input = serde_json::json!({
+            "expectedVersion": 1, "theme": "dark", "accentColor": "silver",
+            "showMediaLibraries": true, "showContinueWatching": true,
+            "audioLanguage": "原始音轨", "subtitleLanguage": "简体中文",
+            "autoPlayNextEpisode": true, "optimizedImages": true,
+        });
+        assert!(serde_json::from_value::<UpdateAccountPreferences>(obsolete_input).is_err());
         Ok(())
     }
 

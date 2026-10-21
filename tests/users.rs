@@ -3554,7 +3554,7 @@ async fn admin_can_read_user_account_preferences_and_reject_non_admin()
     assert_eq!(preferences["audioLanguage"], "原始音轨");
     assert_eq!(preferences["subtitleLanguage"], "简体中文");
     assert_eq!(preferences["autoPlayNextEpisode"], true);
-    assert_eq!(preferences["optimizedImages"], false);
+    assert!(preferences.get("optimizedImages").is_none());
     assert_eq!(preferences["libraryOrder"], json!([]));
     assert_eq!(preferences["playedPercent"], 95);
     assert_eq!(preferences["version"], 0);
@@ -3573,7 +3573,6 @@ async fn admin_can_read_user_account_preferences_and_reject_non_admin()
             "audioLanguage": "日语",
             "subtitleLanguage": "English",
             "autoPlayNextEpisode": false,
-            "optimizedImages": true,
             "libraryOrder": [],
             "playedPercent": 87
         }))
@@ -3624,7 +3623,7 @@ async fn admin_can_read_user_account_preferences_and_reject_non_admin()
     assert_eq!(persisted["audioLanguage"], "日语");
     assert_eq!(persisted["subtitleLanguage"], "English");
     assert_eq!(persisted["autoPlayNextEpisode"], false);
-    assert_eq!(persisted["optimizedImages"], true);
+    assert!(persisted.get("optimizedImages").is_none());
     assert_eq!(
         persisted["libraryOrder"],
         json!([accessible_library.id.to_string()])

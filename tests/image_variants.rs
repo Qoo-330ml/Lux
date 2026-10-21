@@ -160,7 +160,7 @@ impl VariantHarness {
         Ok(())
     }
 
-    async fn set_user_preference(&self, optimized: bool) -> Result<(), Box<dyn std::error::Error>> {
+    async fn save_account_preferences(&self) -> Result<(), Box<dyn std::error::Error>> {
         let preferences: Value = self
             .client
             .get(format!("{}/api/v1/auth/account-preferences", self.base_url))
@@ -183,7 +183,6 @@ impl VariantHarness {
                 "audioLanguage": preferences["audioLanguage"],
                 "subtitleLanguage": preferences["subtitleLanguage"],
                 "autoPlayNextEpisode": preferences["autoPlayNextEpisode"],
-                "optimizedImages": optimized,
                 "libraryOrder": preferences["libraryOrder"],
                 "playedPercent": preferences["playedPercent"],
             }))
@@ -193,7 +192,7 @@ impl VariantHarness {
             return Err(format!("account preference update failed: {}", response.status()).into());
         }
         let body: Value = response.json().await?;
-        assert_eq!(body["optimizedImages"], json!(optimized));
+        assert!(body.get("optimizedImages").is_none());
         Ok(())
     }
 
@@ -310,7 +309,6 @@ async fn conditional_and_head_requests_follow_the_variant_contract()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
-    harness.set_user_preference(true).await?;
 
     let first = harness.variant_response().await?;
     assert_eq!(first.status(), StatusCode::OK);
@@ -371,7 +369,6 @@ async fn invalid_widths_are_rejected_only_while_the_switch_is_on()
     );
 
     harness.enable_server_switch(true).await?;
-    harness.set_user_preference(true).await?;
     let enabled = harness.fetch(Some(999)).await?;
     assert_eq!(enabled.status(), StatusCode::BAD_REQUEST);
     let body: Value = enabled.json().await?;
@@ -391,11 +388,11 @@ async fn invalid_widths_are_rejected_only_while_the_switch_is_on()
 }
 
 #[tokio::test]
-async fn legacy_personal_preference_does_not_block_the_global_switch()
+async fn accounts_with_saved_preferences_use_the_global_switch()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
-    harness.set_user_preference(false).await?;
+    harness.save_account_preferences().await?;
 
     let response = harness.variant_response().await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -411,7 +408,6 @@ async fn changing_the_content_tag_invalidates_the_previous_variant()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
-    harness.set_user_preference(true).await?;
 
     let first = harness.variant_response().await?;
     let first_etag = first.headers()[ETAG].to_str()?.to_owned();
@@ -439,7 +435,6 @@ async fn unwritable_cache_directory_falls_back_to_the_original()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
-    harness.set_user_preference(true).await?;
 
     let item_shard = format!("{:02x}", Sha256::digest(harness.item_id.as_bytes())[0]);
     let shard = harness.config_dir.join("image-cache/v1").join(item_shard);
@@ -498,8 +493,8 @@ async fn auth_me_advertises_the_effective_variant_capability()
     assert!(available_only.get("imageVariantsAvailable").is_none());
     assert_eq!(available_only["imageVariantsEnabled"], json!(true));
 
-    harness.set_user_preference(true).await?;
-    let both: Value = harness
+    harness.enable_server_switch(false).await?;
+    let disabled: Value = harness
         .client
         .get(format!("{}/api/v1/auth/me", harness.base_url))
         .header(COOKIE, &harness.cookies)
@@ -507,7 +502,7 @@ async fn auth_me_advertises_the_effective_variant_capability()
         .await?
         .json()
         .await?;
-    assert!(both.get("imageVariantsAvailable").is_none());
-    assert_eq!(both["imageVariantsEnabled"], json!(true));
+    assert!(disabled.get("imageVariantsAvailable").is_none());
+    assert_eq!(disabled["imageVariantsEnabled"], json!(false));
     Ok(())
 }

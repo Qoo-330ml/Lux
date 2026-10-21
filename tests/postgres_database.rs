@@ -4422,3 +4422,73 @@ async fn assert_postgres_registration_request_schema(
     .await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_removes_personal_image_preference_without_changing_other_preferences()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let migrator = sqlx::migrate!("./migrations-postgres");
+    let old = Migrator::with_migrations(
+        migrator
+            .iter()
+            .filter(|m| m.version <= 206)
+            .cloned()
+            .collect(),
+    );
+    old.run(&pool).await?;
+    sqlx::raw_sql(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+        VALUES ('image-user', 'image-user', 'Images', 'test');
+        INSERT INTO user_account_preferences (user_id, theme, accent_color, auto_play_next_episode,
+            optimized_images, version, updated_at)
+        VALUES ('image-user', 'light', 'ocean', 0, 1, 7, 1234);",
+    )
+    .execute(&pool)
+    .await?;
+    migrator.run(&pool).await?;
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'user_account_preferences'
+        AND column_name = 'optimized_images'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(columns, 0);
+    let values: (String, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT theme, accent_color, auto_play_next_episode, version, updated_at
+         FROM user_account_preferences WHERE user_id = 'image-user'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(values, ("light".into(), "ocean".into(), 0, 7, 1234));
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        },
+        &connection,
+    )
+    .await?;
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'user_account_preferences'
+        AND column_name = 'optimized_images'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 0);
+    database.pool().close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}

@@ -4835,7 +4835,6 @@ pub(crate) struct UserAccountPreferences {
     pub(crate) audio_language: String,
     pub(crate) subtitle_language: String,
     pub(crate) auto_play_next_episode: bool,
-    pub(crate) optimized_images: bool,
     pub(crate) library_order: Vec<String>,
     pub(crate) played_percent: i64,
     pub(crate) version: i64,
@@ -4852,7 +4851,6 @@ pub(crate) struct NewUserAccountPreferences<'a> {
     pub(crate) audio_language: &'a str,
     pub(crate) subtitle_language: &'a str,
     pub(crate) auto_play_next_episode: bool,
-    pub(crate) optimized_images: bool,
     pub(crate) library_order: Option<&'a [String]>,
     pub(crate) played_percent: Option<i64>,
 }
