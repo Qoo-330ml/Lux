@@ -17245,6 +17245,29 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：Lux 仍为明文 HTTP/1.1，HTTP/2 只在 nginx 终止 TLS 时生效；未在本机 nginx、真实浏览器 h2、FNOS/x86_64 或真实弱网下验证。构建脚本按 mtime 跳过未变化的 `.gz`，删除旧源文件后需重新构建；`.gz` 不进入版本控制。M5 用 debug `luxd` 测量，静态字节与 release 无差异，M1/M2 未作为本任务结论。
 
+#### LUX-835：中文标题改用系统宋体栈
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-832：中文字体与 CSS 拆分”（编号顺延）。项目所有者已确认直接改用系统宋体栈。
+
+范围：删除 `web/src/lux-fonts.css` 中 101 个 Noto Serif SC 子集与 `web/src/assets/fonts/noto-serif-sc/` 资产，保留 3 个 Libre Bodoni 拉丁字体；`--lux-editorial-font-family` 的中文回退改为 `"Songti SC", "STSong", "SimSun", serif`。本任务不包含 `react.css` 按路由拆分与 Tailwind 移除，登记为后续工作。
+
+预计文件（4 个）：`web/src/lux-fonts.css`、`web/src/react.css`、`web/src/assets/fonts/README.md`、`docs/LUX-DEVELOPMENT.md`（另删除 `web/src/assets/fonts/noto-serif-sc/`）。
+
+验收标准：
+
+- [x] 中文编辑标题不再请求 Noto Serif SC 子集；首屏字体字节由最多约 1.28 MB 降到 0（拉丁标题最多一个 Bodoni 文件）。
+- [x] 320/390/768/1280/1440 视口截图人工检查无布局回归；浏览器控制台无本任务错误。
+- [ ] 首屏 CSS ≤150 KB、gzip ≤35 KB：本任务只完成字体部分，`react.css` 路由拆分与 Tailwind 移除未完成，主 CSS 仍为 328,721 B / gzip 52,534 B。
+- [x] `pnpm --dir web build`、定向 Web 测试与 `git diff --check` 通过。
+
+短计划：先删 Noto 子集并切换字体栈；构建后检查字体请求、CSS 体积和 1280/390 截图；再更新性能记录。
+
+实施结果（2026-10-21）：`lux-fonts.css` 从 101 个 Noto Serif SC `@font-face`（约 111 KB CSS）与 6.0 MB 字体资产缩减为 3 个 Libre Bodoni 块（1,404 B CSS、53,204 B woff2）；`--lux-editorial-font-family` 改为 `"Lux Libre Bodoni", "Songti SC", "STSong", "SimSun", serif`。`web/index.html` 无需新增 preload，因为中文不再下载字体。移除了 `web/src/assets/fonts/noto-serif-sc/`，保留 `libre-bodoni/`。
+
+验证：`pnpm --dir web build` 通过；主 CSS 430,446→328,721 B（-23.6%），gzip 89,188→52,534 B（-41.1%）；构建产物的 woff2 仅 3 个 Bodoni 文件（合计 53,204 B）。Playwright 1280×900 与 390×844 截图显示媒体库标题、导航和卡片布局正常，中文界面使用系统字体；控制台 0 error，字体请求仅 1 个 Bodoni 子集，未请求 Noto。定向 Vitest `library-page`、`home-page`、`library-card` 42/42 通过。
+
+限制：首屏 CSS 目标未达成（328,721 B / gzip 52,534 B，目标 ≤150 KB / ≤35 KB）；`react.css` 尚未按路由拆分，Tailwind 仍整包引入。未在 Windows/Linux 系统字体、真实 320/768/1024/1440 视口逐像素对比或 FNOS/x86_64 上验证；中文宋体在不同操作系统上的可用字形不同，视觉会有轻微差异。未在真实用户设备上测量字体渲染性能。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

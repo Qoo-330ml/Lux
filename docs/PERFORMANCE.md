@@ -2,6 +2,19 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-835 系统宋体栈与字体字节（2026-10-21）
+
+删除 101 个 Noto Serif SC 子集（约 111 KB CSS、6.0 MB 字体资产），保留 3 个 Libre Bodoni 拉丁字体；中文编辑标题改用系统 `"Songti SC", "STSong", "SimSun", serif` 栈。
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| 主 CSS 原始 | 430,446 B | 328,721 B（-23.6%） |
+| 主 CSS gzip | 89,188 B | 52,534 B（-41.1%） |
+| 构建字体资产 | 101 个 Noto 子集 + 3 个 Bodoni（约 6.06 MB） | 3 个 Bodoni（53,204 B） |
+| 库页字体请求 | 视中文标题命中可达 18 个子集（约 1.28 MB） | 1 个 Bodoni 子集（约 18–26 KB），中文 0 |
+
+Playwright 1280×900 与 390×844 截图检查媒体库导航、标题和卡片布局正常，控制台 0 error。首屏 CSS 仍为 328,721 B / gzip 52,534 B，未达到方案 §LUX-832 的 ≤150 KB / ≤35 KB；`react.css` 路由拆分和 Tailwind 移除未实施。该结果只代表本机 macOS arm64 Chromium，不代表 Windows/Linux 系统字体差异或真实低端设备。
+
 ## LUX-834 静态资源预压缩（2026-10-21）
 
 `scripts/build-web.mjs` 在 `vite build` 后为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip 兄弟文件；`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`。本机 `pnpm --dir web build` 生成 61 个 `.gz`：源文件 3,377,162 B，压缩后 896,497 B（26.5%）。
