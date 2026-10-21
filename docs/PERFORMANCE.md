@@ -2,6 +2,18 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-834 静态资源预压缩（2026-10-21）
+
+`scripts/build-web.mjs` 在 `vite build` 后为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip 兄弟文件；`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`。本机 `pnpm --dir web build` 生成 61 个 `.gz`：源文件 3,377,162 B，压缩后 896,497 B（26.5%）。
+
+| 请求 | `content-encoding` | `content-length` | `vary` |
+|---|---|---:|---|
+| `/assets/index-BKmsjUTO.js` + `Accept-Encoding: gzip` | gzip | 33,968 | accept-encoding |
+| 同上，不带 `Accept-Encoding` | 无 | 129,539 | accept-encoding |
+| `/` + `Accept-Encoding: gzip` | gzip | 448 | accept-encoding |
+
+在 LUX-829 的 100 万条夹具、20 Mbps / 40 ms 下单轮测量：M5 首屏字节 19,257,462→18,571,776 B（-3.6%），其中 JS 490,161→146,164、CSS 430,755→89,543、HTML 1,250→773；图片仍占 18,335,296 B。CSS/JS 的 50% 传输目标已达成，但总首屏 50% 目标需要同时启用 LUX-826 图片变体（默认关闭）。本轮使用 debug `luxd` 验证静态响应，M5 字节与 release 的差异可忽略；M1/M2 未作为本任务结论。未在本机之外验证 nginx `http2 on`/`gzip_static on` 或浏览器实际 h2。
+
 ## LUX-830 目录排序表达式索引复测（2026-10-21）
 
 在 LUX-829 同一 1,000,000 条夹具、同一 release `luxd`、20 Mbps / 40 ms、每轮重启服务的条件下复测。新增 `migrations/0205_catalog_sort_indexes.sql` 与 PostgreSQL 对等 migration；SQLite 旧库/新库表重建路径同步重建五个索引。空库/新库迁移后 `schema_version=205`，在 100 万条库上应用约 14 秒。

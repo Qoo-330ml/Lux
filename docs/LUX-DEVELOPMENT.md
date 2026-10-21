@@ -17222,6 +17222,29 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：卡片投影省略 `mediaSources`，卡片上的删除对话框若需要默认源 ID 会退化为无 sourceId 删除；本任务验收未覆盖该路径，完整详情页仍可取得源 ID。PostgreSQL/桌面真实浏览器未单独复测；所有数字仅代表本机 arm64 headless Chromium。
 
+#### LUX-834：静态资源预压缩与 HTTP/2 部署说明
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-831：静态资源预压缩 + 部署层 HTTP/2”（编号顺延）。
+
+范围：新增 `scripts/build-web.mjs`，在 Vite 构建后为 `web/dist` 下达到阈值的前端静态文件生成 gzip 兄弟文件；`pnpm --dir web build` 自动执行该步骤。Lux 的静态文件路由改用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`，不新增运行时压缩依赖；`docs/DEPLOYMENT.md` 给出 nginx `http2 on` 与 `gzip_static on` 配置。Lux 自身仍监听明文 HTTP/1.1，不新增 `h2` 依赖。
+
+预计文件（7 个）：`scripts/build-web.mjs`、`web/package.json`、`src/api/routes.rs`、`web/tests/asset-precompression.test.mjs`、`docs/DEPLOYMENT.md`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] `Accept-Encoding: gzip` 请求 JS/CSS 返回 `Content-Encoding: gzip`、gzip 长度与 `Vary: Accept-Encoding`；不带该头时返回原文件。
+- [x] 构建产物同时存在原文件与 `.gz`；`pnpm --dir web build` 直接可用，`.gz` 与源文件解压一致。
+- [x] 部署文档给出可复制的 nginx HTTP/2 + `gzip_static` 配置；不新增运行时压缩依赖或 h2 依赖。
+- [x] 在 LUX-829 夹具上复测 M5，并记录图片仍占主导、总首屏 50% 依赖图片变体的限制。
+
+短计划：先写 `.gz` 一致性与静态响应检查；再实现构建脚本与 `precompressed_gzip()`；最后更新部署/性能文档并复测 M5。
+
+实施结果（2026-10-21）：新增 `scripts/build-web.mjs`，为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip；`web/package.json` 的 `build` 在 `tsc --noEmit && vite build` 后自动执行。`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，保留原缓存策略。`pnpm --dir web build` 生成 61 个 `.gz`，源文件 3,377,162 B、压缩后 896,497 B（26.5%）。
+
+验证：`curl` 带 `Accept-Encoding: gzip` 请求入口 JS 返回 `content-encoding: gzip`、`content-length: 33968`、`vary: accept-encoding`；不带该头返回 129,539 B 原文。首页 HTML 同样由 972 B 降至 448 B。新增 `web/tests/asset-precompression.test.mjs` 对每个 `.gz` 执行 gunzip 并与源文件逐字节比较，`node --test web/tests/asset-precompression.test.mjs` 通过。100 万条夹具、20 Mbps / 40 ms 单轮 M5：19,257,462→18,571,776 B（-3.6%），JS 490,161→146,164、CSS 430,755→89,543、HTML 1,250→773；图片仍占 18,335,296 B。CSS/JS 自身传输下降约 74%，但总首屏 50% 目标需要同时启用 LUX-826 图片变体（默认关闭）。
+
+限制：Lux 仍为明文 HTTP/1.1，HTTP/2 只在 nginx 终止 TLS 时生效；未在本机 nginx、真实浏览器 h2、FNOS/x86_64 或真实弱网下验证。构建脚本按 mtime 跳过未变化的 `.gz`，删除旧源文件后需重新构建；`.gz` 不进入版本控制。M5 用 debug `luxd` 测量，静态字节与 release 无差异，M1/M2 未作为本任务结论。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

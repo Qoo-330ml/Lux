@@ -26,7 +26,8 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         .fallback_service(
             ServeDir::new(web_root.clone())
                 .append_index_html_on_directories(true)
-                .fallback(ServeFile::new(web_root.join("index.html"))),
+                .precompressed_gzip()
+                .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip()),
         )
         .with_state(state)
         .layer(middleware::from_fn(
