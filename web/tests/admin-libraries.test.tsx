@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminLibrariesPage } from "../src/features/admin/AdminLibrariesPage";
 import { api } from "../src/lib/api/client";
-import type { AdminPlugin } from "../src/lib/api/types";
+import type { AdminLibraryDeletionJob, AdminPlugin } from "../src/lib/api/types";
 import { stylesheet as allStyles } from "./style-source.mjs";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -30,6 +30,20 @@ const library = {
     isAvailable: true,
     isWritable: true,
   }],
+};
+
+const acceptedDeletionJob: AdminLibraryDeletionJob = {
+  id: "deletion-job-1",
+  libraryId: library.id,
+  libraryName: library.name,
+  status: "PENDING",
+  stage: "CANCELLING_SCANS",
+  processedCount: 0,
+  errorCode: null,
+  createdAt: 1,
+  updatedAt: 1,
+  startedAt: null,
+  finishedAt: null,
 };
 
 const configuredScraper: AdminPlugin = {
@@ -517,11 +531,23 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("01每日更新");
   });
 
-  it("removes a library card after the delete request succeeds", async () => {
+  it("removes a library card after the deletion job is accepted", async () => {
     let listedLibraries = [library];
     vi.mocked(api.adminLibraries).mockImplementation(async () => ({ libraries: listedLibraries }));
     const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockImplementation(async (libraryId) => {
       listedLibraries = listedLibraries.filter((item) => item.id !== libraryId);
+      return {
+        job: {
+          id: "deletion-job-1",
+          libraryId,
+          libraryName: library.name,
+          status: "PENDING",
+          stage: "QUEUED",
+          processedCount: 0,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      };
     });
     const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     await renderPage();
@@ -540,6 +566,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector(".lux-admin-library-card")).toBeNull();
     expect(nativeConfirm).not.toHaveBeenCalled();
     expect(container.textContent).toContain("还没有媒体库");
+    expect(container.textContent).toContain("正在后台清理");
   });
 
   it("starts metadata refresh from the library actions menu", async () => {
