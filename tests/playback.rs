@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use tokio::net::TcpListener;
 
+#[path = "playback_strm_probe.rs"]
+mod playback_strm_probe;
+
 fn emby_public_id(id: &str) -> String {
     uuid::Uuid::parse_str(id)
         .map(|uuid| uuid.as_u128().to_string())

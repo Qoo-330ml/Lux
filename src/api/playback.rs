@@ -1650,6 +1650,20 @@ pub(super) async fn handle_emby_playback_event(
             }
         }
     }
+    let playback_probe_source_id = if state_name == "PLAYING"
+        && !request.is_paused
+        && state.strm_probe.is_some()
+    {
+        match access
+            .authorized_playback_source(principal, &internal_item_id, media_source_id.as_deref())
+            .await
+        {
+            Ok(Some(source)) if source.source_kind == "STRM_URL" => Some(source.source_id),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
     // Stop only the HLS session selected by the callback's play session ID or
@@ -1813,6 +1827,11 @@ pub(super) async fn handle_emby_playback_event(
                     resumed,
                 )
                 .await;
+            }
+            if let Some(source_id) = playback_probe_source_id
+                && let Some(strm_probe) = state.strm_probe.as_ref()
+            {
+                strm_probe.schedule_playback_probe(&internal_item_id, &source_id);
             }
             tracing::info!(
                 event = "emby_playback_callback_recorded",
@@ -3976,6 +3995,7 @@ pub(super) async fn lux_web_playback_direct(
 
 pub(super) async fn lux_web_playback_range(
     headers: HeaderMap,
+    method: Method,
     Path(session_id): Path<String>,
     Query(query): Query<WebPlaybackResourceQuery>,
     State(state): State<AppState>,
@@ -3999,6 +4019,9 @@ pub(super) async fn lux_web_playback_range(
     };
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if method != Method::GET {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
         return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
@@ -4057,6 +4080,9 @@ pub(super) async fn lux_web_playback_range(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
+    if let Some(strm_probe) = state.strm_probe.as_ref() {
+        strm_probe.schedule_playback_probe(&session.item_id, &source.source_id);
+    }
     let mut response = Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
         .header("Accept-Ranges", "bytes")

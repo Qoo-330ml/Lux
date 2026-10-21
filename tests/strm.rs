@@ -25,7 +25,11 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    sqlx::query("UPDATE users SET max_simultaneous_playbacks = 0 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let library = LibraryService::new(database.clone())
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;

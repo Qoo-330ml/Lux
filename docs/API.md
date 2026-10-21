@@ -152,7 +152,7 @@ PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_prel
 - `POST /api/v1/admin/plugins/org.lux.strm-media-info/run`：按已保存的 strm-media-info 插件配置创建 STRM 探测任务，返回 202；不接受媒体库、并发等宿主覆盖参数。
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
 - 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。
-- `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.strm-media-info` 的 `media.probe` 只处理单个由宿主校验的不透明 STRM 目标，可为媒体信息和缩略图分别设置开关；目标可以是私网地址、公网地址、域名或路径。宿主负责并发、超时、取消、恢复、落库和可选旁车写回。播放和 PlaybackInfo 不触发该 RPC。
+- `media_probe` 插件必须声明 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。`org.lux.strm-media-info` 的 `media.probe` 只处理单个由宿主校验的不透明 STRM 目标，可为媒体信息和缩略图分别设置开关；目标可以是私网地址、公网地址、域名或路径。宿主负责并发、超时、取消、恢复、落库和可选旁车写回。PlaybackInfo 和媒体浏览不触发该 RPC；符合 LUX-840 条件的实际播放只可排入有界的单来源后台任务，RPC 仍由后台任务执行，播放请求不等待插件。
 - `chapter_detector` 插件必须声明 `category: "MEDIA"`，并至少声明 `chapters.detect` 或 `chapters.lookup`。`org.lux.intro-outro-detector` 使用 `chapters.detect` 比较宿主提取的有界音频指纹；`org.lux.theintrodb-chapter-source` 使用 `chapters.lookup`，只把已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长交给在线插件，由插件访问固定的 TheIntroDB API。两者都不接收媒体路径或任务对象，宿主负责并发、超时、取消、恢复、结果落库和 Emby 章节映射。
 - 未安装、未启用、无可用凭据、运行失败或未知的插件不能作为媒体库的 `scraperId`；选择不可用插件返回 `PLUGIN_UNAVAILABLE`。
 
@@ -343,7 +343,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 媒体 DTO 只返回客户端所需的标题、年份、简介、时长、容器、大小、码率和轨道信息，不返回服务器内部文件路径。图片内容端点属于 LUX-035。
 
-媒体探测对本地文件使用 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json` 和 NFO 的 `<fileinfo><streamdetails>`。管理员显式创建 STRM 探测任务后，宿主才会按 URL 安全策略调用 `org.lux.strm-media-info`，成功结果写入媒体源/媒体流并可选写回兼容旁车。PlaybackInfo 请求本身不访问外部地址；HTTP `.strm` 的播放入口只请求上游响应头和有限重定向，并转发播放器 User-Agent，媒体内容仍由客户端按最终地址直连。旁车内容和插件结果只接受受限字段，不写入原始 ffprobe JSON、完整 URL 或凭据。
+媒体探测对本地文件使用 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json` 和 NFO 的 `<fileinfo><streamdetails>`。管理员显式创建 STRM 探测任务后，宿主才会按 URL 安全策略调用 `org.lux.strm-media-info`，成功结果写入媒体源/媒体流并可选写回兼容旁车；LUX-840 还允许符合配置条件的实际播放将当前来源排入同一类后台任务。PlaybackInfo 请求本身不访问外部地址；HTTP `.strm` 的播放入口只请求上游响应头和有限重定向，并转发播放器 User-Agent，媒体内容仍由客户端按最终地址直连。旁车内容和插件结果只接受受限字段，不写入原始 ffprobe JSON、完整 URL 或凭据。
 
 ## Web 播放会话（LUX-198）
 

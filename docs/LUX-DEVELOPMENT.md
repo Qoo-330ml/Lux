@@ -99,7 +99,7 @@ Lux 的核心价值不是功能数量，而是：
 - 管理员可以编辑已有媒体库的名称和类型。
 - 单个媒体库可包含多个本地路径。
 - 同一媒体库可同时包含真实媒体文件和 .strm 文件。
-- `.strm` 默认只记录首个非空播放目标；首版支持 HTTP/HTTPS、本地路径、SMB 和 FTP。普通扫描、PlaybackInfo 和播放请求不得主动读取 HTTP/HTTPS、SMB/FTP 目标指向的视频源的容器信息、索引或媒体轨。管理员显式创建 STRM 探测任务后，允许通过受监督的 `media_probe` 插件在后台读取已校验的支持目标；本地路径只有在 Lux 进程实际可读时才会被读取。其他协议保留原始文本但标记为不支持，不得伪造可播放地址。
+- `.strm` 默认只记录首个非空播放目标；首版支持 HTTP/HTTPS、本地路径、SMB 和 FTP。普通扫描、PlaybackInfo 和播放请求处理器不得同步读取 HTTP/HTTPS、SMB/FTP 目标指向的视频源的容器信息、索引或媒体轨。管理员显式创建 STRM 探测任务后，允许通过受监督的 `media_probe` 插件在后台读取已校验的支持目标；LUX-840 也允许符合条件的实际播放排入单来源后台任务，播放请求本身不运行插件且不等待探测。本地路径只有在 Lux 进程实际可读时才会被读取。其他协议保留原始文本但标记为不支持，不得伪造可播放地址。
 - `.strm` 若存在同名 `-mediainfo.json` 旁车，可在后台读取旁车填充已声明的媒体信息；没有旁车时保持媒体信息为空，不因缺少探测结果阻止播放。
 - 每个媒体库可设置一个可选的自定义封面图；仅管理员可以上传或替换，普通用户只能在拥有该媒体库访问权限时读取。
 - 媒体库封面图首版只接受 JPEG、PNG、WebP，大小上限为 5 MiB，并通过 Lux 的受保护图片接口提供。
@@ -120,7 +120,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
 - Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径按 Lux 进程实际可读性处理，不要求落在当前媒体库根目录内。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
-- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；HTTP(S) URL 型目标使用 `Protocol=Http`、`IsRemote=true`，本地路径型目标使用 `Protocol=File`、`IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 统一将 `AddApiKeyToDirectStreamUrl` 设为 `true`，并在签名 URL 中携带本次标准 Emby token 的 `api_key`；请求中有设备 ID 时，也将其作为标准 `DeviceId` 提示带入 URL。本地文件和 SMB/FTP 解析源不携带长期 token。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；Emby 标准视频入口对 HTTP(S) URL 型目标直接返回 302 到原始目标，不在服务器端预探测；Lux 自有播放回退继续使用播放器 User-Agent 有限解析重定向并返回 307。扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
+- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；HTTP(S) URL 型目标使用 `Protocol=Http`、`IsRemote=true`，本地路径型目标使用 `Protocol=File`、`IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 统一将 `AddApiKeyToDirectStreamUrl` 设为 `true`，并在签名 URL 中携带本次标准 Emby token 的 `api_key`；请求中有设备 ID 时，也将其作为标准 `DeviceId` 提示带入 URL。本地文件和 SMB/FTP 解析源不携带长期 token。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；Emby 标准视频入口对 HTTP(S) URL 型目标直接返回 302 到原始目标，不在服务器端预探测；Lux 自有播放回退继续使用播放器 User-Agent 有限解析重定向并返回 307。扫描和 `PlaybackInfo` 不访问目标；符合 LUX-840 条件的实际播放可另行排入不等待的单来源后台媒体信息任务，不改变客户端直连播放。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
@@ -1378,7 +1378,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
   分片请求由服务端等待。Lux Web 的内部 HLS 清单仍保持动态追加和立即启动，不复用 Emby VOD 清单。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
-- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。
+- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。符合 LUX-840 条件时实际播放可异步排入当前来源的后台媒体信息补探测，播放请求不等待插件。
 - 不伪造客户端能播放的编码。
 - 选择默认版本使用稳定策略，并允许客户端显式选择 source ID。
 
@@ -3622,7 +3622,9 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 当前 STRM 探测目标策略只校验非空和长度，不解析 STRM 内容，也不根据 HTTP/HTTPS、localhost、
 云实例元数据主机、回环、私网、链路本地、未指定、多播、共享地址、域名或路径做拒绝，不要求
 管理员指定 IP 或网段。STRM 探测目标只作为插件探测输入，不进入日志、任务事件、旁车或 API
-响应；普通扫描、播放和 PlaybackInfo 仍不主动读取 STRM 指向的内容。
+响应；普通扫描、PlaybackInfo 和媒体浏览不主动读取 STRM 指向的内容。仅符合 LUX-840
+条件的实际播放 GET/已授权 PLAYING 回调可提交当前来源的后台补提取任务；播放请求本身不运行
+远程 ffprobe/ffmpeg，也不等待插件执行。
 
 验收：
 
@@ -3637,7 +3639,7 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后保留调度配置但取消遗留作业实例。
 - [ ] 实时增量扫描完成后，所选媒体库中新入库或发生变化的 `.strm` 来源自动创建定向 STRM 探测任务；定向任务只处理本次增量扫描影响的来源，并支持取消和失败重试。
 - [ ] 定向 STRM 探测与全局定时探测共用并发、插件配置和任务持久化边界；定时任务仍保留并继续负责全库补漏，两个任务不能并发占用同一媒体库。
-- [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
+- [x] 播放和 PlaybackInfo 请求不在请求路径同步执行 STRM 远程探测；PlaybackInfo 不触发探测，符合 LUX-840 条件的实际播放只排入后台单来源任务，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、STRM 探测目标策略、ffprobe/ffmpeg 超时、输出上限和无真实目标的 fake ffprobe/fake ffmpeg 测试覆盖；插件异常不退出主进程。
 - [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。
 
@@ -3653,7 +3655,7 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 明确不做：
 
 - 不改变 `.strm` 播放直连语义，不做代理、转码、缓存或 AList API 访问。
-- 不在普通全量扫描或用户请求路径中探测远程 `.strm`；仅允许文件系统实时事件完成增量索引后，通过宿主后台任务触发定向探测，不把插件权限扩展为媒体库/数据库访问。
+- 不在普通全量扫描、PlaybackInfo、媒体浏览或普通用户请求处理器中同步探测远程 `.strm`；除实时增量索引后的宿主后台任务外，仅 LUX-840 规定的实际播放入口可排入单来源后台探测，不把插件权限扩展为媒体库/数据库访问。
 - 不把计划任务执行放入普通扫描、播放或用户请求路径；计划任务只复用已有 STRM 后台作业服务。
 - 不引入 `ffmpeg-next` 或 FFmpeg C API；插件通过现有系统 `ffprobe` 和 `ffmpeg` 命令完成两步处理。
 
@@ -17530,6 +17532,39 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 验证：现有图片鉴权/撤销/无权限回归仍由 `tests/image_api.rs`、`tests/images.rs`、`tests/users.rs` 覆盖（本轮未新增），LUX-826 的图片变体测试保持通过；本任务未产生代码改动。
 
 限制：本机测量不能代表 FNOS/NAS 或真实弱网；未实现 30 秒会话缓存与 60 秒文件元数据缓存；方案中的 5 ms/张验收仍只由本机实测支持。
+
+#### LUX-840：播放时补全选中媒体库的 STRM 媒体信息
+
+范围：插件已安装、启用、开启媒体信息提取且选中资源所在媒体库时，实际播放 GET 或已授权的
+PLAYING 回调可提交当前 STRM 来源的后台补提取。只补缺失信息，即使全库任务配置为 OVERWRITE，
+播放也不重复覆盖已有信息。不因播放启动截图，不等待插件执行，不改变播放响应或失败处理。
+PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播放请求去重，后台等待有界；
+沿用现有作业、插件执行、旁车写回、取消和并发限制，不把单个播放扩展成全库探测。
+
+按五个可独立验证的增量实施（各至多五个文件）：
+
+1. `docs/LUX-DEVELOPMENT.md`、`migrations/0206_strm_probe_source_scope.sql`、
+   `migrations-postgres/0206_strm_probe_source_scope.sql`、`src/storage/repository.rs`、
+   `src/storage/jobs/strm_probe.rs`：持久化可选的单来源范围。
+2. `src/storage/catalog.rs`、`src/application/strm_probe.rs`、`tests/strm_probe.rs`：
+   精确来源读取、配置检查、排队、去重和后台执行。
+3. `src/api/media.rs`、`tests/playback.rs`、`tests/strm_probe_api.rs`、`tests/strm.rs`：
+   Emby 实际取流接入及行为回归。
+4. `src/api/playback.rs`、`tests/web_playback.rs`、`tests/playback_strm_probe.rs`：
+   Web 实际取流和授权播放回调接入及行为回归。
+5. `docs/CHANGELOG.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`docs/PLUGIN-SDK.md`：
+   记录协议边界、验收结果与限制。
+
+验收：
+
+- [x] 新迁移可从空库执行，普通全库/增量作业范围不变，单来源范围持久化且可重试。
+- [x] 当前来源缺少信息才提取；未选库、禁用插件、关闭媒体信息提取及已有信息均跳过。
+- [x] Web/Emby 实际播放和外部代理播放回调可触发；PlaybackInfo、HEAD 和非播放状态不触发。
+- [x] 重复请求合并，已有其他作业时有界等待后重新检查；任务只覆盖当前来源，失败不阻断播放。
+- [x] `strm_probe`、`strm_probe_api`、`strm`、`web_playback`、`playback` 及 `playback_strm_probe` 定向检查通过。
+- [ ] 完整 Rust 门禁通过（本轮全量测试在干净 `test` 基线上同样有 4 项既有失败，详见结果；完整 Clippy 另有既有诊断）。
+
+结果（2026-10-21；本机 macOS `arm64`，Toshiba 已挂载，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`）：六个定向集成目标共 14/14 通过；新增扫描范围失败任务重试串行回归 1/1 通过（实现前按 RED 复现，补锁后 GREEN），`cargo fmt --all -- --check` 通过。全量 Rust 测试为 1,157 passed、31 ignored、4 failed；四项失败在干净 `test` 基线上复现，分别为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`，全量命令因此未继续执行 integration targets。完整 Clippy 仍有 10 项既有诊断（5 项 `too_many_arguments`、2 项 `useless_conversion`、1 项 `cloned_ref_to_slice_refs`、2 项 `type_complexity`）；本任务早期提交引入的测试模块顺序诊断已通过移动模块修正。全量门禁不记为通过。
 
 ## 29. 参考资料
 
