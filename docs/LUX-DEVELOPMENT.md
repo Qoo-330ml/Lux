@@ -17334,9 +17334,9 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-831：静态资源预压缩 + 部署层 HTTP/2”（编号顺延）。
 
-范围：新增 `scripts/build-web.mjs`，在 Vite 构建后为 `web/dist` 下达到阈值的前端静态文件生成 gzip 兄弟文件；`pnpm --dir web build` 自动执行该步骤。Lux 的静态文件路由改用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`，不新增运行时压缩依赖；`docs/DEPLOYMENT.md` 给出 nginx `http2 on` 与 `gzip_static on` 配置。Lux 自身仍监听明文 HTTP/1.1，不新增 `h2` 依赖。
+范围：新增 `web/scripts/build-web.mjs`，在 Vite 构建后为 `web/dist` 下达到阈值的前端静态文件生成 gzip 兄弟文件；`pnpm --dir web build` 自动执行该步骤。脚本位于 `web/` 内，以确保 Docker `web-builder` 阶段的 `COPY web ./` 能包含它。Lux 的静态文件路由改用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`，不新增运行时压缩依赖；`docs/DEPLOYMENT.md` 给出 nginx `http2 on` 与 `gzip_static on` 配置。Lux 自身仍监听明文 HTTP/1.1，不新增 `h2` 依赖。
 
-预计文件（7 个）：`scripts/build-web.mjs`、`web/package.json`、`src/api/routes.rs`、`web/tests/asset-precompression.test.mjs`、`docs/DEPLOYMENT.md`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+预计文件（7 个）：`web/scripts/build-web.mjs`、`web/package.json`、`src/api/routes.rs`、`web/tests/asset-precompression.test.mjs`、`docs/DEPLOYMENT.md`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 验收标准：
 
@@ -17347,7 +17347,7 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 短计划：先写 `.gz` 一致性与静态响应检查；再实现构建脚本与 `precompressed_gzip()`；最后更新部署/性能文档并复测 M5。
 
-实施结果（2026-10-21）：新增 `scripts/build-web.mjs`，为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip；`web/package.json` 的 `build` 在 `tsc --noEmit && vite build` 后自动执行。`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，保留原缓存策略。`pnpm --dir web build` 生成 61 个 `.gz`，源文件 3,377,162 B、压缩后 896,497 B（26.5%）。
+实施结果（2026-10-21）：新增 `web/scripts/build-web.mjs`，为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip；`web/package.json` 的 `build` 在 `tsc --noEmit && vite build` 后自动执行。脚本位于 Docker `web-builder` 的 `COPY web ./` 范围内。`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，保留原缓存策略。`pnpm --dir web build` 生成 61 个 `.gz`，源文件 3,377,162 B、压缩后 896,497 B（26.5%）。
 
 验证：`curl` 带 `Accept-Encoding: gzip` 请求入口 JS 返回 `content-encoding: gzip`、`content-length: 33968`、`vary: accept-encoding`；不带该头返回 129,539 B 原文。首页 HTML 同样由 972 B 降至 448 B。新增 `web/tests/asset-precompression.test.mjs` 对每个 `.gz` 执行 gunzip 并与源文件逐字节比较，`node --test web/tests/asset-precompression.test.mjs` 通过。100 万条夹具、20 Mbps / 40 ms 单轮 M5：19,257,462→18,571,776 B（-3.6%），JS 490,161→146,164、CSS 430,755→89,543、HTML 1,250→773；图片仍占 18,335,296 B。CSS/JS 自身传输下降约 74%，但总首屏 50% 目标需要同时启用 LUX-826 图片变体（默认关闭）。
 

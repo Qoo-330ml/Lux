@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Precompress the built Web assets so luxd can serve `.gz` files directly.
-// Run automatically after `pnpm --dir web build`.
+// Run automatically after `pnpm --dir web build` and from Docker's web build context.
 
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 
-const root = path.resolve(import.meta.dirname, "..", "web", "dist");
+const root = path.resolve(import.meta.dirname, "..", "dist");
 const extensions = new Set([".js", ".css", ".svg", ".html", ".json"]);
 const minimumBytes = 512;
 
