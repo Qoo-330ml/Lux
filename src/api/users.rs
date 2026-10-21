@@ -1430,7 +1430,6 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
                         },
                     },
                     "serverName": server_name,
-                    "imageVariantsAvailable": false,
                     "imageVariantsEnabled": false,
                 }))
                 .into_response();
@@ -1456,18 +1455,10 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
         .image_variants
         .as_ref()
         .is_some_and(|variants| variants.enabled());
-    let user_optimized_images = match state.database.as_ref() {
-        Some(database) => database
-            .user_optimized_images_enabled(&user.id.to_string())
-            .await
-            .unwrap_or(false),
-        None => false,
-    };
     Json(json!({
         "user": user_json(&user),
         "serverName": server_name,
-        "imageVariantsAvailable": image_variants_available,
-        "imageVariantsEnabled": image_variants_available && user_optimized_images,
+        "imageVariantsEnabled": image_variants_available,
     }))
     .into_response()
 }

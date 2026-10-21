@@ -268,11 +268,10 @@ async fn default_switch_off_serves_the_original_image_bytes()
 }
 
 #[tokio::test]
-async fn enabled_switch_with_user_preference_serves_a_smaller_immutable_variant()
+async fn global_switch_alone_serves_a_smaller_immutable_variant()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
-    harness.set_user_preference(true).await?;
 
     let response = harness.variant_response().await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -392,17 +391,17 @@ async fn invalid_widths_are_rejected_only_while_the_switch_is_on()
 }
 
 #[tokio::test]
-async fn user_preference_off_keeps_the_original_image() -> Result<(), Box<dyn std::error::Error>> {
+async fn legacy_personal_preference_does_not_block_the_global_switch()
+-> Result<(), Box<dyn std::error::Error>> {
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
     harness.set_user_preference(false).await?;
 
-    let response = harness.fetch(Some(360)).await?;
+    let response = harness.variant_response().await?;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=3600");
     assert_eq!(
-        response.bytes().await?.as_ref(),
-        harness.original_bytes.as_slice()
+        response.headers()[CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
     );
     Ok(())
 }
@@ -484,7 +483,7 @@ async fn auth_me_advertises_the_effective_variant_capability()
         .await?
         .json()
         .await?;
-    assert_eq!(initial["imageVariantsAvailable"], json!(false));
+    assert!(initial.get("imageVariantsAvailable").is_none());
     assert_eq!(initial["imageVariantsEnabled"], json!(false));
 
     harness.enable_server_switch(true).await?;
@@ -496,8 +495,8 @@ async fn auth_me_advertises_the_effective_variant_capability()
         .await?
         .json()
         .await?;
-    assert_eq!(available_only["imageVariantsAvailable"], json!(true));
-    assert_eq!(available_only["imageVariantsEnabled"], json!(false));
+    assert!(available_only.get("imageVariantsAvailable").is_none());
+    assert_eq!(available_only["imageVariantsEnabled"], json!(true));
 
     harness.set_user_preference(true).await?;
     let both: Value = harness
@@ -508,7 +507,7 @@ async fn auth_me_advertises_the_effective_variant_capability()
         .await?
         .json()
         .await?;
-    assert_eq!(both["imageVariantsAvailable"], json!(true));
+    assert!(both.get("imageVariantsAvailable").is_none());
     assert_eq!(both["imageVariantsEnabled"], json!(true));
     Ok(())
 }

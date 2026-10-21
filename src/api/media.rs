@@ -1642,7 +1642,7 @@ pub(super) async fn lux_image(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let width = match lux_image_variant_width(&state, &headers, &user, query.w.as_deref()).await {
+    let width = match lux_image_variant_width(&state, &headers, query.w.as_deref()) {
         Ok(width) => width,
         Err(response) => return response,
     };
@@ -1680,7 +1680,7 @@ pub(super) async fn lux_image_at_index(
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let width = match lux_image_variant_width(&state, &headers, &user, query.w.as_deref()).await {
+    let width = match lux_image_variant_width(&state, &headers, query.w.as_deref()) {
         Ok(width) => width,
         Err(response) => return response,
     };
@@ -1704,10 +1704,9 @@ pub(super) async fn lux_image_at_index(
     .await
 }
 
-async fn lux_image_variant_width(
+fn lux_image_variant_width(
     state: &AppState,
     headers: &HeaderMap,
-    user: &crate::auth::users::UserRecord,
     requested: Option<&str>,
 ) -> Result<Option<u32>, Response> {
     let Some(variants) = state.image_variants.as_ref() else {
@@ -1737,16 +1736,7 @@ async fn lux_image_variant_width(
         )
         .into_response());
     }
-    let Some(database) = state.database.as_ref() else {
-        return Ok(None);
-    };
-    match database
-        .user_optimized_images_enabled(&user.id.to_string())
-        .await
-    {
-        Ok(true) => Ok(Some(width)),
-        _ => Ok(None),
-    }
+    Ok(Some(width))
 }
 
 pub(super) async fn lux_list_item_images(
