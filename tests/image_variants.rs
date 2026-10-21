@@ -294,16 +294,15 @@ async fn enabled_switch_with_user_preference_serves_a_smaller_immutable_variant(
     let decoded = image::load_from_memory(&body)?;
     assert_eq!(decoded.width().max(decoded.height()), 360);
 
-    let cached = harness.config_dir.join("image-cache").join("v1");
-    let mut entries = 0;
-    let mut directories = tokio::fs::read_dir(&cached).await?;
-    while let Some(directory) = directories.next_entry().await? {
-        let mut files = tokio::fs::read_dir(directory.path()).await?;
-        while files.next_entry().await?.is_some() {
-            entries += 1;
-        }
-    }
-    assert_eq!(entries, 1, "exactly one cached variant file expected");
+    let shard = format!("{:02x}", Sha256::digest(harness.item_id.as_bytes())[0]);
+    let tag = format!("{:x}", Sha256::digest(&harness.original_bytes));
+    let cached = harness
+        .config_dir
+        .join("image-cache/v1")
+        .join(shard)
+        .join(&harness.item_id)
+        .join(format!("{tag}-w360.jpg"));
+    assert_eq!(tokio::fs::read(cached).await?, body);
     Ok(())
 }
 
@@ -443,17 +442,8 @@ async fn unwritable_cache_directory_falls_back_to_the_original()
     harness.enable_server_switch(true).await?;
     harness.set_user_preference(true).await?;
 
-    let content_tag: String = sqlx::query_scalar(
-        "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
-    )
-    .bind(&harness.item_id)
-    .fetch_one(harness.database.pool())
-    .await?;
-    let shard = harness
-        .config_dir
-        .join("image-cache")
-        .join("v1")
-        .join(&content_tag[..2]);
+    let item_shard = format!("{:02x}", Sha256::digest(harness.item_id.as_bytes())[0]);
+    let shard = harness.config_dir.join("image-cache/v1").join(item_shard);
     tokio::fs::create_dir_all(shard.parent().ok_or("missing cache parent")?).await?;
     // Occupy the shard path with a regular file so the directory cannot be created.
     tokio::fs::write(&shard, b"blocked").await?;

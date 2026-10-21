@@ -3636,7 +3636,7 @@ pub(super) async fn serve_image(
         Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if let (Some(width), Some(variants)) = (width, variants)
-        && let Some(variant) = variants.resolve_variant(&image, width).await
+        && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
         && let Some(response) = serve_variant_file(&variant, headers, method).await
     {
         return response;

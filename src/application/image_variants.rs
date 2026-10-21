@@ -1,7 +1,7 @@
 //! Derived image variants for display-sized artwork.
 //!
 //! The media library remains read-only. Variants are generated on first use and
-//! written to the config directory, keyed by the indexed image content tag and
+//! written to the config directory, keyed by the media item, indexed image content tag and
 //! target width. Every failure path falls back to the original image.
 
 use std::{
@@ -25,7 +25,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::application::{images::ResolvedImage, settings::ImageVariantCacheSettings};
+use crate::application::{
+    images::ResolvedImage, metadata_paths::item_relative_directory,
+    settings::ImageVariantCacheSettings,
+};
 
 pub(crate) const IMAGE_VARIANT_WIDTHS: [u32; 3] = [360, 720, 1280];
 const IMAGE_VARIANT_JPEG_QUALITY: u8 = 80;
@@ -39,6 +42,7 @@ const CACHE_VERSION_DIRECTORY: &str = "v1";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct VariantKey {
+    item_directory: PathBuf,
     content_tag: String,
     width: u32,
 }
@@ -235,6 +239,7 @@ impl ImageVariantService {
 
     pub(crate) async fn resolve_variant(
         self: &Arc<Self>,
+        item_id: &str,
         source: &ResolvedImage,
         width: u32,
     ) -> Option<VariantFile> {
@@ -264,7 +269,11 @@ impl ImageVariantService {
             return None;
         }
 
-        let key = VariantKey { content_tag, width };
+        let key = VariantKey {
+            item_directory: item_relative_directory(item_id).ok()?,
+            content_tag,
+            width,
+        };
         let path = self.variant_path(&key);
         if let Some(file) = self.existing_variant(&key, &path).await {
             return Some(file);
@@ -313,7 +322,7 @@ impl ImageVariantService {
             }),
             Ok(Ok(Err(error))) => {
                 tracing::debug!(
-                    item_id = %source.id,
+                    item_id,
                     image_type = %source.image_type,
                     width,
                     error = %error,
@@ -432,53 +441,78 @@ impl ImageVariantService {
     }
 
     fn variant_path(&self, key: &VariantKey) -> PathBuf {
-        let shard = &key.content_tag[..2];
         self.cache_root
-            .join(shard)
+            .join(&key.item_directory)
             .join(format!("{}-w{}.jpg", key.content_tag, key.width))
     }
 
     async fn scan_cache(self: &Arc<Self>) -> std::io::Result<()> {
         let settings = self.settings();
         let mut scanned = Vec::new();
-        if tokio::fs::metadata(&self.cache_root).await.is_ok() {
+        if tokio::fs::symlink_metadata(&self.cache_root)
+            .await
+            .is_ok_and(|m| m.is_dir())
+        {
             let mut shards = tokio::fs::read_dir(&self.cache_root).await?;
             while let Some(shard) = shards.next_entry().await? {
-                if !shard.file_type().await?.is_dir() {
+                let shard_name = shard.file_name();
+                let shard_name = shard_name.to_string_lossy();
+                if !shard.file_type().await?.is_dir()
+                    || shard_name.len() != 2
+                    || !shard_name
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
                     continue;
                 }
-                let mut files = tokio::fs::read_dir(shard.path()).await?;
-                while let Some(entry) = files.next_entry().await? {
-                    let path = entry.path();
-                    let name = entry.file_name();
+                let mut items = tokio::fs::read_dir(shard.path()).await?;
+                while let Some(item) = items.next_entry().await? {
+                    let name = item.file_name();
                     let name = name.to_string_lossy();
-                    let metadata = match entry.metadata().await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
+                    let file_type = item.file_type().await?;
+                    if file_type.is_file() {
+                        // Old flat variants are disposable and cannot be mapped back to an item.
+                        let legacy_variant = variant_file_parts(&name)
+                            .is_some_and(|(tag, _)| tag[..2] == *shard_name);
+                        if legacy_variant || is_temporary_file(&name) {
+                            tokio::fs::remove_file(item.path()).await?;
+                        }
+                        continue;
+                    }
+                    let Ok(item_directory) = item_relative_directory(&name) else {
+                        continue;
                     };
-                    if name.starts_with(".lux-") && name.ends_with(".tmp") {
-                        let _ = tokio::fs::remove_file(&path).await;
+                    if !file_type.is_dir() || item.path() != self.cache_root.join(&item_directory) {
                         continue;
                     }
-                    if !metadata.is_file() {
-                        continue;
-                    }
-                    if metadata.len() == 0 {
-                        let _ = tokio::fs::remove_file(&path).await;
-                        continue;
-                    }
-                    if let Some(key) = variant_key_from_file_name(&name)
-                        && path.parent()
-                            == Some(self.cache_root.join(&key.content_tag[..2]).as_path())
-                    {
-                        let modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|modified| {
-                                modified.duration_since(std::time::UNIX_EPOCH).ok()
-                            })
-                            .map(|duration| duration.as_millis())
-                            .unwrap_or_default();
+                    let mut files = tokio::fs::read_dir(item.path()).await?;
+                    while let Some(entry) = files.next_entry().await? {
+                        if !entry.file_type().await?.is_file() {
+                            continue;
+                        }
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if is_temporary_file(&name) {
+                            tokio::fs::remove_file(entry.path()).await?;
+                            continue;
+                        }
+                        let Some((content_tag, width)) = variant_file_parts(&name) else {
+                            continue;
+                        };
+                        let metadata = match entry.metadata().await {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
+                        if metadata.len() == 0 {
+                            tokio::fs::remove_file(entry.path()).await?;
+                            continue;
+                        }
+                        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                        let key = VariantKey {
+                            item_directory: item_directory.clone(),
+                            content_tag,
+                            width,
+                        };
                         scanned.push((modified, key, metadata.len()));
                     }
                 }
@@ -496,6 +530,7 @@ impl ImageVariantService {
             lru.eviction_candidates(
                 &settings,
                 &VariantKey {
+                    item_directory: PathBuf::new(),
                     content_tag: String::new(),
                     width: 0,
                 },
@@ -526,16 +561,17 @@ fn valid_content_tag(value: &str) -> Option<String> {
     .then(|| value.to_owned())
 }
 
-fn variant_key_from_file_name(name: &str) -> Option<VariantKey> {
+fn is_temporary_file(name: &str) -> bool {
+    name.starts_with(".lux-") && name.ends_with(".tmp")
+}
+
+fn variant_file_parts(name: &str) -> Option<(String, u32)> {
     let (content_tag, width) = name.split_once("-w")?;
     let width = width.strip_suffix(".jpg")?.parse::<u32>().ok()?;
     if !IMAGE_VARIANT_WIDTHS.contains(&width) {
         return None;
     }
-    Some(VariantKey {
-        content_tag: valid_content_tag(content_tag)?,
-        width,
-    })
+    Some((valid_content_tag(content_tag)?, width))
 }
 
 #[derive(Debug)]
@@ -681,8 +717,21 @@ mod tests {
         let cache = temp.path().join("config");
         let service = service(&cache, settings(true));
         let image = source(source_path, 1536, 1024, "a".repeat(64));
-        let variant = service.resolve_variant(&image, 360).await;
+        let variant = service.resolve_variant("media-item", &image, 360).await;
         let variant = variant.expect("variant should be generated");
+        let metadata_directory =
+            crate::application::metadata_paths::library_item_directory(&cache, "media-item")
+                .expect("metadata directory");
+        let relative = metadata_directory
+            .strip_prefix(cache.join("metadata/library"))
+            .expect("relative item directory");
+        assert_eq!(
+            variant.path,
+            cache
+                .join("image-cache/v1")
+                .join(relative)
+                .join(format!("{}-w360.jpg", "a".repeat(64)))
+        );
         let (width, height) = image::image_dimensions(&variant.path).expect("variant dimensions");
         assert_eq!(width, 360);
         assert!(height.abs_diff(240) <= 1);
@@ -696,7 +745,12 @@ mod tests {
         write_jpeg(&source_path, 300, 200);
         let service = service(&temp.path().join("config"), settings(true));
         let image = source(source_path, 300, 200, "b".repeat(64));
-        assert!(service.resolve_variant(&image, 360).await.is_none());
+        assert!(
+            service
+                .resolve_variant("media-item", &image, 360)
+                .await
+                .is_none()
+        );
         assert_eq!(service.generation_count(), 0);
     }
 
@@ -712,7 +766,10 @@ mod tests {
             let service = Arc::clone(&service);
             let image = Arc::clone(&image);
             tasks.push(tokio::spawn(async move {
-                service.resolve_variant(&image, 360).await.is_some()
+                service
+                    .resolve_variant("media-item", &image, 360)
+                    .await
+                    .is_some()
             }));
         }
         for task in tasks {
@@ -729,8 +786,18 @@ mod tests {
         fs::write(&source_path, b"not an image").expect("broken fixture");
         let service = service(&temp.path().join("config"), settings(true));
         let image = source(source_path, 1024, 1536, "d".repeat(64));
-        assert!(service.resolve_variant(&image, 360).await.is_none());
-        assert!(service.resolve_variant(&image, 360).await.is_none());
+        assert!(
+            service
+                .resolve_variant("media-item", &image, 360)
+                .await
+                .is_none()
+        );
+        assert!(
+            service
+                .resolve_variant("media-item", &image, 360)
+                .await
+                .is_none()
+        );
         assert_eq!(service.generation_count(), 0);
     }
 
@@ -747,7 +814,7 @@ mod tests {
         let first_image = source(first, 800, 1200, "e".repeat(64));
         let second_image = source(second, 800, 1200, "f".repeat(64));
         let first_variant = service
-            .resolve_variant(&first_image, 360)
+            .resolve_variant("media-item", &first_image, 360)
             .await
             .expect("first variant");
         assert!(first_variant.path.exists());
@@ -755,7 +822,7 @@ mod tests {
         // Directly tighten the limit the same way an admin update would.
         service.apply_settings(limits);
         let second_variant = service
-            .resolve_variant(&second_image, 360)
+            .resolve_variant("media-item", &second_image, 360)
             .await
             .expect("second variant");
         assert!(second_variant.path.exists());
@@ -769,7 +836,7 @@ mod tests {
         let shard = cache
             .join("image-cache")
             .join(CACHE_VERSION_DIRECTORY)
-            .join("aa");
+            .join(item_relative_directory("media-item").expect("item directory"));
         fs::create_dir_all(&shard).expect("shard");
         let tag = "a".repeat(64);
         let empty = shard.join(format!("{tag}-w360.jpg"));
@@ -789,7 +856,12 @@ mod tests {
         write_jpeg(&source_path, 800, 1200);
         let service = service(&temp.path().join("config"), settings(false));
         let image = source(source_path, 800, 1200, "1".repeat(64));
-        assert!(service.resolve_variant(&image, 360).await.is_none());
+        assert!(
+            service
+                .resolve_variant("media-item", &image, 360)
+                .await
+                .is_none()
+        );
         assert_eq!(service.generation_count(), 0);
     }
 
@@ -803,7 +875,10 @@ mod tests {
             let mut image = source(source_path.clone(), 800, 1200, "5".repeat(64));
             image.image_type = image_type.to_owned();
             assert!(
-                service.resolve_variant(&image, 360).await.is_none(),
+                service
+                    .resolve_variant("media-item", &image, 360)
+                    .await
+                    .is_none(),
                 "{image_type} must not generate variants"
             );
         }
@@ -818,9 +893,19 @@ mod tests {
         let service = service(&temp.path().join("config"), settings(true));
         let mut image = source(source_path.clone(), 800, 1200, "g".repeat(64));
         image.content_tag = Some("../../etc/passwd".to_owned());
-        assert!(service.resolve_variant(&image, 360).await.is_none());
+        assert!(
+            service
+                .resolve_variant("media-item", &image, 360)
+                .await
+                .is_none()
+        );
         image.content_tag = Some("A".repeat(64));
-        assert!(service.resolve_variant(&image, 360).await.is_none());
+        assert!(
+            service
+                .resolve_variant("media-item", &image, 360)
+                .await
+                .is_none()
+        );
         assert_eq!(service.generation_count(), 0);
         assert!(!temp.path().join("config").join("image-cache").exists());
     }
@@ -832,7 +917,10 @@ mod tests {
         write_jpeg_with_orientation(&source_path, 1200, 600, 6);
         let service = service(&temp.path().join("config"), settings(true));
         let image = source(source_path, 1200, 600, "2".repeat(64));
-        let variant = service.resolve_variant(&image, 360).await.expect("variant");
+        let variant = service
+            .resolve_variant("media-item", &image, 360)
+            .await
+            .expect("variant");
         let (width, height) = image::image_dimensions(&variant.path).expect("dimensions");
         assert_eq!(height, 360);
         assert!(width.abs_diff(180) <= 1);
@@ -849,7 +937,7 @@ mod tests {
         let first_image = source(first, 1600, 1200, "3".repeat(64));
         let second_image = source(second, 1600, 1200, "4".repeat(64));
         let first_variant = service
-            .resolve_variant(&first_image, 360)
+            .resolve_variant("media-item", &first_image, 360)
             .await
             .expect("first variant");
         let mut limit = first_variant.content_length + 1024;
@@ -857,7 +945,7 @@ mod tests {
         limits.max_bytes = limit;
         service.apply_settings(limits.clone());
         let second_variant = service
-            .resolve_variant(&second_image, 360)
+            .resolve_variant("media-item", &second_image, 360)
             .await
             .expect("second variant");
         assert!(second_variant.content_length > 1024);
@@ -869,6 +957,118 @@ mod tests {
         limits.max_bytes = limit;
         service.apply_settings(limits);
         assert!(service.stats().bytes >= second_variant.content_length);
+    }
+
+    #[tokio::test]
+    async fn identical_images_are_isolated_by_media_item_and_width() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("poster.jpg");
+        write_jpeg(&path, 1200, 800);
+        let cache = service(&temp.path().join("config"), settings(true));
+        let image = source(path, 1200, 800, "a".repeat(64));
+        let first = cache
+            .resolve_variant("first-item", &image, 360)
+            .await
+            .expect("first");
+        let second = cache
+            .resolve_variant("second-item", &image, 360)
+            .await
+            .expect("second");
+        let wider = cache
+            .resolve_variant("first-item", &image, 720)
+            .await
+            .expect("wider");
+        assert_ne!(first.path, second.path);
+        assert_ne!(first.path, wider.path);
+        assert_eq!(
+            fs::read(&first.path).expect("first bytes"),
+            fs::read(&second.path).expect("second bytes")
+        );
+        assert_eq!(cache.stats().files, 3);
+        let mut limits = settings(true);
+        limits.max_files = 1;
+        cache.apply_settings(limits);
+        cache
+            .resolve_variant("first-item", &image, 360)
+            .await
+            .expect("hit");
+        assert!(first.path.exists());
+        assert!(!second.path.exists());
+        assert!(!wider.path.exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_item_ids_never_touch_the_cache() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("poster.jpg");
+        write_jpeg(&path, 1200, 800);
+        let cache = service(&temp.path().join("config"), settings(true));
+        let image = source(path, 1200, 800, "a".repeat(64));
+        for item_id in ["", "..", "../escape", "/absolute", "a/b", "a\\b"] {
+            assert!(cache.resolve_variant(item_id, &image, 360).await.is_none());
+        }
+        assert!(!cache.cache_root.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_scan_restores_item_entries_and_removes_only_recognized_legacy_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = temp.path().join("config");
+        let cache = service(&config, settings(true));
+        let item = cache
+            .cache_root
+            .join(item_relative_directory("media-item").expect("item"));
+        fs::create_dir_all(&item).expect("item directory");
+        let tag = "a".repeat(64);
+        let name = format!("{tag}-w360.jpg");
+        let current = item.join(&name);
+        fs::write(&current, b"cached jpeg").expect("current");
+        let legacy_dir = cache.cache_root.join("aa");
+        fs::create_dir_all(&legacy_dir).expect("legacy directory");
+        let legacy = legacy_dir.join(&name);
+        let unrelated = legacy_dir.join("notes.txt");
+        fs::write(&legacy, b"old cache").expect("legacy");
+        fs::write(&unrelated, b"unrelated").expect("unrelated");
+        let misplaced = legacy_dir.join("media-item");
+        fs::create_dir_all(&misplaced).expect("misplaced item");
+        fs::write(misplaced.join(&name), b"not indexed").expect("misplaced");
+        cache.scan_cache().await.expect("scan");
+        assert_eq!(cache.stats().files, 1);
+        assert_eq!(cache.stats().bytes, 11);
+        assert!(current.exists());
+        assert!(!legacy.exists());
+        assert!(unrelated.exists());
+        let mut limits = settings(true);
+        limits.max_files = 0;
+        cache.apply_settings(limits);
+        cache.scan_cache().await.expect("scan with budget");
+        assert!(!current.exists());
+        assert_eq!(cache.stats().files, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_scan_does_not_follow_item_or_file_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cache = service(&temp.path().join("config"), settings(true));
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        let name = format!("{}-w360.jpg", "a".repeat(64));
+        fs::write(outside.join(&name), b"outside").expect("outside cache");
+        let item = cache
+            .cache_root
+            .join(item_relative_directory("media-item").expect("item"));
+        fs::create_dir_all(item.parent().expect("shard")).expect("shard");
+        symlink(&outside, &item).expect("item symlink");
+        cache.scan_cache().await.expect("scan");
+        assert_eq!(cache.stats().files, 0);
+        fs::remove_file(&item).expect("remove symlink");
+        fs::create_dir_all(&item).expect("item directory");
+        symlink(outside.join(&name), item.join(&name)).expect("file symlink");
+        cache.scan_cache().await.expect("scan");
+        assert_eq!(cache.stats().files, 0);
+        assert!(outside.join(name).exists());
     }
 
     fn write_jpeg_with_orientation(path: &Path, width: u32, height: u32, orientation: u16) {
