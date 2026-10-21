@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-826 图片缓存与全局开关修订（2026-10-22）
+
+- 图片变体改为 `/config/image-cache/v1/<SHA256(item_id)前两位>/<item_id>/<content_tag>-w<width>.jpg`，与 `metadata/library` 共用条目分片算法。`content_tag` 保留以区分多图和原图更新；URL、ETag、尺寸规则与原图回退保持原有合同。
+- 启动扫描仅清理旧版 `<content_tag前两位>/<content_tag>-w<width>.jpg` 变体与缓存临时文件；新布局恢复 LRU，旧变体按需重新生成。媒体目录与 metadata 原图不受影响。
+- 管理员全局 `variantCache.enabled` 开启即对所有已认证用户生效；不再提供用户优化图片偏好。Web 保存全局策略后刷新 `auth/me`，当前页面无需手动刷新。
+- `auth/me` 删除 `imageVariantsAvailable`，保留全局语义的 `imageVariantsEnabled`。账户偏好与复制快照删除 `optimizedImages`；旧客户端 PATCH 此字段按未知字段返回 400，需刷新 Web 资源。
+- 新增 SQLite/PostgreSQL `0207_remove_user_optimized_images.sql` 删除存储列，保留其他偏好、CAS 版本和时间戳；历史 0204 migration 不修改。数据库升级后回退旧程序应使用升级前备份，以同时恢复列与迁移记录。
+
 ## LUX-758 PostgreSQL 黑名单查询与登录修复（2026-10-21）
 
 设备/客户端黑名单的命中结果及启用规则摘要统一通过 `CASE` 和 `CAST(... AS BIGINT)` 返回

@@ -17223,6 +17223,18 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 修订实施计划（2026-10-22）：先在图片服务、路径 helper、图片 API 与图片测试中统一 item_id 目录；再逐步调整全局能力、账户 Web 与偏好复制；最后移除存储字段、添加 0207 migration 并更新 API/兼容性文档。各切片保持独立提交，原有更新日志改动不纳入。
 
+修订实施结果（2026-10-22）：图片缓存键增加媒体条目目录，复用 `metadata_paths::item_relative_directory` 的安全组件校验与 SHA256 分片；`serve_image` 传入媒体 item_id，避免误用图片行 ID。启动扫描识别新布局并恢复 LRU，仅清理可识别的旧版扁平缓存与临时文件，跳过符号链接。保留内容标签作为同条目多图与原图更新的版本标记。删除账户 UI、浏览器旧偏好读取、API/复制快照、应用服务、存储查询与结构中的个人开关；保留 0204 migration，新增双端 0207 删除列。管理员保存全局策略后失效 `auth/me` 查询，当前会话自动切换图片 URL。
+
+本次主要修改文件：图片路径与服务 `src/application/metadata_paths.rs`、`src/application/image_variants.rs`、`src/api/media.rs`；偏好模型与存储 `src/application/user_account_preferences.rs`、`src/storage/users.rs`、`src/storage/repository.rs`、`src/api/users.rs` 及两份 0207 migration；Web 的 `App.tsx`、`features/home/image-variants.ts`、账户设置和管理员偏好/复制/全局策略页面；对应 Rust/Web 测试及 `docs/API.md`、`docs/COMPATIBILITY.md`。
+
+定向验证：图片服务单测 15/15、账户偏好单测 10/10、最终图片/图片 API 回归 12/12、用户接口 37/37、SQLite 空库/升级 2/2、本机 PostgreSQL 空库/升级 1/1 通过。Web 安装（冻结锁文件）、全量测试 846/846 与构建通过；脚本语法与 compatibility-probe/catalog-fixture Python 测试 10/10 通过。Playwright 使用本机临时库和 1600×2400 PNG：同一会话通过管理员 UI 关闭/开启全局开关，无需页面刷新即可移除/恢复卡片 `w=360`；生成文件落在 `image-cache/v1/b0/00000000-0000-4000-8000-000000008260/<content_tag>-w360.jpg`，缓存命中响应为 200 JPEG、带内容标签/宽度 ETag 与 immutable 缓存头；全局开启时账户页面个人开关数量为 0，最终页面控制台无错误。
+
+全量 Rust 门禁：`cargo build --locked` 与 fmt 通过；`cargo test --locked --all-targets` 在 lib 阶段为 1163 通过 / 3 失败 / 32 忽略，随后未继续执行集成目标。失败项为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`，已在原始 `test` 提交 `c7123f8` 定向复现（前两项的 automatic_ 组 3 通过 / 2 失败，第三项 0 通过 / 1 失败）；不属于本次图片变更。
+
+最终 `cargo fmt --all -- --check` 与 `git diff --check` 通过；全目标 Clippy 仍因 8 项既有诊断未通过，错误类别与文件（含重复次数）与原始 `c7123f8` 一致：Emby/media/播放会话参数数目 4 项、存储测试不必要 clone 1 项、类型复杂度 2 项、注册测试 helper 参数数目 1 项。本次引入的同步图片宽度解析大 Err 告警已通过装箱错误响应消除，最终图片回归 12/12 通过，未增加 Clippy 诊断。
+
+限制：上述验证在本机 macOS arm64，未部署至 FNOS；冷缓存仍按原有 300 ms 预算回退原图并在后台完成生成，旧 Web 客户端提交已移除字段需刷新资源。
+
 #### LUX-827：开放管理员只读读取用户账户偏好
 
 范围：新增 `GET /api/v1/admin/users/{userId}/account-preferences`，返回与当前用户账户偏好 API 相同的版本化快照，包括版本 0 的默认值和旧服务端排序/已看阈值。接口仅允许管理员读取，不提供单字段写入；`libraryOrder` 按目标账号当前可访问范围过滤，并设置 `Cache-Control: private, no-store`。无效用户 ID 返回 400，不存在的用户返回 404。
