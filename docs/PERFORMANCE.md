@@ -2,6 +2,20 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-836 首屏并行与列表预取（2026-10-21）
+
+`App` 的 `setup` 与 `me` 改为并行发起，`me` 在未初始化服务器上的失败由 setup 完成后的 effect 重试；`LibraryPage` 不再等待 `libraries` 解析，直接用 URL 中的 `libraryId` 发 `fields=card&count=false` 请求，未知名媒体库使用 `MOVIE,SERIES` 顶层过滤，HOMEVIDEOS 在媒体库记录到达后切换；`prefetchLibrary` 使用同一 `itemType` 组合，避免预取键与页面键不一致。媒体库记录未就绪时显示加载骨架，不会误报“媒体库不存在”。
+
+| 指标 | LUX-832 后 | 首屏并行后 | 相对 LUX-829 基线 |
+|---|---:|---:|---:|
+| M1 首卡可见中位数 | 712.3 ms | 615.8 ms | -63.1%（基线 1,669.3 ms） |
+| M2 列表 TTFB 中位数 | 652.1 ms | 558.3 ms | -65.9%（基线 1,638.5 ms） |
+| 列表请求自身耗时 | 52.3 ms | 52.2 ms | 不变 |
+| M3 排序后首卡中位数 | 314.9 ms | 324.9 ms | -74.4%（基线 1,268.2 ms） |
+| M5 首屏字节 | 18,535,204 B | 18,535,200 B | 不变 |
+
+M1 相对基线下降 63.1%，达到方案“改善 ≥40%”的阶段目标；M2 仍高于 300 ms，首条 items 请求约在导航后 500 ms 发出，剩余成本是 HTML/JS 传输与执行、两个引导 RTT 和 20 Mbps 网络。未在本机测量 Playwright 之外的真实浏览器导航缓存或 Service Worker。以上仅代表本机 arm64 headless Chromium。
+
 ## LUX-832 列表跳过 COUNT 复测（2026-10-21）
 
 `GET /api/v1/libraries/{libraryId}/items` 新增 `count=false`：跳过每页全库 `COUNT(*)`，内层查询取 `limit+1` 判断 `hasNext`，响应省略 `total`。Web 媒体库首屏与预取同时使用 `fields=card&count=false`；Emby 与其他 Lux 列表仍包含完整计数。

@@ -150,7 +150,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
   const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
-  const itemTypes = isGlobalCollectionLibrary ? "BOX_SET" : libraryItemTypeFilter(library?.kind);
+  // Until the library record arrives, fetch the top-level movie/series set. The
+  // same filter is safe for MOVIE/SERIES/MIXED libraries, so the key does not
+  // change again once the record loads; HOMEVIDEOS switches after the record.
+  const itemTypes = isGlobalCollectionLibrary
+    ? "BOX_SET"
+    : library?.kind === "HOMEVIDEOS"
+      ? undefined
+      : "MOVIE,SERIES";
   const confirmMetadata = useMutation({
     mutationFn: () => api.confirmAdminMetadata([...selectedIds]),
     onSuccess: (result) => {
@@ -216,7 +223,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,
-    enabled: Boolean(libraryId && library),
+    enabled: Boolean(libraryId),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
       if (typeof lastPage.hasNext === "boolean") return lastPage.hasNext ? page + 1 : undefined;
@@ -237,13 +244,12 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     return () => observer.disconnect();
   }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage]);
 
-  if (libraries.isPending) return <LibraryPageLoadingState />;
   if (pages.error && !pages.data) return <section className="lux-page-state"><h1>媒体库加载失败</h1><p>{pages.error.message}</p></section>;
-  if (!library) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
-  if (pages.isPending) return <LibraryPageLoadingState libraryName={library.name} />;
+  if (!library && !libraries.isPending) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
+  if (pages.isPending) return <LibraryPageLoadingState libraryName={library?.name} />;
 
   const loadedItems = pages.data?.pages.flatMap((page) => page.items ?? []) ?? [];
-  const total = pages.data?.pages[0]?.total ?? 0;
+  const total = pages.data?.pages[0]?.total ?? loadedItems.length;
   const sortOptions = [
     { value: "Name", label: "标题" },
     { value: "DateCreated", label: "最近添加" },

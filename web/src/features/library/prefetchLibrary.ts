@@ -4,13 +4,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { Library, MediaItem, PageResponse } from "../../lib/api/types";
 
 export function prefetchLibraryPage(queryClient: QueryClient, library: Library) {
-  const itemTypes = library.kind === "SERIES"
-    ? "SERIES"
-    : library.kind === "MOVIE"
-      ? "MOVIE"
-      : library.kind === "MIXED"
-        ? "MOVIE,SERIES"
-        : undefined;
+  const itemTypes = library.kind === "HOMEVIDEOS" ? undefined : "MOVIE,SERIES";
   const parentId = library.kind === "HOMEVIDEOS" ? "root" : undefined;
   const sortBy: LibrarySortBy = "Name";
   const sortOrder: LibrarySortOrder = "Ascending";

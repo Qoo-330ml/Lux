@@ -17291,6 +17291,29 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：M2 仍未达到 ≤300 ms 绝对目标，剩余成本是 setup→me→libraries 引导链与 20 Mbps / 40 ms 网络（后续 LUX-836）；M3 单轮波动大；未在 PostgreSQL、真实浏览器弱网、FNOS/x86_64 上复测。Web 依赖 `hasNext` 的新字段，旧服务器仍走 `total` 回退。所有数字仅代表本机 macOS arm64。
 
+#### LUX-836：首屏并行与媒体库预取对齐
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-833：首屏并行与列表预取”（编号顺延）。
+
+范围：`App` 的 `setup` 与 `me` 并行发起，setup 完成后对未初始化的 `me` 失败重试；`LibraryPage` 不再等待 `libraries` 查询，直接按 URL `libraryId` 发 `fields=card&count=false` 的 items 请求，未知名媒体库使用 `MOVIE,SERIES` 顶层过滤，HOMEVIDEOS 记录到达后切换；`prefetchLibrary` 使用同一过滤组合，确保 hover 预取命中页面查询键；媒体库记录未到达时显示骨架而不是整页错误。
+
+预计文件（5 个）：`web/src/app/App.tsx`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/tests/library-page.test.ts`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] `me` 与 setup 并行；items 请求不等待 `libraries`；直达媒体库不出现“媒体库不存在”闪烁。
+- [x] hover 预取的查询键与实际页面一致；HOMEVIDEOS、全局合集、排序和分页不回归。
+- [x] M1 相对 LUX-829 基线改善 ≥40%；M2 记录与 300 ms 目标的剩余差距。
+- [x] 定向 Web 测试、build 与 `git diff --check` 通过。
+
+短计划：先加 items 不等待 libraries 与预取键一致的回归；再实现 App 并行探测和页面骨架；最后用 100 万条夹具复测 M1–M3。
+
+实施结果（2026-10-21）：`ServerApp` 并行启动 `setup` 与 `me`，并在 setup 初始化后用 effect 重试 me；`LibraryPage` 改为 `enabled: Boolean(libraryId)`，未知媒体库使用 `MOVIE,SERIES`，媒体库记录加载后 MOVIE/SERIES/MIXED 查询键保持稳定，HOMEVIDEOS 切换到顶层文件夹；加载期间显示 `LibraryPageLoadingState`，`!library && !libraries.isPending` 时才显示不存在；`prefetchLibrary` 使用相同 `itemType`，并继续传 `fields=card&count=false`。排序/筛选工具栏在媒体库记录到达后显示名称，卡片先渲染。
+
+验证：`pnpm --dir web exec vitest run tests/library-page.test.ts tests/setup-page.test.tsx tests/library-card.test.tsx` 27/27；`pnpm --dir web build` 通过。100 万条夹具、20 Mbps / 40 ms、三次冷启动：M1 712.3→615.8 ms（-13.5%，相对 LUX-829 基线 -63.1%），M2 652.1→558.3 ms（-14.4%，相对基线 -65.9%），列表请求自身 52 ms 不变，M3 324.9 ms，M5 18,535,200 B。控制台 0 error。
+
+限制：M2 未达到 ≤300 ms；首条 items 请求在导航后约 500 ms 发出，剩余成本为 HTML/JS 传输与执行、setup/me 两个引导 RTT 和 20 Mbps 网络，未进一步做关键请求预连接或 HTML 内联。未在真实浏览器弱网、HOMEVIDEOS/全局合集的真实数据、PostgreSQL 或 FNOS/x86_64 上验证；所有数字仅代表本机 macOS arm64 headless Chromium。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

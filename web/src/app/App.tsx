@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
 import { Component, lazy, Suspense, useEffect } from "react";
 import type { ReactNode } from "react";
@@ -63,21 +63,27 @@ function ServerApp() {
     queryFn: () => api.setupStatus(),
     retry: false,
   });
-
-  if (setup.isPending) return <LoadingScreen label="正在启动 Lux" />;
-  if (setup.error) return <ErrorScreen error={setup.error} />;
-  if (!setup.data.initialized) return <SetupPage />;
-
-  return <SessionRoutes />;
-}
-
-function SessionRoutes() {
-  const location = useLocation();
+  // Start the session probe in parallel with setup. On an uninitialized
+  // server it fails immediately; once setup finishes the effect retries it.
   const me = useQuery({
     queryKey: queryKeys.me,
     queryFn: () => api.me(),
     retry: false,
   });
+
+  useEffect(() => {
+    if (setup.data?.initialized && me.isError) void me.refetch();
+  }, [me.isError, me.refetch, setup.data?.initialized]);
+
+  if (setup.isPending) return <LoadingScreen label="正在启动 Lux" />;
+  if (setup.error) return <ErrorScreen error={setup.error} />;
+  if (!setup.data.initialized) return <SetupPage />;
+
+  return <SessionRoutes me={me} />;
+}
+
+function SessionRoutes({ me }: { me: UseQueryResult<Awaited<ReturnType<typeof api.me>>, Error> }) {
+  const location = useLocation();
 
   if (me.isPending) return <LoadingScreen label="正在恢复会话" />;
   if (me.error && !(me.error instanceof ApiError && me.error.status === 401)) {
