@@ -1,3 +1,4 @@
+import "./detail.css";
 import { ArrowLeft, Cake, Heart, MapPin, UserRound } from "lucide-react";
 import { Fragment, type FormEvent, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";

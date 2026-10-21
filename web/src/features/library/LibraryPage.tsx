@@ -250,7 +250,9 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   if (pages.isPending) return <LibraryPageLoadingState libraryName={library?.name} />;
 
   const loadedItems = pages.data?.pages.flatMap((page) => page.items ?? []) ?? [];
-  const total = pages.data?.pages[0]?.total ?? loadedItems.length;
+  const total = pages.data?.pages[0]?.total;
+  const loadedCountLabel = (unit: string) =>
+    total != null ? `${total} ${unit}` : `已加载 ${loadedItems.length} ${unit}`;
   const sortOptions = [
     { value: "Name", label: "标题" },
     { value: "DateCreated", label: "最近添加" },
@@ -315,7 +317,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       {isHomeVideos && folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
       <div className="lux-page-heading">
         <h1>{library?.name || "媒体库"}</h1>
-        <p>{metadataStatus ? `${total} 项待确认内容` : isGlobalCollectionLibrary ? `${total} 个系列 · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${total} 项内容` : `${total} 项内容`}</p>
+        <p>{metadataStatus ? loadedCountLabel("项待确认内容") : isGlobalCollectionLibrary ? `${loadedCountLabel("个系列")} · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${loadedCountLabel("项内容")}` : loadedCountLabel("项内容")}</p>
       </div>
       {!isGlobalCollectionLibrary ? <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
         <button
@@ -417,7 +419,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           <button className="lux-button lux-button-secondary" type="button" onClick={() => void pages.fetchNextPage()}>重试</button>
         </p>
       ) : null}
-      {!pages.hasNextPage && loadedItems.length ? <p className="lux-muted-copy" role="status">已加载全部 {total} 项</p> : null}
+      {!pages.hasNextPage && loadedItems.length ? <p className="lux-muted-copy" role="status">已加载全部 {total ?? loadedItems.length} 项</p> : null}
     </section>
   );
 }

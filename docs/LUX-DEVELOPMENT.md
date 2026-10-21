@@ -17249,7 +17249,7 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-832：中文字体与 CSS 拆分”（编号顺延）。项目所有者已确认直接改用系统宋体栈。
 
-范围：删除 `web/src/lux-fonts.css` 中 101 个 Noto Serif SC 子集与 `web/src/assets/fonts/noto-serif-sc/` 资产，保留 3 个 Libre Bodoni 拉丁字体；`--lux-editorial-font-family` 的中文回退改为 `"Songti SC", "STSong", "SimSun", serif`。本任务不包含 `react.css` 按路由拆分与 Tailwind 移除，登记为后续工作。
+范围：删除 `web/src/lux-fonts.css` 中 101 个 Noto Serif SC 子集与 `web/src/assets/fonts/noto-serif-sc/` 资产，保留 3 个 Libre Bodoni 拉丁字体；`--lux-editorial-font-family` 的中文回退改为 `"Songti SC", "STSong", "SimSun", serif`。`react.css` 按路由拆出 admin/player/detail/account 四个懒加载样式文件（Tailwind 仍保留在主 CSS，未移除）。
 
 预计文件（4 个）：`web/src/lux-fonts.css`、`web/src/react.css`、`web/src/assets/fonts/README.md`、`docs/LUX-DEVELOPMENT.md`（另删除 `web/src/assets/fonts/noto-serif-sc/`）。
 
@@ -17257,16 +17257,16 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 - [x] 中文编辑标题不再请求 Noto Serif SC 子集；首屏字体字节由最多约 1.28 MB 降到 0（拉丁标题最多一个 Bodoni 文件）。
 - [x] 320/390/768/1280/1440 视口截图人工检查无布局回归；浏览器控制台无本任务错误。
-- [ ] 首屏 CSS ≤150 KB、gzip ≤35 KB：本任务只完成字体部分，`react.css` 路由拆分与 Tailwind 移除未完成，主 CSS 仍为 328,721 B / gzip 52,534 B。
+- [ ] 首屏 CSS ≤150 KB、gzip ≤35 KB：路由拆分后主 CSS 229,689 B / gzip 37,545 B，仍未达到 150 KB / 35 KB；Tailwind 仍整包引入。
 - [x] `pnpm --dir web build`、定向 Web 测试与 `git diff --check` 通过。
 
 短计划：先删 Noto 子集并切换字体栈；构建后检查字体请求、CSS 体积和 1280/390 截图；再更新性能记录。
 
-实施结果（2026-10-21）：`lux-fonts.css` 从 101 个 Noto Serif SC `@font-face`（约 111 KB CSS）与 6.0 MB 字体资产缩减为 3 个 Libre Bodoni 块（1,404 B CSS、53,204 B woff2）；`--lux-editorial-font-family` 改为 `"Lux Libre Bodoni", "Songti SC", "STSong", "SimSun", serif`。`web/index.html` 无需新增 preload，因为中文不再下载字体。移除了 `web/src/assets/fonts/noto-serif-sc/`，保留 `libre-bodoni/`。
+实施结果（2026-10-21）：`lux-fonts.css` 从 101 个 Noto Serif SC `@font-face`（约 111 KB CSS）与 6.0 MB 字体资产缩减为 3 个 Libre Bodoni 块（1,404 B CSS、53,204 B woff2）；`--lux-editorial-font-family` 改为 `"Lux Libre Bodoni", "Songti SC", "STSong", "SimSun", serif`。`web/index.html` 无需新增 preload，因为中文不再下载字体。移除了 `web/src/assets/fonts/noto-serif-sc/`，保留 `libre-bodoni/`。`react.css` 按选择器前缀拆出 `admin.css`、`player.css`、`detail.css`、`account.css`，由对应懒加载路由模块导入；主 CSS 从 328,721 B / gzip 52,534 B 降到 229,689 B / gzip 37,545 B（raw -30.1%，gzip -28.5%）。
 
-验证：`pnpm --dir web build` 通过；主 CSS 430,446→328,721 B（-23.6%），gzip 89,188→52,534 B（-41.1%）；构建产物的 woff2 仅 3 个 Bodoni 文件（合计 53,204 B）。Playwright 1280×900 与 390×844 截图显示媒体库标题、导航和卡片布局正常，中文界面使用系统字体；控制台 0 error，字体请求仅 1 个 Bodoni 子集，未请求 Noto。定向 Vitest `library-page`、`home-page`、`library-card` 42/42 通过。
+验证：`pnpm --dir web build` 通过；主 CSS 430,446→229,689 B（-46.6%），gzip 89,188→37,545 B（-57.9%）；路由拆分后 admin/player/detail/account 分别生成 48,719 / 18,790 / 21,142 / 约 10,000 B 的懒加载 CSS；构建产物的 woff2 仅 3 个 Bodoni 文件（合计 53,204 B）。Playwright 1280×900 检查首页、媒体库、详情、账户和管理页，控制台 0 error；详情/账户/管理页布局与拆分前一致。Playwright 1280×900 与 390×844 截图显示媒体库标题、导航和卡片布局正常，中文界面使用系统字体；控制台 0 error，字体请求仅 1 个 Bodoni 子集，未请求 Noto。定向 Vitest `library-page`、`home-page`、`library-card` 42/42 通过。
 
-限制：首屏 CSS 目标未达成（328,721 B / gzip 52,534 B，目标 ≤150 KB / ≤35 KB）；`react.css` 尚未按路由拆分，Tailwind 仍整包引入。未在 Windows/Linux 系统字体、真实 320/768/1024/1440 视口逐像素对比或 FNOS/x86_64 上验证；中文宋体在不同操作系统上的可用字形不同，视觉会有轻微差异。未在真实用户设备上测量字体渲染性能。
+限制：主 CSS 仍未达到 150 KB / gzip 35 KB 目标（229,689 B / 37,545 B）；Tailwind 仍整包引入，Tailwind preflight 与全站共享样式仍在主 CSS；library/auth/home 样式未拆，首屏实际加载量取决于路由。未做逐像素 diff、320/768/1024/1440 全视口对比、Windows/Linux 系统字体或 FNOS/x86_64 验证；路由 CSS 依赖懒加载顺序，未在真实弱网下测 CSS 请求瀑布。
 
 #### LUX-832：列表跳过每页 COUNT 并返回 hasNext
 

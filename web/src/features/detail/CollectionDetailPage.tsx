@@ -1,3 +1,4 @@
+import "./detail.css";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Play } from "lucide-react";
 import { useState } from "react";
