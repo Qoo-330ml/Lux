@@ -29,7 +29,6 @@ const defaultServerPreferences: AccountPreferences = {
   audioLanguage: "原始音轨",
   subtitleLanguage: "简体中文",
   autoPlayNextEpisode: true,
-  optimizedImages: false,
   libraryOrder: [],
   playedPercent: 95,
   version: 0,
@@ -90,7 +89,6 @@ describe("account settings", () => {
       audioLanguage: input.audioLanguage,
       subtitleLanguage: input.subtitleLanguage,
       autoPlayNextEpisode: input.autoPlayNextEpisode,
-      optimizedImages: input.optimizedImages,
       libraryOrder: input.libraryOrder,
       playedPercent: input.playedPercent,
       version: input.expectedVersion + 1,
@@ -307,7 +305,6 @@ describe("account settings", () => {
       audioLanguage: "日本語",
       subtitleLanguage: "关闭字幕",
       autoPlayNextEpisode: false,
-      optimizedImages: false,
       libraryOrder: ["series", "movies"],
       playedPercent: 95,
     });
@@ -907,13 +904,20 @@ describe("account settings", () => {
     expect(container.querySelector(".lux-account-library-row")?.textContent).toContain("剧集");
   });
 
+  it("drops the old image preference from browser settings", () => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({
+      ...DEFAULT_ACCOUNT_SETTINGS, optimizedImages: true,
+    }));
+    expect(readAccountSettings(user.id)).not.toHaveProperty("optimizedImages");
+  });
+
   it.each([false, true])("never shows a personal optimized image switch (global=%s)", async (enabled) => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
-            <ImageVariantsContext.Provider value={{ available: enabled, enabled }}>
+            <ImageVariantsContext.Provider value={{ enabled }}>
               <AccountPage user={user} />
             </ImageVariantsContext.Provider>
           </MemoryRouter>

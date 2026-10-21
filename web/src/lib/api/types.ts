@@ -55,7 +55,6 @@ export type AccountPreferences = {
   audioLanguage: string;
   subtitleLanguage: string;
   autoPlayNextEpisode: boolean;
-  optimizedImages: boolean;
   libraryOrder: string[];
   playedPercent: number;
   version: number;
@@ -83,9 +82,7 @@ export type UserPasswordChangeInput = {
 export type AuthSession = {
   user: LuxUser;
   serverName?: string | null;
-  /** The server-level experiment switch is on. */
-  imageVariantsAvailable?: boolean;
-  /** Server switch and the current user's preference are both on. */
+  /** The administrator global image variant switch is on. */
   imageVariantsEnabled?: boolean;
 };
 
@@ -1627,7 +1624,6 @@ export type AdminAccountPreferenceCopyPreview = {
       audioLanguage: string;
       subtitleLanguage: string;
       autoPlayNextEpisode: boolean;
-      optimizedImages: boolean;
       playedPercent: number;
     };
     libraryOrder?: string[];

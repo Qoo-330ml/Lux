@@ -839,7 +839,6 @@ function accountPreferencesUpdateFor(settings: AccountSettings, expectedVersion:
     audioLanguage: settings.audioLanguage,
     subtitleLanguage: settings.subtitleLanguage,
     autoPlayNextEpisode: settings.autoPlayNextEpisode,
-    optimizedImages: settings.optimizedImages,
     libraryOrder: settings.libraryOrder,
     playedPercent: settings.playedPercent,
   };
@@ -855,7 +854,6 @@ function accountSettingsFromPreferences(preferences: AccountPreferences): Accoun
     audioLanguage: preferences.audioLanguage,
     subtitleLanguage: preferences.subtitleLanguage,
     autoPlayNextEpisode: preferences.autoPlayNextEpisode,
-    optimizedImages: preferences.optimizedImages === true,
     playedPercent: preferences.playedPercent,
   };
 }

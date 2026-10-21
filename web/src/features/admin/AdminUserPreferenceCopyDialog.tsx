@@ -189,7 +189,7 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
             <legend>复制项目</legend>
             <label><input aria-label="复制外观偏好" type="checkbox" checked={groups.appearance} onChange={(event) => changeGroup("appearance", event.target.checked)} />外观与强调色</label>
             <label><input aria-label="复制首页偏好" type="checkbox" checked={groups.home} onChange={(event) => changeGroup("home", event.target.checked)} />首页分区</label>
-            <label><input aria-label="复制播放偏好" type="checkbox" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} />音轨、字幕、自动连播、优化图片与已看阈值</label>
+            <label><input aria-label="复制播放偏好" type="checkbox" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} />音轨、字幕、自动连播与已看阈值</label>
             <label><input aria-label="复制媒体库排序" type="checkbox" checked={groups.libraryOrder} onChange={(event) => changeGroup("libraryOrder", event.target.checked)} />媒体库排序</label>
           </fieldset>
           <p className="lux-admin-muted">不选择任何项目时不能继续。每次最多复制到 100 个账号。</p>

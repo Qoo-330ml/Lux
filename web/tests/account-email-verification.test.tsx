@@ -25,7 +25,6 @@ const defaultServerPreferences: AccountPreferences = {
   audioLanguage: "原始音轨",
   subtitleLanguage: "简体中文",
   autoPlayNextEpisode: true,
-  optimizedImages: false,
   libraryOrder: [],
   playedPercent: 95,
   version: 0,

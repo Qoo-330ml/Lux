@@ -106,7 +106,6 @@ function SessionRoutes({ me }: { me: UseQueryResult<Awaited<ReturnType<typeof ap
   return (
     <ImageVariantsContext.Provider
       value={{
-        available: me.data.imageVariantsAvailable === true,
         enabled: me.data.imageVariantsEnabled === true,
       }}
     >

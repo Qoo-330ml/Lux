@@ -184,7 +184,6 @@ function AdminUserPreferencesSection({ user }: { user: AdminUser }) {
             <div><dt>默认音轨</dt><dd>{preferences.audioLanguage}</dd></div>
             <div><dt>默认字幕</dt><dd>{preferences.subtitleLanguage}</dd></div>
             <div><dt>自动连播</dt><dd>{preferences.autoPlayNextEpisode ? "开启" : "关闭"}</dd></div>
-            <div><dt>优化图片</dt><dd>{preferences.optimizedImages ? "开启" : "关闭"}</dd></div>
             <div><dt>播放完成阈值</dt><dd>{preferences.playedPercent}%</dd></div>
           </dl>
         </section>

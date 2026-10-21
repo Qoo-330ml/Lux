@@ -3,14 +3,11 @@ import { createContext, useContext } from "react";
 export type ImageVariantWidth = 360 | 720 | 1280;
 
 export type ImageVariantsState = {
-  /** Server-level switch (管理员主开关) is on. */
-  available: boolean;
-  /** Server switch and the current user's preference are both on. */
+  /** The administrator global switch is on. */
   enabled: boolean;
 };
 
 export const IMAGE_VARIANTS_DISABLED: ImageVariantsState = {
-  available: false,
   enabled: false,
 };
 

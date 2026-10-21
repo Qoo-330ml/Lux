@@ -35,7 +35,7 @@ describe("image variant rendering", () => {
     act(() => {
       root.render(
         <MemoryRouter>
-          <ImageVariantsContext.Provider value={{ available: enabled, enabled }}>
+          <ImageVariantsContext.Provider value={{ enabled }}>
             {children}
           </ImageVariantsContext.Provider>
         </MemoryRouter>,
