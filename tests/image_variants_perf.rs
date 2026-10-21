@@ -126,3 +126,88 @@ fn image_variant_generation_latency() {
         );
     }
 }
+
+/// Peak resident memory while two generations run at once.
+///
+/// The production cache generates with a semaphore of two, and the plan budgets
+/// under 40 MB of growth at that concurrency. `ru_maxrss` is a high-water mark
+/// for the whole process, so the test warms up first and reports the delta from
+/// the warm baseline.
+#[test]
+#[ignore = "requires LUX_PERF_IMAGE_DIR with real images; run explicitly"]
+fn image_variant_concurrent_memory() {
+    const CONCURRENCY: usize = 2;
+
+    let root = std::env::var_os("LUX_PERF_IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("media"));
+    let files = image_files(&root);
+    assert!(
+        !files.is_empty(),
+        "no supported images under {}; set LUX_PERF_IMAGE_DIR",
+        root.display()
+    );
+    // The plan's 40 MB budget assumes a typical poster decode (about 14 MB per
+    // image). Keep the middle of the size distribution, so a 4K still or a
+    // 11 MB clearlogo does not stand in for the poster workload.
+    let mut sized: Vec<(u64, PathBuf)> = files
+        .iter()
+        .filter_map(|path| {
+            let size = std::fs::metadata(path).ok()?.len();
+            Some((size, path.clone()))
+        })
+        .collect();
+    sized.sort_by_key(|(size, _)| *size);
+    let low = sized.len() * 40 / 100;
+    let high = (sized.len() * 60 / 100).max(low + 1);
+    let sample: Vec<PathBuf> = sized[low..high]
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect();
+
+    let workspace = tempfile::tempdir().expect("temporary output directory");
+    let peak = || -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage only writes into the provided rusage buffer.
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(status, 0, "getrusage failed");
+        // SAFETY: the call above succeeded, so the buffer is initialised.
+        let usage = unsafe { usage.assume_init() };
+        #[cfg(target_os = "macos")]
+        {
+            usage.ru_maxrss as u64
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            usage.ru_maxrss as u64 * 1024
+        }
+    };
+
+    let warm_target = workspace.path().join("warm.jpg");
+    generate(&sample[0], &warm_target, 1280).expect("warm-up generation");
+    let baseline = peak();
+
+    // One round only: `ru_maxrss` is a process high-water mark, so repeated
+    // rounds would keep reporting the first allocation instead of the steady
+    // state. Two concurrent generations are exactly the production semaphore.
+    std::thread::scope(|scope| {
+        for slot in 0..CONCURRENCY {
+            let source = &sample[slot % sample.len()];
+            let target = workspace.path().join(format!("r-{slot}.jpg"));
+            scope.spawn(move || {
+                generate(source, &target, 1280).expect("variant generation");
+            });
+        }
+    });
+
+    let after = peak();
+    let growth_mb = after.saturating_sub(baseline) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "concurrency={CONCURRENCY} baseline={} B peak={} B growth={growth_mb:.1} MB",
+        baseline, after
+    );
+    assert!(
+        growth_mb < 40.0,
+        "concurrent generation grew peak memory by {growth_mb:.1} MB, budget is 40 MB"
+    );
+}

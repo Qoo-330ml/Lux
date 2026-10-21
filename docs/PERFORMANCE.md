@@ -101,6 +101,20 @@ M1 相对基线下降 63.1%，达到方案“改善 ≥40%”的阶段目标；M
 
 单页 `count=false` 请求：冷启动后首次约 12 ms，连续 10 次热请求最小 1.5 ms、中位 1.5 ms、最大 1.7 ms；同页 `count=true` 约 443 ms。M2 仍未达到方案“≤300 ms”的绝对目标，剩余成本来自 setup→me→libraries 引导链和 20 Mbps / 40 ms 网络；留给 LUX-836（首屏并行）处理。Emby 路由和其他未传 `count=false` 的调用保持原响应。以上只代表本机 arm64 与直接写库夹具。
 
+## LUX-839 图片变体并发内存（2026-10-21）
+
+`tests/image_variants_perf.rs` 新增 `image_variant_concurrent_memory`（ignored），用 `getrusage(RUSAGE_SELF).ru_maxrss` 测并发 2 的进程峰值增量。样本取本机媒体库按文件大小排序的 40%–60% 区间（1,133 张 JPEG，中位 2,073,600 像素），先做一次 1280 预热再取基线。
+
+| 指标 | 数值 |
+|---|---:|
+| baseline `ru_maxrss` | 15,204,352 B |
+| 并发 2 后峰值 | 50,479,104 B |
+| 增量 | 33.6 MB（预算 40 MB） |
+
+同一轮三档耗时：360 p50 17.01 / p95 63.36 / max 98.54 ms；720 p50 20.23 / p95 68.23 / max 100.06 ms；1280 p50 29.24 / p95 80.80 / max 115.30 ms。
+
+该预算只对中位尺寸的海报/缩略图成立：改用餐具里的 4K 剧照或 11 MB clearlogo PNG 作样本时，同样的测量会升到 130 MB 以上，因为单张解码本身就接近 40 MP 上限。结论只代表本机 arm64，不代表 FNOS/x86_64 或低端 CPU。
+
 ## LUX-835 系统宋体栈与字体字节（2026-10-21）
 
 删除 101 个 Noto Serif SC 子集（约 111 KB CSS、6.0 MB 字体资产），保留 3 个 Libre Bodoni 拉丁字体；中文编辑标题改用系统 `"Songti SC", "STSong", "SimSun", serif` 栈。
