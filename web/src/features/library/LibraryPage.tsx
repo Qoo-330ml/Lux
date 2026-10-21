@@ -210,6 +210,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, {
       sortBy,
       sortOrder,
+      fields: "card",
       ...(metadataStatus ? { metadataStatus } : {}),
       ...(parentId ? { parentId } : {}),
     }),

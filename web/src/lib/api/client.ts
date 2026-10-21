@@ -200,6 +200,7 @@ export type LibraryItemsOptions = {
   metadataStatus?: "PENDING";
   pageSize?: number;
   parentId?: string;
+  fields?: "card";
 };
 
 function withHomeRequestTimeout<T>(
@@ -676,6 +677,7 @@ export class LuxApiClient {
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
     if (options.parentId) params.set("parentId", options.parentId);
+    if (options.fields) params.set("fields", options.fields);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );

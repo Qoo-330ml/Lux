@@ -2302,6 +2302,13 @@ pub struct CatalogPage {
     pub limit: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CatalogItemProjection {
+    #[default]
+    Full,
+    Card,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlobalCollectionCard {
     pub item: CatalogItem,

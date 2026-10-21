@@ -150,6 +150,7 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      fields: "card",
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "root",
@@ -167,6 +168,7 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.textContent).toContain("Show S01E01"));
     });
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      fields: "card",
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "folder-trips",
@@ -179,6 +181,7 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.textContent).toContain("Movie (2024)"));
     });
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      fields: "card",
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "folder-2024",
@@ -397,6 +400,7 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "SERIES", {
+      fields: "card",
       sortBy: "Name",
       sortOrder: "Ascending",
     });
@@ -408,6 +412,7 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "SERIES", {
+      fields: "card",
       sortBy: "Name",
       sortOrder: "Ascending",
     });
@@ -547,6 +552,7 @@ describe("LibraryPage infinite scroll", () => {
     });
     await act(async () => {
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        fields: "card",
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -601,6 +607,7 @@ describe("LibraryPage infinite scroll", () => {
       if (!releaseDateOption) throw new Error("release-date sort option was not rendered");
       releaseDateOption.click();
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        fields: "card",
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -614,6 +621,7 @@ describe("LibraryPage infinite scroll", () => {
     await renderLibraryPage();
     await act(async () => {
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        fields: "card",
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -655,6 +663,7 @@ describe("LibraryPage infinite scroll", () => {
 
     await act(async () => {
       await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+        fields: "card",
         sortBy: "Name",
         sortOrder: "Ascending",
         metadataStatus: "PENDING",
@@ -926,6 +935,7 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     expect(libraryItems).toHaveBeenCalledWith(collectionLibraryId, 1, "BOX_SET", {
+      fields: "card",
       sortBy: "Name",
       sortOrder: "Ascending",
     });

@@ -1567,6 +1567,95 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(favorite_page_body["total"], 1);
     assert_eq!(favorite_page_body["items"][0]["title"], "Beta Movie");
 
+    let full_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=2&sort_by=Name&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(full_page.status(), reqwest::StatusCode::OK);
+    let full_page_body: Value = full_page.json().await?;
+    assert!(
+        full_page_body["items"][0].get("mediaSources").is_some(),
+        "the default projection keeps full media sources"
+    );
+    assert!(full_page_body["items"][0].get("overview").is_some());
+
+    let card_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=2&sort_by=Name&sort_order=Ascending&fields=card",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(card_page.status(), reqwest::StatusCode::OK);
+    let card_page_body: Value = card_page.json().await?;
+    let card = &card_page_body["items"][0];
+    for field in [
+        "id",
+        "libraryId",
+        "itemType",
+        "title",
+        "addedAt",
+        "metadataPending",
+        "localMetadataPending",
+    ] {
+        assert!(card.get(field).is_some(), "card projection lacks {field}");
+    }
+    for field in ["productionYear", "rating", "runtimeTicks"] {
+        let full_value = full_page_body["items"][0].get(field).cloned().unwrap_or(Value::Null);
+        let card_value = card.get(field).cloned().unwrap_or(Value::Null);
+        assert_eq!(card_value, full_value, "card field {field} diverges from full DTO");
+    }
+    let full_sources = full_page_body["items"][0]["mediaSources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let full_default_duration = full_sources
+        .iter()
+        .find(|source| source["isDefault"] == true)
+        .or_else(|| full_sources.first())
+        .and_then(|source| source["durationTicks"].as_i64());
+    assert_eq!(
+        card["defaultDurationTicks"].as_i64(),
+        full_default_duration,
+        "card defaultDurationTicks diverges from the default source"
+    );
+    for image_type in ["poster", "fanart", "thumb", "logo"] {
+        let full_value = &full_page_body["items"][0]["imageTags"][image_type];
+        if !full_value.is_null() {
+            assert_eq!(
+                &card["imageTags"][image_type], full_value,
+                "card image tag {image_type} diverges from full DTO"
+            );
+        }
+    }
+    assert!(card["userData"].is_object());
+    assert_eq!(
+        card["userData"]["positionTicks"].as_i64().unwrap_or(0),
+        full_page_body["items"][0]["userData"]["positionTicks"]
+            .as_i64()
+            .unwrap_or(0)
+    );
+    assert!(card.get("mediaSources").is_none());
+    assert!(card.get("overview").is_none());
+    assert!(card.get("sortTitle").is_none());
+    assert!(card.get("providerIds").is_none());
+    assert_eq!(card["id"], full_page_body["items"][0]["id"]);
+
+    let invalid_fields = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?fields=unknown",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(invalid_fields.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let favorites = client
         .get(format!("{base_url}/api/v1/favorites?pageSize=1"))
         .header(COOKIE, &cookies)

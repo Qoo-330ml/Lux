@@ -20,6 +20,7 @@ export function prefetchLibraryPage(queryClient: QueryClient, library: Library) 
     queryFn: ({ pageParam }) => api.libraryItems(library.id, pageParam, itemTypes, {
       sortBy,
       sortOrder,
+      fields: "card",
       ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,

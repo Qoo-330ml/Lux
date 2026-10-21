@@ -17197,6 +17197,31 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：PostgreSQL migration 未在本机真实 PostgreSQL 执行；M3 的单轮波动来自服务重启后的本地元数据回填与浏览器调度，只作方向参考；外层有界临时 B-tree 仍在，但不再对 100 万条目录做全量排序；所有数字仅代表本机 macOS arm64。
 
+#### LUX-831：媒体库列表卡片投影
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-828：列表 DTO 投影，去掉卡片不需要的字段”（编号顺延）。
+
+范围：`GET /api/v1/libraries/{libraryId}/items` 新增可选 `fields=card`。卡片投影保留 `id`、`libraryId`、`itemType`、`title`、`productionYear`、`rating`、`runtimeTicks`、`addedAt`、`episodeCount`、`seriesId`、`parentId`、`imageTags`、`userData`、`defaultDurationTicks`、`metadataPending`、`localMetadataPending`（空的字符串/数字字段省略），省略 `mediaSources`、`overview`、`providerIds`、`sortTitle` 等完整详情字段；缺省 `fields` 时响应保持旧版完整 DTO，其他 `fields` 值返回 400。Web 媒体库首屏与预取统一携带 `fields=card`，其他详情/搜索/继续观看仍使用完整 DTO。
+
+预计文件（11 个）：`src/application/catalog.rs`、`src/api/media.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`tests/catalog.rs`、`web/tests/api-client.test.ts`、`web/tests/library-page.test.ts`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 24 条卡片页 raw ≤12 KB；gzip 2.8 KB（目标 2.5 KB 未达，见实施结果）。缺省 `fields` 时完整响应字段与旧版一致。
+- [x] 卡片渲染、继续观看进度、集数徽标、多选、合并对话框不回归；非法 `fields` 返回 400。
+- [x] Rust `catalog`/`media` 定向回归、Web 客户端与媒体库页定向测试、build 与 fmt 通过。
+- [x] 在 LUX-829 的 100 万条夹具上复测列表 payload 与 M1/M2，并记录相对基线变化。
+
+短计划：先写 `fields=card` 的 API 回归（缺失字段与 400）；再实现投影枚举与卡片 DTO、接入 Web；最后在 100 万条夹具上测量 payload 和首屏指标。
+
+实施结果（2026-10-21）：`GET /api/v1/libraries/{libraryId}/items` 新增 `fields=card`，新增 `CatalogItemProjection` 枚举与卡片 DTO；卡片保留 `id`、`libraryId`、`itemType`、`title`、`productionYear`、`rating`、`runtimeTicks`、`addedAt`、`episodeCount`、`seriesId`、`parentId`、`imageTags`、`userData`、`defaultDurationTicks`、`metadataPending`、`localMetadataPending`，空的字符串/数字字段与空图片标签省略，`userData` 只写非默认值；完整详情仍走完整 DTO。Web 媒体库首屏与预取统一传 `fields=card`，`MediaItem` 增加 `defaultDurationTicks`。非法 `fields` 返回 `400 INVALID_REQUEST`。
+
+验证：新增 `tests/catalog.rs` 断言 `fields=card` 的字段集合、`mediaSources`/`overview`/`sortTitle`/`providerIds` 被省略、非法值 400，且缺省响应仍含完整源；`cargo test --locked --test catalog lux_and_emby_catalogs_list_page_and_show_movie_details` 1/1。`pnpm --dir web exec vitest run tests/api-client.test.ts tests/library-page.test.ts` 通过（104+19）；`pnpm --dir web build` 通过；`cargo fmt --all -- --check` 通过。
+
+100 万条夹具、20 Mbps / 40 ms、每轮重启复测：24 条完整响应 48,228 B / gzip 4,842 B；卡片响应 11,125 B / gzip 2,804 B（raw -76.9%，gzip -42.1%）。raw ≤12 KB 达标；gzip 2.5 KB 未达，主要原因是 24 个随机 UUID `id` 约 864 B 原始字节、压缩后仍约 700 B，gzip 对重复 key 已高度压缩，继续裁剪字段收益有限。M1/M2 中位数 1,365.5→1,433.7 ms、1,335.9→1,417.6 ms（CV 1.5%），投影不改变每页 `COUNT(*)` 与首屏引导链，差异在噪声范围内；M5 不变。预期收益需要 LUX-832（去 COUNT）和 LUX-834（首屏并行）叠加后才能体现在 M1/M2。
+
+限制：卡片投影省略 `mediaSources`，卡片上的删除对话框若需要默认源 ID 会退化为无 sourceId 删除；本任务验收未覆盖该路径，完整详情页仍可取得源 ID。PostgreSQL/桌面真实浏览器未单独复测；所有数字仅代表本机 arm64 headless Chromium。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

@@ -36,6 +36,8 @@ pub(super) struct LuxPageQuery {
     sort_order: Option<String>,
     #[serde(rename = "metadataStatus", default)]
     metadata_status: Option<String>,
+    #[serde(default)]
+    fields: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -883,6 +885,21 @@ pub(super) async fn lux_list_library_items(
             .into_response();
         }
     };
+    let projection = match query.fields.as_deref() {
+        None => crate::application::catalog::CatalogItemProjection::Full,
+        Some(value) if value.eq_ignore_ascii_case("card") => {
+            crate::application::catalog::CatalogItemProjection::Card
+        }
+        Some(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "fields 参数无效",
+            )
+            .into_response();
+        }
+    };
     let Some(catalog) = state.catalog.as_ref() else {
         return api_error(
             &headers,
@@ -933,13 +950,17 @@ pub(super) async fn lux_list_library_items(
                     .iter()
                     .map(|card| card.item.clone())
                     .collect::<Vec<_>>();
-                let mut values =
-                    match lux_catalog_items_json_for_user(database, &user.id.to_string(), &items)
-                        .await
-                    {
-                        Ok(values) => values,
-                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                    };
+                let mut values = match lux_catalog_items_json_for_user_with_projection(
+                    database,
+                    &user.id.to_string(),
+                    &items,
+                    projection,
+                )
+                .await
+                {
+                    Ok(values) => values,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
                 for (value, card) in values.iter_mut().zip(&page.cards) {
                     add_global_collection_card_fields(
                         value,
@@ -1012,7 +1033,14 @@ pub(super) async fn lux_list_library_items(
         .await
     {
         Ok(page) => {
-            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+            match lux_catalog_page_json_for_user_with_projection(
+                database,
+                &user.id.to_string(),
+                &page,
+                projection,
+            )
+            .await
+            {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
@@ -3874,7 +3902,23 @@ pub(super) async fn lux_catalog_items_json_for_user(
     user_id: &str,
     items: &[CatalogItem],
 ) -> Result<Vec<Value>, StorageError> {
-    let values = lux_catalog_item_values_by_id(database, user_id, items).await?;
+    lux_catalog_items_json_for_user_with_projection(
+        database,
+        user_id,
+        items,
+        crate::application::catalog::CatalogItemProjection::Full,
+    )
+    .await
+}
+
+pub(super) async fn lux_catalog_items_json_for_user_with_projection(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+    projection: crate::application::catalog::CatalogItemProjection,
+) -> Result<Vec<Value>, StorageError> {
+    let values =
+        lux_catalog_item_values_by_id_with_projection(database, user_id, items, projection).await?;
     Ok(lux_catalog_items_from_values(items, &values))
 }
 
@@ -3882,6 +3926,21 @@ pub(super) async fn lux_catalog_item_values_by_id(
     database: &Database,
     user_id: &str,
     items: &[CatalogItem],
+) -> Result<HashMap<String, Value>, StorageError> {
+    lux_catalog_item_values_by_id_with_projection(
+        database,
+        user_id,
+        items,
+        crate::application::catalog::CatalogItemProjection::Full,
+    )
+    .await
+}
+
+pub(super) async fn lux_catalog_item_values_by_id_with_projection(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+    projection: crate::application::catalog::CatalogItemProjection,
 ) -> Result<HashMap<String, Value>, StorageError> {
     let mut item_ids = Vec::with_capacity(items.len());
     let mut seen = HashSet::with_capacity(items.len());
@@ -3898,7 +3957,14 @@ pub(super) async fn lux_catalog_item_values_by_id(
     Ok(items
         .iter()
         .map(|item| {
-            let mut value = lux_catalog_item_json_with_user_state(item, states.get(&item.id));
+            let mut value = match projection {
+                crate::application::catalog::CatalogItemProjection::Full => {
+                    lux_catalog_item_json_with_user_state(item, states.get(&item.id))
+                }
+                crate::application::catalog::CatalogItemProjection::Card => {
+                    lux_catalog_card_json_with_user_state(item, states.get(&item.id))
+                }
+            };
             if let Value::Object(object) = &mut value {
                 object.insert(
                     "metadataPending".to_owned(),
@@ -3929,7 +3995,24 @@ pub(super) async fn lux_catalog_page_json_for_user(
     user_id: &str,
     page: &CatalogPage,
 ) -> Result<Value, StorageError> {
-    let items = lux_catalog_items_json_for_user(database, user_id, &page.items).await?;
+    lux_catalog_page_json_for_user_with_projection(
+        database,
+        user_id,
+        page,
+        crate::application::catalog::CatalogItemProjection::Full,
+    )
+    .await
+}
+
+pub(super) async fn lux_catalog_page_json_for_user_with_projection(
+    database: &Database,
+    user_id: &str,
+    page: &CatalogPage,
+    projection: crate::application::catalog::CatalogItemProjection,
+) -> Result<Value, StorageError> {
+    let items =
+        lux_catalog_items_json_for_user_with_projection(database, user_id, &page.items, projection)
+            .await?;
     Ok(json!({
         "items": items,
         "total": page.total,
@@ -4011,6 +4094,88 @@ pub(super) fn lux_catalog_item_json_with_user_state(
         object.insert("userData".to_owned(), lux_user_data_json(user_state));
     }
     value
+}
+
+pub(super) fn lux_catalog_card_json(item: &CatalogItem) -> Value {
+    let default_duration_ticks = item
+        .media_sources
+        .iter()
+        .find(|source| source.is_default)
+        .or_else(|| item.media_sources.first())
+        .and_then(|source| source.duration_ticks);
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_owned(), json!(item.id));
+    object.insert("libraryId".to_owned(), json!(item.library_id));
+    object.insert("itemType".to_owned(), json!(item.item_type));
+    object.insert("title".to_owned(), json!(item.title));
+    object.insert("addedAt".to_owned(), json!(item.added_at));
+    for (key, value) in [
+        ("productionYear", item.production_year.map(Value::from)),
+        ("rating", item.rating.map(Value::from)),
+        ("runtimeTicks", item.runtime_ticks.map(Value::from)),
+        ("episodeCount", item.episode_count.map(Value::from)),
+        ("seriesId", item.series_id.as_deref().map(Value::from)),
+        ("parentId", item.parent_id.as_deref().map(Value::from)),
+        (
+            "defaultDurationTicks",
+            default_duration_ticks.map(Value::from),
+        ),
+    ] {
+        if let Some(value) = value {
+            object.insert(key.to_owned(), value);
+        }
+    }
+    let mut image_tags = serde_json::Map::new();
+    for (key, value) in [
+        ("poster", item.poster_image_tag.as_ref()),
+        ("fanart", item.fanart_image_tag.as_ref()),
+        ("thumb", item.thumb_image_tag.as_ref()),
+        ("logo", item.logo_image_tag.as_ref()),
+    ] {
+        if let Some(value) = value {
+            image_tags.insert(key.to_owned(), json!(value));
+        }
+    }
+    if !image_tags.is_empty() {
+        object.insert("imageTags".to_owned(), Value::Object(image_tags));
+    }
+    Value::Object(object)
+}
+
+pub(super) fn lux_catalog_card_json_with_user_state(
+    item: &CatalogItem,
+    user_state: Option<&crate::storage::StoredUserItemState>,
+) -> Value {
+    let mut value = lux_catalog_card_json(item);
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "userData".to_owned(),
+            lux_catalog_card_user_data_json(user_state),
+        );
+    }
+    value
+}
+
+fn lux_catalog_card_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Value {
+    let mut object = serde_json::Map::new();
+    if let Some(state) = state {
+        if state.position_ticks != 0 {
+            object.insert("positionTicks".to_owned(), json!(state.position_ticks));
+        }
+        if state.play_count != 0 {
+            object.insert("playCount".to_owned(), json!(state.play_count));
+        }
+        if state.is_favorite {
+            object.insert("isFavorite".to_owned(), json!(true));
+        }
+        if state.is_played {
+            object.insert("isPlayed".to_owned(), json!(true));
+        }
+        if let Some(last_played_at) = state.last_played_at {
+            object.insert("lastPlayedAt".to_owned(), json!(last_played_at));
+        }
+    }
+    Value::Object(object)
 }
 
 pub(super) fn apply_local_nfo_details(

@@ -1182,6 +1182,22 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("requests the card projection for library grids", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("movie-library", 2, "MOVIE", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      fields: "card",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/movie-library/items?page=2&pageSize=24&itemType=MOVIE&sortBy=Name&sortOrder=Ascending&fields=card",
+    );
+  });
+
   it("requests only metadata items that still need confirmation", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

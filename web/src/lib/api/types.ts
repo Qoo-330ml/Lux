@@ -306,6 +306,7 @@ export type MediaItem = {
   seasonCount?: number | null;
   episodeCount?: number | null;
   runtimeTicks?: number | null;
+  defaultDurationTicks?: number | null;
   addedAt?: number | null;
   imageTags?: ImageTags;
   userData?: UserData;
