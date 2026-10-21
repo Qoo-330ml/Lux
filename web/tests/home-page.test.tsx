@@ -783,7 +783,7 @@ describe("HomePage shelves", () => {
     });
 
     expect(prefetch).toHaveBeenCalledWith(expect.objectContaining({
-      queryKey: queryKeys.library("library-1", 1, "MOVIE", "Name", "Ascending", "all"),
+      queryKey: queryKeys.library("library-1", 1, "MOVIE,SERIES", "Name", "Ascending", "all"),
       initialPageParam: 1,
     }));
   });

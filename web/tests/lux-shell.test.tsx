@@ -401,7 +401,7 @@ describe("LuxShell user control", () => {
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual(expect.arrayContaining([
       { queryKey: ["home"], refetchType: "none" },
       { queryKey: ["libraries"], refetchType: "none" },
-      { queryKey: ["library"], refetchType: "none" },
+      { queryKey: ["library"], refetchType: "active" },
     ]));
   });
 

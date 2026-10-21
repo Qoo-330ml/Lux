@@ -10794,6 +10794,7 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         descending: true,
         offset: 0,
         limit: 24,
+        include_total: true,
     };
     let (where_clause, binds) = catalog_filter_where_clause(&filter);
     let query = format!(
@@ -10964,6 +10965,7 @@ async fn content_restrictions_filter_catalog_rows_before_pagination()
         descending: false,
         offset,
         limit,
+        include_total: true,
     };
 
     let unrestricted_query = CatalogFilterQuery {
@@ -11119,6 +11121,7 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             descending,
             offset: 0,
             limit: 24,
+            include_total: true,
         };
         let plan = database.explain_filtered_catalog_rows(&filter).await?;
         let joined = plan.join("\n");
@@ -12777,6 +12780,7 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             descending,
             offset: 0,
             limit: 10,
+            include_total: true,
         };
         let (rows, total) = database
             .list_filtered_catalog_rows(&filter)
@@ -12847,6 +12851,7 @@ async fn catalog_filter_parent_scope_applies_before_pagination() {
         limit: 1,
         parent_id_scope: Some(None),
         content_restrictions: None,
+        include_total: true,
     };
 
     let (root_page, root_total) = database
@@ -13013,6 +13018,7 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             descending,
             offset: 0,
             limit: 10,
+            include_total: true,
         };
         let (rows, total) = database
             .list_filtered_catalog_rows(&filter)
