@@ -1144,6 +1144,7 @@ describe("AdminLibrariesPage library cards", () => {
   });
 
   it("saves the experimental display-sized image variant cache", async () => {
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     const updateSettings = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
       resumePlayedPercent: 90,
       resumeMinTicks: 1_200_000_000,
@@ -1200,5 +1201,6 @@ describe("AdminLibrariesPage library cards", () => {
         }),
       }),
     }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["me"] });
   });
 });

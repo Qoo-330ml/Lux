@@ -65,6 +65,7 @@ export function AdminLibrariesPage() {
       setStrategy(data.mediaStrategy);
       setStrategySaved(true);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.me });
     },
     onError: () => setStrategySaved(false),
   });
@@ -342,7 +343,7 @@ function GlobalStrategyPanel({
           <div className="lux-library-strategy-image-variants">
             <StrategyToggle
               label="按显示尺寸提供图片（实验性）"
-              description="为海报、缩略图、艺术图按需生成 360 / 720 / 1280 像素变体，写入 /config 缓存。原图不会被修改；关闭时完全使用原图。"
+              description="为海报、缩略图、艺术图按需生成 360 / 720 / 1280 像素变体，写入 /config 缓存。全局开启后对所有用户生效。原图不会被修改；关闭时完全使用原图。"
               checked={variantCache.enabled}
               onChange={(enabled) => updateVariantCache({ enabled })}
             />
