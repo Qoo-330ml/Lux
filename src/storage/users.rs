@@ -1955,7 +1955,8 @@ impl Database {
             return Ok(false);
         }
         self.query(
-            "SELECT EXISTS (
+            // A bare EXISTS returns BOOLEAN on PostgreSQL, but INTEGER on SQLite.
+            "SELECT CAST(CASE WHEN EXISTS (
                  SELECT 1
                  FROM user_access_blacklist_rules
                  WHERE is_enabled = 1
@@ -1964,7 +1965,7 @@ impl Database {
                        (rule_type = 'DEVICE' AND ? IS NOT NULL AND match_value = ?)
                        OR (rule_type = 'CLIENT' AND ? IS NOT NULL AND match_value = ?)
                    )
-             ) AS matched",
+             ) THEN 1 ELSE 0 END AS BIGINT) AS matched",
         )
         .bind(query.user_id)
         .bind(query.device_id)
@@ -1973,7 +1974,7 @@ impl Database {
         .bind(query.client_name)
         .fetch_one(&self.pool)
         .await
-        .map(|row| row.get::<i64, _>("matched") != 0)
+        .and_then(|row| row.try_get::<i64, _>("matched").map(|value| value != 0))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -1986,28 +1987,28 @@ impl Database {
     ) -> Result<(bool, bool), StorageError> {
         self.query(
             "SELECT
-                 EXISTS (
+                 CAST(CASE WHEN EXISTS (
                      SELECT 1 FROM user_access_blacklist_rules
                      WHERE is_enabled = 1
                        AND rule_type = 'DEVICE'
                        AND (user_id IS NULL OR user_id = ?)
-                 ) AS has_device_rules,
-                 EXISTS (
+                 ) THEN 1 ELSE 0 END AS BIGINT) AS has_device_rules,
+                 CAST(CASE WHEN EXISTS (
                      SELECT 1 FROM user_access_blacklist_rules
                      WHERE is_enabled = 1
                        AND rule_type = 'CLIENT'
                        AND (user_id IS NULL OR user_id = ?)
-                 ) AS has_client_rules",
+                 ) THEN 1 ELSE 0 END AS BIGINT) AS has_client_rules",
         )
         .bind(user_id)
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
-        .map(|row| {
-            (
-                row.get::<i64, _>("has_device_rules") != 0,
-                row.get::<i64, _>("has_client_rules") != 0,
-            )
+        .and_then(|row| {
+            Ok((
+                row.try_get::<i64, _>("has_device_rules")? != 0,
+                row.try_get::<i64, _>("has_client_rules")? != 0,
+            ))
         })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),

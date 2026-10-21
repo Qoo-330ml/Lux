@@ -1,5 +1,30 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-758 PostgreSQL 黑名单查询与登录修复（2026-10-21）
+
+设备/客户端黑名单的命中结果及启用规则摘要统一通过 `CASE` 和 `CAST(... AS BIGINT)` 返回
+0/1。PostgreSQL 的裸 `EXISTS` 返回 `BOOLEAN`，原实现按 `i64` 读取时会 panic，导致正常
+Web 登录在空黑名单下也无法完成；相同查询还用于 Emby 身份验证和播放票据检查。
+三处结果解码改用 `try_get`，解码错误通过 storage 错误返回，调用方继续按原有规则拒绝授权。
+
+本机 macOS `arm64` / PostgreSQL 16 回归先复现 `users.rs:1976` 的 `matched` 类型解码
+panic，修复后正常登录和命中全局客户端规则后的拒绝均通过。同一组 SQLite/PostgreSQL
+storage 断言覆盖全局/用户范围、启用状态、设备/客户端精确匹配、IP 规则隔离，以及启用规则
+摘要的四种布尔组合。定向 library 回归 3/3 通过，PostgreSQL 使用独立临时测试库。
+`users`、`web_auth`、`emby_auth`、`web_playback` 四个 HTTP 集成目标共 55/55 通过。
+PostgreSQL 定向命令为 `cargo test --locked --lib postgres_user_access_blacklist_queries_and_web_login_are_portable -- --ignored`。
+
+Rust build、fmt 与 diff check 通过。完整 Rust 检查未全绿：`cargo test --locked --all-targets -- --test-threads=1`
+在 library 阶段为 1158 通过、4 失败、32 忽略，后续 integration targets 未继续执行。四项失败为
+`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、
+`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、
+`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、
+`changed_local_fill_request_during_running_item_is_not_lost`；均在干净基线 `bcc7d3f3` 逐项复现。
+全目标/全特性 Clippy 报告 `emby_catalog.rs`、`media.rs`、`playback/session.rs` 中四处
+`too_many_arguments`，相同错误也在该基线复现。这些元数据/播放函数问题未纳入本次登录修复。
+
+线上容器仍需更新到包含本修复的构建并进行部署后验证。
+
 ## LUX-616 管理员用户播放策略 API（2026-10-19）
 
 管理员可通过 `GET /api/v1/admin/users/{userId}/playback-policy` 读取用户的 `canPlay`、

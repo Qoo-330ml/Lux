@@ -281,27 +281,49 @@ async fn user_access_blacklist_rules_are_scoped_stable_and_bounded()
 
 #[tokio::test]
 async fn user_access_blacklist_matching_is_scoped_enabled_and_type_specific()
--> Result<(), Box<dyn std::error::Error>> {
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let temp = tempfile::tempdir()?;
     let database = Database::connect(&Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp.path().join("config"),
     })
     .await?;
+    assert_user_access_blacklist_matching_contract(&database).await
+}
+
+async fn assert_user_access_blacklist_matching_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    assert!(
+        !database
+            .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                user_id: "blacklist-match-a",
+                device_id: Some("unmatched-device"),
+                client_name: Some("lux web"),
+            })
+            .await?
+    );
+    assert_eq!(
+        database
+            .active_user_access_device_client_blacklist_rules("blacklist-match-a")
+            .await?,
+        (false, false)
+    );
     for (user_id, username) in [
         ("blacklist-match-a", "blacklist-match-a"),
         ("blacklist-match-b", "blacklist-match-b"),
         ("blacklist-match-creator", "blacklist-match-creator"),
     ] {
-        sqlx::query(
-            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+        database
+            .query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
              VALUES (?, ?, ?, 'test-hash')",
-        )
-        .bind(user_id)
-        .bind(username)
-        .bind(username)
-        .execute(database.pool())
-        .await?;
+            )
+            .bind(user_id)
+            .bind(username)
+            .bind(username)
+            .execute(database.pool())
+            .await?;
     }
 
     for (id, user_id, rule_type, match_value, is_enabled) in [
@@ -391,7 +413,132 @@ async fn user_access_blacklist_matching_is_scoped_enabled_and_type_specific()
                 .await?
         );
     }
+    assert_eq!(
+        database
+            .active_user_access_device_client_blacklist_rules("blacklist-match-creator")
+            .await?,
+        (true, true)
+    );
+    for id in ["match-global-device", "match-global-client"] {
+        assert!(
+            database
+                .set_user_access_blacklist_rule_enabled(
+                    UserAccessBlacklistRuleScope::Global,
+                    id,
+                    false
+                )
+                .await?
+        );
+    }
+    for (user_id, expected) in [
+        ("blacklist-match-a", (true, true)),
+        ("blacklist-match-b", (true, false)),
+        ("blacklist-match-creator", (false, false)),
+    ] {
+        assert_eq!(
+            database
+                .active_user_access_device_client_blacklist_rules(user_id)
+                .await?,
+            expected
+        );
+    }
+    assert!(
+        database
+            .set_user_access_blacklist_rule_enabled(
+                UserAccessBlacklistRuleScope::User("blacklist-match-a"),
+                "match-user-a-device",
+                false,
+            )
+            .await?
+    );
+    assert_eq!(
+        database
+            .active_user_access_device_client_blacklist_rules("blacklist-match-a")
+            .await?,
+        (false, true)
+    );
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_access_blacklist_queries_and_web_login_are_portable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        },
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let test_database = database.clone();
+    let assertions = tokio::spawn(async move {
+        SetupService::new(test_database.clone())?
+            .complete("postgres-blacklist-admin", "Admin", "test-password")
+            .await?;
+        let auth = crate::auth::sessions::WebAuthService::new(test_database.clone())?;
+        assert!(
+            auth.login("postgres-blacklist-admin", "test-password")
+                .await?
+                .is_some()
+        );
+        assert_user_access_blacklist_matching_contract(&test_database).await?;
+        assert!(
+            test_database
+                .set_user_access_blacklist_rule_enabled(
+                    UserAccessBlacklistRuleScope::Global,
+                    "match-global-client",
+                    true,
+                )
+                .await?
+        );
+        assert!(matches!(
+            auth.login("postgres-blacklist-admin", "test-password")
+                .await,
+            Err(crate::auth::sessions::WebAuthError::AccessDenied)
+        ));
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    database.close().await;
+    let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    cleanup?;
+    assertions?.map_err(|error| error as Box<dyn std::error::Error>)
 }
 
 #[tokio::test]
