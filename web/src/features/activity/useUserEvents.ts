@@ -61,9 +61,19 @@ export function useUserEvents() {
       // The server may send scope-only events; IDs narrow updates when available.
       const itemId = event.scope === "item" ? event.itemId : undefined;
       const libraryId = event.scope === "library" ? event.libraryId : undefined;
+      if (libraryId) {
+        void queryClient.invalidateQueries({
+          queryKey: ["library", libraryId],
+          refetchType: "none",
+        });
+      } else {
+        void queryClient.invalidateQueries({
+          queryKey: ["library"],
+          refetchType: "none",
+        });
+      }
       const keys: QueryKey[] = [
         queryKeys.home, queryKeys.libraries,
-        libraryId ? ["library", libraryId] : ["library"],
         itemId ? queryKeys.item(itemId) : ["item"],
         itemId ? queryKeys.itemImages(itemId) : ["item-images"],
         itemId ? queryKeys.playback(itemId) : ["playback"],

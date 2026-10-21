@@ -17314,6 +17314,28 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：M2 未达到 ≤300 ms；首条 items 请求在导航后约 500 ms 发出，剩余成本为 HTML/JS 传输与执行、setup/me 两个引导 RTT 和 20 Mbps 网络，未进一步做关键请求预连接或 HTML 内联。未在真实浏览器弱网、HOMEVIDEOS/全局合集的真实数据、PostgreSQL 或 FNOS/x86_64 上验证；所有数字仅代表本机 macOS arm64 headless Chromium。
 
+#### LUX-837：SSE 精确失效与媒体库分页上限
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-834：SSE 精确失效与分页上限”（编号顺延）。
+
+范围：`useUserEvents` 的媒体库失效从宽 `["library"]` 改为：带 `libraryId` 的媒体库事件只标记对应媒体库；无 ID 时标记全部媒体库；两者都使用 `refetchType: "none"`，避免一次扫描事件重放所有已加载页。媒体库 infinite query 和 `prefetchLibrary` 增加 `maxPages: 5`。详情剧照在 SSE 连接时已关闭 30 s 轮询，本任务补回归说明。
+
+预计文件（5 个）：`web/src/features/activity/useUserEvents.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/tests/user-events.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 51 页已加载后，一次扫描事件触发的媒体库请求从 51 页降到 ≤2；未变化的页不被重取。
+- [x] 带 `libraryId` 的事件只影响该媒体库；无 ID 时全量媒体库标记 stale；SSE 断线仍轮询详情剧照。
+- [x] 查询缓存断言覆盖后台重取计数；定向 Web 测试、build 与 `git diff --check` 通过。
+
+短计划：先加“目标库只失效自身且不后台重取”的失败回归；再改失效键与 `maxPages`；最后更新性能记录。
+
+实施结果（2026-10-21）：`useUserEvents` 移除通用 `["library"]` 刷新键，改为媒体库事件专用：带 `libraryId` 时 `invalidateQueries({ queryKey: ["library", libraryId], refetchType: "none" })`，否则一次性标记全部 `["library"]`；其他事件（home/item/favorites）也仅标记媒体库 stale。`LibraryPage` 与 `prefetchLibrary` 的 infinite query 增加 `maxPages: 5`，详情 `MediaStillsSection` 在 SSE connected 时 `refetchInterval: false` 的既有行为保留。
+
+验证：`web/tests/user-events.test.tsx` 10/10，新增断言：目标媒体库失效、其他媒体库不失效、后台重取计数 0；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/user-events.test.tsx` 通过；`pnpm --dir web build` 通过。旧实现会在一次事件中重放所有缓存页，新实现后台重取 0 页；以查询缓存计数代替真实服务器请求数。
+
+限制：stale 列表只在下次聚焦/导航时刷新，当前可见页不会在事件到达瞬间更新；`maxPages: 5` 丢弃更早分页；未在真实服务器 SSE、慢客户端或 FNOS/x86_64 上测量请求数和延迟。所有验证来自 jsdom 与 fake EventSource，不等于真实浏览器网络行为。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

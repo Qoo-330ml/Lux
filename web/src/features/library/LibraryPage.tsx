@@ -223,6 +223,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,
+    maxPages: 5,
     enabled: Boolean(libraryId),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;

@@ -19,6 +19,7 @@ export function prefetchLibraryPage(queryClient: QueryClient, library: Library) 
       ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,
+    maxPages: 5,
     getNextPageParam: (lastPage: PageResponse<MediaItem>) => {
       const page = lastPage.page ?? 1;
       if (typeof lastPage.hasNext === "boolean") return lastPage.hasNext ? page + 1 : undefined;

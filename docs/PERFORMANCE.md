@@ -2,6 +2,20 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-837 SSE 精确失效与分页上限（2026-10-21）
+
+`useUserEvents` 不再把 `["library"]` 放进每次事件的通用刷新键：带 `libraryId` 的媒体库事件只把对应媒体库查询标记为 stale，不带 ID 的媒体库事件和 home/item/favorites 事件把全部媒体库查询标记为 stale，均使用 `refetchType: "none"`，不立即逐页重取。媒体库 infinite query 与预取增加 `maxPages: 5`，限制单查询保留和后续失效的分页数量。
+
+| 场景 | 旧行为 | 新行为 |
+|---|---|---|
+| 51 页已加载后收到一次扫描事件 | `["library"]` 前缀失效，infinite query 重放全部页 | 仅标记 stale，后台重取 0 页；下次聚焦/导航按 `maxPages` 上限重取 |
+| 事件带 `libraryId` | 同时失效所有媒体库与目标媒体库 | 只失效目标媒体库 |
+| SSE 断线 | 详情剧照每 30 s 轮询 | 保持 30 s 轮询（连接时已关闭） |
+
+验证：`web/tests/user-events.test.tsx` 10/10，新增“目标媒体库只失效该库且后台不重取”的计数断言；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/user-events.test.tsx` 通过；`pnpm --dir web build` 通过。该结果来自 jsdom 查询缓存与 fake EventSource，不是真实服务器 SSE 延迟或浏览器网络测量。
+
+限制：标记 stale 后，当前可见列表不会在事件到达瞬间重取，需要下一次聚焦/导航；`maxPages: 5` 会丢弃更早的分页，回滚时重新请求。未在真实扫描、真实慢客户端或 FNOS/x86_64 上复测请求数。
+
 ## LUX-836 首屏并行与列表预取（2026-10-21）
 
 `App` 的 `setup` 与 `me` 改为并行发起，`me` 在未初始化服务器上的失败由 setup 完成后的 effect 重试；`LibraryPage` 不再等待 `libraries` 解析，直接用 URL 中的 `libraryId` 发 `fields=card&count=false` 请求，未知名媒体库使用 `MOVIE,SERIES` 顶层过滤，HOMEVIDEOS 在媒体库记录到达后切换；`prefetchLibrary` 使用同一 `itemType` 组合，避免预取键与页面键不一致。媒体库记录未就绪时显示加载骨架，不会误报“媒体库不存在”。
