@@ -435,8 +435,8 @@ mod tests {
         // delay, so startup work owns the first minutes of a deployment.
         assert_ne!(DEFAULT_MAINTENANCE_INTERVAL_SECONDS, 0);
         assert_ne!(DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, 0);
-        let interval = u64::from(DEFAULT_MAINTENANCE_INTERVAL_SECONDS);
-        let delay = u64::from(DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS);
+        let interval = DEFAULT_MAINTENANCE_INTERVAL_SECONDS;
+        let delay = DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS;
         assert!(
             delay < interval,
             "first round must precede the daily cadence"
