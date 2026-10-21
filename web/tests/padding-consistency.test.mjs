@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { stylesheet as allStyles } from "./style-source.mjs";
+import { baseRule, stylesheet as allStyles } from "./style-source.mjs";
 
 const stylesheet = allStyles;
 
 function rule(selector) {
-  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return stylesheet.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+  return baseRule(selector);
 }
 
 test("shared control padding is used by form controls across pages", () => {

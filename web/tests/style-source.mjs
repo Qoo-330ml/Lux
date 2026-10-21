@@ -41,3 +41,54 @@ export function mediaStyles(query) {
   }
   return chunks.join("\n");
 }
+
+function withoutMediaBlocks(css) {
+  let text = "";
+  let index = 0;
+  while (index < css.length) {
+    const open = css.indexOf("@media", index);
+    if (open === -1) {
+      text += css.slice(index);
+      break;
+    }
+    text += css.slice(index, open);
+    const brace = css.indexOf("{", open);
+    if (brace === -1) break;
+    let depth = 0;
+    let cursor = brace;
+    while (cursor < css.length) {
+      if (css[cursor] === "{") depth += 1;
+      else if (css[cursor] === "}") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      cursor += 1;
+    }
+    index = cursor + 1;
+  }
+  return text;
+}
+
+// Return the declarations of the last rule whose selector list contains
+// `selector` verbatim, reading react.css first and route stylesheets after.
+// The caller may pass a single selector or a whole comma-separated list; route
+// sheets now own rules that react.css used to hold, so a plain first match would
+// return a breakpoint override that still lives in react.css.
+export function baseRule(selector) {
+  const wanted = selector.replace(/\s+/g, " ").trim();
+  let found = "";
+
+  for (const file of files) {
+    const text = withoutMediaBlocks(readFileSync(file, "utf8"));
+    const matcher = /([^{}]+)\{([^{}]*)\}/g;
+    let match = matcher.exec(text);
+    while (match !== null) {
+      const list = match[1].replace(/\s+/g, " ").trim();
+      const components = list.split(",").map((part) => part.trim());
+      if (list === wanted || components.includes(wanted)) found = match[2];
+      match = matcher.exec(text);
+    }
+  }
+
+  return found;
+}

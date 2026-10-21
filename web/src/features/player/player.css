@@ -1,4 +1,9 @@
 /* Route-scoped styles moved from react.css (LUX-835). */
+
+/* Route-only rules moved out of react.css so the shared sheet stays small (LUX-835). */
+
+.lux-video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000; object-fit: contain; cursor: default; touch-action: none; }
+
 .lux-player-page { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; min-height: 100vh; min-height: 100dvh; padding: 0; background: #000; overflow: hidden; z-index: 100; user-select: none; display: flex; flex-direction: column; justify-content: space-between; }
 
 .lux-player-page.controls-hidden { cursor: none; }

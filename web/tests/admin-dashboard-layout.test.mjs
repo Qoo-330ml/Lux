@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { mediaStyles, stylesheet as allStyles } from "./style-source.mjs";
+import { baseRule, mediaStyles, stylesheet as allStyles } from "./style-source.mjs";
 
 const stylesheet = allStyles;
 
@@ -139,18 +139,18 @@ test("light mode preserves the same flat admin surfaces", () => {
 });
 
 test("now-playing cards use theme tokens and compact proportions", () => {
-  const cardRule = stylesheet.match(/\.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
-  const gridRule = stylesheet.match(/\.lux-now-playing-grid\s*\{([^}]*)\}/)?.[1] ?? "";
-  const bodyRule = stylesheet.match(/\.lux-now-playing-body\s*\{([^}]*)\}/)?.[1] ?? "";
-  const factsRule = stylesheet.match(/\.lux-now-playing-facts\s*\{([^}]*)\}/)?.[1] ?? "";
-  const networkRule = stylesheet.match(/\.lux-now-playing-network\s*\{([^}]*)\}/)?.[1] ?? "";
-  const clientRule = stylesheet.match(/\.lux-now-playing-client\s*\{([^}]*)\}/)?.[1] ?? "";
-  const networkFieldRule = stylesheet.match(/\.lux-now-playing-network-field\s*\{([^}]*)\}/)?.[1] ?? "";
-  const accountRule = stylesheet.match(/\.lux-now-playing-account\s*\{([^}]*)\}/)?.[1] ?? "";
-  const factCopyRule = stylesheet.match(/\.lux-now-playing-fact-copy\s*\{([^}]*)\}/)?.[1] ?? "";
-  const lightRule = stylesheet.match(/html\[data-lux-theme="light"\] \.lux-now-playing-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const cardRule = baseRule(".lux-now-playing-card");
+  const gridRule = baseRule(".lux-now-playing-grid");
+  const bodyRule = baseRule(".lux-now-playing-body");
+  const factsRule = baseRule(".lux-now-playing-facts");
+  const networkRule = baseRule(".lux-now-playing-network");
+  const clientRule = baseRule(".lux-now-playing-client");
+  const networkFieldRule = baseRule(".lux-now-playing-network-field");
+  const accountRule = baseRule(".lux-now-playing-account");
+  const factCopyRule = baseRule(".lux-now-playing-fact-copy");
+  const lightRule = baseRule('html[data-lux-theme="light"] .lux-now-playing-card');
 
-  const posterRule = stylesheet.match(/\.lux-now-playing-poster\s*\{([^}]*)\}/)?.[1] ?? "";
+  const posterRule = baseRule(".lux-now-playing-poster");
 
   assert.match(cardRule, /background:\s*var\(--lux-now-card-bg\)/);
   assert.match(gridRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*310px\),\s*1fr\)\)/);
