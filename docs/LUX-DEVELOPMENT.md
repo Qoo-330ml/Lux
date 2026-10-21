@@ -17379,6 +17379,71 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：未测并发 2 峰值内存、命中率/回退率、真实网络首屏或 FNOS/x86_64；灰度策略未实施，当前仍由管理员主开关统一控制全部支持类型；样本来自本机媒体库，不能外推到 NAS/低端 CPU。
 
+#### LUX-837：SSE 精确失效与媒体库分页上限
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-834：SSE 精确失效与分页上限”（编号顺延）。
+
+范围：`useUserEvents` 的媒体库失效从宽 `["library"]` 改为：带 `libraryId` 的媒体库事件只标记对应媒体库；无 ID 时标记全部媒体库；两者都使用 `refetchType: "none"`，避免一次扫描事件重放所有已加载页。媒体库 infinite query 和 `prefetchLibrary` 增加 `maxPages: 5`。详情剧照在 SSE 连接时已关闭 30 s 轮询，本任务补回归说明。
+
+预计文件（5 个）：`web/src/features/activity/useUserEvents.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/tests/user-events.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 51 页已加载后，一次扫描事件触发的媒体库请求从 51 页降到 ≤2；未变化的页不被重取。
+- [x] 带 `libraryId` 的事件只影响该媒体库；无 ID 时全量媒体库标记 stale；SSE 断线仍轮询详情剧照。
+- [x] 查询缓存断言覆盖后台重取计数；定向 Web 测试、build 与 `git diff --check` 通过。
+
+短计划：先加“目标库只失效自身且不后台重取”的失败回归；再改失效键与 `maxPages`；最后更新性能记录。
+
+实施结果（2026-10-21）：`useUserEvents` 移除通用 `["library"]` 刷新键，改为媒体库事件专用：带 `libraryId` 时只让对应媒体库的活跃查询失效并重取，否则让全部活跃 `["library"]` 查询失效并重取；home/item/favorites 事件同样只刷新活跃媒体库查询，不再重放所有缓存页。`LibraryPage` 与 `prefetchLibrary` 的 infinite query 增加 `maxPages: 5`，活跃查询的重取因此最多 5 页；详情 `MediaStillsSection` 在 SSE connected 时 `refetchInterval: false` 的既有行为保留。
+
+验证：`web/tests/user-events.test.tsx` 10/10，新增断言：目标媒体库失效、其他媒体库不失效、后台重取计数 0；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/user-events.test.tsx` 通过；`pnpm --dir web build` 通过。旧实现会在一次事件中重放所有缓存页（50 页即 50 个请求），新实现把活跃查询的重取限制在 `maxPages: 5`，不再广播到非活跃媒体库；以查询缓存与请求计数代替真实服务器请求数。
+
+限制：活跃媒体库仍会重取最多 5 页，未达到方案“≤2 个请求”的目标；`maxPages: 5` 丢弃更早分页；未在真实服务器 SSE、慢客户端或 FNOS/x86_64 上测量请求数和延迟。所有验证来自 jsdom 与 fake EventSource，不等于真实浏览器网络行为。
+
+#### LUX-838：网格虚拟化与卡片合成层降压
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-836：未虚拟化网格与合成层降压”（编号顺延）。
+
+范围：搜索、收藏和人物作品页复用 `LibraryGrid`（`useWindowVirtualizer`）；搜索页改为 infinite query + “加载更多”，媒体结果使用虚拟网格；卡片上的集数徽标、多选控件、菜单触发器与操作按钮的 `backdrop-filter` 改为纯色半透明，弹层、详情页、播放器保留模糊。明确不做：改变搜索排序/匹配、详情页视觉重设计、跨路由共享滚动位置。
+
+预计文件（5 个）：`web/src/features/search/SearchPage.tsx`、`web/src/features/favorites/FavoritesPage.tsx`、`web/src/features/detail/PersonDetailPage.tsx`、`web/src/react.css`、`web/tests/search-and-filmography.test.tsx`。
+
+验收标准：
+
+- [x] 500 条搜索结果只挂载 <50 张卡片；搜索可加载更多。
+- [x] 收藏、人物作品页复用同一虚拟网格；卡片视觉基本无差，弹层/详情模糊保留。
+- [x] 定向 Web 测试、build 与 `git diff --check` 通过；记录未做真实 GPU/帧率验证。
+
+短计划：先加 500 条结果挂载数的失败回归；再替换三个网格并接入搜索 infinite query；最后去除卡片 blur 并跑定向测试。
+
+实施结果（2026-10-21）：搜索页媒体结果改为 `LibraryGrid` + `useInfiniteQuery`（`maxPages: 5`，`getNextPageParam` 按 `total/pageSize`，底部“加载更多”）；收藏页与人物作品页改用 `LibraryGrid`；`.lux-media-episode-count`、`.lux-media-selection-control`、`.lux-media-actions-trigger`、`.lux-library-card-menu-trigger::before`、`.lux-media-art-shell > .lux-media-actions .lux-media-actions-trigger::before` 移除 `backdrop-filter`，新增 `.lux-load-more-row` 样式。
+
+验证：`web/tests/search-and-filmography.test.tsx` 4/4，新增 500 条搜索结果挂载卡片 >0 且 <50；`web/tests/library-grid.test.tsx`、`web/tests/library-card-performance.test.tsx` 通过；`pnpm --dir web build` 通过。
+
+限制：jsdom 不做真实布局/合成，挂载数不能证明 long task 或掉帧下降；未在真实 500 条数据、低端 GPU、Safari/Firefox 或 FNOS/x86_64 上截图/采样。搜索最多保留 5 页；收藏仍为分页而非无限滚动。
+
+#### LUX-839：图片变体生成基准
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-837：单张/批量图片性能基准与灰度”（编号顺延）。
+
+范围：新增 ignored Rust 基准 `tests/image_variants_perf.rs`，从 `LUX_PERF_IMAGE_DIR`（默认 `media/`）取真实图片 1,000 张，按生产参数（EXIF 方向、Lanczos3、JPEG q80、落盘）测 360/720/1280 三档的单张耗时 p50/p95/max。灰度策略与峰值内存不在本任务实现，记录为剩余风险。
+
+预计文件（3 个）：`tests/image_variants_perf.rs`（新增）、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 三档 p95 ≤120 ms（本机 arm64）；p50/p95/max 与样本来源记录。
+- [ ] 并发 2 时峰值内存 <40 MB：未测。
+- [ ] 灰度策略（先 POSTER/THUMB，再 FANART）：未实施，维持 LUX-826 默认关闭与全部类型一致行为。
+- [x] 基准可重复执行，ignored，不写媒体库；文档记录命令、样本和未覆盖环境。
+
+短计划：先写 ignored 基准并跑 1,000 张真实图；再记录结果与未覆盖项；灰度策略留给项目所有者观察期决定。
+
+实施结果（2026-10-21）：`tests/image_variants_perf.rs` 新增 1,000 张真实图片、三档宽度的 ignored 基准；本机 `media/` 含 5,857 张支持格式图片。release 运行结果：360 p50 17.18 / p95 63.71 / max 102.22 ms；720 p50 20.39 / p95 68.38 / max 103.45 ms；1280 p50 29.88 / p95 81.19 / max 146.41 ms；总耗时 25.72 / 29.03 / 31.53 秒。三档 p95 均 ≤120 ms；1280 最大 146.41 ms 仍由 LUX-826 的 300 ms 预算回退原图。
+
+限制：未测并发 2 峰值内存、命中率/回退率、真实网络首屏或 FNOS/x86_64；灰度策略未实施，当前仍由管理员主开关统一控制全部支持类型；样本来自本机媒体库，不能外推到 NAS/低端 CPU。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

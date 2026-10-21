@@ -634,7 +634,7 @@ describe("LibraryPage infinite scroll", () => {
         sortOrder: "Descending",
       }));
     });
-    expect(container.querySelector("[role='combobox'][aria-label='排序方式']")?.textContent).toContain("发行日期");
+    await vi.waitFor(() => expect(container.querySelector("[role='combobox'][aria-label='排序方式']")?.textContent).toContain("发行日期"));
   });
 
   it("opens with the pending metadata filter from a task result", async () => {
@@ -678,7 +678,7 @@ describe("LibraryPage infinite scroll", () => {
         metadataStatus: "PENDING",
       }));
     });
-    expect(container.textContent).toContain("待确认");
+    await vi.waitFor(() => expect(container.textContent).toContain("待确认"));
     expect(container.querySelector(".lux-metadata-attention-badge")?.textContent).toContain("待确认");
   });
 

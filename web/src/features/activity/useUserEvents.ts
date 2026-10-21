@@ -64,12 +64,12 @@ export function useUserEvents() {
       if (libraryId) {
         void queryClient.invalidateQueries({
           queryKey: ["library", libraryId],
-          refetchType: "none",
+          refetchType: "active",
         });
       } else {
         void queryClient.invalidateQueries({
           queryKey: ["library"],
-          refetchType: "none",
+          refetchType: "active",
         });
       }
       const keys: QueryKey[] = [

@@ -72,8 +72,14 @@ function ServerApp() {
   });
 
   useEffect(() => {
-    if (setup.data?.initialized && me.isError) void me.refetch();
-  }, [me.isError, me.refetch, setup.data?.initialized]);
+    if (
+      setup.data?.initialized
+      && me.isError
+      && !(me.error instanceof ApiError && me.error.status === 401)
+    ) {
+      void me.refetch();
+    }
+  }, [me.error, me.isError, me.refetch, setup.data?.initialized]);
 
   if (setup.isPending) return <LoadingScreen label="正在启动 Lux" />;
   if (setup.error) return <ErrorScreen error={setup.error} />;
