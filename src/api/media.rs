@@ -1644,7 +1644,7 @@ pub(super) async fn lux_image(
     };
     let width = match lux_image_variant_width(&state, &headers, query.w.as_deref()) {
         Ok(width) => width,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
@@ -1682,7 +1682,7 @@ pub(super) async fn lux_image_at_index(
     };
     let width = match lux_image_variant_width(&state, &headers, query.w.as_deref()) {
         Ok(width) => width,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
@@ -1708,7 +1708,7 @@ fn lux_image_variant_width(
     state: &AppState,
     headers: &HeaderMap,
     requested: Option<&str>,
-) -> Result<Option<u32>, Response> {
+) -> Result<Option<u32>, Box<Response>> {
     let Some(variants) = state.image_variants.as_ref() else {
         return Ok(None);
     };
@@ -1719,22 +1719,26 @@ fn lux_image_variant_width(
         return Ok(None);
     };
     let Ok(width) = requested.parse::<u32>() else {
-        return Err(api_error(
-            headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "图片宽度无效",
-        )
-        .into_response());
+        return Err(Box::new(
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "图片宽度无效",
+            )
+            .into_response(),
+        ));
     };
     if !crate::application::image_variants::IMAGE_VARIANT_WIDTHS.contains(&width) {
-        return Err(api_error(
-            headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "图片宽度无效",
-        )
-        .into_response());
+        return Err(Box::new(
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "图片宽度无效",
+            )
+            .into_response(),
+        ));
     }
     Ok(Some(width))
 }
