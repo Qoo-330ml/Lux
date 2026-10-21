@@ -1,21 +1,31 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Search, UserRound } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { MediaActor } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
+import { LibraryGrid } from "../library/LibraryGrid";
 
 export function SearchPage() {
   const [params, setParams] = useSearchParams();
   const initial = params.get("q") ?? "";
   const [query, setQuery] = useState(initial);
   useEffect(() => setQuery(initial), [initial]);
-  const result = useQuery({
+  const result = useInfiniteQuery({
     queryKey: ["search", initial],
-    queryFn: () => api.search(initial),
+    queryFn: ({ pageParam }) => api.search(initial, pageParam),
+    initialPageParam: 1,
+    maxPages: 5,
     enabled: initial.trim().length > 0,
+    getNextPageParam: (lastPage) => {
+      const page = lastPage.page ?? 1;
+      const pageSize = lastPage.pageSize ?? 24;
+      const total = lastPage.total ?? 0;
+      return page * pageSize < total ? page + 1 : undefined;
+    },
   });
+  const mediaItems = result.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const people = useQuery({
     queryKey: ["people-search", initial],
     queryFn: () => api.searchPeople(initial),
@@ -47,13 +57,20 @@ export function SearchPage() {
           </div>
         </section>
       ) : null}
-      {result.data?.items?.length ? (
+      {mediaItems.length ? (
         <section className="lux-search-results-section" aria-labelledby="media-search-heading">
-          <div className="lux-section-heading"><h2 id="media-search-heading">媒体</h2><span>{result.data.total ?? result.data.items.length} 项</span></div>
-          <div className="lux-poster-grid">{result.data.items.map((item) => <MediaCard item={item} key={item.id} />)}</div>
+          <div className="lux-section-heading"><h2 id="media-search-heading">媒体</h2><span>{result.data?.pages[0]?.total ?? mediaItems.length} 项</span></div>
+          <LibraryGrid items={mediaItems} renderItem={(item) => <MediaCard item={item} key={item.id} />} />
+          {result.hasNextPage ? (
+            <div className="lux-load-more-row">
+              <button className="lux-button lux-button-secondary" type="button" disabled={result.isFetchingNextPage} onClick={() => void result.fetchNextPage()}>
+                {result.isFetchingNextPage ? "正在加载…" : "加载更多"}
+              </button>
+            </div>
+          ) : null}
         </section>
       ) : null}
-      {!result.isPending && !people.isPending && initial && !result.data?.items?.length && !people.data?.items?.length && !result.error && !people.error ? <div className="lux-empty-card"><span>没有找到匹配内容。</span></div> : null}
+      {!result.isPending && !people.isPending && initial && !mediaItems.length && !people.data?.items?.length && !result.error && !people.error ? <div className="lux-empty-card"><span>没有找到匹配内容。</span></div> : null}
       {!initial ? <p className="lux-muted-copy">输入关键词开始搜索。</p> : null}
     </section>
   );

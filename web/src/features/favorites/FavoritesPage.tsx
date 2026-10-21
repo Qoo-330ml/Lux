@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { MediaCard } from "../home/media";
+import { LibraryGrid } from "../library/LibraryGrid";
 
 export function FavoritesPage() {
   const [page, setPage] = useState(1);
@@ -26,9 +27,7 @@ export function FavoritesPage() {
     <section className="lux-page lux-page-narrow">
       <div className="lux-page-heading"><h1>我的收藏</h1><p>共 {total} 项</p></div>
       {items.length ? (
-        <div className="lux-poster-grid">
-          {items.map((item) => <MediaCard item={item} key={item.id} />)}
-        </div>
+        <LibraryGrid items={items} renderItem={(item) => <MediaCard item={item} key={item.id} />} />
       ) : (
         <div className="lux-empty-card"><span>还没有收藏内容。</span><Link to="/libraries">去媒体库看看</Link></div>
       )}

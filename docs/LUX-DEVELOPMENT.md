@@ -17336,6 +17336,28 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：stale 列表只在下次聚焦/导航时刷新，当前可见页不会在事件到达瞬间更新；`maxPages: 5` 丢弃更早分页；未在真实服务器 SSE、慢客户端或 FNOS/x86_64 上测量请求数和延迟。所有验证来自 jsdom 与 fake EventSource，不等于真实浏览器网络行为。
 
+#### LUX-838：网格虚拟化与卡片合成层降压
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-836：未虚拟化网格与合成层降压”（编号顺延）。
+
+范围：搜索、收藏和人物作品页复用 `LibraryGrid`（`useWindowVirtualizer`）；搜索页改为 infinite query + “加载更多”，媒体结果使用虚拟网格；卡片上的集数徽标、多选控件、菜单触发器与操作按钮的 `backdrop-filter` 改为纯色半透明，弹层、详情页、播放器保留模糊。明确不做：改变搜索排序/匹配、详情页视觉重设计、跨路由共享滚动位置。
+
+预计文件（5 个）：`web/src/features/search/SearchPage.tsx`、`web/src/features/favorites/FavoritesPage.tsx`、`web/src/features/detail/PersonDetailPage.tsx`、`web/src/react.css`、`web/tests/search-and-filmography.test.tsx`。
+
+验收标准：
+
+- [x] 500 条搜索结果只挂载 <50 张卡片；搜索可加载更多。
+- [x] 收藏、人物作品页复用同一虚拟网格；卡片视觉基本无差，弹层/详情模糊保留。
+- [x] 定向 Web 测试、build 与 `git diff --check` 通过；记录未做真实 GPU/帧率验证。
+
+短计划：先加 500 条结果挂载数的失败回归；再替换三个网格并接入搜索 infinite query；最后去除卡片 blur 并跑定向测试。
+
+实施结果（2026-10-21）：搜索页媒体结果改为 `LibraryGrid` + `useInfiniteQuery`（`maxPages: 5`，`getNextPageParam` 按 `total/pageSize`，底部“加载更多”）；收藏页与人物作品页改用 `LibraryGrid`；`.lux-media-episode-count`、`.lux-media-selection-control`、`.lux-media-actions-trigger`、`.lux-library-card-menu-trigger::before`、`.lux-media-art-shell > .lux-media-actions .lux-media-actions-trigger::before` 移除 `backdrop-filter`，新增 `.lux-load-more-row` 样式。
+
+验证：`web/tests/search-and-filmography.test.tsx` 4/4，新增 500 条搜索结果挂载卡片 >0 且 <50；`web/tests/library-grid.test.tsx`、`web/tests/library-card-performance.test.tsx` 通过；`pnpm --dir web build` 通过。
+
+限制：jsdom 不做真实布局/合成，挂载数不能证明 long task 或掉帧下降；未在真实 500 条数据、低端 GPU、Safari/Firefox 或 FNOS/x86_64 上截图/采样。搜索最多保留 5 页；收藏仍为分页而非无限滚动。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

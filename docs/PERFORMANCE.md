@@ -2,6 +2,20 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-838 未虚拟化网格与合成层降压（2026-10-21）
+
+搜索、收藏和人物作品页改用已虚拟化的 `LibraryGrid`；搜索页从单页查询改为 infinite query，提供“加载更多”并保留人物结果。媒体卡片上的 5 处 `backdrop-filter: blur(12px)`（集数徽标、多选控件、菜单触发器及两处操作按钮）改为纯色半透明，保留弹层、详情页和播放器模糊。
+
+| 指标 | 结果 |
+|---|---|
+| 500 条搜索结果挂载卡片 | 测试断言 <50，实际通过 |
+| 卡片合成层模糊 | 从 5 处降至 0；弹层/详情保留 |
+| 搜索可达结果 | 从仅第 1 页扩展到 infinite query（最多 5 页），“加载更多”可用 |
+
+验证：`web/tests/search-and-filmography.test.tsx` 4/4（新增 500 条结果虚拟化断言）、`web/tests/library-grid.test.tsx`、`web/tests/library-card-performance.test.tsx` 通过；`pnpm --dir web build` 通过。该结果来自 jsdom 与静态构建，不是真实 GPU 合成层、滚动帧率或 120 Hz 设备测量。
+
+限制：jsdom 不执行真实布局/合成，<50 张卡片不能直接证明长期滚动 long task 或掉帧下降；未在 500 条真实数据、低端 GPU、Safari/Firefox 或 FNOS/x86_64 上做视觉回归和性能采样。搜索只保留 5 页（120 条），更早结果需要重新搜索。
+
 ## LUX-837 SSE 精确失效与分页上限（2026-10-21）
 
 `useUserEvents` 不再把 `["library"]` 放进每次事件的通用刷新键：带 `libraryId` 的媒体库事件只把对应媒体库查询标记为 stale，不带 ID 的媒体库事件和 home/item/favorites 事件把全部媒体库查询标记为 stale，均使用 `refetchType: "none"`，不立即逐页重取。媒体库 infinite query 与预取增加 `maxPages: 5`，限制单查询保留和后续失效的分页数量。
