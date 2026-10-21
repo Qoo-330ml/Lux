@@ -20,7 +20,7 @@
 未完成/部分完成：
 
 - **LUX-833 图片热路径缓存**：未改认证/ACL 代码。本机 release 图片端点 10 次热请求为 min 1.6 ms / median 1.9 ms / max 2.9 ms，已低于方案 5 ms 目标；方案中的 23 ms/张来自不同环境。会话/黑名单/撤销缓存需要新的失效设计，本轮不在缺少真实部署证据时修改安全边界。
-- **CSS 路由拆分**（LUX-835 后半）：三次收敛后主 CSS 123,840 B / gzip 22,672 B，raw ≤150 KB 与 gzip ≤35 KB 两项目标均达成。Tailwind 工具类仍整包引入（约 15 KB 在 preflight/theme 上），library/auth/home 共享规则仍在主包。
+- **CSS 路由拆分与 Tailwind 按需加载**（LUX-835 后半）：主 CSS 109,630 B / gzip 20,080 B，raw ≤150 KB 与 gzip ≤35 KB 两项目标均达成。Tailwind 的 preflight（约 3.7 KB）仍全局加载以承担 reset，工具类已随详情路由懒加载；library/auth/home 的共享规则仍在主包。
 - **SSE 请求上限**：活跃媒体库重取受 `maxPages: 5` 限制，未达到方案 ≤2 个请求；非活跃库不重取。
 - **图片变体灰度**：未实施灰度策略（项目所有者保留观察期决定）；并发 2 峰值内存已实测 33.6 MB（预算 40 MB）。变体仍默认关闭，M5 未包含变体开启场景。
 
@@ -139,12 +139,14 @@ M1 相对基线下降 63.1%，达到方案“改善 ≥40%”的阶段目标；M
 
 gzip 侧已达到 ≤35 KB 目标，原始体积仍高于 ≤150 KB。第三次拆分把带 `@media` 覆盖的路由类名也整组迁出（判定条件扩展为「提及该类名的所有规则只归一个路由」），主 CSS 进一步降到 123,840 B / gzip 22,672 B，两项目标同时达标。
 
-| 指标 | 一次拆分 | 二次拆分 | 三次拆分 |
-|---|---:|---:|---:|
-| 主 CSS 原始 | 229,689 B | 164,828 B | 123,840 B |
-| 主 CSS gzip | 37,545 B | 28,472 B | 22,672 B |
-| admin 懒加载 | 48,719 B | 88,578 B | 122,104 B |
-| detail 懒加载 | 21,142 B | 41,129 B | 53,467 B |
+| 指标 | 一次拆分 | 二次拆分 | 三次拆分 | Tailwind 按路由懒加载 |
+|---|---:|---:|---:|---:|
+| 主 CSS 原始 | 229,689 B | 164,828 B | 123,840 B | 109,630 B |
+| 主 CSS gzip | 37,545 B | 28,472 B | 22,672 B | 20,080 B |
+| admin 懒加载 | 48,719 B | 88,578 B | 122,104 B | 122,104 B |
+| detail 懒加载 | 21,142 B | 41,129 B | 53,467 B | 59,770 B |
+
+最后一次调整把 Tailwind 的 `utilities` 层从主表移到懒加载的 `detail.css`：核对后确认工具类只出现在 `MediaInfoPanel`、`MediaNfoPanel` 两个组件里，而它们只被详情路由使用；`react.css` 只保留 `theme` 与 `preflight`，并用 `@layer theme, base, components, utilities;` 固定层顺序，`detail.css` 用 `theme(reference)` 引用主题而不重复输出。代价是详情表的 CSS 增加约 6 KB，但首屏不再承担它。
 
 等价性验证没有用截图，而是对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style 的 23 项（颜色、字号、内外边距、display、gap、圆角、transform、字体栈、行高等），与改动前构建逐条比对：三次拆分后桌面 1280×900 与移动 390×844 两个视口全部一致，唯一差异是首页 hero 进度条的一帧动画 transform。该验证只覆盖本机 Chromium 与一个媒体库夹具，不覆盖 320/768/1024/1440 全视口、Safari/Firefox 或真实弱网。
 

@@ -17363,7 +17363,7 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 - [x] 中文编辑标题不再请求 Noto Serif SC 子集；首屏字体字节由最多约 1.28 MB 降到 0（拉丁标题最多一个 Bodoni 文件）。
 - [x] 320/390/768/1280/1440 视口截图人工检查无布局回归；浏览器控制台无本任务错误。
-- [x] 首屏 CSS ≤150 KB、gzip ≤35 KB：三次拆分后主 CSS 123,840 B / gzip 22,672 B，两项均达标。
+- [x] 首屏 CSS ≤150 KB、gzip ≤35 KB：拆分 + Tailwind 工具类按路由懒加载后主 CSS 109,630 B / gzip 20,080 B，两项均达标。
 - [x] `pnpm --dir web build`、定向 Web 测试与 `git diff --check` 通过。
 
 短计划：先删 Noto 子集并切换字体栈；构建后检查字体请求、CSS 体积和 1280/390 截图；再更新性能记录。
@@ -17385,6 +17385,23 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 结果：`react.css` 162,447 → 118,119 B；构建后主 CSS 164,828 → 123,840 B（gzip 28,472 → 22,672 B），**raw ≤150 KB 与 gzip ≤35 KB 两项均达标**。admin/detail 懒加载 CSS 分别为 122,104 / 53,467 B。等价性验证重复了桌面 11 条路由，并对同一 11 条路由在 390×844 移动视口各导出一次 computed style 比对，全部一致（唯一差异仍是首页 hero 进度条的一帧动画 transform）。
 
 限制：剩余体积主要来自 Tailwind preflight/工具类（约 15 KB）与 library/auth/home 的共享规则；未拆 library/auth 是因为媒体库与登录页不在首屏懒加载链路上，拆出只会把字节挪到另一个首屏请求。未做逐像素截图或 320/768/1024/1440 全视口对比，也未在真实弱网下复测 CSS 请求瀑布。
+
+第四次调整（同日，Tailwind 工具类按路由懒加载）：方案 T6 指出 Tailwind 整包引入而实际只用到少数工具类。核对后确认工具类只出现在 `MediaInfoPanel` 与 `MediaNfoPanel` 两个组件里，而这两个组件只被详情路由使用。于是 `react.css` 只保留 theme 与 preflight 两层，`utilities` 层改由懒加载的 `detail.css` 引入：
+
+```css
+/* react.css */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+
+/* detail.css */
+@import "tailwindcss/theme.css" layer(theme) theme(reference);
+@import "tailwindcss/utilities.css" layer(utilities) source("../../");
+```
+
+`theme(reference)` 让详情表不重复输出 theme 层；`@layer theme, base, components, utilities;` 固定层顺序，使路由表里的工具类仍落在原来的层里。结果：主 CSS 123,840 → 109,630 B（gzip 22,672 → 20,080 B），详情表 53,467 → 59,770 B（仍懒加载）。桌面 1280×900 与移动 390×844 各 11 条路由的 computed style 再次逐一比对，全部一致（唯一差异仍是 hero 进度条的一帧动画）。
+
+限制：Tailwind 的 preflight（约 3.7 KB）仍需全局加载，因为它承担全站 reset；工具类虽然搬到了详情表，但只要有新页面继续使用工具类，就必须同步引入该表，这一点没有构建期守卫。
 
 #### LUX-832：列表跳过每页 COUNT 并返回 hasNext
 
