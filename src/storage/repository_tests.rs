@@ -11016,6 +11016,139 @@ async fn content_restrictions_filter_catalog_rows_before_pagination()
 }
 
 #[tokio::test]
+async fn catalog_sort_expression_indexes_cover_default_sorting()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await
+    .expect("database");
+    let library_ids: Vec<String> = (0..3)
+        .map(|index| format!("index-plan-library-{index}"))
+        .collect();
+    for (index, library_id) in library_ids.iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind, is_enabled, scan_concurrency, probe_concurrency)
+                 VALUES (?, ?, 'MOVIE', 1, 2, 1)",
+            )
+            .bind(library_id)
+            .bind(format!("Index plan {index}"))
+            .execute(database.pool())
+            .await?;
+    }
+    for index in 0..1_800_i64 {
+        let library_id = &library_ids[(index % 3) as usize];
+        let item_id = format!("index-plan-item-{index:04}");
+        let title = format!("Movie {index:04}");
+        let sort_title = format!("Sort {index:04}");
+        let year = 1990 + index % 35;
+        let month = 1 + index % 12;
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, production_year,
+                    premiere_date, rating, identification_status, added_at, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, 1)",
+            )
+            .bind(&item_id)
+            .bind(library_id)
+            .bind(&title)
+            .bind(&sort_title)
+            .bind(year)
+            .bind(format!("{year:04}-{month:02}-01"))
+            .bind((index % 20) as f64 / 2.0)
+            .bind(1_700_000_000 + (index % 50) * 86_400)
+            .execute(database.pool())
+            .await?;
+    }
+    database.query("ANALYZE").execute(database.pool()).await?;
+    let library_ids = vec![library_ids[1].clone()];
+    let item_types = vec!["MOVIE".to_owned()];
+    let empty: Vec<String> = Vec::new();
+    let empty_years: Vec<i64> = Vec::new();
+    let cases = [
+        (
+            CatalogSort::Name,
+            false,
+            "idx_media_items_library_name_sort",
+        ),
+        (
+            CatalogSort::SortName,
+            false,
+            "idx_media_items_library_sortname_sort",
+        ),
+        (
+            CatalogSort::DateCreated,
+            true,
+            "idx_media_items_library_added_sort",
+        ),
+        (
+            CatalogSort::PremiereDate,
+            true,
+            "idx_media_items_library_premiere_sort",
+        ),
+        (
+            CatalogSort::Rating,
+            true,
+            "idx_media_items_library_rating_sort",
+        ),
+    ];
+    for (sort_by, descending, index_name) in cases {
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "index-plan-user",
+            item_types: &item_types,
+            excluded_item_types: &empty,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &empty_years,
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by,
+            descending,
+            offset: 0,
+            limit: 24,
+        };
+        let plan = database.explain_filtered_catalog_rows(&filter).await?;
+        let joined = plan.join("\n");
+        assert!(
+            joined.contains(index_name),
+            "{sort_by:?} must use {index_name}: {joined}"
+        );
+        let outer_start = plan
+            .iter()
+            .position(|line| line.contains("SCAN selected"))
+            .unwrap_or(plan.len());
+        assert!(
+            !plan[..outer_start]
+                .iter()
+                .any(|line| line.contains("TEMP B-TREE")),
+            "{sort_by:?} still sorts the library with a temporary b-tree: {joined}"
+        );
+        assert!(
+            !plan[..outer_start]
+                .iter()
+                .any(|line| line.contains("SCAN mi")),
+            "{sort_by:?} still scans media_items: {joined}"
+        );
+    }
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn recommendation_query_uses_materialized_stats_and_image_indexes() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -7506,7 +7506,7 @@ pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) limit: i64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum CatalogSort {
     Name,
     SortName,

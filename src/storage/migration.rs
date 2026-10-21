@@ -262,6 +262,33 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
              WHERE removed_at IS NULL",
             "CREATE INDEX idx_media_items_updated_at
              ON media_items(updated_at, id)",
+            "CREATE INDEX idx_media_items_library_name_sort
+             ON media_items(library_id, LOWER(title), id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_sortname_sort
+             ON media_items(library_id, LOWER(sort_title), id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_added_sort
+             ON media_items(library_id, added_at DESC, LOWER(title), id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_premiere_sort
+             ON media_items(
+                 library_id,
+                 (CASE WHEN NULLIF(premiere_date, '') IS NULL AND production_year IS NULL THEN 1 ELSE 0 END),
+                 (COALESCE(NULLIF(premiere_date, ''), CAST(production_year AS TEXT) || '-01-01')) DESC,
+                 LOWER(title),
+                 id
+             )
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_rating_sort
+             ON media_items(
+                 library_id,
+                 (CASE WHEN rating IS NULL THEN 1 ELSE 0 END) ASC,
+                 rating DESC,
+                 LOWER(title),
+                 id
+             )
+             WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search_map (item_id) VALUES (NEW.id);
                 INSERT INTO media_search (rowid, item_id, title, sort_title, original_title, aliases)

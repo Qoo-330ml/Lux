@@ -17174,6 +17174,29 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：所有数字仅代表本机 macOS arm64 headless Chromium，不代表 FNOS/x86_64、NAS、真实弱网、TLS/HTTP/2 或真实用户设备；夹具直接写库，不执行 100 万次扫描/ffprobe，全文搜索索引为空，只有前 2,000 条有源、轨道和图片；M4/M6 在本夹具接近零，不能据此宣称真实滚动或解码性能。完整记录见 `docs/PERFORMANCE.md` LUX-829 节。
 
+#### LUX-830：为默认目录排序建立表达式索引
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-827：为默认排序与看板排序建立表达式索引”（编号顺延）。
+
+范围：为默认目录排序新增五个部分表达式索引，覆盖 `Name`、`SortName`、`DateCreated`、`PremiereDate`、`Rating`；SQLite 与 PostgreSQL 各一份 migration，SQLite 旧库/新库的表重建路径同步重建这些索引。`list_filtered_catalog_rows` 的查询构造抽出为可测试 helper，新增仅测试可见的 `EXPLAIN QUERY PLAN` 入口，验证内层 100 万级排序不再使用临时 B-tree。
+
+预计文件（6 个）：`migrations/0205_catalog_sort_indexes.sql`、`migrations-postgres/0205_catalog_sort_indexes.sql`、`src/storage/catalog.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] `EXPLAIN QUERY PLAN` 对五种排序都使用对应表达式索引；内层目录扫描不再出现 `TEMP B-TREE`。
+- [x] `ORDER BY` 结果与未加索引前一致，`list_filtered_catalog_rows` 现有回归全部通过。
+- [x] 空库迁移、SQLite 旧库重建路径和 PostgreSQL migration 定义保持双端一致；`cargo build --locked`、fmt、定向测试通过。
+- [x] 在 LUX-829 的 100 万条夹具上复测冷启动列表 TTFB 与 M1–M3，并记录相对基线的变化与剩余限制。
+
+短计划：先写 migration 与索引计划失败测试；再补 SQLite 重建路径与查询 helper；最后在 100 万条夹具上复测并更新性能记录。
+
+实施结果（2026-10-21）：新增 SQLite/PostgreSQL `0205_catalog_sort_indexes.sql`，为 `Name`、`SortName`、`DateCreated`、`PremiereDate`、`Rating` 建立部分表达式索引；`migrate_sqlite_catalog_constraints` 的新库/旧库表重建路径同步重建五个索引，避免新装库首次启动时被表重建丢弃。`list_filtered_catalog_rows` 的列表 SQL 抽出为 `filtered_catalog_list_query`，新增仅测试可见的 `explain_filtered_catalog_rows`，对五种排序断言使用对应索引、内层扫描无 `TEMP B-TREE`，并保留外层已选 24 条 source/stream 的有界临时排序说明。`CatalogSort` 增加 `Debug` 派生仅供测试诊断。
+
+验证：`cargo test --locked --lib catalog_sort_expression_indexes_cover_default_sorting` 1/1 通过；`cargo build --release --locked` 通过，100 万条夹具启动时 `schema_version=205`、应用 migration 约 14 秒。100 万条库上五种排序的 `EXPLAIN QUERY PLAN` 均命中对应索引；内层列表查询预热后约 0.01 ms/次，`COUNT(*)` 仍约 661 ms。与 LUX-829 同条件复测：M1 1,669.3→1,365.5 ms（-18.2%），M2 1,638.5→1,335.9 ms（-18.5%），列表请求自身 736–768→434–442 ms（约 -41%），M3 中位数 1,268.2→772.7 ms（单轮波动，CV 31.7%），M5/M4/M6 不变。M2 尚未达到 ≤300 ms，主因是每页 `COUNT(*)`，由 LUX-832 处理。
+
+限制：PostgreSQL migration 未在本机真实 PostgreSQL 执行；M3 的单轮波动来自服务重启后的本地元数据回填与浏览器调度，只作方向参考；外层有界临时 B-tree 仍在，但不再对 100 万条目录做全量排序；所有数字仅代表本机 macOS arm64。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

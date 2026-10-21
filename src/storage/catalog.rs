@@ -2523,53 +2523,6 @@ impl Database {
                 CatalogBind::Real(value) => count_statement.bind(*value),
             };
         }
-        let item_order = catalog_item_order(filter.sort_by, filter.descending);
-        let query = format!(
-            "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
-                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
-                    mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
-                    mi.added_at, mi.updated_at,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
-                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
-                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
-                     ORDER BY image_index LIMIT 1) AS thumb_image_tag,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
-                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
-                    (SELECT fe.relative_path FROM filesystem_entries fe
-                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
-                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
-                    ms.edition_name, ms.quality_label,
-                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
-                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                    mt.codec, mt.language, mt.title AS stream_title,
-                    mt.details_json AS stream_details_json,
-                    mt.is_external AS stream_is_external,
-                    mt.is_default AS stream_is_default,
-                    mt.is_forced AS stream_is_forced
-             FROM (
-                 SELECT mi.id
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 {where_clause}
-                 ORDER BY {item_order}
-                 LIMIT ? OFFSET ?
-             ) selected
-             JOIN media_items mi ON mi.id = selected.id
-             LEFT JOIN media_sources ms
-               ON ms.item_id = mi.id
-              AND EXISTS (
-                  SELECT 1 FROM filesystem_entries fe
-                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
-              )
-             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY {item_order}, ms.id, mt.stream_index"
-        );
-        let mut list_binds = filter_binds.clone();
-        list_binds.push(CatalogBind::Integer(filter.limit));
-        list_binds.push(CatalogBind::Integer(filter.offset));
         let total_future = async {
             count_statement
                 .fetch_one(&self.pool)
@@ -2579,9 +2532,43 @@ impl Database {
                     source,
                 })
         };
+        let (query, list_binds) = filtered_catalog_list_query(filter);
         let rows_future = self.fetch_catalog_rows(&query, &list_binds);
         let (total, rows) = tokio::try_join!(total_future, rows_future)?;
         Ok((rows, total))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn explain_filtered_catalog_rows(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+    ) -> Result<Vec<String>, StorageError> {
+        let (query, binds) = filtered_catalog_list_query(filter);
+        let explain = format!("EXPLAIN QUERY PLAN {query}");
+        let mut statement = self.query(sqlx::AssertSqlSafe(explain));
+        for bind in &binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(*value),
+                CatalogBind::Integer(value) => statement.bind(*value),
+                CatalogBind::Real(value) => statement.bind(*value),
+            };
+        }
+        let rows = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("detail")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })
+            })
+            .collect()
     }
 
     pub(crate) async fn list_catalog_rows(
@@ -9864,6 +9851,59 @@ impl Database {
             source,
         })
     }
+}
+
+fn filtered_catalog_list_query<'a>(
+    filter: &CatalogFilterQuery<'a>,
+) -> (String, Vec<CatalogBind<'a>>) {
+    let (where_clause, mut binds) = catalog_filter_where_clause(filter);
+    let item_order = catalog_item_order(filter.sort_by, filter.descending);
+    let query = format!(
+        "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                mi.title, mi.sort_title, mi.original_title, mi.overview,
+                mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                mi.added_at, mi.updated_at,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                 ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                 ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                 ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                 ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                (SELECT fe.relative_path FROM filesystem_entries fe
+                 WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
+                ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                ms.edition_name, ms.quality_label,
+                ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                mt.codec, mt.language, mt.title AS stream_title,
+                mt.details_json AS stream_details_json,
+                mt.is_external AS stream_is_external,
+                mt.is_default AS stream_is_default,
+                mt.is_forced AS stream_is_forced
+         FROM (
+             SELECT mi.id
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {where_clause}
+             ORDER BY {item_order}
+             LIMIT ? OFFSET ?
+         ) selected
+         JOIN media_items mi ON mi.id = selected.id
+         LEFT JOIN media_sources ms
+           ON ms.item_id = mi.id
+          AND EXISTS (
+              SELECT 1 FROM filesystem_entries fe
+              WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+          )
+         LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+         ORDER BY {item_order}, ms.id, mt.stream_index"
+    );
+    binds.push(CatalogBind::Integer(filter.limit));
+    binds.push(CatalogBind::Integer(filter.offset));
+    (query, binds)
 }
 
 fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {

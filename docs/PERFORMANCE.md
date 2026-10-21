@@ -2,6 +2,23 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-830 目录排序表达式索引复测（2026-10-21）
+
+在 LUX-829 同一 1,000,000 条夹具、同一 release `luxd`、20 Mbps / 40 ms、每轮重启服务的条件下复测。新增 `migrations/0205_catalog_sort_indexes.sql` 与 PostgreSQL 对等 migration；SQLite 旧库/新库表重建路径同步重建五个索引。空库/新库迁移后 `schema_version=205`，在 100 万条库上应用约 14 秒。
+
+| 指标 | 基线（无索引） | 索引后 | 变化 |
+|---|---:|---:|---:|
+| M1 首卡可见中位数 | 1,669.3 ms | 1,365.5 ms | -18.2% |
+| M2 列表 TTFB 中位数 | 1,638.5 ms | 1,335.9 ms | -18.5% |
+| 列表请求自身耗时中位数 | 736–768 ms | 434–442 ms | 约 -41% |
+| M3 排序后首卡中位数 | 1,268.2 ms | 772.7 ms | -39.1%（单轮 1,382.5 ms，CV 31.7%，仅作方向参考） |
+| M5 首屏字节 | 19,257,462 B | 19,257,462 B | 不变 |
+| M4 / M6 | 0 / 0% | 0 / 0% | 不变 |
+
+`EXPLAIN QUERY PLAN` 对 `Name`、`SortName`、`DateCreated`、`PremiereDate`、`Rating` 五种排序分别使用 `idx_media_items_library_name_sort`、`idx_media_items_library_sortname_sort`、`idx_media_items_library_added_sort`、`idx_media_items_library_premiere_sort`、`idx_media_items_library_rating_sort`；内层 100 万条扫描不再出现 `TEMP B-TREE`。外层按已选 24 条再做 source/stream 排序时仍可能使用一个有界临时 B-tree，测试按“内层目录扫描无临时排序”断言并在结果中保留该说明。
+
+索引后的列表内层查询（同一 SQL、同一夹具，预热后）在本机为约 0.01 ms/次；`COUNT(*)` 仍约 661 ms，是 M2 尚未达到 ≤300 ms 的主要原因，留给 LUX-832（`count=false`）处理。M3 的单轮波动来自服务重启后的本地元数据回填与浏览器调度，不能作为稳定的 50% 收益证据。以上仍只代表本机 arm64 与直接写库夹具，不代表 NAS/x86_64 或真实网络。
+
 ## LUX-829 Web 性能基准（2026-10-21）
 
 固定 1,000,000 条合成媒体、20 Mbps / 40 ms 模拟网络和无浏览器缓存的三次冷启动基线。用于后续 LUX-830–LUX-838 的前后对比；数字只代表本机 arm64，不代表 FNOS/x86_64 或真实 NAS。
