@@ -2,6 +2,61 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-829 Web 性能基准（2026-10-21）
+
+固定 1,000,000 条合成媒体、20 Mbps / 40 ms 模拟网络和无浏览器缓存的三次冷启动基线。用于后续 LUX-830–LUX-838 的前后对比；数字只代表本机 arm64，不代表 FNOS/x86_64 或真实 NAS。
+
+### 环境与数据集
+
+| 项 | 值 |
+|---|---|
+| 架构 | macOS `arm64`（`uname -m=arm64`），10 核，16 GiB |
+| 代码 | `73290437` 加工作树并行未提交改动；`target/release/luxd` 于基准前构建 |
+| 夹具 | `lux-catalog-fixture-v1` / `lux-catalog-db-v1`：1,000,000 条媒体，3 个用户媒体库（MOVIE / SERIES / MIXED），2,400 个媒体源、10,800 条轨道、5,000 张图片索引 |
+| 图片 | 200 张真实海报硬链接复用；`detailItemCount=2,000`（仅前 2,000 条物化源、轨道和图片，其余条目仍参与 100 万条列表查询） |
+| 搜索索引 | `searchIndexPopulated=false`（夹具跳过 `media_search` FTS 触发器，以将 100 万条种子控制在 43 秒内；列表基准不使用全文搜索） |
+| 媒体文件 | 不生成 100 万媒体文件，也不调用 ffprobe；夹具直接写入已迁移 SQLite 库 |
+| 服务 | `LUX_CONFIG_DIR=/tmp/lux-perf-1m LUX_HTTP_ADDR=127.0.0.1:8100 target/release/luxd`，每轮测量前重启并等待健康 |
+| 浏览器 | Playwright 1.63.0 Chromium 1243 headless，1280×900，CDP `Network.emulateNetworkConditions` 20 Mbps 下行 / 5 Mbps 上行 / 40 ms 延迟，禁用浏览器缓存 |
+| 采集 | `scripts/run-web-performance.mjs --runs 3 --warmup 0 --cooldown-seconds 5 --restart-command ...` |
+
+命令：
+
+```bash
+python3 tools/catalog-fixture/generate.py \
+  --catalog-db /tmp/lux-perf-1m/lux.db --media-root /tmp/lux-perf-1m/media \
+  --items 1000000 --libraries 3 --posters 200 --posters-dir media \
+  --skip-search-index --detail-items 2000 \
+  --session-token perf-token-0123456789 --manifest /tmp/lux-perf-1m/manifest.json
+
+node scripts/run-web-performance.mjs \
+  --base-url http://127.0.0.1:8100 --manifest /tmp/lux-perf-1m/manifest.json \
+  --runs 3 --warmup 0 --cooldown-seconds 5 \
+  --restart-command /tmp/lux-perf-1m-restart.sh \
+  --scroll-seconds 30 --output /tmp/lux-perf-1m/baseline.json
+```
+
+### 基线结果（三次，median / p95 / CV）
+
+| 指标 | 中位数 | p95 | CV | 目标（方案 §2） |
+|---|---:|---:|---:|---|
+| M1 首张卡片可见 | 1,669.3 ms | 1,690.5 ms | 0.75% | ≤ 基线 50% |
+| M2 媒体库列表 TTFB | 1,638.5 ms | 1,660.0 ms | 0.77% | ≤ 基线 50%，且 ≤ 300 ms |
+| M3 排序切换后首卡更新 | 1,268.2 ms | 1,275.6 ms | 1.84% | ≤ 基线 50% |
+| M4 滚动 30 s 的 long task 数 | 0 | 0 | 0% | ≤ 基线 50% |
+| M5 首屏字节（HTML+JS+CSS+字体+前 24 图） | 19,257,462 B（18.36 MiB） | 同左 | 0% | ≤ 基线 50% |
+| M6 滚动掉帧率 | 0% | 0.056% | — | 不劣化，目标 <1% |
+
+M5 分项：HTML 1,250 B、JS 490,161 B、CSS 430,755 B、字体 0 B、前 24 张 POSTER 18,335,296 B、其他静态资源 3,545 B。列表响应体（完整 DTO，非卡片投影）为 48,228 B。
+
+### 结论与限制
+
+- 三次冷启动的 M1–M5 CV 均低于 2%，M6 只为 0/0.06%，满足“连续跑 3 次 CV <15%”的复现要求。
+- M4/M6 在本机 headless Chromium 下接近零；这是本夹具滚动路径的结果，不代表真实低端设备、真实海报解码或 120 Hz 屏幕。
+- 夹具以直接写库替代 100 万次 ffprobe / 扫描；只有前 2,000 条有源、轨道和图片，全文搜索索引为空。它验证列表、图片和排序路径，不等同于完整扫描或搜索性能。
+- 20 Mbps / 40 ms 是 CDP 模拟值，不是真实弱网、TLS 或 HTTP/2 环境；未在 FNOS/x86_64、真实 NAS 或真实浏览器网络下复测。
+- 这组数字是 LUX-830 起的“优化前”基线；后续任务在同一夹具、同一命令下复测并更新本表。
+
 ## LUX-561 多管线共享后台预算（2026-10-16）
 
 实现新增进程级共享预算，协调扫描准备与指纹、本地 NFO/图片计算、ffprobe 和缩略图 ffmpeg。预算容量按可见 CPU 与 cgroup CPU 限额推导，也可用 `LUX_BACKGROUND_CPU_BUDGET` 显式设置；运行时仍保留各管线原有局部并发上限。功能测试用于证明准入、取消与回收语义，不作为 CPU 性能结果。

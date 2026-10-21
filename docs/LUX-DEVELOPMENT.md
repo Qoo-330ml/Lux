@@ -17151,6 +17151,29 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制与剩余风险：未在 FNOS/x86_64 或真实 NAS 上验证；未执行方案阶段 F 的 1,000 张真实图片、20 Mbps / 40 ms 网络基准，因此 §12 的生成 p95、首字节和首屏总字节仍以方案中的本机测量为参考，未在本任务复测。PostgreSQL migration 未在本机真实 PostgreSQL 上执行（SQLite 空库升级由全部集成测试覆盖）。冷缓存首次请求仍按 300 ms 预算回退原图，由后台完成生成；这是方案设计行为。LOGO 透明背景未处理。缓存目录当前按单实例文件锁与原子写设计，多实例共享 `/config` 不在支持范围。
 
+#### LUX-829：建立可复现的 Web 性能基准
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-827：建立可复现的性能基准”（方案编号因 LUX-826 图片变体与并行 LUX-827/828 占用而顺延为 LUX-829）。
+
+范围：为 `tools/catalog-fixture/generate.py` 增加“直接写入已迁移 SQLite 库”的合成目录夹具，生成电影/剧集/混合媒体库、媒体源、轨道与图片索引；图片复用真实海报文件，不复制百万张图片，也不写媒体库。新增 `scripts/run-web-performance.mjs`，用 Playwright + CDP 在固定视口下采集 M1 首卡可见、M2 列表 TTFB、M3 排序后首卡、M4 滚动 long task、M5 首屏字节、M6 掉帧率，并把结果与限制写入 `docs/PERFORMANCE.md`。
+
+预计文件（3 个）：`tools/catalog-fixture/generate.py`、`scripts/run-web-performance.mjs`、`docs/PERFORMANCE.md`。
+
+验收标准：
+
+- [x] 夹具可重复生成 1,000,000 条目，含媒体源、轨道与真实图片索引；媒体库文件只读。
+- [x] 同一命令连续跑 3 次，M1–M6 变异系数 <15%，基线 JSON 记录 commit、架构、数据集与命令。
+- [x] M1–M6 定义与方案 §2 一致；浏览器控制台无本任务引入的错误。
+- [x] 本机 arm64 数值与未覆盖的 NAS/x86_64、真实网络条件如实记录。
+
+短计划：先实现夹具种子与迁移校验；再实现 Playwright 采集与 3 次聚合；最后在 100 万条测试库上跑基线并记录。
+
+实施结果（2026-10-21）：`tools/catalog-fixture/generate.py` 新增直接写入已迁移 SQLite 库的合成目录夹具：可选电影/剧集/混合媒体库、媒体源、轨道、图片索引、固定测试会话与 Playwright 夹具清单；图片复用真实海报硬链接，不写媒体库。为控制本机种子时间与磁盘占用，100 万条夹具使用 `--skip-search-index`（不填 FTS 搜索索引）与 `--detail-items 2000`（只对前 2,000 条物化源/轨道/图片）；完整 100 万条写入实测 43 秒，库约 916 MB。新增 `scripts/run-web-performance.mjs`：Playwright + CDP 采集 M1–M6，支持每轮重启服务消除 15 秒列表缓存、20 Mbps / 40 ms 网络模拟、浏览器缓存禁用、丢弃预热轮，并输出 JSON 与 CV 汇总。
+
+验证：`python3 -m unittest tools/catalog-fixture/test_generator.py` 7/7 通过；`node --check scripts/run-web-performance.mjs` 通过。在本机 arm64、release `luxd`、1,000,000 条夹具、20 Mbps / 40 ms、三次冷启动下：M1 中位数 1,669.3 ms（CV 0.75%）、M2 1,638.5 ms（CV 0.77%）、M3 1,268.2 ms（CV 1.84%）、M4 0 个 long task、M5 19,257,462 B（CV 0%）、M6 0%（单次最大 0.056%），均满足三次重复 CV <15%。列表响应体 48,228 B，其中前 24 张 POSTER 占 18,335,296 B。
+
+限制：所有数字仅代表本机 macOS arm64 headless Chromium，不代表 FNOS/x86_64、NAS、真实弱网、TLS/HTTP/2 或真实用户设备；夹具直接写库，不执行 100 万次扫描/ffprobe，全文搜索索引为空，只有前 2,000 条有源、轨道和图片；M4/M6 在本夹具接近零，不能据此宣称真实滚动或解码性能。完整记录见 `docs/PERFORMANCE.md` LUX-829 节。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
