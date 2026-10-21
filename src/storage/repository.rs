@@ -5885,6 +5885,7 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) thumbnail_enabled: bool,
     pub(crate) thumbnail_position_percent: i64,
     pub(crate) target_scan_job_id: Option<String>,
+    pub(crate) target_source_id: Option<String>,
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
@@ -5906,6 +5907,7 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) thumbnail_enabled: bool,
     pub(crate) thumbnail_position_percent: i64,
     pub(crate) target_scan_job_id: Option<&'a str>,
+    pub(crate) target_source_id: Option<&'a str>,
     pub(crate) total_count: i64,
 }
 
@@ -5980,6 +5982,7 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
         thumbnail_position_percent: row.get("thumbnail_position_percent"),
         target_scan_job_id: row.get("target_scan_job_id"),
+        target_source_id: row.get("target_source_id"),
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),

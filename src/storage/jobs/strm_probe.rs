@@ -1,5 +1,47 @@
 use super::*;
 
+#[cfg(test)]
+mod playback_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn source_scoped_job_round_trips_without_changing_library_jobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO strm_probe_jobs
+             (id, operation_id, library_id, status, concurrency, include_ready,
+              write_sidecars, total_count, target_source_id)
+             VALUES ('playback', 'operation', ?, 'PENDING', 1, 0, 0, 1, 'source')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let target: Option<String> = sqlx::query_scalar(
+            "SELECT target_source_id FROM strm_probe_jobs WHERE id = 'playback'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(target.as_deref(), Some("source"));
+        let job = database.find_strm_probe_job("playback").await?;
+        assert_eq!(
+            job.as_ref().and_then(|job| job.target_source_id.as_deref()),
+            Some("source")
+        );
+        assert_eq!(job.map(|job| job.total_count), Some(1));
+        database.close().await;
+        Ok(())
+    }
+}
+
 impl Database {
     pub(crate) async fn create_strm_probe_job(
         &self,
@@ -18,8 +60,8 @@ impl Database {
                 id, operation_id, library_id, status, concurrency,
                 include_ready, write_sidecars, media_info_enabled,
                 thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?)",
+                target_source_id, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.operation_id)
@@ -31,6 +73,7 @@ impl Database {
         .bind(database_flag(job.thumbnail_enabled))
         .bind(job.thumbnail_position_percent)
         .bind(job.target_scan_job_id)
+        .bind(job.target_source_id)
         .bind(job.total_count)
         .execute(&mut *transaction)
         .await
@@ -98,7 +141,7 @@ impl Database {
             "SELECT id, operation_id, library_id, status, concurrency,
                     include_ready, write_sidecars, media_info_enabled,
                     thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                    cursor, processed_count,
+                    target_source_id, cursor, processed_count,
                     total_count, cancel_requested, error,
                     created_at, started_at, finished_at
              FROM strm_probe_jobs WHERE id = ?",
@@ -124,7 +167,7 @@ impl Database {
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                        cursor, processed_count,
+                        target_source_id, cursor, processed_count,
                         total_count, cancel_requested, error,
                         created_at, started_at, finished_at
                  FROM strm_probe_jobs WHERE status = ?
@@ -140,7 +183,7 @@ impl Database {
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                        cursor, processed_count,
+                        target_source_id, cursor, processed_count,
                         total_count, cancel_requested, error,
                         created_at, started_at, finished_at
                  FROM strm_probe_jobs
@@ -256,9 +299,9 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let cancelled_library_id: Option<String> = self
-            .query_scalar(
-                "SELECT library_id FROM strm_probe_jobs
+        let cancelled_scope: Option<(String, Option<String>)> = self
+            .query_as(
+                "SELECT library_id, target_source_id FROM strm_probe_jobs
                  WHERE id = ? AND cancel_requested = 1
                    AND status IN ('PENDING', 'RUNNING')",
             )
@@ -269,20 +312,36 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        if let Some(library_id) = cancelled_library_id {
-            self.query(
-                "UPDATE media_sources
-                 SET probe_status = 'NOT_CONFIGURED', probe_error = NULL,
-                     updated_at = unixepoch()
-                 WHERE source_kind = 'STRM_URL' AND probe_status = 'PENDING'
-                   AND item_id IN (
-                       SELECT id FROM media_items WHERE library_id = ?
-                   )",
-            )
-            .bind(library_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
+        if let Some((library_id, target_source_id)) = cancelled_scope {
+            let reset = if let Some(source_id) = target_source_id {
+                self.query(
+                    "UPDATE media_sources
+                     SET probe_status = 'NOT_CONFIGURED', probe_error = NULL,
+                         updated_at = unixepoch()
+                     WHERE id = ? AND source_kind = 'STRM_URL' AND probe_status = 'PENDING'
+                       AND item_id IN (
+                           SELECT id FROM media_items WHERE library_id = ?
+                       )",
+                )
+                .bind(source_id)
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+            } else {
+                self.query(
+                    "UPDATE media_sources
+                     SET probe_status = 'NOT_CONFIGURED', probe_error = NULL,
+                         updated_at = unixepoch()
+                     WHERE source_kind = 'STRM_URL' AND probe_status = 'PENDING'
+                       AND item_id IN (
+                           SELECT id FROM media_items WHERE library_id = ?
+                       )",
+                )
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+            };
+            reset.map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;

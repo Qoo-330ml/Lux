@@ -144,8 +144,15 @@ impl StrmProbeService {
         let mut jobs = Vec::with_capacity(libraries.len());
         for (library_id, total_count) in libraries {
             jobs.push(
-                self.create_job_record(&operation_id, &library_id, None, total_count, options)
-                    .await?,
+                self.create_job_record(
+                    &operation_id,
+                    &library_id,
+                    None,
+                    None,
+                    total_count,
+                    options,
+                )
+                .await?,
             );
         }
         Ok(jobs)
@@ -200,6 +207,7 @@ impl StrmProbeService {
                 &operation_id,
                 &library_id_text,
                 Some(scan_job_id),
+                None,
                 total_count,
                 StrmProbeOptions {
                     concurrency: settings.concurrency,
@@ -219,6 +227,7 @@ impl StrmProbeService {
         operation_id: &str,
         library_id: &str,
         target_scan_job_id: Option<&str>,
+        target_source_id: Option<&str>,
         total_count: i64,
         options: StrmProbeOptions,
     ) -> Result<StrmProbeJob, StrmProbeError> {
@@ -235,6 +244,7 @@ impl StrmProbeService {
                 thumbnail_enabled: options.thumbnail_enabled,
                 thumbnail_position_percent: options.thumbnail_position_percent,
                 target_scan_job_id,
+                target_source_id,
                 total_count,
             })
             .await?;
@@ -418,7 +428,22 @@ impl StrmProbeService {
             thumbnail_enabled: job.thumbnail_enabled,
             thumbnail_position_percent: job.thumbnail_position_percent,
         };
-        if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
+        if let Some(source_id) = job.target_source_id.as_deref() {
+            if self.database.has_active_strm_probe_jobs().await? {
+                return Err(StrmProbeError::AlreadyActive);
+            }
+            let operation_id = Uuid::now_v7().to_string();
+            let library_id_text = library_id.to_string();
+            self.create_job_record(
+                &operation_id,
+                &library_id_text,
+                None,
+                Some(source_id),
+                1,
+                options,
+            )
+            .await
+        } else if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
             if self.database.has_active_strm_probe_jobs().await? {
                 return Err(StrmProbeError::AlreadyActive);
             }
@@ -432,6 +457,7 @@ impl StrmProbeService {
                 &operation_id,
                 &library_id_text,
                 Some(scan_job_id),
+                None,
                 total_count,
                 options,
             )
