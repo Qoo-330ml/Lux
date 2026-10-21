@@ -4493,6 +4493,71 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_strm_media_source_for_library(
+        &self,
+        library_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StoredStrmMediaSource>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
+                    mi.poster_fallback_required,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM media_streams mt
+                        WHERE mt.media_source_id = ms.id
+                    ) OR ms.duration_ticks IS NOT NULL
+                        OR ms.bitrate IS NOT NULL
+                        OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
+                    THEN 1 ELSE 0 END AS has_media_info,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM item_images screenshot
+                        WHERE screenshot.item_id = ms.item_id
+                          AND screenshot.image_index = 0
+                          AND screenshot.source = 'STRM_FFMPEG'
+                          AND screenshot.image_type = 'POSTER'
+                    ) AND EXISTS (
+                        SELECT 1 FROM item_images screenshot
+                        WHERE screenshot.item_id = ms.item_id
+                          AND screenshot.image_index = 0
+                          AND screenshot.source = 'STRM_FFMPEG'
+                          AND screenshot.image_type = 'THUMB'
+                    ) THEN 1 ELSE 0 END AS has_strm_thumbnail,
+                    lr.canonical_path AS root_path, fe.relative_path,
+                    ii.local_path AS thumbnail_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             LEFT JOIN item_images ii
+               ON ii.item_id = ms.item_id AND ii.image_type = 'THUMB'
+              AND ii.image_index = 0
+             WHERE mi.library_id = ? AND mi.removed_at IS NULL
+               AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
+               AND ms.id = ?
+             LIMIT 1",
+        )
+        .bind(library_id)
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredStrmMediaSource {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
+                has_media_info: row.get::<i64, _>("has_media_info") != 0,
+                external_url: row.get("external_url"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+                thumbnail_path: row.get("thumbnail_path"),
+                has_strm_thumbnail: row.get::<i64, _>("has_strm_thumbnail") != 0,
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_strm_media_source_counts_for_libraries(
         &self,
         library_ids: &[String],
@@ -6486,8 +6551,26 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
         library_id: &str,
         target_scan_job_id: Option<&str>,
+        target_source_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        let result = if let Some(scan_job_id) = target_scan_job_id {
+        let result = if let Some(source_id) = target_source_id {
+            self.query(
+                "UPDATE media_sources
+                 SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+                 WHERE id = ? AND source_kind = 'STRM_URL'
+                   AND item_id IN (
+                       SELECT id FROM media_items
+                       WHERE library_id = ? AND removed_at IS NULL
+                   )
+                   AND filesystem_entry_id IN (
+                       SELECT id FROM filesystem_entries WHERE is_missing = 0
+                   )",
+            )
+            .bind(source_id)
+            .bind(library_id)
+            .execute(&mut **transaction)
+            .await
+        } else if let Some(scan_job_id) = target_scan_job_id {
             let query = format!(
                 "UPDATE media_sources
                  SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
