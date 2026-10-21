@@ -1,3 +1,6 @@
+@import "tailwindcss/theme.css" layer(theme) theme(reference);
+@import "tailwindcss/utilities.css" layer(utilities) source("../../");
+
 /* Route-scoped styles moved from react.css (LUX-835). */
 
 /* Route-only rules moved out of react.css so the shared sheet stays small (LUX-835). */
