@@ -3041,6 +3041,8 @@ async fn serve_media_file_internal(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let playback_probe_source =
+        (source.source_kind == "STRM_URL").then_some((request.item_id, source.source_id.as_str()));
     if source.source_kind == "STRM_URL" {
         let Some(external_url) = source.external_url else {
             return StatusCode::NOT_FOUND.into_response();
@@ -3058,6 +3060,7 @@ async fn serve_media_file_internal(
                         method,
                         request.play_session_id,
                         response,
+                        playback_probe_source,
                     )
                     .await;
                 }
@@ -3082,6 +3085,7 @@ async fn serve_media_file_internal(
                     method,
                     request.play_session_id,
                     response,
+                    playback_probe_source,
                 )
                 .await;
             }
@@ -3116,6 +3120,7 @@ async fn serve_media_file_internal(
                     method,
                     request.play_session_id,
                     response,
+                    playback_probe_source,
                 )
                 .await;
             }
@@ -3143,6 +3148,7 @@ async fn serve_media_file_internal(
             method,
             request.play_session_id,
             response,
+            playback_probe_source,
         )
         .await;
     }
@@ -3162,6 +3168,7 @@ async fn serve_media_file_internal(
         method,
         request.play_session_id,
         response,
+        playback_probe_source,
     )
     .await
 }
@@ -3173,23 +3180,29 @@ async fn admit_emby_media_response(
     method: &Method,
     play_session_id: Option<&str>,
     response: Response,
+    playback_probe_source: Option<(&str, &str)>,
 ) -> Response {
     if *method != Method::GET
         || !(response.status().is_success() || response.status().is_redirection())
     {
         return response;
     }
-    let Some(play_session_id) = play_session_id else {
-        return response;
-    };
-    let user_id = principal.user_id_string();
-    if user_id.is_empty() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Some(play_session_id) = play_session_id {
+        let user_id = principal.user_id_string();
+        if user_id.is_empty() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if let Err(response) =
+            super::playback::admit_emby_direct_playback(headers, state, &user_id, play_session_id)
+                .await
+        {
+            return response;
+        }
     }
-    if let Err(response) =
-        super::playback::admit_emby_direct_playback(headers, state, &user_id, play_session_id).await
+    if let Some((item_id, source_id)) = playback_probe_source
+        && let Some(strm_probe) = state.strm_probe.as_ref()
     {
-        return response;
+        strm_probe.schedule_playback_probe(item_id, source_id);
     }
     response
 }
