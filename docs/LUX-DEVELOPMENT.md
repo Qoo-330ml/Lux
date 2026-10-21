@@ -17358,6 +17358,27 @@ HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ j
 
 限制：jsdom 不做真实布局/合成，挂载数不能证明 long task 或掉帧下降；未在真实 500 条数据、低端 GPU、Safari/Firefox 或 FNOS/x86_64 上截图/采样。搜索最多保留 5 页；收藏仍为分页而非无限滚动。
 
+#### LUX-839：图片变体生成基准
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-837：单张/批量图片性能基准与灰度”（编号顺延）。
+
+范围：新增 ignored Rust 基准 `tests/image_variants_perf.rs`，从 `LUX_PERF_IMAGE_DIR`（默认 `media/`）取真实图片 1,000 张，按生产参数（EXIF 方向、Lanczos3、JPEG q80、落盘）测 360/720/1280 三档的单张耗时 p50/p95/max。灰度策略与峰值内存不在本任务实现，记录为剩余风险。
+
+预计文件（3 个）：`tests/image_variants_perf.rs`（新增）、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 三档 p95 ≤120 ms（本机 arm64）；p50/p95/max 与样本来源记录。
+- [ ] 并发 2 时峰值内存 <40 MB：未测。
+- [ ] 灰度策略（先 POSTER/THUMB，再 FANART）：未实施，维持 LUX-826 默认关闭与全部类型一致行为。
+- [x] 基准可重复执行，ignored，不写媒体库；文档记录命令、样本和未覆盖环境。
+
+短计划：先写 ignored 基准并跑 1,000 张真实图；再记录结果与未覆盖项；灰度策略留给项目所有者观察期决定。
+
+实施结果（2026-10-21）：`tests/image_variants_perf.rs` 新增 1,000 张真实图片、三档宽度的 ignored 基准；本机 `media/` 含 5,857 张支持格式图片。release 运行结果：360 p50 17.18 / p95 63.71 / max 102.22 ms；720 p50 20.39 / p95 68.38 / max 103.45 ms；1280 p50 29.88 / p95 81.19 / max 146.41 ms；总耗时 25.72 / 29.03 / 31.53 秒。三档 p95 均 ≤120 ms；1280 最大 146.41 ms 仍由 LUX-826 的 300 ms 预算回退原图。
+
+限制：未测并发 2 峰值内存、命中率/回退率、真实网络首屏或 FNOS/x86_64；灰度策略未实施，当前仍由管理员主开关统一控制全部支持类型；样本来自本机媒体库，不能外推到 NAS/低端 CPU。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
