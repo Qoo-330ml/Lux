@@ -3622,7 +3622,9 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 当前 STRM 探测目标策略只校验非空和长度，不解析 STRM 内容，也不根据 HTTP/HTTPS、localhost、
 云实例元数据主机、回环、私网、链路本地、未指定、多播、共享地址、域名或路径做拒绝，不要求
 管理员指定 IP 或网段。STRM 探测目标只作为插件探测输入，不进入日志、任务事件、旁车或 API
-响应；普通扫描、播放和 PlaybackInfo 仍不主动读取 STRM 指向的内容。
+响应；普通扫描、PlaybackInfo 和媒体浏览不主动读取 STRM 指向的内容。仅符合 LUX-840
+条件的实际播放 GET/已授权 PLAYING 回调可提交当前来源的后台补提取任务；播放请求本身不运行
+远程 ffprobe/ffmpeg，也不等待插件执行。
 
 验收：
 
@@ -17530,6 +17532,33 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 验证：现有图片鉴权/撤销/无权限回归仍由 `tests/image_api.rs`、`tests/images.rs`、`tests/users.rs` 覆盖（本轮未新增），LUX-826 的图片变体测试保持通过；本任务未产生代码改动。
 
 限制：本机测量不能代表 FNOS/NAS 或真实弱网；未实现 30 秒会话缓存与 60 秒文件元数据缓存；方案中的 5 ms/张验收仍只由本机实测支持。
+
+#### LUX-840：播放时补全选中媒体库的 STRM 媒体信息
+
+范围：插件已安装、启用、开启媒体信息提取且选中资源所在媒体库时，实际播放 GET 或已授权的
+PLAYING 回调可提交当前 STRM 来源的后台补提取。只补缺失信息，即使全库任务配置为 OVERWRITE，
+播放也不重复覆盖已有信息。不因播放启动截图，不等待插件执行，不改变播放响应或失败处理。
+PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播放请求去重，后台等待有界；
+沿用现有作业、插件执行、旁车写回、取消和并发限制，不把单个播放扩展成全库探测。
+
+按四个可独立验证的增量实施（各至多五个文件）：
+
+1. `docs/LUX-DEVELOPMENT.md`、`migrations/0206_strm_probe_source_scope.sql`、
+   `migrations-postgres/0206_strm_probe_source_scope.sql`、`src/storage/repository.rs`、
+   `src/storage/jobs/strm_probe.rs`：持久化可选的单来源范围。
+2. `src/storage/catalog.rs`、`src/application/strm_probe.rs`、`tests/strm_probe.rs`：
+   精确来源读取、配置检查、排队、去重和后台执行。
+3. `src/api/media.rs`、`src/api/playback.rs`、`tests/playback.rs`、
+   `tests/strm_probe_api.rs`：实际取流与授权播放回调接入及行为回归。
+4. `docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`：记录协议边界、验收结果与限制。
+
+验收：
+
+- [ ] 新迁移可从空库执行，普通全库/增量作业范围不变，单来源范围持久化且可重试。
+- [ ] 当前来源缺少信息才提取；未选库、禁用插件、关闭媒体信息提取及已有信息均跳过。
+- [ ] Web/Emby 实际播放和外部代理播放回调可触发；PlaybackInfo、HEAD 和非播放状态不触发。
+- [ ] 重复请求合并，已有其他作业时有界等待后重新检查；任务只覆盖当前来源，失败不阻断播放。
+- [ ] `strm_probe`、`strm_probe_api`、`strm`、`web_playback`、`playback` 定向检查及完整 Rust 门禁。
 
 ## 29. 参考资料
 
