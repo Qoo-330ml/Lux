@@ -2,8 +2,12 @@ use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing:
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
-        strm_playback::StrmPlaybackResolver, webhooks::WebhookService,
+        libraries::LibraryService,
+        plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
+        scanner::LibraryScanner,
+        setup::SetupService,
+        strm_playback::StrmPlaybackResolver,
+        webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -183,9 +187,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let strm_resolver =
         StrmPlaybackResolver::new_with_proxy_for_tests(format!("http://{proxy_address}"))?;
     let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
-        config_dir: temp_dir.path().join("config"),
+        config_dir: config_dir.clone(),
     };
     let audit_logs = LogStore::new(&config.config_dir);
     let database = Database::connect(&config).await?;
@@ -204,6 +209,53 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .await?;
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
+        .await?;
+    let plugin_root = config_dir.join("plugins").join(MEDIA_INFO_PLUGIN_ID);
+    tokio::fs::create_dir_all(plugin_root.join("binaries")).await?;
+    tokio::fs::write(plugin_root.join("binaries/plugin"), b"placeholder").await?;
+    tokio::fs::write(
+        plugin_root.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": MEDIA_INFO_PLUGIN_ID,
+            "name": "strm媒体信息提取",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "media_probe",
+            "category": "MEDIA",
+            "capabilities": ["media.probe"],
+            "configFields": [
+                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "required": true, "optionsSource": "media-libraries"},
+                {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
+                {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
+                {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
+                {"key": "thumbnailPositionPercent", "label": "缩略图位置", "type": "number", "required": true, "defaultValue": 30, "minimum": 1, "maximum": 99},
+                {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
+                {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": false},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
+            ],
+            "permissions": {"network": ["media-source"], "filesystem": []},
+            "files": []
+        }))?,
+    )
+    .await?;
+    let plugins = PluginService::new(database.clone(), config_dir.clone());
+    plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
+    plugins
+        .update_dynamic_config(
+            MEDIA_INFO_PLUGIN_ID,
+            serde_json::Map::from_iter([
+                ("libraryIds".to_owned(), json!([library.id.to_string()])),
+                ("concurrency".to_owned(), json!(2)),
+                ("mediaInfoEnabled".to_owned(), json!(true)),
+                ("thumbnailEnabled".to_owned(), json!(false)),
+                ("thumbnailPositionPercent".to_owned(), json!(30)),
+                ("existingInfoPolicy".to_owned(), json!("OVERWRITE")),
+                ("writeSidecars".to_owned(), json!(false)),
+                ("schedule".to_owned(), json!("0 3 * * *")),
+            ]),
+        )
         .await?;
     let item_id: String =
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
@@ -744,6 +796,29 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         strm_admission_before_range, 0,
         "STRM link issue must not reserve a slot"
     );
+    let strm_head = client
+        .head(format!("{base_url}{strm_range_url}"))
+        .header(COOKIE, &cookies)
+        .header("Range", "bytes=0-3")
+        .send()
+        .await?;
+    assert_eq!(strm_head.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM strm_probe_jobs WHERE target_source_id = ?",
+        )
+        .bind(&strm_source_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "HEAD must not enqueue a playback-triggered probe"
+    );
+    assert_eq!(
+        active_admission_count(&database, &admin_id, strm_play_session_id).await?,
+        0,
+        "HEAD must not reserve a playback slot"
+    );
     let strm_range = client
         .get(format!("{base_url}{strm_range_url}"))
         .header(COOKIE, &cookies)
@@ -752,6 +827,25 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .await?;
     assert_eq!(strm_range.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(strm_range.bytes().await?.as_ref(), b"0123");
+    let mut playback_probe_source = None;
+    for _ in 0..100 {
+        playback_probe_source = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT target_source_id FROM strm_probe_jobs
+             WHERE target_source_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&strm_source_id)
+        .fetch_optional(database.pool())
+        .await?
+        .flatten();
+        if playback_probe_source.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        playback_probe_source.as_deref(),
+        Some(strm_source_id.as_str())
+    );
     assert_eq!(
         active_admission_count(&database, &admin_id, strm_play_session_id).await?,
         1,
