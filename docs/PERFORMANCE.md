@@ -2,6 +2,35 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-829–839 总览（2026-10-21）
+
+同一 1,000,000 条夹具、release `luxd`、20 Mbps / 40 ms、每轮重启服务的冷启动序列：
+
+| 指标 | LUX-829 基线 | LUX-839 后 | 变化 | 方案目标 |
+|---|---:|---:|---:|---|
+| M1 首卡可见 | 1,669.3 ms | 615.8 ms | -63.1% | ≤50% 基线（达成） |
+| M2 列表 TTFB | 1,638.5 ms | 558.3 ms | -65.9% | ≤50% 基线且 ≤300 ms（绝对目标未达） |
+| M3 排序后首卡 | 1,268.2 ms | 324.9 ms | -74.4% | ≤50% 基线（达成） |
+| M4 滚动 long task | 0 | 0 | 不变 | ≤50%（基线已为 0，无法体现） |
+| M5 首屏字节 | 19,257,462 B | 18,535,200 B | -3.7% | ≤50%（仅启用图片变体时才可能达到） |
+| M6 滚动掉帧率 | 0% | 0% | 不变 | <1%（达成） |
+
+已完成并提交：LUX-829 基准、LUX-830 排序索引、LUX-831 卡片投影、LUX-832 去 COUNT、LUX-834 静态预压缩、LUX-835 系统宋体栈、LUX-836 首屏并行、LUX-837 SSE 失效收敛、LUX-838 网格虚拟化、LUX-839 图片变体基准。
+
+未完成/部分完成：
+
+- **LUX-833 图片热路径缓存**：未改认证/ACL 代码。本机 release 图片端点 10 次热请求为 min 1.6 ms / median 1.9 ms / max 2.9 ms，已低于方案 5 ms 目标；方案中的 23 ms/张来自不同环境。会话/黑名单/撤销缓存需要新的失效设计，本轮不在缺少真实部署证据时修改安全边界。
+- **CSS 路由拆分与 Tailwind 移除**（LUX-835 后半）：未实施；主 CSS 328,721 B / gzip 52,534 B，未达到 ≤150 KB / ≤35 KB。
+- **SSE 请求上限**：活跃媒体库重取受 `maxPages: 5` 限制，未达到方案 ≤2 个请求；非活跃库不重取。
+- **图片变体灰度与内存**：未实施灰度策略，未测并发 2 峰值内存；变体仍默认关闭，M5 未包含变体开启场景。
+
+最终门禁（2026-10-21）：
+
+- `cargo build --locked`、`cargo fmt --all -- --check` 通过；`--test catalog` 3/3。
+- `cargo test --locked --all-targets`：1154 通过 / 5 失败 / 31 忽略。5 个失败与实施前基线一致：`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、3 个 FILL_MISSING 队列用例，以及受并行媒体库删除改动影响的 `shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（10 vs 9）。
+- 全目标 Clippy 仍报 14 项既有/并行代码诊断（`emby_catalog`、`media`、`playback/session`、`database_maintenance`、存储测试）；本次新增/修改文件未发现新诊断。
+- `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 通过；全量 Web 测试 842 通过 / 1 失败，唯一失败为并行媒体库删除改动的 `admin-libraries` 旧断言（LUX-826 已记录）。
+
 ## LUX-839 图片变体生成基准（2026-10-21）
 
 新增 `tests/image_variants_perf.rs`（`#[ignore]`），在本机 `media/` 的 5,857 张真实图片中按序取 1,000 张，对 360/720/1280 三档重复执行与生产相同的解码、EXIF 方向、Lanczos3 缩放、JPEG q80 编码和落盘流程。
