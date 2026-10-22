@@ -4684,3 +4684,42 @@ async fn postgres_media_item_update_triggers_are_column_specific()
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_home_index_and_statement_timestamp_defaults_exist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_media_items_home_unavailable_series'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 1, "the home query needs its partial index");
+
+    let default_expression: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_access_blacklist_rules'
+           AND column_name = 'created_at'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        default_expression.contains("unixepoch"),
+        "statement-timestamp defaults must use unixepoch(), found {default_expression}"
+    );
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
