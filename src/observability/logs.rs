@@ -63,6 +63,18 @@ pub(crate) struct NewAuditLogEvent<'a> {
     pub(crate) metadata_json: &'a str,
 }
 
+/// Opens the manager on first use inside an already-blocking context.
+fn open_manager<'a>(
+    slot: &'a mut Option<LogManager>,
+    config_dir: &Path,
+) -> io::Result<&'a mut LogManager> {
+    if slot.is_none() {
+        *slot = Some(LogManager::open(config_dir)?);
+    }
+    slot.as_mut()
+        .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))
+}
+
 impl LogStore {
     pub fn new(config_dir: &Path) -> Self {
         let manager_key = config_dir.to_path_buf();
@@ -131,37 +143,39 @@ impl LogStore {
         // Redact here, not only at the call sites: any caller that writes a record must not be
         // able to persist a token or cookie by forgetting the helper.
         let record = redact_sensitive_log_values(record);
-        self.initialize().await?;
         let manager = Arc::clone(&self.manager);
+        let config_dir = self.config_dir.clone();
         tokio::task::spawn_blocking(move || {
             let mut line = serde_json::to_vec(&record)
                 .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
             line.push(b'\n');
-            let mut manager = manager
+            let mut slot = manager
                 .lock()
                 .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
-            let manager = manager
-                .as_mut()
-                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
-            manager.write_line(&line)
+            // Open on first use inside this blocking task: a separate initialize() would cost a
+            // second thread hop per record.
+            open_manager(&mut slot, &config_dir)?.write_line(&line)
         })
         .await
         .map_err(|error| io::Error::other(format!("日志写入任务失败: {error}")))?
     }
 
     pub(crate) async fn append_json_batch_and_sync(&self, records: Vec<Value>) -> io::Result<()> {
-        self.suspend_archive_pruning().await?;
         if records.is_empty() {
             return Ok(());
         }
+        let records = records
+            .into_iter()
+            .map(redact_sensitive_log_values)
+            .collect::<Vec<_>>();
         let manager = Arc::clone(&self.manager);
+        let config_dir = self.config_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let mut manager = manager
+            let mut slot = manager
                 .lock()
                 .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
-            let manager = manager
-                .as_mut()
-                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
+            let manager = open_manager(&mut slot, &config_dir)?;
+            manager.defer_archive_pruning = true;
             for record in records {
                 let mut line = serde_json::to_vec(&record)
                     .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
@@ -1144,7 +1158,11 @@ impl LogManager {
             self.active_path = self.log_dir.join(log_file_name(date));
             self.open_active_file()?;
         }
-        if let Some(file) = self.active_file.as_ref() {
+        // `active_bytes` tracks every write, so a plain size comparison detects a torn tail left
+        // by another writer (or a previous crash) without re-reading the file per line.
+        if let Some(file) = self.active_file.as_ref()
+            && file.metadata()?.len() != self.active_bytes
+        {
             self.active_bytes = repair_incomplete_jsonl_tail(file)?;
         }
         let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
