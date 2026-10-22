@@ -31288,3 +31288,42 @@ fn database_pool_options_bound_waits_and_connection_age() {
     assert!(options.get_idle_timeout().is_some());
     assert!(options.get_max_lifetime().is_some());
 }
+
+#[test]
+fn sql_placeholder_rewrite_ignores_strings_and_comments() {
+    use crate::config::DatabaseBackend;
+
+    let rewrite = |sql: &str| {
+        super::adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::AssertSqlSafe(sql.to_owned()),
+        )
+        .as_str()
+        .to_owned()
+    };
+    assert_eq!(
+        rewrite("SELECT * FROM t WHERE a = ? AND b = '?'"),
+        "SELECT * FROM t WHERE a = $1 AND b = '?'"
+    );
+    assert_eq!(
+        rewrite("SELECT * FROM t -- note: ? placeholder\nWHERE a = ?"),
+        "SELECT * FROM t -- note: ? placeholder\nWHERE a = $1"
+    );
+    assert_eq!(
+        rewrite("SELECT /* a ? b */ * FROM t WHERE a = ?"),
+        "SELECT /* a ? b */ * FROM t WHERE a = $1"
+    );
+    assert_eq!(
+        rewrite("SELECT 'it''s ?' AS x, ? AS y"),
+        "SELECT 'it''s ?' AS x, $1 AS y"
+    );
+    // SQLite keeps qmark placeholders untouched.
+    assert_eq!(
+        super::adapt_sql_for_backend(
+            DatabaseBackend::Sqlite,
+            sqlx::AssertSqlSafe("SELECT ?".to_owned())
+        )
+        .as_str(),
+        "SELECT ?"
+    );
+}

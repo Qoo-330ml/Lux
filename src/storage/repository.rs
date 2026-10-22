@@ -8477,6 +8477,33 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
                 in_double_quote = !in_double_quote;
                 adapted.push(character);
             }
+            // Comments are copied verbatim: a `?` inside one is documentation, not a placeholder.
+            '-' if !in_single_quote && !in_double_quote && characters.peek() == Some(&'-') => {
+                adapted.push(character);
+                if let Some(next) = characters.next() {
+                    adapted.push(next);
+                }
+                for next in characters.by_ref() {
+                    adapted.push(next);
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if !in_single_quote && !in_double_quote && characters.peek() == Some(&'*') => {
+                adapted.push(character);
+                if let Some(next) = characters.next() {
+                    adapted.push(next);
+                }
+                let mut previous = '\0';
+                while let Some(next) = characters.next() {
+                    adapted.push(next);
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
             '?' if !in_single_quote && !in_double_quote => {
                 adapted.push('$');
                 // Formatting into String cannot fail, but the formatting API returns Result.
