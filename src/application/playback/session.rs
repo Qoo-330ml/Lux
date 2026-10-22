@@ -1441,7 +1441,21 @@ impl ResourceSigner {
         let Some(expected) = self.sign(session_id, resource, expires_at) else {
             return false;
         };
-        expected.as_bytes().ct_eq(signature.as_bytes()).into()
+        if bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
+            return true;
+        }
+        // URLs signed before the length-prefixed format still work until they expire.
+        let Some(legacy) = self.sign_legacy(session_id, resource, expires_at) else {
+            return false;
+        };
+        legacy.as_bytes().ct_eq(signature.as_bytes()).into()
+    }
+
+    /// Legacy (unprefixed) format, kept only to let in-flight URLs finish.
+    fn sign_legacy(&self, session_id: &str, resource: &str, expires_at: i64) -> Option<String> {
+        let mut mac = HmacSha256::new_from_slice(&self.key).ok()?;
+        mac.update(format!("lux-web-playback\n{session_id}\n{resource}\n{expires_at}").as_bytes());
+        Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
     }
 }
 
@@ -1453,8 +1467,19 @@ pub fn unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+/// Length-prefixes every field so a resource name containing a newline cannot shift the
+/// boundaries between the signed components.
 fn signed_message(session_id: &str, resource: &str, expires_at: i64) -> String {
-    format!("lux-web-playback\n{session_id}\n{resource}\n{expires_at}")
+    let mut message = String::with_capacity(session_id.len() + resource.len() + 64);
+    message.push_str("lux-web-playback\n");
+    for field in [session_id, resource] {
+        message.push_str(&field.len().to_string());
+        message.push(':');
+        message.push_str(field);
+        message.push('\n');
+    }
+    message.push_str(&expires_at.to_string());
+    message
 }
 
 fn emby_direct_stream_resource(
@@ -1511,6 +1536,40 @@ mod tests {
         storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
     };
     use uuid::Uuid;
+
+    #[test]
+    fn legacy_signatures_still_verify_until_the_format_is_retired() {
+        let signer = ResourceSigner::random();
+        let expires_at = unix_timestamp() + 60;
+        let legacy = signer
+            .sign_legacy("session-1", "direct", expires_at)
+            .expect("sign");
+        assert!(signer.verify("session-1", "direct", expires_at, &legacy, unix_timestamp()));
+        assert!(!signer.verify("session-2", "direct", expires_at, &legacy, unix_timestamp()));
+    }
+
+    #[test]
+    fn signature_fields_cannot_be_shifted_by_embedded_newlines() {
+        let signer = ResourceSigner::random();
+        let expires_at = unix_timestamp() + 60;
+        let signature = signer
+            .sign("session-1", "direct\n1:x", expires_at)
+            .expect("sign");
+        assert!(!signer.verify(
+            "session-1",
+            "direct",
+            expires_at,
+            &signature,
+            unix_timestamp()
+        ));
+        assert!(signer.verify(
+            "session-1",
+            "direct\n1:x",
+            expires_at,
+            &signature,
+            unix_timestamp()
+        ));
+    }
 
     #[test]
     fn signatures_are_bound_to_the_session_resource_and_expiry() {
