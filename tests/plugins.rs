@@ -323,6 +323,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()?;
 
@@ -861,6 +862,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
@@ -994,6 +996,7 @@ async fn emby_route_plugin_is_only_exposed_when_installed_and_enabled()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(3))
         .build()?;
     let (cookies, csrf) = admin_session(&client, &base_url).await?;

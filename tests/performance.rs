@@ -2074,6 +2074,7 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
         .build()?;
     let login = client
@@ -2521,6 +2522,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
         .build()?;
     let login = client
@@ -3324,6 +3326,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
         .build()?;
     let login = client

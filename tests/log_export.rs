@@ -67,6 +67,7 @@ async fn admin_can_export_selected_daily_logs_but_viewer_cannot()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let base_url = format!("http://{address}");

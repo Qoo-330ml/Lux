@@ -91,6 +91,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let unauthenticated_retention_update = client

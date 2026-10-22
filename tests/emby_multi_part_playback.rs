@@ -117,6 +117,7 @@ async fn playback_info_keeps_the_parts_of_a_version_together()
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         let base_url = format!("http://{address}");
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()?;
         let login = client

@@ -89,6 +89,7 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     };
     let (base_url, server, _) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -787,6 +788,7 @@ async fn admin_can_browse_server_directories_with_bounded_pagination()
 
     let (base_url, server, _) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let setup = client
@@ -960,6 +962,7 @@ async fn admin_can_run_registered_auto_library_cover_task_manually()
     };
     let (base_url, server, database) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let setup = client

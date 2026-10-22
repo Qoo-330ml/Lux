@@ -247,6 +247,7 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;

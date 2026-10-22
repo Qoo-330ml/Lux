@@ -121,6 +121,7 @@ fi
         .to_owned();
 
     let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     for (title, target) in [

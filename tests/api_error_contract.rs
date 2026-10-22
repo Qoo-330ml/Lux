@@ -11,6 +11,7 @@ async fn empty_lux_api_service_unavailable_responses_use_the_error_contract()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app()).await });
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 

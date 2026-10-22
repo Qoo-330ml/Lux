@@ -84,6 +84,7 @@ async fn strm_absolute_path_enables_web_and_emby_local_playback_without_extra_se
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let stream_url = format!("{base_url}/Videos/{item_id}/{source_id}/stream");

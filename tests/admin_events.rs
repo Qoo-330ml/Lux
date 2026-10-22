@@ -68,6 +68,7 @@ async fn admin_event_stream_sends_ready_frame_to_an_admin() -> Result<(), Box<dy
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -158,6 +159,7 @@ async fn user_event_stream_is_authenticated_and_does_not_expose_admin_events()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 

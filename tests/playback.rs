@@ -781,6 +781,7 @@ async fn emby_direct_playback_admission() -> Result<(), Box<dyn std::error::Erro
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let login = client

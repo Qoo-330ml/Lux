@@ -11,6 +11,7 @@ async fn live_health_endpoint_returns_json_and_request_id() -> Result<(), Box<dy
     let server = tokio::spawn(async move { axum::serve(listener, app()).await });
 
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let response = client

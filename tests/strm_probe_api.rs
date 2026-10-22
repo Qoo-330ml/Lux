@@ -316,6 +316,7 @@ async fn only_authorized_strm_media_get_triggers_playback_probe()
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let unauthorized = client

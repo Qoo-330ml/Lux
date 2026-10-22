@@ -77,6 +77,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 
