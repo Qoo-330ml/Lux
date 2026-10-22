@@ -15,6 +15,21 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.14",
+    date: "2026-10-22",
+    sections: [
+      { kind: "added", items: [
+        "管理员用户管理升级为分组工作区，并将用户详情按概览、访问、设备、活动和偏好设置整理。",
+      ] },
+      { kind: "changed", items: [
+        "降低媒体扫描、Emby 活动和数据库维护的写入压力：合并增量扫描文件更新、节流活动记录，并按回收空间阈值执行 SQLite VACUUM。",
+        "内容分级索引改用持久化队列和批量处理；为自动元数据重试、推荐统计和通知保留增加索引或快照，减少周期性全表扫描。",
+        "减少后台空闲开销：缓存仪表盘统计和健康探测、跳过无变化时的推荐计算与自动 SQLite dbstat 检查、降低 Webhook 空闲轮询，并清理过期通知历史。",
+        "每个数据库的旧版兼容修复仅执行一次。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.13",
     date: "2026-10-21",
     sections: [
