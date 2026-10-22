@@ -161,7 +161,9 @@ pub(crate) async fn accept_user_invitation(
     }
 
     let password_hash = PasswordService::new()
-        .and_then(|passwords| passwords.hash_password(input.password))
+        .map_err(|_| UserInvitationAcceptanceError::PasswordUnavailable)?
+        .hash_password(input.password)
+        .await
         .map_err(|_| UserInvitationAcceptanceError::PasswordUnavailable)?;
     let user_id = uuid::Uuid::now_v7().to_string();
     let display_name = if display_name.is_empty() {
@@ -743,9 +745,11 @@ mod tests {
         assert_eq!(email_verified_at, Some(2_001));
         assert_eq!(is_disabled, 0);
         assert!(!password_hash.contains("correct horse battery staple"));
+        let passwords = crate::auth::password::PasswordService::new()?;
         assert!(
-            crate::auth::password::PasswordService::new()?
-                .verify_password(Some(&password_hash), "correct horse battery staple")?
+            passwords
+                .verify_password(Some(&password_hash), "correct horse battery staple")
+                .await?
         );
         assert!(matches!(
             accept_user_invitation(&database, &directory.path().join("config"), input, 2_002,)

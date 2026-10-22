@@ -137,7 +137,7 @@ impl UserStore {
         let username_normalized = normalize_username(username)?;
         let display_name = normalized_display_name(display_name, &username_normalized);
         let email = email.map(normalize_email).transpose()?;
-        let password_hash = self.passwords.hash_password(password)?;
+        let password_hash = self.passwords.hash_password(password).await?;
         let id = UserId::new();
         let id_string = id.to_string();
 
@@ -180,7 +180,7 @@ impl UserStore {
         let username_normalized = normalize_username(username)?;
         let display_name = normalized_display_name(display_name, &username_normalized);
         let email = email.map(normalize_email).transpose()?;
-        let password_hash = self.passwords.hash_password(password)?;
+        let password_hash = self.passwords.hash_password(password).await?;
         let id = UserId::new();
         let id_string = id.to_string();
 
@@ -223,7 +223,7 @@ impl UserStore {
         let username_normalized = normalize_username(username)?;
         let display_name = normalized_display_name(display_name, &username_normalized);
         let placeholder = format!("lux-unset-password-{}", UserId::new());
-        let password_hash = self.passwords.hash_password(&placeholder)?;
+        let password_hash = self.passwords.hash_password(&placeholder).await?;
         let id = UserId::new();
 
         self.database
@@ -262,7 +262,7 @@ impl UserStore {
         let username_normalized = normalize_username(username)?;
         let display_name = normalized_display_name(display_name, &username_normalized);
         let placeholder = format!("lux-unset-password-{}", UserId::new());
-        let password_hash = self.passwords.hash_password(&placeholder)?;
+        let password_hash = self.passwords.hash_password(&placeholder).await?;
         let id = UserId::new();
         let id_string = id.to_string();
 
@@ -455,11 +455,10 @@ impl UserStore {
         user_id: &str,
         update: UserUpdate<'_>,
     ) -> Result<Option<(UserRecord, Vec<String>)>, UserStoreError> {
-        let password_hash = update
-            .password
-            .filter(|password| !password.is_empty())
-            .map(|password| self.passwords.hash_password(password))
-            .transpose()?;
+        let password_hash = match update.password.filter(|password| !password.is_empty()) {
+            Some(password) => Some(self.passwords.hash_password(password).await?),
+            None => None,
+        };
         let updated = match self
             .database
             .update_user_with_hls_session_ids(
@@ -528,12 +527,13 @@ impl UserStore {
         };
         let current_password_matches = self
             .passwords
-            .verify_password(Some(stored.password_hash.as_str()), current_password)?;
+            .verify_password(Some(stored.password_hash.as_str()), current_password)
+            .await?;
         if stored.is_disabled || !stored.has_password || !current_password_matches {
             return Ok(false);
         }
 
-        let password_hash = self.passwords.hash_password(new_password)?;
+        let password_hash = self.passwords.hash_password(new_password).await?;
         let updated = self
             .database
             .update_user(
@@ -600,7 +600,7 @@ impl UserStore {
     ) -> Result<UserRecord, UserStoreError> {
         let username_normalized = normalize_username(username)?;
         let display_name = normalized_display_name(display_name, &username_normalized);
-        let password_hash = self.passwords.hash_password(password)?;
+        let password_hash = self.passwords.hash_password(password).await?;
         let id = UserId::new();
         let inserted = self
             .database
@@ -679,7 +679,10 @@ impl UserStore {
         password: &str,
     ) -> Result<Option<UserRecord>, UserStoreError> {
         let stored_hash = stored.as_ref().map(|user| user.password_hash.as_str());
-        let password_matches = self.passwords.verify_password(stored_hash, password)?;
+        let password_matches = self
+            .passwords
+            .verify_password(stored_hash, password)
+            .await?;
 
         let Some(stored) = stored else {
             return Ok(None);

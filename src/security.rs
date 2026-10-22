@@ -40,7 +40,10 @@ impl LoginRateLimiter {
         maybe_cleanup(&mut state, now);
         let key = key_digest(key);
         let Some(attempt) = state.attempts.get(&key) else {
-            return state.attempts.len() < MAX_ENTRIES;
+            // A saturated table must never deny an account that has no entry yet: otherwise a
+            // flood of unique usernames would lock every legitimate sign-in out. Unknown keys
+            // simply stay untracked until the periodic sweep frees capacity.
+            return true;
         };
         if now.saturating_duration_since(attempt.started_at) >= WINDOW {
             state.attempts.remove(&key);
@@ -184,7 +187,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[tokio::test]
-    async fn unique_failure_keys_are_bounded_and_active_keys_are_not_evicted() {
+    async fn unique_failure_keys_are_bounded_and_a_full_table_does_not_deny_new_keys() {
         let limiter = LoginRateLimiter::default();
         let active_key = "active-user";
         limiter.record_failure(active_key).await;
@@ -207,7 +210,9 @@ mod tests {
         assert!(limiter.is_allowed(active_key).await);
         limiter.record_failure(active_key).await;
         assert!(!limiter.is_allowed(active_key).await);
-        assert!(!limiter.is_allowed("another-new-user").await);
+        // Tracked keys keep their counters, but a saturated table must never lock out an
+        // account that has no entry yet: unknown keys fail open instead.
+        assert!(limiter.is_allowed("another-new-user").await);
     }
 
     #[tokio::test]

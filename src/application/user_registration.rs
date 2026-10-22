@@ -309,7 +309,9 @@ pub(crate) async fn submit_public_user_registration(
     .map_err(|_| UserRegistrationError::SettingsUnavailable)?;
 
     let password_hash = PasswordService::new()
-        .and_then(|passwords| passwords.hash_password(input.password))
+        .map_err(|_| UserRegistrationError::PasswordUnavailable)?
+        .hash_password(input.password)
+        .await
         .map_err(|_| UserRegistrationError::PasswordUnavailable)?;
     let user_id = Uuid::now_v7().to_string();
     let challenge_id = Uuid::now_v7().to_string();
