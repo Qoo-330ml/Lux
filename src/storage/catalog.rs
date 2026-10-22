@@ -10246,11 +10246,9 @@ fn filtered_catalog_list_query<'a>(
     } else {
         filter.limit.saturating_add(1)
     };
-    if let Some((selected_sql, mut union_binds)) =
+    if let Some((selected_sql, union_binds)) =
         catalog_list_union_selected_sql(filter, &where_clause, &binds, item_order, fetch_limit)
     {
-        union_binds.push(CatalogBind::Integer(fetch_limit));
-        union_binds.push(CatalogBind::Integer(filter.offset));
         return (
             catalog_list_query_from_selected(&selected_sql, item_order),
             union_binds,
@@ -10354,11 +10352,13 @@ fn catalog_list_union_selected_sql<'a>(
     );
     let branch_limit = filter.offset.saturating_add(fetch_limit);
     let mut branches = Vec::with_capacity(library_count);
-    let mut union_binds = Vec::with_capacity(library_count * (rest_binds.len() + 2));
+    let mut union_binds = Vec::with_capacity(library_count * (rest_binds.len() + 2) + 2);
     for (index, library_id) in filter.library_ids.iter().enumerate() {
+        // The branch columns carry the sort keys so the union can be ordered and paged
+        // globally before the per-source detail join runs.
         branches.push(format!(
             "SELECT * FROM (
-                 SELECT mi.id
+                 SELECT mi.id AS id, mi.added_at AS added_at, mi.title AS title
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  {branch_where}
@@ -10370,7 +10370,20 @@ fn catalog_list_union_selected_sql<'a>(
         union_binds.extend(rest_binds.iter().copied());
         union_binds.push(CatalogBind::Integer(branch_limit));
     }
-    Some((branches.join("\nUNION ALL\n"), union_binds))
+    // Page on item ids, not on the joined media_source/media_stream rows: one item can expand
+    // into several detail rows, so the row-level LIMIT would drop items from a full page.
+    let paged_sql = format!(
+        "SELECT paged.id
+         FROM (
+             {}
+         ) paged
+         ORDER BY paged.added_at DESC, LOWER(paged.title) ASC, paged.id ASC
+         LIMIT ? OFFSET ?",
+        branches.join("\nUNION ALL\n")
+    );
+    union_binds.push(CatalogBind::Integer(fetch_limit));
+    union_binds.push(CatalogBind::Integer(filter.offset));
+    Some((paged_sql, union_binds))
 }
 
 fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {
@@ -10518,16 +10531,63 @@ mod tests {
             descending: true,
             offset: 0,
             limit: 2,
-            include_total: false,
+            include_total: true,
         };
-        let (rows, _) = database.list_filtered_catalog_rows(&filter).await?;
+        let (rows, total) = database.list_filtered_catalog_rows(&filter).await?;
+        assert_eq!(total, 3);
         assert_eq!(
             rows.iter()
                 .map(|row| row.item_id.as_str())
                 .collect::<Vec<_>>(),
-            ["newest", "middle", "old"]
+            ["newest", "middle"]
+        );
+
+        let second_page = CatalogFilterQuery {
+            offset: 2,
+            ..filter
+        };
+        let (rows, _) = database.list_filtered_catalog_rows(&second_page).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
         );
         Ok(())
+    }
+
+    #[test]
+    fn multi_library_default_date_page_binds_match_placeholders() {
+        let libraries = vec!["library-a".to_owned(), "library-b".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 50,
+            limit: 24,
+            include_total: false,
+        };
+        let (query, binds) = filtered_catalog_list_query(&filter);
+        assert!(query.contains("UNION ALL"));
+        assert_eq!(
+            query.matches('?').count(),
+            binds.len(),
+            "every placeholder must have exactly one bound value"
+        );
     }
 
     #[test]
