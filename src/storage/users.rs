@@ -1590,9 +1590,13 @@ impl Database {
 
     pub(crate) async fn touch_access_token(&self, token_hash: &[u8]) -> Result<(), StorageError> {
         self.query(
-            "UPDATE access_tokens SET last_seen_at = unixepoch(), updated_at = unixepoch()
-             WHERE token_hash = ? AND revoked_at IS NULL",
+            "UPDATE access_tokens
+                SET last_seen_at = unixepoch(),
+                    updated_at = unixepoch(),
+                    expires_at = unixepoch() + ?
+              WHERE token_hash = ? AND revoked_at IS NULL",
         )
+        .bind(EMBY_ACCESS_TOKEN_TTL_SECONDS)
         .bind(token_hash)
         .execute(&self.pool)
         .await
@@ -2328,7 +2332,8 @@ impl Database {
                     ) AS last_activity_at
              FROM access_tokens at
              JOIN users u ON u.id = at.user_id
-             WHERE at.token_hash = ? AND at.revoked_at IS NULL",
+             WHERE at.token_hash = ? AND at.revoked_at IS NULL
+               AND (at.expires_at IS NULL OR at.expires_at > unixepoch())",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -2347,7 +2352,8 @@ impl Database {
         self.query(
             "SELECT device_id, client_name, device_name, client_version
              FROM access_tokens
-             WHERE token_hash = ? AND revoked_at IS NULL",
+             WHERE token_hash = ? AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > unixepoch())",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)

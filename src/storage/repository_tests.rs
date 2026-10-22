@@ -30688,3 +30688,73 @@ async fn successful_write_probes_are_cached_so_health_checks_do_not_write()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn emby_access_tokens_expire_and_renew_on_touch() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Admin", "Admin", "password")
+        .await?;
+    let user_id = user.id.to_string();
+    let token_hash = [7_u8; 32];
+    database
+        .create_access_token(NewAccessToken {
+            id: "expiring-token",
+            token_hash: &token_hash,
+            user_id: &user_id,
+            device_id: "device",
+            client_name: "Client",
+            device_name: "Device",
+            client_version: "1.0",
+            device_type: Some("DEVICE"),
+        })
+        .await?;
+    assert!(
+        database
+            .find_user_by_access_token(&token_hash)
+            .await?
+            .is_some(),
+        "a fresh token must resolve"
+    );
+    let expires_at: i64 =
+        sqlx::query_scalar("SELECT expires_at FROM access_tokens WHERE id = 'expiring-token'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(expires_at > 0, "tokens are created with an expiry");
+
+    sqlx::query(
+        "UPDATE access_tokens SET expires_at = unixepoch() - 1 WHERE id = 'expiring-token'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .find_user_by_access_token(&token_hash)
+            .await?
+            .is_none(),
+        "expired tokens must not resolve"
+    );
+
+    sqlx::query(
+        "UPDATE access_tokens SET expires_at = unixepoch() + 5 WHERE id = 'expiring-token'",
+    )
+    .execute(database.pool())
+    .await?;
+    database.touch_access_token(&token_hash).await?;
+    let renewed: i64 =
+        sqlx::query_scalar("SELECT expires_at FROM access_tokens WHERE id = 'expiring-token'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        renewed > crate::application::playback::session::unix_timestamp() + 86_400,
+        "a touch slides the expiry window"
+    );
+    Ok(())
+}

@@ -9966,11 +9966,12 @@ impl Database {
         &self,
         token: NewAccessToken<'_>,
     ) -> Result<(), StorageError> {
+        let expires_at = current_unix_timestamp().saturating_add(EMBY_ACCESS_TOKEN_TTL_SECONDS);
         self.query(
             "INSERT INTO access_tokens (
                 id, token_hash, user_id, device_id, client_name,
-                device_name, client_version, device_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                device_name, client_version, device_type, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(token.id)
         .bind(token.token_hash)
@@ -9980,6 +9981,7 @@ impl Database {
         .bind(token.device_name)
         .bind(token.client_version)
         .bind(token.device_type)
+        .bind(expires_at)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -10013,6 +10015,7 @@ impl Database {
             "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM access_tokens
                 WHERE token_hash = ? AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > unixepoch())
             ) THEN 1 ELSE 0 END",
         )
         .bind(token_hash)

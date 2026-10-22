@@ -322,6 +322,8 @@ pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 pub(crate) const MAX_PLAYBACK_SESSION_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
+/// Sliding window for Emby access tokens; clients re-authenticate after it lapses.
+pub(crate) const EMBY_ACCESS_TOKEN_TTL_SECONDS: i64 = 180 * 24 * 60 * 60;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
 // Four binds per reconciliation row keep 200 rows below SQLite's historical 999-variable limit.
 const SCAN_DML_CHUNK_SIZE: usize = 200;
