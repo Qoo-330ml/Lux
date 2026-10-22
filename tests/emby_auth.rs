@@ -664,11 +664,24 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
     assert_eq!(avatar_upload_as_base64.status(), reqwest::StatusCode::OK);
     assert!(avatar_upload_as_base64.bytes().await?.is_empty());
 
+    let avatar_read_anonymous = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        avatar_read_anonymous.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
     let avatar_read = client
         .get(format!(
             "http://{address}/emby/Users/{}/Images/Primary",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_read.status(), reqwest::StatusCode::OK);
@@ -686,6 +699,7 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
             "http://{address}/emby/Users/{}/Images/Primary/0",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_read_at_index.status(), reqwest::StatusCode::OK);
@@ -699,6 +713,7 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
             "http://{address}/emby/Users/{}/Images/Primary",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_head.status(), reqwest::StatusCode::OK);
@@ -720,6 +735,7 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
             "http://{address}/emby/Users/{}/Images/Primary",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_after_delete.status(), reqwest::StatusCode::NOT_FOUND);

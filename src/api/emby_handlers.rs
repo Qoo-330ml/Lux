@@ -1889,20 +1889,31 @@ async fn emby_user_avatar_response(
 }
 
 pub(super) async fn emby_user_avatar(
+    headers: HeaderMap,
     Path((user_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyUserImageQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let _ = query.auth;
+    // Avatars are user data: require a valid Emby credential before serving them.
+    if let Err(status) =
+        require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await
+    {
+        return status.into_response();
+    }
     emby_user_avatar_response(&image_type, &user_id, query.index, &state, false).await
 }
 
 pub(super) async fn emby_user_avatar_head(
+    headers: HeaderMap,
     Path((user_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyUserImageQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let _ = query.auth;
+    if let Err(status) =
+        require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await
+    {
+        return status.into_response();
+    }
     emby_user_avatar_response(&image_type, &user_id, query.index, &state, true).await
 }
 
