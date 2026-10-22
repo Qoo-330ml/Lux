@@ -810,7 +810,7 @@ async fn record_web_device_observation(
     let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
         return;
     };
-    let remote_ip = request_client_ip(headers, &state.remote_access);
+    let remote_ip = request_client_ip(headers, &state).await;
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
@@ -946,7 +946,7 @@ pub(super) async fn auth_login(
                 &state.admin_events,
                 &user_id,
                 "LUX_WEB",
-                request_client_ip(&headers, &state.remote_access),
+                request_client_ip(&headers, &state).await,
             )
             .await;
         }
@@ -983,7 +983,7 @@ pub(super) async fn auth_login(
         "AUTH_LOGIN",
         None,
         json!({
-            "remoteIp": request_client_ip(&headers, &state.remote_access),
+            "remoteIp": request_client_ip(&headers, &state).await,
         }),
     )
     .await;
@@ -1719,7 +1719,7 @@ pub(super) async fn auth_create_device_pairing(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let client_ip = pairing_rate_limit_client_ip(&headers, &state.remote_access);
+    let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
     let rate_key = format!("create:{}:{client_ip}", session.user.id);
     if !state
         .device_pairing_rate_limiter
@@ -1823,7 +1823,7 @@ pub(super) async fn redeem_device_pairing(
     State(state): State<AppState>,
     Json(request): Json<DevicePairingRedeemRequest>,
 ) -> Response {
-    let client_ip = pairing_rate_limit_client_ip(&headers, &state.remote_access);
+    let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
     if !state
         .device_pairing_rate_limiter
         .try_acquire(&format!("redeem:{client_ip}"), DEVICE_PAIRING_REDEEM_LIMIT)
@@ -1971,13 +1971,9 @@ fn bounded_non_empty(value: &str, max_bytes: usize) -> Option<&str> {
     (!value.is_empty() && value.len() <= max_bytes).then_some(value)
 }
 
-fn pairing_rate_limit_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> String {
-    policy
-        .client_ip(
-            header_str(headers, "x-lux-peer-ip"),
-            header_str(headers, "x-forwarded-for"),
-        )
-        .map(|address| address.to_string())
+async fn pairing_rate_limit_client_ip(headers: &HeaderMap, state: &AppState) -> String {
+    request_client_ip(headers, state)
+        .await
         .unwrap_or_else(|| "local".to_owned())
 }
 

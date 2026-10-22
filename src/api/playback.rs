@@ -1717,7 +1717,7 @@ pub(super) async fn handle_emby_playback_event(
             occurred_at,
         ),
     );
-    let remote_ip = request_client_ip(&headers, &state.remote_access);
+    let remote_ip = request_client_ip(&headers, &state).await;
     let activity_remote_ip = remote_ip.as_deref().or_else(|| {
         previous_session
             .as_ref()
@@ -4317,7 +4317,7 @@ pub(super) async fn lux_web_playback_event(
                 occurred_at,
             ),
         );
-        let remote_ip = request_client_ip(&headers, &state.remote_access);
+        let remote_ip = request_client_ip(&headers, &state).await;
         let activity_remote_ip = remote_ip.as_deref().or_else(|| {
             previous_session
                 .as_ref()
@@ -4568,7 +4568,7 @@ pub(super) async fn lux_post_progress(
             occurred_at,
         ),
     );
-    let remote_ip = request_client_ip(&headers, &state.remote_access);
+    let remote_ip = request_client_ip(&headers, &state).await;
     let activity_remote_ip = remote_ip.as_deref().or_else(|| {
         previous_session
             .as_ref()

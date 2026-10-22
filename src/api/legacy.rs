@@ -1077,15 +1077,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option<String> {
-    policy
-        .reported_client_ip(
-            header_str(headers, "x-lux-peer-ip"),
-            header_str(headers, "x-forwarded-for"),
-            header_str(headers, "x-real-ip"),
-            header_str(headers, "forwarded"),
-        )
-        .map(|address| address.to_string())
+/// Client address for audit records and rate-limit keys.
+///
+/// Raw `X-Forwarded-For` values are attacker-controlled; only the trusted-proxy resolver may
+/// decide which address a request actually came from.
+pub(super) async fn request_client_ip(headers: &HeaderMap, state: &AppState) -> Option<String> {
+    match request_access_ip(headers, state).await {
+        Ok(address) => address.map(|address| address.to_string()),
+        Err(_) => None,
+    }
 }
 
 async fn request_access_ip(

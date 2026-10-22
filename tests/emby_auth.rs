@@ -1167,6 +1167,13 @@ async fn emby_authenticated_access_refreshes_device_activity()
     }));
     let client = reqwest::Client::new();
     let device_id = "emby-activity-device";
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -1218,6 +1225,36 @@ async fn emby_authenticated_access_refreshes_device_activity()
     assert_eq!(refreshed_device.0, first_seen_at);
     assert!(refreshed_device.1 > 1);
     assert_eq!(refreshed_device.2.as_deref(), Some("203.0.113.11"));
+
+    // Once the proxy allowlist is gone the forwarded header must not be believed: the recorded
+    // address has to fall back to the connection peer.
+    sqlx::query("DELETE FROM server_settings WHERE key = 'trusted_proxy_cidrs'")
+        .execute(database.pool())
+        .await?;
+    let untrusted_forward = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="Apple TV", DeviceId="emby-untrusted-forward", Version="1.0""#,
+        )
+        .header("x-forwarded-for", "203.0.113.12")
+        .json(&json!({ "Username": "Admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(untrusted_forward.status(), reqwest::StatusCode::OK);
+    let untrusted_device: (Option<String>,) = sqlx::query_as(
+        "SELECT last_remote_ip FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind("emby-untrusted-forward")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(untrusted_device.0.as_deref(), Some("127.0.0.1"));
+    sqlx::query("DELETE FROM user_devices WHERE user_id = ? AND device_id = ?")
+        .bind(admin.id.to_string())
+        .bind("emby-untrusted-forward")
+        .execute(database.pool())
+        .await?;
 
     let login_without_device = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -1438,6 +1475,13 @@ async fn emby_password_logins_update_device_inventory_without_blocking_auth()
     let client = reqwest::Client::new();
     let device_id = "emby-shared-device";
     let remote_ip = "203.0.113.10";
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
 
     let first_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))

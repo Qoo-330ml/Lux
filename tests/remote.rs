@@ -157,7 +157,7 @@ fn reported_forwarded_ip_rejects_unknown_malformed_and_later_proxy_nodes() {
 }
 
 #[tokio::test]
-async fn alternate_forwarded_headers_are_reported_in_playback_sessions()
+async fn forwarded_headers_are_only_honoured_for_trusted_proxies()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -223,16 +223,53 @@ async fn alternate_forwarded_headers_are_reported_in_playback_sessions()
         .ok_or("missing token")?
         .to_owned();
 
+    // Without a trusted proxy, forwarded headers must be ignored in favour of the peer.
+    for (header, value) in [
+        ("X-Real-IP", "203.0.113.9"),
+        ("Forwarded", "for=198.51.100.17;proto=https"),
+        ("X-Forwarded-For", "198.51.100.20"),
+    ] {
+        let playing = client
+            .post(format!("{base_url}/Sessions/Playing"))
+            .header("X-Emby-Token", &token)
+            .header(header, value)
+            .json(&json!({
+                "ItemId": emby_item_id,
+                "MediaSourceId": source_id,
+                "PlaySessionId": "proxy-session",
+                "PositionTicks": 100,
+                "RunTimeTicks": 5000,
+            }))
+            .send()
+            .await?;
+        assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+        let stored_ip: Option<String> = sqlx::query_scalar(
+            "SELECT remote_ip FROM playback_sessions WHERE play_session_id = 'proxy-session'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            stored_ip.as_deref(),
+            Some("127.0.0.1"),
+            "{header} must not be trusted without a proxy allowlist"
+        );
+    }
+
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
+
     for prefix in ["", "/emby"] {
         for (header, value, expected) in [
-            ("X-Real-IP", "203.0.113.9", "203.0.113.9"),
-            ("X-Real-IP", "2001:db8::9", "2001:db8::9"),
-            (
-                "Forwarded",
-                "for=198.51.100.17;proto=https",
-                "198.51.100.17",
-            ),
-            ("Forwarded", r#"For="[2001:db8::17]:4711""#, "2001:db8::17"),
+            ("X-Forwarded-For", "203.0.113.9", "203.0.113.9"),
+            ("X-Forwarded-For", "2001:db8::9", "2001:db8::9"),
+            // X-Real-IP and Forwarded are outside the trusted resolver contract.
+            ("X-Real-IP", "203.0.113.9", "127.0.0.1"),
+            ("Forwarded", "for=198.51.100.17;proto=https", "127.0.0.1"),
         ] {
             let playing = client
                 .post(format!("{base_url}{prefix}/Sessions/Playing"))
