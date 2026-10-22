@@ -127,7 +127,7 @@ describe("AdminUsersPage account preference copy", () => {
     });
     expect(container.textContent).toContain("爱丽丝：成功");
     expect(container.textContent).toContain("鲍勃：偏好已被其他操作修改");
-    expect(container.textContent).toContain("当前页已选 0 人");
+    expect(container.querySelector(".lux-users-selection")).toBeNull();
     expect(listUsers.mock.calls.filter(([query]) => query?.pageSize === 20)).toHaveLength(2);
   });
 

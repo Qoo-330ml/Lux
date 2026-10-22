@@ -1,0 +1,526 @@
+/* 用户与权限工作区：分区栏、卡片、工具条、表格、批量条、抽屉。 */
+
+.lux-users-page { display: grid; }
+
+.lux-users-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding-bottom: 20px; }
+
+.lux-users-heading h1 { margin: 7px 0 6px; color: var(--lux-text); font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.055em; line-height: 1.08; }
+
+.lux-users-heading p { max-width: 62ch; margin: 0; color: var(--lux-muted); font-size: .82rem; line-height: 1.55; }
+
+.lux-users-heading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+
+.lux-users-workspace { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: 26px; align-items: start; }
+
+.lux-users-rail { position: sticky; top: 18px; display: grid; gap: 20px; }
+
+.lux-users-rail-group { display: grid; gap: 2px; }
+
+.lux-users-rail-label { padding: 0 10px 7px; color: var(--lux-subtle); font-size: .62rem; letter-spacing: .14em; text-transform: uppercase; }
+
+.lux-users-rail-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: var(--lux-muted);
+  font: inherit;
+  font-size: .8rem;
+  text-align: left;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, border-color .16s ease;
+}
+
+.lux-users-rail-item:hover { color: var(--lux-text); background: rgba(255, 255, 255, .05); }
+
+.lux-users-rail-item[aria-current="page"] {
+  border-color: color-mix(in srgb, var(--lux-accent) 30%, transparent);
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-accent) 10%, transparent);
+}
+
+.lux-users-pane { display: grid; gap: 16px; min-width: 0; }
+
+.lux-users-card {
+  position: relative;
+  min-width: 0;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 14px;
+  background: var(--lux-surface);
+}
+
+.lux-users-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px 0; }
+
+.lux-users-card-heading h2 { margin: 0; color: var(--lux-text); font-size: .95rem; font-weight: 600; }
+
+.lux-users-card-heading p { margin: 6px 0 0; color: var(--lux-muted); font-size: .75rem; line-height: 1.55; }
+
+.lux-users-card-body { padding: 16px 20px 20px; }
+
+/* ---------- 工具条 ---------- */
+
+.lux-users-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 14px;
+  background: var(--lux-surface);
+}
+
+.lux-users-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 260px;
+  min-width: 0;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .05);
+  color: var(--lux-subtle);
+}
+
+.lux-users-search:focus-within { border-color: color-mix(in srgb, var(--lux-accent) 60%, var(--lux-line-soft)); }
+
+.lux-users-search input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  background: none;
+  color: var(--lux-text);
+  font: inherit;
+  font-size: .8rem;
+}
+
+.lux-users-search input::placeholder { color: var(--lux-subtle); }
+
+.lux-users-chips { display: flex; gap: 4px; padding: 2px; border: 1px solid var(--lux-line-soft); border-radius: 9px; background: rgba(255, 255, 255, .05); }
+
+.lux-users-chips button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--lux-muted);
+  font: inherit;
+  font-size: .72rem;
+  cursor: pointer;
+}
+
+.lux-users-chips button:hover { color: var(--lux-text); }
+
+.lux-users-chips button[aria-pressed="true"] {
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-accent) 16%, transparent);
+  font-weight: 600;
+}
+
+.lux-users-toolbar-end { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+/* ---------- 表格 ---------- */
+
+.lux-users-table-card { overflow: visible; }
+
+.lux-users-table-scroll { overflow-x: auto; }
+
+.lux-users-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+
+.lux-users-table th {
+  height: 38px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--lux-line-soft);
+  color: var(--lux-subtle);
+  font-size: .64rem;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.lux-users-table th button {
+  padding: 0;
+  border: 0;
+  border-bottom: 1px dashed var(--lux-line);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.lux-users-table th button:hover { color: var(--lux-text); }
+
+.lux-users-table td {
+  height: 60px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--lux-line-soft);
+  color: var(--lux-text);
+  font-size: .78rem;
+  vertical-align: middle;
+}
+
+.lux-users-table tbody tr:last-child td { border-bottom: 0; }
+
+.lux-users-table tbody tr:hover td { background: rgba(255, 255, 255, .03); }
+
+.lux-users-table tbody tr.is-selected td { background: color-mix(in srgb, var(--lux-accent) 7%, transparent); }
+
+.lux-users-table tbody tr.is-selected td:first-child { box-shadow: inset 2px 0 0 var(--lux-accent); }
+
+.lux-users-table tbody tr.is-disabled .lux-users-account-name { color: var(--lux-muted); }
+
+.lux-users-col-check { width: 44px; padding-right: 0 !important; }
+
+.lux-users-col-actions { width: 132px; text-align: right; white-space: nowrap; }
+
+.lux-users-table th.lux-users-col-actions { text-align: right; }
+
+.lux-users-account { display: flex; align-items: center; gap: 11px; min-width: 0; }
+
+.lux-users-account-copy { min-width: 0; }
+
+.lux-users-account-name { display: block; overflow: hidden; color: var(--lux-text); font-size: .82rem; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+
+.lux-users-account-meta { display: block; margin-top: 3px; overflow: hidden; color: var(--lux-subtle); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
+
+.lux-users-avatar {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: linear-gradient(145deg, #515158, #242429);
+  color: #fff;
+  font-size: .72rem;
+  font-weight: 600;
+}
+
+html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145deg, #dfe3ea, #b9c0cc); color: #2a2d35; }
+
+.lux-users-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+
+.lux-users-tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 21px;
+  padding: 0 7px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 6px;
+  color: var(--lux-muted);
+  font-size: .66rem;
+  white-space: nowrap;
+}
+
+.lux-users-tag.is-strong { color: var(--lux-text); }
+
+.lux-users-status { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+
+/* ---------- 行内菜单 ---------- */
+
+.lux-users-menu-wrap { position: relative; display: inline-flex; }
+
+.lux-users-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 196px;
+  padding: 5px;
+  border: 1px solid var(--lux-line);
+  border-radius: 11px;
+  background: var(--lux-surface-strong);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+}
+
+.lux-users-menu button,
+.lux-users-menu a {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 33px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--lux-text);
+  font: inherit;
+  font-size: .76rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.lux-users-menu button:hover,
+.lux-users-menu a:hover { background: rgba(255, 255, 255, .07); }
+
+.lux-users-menu button.is-danger { color: var(--lux-danger, #ee9eaa); }
+
+.lux-users-menu-divider { height: 1px; margin: 5px 4px; background: var(--lux-line-soft); }
+
+/* ---------- 选择条 ---------- */
+
+.lux-users-selection {
+  position: sticky;
+  z-index: 10;
+  bottom: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--lux-accent) 34%, var(--lux-line-soft));
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--lux-surface-strong) 92%, transparent);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .45);
+  backdrop-filter: blur(14px);
+}
+
+.lux-users-selection strong { color: var(--lux-text); font-size: .8rem; }
+
+.lux-users-selection-hint { color: var(--lux-subtle); font-size: .7rem; }
+
+.lux-users-selection-divider { width: 1px; height: 22px; background: var(--lux-line-soft); }
+
+.lux-users-selection-spacer { margin-left: auto; }
+
+.lux-users-selection label { display: flex; align-items: center; gap: 8px; color: var(--lux-muted); font-size: .72rem; }
+
+.lux-users-selection select {
+  min-width: 168px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 8px;
+  color: var(--lux-text);
+  background: rgba(255, 255, 255, .05);
+  font: inherit;
+  font-size: .74rem;
+}
+
+.lux-users-selection-results {
+  flex: 1 1 100%;
+  max-height: 132px;
+  overflow: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--lux-line-soft);
+  color: var(--lux-muted);
+  font-size: .74rem;
+}
+
+.lux-users-selection-results ul { display: grid; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
+
+.lux-users-selection-results li.is-success { color: #9bdcb3; }
+
+.lux-users-selection-results li.is-failure { color: var(--lux-danger, #ee9eaa); }
+
+/* ---------- 页脚分页 ---------- */
+
+.lux-users-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--lux-line-soft);
+  color: var(--lux-subtle);
+  font-size: .72rem;
+}
+
+.lux-users-pager-actions { display: flex; align-items: center; gap: 10px; }
+
+.lux-users-pager select {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 8px;
+  color: var(--lux-text);
+  background: rgba(255, 255, 255, .05);
+  font: inherit;
+  font-size: .72rem;
+}
+
+/* ---------- 创建抽屉 ---------- */
+
+.lux-users-drawer-scrim { position: fixed; z-index: 60; inset: 0; background: rgba(0, 0, 0, .62); backdrop-filter: blur(4px); }
+
+.lux-users-drawer {
+  position: fixed;
+  z-index: 61;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  width: 420px;
+  max-width: 92vw;
+  border-left: 1px solid var(--lux-line-soft);
+  background: var(--lux-surface-strong, #151519);
+  box-shadow: -30px 0 80px rgba(0, 0, 0, .45);
+}
+
+.lux-users-drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 20px 22px 14px; border-bottom: 1px solid var(--lux-line-soft); }
+
+.lux-users-drawer-head h2 { margin: 0; color: var(--lux-text); font-size: 1.05rem; }
+
+.lux-users-drawer-head p { margin: 6px 0 0; color: var(--lux-muted); font-size: .74rem; line-height: 1.55; }
+
+.lux-users-drawer-form { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+
+.lux-users-danger-text { color: var(--lux-danger, #ee9eaa); }
+
+.lux-users-danger-text:hover { border-color: color-mix(in srgb, var(--lux-danger, #ee9eaa) 55%, transparent); }
+
+.lux-users-drawer-body { display: grid; gap: 14px; padding: 20px 22px; overflow: auto; }
+
+.lux-users-drawer-body label:not(.lux-admin-toggle) { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }
+
+.lux-users-drawer-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: auto; padding: 16px 22px; border-top: 1px solid var(--lux-line-soft); }
+
+/* ---------- 空态 ---------- */
+
+.lux-users-empty { margin: 0; padding: 28px 20px; color: var(--lux-muted); font-size: .8rem; }
+
+/* ---------- 响应式 ---------- */
+
+@media (max-width: 1179px) {
+  .lux-users-workspace { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .lux-users-rail { position: static; display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+  .lux-users-rail::-webkit-scrollbar { display: none; }
+  .lux-users-rail-group { display: flex; gap: 6px; }
+  .lux-users-rail-label { display: none; }
+  .lux-users-rail-item { flex: 0 0 auto; white-space: nowrap; }
+}
+
+@media (max-width: 1023px) {
+  .lux-users-col-access { display: none; }
+}
+
+@media (max-width: 899px) {
+  .lux-users-toolbar { flex-direction: column; align-items: stretch; gap: 10px; }
+  .lux-users-search { flex: 0 0 auto; width: 100%; height: 38px; }
+  .lux-users-chips { justify-content: space-between; }
+  .lux-users-chips button { flex: 1; }
+  .lux-users-toolbar-end { margin-left: 0; justify-content: space-between; }
+}
+
+@media (max-width: 639px) {
+  .lux-users-heading { flex-direction: column; align-items: flex-start; gap: 14px; }
+  .lux-users-heading-actions { width: 100%; }
+  .lux-users-heading-actions .lux-button { flex: 1; }
+  .lux-users-table-scroll { display: none; }
+  .lux-users-cards { display: grid; gap: 10px; padding: 12px; }
+  .lux-users-pager { flex-direction: column; align-items: flex-start; }
+  .lux-users-pager-actions { width: 100%; justify-content: space-between; }
+  .lux-users-drawer { width: 100%; max-width: 100%; border-left: 0; border-radius: 18px 18px 0 0; height: 82%; top: auto; }
+}
+
+.lux-users-cards { display: none; }
+
+.lux-users-card-item {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .025);
+}
+
+.lux-users-card-item-head { display: flex; align-items: center; gap: 11px; }
+
+.lux-users-card-item-head .lux-users-menu-wrap { margin-left: auto; }
+
+.lux-users-card-item-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--lux-subtle); font-size: .7rem; }
+
+/* ---------- 用户详情 ---------- */
+
+.lux-users-detail { display: grid; gap: 4px; }
+
+.lux-users-detail-back { display: inline-flex; align-items: center; gap: 6px; width: fit-content; color: var(--lux-muted); font-size: .76rem; }
+
+.lux-users-detail-back:hover { color: var(--lux-text); }
+
+.lux-users-detail-head { display: grid; gap: 14px; padding: 14px 0 4px; }
+
+.lux-users-detail-identity { display: flex; align-items: center; gap: 16px; min-width: 0; }
+
+.lux-users-avatar.is-large { width: 56px; height: 56px; border-radius: 16px; font-size: 1.15rem; }
+
+.lux-users-detail-copy { min-width: 0; }
+
+.lux-users-detail-name { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+
+.lux-users-detail-name h1 { margin: 0; color: var(--lux-text); font-size: clamp(1.6rem, 2.6vw, 2.15rem); letter-spacing: -.045em; }
+
+.lux-users-detail-facts { display: flex; flex-wrap: wrap; gap: 4px 0; margin: 7px 0 0; color: var(--lux-muted); font-size: .76rem; line-height: 1.5; }
+
+.lux-users-detail-facts span + span::before { content: "·"; margin: 0 8px; color: var(--lux-subtle); }
+
+.lux-users-segments {
+  display: flex;
+  gap: 2px;
+  margin: 16px 0 20px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--lux-line-soft);
+  scrollbar-width: none;
+}
+
+.lux-users-segments::-webkit-scrollbar { display: none; }
+
+.lux-users-segments button {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--lux-muted);
+  font: inherit;
+  font-size: .8rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.lux-users-segments button:hover { color: var(--lux-text); }
+
+.lux-users-segments button[aria-current="page"] { border-bottom-color: var(--lux-accent); color: var(--lux-text); }
+
+.lux-users-detail-body { display: grid; gap: 16px; max-width: 1120px; min-width: 0; }
+
+.lux-users-detail-body .lux-admin-panel {
+  max-width: none;
+  padding: 18px 20px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 14px;
+  background: var(--lux-surface);
+}
+
+.lux-users-detail-body .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }
+
+.lux-users-detail-body .lux-admin-user-content-section { max-width: none; }
+
+.lux-users-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.lux-users-summary .lux-admin-eyebrow { margin-right: 4px; }
+
+@media (max-width: 639px) {
+  .lux-users-detail-identity { align-items: flex-start; }
+  .lux-users-detail-facts { flex-direction: column; gap: 2px; }
+  .lux-users-detail-facts span + span::before { display: none; }
+}

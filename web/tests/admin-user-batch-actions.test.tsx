@@ -73,7 +73,7 @@ describe("AdminUsersPage batch user actions", () => {
 
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("查理"));
-      expect(container.querySelector<HTMLButtonElement>('button[aria-label="批量禁用用户"]')?.disabled).toBe(true);
+      expect(container.querySelector('button[aria-label="批量禁用用户"]')).toBeNull();
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
       container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.click();
     });
@@ -95,7 +95,7 @@ describe("AdminUsersPage batch user actions", () => {
     expect(confirm.mock.calls.at(-1)?.[0]).not.toContain("查理");
     expect(container.textContent).toContain("爱丽丝：成功");
     expect(container.textContent).toContain("鲍勃：最后一个管理员不能失去管理权限");
-    expect(container.textContent).toContain("当前页已选 0 人");
+    expect(container.querySelector(".lux-users-selection")).toBeNull();
   });
 
   it("confirms enabling selected disabled users and reports that a new login is required", async () => {
@@ -139,7 +139,6 @@ describe("AdminUsersPage batch user actions", () => {
     renderPage();
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("鲍勃")); });
-    expect(container.textContent).toContain("仅对当前页勾选的用户操作");
 
     await act(async () => {
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
@@ -152,6 +151,7 @@ describe("AdminUsersPage batch user actions", () => {
       }
     });
     expect(container.textContent).toContain("当前页已选 2 人");
+    expect(container.textContent).toContain("仅对当前页勾选的用户操作");
 
     await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="批量应用权限预设"]')?.click();
@@ -178,15 +178,15 @@ describe("AdminUsersPage batch user actions", () => {
 
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("鲍勃"));
-      container.querySelector<HTMLButtonElement>('button[aria-label="全选本页"]')?.click();
+      container.querySelector<HTMLInputElement>('input[aria-label="全选本页"]')?.click();
     });
     expect(container.textContent).toContain("当前页已选 2 人");
     expect([...container.querySelectorAll<HTMLInputElement>(".lux-admin-user-select input")].every((input) => input.checked)).toBe(true);
 
     await act(async () => {
-      container.querySelector<HTMLButtonElement>('button[aria-label="取消本页全选"]')?.click();
+      container.querySelector<HTMLInputElement>('input[aria-label="取消本页全选"]')?.click();
     });
-    expect(container.textContent).toContain("当前页已选 0 人");
+    expect(container.querySelector(".lux-users-selection")).toBeNull();
     expect([...container.querySelectorAll<HTMLInputElement>(".lux-admin-user-select input")].some((input) => input.checked)).toBe(false);
   });
 
@@ -233,7 +233,7 @@ describe("AdminUsersPage batch user actions", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("鲍勃"));
     });
 
-    expect(container.textContent).toContain("当前页已选 0 人");
+    expect(container.querySelector(".lux-users-selection")).toBeNull();
     expect(container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.checked).toBe(false);
   });
 
@@ -319,12 +319,12 @@ describe("AdminUsersPage batch user actions", () => {
 
     expect(container.textContent).toContain("爱丽丝：成功");
     expect(container.textContent).toContain("鲍勃：权限已变化，请重新预览");
-    expect(container.textContent).toContain("当前页已选 0 人");
+    expect(container.querySelector(".lux-users-selection")).toBeNull();
     await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="关闭权限复制"]')?.click();
       await vi.waitFor(() => expect(container.querySelector('[role="dialog"][aria-label="权限复制"]')).toBeNull());
     });
-    await vi.waitFor(() => expect(document.activeElement).toBe(container.querySelector<HTMLHeadingElement>("#lux-admin-user-batch-title")));
+    await vi.waitFor(() => expect(document.activeElement).toBe(container.querySelector<HTMLHeadingElement>("#lux-users-list-title")));
   });
 
   it("invalidates a permission preview when the selected groups change", async () => {

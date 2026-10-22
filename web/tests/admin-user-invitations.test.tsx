@@ -66,7 +66,7 @@ describe("admin user invitations", () => {
     renderPage("/admin/users?view=invitations");
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.querySelector('button[aria-current="page"]')?.textContent).toBe("注册邀请"));
+      await vi.waitFor(() => expect(container.querySelector('button[aria-current="page"]')?.textContent).toBe("邀请"));
       await vi.waitFor(() => expect(container.textContent).toContain("person@example.test"));
     });
     expect(list).toHaveBeenCalledWith({ page: 1, pageSize: 20, status: "all" });
