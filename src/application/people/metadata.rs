@@ -17,6 +17,9 @@ struct PersonImageLookup {
     person_id: String,
 }
 
+/// Page size for walking every item credited to one person.
+const PERSON_CREDIT_PAGE_SIZE: i64 = 500;
+
 struct ActorViewPrefetchPlan {
     relation_item_ids: Vec<String>,
     canonical_person_ids: Vec<String>,
@@ -259,77 +262,94 @@ impl PeopleService {
             }
             None => (BTreeSet::new(), None),
         };
-        let item_ids = database
-            .list_person_credit_item_ids(library_ids, "Actor", person_id)
-            .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))?;
         let mut updated = false;
-        for item_id in item_ids {
-            let new_path = library_item_directory(&self.config_dir, &item_id)
-                .map_err(PeopleError::from)?
-                .join("people.json");
-            let legacy_path = self
-                .legacy_people_dir()
-                .join(LEGACY_ITEMS_DIR)
-                .join(format!("{item_id}.json"));
-            let (relation_path, Some(mut relation)) = (match read_relation(&new_path).await? {
-                Some(relation) => (new_path, Some(relation)),
-                None => (legacy_path.clone(), read_relation(&legacy_path).await?),
-            }) else {
-                continue;
-            };
-            let mut item_updated = false;
-            for actor in &mut relation.actors {
-                if actor_id_from_stored_actor(actor) != person_id {
-                    continue;
-                }
-                if !locked_fields.contains("name") || actor.name.trim().is_empty() {
-                    // Local-only IDs are derived from the name, so pin the current ID
-                    // before renaming to keep the Emby item ID stable.
-                    if actor.name != update.name && actor_id_is_name_derived(actor) {
-                        actor.id = Some(person_id.to_owned());
-                    }
-                    actor.name = update.name.clone();
-                }
-                actor.person = Some(metadata_update_respecting_locks(
-                    actor
-                        .person
-                        .as_ref()
-                        .or(existing_metadata.as_ref())
-                        .unwrap_or(&PersonMetadata::default()),
-                    &update,
-                    &locked_fields,
-                ));
-                if replace_existing_nfo {
-                    self.write_person_nfo_for_actor_replacing_metadata(actor)
-                        .await?;
-                } else {
-                    self.write_person_nfo_for_actor(actor).await?;
-                }
-                item_updated = true;
-            }
-            if !item_updated {
-                continue;
-            }
-            let bytes = serde_json::to_vec_pretty(&relation)
-                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-            let relation_checksum = relation_snapshot_checksum(&bytes);
-            write_atomically(&relation_path, &bytes).await?;
-            let credits = relation
-                .actors
-                .iter()
-                .map(person_credit_from_stored_actor)
-                .collect::<Vec<_>>();
-            database
-                .replace_person_credits_with_relation_checksum(
-                    &item_id,
-                    &credits,
-                    relation.source_fingerprint.as_deref(),
-                    Some(&relation_checksum),
+        let mut after_item_id: Option<String> = None;
+        loop {
+            let item_ids = database
+                .list_person_credit_item_ids(
+                    library_ids,
+                    "Actor",
+                    person_id,
+                    after_item_id.as_deref(),
+                    PERSON_CREDIT_PAGE_SIZE,
                 )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
-            updated = true;
+            let Some(last) = item_ids.last().cloned() else {
+                break;
+            };
+            let page_len = item_ids.len();
+            for item_id in item_ids {
+                let new_path = library_item_directory(&self.config_dir, &item_id)
+                    .map_err(PeopleError::from)?
+                    .join("people.json");
+                let legacy_path = self
+                    .legacy_people_dir()
+                    .join(LEGACY_ITEMS_DIR)
+                    .join(format!("{item_id}.json"));
+                let (relation_path, Some(mut relation)) = (match read_relation(&new_path).await? {
+                    Some(relation) => (new_path, Some(relation)),
+                    None => (legacy_path.clone(), read_relation(&legacy_path).await?),
+                }) else {
+                    continue;
+                };
+                let mut item_updated = false;
+                for actor in &mut relation.actors {
+                    if actor_id_from_stored_actor(actor) != person_id {
+                        continue;
+                    }
+                    if !locked_fields.contains("name") || actor.name.trim().is_empty() {
+                        // Local-only IDs are derived from the name, so pin the current ID
+                        // before renaming to keep the Emby item ID stable.
+                        if actor.name != update.name && actor_id_is_name_derived(actor) {
+                            actor.id = Some(person_id.to_owned());
+                        }
+                        actor.name = update.name.clone();
+                    }
+                    actor.person = Some(metadata_update_respecting_locks(
+                        actor
+                            .person
+                            .as_ref()
+                            .or(existing_metadata.as_ref())
+                            .unwrap_or(&PersonMetadata::default()),
+                        &update,
+                        &locked_fields,
+                    ));
+                    if replace_existing_nfo {
+                        self.write_person_nfo_for_actor_replacing_metadata(actor)
+                            .await?;
+                    } else {
+                        self.write_person_nfo_for_actor(actor).await?;
+                    }
+                    item_updated = true;
+                }
+                if !item_updated {
+                    continue;
+                }
+                let bytes = serde_json::to_vec_pretty(&relation)
+                    .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+                let relation_checksum = relation_snapshot_checksum(&bytes);
+                write_atomically(&relation_path, &bytes).await?;
+                let credits = relation
+                    .actors
+                    .iter()
+                    .map(person_credit_from_stored_actor)
+                    .collect::<Vec<_>>();
+                database
+                    .replace_person_credits_with_relation_checksum(
+                        &item_id,
+                        &credits,
+                        relation.source_fingerprint.as_deref(),
+                        Some(&relation_checksum),
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                updated = true;
+            }
+            after_item_id = Some(last);
+            if page_len < PERSON_CREDIT_PAGE_SIZE as usize {
+                break;
+            }
         }
         Ok(updated)
     }

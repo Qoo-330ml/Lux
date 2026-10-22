@@ -30835,3 +30835,69 @@ async fn library_strm_source_counts_ignore_removed_items() -> Result<(), Box<dyn
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn person_credit_item_ids_are_paged_by_keyset() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{config::Config, library::LibraryKind};
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let root_id = "root-credits";
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+        ) VALUES (?, ?, ?, ?, 1, 1)",
+    )
+    .bind(root_id)
+    .bind(&library_id)
+    .bind("/media/movies")
+    .bind("/media/movies")
+    .execute(database.pool())
+    .await?;
+    for suffix in ["a", "b", "c"] {
+        let item_id = format!("item-{suffix}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+            ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(format!("Item {suffix}"))
+        .bind(format!("Item {suffix}"))
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO person_credits (item_id, person_id, person_type, person_name)
+             VALUES (?, 'person-1', 'Actor', 'Actor One')",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let first = database
+        .list_person_credit_item_ids(&[library_id.clone()], "Actor", "person-1", None, 2)
+        .await?;
+    assert_eq!(first, vec!["item-a".to_owned(), "item-b".to_owned()]);
+    let second = database
+        .list_person_credit_item_ids(
+            &[library_id],
+            "Actor",
+            "person-1",
+            first.last().map(String::as_str),
+            2,
+        )
+        .await?;
+    assert_eq!(second, vec!["item-c".to_owned()]);
+    Ok(())
+}
