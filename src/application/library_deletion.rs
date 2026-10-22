@@ -144,8 +144,6 @@ impl LibraryDeletionService {
             None => None,
         };
 
-        self.record_deletion_total(job_id, &job).await;
-
         match self.delete_in_batches(job_id, &job.library_id).await {
             Ok(true) => {}
             Ok(false) => {
@@ -225,35 +223,6 @@ impl LibraryDeletionService {
                 tracing::error!(job_id, library_id = %job.library_id, %error, "library deletion final transaction failed");
                 self.fail(job_id, &job.library_id, "DATABASE_ERROR", started)
                     .await;
-            }
-        }
-    }
-
-    /// Progress needs a denominator. Both counts are bounded index lookups and run
-    /// inside the worker, never from a request handler.
-    async fn record_deletion_total(&self, job_id: &str, job: &StoredLibraryDeletionJob) {
-        if job.total_count.is_some() {
-            return;
-        }
-        match self
-            .database
-            .count_library_deletion_remaining_rows(&job.library_id)
-            .await
-        {
-            Ok(remaining) => {
-                // A retried job keeps its cumulative `processed_count`, so the total
-                // is the remaining rows plus what earlier runs already removed.
-                let total = remaining.saturating_add(job.processed_count);
-                if let Err(error) = self
-                    .database
-                    .record_library_deletion_total(job_id, total)
-                    .await
-                {
-                    tracing::warn!(job_id, %error, "could not record library deletion total");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(job_id, %error, "could not count remaining library deletion rows");
             }
         }
     }

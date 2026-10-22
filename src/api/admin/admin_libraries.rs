@@ -1093,7 +1093,6 @@ fn library_deletion_job_json(job: &crate::storage::StoredLibraryDeletionJob) -> 
         "status": job.status,
         "stage": job.stage,
         "processedCount": job.processed_count,
-        "totalCount": job.total_count,
         "errorCode": job.error_code,
         "createdAt": job.created_at,
         "updatedAt": job.updated_at,

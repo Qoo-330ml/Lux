@@ -2496,7 +2496,7 @@ SQLx SQLite 3.51.3 的原计划按 root 使用 `idx_filesystem_entries_local_met
 
 这些数字来自对应功能分支的固定 SQLite fixture 历史记录；本次把逻辑适配到当前实现后没有重跑测试或计数。它们不表示事务墙钟、PostgreSQL、NAS 或生产吞吐收益。全量扫描专用队列只串行化索引阶段，索引终结后释放队列，允许下一媒体库开始索引。
 
-## 媒体库删除：批事务持久性、进度分母与增量回收（2026-10-22）
+## 媒体库删除：批事务持久性与增量回收（2026-10-22）
 
 夹具由 `.tmp/sim/` 生成：剧集库中每部剧固定 502 行（23 `media_items`、20 `filesystem_entries`、
 20 `media_sources`、80 `media_streams`、60 `media_chapters`、25 `item_images`、130 `person_credits`、

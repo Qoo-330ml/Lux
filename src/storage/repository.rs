@@ -5284,7 +5284,6 @@ pub(crate) struct StoredLibraryDeletionJob {
     pub(crate) status: String,
     pub(crate) stage: String,
     pub(crate) processed_count: i64,
-    pub(crate) total_count: Option<i64>,
     pub(crate) error_code: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,

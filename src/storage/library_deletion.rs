@@ -22,7 +22,7 @@ pub(crate) enum LibraryDeletionBatch {
 }
 
 const LIBRARY_DELETION_JOB_COLUMNS: &str =
-    "id, library_id, library_name, status, stage, processed_count, total_count, error_code,
+    "id, library_id, library_name, status, stage, processed_count, error_code,
      created_at, updated_at, started_at, finished_at";
 
 /// SQLite keeps the original batch size: with the deletion connection at
@@ -99,7 +99,6 @@ fn stored_library_deletion_job(row: sqlx::any::AnyRow) -> StoredLibraryDeletionJ
         status: row.get("status"),
         stage: row.get("stage"),
         processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
         error_code: row.get("error_code"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -374,62 +373,6 @@ impl Database {
              WHERE id = ? AND status = 'RUNNING'",
         )
         .bind(stage)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    /// Rows the job still has to remove from the two large stages. Called once per
-    /// run by the deletion worker to derive a progress percentage; it is never part
-    /// of a request path.
-    pub(crate) async fn count_library_deletion_remaining_rows(
-        &self,
-        library_id: &str,
-    ) -> Result<i64, StorageError> {
-        let media_items: i64 = self
-            .query_scalar("SELECT COUNT(*) FROM media_items WHERE library_id = ?")
-            .bind(library_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let filesystem_entries: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*)
-                 FROM filesystem_entries entry
-                 JOIN library_roots root ON root.id = entry.library_root_id
-                 WHERE root.library_id = ?",
-            )
-            .bind(library_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(media_items.saturating_add(filesystem_entries))
-    }
-
-    /// Persists the denominator for progress reporting exactly once per job, so a
-    /// retry keeps counting against the original total instead of the remainder.
-    pub(crate) async fn record_library_deletion_total(
-        &self,
-        job_id: &str,
-        total: i64,
-    ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE library_deletion_jobs
-             SET total_count = ?, updated_at = unixepoch()
-             WHERE id = ? AND status = 'RUNNING' AND total_count IS NULL",
-        )
-        .bind(total.max(0))
         .bind(job_id)
         .execute(&self.pool)
         .await
