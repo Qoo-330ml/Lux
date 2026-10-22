@@ -3,7 +3,7 @@ use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
-const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = 4_096;
+const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = EMBY_MAX_PAGE_LIMIT;
 const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
@@ -3317,13 +3317,8 @@ pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), Sta
 }
 
 fn emby_catalog_items_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
-    let offset = query.start_index.unwrap_or(0);
-    if offset < 0 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if query.limit == Some(0) && query.enable_total_record_count != Some(true) {
-        return Ok((offset, EMBY_MAX_PAGE_LIMIT));
-    }
+    // `Limit=0` is handled exactly once, by `emby_page_params`, so every item endpoint agrees:
+    // it is a count-only request when totals are requested and a bad request otherwise.
     emby_page_params(query)
 }
 
@@ -3345,7 +3340,7 @@ pub(super) fn emby_show_episode_page_params(
 pub(super) fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
-    if offset < 0 || limit < 1 {
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -5265,6 +5260,73 @@ pub(super) fn emby_stream_type(stream_type: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod page_params_tests {
+    use super::{
+        EMBY_MAX_PAGE_LIMIT, EmbyItemsQuery, EmbyPersonsQuery, emby_catalog_items_page_params,
+        emby_page_params, emby_person_page_params, emby_show_episode_page_params,
+    };
+    use axum::http::StatusCode;
+
+    #[test]
+    fn episode_pages_default_to_the_global_cap() {
+        let query = EmbyItemsQuery::default();
+        assert_eq!(
+            emby_show_episode_page_params(&query),
+            Ok((0, EMBY_MAX_PAGE_LIMIT))
+        );
+        let too_large = EmbyItemsQuery {
+            limit: Some(EMBY_MAX_PAGE_LIMIT + 1),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(
+            emby_show_episode_page_params(&too_large),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn zero_limit_is_count_only_or_a_bad_request_everywhere() {
+        let count_only = EmbyItemsQuery {
+            limit: Some(0),
+            enable_total_record_count: Some(true),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_page_params(&count_only), Ok((0, 0)));
+        assert_eq!(emby_catalog_items_page_params(&count_only), Ok((0, 0)));
+
+        let zero = EmbyItemsQuery {
+            limit: Some(0),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_page_params(&zero), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            emby_catalog_items_page_params(&zero),
+            Err(StatusCode::BAD_REQUEST),
+            "catalog items must agree with the shared page contract"
+        );
+    }
+
+    #[test]
+    fn person_pages_are_capped_like_every_other_list() {
+        let query = EmbyPersonsQuery {
+            limit: Some(EMBY_MAX_PAGE_LIMIT + 1),
+            ..EmbyPersonsQuery::default()
+        };
+        assert_eq!(
+            emby_person_page_params(&query),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let allowed = EmbyPersonsQuery {
+            limit: Some(EMBY_MAX_PAGE_LIMIT),
+            ..EmbyPersonsQuery::default()
+        };
+        assert_eq!(
+            emby_person_page_params(&allowed),
+            Ok((0, EMBY_MAX_PAGE_LIMIT))
+        );
+    }
+}
+
 mod tests {
     use std::collections::BTreeMap;
 
