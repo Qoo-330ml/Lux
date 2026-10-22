@@ -4028,10 +4028,9 @@ pub(super) async fn lux_web_playback_range(
     if method != Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    // No Range header means the client wants the whole resource; asking the upstream for the
-    // full range keeps the proxy path working for players that never send one.
-    let requested_range = headers.get("range").and_then(|value| value.to_str().ok());
-    let range = requested_range.unwrap_or("bytes=0-");
+    let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
+        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    };
     let Ok(user_id) = session.user_id.parse::<crate::domain::ids::UserId>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -4090,17 +4089,11 @@ pub(super) async fn lux_web_playback_range(
         strm_probe.schedule_playback_probe(&session.item_id, &source.source_id);
     }
     let mut response = Response::builder()
-        .status(if requested_range.is_some() {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        })
+        .status(StatusCode::PARTIAL_CONTENT)
         .header("Accept-Ranges", "bytes")
+        .header("Content-Range", result.content_range)
         .header("Content-Length", result.content_length)
         .header("Cache-Control", "private, no-store");
-    if requested_range.is_some() {
-        response = response.header("Content-Range", result.content_range);
-    }
     if let Some(content_type) = result.content_type {
         response = response.header("Content-Type", content_type);
     }
