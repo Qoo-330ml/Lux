@@ -4228,6 +4228,87 @@ async fn notification_deliveries_are_written_in_bounded_batches()
 }
 
 #[tokio::test]
+async fn notification_history_retention_prunes_old_delivered_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .create_notification_destination(NewNotificationDestination {
+            id: "retention-destination",
+            name: "Retention",
+            url: "https://example.test/webhook",
+            enabled: true,
+            allow_private_network: false,
+            event_types_json: "[]",
+            payload_format: "LUX",
+            provider_plugin_id: "builtin.webhook",
+            provider_config_json: "{}",
+        })
+        .await?;
+    let destination_ids = vec!["retention-destination".to_owned()];
+    database
+        .insert_notification_event_with_deliveries(
+            NewNotificationEvent {
+                id: "retention-old-event",
+                event_type: "ITEM_ADDED",
+                schema_version: 1,
+                occurred_at: 1,
+                dedupe_key: "retention-old-key",
+                payload_json: "{}",
+            },
+            &destination_ids,
+        )
+        .await?;
+    database
+        .insert_notification_event_with_deliveries(
+            NewNotificationEvent {
+                id: "retention-new-event",
+                event_type: "ITEM_ADDED",
+                schema_version: 1,
+                occurred_at: 2,
+                dedupe_key: "retention-new-key",
+                payload_json: "{}",
+            },
+            &destination_ids,
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE notification_events SET created_at = 1
+         WHERE id = 'retention-old-event'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE notification_deliveries
+         SET created_at = 1, status = 'DELIVERED', delivered_at = 1
+         WHERE event_id = 'retention-old-event'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let (deleted_deliveries, deleted_events) = database.prune_notification_history(100, 10).await?;
+    assert!(deleted_deliveries >= 1);
+    assert!(deleted_events >= 1);
+    let old_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events WHERE id = 'retention-old-event'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let new_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events WHERE id = 'retention-new-event'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(old_events, 0);
+    assert_eq!(new_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_notification_deliveries_are_written_in_bounded_batches()
 -> Result<(), Box<dyn std::error::Error>> {

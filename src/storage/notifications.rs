@@ -256,6 +256,60 @@ impl Database {
         })
     }
 
+    /// Deletes one bounded batch of delivered/failed delivery rows and then
+    /// events that no longer have any delivery. Returns
+    /// `(deliveries_deleted, events_deleted)`.
+    pub(crate) async fn prune_notification_history(
+        &self,
+        cutoff: i64,
+        batch_limit: i64,
+    ) -> Result<(u64, u64), StorageError> {
+        let deliveries = self
+            .query(
+                "DELETE FROM notification_deliveries
+                 WHERE id IN (
+                     SELECT id FROM notification_deliveries
+                     WHERE created_at < ?
+                       AND (status = 'DELIVERED' OR status = 'FAILED')
+                     ORDER BY created_at, id
+                     LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch_limit.clamp(1, 2_000))
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        let events = self
+            .query(
+                "DELETE FROM notification_events
+                 WHERE id IN (
+                     SELECT events.id FROM notification_events events
+                     WHERE events.created_at < ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM notification_deliveries deliveries
+                           WHERE deliveries.event_id = events.id
+                       )
+                     ORDER BY events.created_at, events.id
+                     LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch_limit.clamp(1, 2_000))
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        Ok((deliveries, events))
+    }
+
     pub(crate) async fn list_notification_deliveries(
         &self,
         offset: i64,

@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -36,7 +36,10 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS: i64 = 8;
 const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
-const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HISTORY_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const HISTORY_RETENTION_SECONDS: i64 = 30 * 86_400;
+const HISTORY_RETENTION_BATCH_SIZE: i64 = 500;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DELIVERY_CONCURRENCY: usize = 4;
 
@@ -583,7 +586,14 @@ impl WebhookService {
     pub fn spawn_worker(&self) {
         let service = self.clone();
         tokio::spawn(async move {
+            let mut last_retention_sweep: Option<Instant> = None;
             loop {
+                if last_retention_sweep
+                    .is_none_or(|last| last.elapsed() >= HISTORY_RETENTION_INTERVAL)
+                {
+                    service.prune_history().await;
+                    last_retention_sweep = Some(Instant::now());
+                }
                 match service.process_ready_deliveries().await {
                     Ok(0) => sleep(DELIVERY_POLL_INTERVAL).await,
                     Ok(_) => {}
@@ -594,6 +604,40 @@ impl WebhookService {
                 }
             }
         });
+    }
+
+    async fn prune_history(&self) {
+        let cutoff = unix_now().saturating_sub(HISTORY_RETENTION_SECONDS);
+        let mut deliveries = 0_u64;
+        let mut events = 0_u64;
+        for _ in 0..10 {
+            match self
+                .database
+                .prune_notification_history(cutoff, HISTORY_RETENTION_BATCH_SIZE)
+                .await
+            {
+                Ok((deleted_deliveries, deleted_events)) => {
+                    deliveries = deliveries.saturating_add(deleted_deliveries);
+                    events = events.saturating_add(deleted_events);
+                    if deleted_deliveries < u64::try_from(HISTORY_RETENTION_BATCH_SIZE).unwrap_or(0)
+                        && deleted_events < u64::try_from(HISTORY_RETENTION_BATCH_SIZE).unwrap_or(0)
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "webhook history retention sweep failed");
+                    break;
+                }
+            }
+        }
+        if deliveries > 0 || events > 0 {
+            tracing::info!(
+                deliveries,
+                events,
+                "pruned expired webhook notification history"
+            );
+        }
     }
 
     pub async fn process_ready_deliveries(&self) -> Result<usize, WebhookError> {
