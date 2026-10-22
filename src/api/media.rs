@@ -1787,6 +1787,20 @@ pub(super) async fn lux_search_item_images(
         Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    // Image search fans out to the external scraper, so it is a management action: any other
+    // caller could otherwise drive arbitrary outbound metadata requests from a user session.
+    if !user.can_manage_server {
+        return api_error(
+            &headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "需要管理员权限",
+        )
+        .into_response();
+    }
     if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
         return api_error(
             &headers,
