@@ -1385,64 +1385,75 @@ impl ScanJobService {
                 preparation_concurrency,
                 expected_root_identity,
             };
-            let discovery = self
-                .discover_scan_manifest_directory_group_batches(context, &relative_directories)
-                .await;
-            match discovery {
-                Ok(Some(discovered)) => {
-                    discovered_count = discovered_count.saturating_add(
-                        i64::try_from(discovered.observed_file_count).unwrap_or(i64::MAX),
-                    );
-                    created_items = created_items.saturating_add(discovered.created_items);
-                    self.push_lite_manifest_directories(
-                        manifest_id,
-                        &root_id,
-                        has_filesystem_entries,
-                        discovered.child_directories,
-                    );
-                    if !root.is_available {
-                        self.database
-                            .update_library_root_availability(&root.id, true)
-                            .await?;
-                    }
-                }
-                Ok(None) => return self.cancel_running_job(&job.id).await,
-                Err(_error)
-                    if self
-                        .cancellation_requested(&job.id, false, cancellation)
-                        .await? =>
-                {
+            for relative_directory in &relative_directories {
+                if cancellation.load(Ordering::Acquire) {
                     return self.cancel_running_job(&job.id).await;
                 }
-                Err(error @ (ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_))) => {
-                    // Keep the conservative root-level handling, but leave a trace of which
-                    // directory failed so an operator can act on it.
-                    tracing::warn!(
-                        root_id = %root.id,
-                        job_id = %job.id,
-                        %error,
-                        "manifest discovery could not read a directory; marking the root unavailable"
-                    );
-                    self.database
-                        .update_library_root_availability(&root.id, false)
-                        .await?;
-                    self.database
-                        .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
-                        .await?;
-                    self.remove_lite_manifest_root(manifest_id, &root.id);
-                    self.record_event(
-                        &job.id,
-                        "WARN",
-                        "ROOT_UNAVAILABLE",
-                        "媒体库根路径不可用，已跳过本轮缺失判定",
-                        "{}",
+                let discovery = self
+                    .discover_scan_manifest_directory_group_batches(
+                        context,
+                        std::slice::from_ref(relative_directory),
                     )
                     .await;
-                }
-                Err(error) => {
-                    return self
-                        .fail_reconciliation_job(job, error, &[], job.processed_count)
+                match discovery {
+                    Ok(Some(discovered)) => {
+                        discovered_count = discovered_count.saturating_add(
+                            i64::try_from(discovered.observed_file_count).unwrap_or(i64::MAX),
+                        );
+                        created_items = created_items.saturating_add(discovered.created_items);
+                        self.push_lite_manifest_directories(
+                            manifest_id,
+                            &root_id,
+                            has_filesystem_entries,
+                            discovered.child_directories,
+                        );
+                        if !root.is_available {
+                            self.database
+                                .update_library_root_availability(&root.id, true)
+                                .await?;
+                        }
+                    }
+                    Ok(None) => return self.cancel_running_job(&job.id).await,
+                    Err(_error)
+                        if self
+                            .cancellation_requested(&job.id, false, cancellation)
+                            .await? =>
+                    {
+                        return self.cancel_running_job(&job.id).await;
+                    }
+                    Err(
+                        error @ (ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_)),
+                    ) => {
+                        // Keep the conservative root-level handling, but leave a trace of which
+                        // directory failed so an operator can act on it.
+                        tracing::warn!(
+                            root_id = %root.id,
+                            job_id = %job.id,
+                            %error,
+                            "manifest discovery could not read a directory; marking the root unavailable"
+                        );
+                        self.database
+                            .update_library_root_availability(&root.id, false)
+                            .await?;
+                        self.database
+                            .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
+                            .await?;
+                        self.remove_lite_manifest_root(manifest_id, &root.id);
+                        self.record_event(
+                            &job.id,
+                            "WARN",
+                            "ROOT_UNAVAILABLE",
+                            "媒体库根路径不可用，已跳过本轮缺失判定",
+                            "{}",
+                        )
                         .await;
+                        break;
+                    }
+                    Err(error) => {
+                        return self
+                            .fail_reconciliation_job(job, error, &[], job.processed_count)
+                            .await;
+                    }
                 }
             }
         }
