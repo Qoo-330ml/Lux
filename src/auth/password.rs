@@ -8,6 +8,8 @@ use rand_core::OsRng;
 use tokio::sync::Semaphore;
 
 const DUMMY_PASSWORD: &[u8] = b"lux-invalid-user-password";
+/// Longest password accepted anywhere in the system (matches registration and invitations).
+const MAX_PASSWORD_BYTES: usize = 1024;
 /// Argon2id is memory-hard (about 19 MiB per hash), so concurrent hashes are capped to keep a
 /// login flood from pinning Tokio workers and multiplying that memory.
 const MAX_CONCURRENT_PASSWORD_HASHES: usize = 2;
@@ -40,6 +42,9 @@ impl PasswordService {
         if password.is_empty() {
             return Err(PasswordError::Empty);
         }
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Err(PasswordError::TooLong);
+        }
 
         let password = password.to_owned();
         self.run_hash_worker(move || {
@@ -57,6 +62,11 @@ impl PasswordService {
         stored_hash: Option<&str>,
         password: &str,
     ) -> Result<bool, PasswordError> {
+        // Reject absurd input before hashing: Argon2 cost grows with the password length, and no
+        // stored password can be longer than the registration limit.
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Ok(false);
+        }
         // Unknown users still verify against a valid Argon2id hash to keep the work factor
         // comparable to a known user and avoid a username-enumeration timing oracle.
         let hash = stored_hash.unwrap_or(&self.dummy_hash).to_owned();
@@ -97,6 +107,7 @@ impl PasswordService {
 #[derive(Debug)]
 pub enum PasswordError {
     Empty,
+    TooLong,
     Hash(String),
     InvalidHash(String),
 }
@@ -105,6 +116,7 @@ impl std::fmt::Display for PasswordError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => formatter.write_str("password must not be empty"),
+            Self::TooLong => formatter.write_str("password exceeds the 1024-byte limit"),
             Self::Hash(error) => write!(formatter, "password hashing failed: {error}"),
             Self::InvalidHash(error) => {
                 write!(formatter, "stored password hash is invalid: {error}")
@@ -157,6 +169,23 @@ mod tests {
         for task in tasks {
             assert!(task.await.expect("hashing task").is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_passwords_are_rejected_without_hashing() {
+        let service = PasswordService::new().expect("password service");
+        let oversized = "x".repeat(1_025);
+        assert!(matches!(
+            service.hash_password(&oversized).await,
+            Err(super::PasswordError::TooLong)
+        ));
+        let hash = service.hash_password("short password").await.unwrap();
+        assert!(
+            !service
+                .verify_password(Some(&hash), &oversized)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

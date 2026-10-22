@@ -3176,7 +3176,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(users::setup_database_restart),
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
-        .route("/api/v1/auth/login", post(users::auth_login))
+        .route(
+            "/api/v1/auth/login",
+            post(users::auth_login).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/v1/auth/invitations/accept",
             post(users::auth_accept_user_invitation).layer(DefaultBodyLimit::max(16 * 1024)),
