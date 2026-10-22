@@ -9,13 +9,14 @@ type ChangelogSection = {
 
 type ChangelogRelease = {
   version: string;
-  date?: string;
+  date: string;
   sections: ChangelogSection[];
 };
 
 export const changelogReleases: ChangelogRelease[] = [
   {
-    version: "Unreleased",
+    version: "0.6.13",
+    date: "2026-10-21",
     sections: [
       { kind: "added", items: [
         "支持邀请码注册与开放注册、邮箱验证和管理员审批；管理员可配置邮件服务并管理邀请。",
@@ -1553,8 +1554,7 @@ const sectionMeta: Record<ChangelogSectionKind, { label: string; icon: typeof Sp
 };
 
 export function AdminChangelogPage() {
-  const latestRelease = changelogReleases.find((release) => release.version !== "Unreleased") ?? changelogReleases[0];
-  const releaseCount = changelogReleases.filter((release) => release.version !== "Unreleased").length;
+  const latestRelease = changelogReleases[0];
 
   return (
     <main className="lux-admin-page lux-changelog-page">
@@ -1575,7 +1575,7 @@ export function AdminChangelogPage() {
       <div className="lux-changelog-intro">
         <div className="lux-changelog-intro-line" aria-hidden="true"><GitBranch size={16} /></div>
         <p>从 <strong>0.1.0</strong> 开始，按版本倒序整理项目主要的用户可见变化。</p>
-        <span>{releaseCount} 个版本</span>
+        <span>{changelogReleases.length} 个版本</span>
       </div>
 
       <div className="lux-changelog-timeline">
@@ -1585,10 +1585,10 @@ export function AdminChangelogPage() {
             <div className="lux-changelog-release-body">
               <header className="lux-changelog-release-header">
                 <div>
-                  <span className="lux-changelog-release-kicker">{release.version === "Unreleased" ? "UNRELEASED" : "RELEASE"}</span>
-                  <h2>{release.version === "Unreleased" ? "未发布" : `v${release.version}`}</h2>
+                  <span className="lux-changelog-release-kicker">RELEASE</span>
+                  <h2>v{release.version}</h2>
                 </div>
-                {release.date && <time dateTime={release.date}>{release.date}</time>}
+                <time dateTime={release.date}>{release.date}</time>
               </header>
               <div className="lux-changelog-sections">
                 {release.sections.map((section) => {
