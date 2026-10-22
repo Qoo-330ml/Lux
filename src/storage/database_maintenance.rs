@@ -386,6 +386,23 @@ impl Database {
                 return report;
             }
         }
+        if self.backend == DatabaseBackend::Postgres {
+            // media_search is populated by triggers and can remain "untrusted"
+            // forever because autovacuum has never analyzed it. Refresh its
+            // statistics before selecting maintenance candidates.
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                self.query("ANALYZE media_search").execute(&self.pool),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "media_search analyze failed");
+                }
+                Err(_) => tracing::warn!("media_search analyze timed out"),
+            }
+        }
         let candidates = match self.maintenance_candidates().await {
             Ok(candidates) => candidates,
             Err(error) => {

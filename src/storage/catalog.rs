@@ -10239,9 +10239,42 @@ impl Database {
 fn filtered_catalog_list_query<'a>(
     filter: &CatalogFilterQuery<'a>,
 ) -> (String, Vec<CatalogBind<'a>>) {
-    let (where_clause, mut binds) = catalog_filter_where_clause(filter);
+    let (where_clause, binds) = catalog_filter_where_clause(filter);
     let item_order = catalog_item_order(filter.sort_by, filter.descending);
-    let query = format!(
+    let fetch_limit = if filter.include_total {
+        filter.limit
+    } else {
+        filter.limit.saturating_add(1)
+    };
+    if let Some((selected_sql, mut union_binds)) =
+        catalog_list_union_selected_sql(filter, &where_clause, &binds, item_order, fetch_limit)
+    {
+        union_binds.push(CatalogBind::Integer(fetch_limit));
+        union_binds.push(CatalogBind::Integer(filter.offset));
+        return (
+            catalog_list_query_from_selected(&selected_sql, item_order),
+            union_binds,
+        );
+    }
+    let selected_sql = format!(
+        "SELECT mi.id
+         FROM media_items mi
+         JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+         {where_clause}
+         ORDER BY {item_order}
+         LIMIT ? OFFSET ?"
+    );
+    let mut binds = binds;
+    binds.push(CatalogBind::Integer(fetch_limit));
+    binds.push(CatalogBind::Integer(filter.offset));
+    (
+        catalog_list_query_from_selected(&selected_sql, item_order),
+        binds,
+    )
+}
+
+fn catalog_list_query_from_selected(selected_sql: &str, item_order: &str) -> String {
+    format!(
         "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                 mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                 mi.title, mi.sort_title, mi.original_title, mi.overview,
@@ -10266,14 +10299,7 @@ fn filtered_catalog_list_query<'a>(
                 mt.is_external AS stream_is_external,
                 mt.is_default AS stream_is_default,
                 mt.is_forced AS stream_is_forced
-         FROM (
-             SELECT mi.id
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             {where_clause}
-             ORDER BY {item_order}
-             LIMIT ? OFFSET ?
-         ) selected
+         FROM ({selected_sql}) selected
          JOIN media_items mi ON mi.id = selected.id
          LEFT JOIN media_sources ms
            ON ms.item_id = mi.id
@@ -10283,15 +10309,68 @@ fn filtered_catalog_list_query<'a>(
           )
          LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
          ORDER BY {item_order}, ms.id, mt.stream_index"
+    )
+}
+
+/// For the default "recently added" view over multiple libraries, each library
+/// contributes at most `offset + limit` rows to the global page. Querying each
+/// library separately keeps the existing per-library sort index usable and
+/// avoids sorting the whole catalog. Other filters keep the single-query plan.
+fn catalog_list_union_selected_sql<'a>(
+    filter: &CatalogFilterQuery<'a>,
+    where_clause: &str,
+    binds: &[CatalogBind<'a>],
+    item_order: &str,
+    fetch_limit: i64,
+) -> Option<(String, Vec<CatalogBind<'a>>)> {
+    if filter.library_ids.len() <= 1
+        || filter.offset > 200
+        || filter.parent_id_scope.is_some()
+        || filter.item_ids.is_some()
+        || filter.person_id.is_some()
+        || filter.media_source_ids.is_some()
+        || filter.provider_id_equals.is_some()
+        || !filter.excluded_item_types.is_empty()
+        || !filter.years.is_empty()
+        || filter.is_played.is_some()
+        || filter.is_favorite.is_some()
+        || filter.min_date_last_saved.is_some()
+        || filter.metadata_pending
+        || filter.sort_by != CatalogSort::DateCreated
+        || !filter.descending
+    {
+        return None;
+    }
+    let library_count = filter.library_ids.len();
+    let rest_binds = binds.get(library_count..)?.to_vec();
+    let marker = "AND mi.library_id IN (";
+    let start = where_clause.find(marker)?;
+    let values_start = start + marker.len();
+    let values_end = where_clause[values_start..].find(')')? + values_start;
+    let branch_where = format!(
+        "{}AND mi.library_id = ?{}",
+        &where_clause[..start],
+        &where_clause[values_end + 1..]
     );
-    let fetch_limit = if filter.include_total {
-        filter.limit
-    } else {
-        filter.limit.saturating_add(1)
-    };
-    binds.push(CatalogBind::Integer(fetch_limit));
-    binds.push(CatalogBind::Integer(filter.offset));
-    (query, binds)
+    let branch_limit = filter.offset.saturating_add(fetch_limit);
+    let mut branches = Vec::with_capacity(library_count);
+    let mut union_binds = Vec::with_capacity(library_count * (rest_binds.len() + 2));
+    for (index, library_id) in filter.library_ids.iter().enumerate() {
+        branches.push(format!(
+            "SELECT * FROM (
+                 SELECT mi.id
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 {branch_where}
+                 ORDER BY {item_order}
+                 LIMIT ? OFFSET 0
+             ) AS branch_{index}"
+        ));
+        union_binds.push(CatalogBind::Text(library_id.as_str()));
+        union_binds.extend(rest_binds.iter().copied());
+        union_binds.push(CatalogBind::Integer(branch_limit));
+    }
+    Some((branches.join("\nUNION ALL\n"), union_binds))
 }
 
 fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {
@@ -10353,8 +10432,10 @@ fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
 mod tests {
     use super::{
         Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
-        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
+        filtered_catalog_list_query, postgres_recent_catalog_rows_by_library_query,
+        sqlite_recent_catalog_rows_by_library_query,
     };
+    use crate::storage::repository::{CatalogFilterQuery, CatalogSort};
 
     #[test]
     fn recommendation_stats_cleanup_uses_an_indexable_exists_lookup() {
@@ -10386,6 +10467,105 @@ mod tests {
         assert!(query.contains("GROUP BY episode.parent_id"));
         assert!(!query.contains("episode_roots"));
         assert!(!query.contains("MAX(child.added_at)"));
+    }
+
+    #[tokio::test]
+    async fn multi_library_union_list_preserves_global_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('union-a', 'A', 'MOVIE'), ('union-b', 'B', 'MOVIE')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, added_at,
+                      has_available_source, identification_status)
+                 VALUES
+                     ('old', 'union-a', 'MOVIE', 'Old', 'old', 100, 1, 'LOCAL_CONFIRMED'),
+                     ('newest', 'union-b', 'MOVIE', 'Newest', 'newest', 300, 1, 'LOCAL_CONFIRMED'),
+                     ('middle', 'union-a', 'MOVIE', 'Middle', 'middle', 200, 1, 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        let libraries = vec!["union-a".to_owned(), "union-b".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 2,
+            include_total: false,
+        };
+        let (rows, _) = database.list_filtered_catalog_rows(&filter).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["newest", "middle", "old"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_library_default_date_list_queries_each_library_separately() {
+        let libraries = vec!["library-a".to_owned(), "library-b".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 24,
+            include_total: true,
+        };
+        let (query, binds) = filtered_catalog_list_query(&filter);
+        assert!(query.contains("UNION ALL"));
+        assert_eq!(query.matches("mi.library_id = ?").count(), 2);
+        assert_eq!(binds.len(), 6);
+
+        let deep = CatalogFilterQuery {
+            offset: 201,
+            ..filter
+        };
+        let (query, _) = filtered_catalog_list_query(&deep);
+        assert!(!query.contains("UNION ALL"));
     }
 
     #[test]

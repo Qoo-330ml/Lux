@@ -42,3 +42,39 @@ jobs:
 
       - name: Run project quality checks
         run: ./scripts/check-all.sh
+
+  postgres-migrations:
+    name: Run PostgreSQL migration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lux
+          POSTGRES_PASSWORD: lux-test-password
+          POSTGRES_DB: postgres
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U lux -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      POSTGRES_TEST_HOST: 127.0.0.1
+      POSTGRES_TEST_PORT: 55432
+      POSTGRES_TEST_USER: lux
+      POSTGRES_TEST_PASSWORD: lux-test-password
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run PostgreSQL migration tests
+        run: cargo test --locked --test postgres_database -- --ignored --test-threads=1
