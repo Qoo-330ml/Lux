@@ -172,7 +172,10 @@ pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize 
 
 pub(crate) fn manifest_seen_filesystem_update_chunk_size(backend: DatabaseBackend) -> usize {
     match backend {
-        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS.saturating_sub(3) / 3,
+        // The SQLite presence path binds seven values per row when filling its
+        // temporary table; keep the chunk below SQLite's variable limit instead
+        // of assuming three binds per row.
+        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS.saturating_sub(2) / 7,
         DatabaseBackend::Postgres => manifest_path_query_chunk_size(backend),
     }
 }
@@ -252,12 +255,12 @@ mod manifest_positive_index_batch_tests {
         let sqlite_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Sqlite);
         let postgres_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Postgres);
 
-        assert_eq!(sqlite_size, 10_921);
+        assert_eq!(sqlite_size, 4_680);
         assert_eq!(
             postgres_size,
             manifest_path_query_chunk_size(DatabaseBackend::Postgres)
         );
-        assert!(sqlite_size * 3 + 3 <= SQLITE_MAX_BIND_PARAMETERS);
+        assert!(sqlite_size * 7 + 2 <= SQLITE_MAX_BIND_PARAMETERS);
     }
 
     #[test]

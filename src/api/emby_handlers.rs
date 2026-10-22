@@ -2641,6 +2641,9 @@ async fn record_emby_device_access(
     let Some(database) = state.database.as_ref() else {
         return;
     };
+    if !auth.device_access_refresh_due(token) {
+        return;
+    }
     let device = match auth.device_info(token).await {
         Ok(Some(device)) => device,
         Ok(None) => return,
@@ -2656,7 +2659,7 @@ async fn record_emby_device_access(
     let client_name = bounded_emby_device_field(&device.client);
     let client_version = bounded_emby_device_field(&device.version);
     let last_remote_ip = request_client_ip(headers, &state.remote_access);
-    if database
+    match database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
             device_id: &device_id,
@@ -2668,9 +2671,9 @@ async fn record_emby_device_access(
             seen_at: super::playback::current_unix_timestamp(),
         })
         .await
-        .is_err()
     {
-        tracing::warn!("failed to update Emby user device activity");
+        Ok(()) => auth.mark_device_access_refreshed(token),
+        Err(_) => tracing::warn!("failed to update Emby user device activity"),
     }
 }
 

@@ -38,26 +38,60 @@ impl Database {
         let mut successfully_seen_paths: std::collections::HashSet<Cow<'data, str>> =
             std::collections::HashSet::new();
         if discovery_format_version == 3 && !seen_filesystem_entries.is_empty() {
+            if self.backend() == DatabaseBackend::Sqlite {
+                self.query("DROP TABLE IF EXISTS temp.lux_manifest_presence_incoming")
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                self.query(
+                    "CREATE TEMP TABLE lux_manifest_presence_incoming (
+                         filesystem_entry_id TEXT PRIMARY KEY NOT NULL,
+                         relative_path TEXT NOT NULL,
+                         fingerprint BLOB NOT NULL,
+                         size INTEGER NOT NULL,
+                         modified_at INTEGER NOT NULL,
+                         device INTEGER,
+                         inode INTEGER
+                     )",
+                )
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
             for entries in seen_filesystem_entries.chunks(
                 super::manifest_seen_filesystem_update_chunk_size(self.backend()),
             ) {
                 if entries.is_empty() {
                     continue;
                 }
-                let postgres_update_from = self.backend() == DatabaseBackend::Postgres;
-                let template = manifest_presence_update_template(
-                    &self.filesystem_path_templates,
-                    self.backend(),
-                    entries.len(),
-                );
-                let mut statement = match template {
-                    Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
-                    Err(_) => {
-                        let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let query = if postgres_update_from {
-                            format!(
+                let updated_count = if self.backend() == DatabaseBackend::Sqlite {
+                    self.update_manifest_presence_entries_sqlite(
+                        transaction,
+                        chunk.library_root_id,
+                        generation,
+                        entries,
+                    )
+                    .await?
+                } else {
+                    let template = manifest_presence_update_template(
+                        &self.filesystem_path_templates,
+                        self.backend(),
+                        entries.len(),
+                    );
+                    let mut statement = match template {
+                        Ok(sql) => self.query(sqlx::AssertSqlSafe(sql)),
+                        Err(_) => {
+                            let values =
+                                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                            let query = format!(
                                 "WITH incoming(
                                      filesystem_entry_id, relative_path, fingerprint, size,
                                      modified_at, device, inode
@@ -75,63 +109,32 @@ impl Database {
                                    AND current.relative_path = incoming.relative_path
                                    AND current.fingerprint = incoming.fingerprint
                                    AND current.entry_kind = 'FILE'
-                                   AND current.is_missing = 0
-                                   AND current.entry_kind = 'FILE'
                                    AND current.is_missing = 0"
-                            )
-                        } else {
-                            format!(
-                                "WITH incoming(
-                                          filesystem_entry_id, relative_path, fingerprint, size,
-                                          modified_at, device, inode
-                                      ) AS (VALUES {values}),
-                                      matching(filesystem_entry_id) AS (
-                                          SELECT incoming.filesystem_entry_id
-                                          FROM incoming
-                                          JOIN filesystem_entries current
-                                            ON current.id = incoming.filesystem_entry_id
-                                           AND current.relative_path = incoming.relative_path
-                                           AND current.fingerprint = incoming.fingerprint
-                                          WHERE current.library_root_id = ?
-                                            AND current.entry_kind = 'FILE'
-                                            AND current.is_missing = 0
-                                      )
-                                 UPDATE filesystem_entries
-                                 SET size = (SELECT size FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                                     modified_at = (SELECT modified_at FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                                     device = (SELECT device FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                                     inode = (SELECT inode FROM incoming WHERE filesystem_entry_id = filesystem_entries.id),
-                                     last_seen_generation = ?,
-                                     last_seen_change_kind = NULL
-                                 WHERE id IN (SELECT filesystem_entry_id FROM matching)"
-                            )
-                        };
-                        self.query(sqlx::AssertSqlSafe(query))
+                            );
+                            self.query(sqlx::AssertSqlSafe(query))
+                        }
+                    };
+                    for entry in entries {
+                        statement = statement
+                            .bind(&entry.filesystem_entry_id)
+                            .bind(&entry.relative_path)
+                            .bind(&entry.fingerprint)
+                            .bind(entry.size)
+                            .bind(entry.modified_at)
+                            .bind(entry.device)
+                            .bind(entry.inode);
                     }
+                    let updated = statement
+                        .bind(generation)
+                        .bind(chunk.library_root_id)
+                        .execute(&mut **transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    usize::try_from(updated.rows_affected()).unwrap_or(usize::MAX)
                 };
-                for entry in entries {
-                    statement = statement
-                        .bind(&entry.filesystem_entry_id)
-                        .bind(&entry.relative_path)
-                        .bind(&entry.fingerprint)
-                        .bind(entry.size)
-                        .bind(entry.modified_at)
-                        .bind(entry.device)
-                        .bind(entry.inode);
-                }
-                statement = if postgres_update_from {
-                    statement.bind(generation).bind(chunk.library_root_id)
-                } else {
-                    statement.bind(chunk.library_root_id).bind(generation)
-                };
-                let updated = statement
-                    .execute(&mut **transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                let updated_count = usize::try_from(updated.rows_affected()).unwrap_or(usize::MAX);
                 if updated_count == entries.len() {
                     successfully_seen_paths.extend(
                         entries
@@ -188,6 +191,12 @@ impl Database {
                         .into_iter()
                         .map(|row| Cow::Owned(row.get::<String, _>("relative_path"))),
                 );
+            }
+            if self.backend() == DatabaseBackend::Sqlite {
+                let _ = self
+                    .query("DROP TABLE IF EXISTS temp.lux_manifest_presence_incoming")
+                    .execute(&mut **transaction)
+                    .await;
             }
         }
 
@@ -255,6 +264,81 @@ impl Database {
         Ok(successfully_seen_paths
             .len()
             .saturating_add(ledger_paths.len()))
+    }
+
+    async fn update_manifest_presence_entries_sqlite(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        library_root_id: &str,
+        generation: &str,
+        entries: &[&NewScanManifestSeenFilesystemEntry],
+    ) -> Result<usize, StorageError> {
+        self.query("DELETE FROM temp.lux_manifest_presence_incoming")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut insert = self.query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO temp.lux_manifest_presence_incoming (
+                 filesystem_entry_id, relative_path, fingerprint, size, modified_at, device, inode
+             ) VALUES {values}"
+        )));
+        for entry in entries {
+            insert = insert
+                .bind(&entry.filesystem_entry_id)
+                .bind(&entry.relative_path)
+                .bind(&entry.fingerprint)
+                .bind(entry.size)
+                .bind(entry.modified_at)
+                .bind(entry.device)
+                .bind(entry.inode);
+        }
+        insert
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let updated = self
+            .query(
+                "UPDATE filesystem_entries
+                 SET size = (SELECT size FROM temp.lux_manifest_presence_incoming incoming
+                             WHERE incoming.filesystem_entry_id = filesystem_entries.id),
+                     modified_at = (SELECT modified_at FROM temp.lux_manifest_presence_incoming incoming
+                                    WHERE incoming.filesystem_entry_id = filesystem_entries.id),
+                     device = (SELECT device FROM temp.lux_manifest_presence_incoming incoming
+                               WHERE incoming.filesystem_entry_id = filesystem_entries.id),
+                     inode = (SELECT inode FROM temp.lux_manifest_presence_incoming incoming
+                              WHERE incoming.filesystem_entry_id = filesystem_entries.id),
+                     last_seen_generation = ?,
+                     last_seen_change_kind = NULL
+                 WHERE id IN (
+                     SELECT incoming.filesystem_entry_id
+                     FROM temp.lux_manifest_presence_incoming incoming
+                     JOIN filesystem_entries current
+                       ON current.id = incoming.filesystem_entry_id
+                      AND current.relative_path = incoming.relative_path
+                      AND current.fingerprint = incoming.fingerprint
+                     WHERE current.library_root_id = ?
+                       AND current.entry_kind = 'FILE'
+                       AND current.is_missing = 0
+                 )",
+            )
+            .bind(generation)
+            .bind(library_root_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(usize::try_from(updated.rows_affected()).unwrap_or(usize::MAX))
     }
 
     async fn record_scan_job_processed_media_items_in_transaction(

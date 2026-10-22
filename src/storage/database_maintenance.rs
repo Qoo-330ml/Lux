@@ -22,6 +22,11 @@ const TRIGGER_FRACTION_DENOMINATOR: i64 = 10;
 const DEFAULT_VACUUM_THRESHOLD: i64 = 50;
 const DEFAULT_VACUUM_SCALE_PERCENT: i64 = 20;
 const MIN_LIVE_TUPLES_FOR_OVERRIDE: i64 = 10_000;
+/// SQLite never reclaims free pages on its own. A full `VACUUM` rewrites the
+/// whole database, so only run it when the freelist is both large in absolute
+/// terms and a meaningful share of the file.
+const SQLITE_VACUUM_MIN_FREELIST_PAGES: i64 = 256;
+const SQLITE_VACUUM_MIN_FREELIST_PERCENT: i64 = 5;
 
 const MAINTENANCE_ENV: &str = "LUX_DATABASE_MAINTENANCE";
 const MAINTENANCE_INTERVAL_ENV: &str = "LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS";
@@ -48,6 +53,7 @@ pub struct MaintenanceReport {
     pub vacuumed: Vec<String>,
     pub parameters_applied: Vec<String>,
     pub skipped_untrusted: Vec<String>,
+    pub skipped_below_threshold: Vec<String>,
     pub failed: Vec<String>,
 }
 
@@ -78,6 +84,19 @@ impl MaintenanceCandidate {
         self.statistics_trusted
             && self.live_tuples >= MIN_LIVE_TUPLES_FOR_OVERRIDE
             && self.exceeds_vacuum_trigger()
+    }
+
+    /// SQLite candidate: `dead_tuples` stores freelist pages and
+    /// `live_tuples` stores total pages. A handful of freelist pages is not
+    /// worth rewriting a multi-gigabyte file.
+    pub fn sqlite_freelist_worth_vacuum(&self) -> bool {
+        self.statistics_trusted
+            && self.dead_tuples >= SQLITE_VACUUM_MIN_FREELIST_PAGES
+            && self.live_tuples > 0
+            && self.dead_tuples.saturating_mul(100)
+                >= self
+                    .live_tuples
+                    .saturating_mul(SQLITE_VACUUM_MIN_FREELIST_PERCENT)
     }
 }
 
@@ -193,17 +212,28 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let page_count: i64 = self
+            .query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         // SQLite tracks no per-table dead tuples. Model the database-wide
         // freelist as one synthetic candidate so the round can run `VACUUM` when
         // enough pages are reclaimable, and skip it otherwise.
-
-        let table = "sqlite-main".to_owned();
-        Ok(vec![MaintenanceCandidate {
-            table,
+        let candidate = MaintenanceCandidate {
+            table: "sqlite-main".to_owned(),
             dead_tuples: freelist,
-            live_tuples: 0,
-            statistics_trusted: freelist > 0,
-        }])
+            live_tuples: page_count,
+            statistics_trusted: freelist > 0 && page_count > 0,
+        };
+        Ok(candidate
+            .sqlite_freelist_worth_vacuum()
+            .then_some(candidate)
+            .into_iter()
+            .collect())
     }
 
     async fn run_maintenance_vacuum(&self, table: &str, report: &mut MaintenanceReport) -> bool {
@@ -317,6 +347,7 @@ impl Database {
                     vacuumed = report.vacuumed.len(),
                     parameters_applied = report.parameters_applied.len(),
                     skipped_untrusted = report.skipped_untrusted.len(),
+                    skipped_below_threshold = report.skipped_below_threshold.len(),
                     failed = report.failed.len(),
                     "database maintenance round finished"
                 );
@@ -362,6 +393,14 @@ impl Database {
         for candidate in candidates.into_iter().take(MAX_MAINTENANCE_TABLES) {
             if !candidate.can_be_evaluated() {
                 report.skipped_untrusted.push(candidate.table.clone());
+                continue;
+            }
+            let worth_vacuum = match self.backend {
+                DatabaseBackend::Sqlite => candidate.sqlite_freelist_worth_vacuum(),
+                DatabaseBackend::Postgres => candidate.exceeds_vacuum_trigger(),
+            };
+            if !worth_vacuum {
+                report.skipped_below_threshold.push(candidate.table.clone());
                 continue;
             }
             if !self
@@ -427,6 +466,20 @@ mod tests {
         assert!(!small.deserves_parameter_override());
         let large = candidate(50_000, 10_000, true);
         assert!(large.deserves_parameter_override());
+    }
+
+    #[test]
+    fn sqlite_vacuum_requires_absolute_and_relative_freelist() {
+        let below_absolute = candidate(10_000, 255, true);
+        assert!(!below_absolute.sqlite_freelist_worth_vacuum());
+        let below_ratio = candidate(100_000, 4_999, true);
+        assert!(!below_ratio.sqlite_freelist_worth_vacuum());
+        let worth = candidate(10_000, 1_000, true);
+        assert!(worth.sqlite_freelist_worth_vacuum());
+        let untrusted = candidate(10_000, 1_000, false);
+        assert!(!untrusted.sqlite_freelist_worth_vacuum());
+        let empty = candidate(0, 1_000, true);
+        assert!(!empty.sqlite_freelist_worth_vacuum());
     }
 
     #[test]
