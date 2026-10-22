@@ -178,6 +178,8 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         reqwest::StatusCode::UNAUTHORIZED
     );
 
+    // The Filmly compatibility path is opt-in (LUX_FILMLY_IMAGE_MODE=compat) because it
+    // serves untagged images without authentication; by default the UA alone grants nothing.
     let emby_filmly_image = client
         .get(format!("{base_url}/emby/Items/{item_id}/Images/Primary"))
         .header(
@@ -186,8 +188,10 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         )
         .send()
         .await?;
-    assert_eq!(emby_filmly_image.status(), reqwest::StatusCode::OK);
-    assert_eq!(emby_filmly_image.bytes().await?, "poster-bytes".as_bytes());
+    assert_eq!(
+        emby_filmly_image.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     let emby_capability_image = client
         .get(format!(

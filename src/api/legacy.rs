@@ -254,6 +254,12 @@ impl AppState {
         let filmly_image_compat_mode = filmly_image_compat_mode_from_env_value(
             std::env::var("LUX_FILMLY_IMAGE_MODE").ok().as_deref(),
         );
+        if filmly_image_compat_mode == FilmlyImageCompatMode::Compat {
+            tracing::warn!(
+                "LUX_FILMLY_IMAGE_MODE=compat serves untagged images without authentication; \
+                 enable it only on a trusted network"
+            );
+        }
         let config_dir = config.config_dir.clone();
         let log_store = LogStore::new(&config_dir);
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
@@ -2253,10 +2259,10 @@ mod tests {
     }
 
     #[test]
-    fn filmly_image_compat_mode_defaults_to_compat_and_accepts_generic_ab_value() {
+    fn filmly_image_compat_mode_is_opt_in() {
         assert_eq!(
             filmly_image_compat_mode_from_env_value(None),
-            FilmlyImageCompatMode::Compat
+            FilmlyImageCompatMode::Generic
         );
         assert_eq!(
             filmly_image_compat_mode_from_env_value(Some("generic")),
@@ -2268,7 +2274,7 @@ mod tests {
         );
         assert_eq!(
             filmly_image_compat_mode_from_env_value(Some("unexpected")),
-            FilmlyImageCompatMode::Compat
+            FilmlyImageCompatMode::Generic
         );
     }
 

@@ -2204,18 +2204,19 @@ pub(super) fn is_filmly_image_request(headers: &HeaderMap) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum FilmlyImageCompatMode {
-    Generic,
     #[default]
+    Generic,
     Compat,
 }
 
 pub(super) fn filmly_image_compat_mode_from_env_value(
     value: Option<&str>,
 ) -> FilmlyImageCompatMode {
-    if value.is_some_and(|value| value.trim().eq_ignore_ascii_case("generic")) {
-        FilmlyImageCompatMode::Generic
-    } else {
+    // The compat path serves untagged images without authentication, so it is opt-in only.
+    if value.is_some_and(|value| value.trim().eq_ignore_ascii_case("compat")) {
         FilmlyImageCompatMode::Compat
+    } else {
+        FilmlyImageCompatMode::Generic
     }
 }
 
