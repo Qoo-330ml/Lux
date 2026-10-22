@@ -40,7 +40,7 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_media_items_content_restriction_index_invalidate_nfo;
+DROP TRIGGER IF EXISTS trg_media_items_content_restriction_index_invalidate_nfo ON media_items;
 CREATE TRIGGER trg_media_items_content_restriction_index_invalidate_nfo
 AFTER UPDATE OF nfo_metadata_json ON media_items
 FOR EACH ROW
