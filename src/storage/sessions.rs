@@ -3,6 +3,9 @@ use crate::storage::{
     PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, PlaybackAdmissionResult,
 };
 
+/// Upper bound for the session listing; live sessions on one server stay far below it.
+const MAX_LISTED_PLAYBACK_SESSIONS: i64 = 500;
+
 impl Database {
     // LUX-736 wires this bounded storage contract into the admin playback API.
     #[allow(dead_code)]
@@ -702,7 +705,8 @@ impl Database {
                  WHERE user_id = ?
                    AND state != 'STOPPED'
                    AND last_event_at > unixepoch() - ?
-                 ORDER BY last_event_at DESC, id",
+                 ORDER BY last_event_at DESC, id
+                 LIMIT ?",
                 user_id,
             )
         } else {
@@ -715,7 +719,8 @@ impl Database {
                  FROM playback_sessions
                  WHERE state != 'STOPPED'
                    AND last_event_at > unixepoch() - ?
-                 ORDER BY last_event_at DESC, id",
+                 ORDER BY last_event_at DESC, id
+                 LIMIT ?",
                 None,
             )
         };
@@ -723,7 +728,9 @@ impl Database {
         if let Some(user_id) = bind {
             statement = statement.bind(user_id);
         }
-        statement = statement.bind(active_within_seconds);
+        statement = statement
+            .bind(active_within_seconds)
+            .bind(MAX_LISTED_PLAYBACK_SESSIONS);
         statement
             .fetch_all(&self.pool)
             .await
@@ -1489,5 +1496,15 @@ impl Database {
         } else {
             WebPlaybackEventClaim::Stale
         })
+    }
+}
+
+#[cfg(test)]
+mod session_bound_tests {
+    use super::MAX_LISTED_PLAYBACK_SESSIONS;
+
+    #[test]
+    fn session_listing_bound_is_small_enough_to_stay_cheap() {
+        assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
     }
 }
