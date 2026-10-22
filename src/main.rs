@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(error) => error!(%error, "one-time database lifecycle cleanup failed"),
     }
     database.spawn_removed_media_item_purge();
+    database.spawn_task_history_retention();
     database.spawn_database_maintenance();
     let cancelled_jobs = database.cancel_incomplete_jobs_for_shutdown().await?;
     if cancelled_jobs > 0 {

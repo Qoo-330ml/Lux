@@ -330,7 +330,7 @@ const SCAN_MANIFEST_DELTA_BATCH_SIZE: usize = 100;
 const RECOMMENDATION_RATING_CACHE_TTL_SECONDS: i64 = 30 * 86_400;
 const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
 const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
-const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 20;
+const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
 const MIN_DATABASE_POOL_MAX_CONNECTIONS: u32 = 1;
 const MAX_DATABASE_POOL_MAX_CONNECTIONS: u32 = 100;
 
@@ -931,7 +931,14 @@ impl Database {
             DatabaseBackend::Sqlite => {
                 "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"
             }
-            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'",
+            DatabaseBackend::Postgres => {
+                "SET TIME ZONE 'UTC';
+                 SET idle_in_transaction_session_timeout = '60s';
+                 SET work_mem = '16MB';
+                 SET jit = off;
+                 SET max_parallel_workers_per_gather = 1;
+                 SET statement_timeout = '1800s'"
+            }
         };
         let pool = AnyPoolOptions::new()
             .max_connections(pool_max_connections)

@@ -102,16 +102,25 @@ fn postgres_recent_catalog_rows_by_library_query(
         .join(", ");
     format!(
         "WITH episode_latest_by_root AS MATERIALIZED (
-             SELECT episode_roots.root_id, MAX(episode.added_at) AS latest_added_at
-             FROM media_items episode
-             CROSS JOIN LATERAL (
-                 VALUES (episode.series_id), (episode.parent_id)
-             ) AS episode_roots(root_id)
-             WHERE episode.item_type = 'EPISODE'
-               AND episode.removed_at IS NULL
-               AND episode.has_available_source = 1
-               AND episode_roots.root_id IS NOT NULL
-             GROUP BY episode_roots.root_id
+             SELECT roots.root_id, MAX(roots.latest_added_at) AS latest_added_at
+             FROM (
+                 SELECT episode.series_id AS root_id, MAX(episode.added_at) AS latest_added_at
+                 FROM media_items episode
+                 WHERE episode.item_type = 'EPISODE'
+                   AND episode.removed_at IS NULL
+                   AND episode.has_available_source = 1
+                   AND episode.series_id IS NOT NULL
+                 GROUP BY episode.series_id
+                 UNION ALL
+                 SELECT episode.parent_id AS root_id, MAX(episode.added_at) AS latest_added_at
+                 FROM media_items episode
+                 WHERE episode.item_type = 'EPISODE'
+                   AND episode.removed_at IS NULL
+                   AND episode.has_available_source = 1
+                   AND episode.parent_id IS NOT NULL
+                 GROUP BY episode.parent_id
+             ) roots
+             GROUP BY roots.root_id
          ), requested_libraries(library_id) AS (
              SELECT DISTINCT library_id FROM (VALUES {values}) requested(library_id)
          ), home_candidates AS MATERIALIZED (
@@ -1258,8 +1267,8 @@ impl Database {
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
-             WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
-                    OR ms.aliases ILIKE ? ESCAPE '\\')
+             WHERE (ms.title ILIKE ? OR ms.original_title ILIKE ?
+                    OR ms.aliases ILIKE ?)
                AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
@@ -10367,13 +10376,15 @@ mod tests {
     }
 
     #[test]
-    fn postgres_recent_catalog_aggregates_episode_dates_once() {
+    fn postgres_recent_catalog_aggregates_series_and_parent_episode_dates() {
         let query = postgres_recent_catalog_rows_by_library_query(2, "");
 
         assert!(query.contains("episode_latest_by_root AS MATERIALIZED"));
-        assert_eq!(query.matches("MAX(episode.added_at)").count(), 1);
+        assert_eq!(query.matches("MAX(episode.added_at)").count(), 2);
         assert_eq!(query.matches("LEFT JOIN episode_latest_by_root").count(), 1);
-        assert!(query.contains("roots.root_id IS NOT NULL"));
+        assert!(query.contains("GROUP BY episode.series_id"));
+        assert!(query.contains("GROUP BY episode.parent_id"));
+        assert!(!query.contains("episode_roots"));
         assert!(!query.contains("MAX(child.added_at)"));
     }
 

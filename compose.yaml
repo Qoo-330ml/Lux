@@ -26,6 +26,9 @@ services:
     container_name: lux-postgres
     profiles:
       - postgres
+    # Parallel VACUUM needs more than Docker's default 64 MB /dev/shm.
+    shm_size: 512mb
+    command: ["postgres", "-c", "shared_buffers=512MB", "-c", "work_mem=16MB"]
     environment:
       POSTGRES_DB: ${LUX_POSTGRES_DB:-lux}
       POSTGRES_USER: ${LUX_POSTGRES_USER:-lux}

@@ -2144,32 +2144,39 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        // Resolve each identity key through its own index instead of one
+        // cross-column OR that forces the planner to scan all credits.
         let query = format!(
-            "SELECT DISTINCT pc.item_id
-             FROM person_credits pc
-             JOIN media_items mi ON mi.id = pc.item_id
-             LEFT JOIN person_identities pi
-               ON pi.provider = pc.provider
-              AND pi.provider_id = pc.person_id
+            "SELECT candidate.item_id
+             FROM (
+                 SELECT pc.item_id
+                 FROM person_credits pc
+                 WHERE pc.person_type = ? AND pc.person_id = ?
+                 UNION
+                 SELECT pc.item_id
+                 FROM person_credits pc
+                 WHERE pc.person_type = ? AND pc.lux_person_id = ?
+                 UNION
+                 SELECT pc.item_id
+                 FROM person_credits pc
+                 JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
+                 WHERE pc.person_type = ? AND pi.person_id = ?
+             ) candidate
+             JOIN media_items mi ON mi.id = candidate.item_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
-               AND pc.person_type = ?
-               AND (
-                   pc.person_id = ?
-                   OR pc.lux_person_id = ?
-                   OR pi.person_id = ?
-               )
-             ORDER BY pc.item_id"
+             ORDER BY candidate.item_id"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for _ in 0..3 {
+            statement = statement.bind(person_type).bind(person_id);
+        }
         for library_id in library_ids {
             statement = statement.bind(library_id);
         }
         let rows = statement
-            .bind(person_type)
-            .bind(person_id)
-            .bind(person_id)
-            .bind(person_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {

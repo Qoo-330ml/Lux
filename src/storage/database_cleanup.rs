@@ -885,6 +885,15 @@ const REMOVED_ITEM_PURGE_BATCH_SIZE: i64 = 200;
 const REMOVED_ITEM_PURGE_MAX_BATCHES: u32 = 500;
 const REMOVED_ITEM_PURGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 const SECONDS_PER_DAY: i64 = 86_400;
+const TASK_HISTORY_RETENTION_ENV: &str = "LUX_TASK_HISTORY_RETENTION_DAYS";
+const DEFAULT_TASK_HISTORY_RETENTION_DAYS: i64 = 14;
+const TASK_HISTORY_RETENTION_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+const TASK_HISTORY_RETENTION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+const TASK_HISTORY_PRUNE_BATCH: i64 = 500;
+const TASK_HISTORY_PRUNE_MAX_BATCHES: u32 = 100;
+const METADATA_CANDIDATE_PRUNE_BATCH: i64 = 2_000;
 
 static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -896,6 +905,25 @@ pub fn removed_item_retention_days() -> i64 {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|days| *days >= 0)
         .unwrap_or(DEFAULT_REMOVED_ITEM_RETENTION_DAYS)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TaskHistoryRetentionReport {
+    pub scan_jobs: u64,
+    pub metadata_reidentify_jobs: u64,
+    pub chapter_detection_jobs: u64,
+    pub danmaku_match_jobs: u64,
+    pub strm_probe_jobs: u64,
+    pub metadata_candidates: u64,
+}
+
+/// Retention window for finished background-job history, in days. `0` disables pruning.
+pub fn task_history_retention_days() -> i64 {
+    std::env::var(TASK_HISTORY_RETENTION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days >= 0)
+        .unwrap_or(DEFAULT_TASK_HISTORY_RETENTION_DAYS)
 }
 
 impl Database {
@@ -1150,5 +1178,256 @@ impl Database {
         self.mark_startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
             .await?;
         Ok(repaired)
+    }
+
+    async fn prune_task_history_batches(
+        &self,
+        sql: &'static str,
+        cutoff: i64,
+        batch: i64,
+        max_batches: u32,
+    ) -> Result<u64, StorageError> {
+        let mut total = 0_u64;
+        for _ in 0..max_batches {
+            let deleted = self
+                .query(sql)
+                .bind(cutoff)
+                .bind(batch)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            total = total.saturating_add(deleted);
+            if deleted < u64::try_from(batch).unwrap_or(u64::MAX) {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Deletes one bounded pass of finished job history and resolved candidates.
+    #[allow(clippy::field_reassign_with_default)]
+    pub async fn prune_task_history(
+        &self,
+        retention_seconds: i64,
+        batch_limit: i64,
+    ) -> Result<TaskHistoryRetentionReport, StorageError> {
+        let cutoff = current_unix_timestamp().saturating_sub(retention_seconds.max(0));
+        let batch = batch_limit.clamp(1, 5_000);
+        let mut report = TaskHistoryRetentionReport::default();
+        report.strm_probe_jobs = self
+            .prune_task_history_batches(
+                "DELETE FROM strm_probe_jobs
+                 WHERE id IN (
+                     SELECT id FROM strm_probe_jobs
+                     WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND created_at < ?
+                     ORDER BY created_at, id
+                     LIMIT ?
+                 )",
+                cutoff,
+                batch,
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+            )
+            .await?;
+        report.chapter_detection_jobs = self
+            .prune_task_history_batches(
+                "DELETE FROM chapter_detection_jobs
+                 WHERE id IN (
+                     SELECT id FROM chapter_detection_jobs
+                     WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND created_at < ?
+                     ORDER BY created_at, id
+                     LIMIT ?
+                 )",
+                cutoff,
+                batch,
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+            )
+            .await?;
+        report.danmaku_match_jobs = self
+            .prune_task_history_batches(
+                "DELETE FROM danmaku_match_jobs
+                 WHERE id IN (
+                     SELECT id FROM danmaku_match_jobs
+                     WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND created_at < ?
+                     ORDER BY created_at, id
+                     LIMIT ?
+                 )",
+                cutoff,
+                batch,
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+            )
+            .await?;
+        report.metadata_reidentify_jobs = self
+            .prune_task_history_batches(
+                "DELETE FROM metadata_reidentify_jobs
+                 WHERE id IN (
+                     SELECT id FROM metadata_reidentify_jobs
+                     WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND created_at < ?
+                     ORDER BY created_at, id
+                     LIMIT ?
+                 )",
+                cutoff,
+                batch,
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+            )
+            .await?;
+        report.scan_jobs = self
+            .prune_task_history_batches(
+                "DELETE FROM scan_jobs
+                 WHERE id IN (
+                     SELECT job.id FROM scan_jobs job
+                     WHERE job.status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND job.scan_phase <> 'POSTPROCESSING'
+                       AND job.created_at < ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM strm_probe_jobs probe
+                           WHERE probe.target_scan_job_id = job.id
+                       )
+                     ORDER BY job.created_at, job.id
+                     LIMIT ?
+                 )",
+                cutoff,
+                batch,
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+            )
+            .await?;
+        report.metadata_candidates = self
+            .prune_task_history_batches(
+                "DELETE FROM metadata_candidates
+                 WHERE id IN (
+                     SELECT candidate.id FROM metadata_candidates candidate
+                     WHERE candidate.created_at < ?
+                       AND (
+                           candidate.status IN ('REJECTED', 'EXPIRED')
+                           OR (
+                               candidate.status = 'SELECTED'
+                               AND EXISTS (
+                                   SELECT 1 FROM metadata_candidates newer
+                                   WHERE newer.item_id = candidate.item_id
+                                     AND newer.status = 'SELECTED'
+                                     AND (
+                                         newer.created_at > candidate.created_at
+                                         OR (
+                                             newer.created_at = candidate.created_at
+                                             AND newer.id > candidate.id
+                                         )
+                                     )
+                               )
+                           )
+                       )
+                     ORDER BY candidate.created_at, candidate.id
+                     LIMIT ?
+                 )",
+                cutoff,
+                METADATA_CANDIDATE_PRUNE_BATCH.max(batch),
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+            )
+            .await?;
+        Ok(report)
+    }
+
+    /// Starts the daily retention pass for finished job history. This is
+    /// independent from database maintenance so disabling VACUUM does not
+    /// retain every historical scan and metadata job forever.
+    pub fn spawn_task_history_retention(&self) {
+        let retention_days = task_history_retention_days();
+        if retention_days == 0 {
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TASK_HISTORY_RETENTION_INITIAL_DELAY).await;
+            let mut ticker = tokio::time::interval(TASK_HISTORY_RETENTION_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match database
+                    .prune_task_history(
+                        retention_days.saturating_mul(SECONDS_PER_DAY),
+                        TASK_HISTORY_PRUNE_BATCH,
+                    )
+                    .await
+                {
+                    Ok(report)
+                        if report.scan_jobs > 0
+                            || report.metadata_reidentify_jobs > 0
+                            || report.chapter_detection_jobs > 0
+                            || report.danmaku_match_jobs > 0
+                            || report.strm_probe_jobs > 0
+                            || report.metadata_candidates > 0 =>
+                    {
+                        tracing::info!(
+                            scan_jobs = report.scan_jobs,
+                            metadata_reidentify_jobs = report.metadata_reidentify_jobs,
+                            chapter_detection_jobs = report.chapter_detection_jobs,
+                            danmaku_match_jobs = report.danmaku_match_jobs,
+                            strm_probe_jobs = report.strm_probe_jobs,
+                            metadata_candidates = report.metadata_candidates,
+                            "pruned expired task history"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "task history retention failed"),
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod task_history_retention_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn retention_deletes_only_expired_terminal_scan_jobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('retention-library', 'Retention', 'MOVIE')")
+            .execute(&database.pool)
+            .await?;
+        let now = current_unix_timestamp();
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, created_at)
+                 VALUES ('old-completed', 'retention-library', 'RECONCILE_LIBRARY', 'COMPLETED', 'g1', 1),
+                        ('new-completed', 'retention-library', 'RECONCILE_LIBRARY', 'COMPLETED', 'g2', ?),
+                        ('old-running', 'retention-library', 'RECONCILE_LIBRARY', 'RUNNING', 'g3', 1)",
+            )
+            .bind(now)
+            .execute(&database.pool)
+            .await?;
+
+        let report = database.prune_task_history(100, 10).await?;
+        assert!(report.scan_jobs >= 1);
+        let old_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'old-completed'")
+            .fetch_one(&database.pool)
+            .await?;
+        let new_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'new-completed'")
+            .fetch_one(&database.pool)
+            .await?;
+        let running_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'old-running'")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(old_count, 0);
+        assert_eq!(new_count, 1);
+        assert_eq!(running_count, 1);
+        Ok(())
     }
 }

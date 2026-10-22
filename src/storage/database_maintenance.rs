@@ -260,7 +260,10 @@ impl Database {
                 }
             },
             DatabaseBackend::Postgres => {
-                let statement = format!("VACUUM (ANALYZE) {}", quote_identifier(table));
+                // Parallel index vacuum needs shared memory beyond Docker's 64 MB
+                // default /dev/shm. Keep maintenance single-process so it cannot
+                // fail with "could not resize shared memory segment".
+                let statement = format!("VACUUM (ANALYZE, PARALLEL 0) {}", quote_identifier(table));
                 match tokio::time::timeout(
                     PER_TABLE_TIMEOUT,
                     self.query(sqlx::AssertSqlSafe(statement))

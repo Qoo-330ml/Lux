@@ -101,7 +101,7 @@ LUX_BACKGROUND_CPU_BUDGET 为扫描准备、指纹、后台 NFO/图片计算、f
 
 LUX_SCAN_CONCURRENCY 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；LUX_PROBE_CONCURRENCY 和 LUX_FFMPEG_CONCURRENCY 独立限制 ffprobe、ffmpeg 子进程，LUX_BACKGROUND_CPU_BUDGET 再对列出的后台 CPU 工作做共享准入。LUX_SCAN_CONCURRENCY 范围为 1–1024，LUX_PROBE_CONCURRENCY 范围为 1–512，LUX_FFMPEG_CONCURRENCY 范围为 1–4。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路；资源自适应仍可能在 CPU、内存、前台延迟或存储延迟较高时降低实际扫描并发，SQLite 批量入库保持单写者。
 
-LUX_DATABASE_MAINTENANCE 控制内置数据库维护，默认开启；设为 `0`、`false`、`off` 或 `no` 可完全关闭。维护在启动后延迟执行一次，之后按每 24 小时一轮在后台运行，并且只在没有扫描或元数据任务运行时才开始；检测到活动任务则跳过本轮。它只做两类低风险动作：对死元组达到判定阈值的表执行 `VACUUM (ANALYZE)`，以及对满足条件的热点大表写入表级 `autovacuum_*` 参数。它不会删除业务数据、删除索引、执行 `VACUUM FULL` 或 `REINDEX`，也不会修改全局 `postgresql.conf` 或重启数据库进程。SQLite 后端只在 `freelist` 同时达到最小页数和文件占比阈值时执行 `VACUUM`，autovacuum 参数对它不适用。LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS 调整轮次间隔（`0` 表示停用周期任务），LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS 调整启动后的首次延迟；非法值回退默认。若运行 PostgreSQL 的容器使用较小的 `/dev/shm`，并行索引清理可能因共享内存不足失败，此时可对该容器设置 `shm_size`。
+LUX_DATABASE_MAINTENANCE 控制内置数据库维护，默认开启；设为 `0`、`false`、`off` 或 `no` 可完全关闭。维护在启动后延迟执行一次，之后按每 24 小时一轮在后台运行，并且只在没有扫描或元数据任务运行时才开始；检测到活动任务则跳过本轮。它只做两类低风险动作：对死元组达到判定阈值的表执行 `VACUUM (ANALYZE)`，以及对满足条件的热点大表写入表级 `autovacuum_*` 参数。它不会删除业务数据、删除索引、执行 `VACUUM FULL` 或 `REINDEX`，也不会修改全局 `postgresql.conf` 或重启数据库进程。SQLite 后端只在 `freelist` 同时达到最小页数和文件占比阈值时执行 `VACUUM`，autovacuum 参数对它不适用。LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS 调整轮次间隔（`0` 表示停用周期任务），LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS 调整启动后的首次延迟；非法值回退默认。 LUX_TASK_HISTORY_RETENTION_DAYS 控制已完成/失败/取消的扫描、元数据、章节、弹幕和 STRM 探测任务历史保留天数（默认 14，0 表示停用周期清理）；`metadata_candidates` 中已拒绝/过期的候选也会一并分批清理。若运行 PostgreSQL 的容器使用较小的 `/dev/shm`，并行索引清理可能因共享内存不足失败，此时可对该容器设置 `shm_size`。
 
 修改 Compose 中的该变量后需要重新创建容器，单纯执行 `docker restart lux` 不会更新容器环境变量：
 

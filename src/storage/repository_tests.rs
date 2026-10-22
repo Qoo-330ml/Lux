@@ -3258,7 +3258,7 @@ fn database_pool_max_connections_uses_backend_defaults() {
     assert_eq!(
         resolve_database_pool_max_connections(DatabaseBackend::Postgres, None)
             .expect("PostgreSQL default pool size"),
-        20
+        8
     );
 }
 

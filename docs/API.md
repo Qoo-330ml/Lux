@@ -64,7 +64,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 附带这些请求头。`X-Lux-Api-Key` 和 `api_key` 查询参数仍只表示 LUX-182 的共享管理员 API Key，不能
 用来冒充普通用户。
 
-数据库连接池的 `maxConnections` 默认值为 SQLite 8、PostgreSQL 20；可通过进程环境变量
+数据库连接池的 `maxConnections` 默认值为 SQLite 8、PostgreSQL 8；可通过进程环境变量
 `LUX_DB_MAX_CONNECTIONS` 在 1-100 范围内覆盖，未设置或为空时使用默认值。管理员健康接口的
 `database.pool.maxConnections` 返回当前生效值。
 
