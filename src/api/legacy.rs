@@ -1173,6 +1173,15 @@ async fn request_access_ip(
     let peer = peer_value
         .parse::<std::net::IpAddr>()
         .map_err(|_| AccessIpResolutionError::InvalidPeerAddress)?;
+    let forwarded_for_values = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|value| value.to_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    if forwarded_for_values.is_empty() {
+        // Without a forwarded chain the answer is the peer, so skip the settings read entirely.
+        return Ok(Some(peer));
+    }
     let database = state
         .database
         .as_ref()
@@ -1187,11 +1196,6 @@ async fn request_access_ip(
                 .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let forwarded_for_values = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .map(|value| value.to_str().unwrap_or_default())
-        .collect::<Vec<_>>();
     crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
         peer,
         &forwarded_for_values,
@@ -2064,6 +2068,21 @@ mod tests {
         assert_eq!(
             request_access_ip(&headers, &state).await,
             Ok(Some("198.51.100.24".parse()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_without_forwarded_headers_does_not_read_settings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // No database at all: without a forwarded chain the peer is authoritative, so the
+        // resolver must not fail (or issue a query).
+        let state = AppState::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("203.0.113.9"));
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("203.0.113.9".parse()?))
         );
         Ok(())
     }
