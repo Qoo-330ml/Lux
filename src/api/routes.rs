@@ -12,6 +12,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
     let resources = state.resources.clone();
     let (emby_routes, emby_path_templates) = emby::api_routes();
+    let request_rate_limiter = state.request_rate_limiter.clone();
     let catalog_request_slots =
         Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_CATALOG_REQUESTS));
     let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
@@ -30,6 +31,10 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip()),
         )
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            request_rate_limiter,
+            limit_request_rate,
+        ))
         .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {
                 let catalog_request_slots = catalog_request_slots.clone();
@@ -402,6 +407,32 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
      base-uri 'self'; \
      form-action 'self'; \
      object-src 'none'";
+
+async fn limit_request_rate(
+    State(limiter): State<crate::security::RequestRateLimiter>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string())
+        .unwrap_or_else(|| "local".to_owned());
+    if limiter.allow(&peer).await {
+        return next.run(request).await;
+    }
+    let mut response = api_error(
+        request.headers(),
+        StatusCode::TOO_MANY_REQUESTS,
+        super::lux::ApiErrorCode::RateLimited,
+        "请求过于频繁，请稍后重试",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("60"));
+    response
+}
 
 async fn security_response_headers(request: Request<Body>, next: Next) -> Response {
     let forwarded_https = request

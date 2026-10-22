@@ -314,3 +314,70 @@ async fn admin_scan_job_endpoints_expose_media_progress_without_changing_file_co
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn concurrent_event_streams_are_capped() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(
+        AppState::ready(config, database, setup, auth, emby_auth).with_sse_connection_limit(1),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookie = cookie_value(login.headers(), "lux_session");
+
+    let session_cookie = format!("lux_session={cookie}");
+    let first = client
+        .get(format!("http://{address}/api/v1/admin/events"))
+        .header(COOKIE, &session_cookie)
+        .send()
+        .await?;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let second = client
+        .get(format!("http://{address}/api/v1/admin/events"))
+        .header(COOKIE, &session_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the stream budget must reject extra connections"
+    );
+    assert_eq!(
+        second
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+
+    drop(first);
+    server.abort();
+    Ok(())
+}

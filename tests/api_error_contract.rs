@@ -141,3 +141,68 @@ async fn responses_carry_security_headers_and_hsts_only_when_forwarded_https()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn request_bursts_from_one_peer_are_rate_limited() -> Result<(), Box<dyn std::error::Error>> {
+    use luxd::{
+        api::AppState,
+        application::setup::SetupService,
+        auth::{emby::EmbyAuthService, sessions::WebAuthService},
+        config::Config,
+        storage::Database,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let app = luxd::api::app_with_state(
+        AppState::ready(
+            config,
+            database.clone(),
+            setup,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database.clone())?,
+        )
+        .with_request_rate_limit(3),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    for _ in 0..3 {
+        let allowed = client
+            .get(format!("http://{address}/api/v1/version"))
+            .send()
+            .await?;
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+    }
+    let limited = client
+        .get(format!("http://{address}/api/v1/version"))
+        .send()
+        .await?;
+    assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        limited
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("60")
+    );
+
+    server.abort();
+    Ok(())
+}

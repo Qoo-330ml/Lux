@@ -147,6 +147,22 @@ mod routes;
 #[path = "users.rs"]
 mod users;
 
+/// Concurrency budget for server-sent-event streams; the default keeps resource use bounded.
+#[derive(Clone)]
+pub(crate) struct SseConnectionBudget(Arc<tokio::sync::Semaphore>);
+
+impl Default for SseConnectionBudget {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(MAX_SSE_CONNECTIONS)))
+    }
+}
+
+impl SseConnectionBudget {
+    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AppState {
     admin_health_probe_cache: AdminHealthProbeCache,
@@ -207,6 +223,9 @@ pub struct AppState {
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
     device_pairing_rate_limiter: DevicePairingRateLimiter,
+    request_rate_limiter: crate::security::RequestRateLimiter,
+    /// Bounds the number of concurrent server-sent-event streams.
+    sse_permits: SseConnectionBudget,
 }
 
 impl AppState {
@@ -230,6 +249,18 @@ impl AppState {
             worker.shutdown().await;
         }
         Ok(())
+    }
+
+    /// Overrides the concurrent SSE stream budget (tests use a small value).
+    pub fn with_sse_connection_limit(mut self, limit: usize) -> Self {
+        self.sse_permits = SseConnectionBudget(Arc::new(tokio::sync::Semaphore::new(limit)));
+        self
+    }
+
+    /// Overrides the per-peer request budget (tests use a small value).
+    pub fn with_request_rate_limit(mut self, limit: u32) -> Self {
+        self.request_rate_limiter = crate::security::RequestRateLimiter::new(limit);
+        self
     }
 
     pub fn ready(
@@ -519,6 +550,8 @@ impl AppState {
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
+            request_rate_limiter: crate::security::RequestRateLimiter::default(),
+            sse_permits: SseConnectionBudget::default(),
         }
     }
 
@@ -733,6 +766,8 @@ async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), R
 }
 
 const MAX_CONCURRENT_CATALOG_REQUESTS: usize = 16;
+/// Each stream holds a task and a 16 KiB buffer, so the cap keeps them bounded.
+const MAX_SSE_CONNECTIONS: usize = 64;
 const MAX_IN_FLIGHT_CATALOG_REQUESTS: usize = 64;
 
 fn is_catalog_aggregation_path(path: &str) -> bool {
@@ -1107,6 +1142,20 @@ pub(super) async fn request_client_ip(headers: &HeaderMap, state: &AppState) -> 
         Ok(address) => address.map(|address| address.to_string()),
         Err(_) => None,
     }
+}
+
+fn sse_capacity_response(headers: &HeaderMap) -> Response {
+    let mut response = api_error(
+        headers,
+        StatusCode::TOO_MANY_REQUESTS,
+        super::lux::ApiErrorCode::RateLimited,
+        "同时打开的事件流过多，请稍后重试",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("30"));
+    response
 }
 
 async fn request_access_ip(

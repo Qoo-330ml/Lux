@@ -178,11 +178,89 @@ fn key_digest(key: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+const REQUEST_WINDOW: Duration = Duration::from_secs(60);
+const REQUEST_MAX_ENTRIES: usize = 8192;
+/// Generous per-peer budget: a player fetching HLS segments and artwork bursts stays well below
+/// it, while a runaway client cannot monopolise the server.
+pub const DEFAULT_REQUESTS_PER_MINUTE: u32 = 2_400;
+
+#[derive(Clone)]
+pub struct RequestRateLimiter {
+    state: Arc<Mutex<RequestRateLimiterState>>,
+    limit: u32,
+}
+
+impl Default for RequestRateLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_REQUESTS_PER_MINUTE)
+    }
+}
+
+impl RequestRateLimiter {
+    pub fn new(limit: u32) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RequestRateLimiterState {
+                entries: HashMap::new(),
+                last_cleanup: Instant::now(),
+            })),
+            limit: limit.max(1),
+        }
+    }
+
+    /// Counts one request for `key`; returns false once the minute budget is exhausted.
+    pub async fn allow(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        if now.saturating_duration_since(state.last_cleanup) >= REQUEST_WINDOW {
+            state.entries.retain(|_, entry| {
+                now.saturating_duration_since(entry.started_at) < REQUEST_WINDOW
+            });
+            state.last_cleanup = now;
+        }
+        let key = key_digest(key);
+        if let Some(entry) = state.entries.get_mut(&key) {
+            if now.saturating_duration_since(entry.started_at) >= REQUEST_WINDOW {
+                *entry = RequestWindow {
+                    started_at: now,
+                    count: 1,
+                };
+                return true;
+            }
+            if entry.count >= self.limit {
+                return false;
+            }
+            entry.count = entry.count.saturating_add(1);
+            return true;
+        }
+        if state.entries.len() >= REQUEST_MAX_ENTRIES {
+            return false;
+        }
+        state.entries.insert(
+            key,
+            RequestWindow {
+                started_at: now,
+                count: 1,
+            },
+        );
+        true
+    }
+}
+
+struct RequestRateLimiterState {
+    entries: HashMap<[u8; 32], RequestWindow>,
+    last_cleanup: Instant,
+}
+
+struct RequestWindow {
+    started_at: Instant,
+    count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CLEANUP_INTERVAL, DevicePairingRateLimiter, LoginAttempt, LoginRateLimiter, MAX_ENTRIES,
-        WINDOW, key_digest,
+        RequestRateLimiter, WINDOW, key_digest,
     };
     use std::time::{Duration, Instant};
 
@@ -249,5 +327,14 @@ mod tests {
         assert!(limiter.try_acquire("client-a", 2).await);
         assert!(!limiter.try_acquire("client-a", 2).await);
         assert!(limiter.try_acquire("client-b", 2).await);
+    }
+
+    #[tokio::test]
+    async fn request_limiter_counts_per_key_within_the_window() {
+        let limiter = RequestRateLimiter::new(2);
+        assert!(limiter.allow("peer-a").await);
+        assert!(limiter.allow("peer-a").await);
+        assert!(!limiter.allow("peer-a").await);
+        assert!(limiter.allow("peer-b").await);
     }
 }
