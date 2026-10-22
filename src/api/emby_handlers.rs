@@ -582,6 +582,10 @@ pub(super) async fn emby_media_updated(
     if request.updates.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // Each entry costs a filesystem probe, so a single notification cannot be unbounded.
+    if request.updates.len() > EMBY_MEDIA_UPDATED_MAX_ENTRIES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     let roots = match database.list_all_library_roots().await {
         Ok(roots) => roots,
@@ -2380,6 +2384,9 @@ pub(super) struct EmbyRefreshQuery {
     )]
     pub(super) recursive: Option<bool>,
 }
+
+/// Upper bound for one `/Library/Media/Updated` batch.
+const EMBY_MEDIA_UPDATED_MAX_ENTRIES: usize = 256;
 
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyMediaUpdatedRequest {
