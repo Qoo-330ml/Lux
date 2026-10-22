@@ -30901,3 +30901,82 @@ async fn person_credit_item_ids_are_paged_by_keyset() -> Result<(), Box<dyn std:
     assert_eq!(second, vec!["item-c".to_owned()]);
     Ok(())
 }
+
+#[tokio::test]
+async fn search_pages_past_the_end_still_report_the_real_total()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{config::Config, library::LibraryKind};
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+        ) VALUES ('root-search', ?, '/media/movies', '/media/movies', 1, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    for (index, title) in ["Zebra One", "Zebra Two"].iter().enumerate() {
+        let entry_id = format!("entry-search-{index}");
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                id, library_root_id, relative_path, entry_kind, size, modified_at,
+                last_seen_generation
+            ) VALUES (?, 'root-search', ?, 'FILE', 1, 1, 'gen')",
+        )
+        .bind(&entry_id)
+        .bind(format!("{index}.mkv"))
+        .execute(database.pool())
+        .await?;
+        let item_id = format!("item-search-{index}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+            ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(title)
+        .bind(title)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default)
+             VALUES (?, ?, 'LOCAL_FILE', ?, 1)",
+        )
+        .bind(format!("source-search-{index}"))
+        .bind(&item_id)
+        .bind(&entry_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let page = database
+        .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+            query: "Zebra",
+            like_query: "%Zebra%",
+            item_types: &["MOVIE".to_owned()],
+            library_ids: Some(&[library_id.clone()]),
+            offset: 10,
+            limit: 5,
+            content_restrictions: None,
+        })
+        .await?;
+    assert!(page.0.is_empty());
+    assert_eq!(
+        page.1, 2,
+        "an out-of-range page must still report the real total"
+    );
+    Ok(())
+}

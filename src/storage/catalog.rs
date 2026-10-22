@@ -85,6 +85,7 @@ const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_ite
                    AND media_items.item_type IN ('MOVIE', 'SERIES')
              )";
 
+#[derive(Clone, Copy)]
 struct CatalogSearchPageBindings<'a> {
     fts_query: Option<&'a str>,
     like_query: Option<&'a str>,
@@ -1346,6 +1347,14 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        if rows.is_empty() && bindings.offset > 0 {
+            // `COUNT(*) OVER()` only appears on returned rows, so a page past the end would
+            // report a total of zero. Ask for the first page to learn the real total.
+            let mut first_page = bindings;
+            first_page.offset = 0;
+            let (_, total) = Box::pin(self.fetch_catalog_search_page(query, first_page)).await?;
+            return Ok((Vec::new(), total));
+        }
         let total = rows.first().map(|row| row.get("total")).unwrap_or(0);
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
