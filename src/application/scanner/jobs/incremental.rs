@@ -1,5 +1,17 @@
 use super::*;
 
+/// Stats one incremental entry without following symbolic links.
+///
+/// Events can name a symlink that points outside the library root; treating it as absent keeps
+/// the walker (and the catalog) inside the root.
+async fn incremental_entry_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => None,
+        Ok(metadata) => Some(metadata),
+        Err(_) => None,
+    }
+}
+
 impl ScanJobService {
     pub(in crate::application::scanner) async fn run_incremental_batch(
         &self,
@@ -196,7 +208,7 @@ impl ScanJobService {
         let metadata = if path.change_kind == "REMOVE" {
             None
         } else {
-            fs::metadata(&media_path).await.ok()
+            incremental_entry_metadata(&media_path).await
         };
         if metadata.is_none() {
             if super::super::library::is_supported_incremental_sidecar_file(&media_path) {
@@ -391,5 +403,41 @@ impl ScanJobService {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::incremental_entry_metadata;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_incremental_entries_are_treated_as_absent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside)
+            .await
+            .expect("outside directory");
+        let outside_file = outside.join("Outside.Movie.2024.mkv");
+        tokio::fs::write(&outside_file, b"video")
+            .await
+            .expect("outside file");
+        let link = temp.path().join("linked");
+        std::os::unix::fs::symlink(&outside, &link).expect("directory symlink");
+
+        assert!(
+            incremental_entry_metadata(&link).await.is_none(),
+            "a symlinked event path must not be walked"
+        );
+        assert!(
+            incremental_entry_metadata(&outside).await.is_some(),
+            "regular directories stay scannable"
+        );
+        assert!(incremental_entry_metadata(&outside_file).await.is_some());
+        assert!(
+            incremental_entry_metadata(&temp.path().join("missing.mkv"))
+                .await
+                .is_none()
+        );
     }
 }
