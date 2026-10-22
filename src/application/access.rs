@@ -84,6 +84,19 @@ impl MediaAccessService {
         if !self.can_view_library(principal, &library_id).await? {
             return Ok(false);
         }
+        self.can_view_item_content(principal, item_id).await
+    }
+
+    /// Checks only the per-user content restrictions. The caller has already confirmed that the
+    /// item exists and that the principal may view its library.
+    async fn can_view_item_content(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+    ) -> Result<bool, AccessError> {
+        if principal.is_admin {
+            return Ok(true);
+        }
         let user_id = principal.user_id_string();
         let Some(restrictions) = self.database.user_content_restrictions(&user_id).await? else {
             return Ok(true);
@@ -141,7 +154,7 @@ impl MediaAccessService {
         item_id: &str,
         source_id: Option<&str>,
     ) -> Result<Option<StoredPlaybackSource>, AccessError> {
-        Ok(self
+        let Some(source) = self
             .database
             .find_authorized_playback_source(
                 item_id,
@@ -149,7 +162,16 @@ impl MediaAccessService {
                 &principal.user_id_string(),
                 principal.is_admin,
             )
-            .await?)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Streaming and downloads reuse this lookup; without the content check they would
+        // bypass the parental-control policy that item detail and subtitles enforce.
+        if !self.can_view_item_content(principal, item_id).await? {
+            return Ok(None);
+        }
+        Ok(Some(source))
     }
 }
 
@@ -313,6 +335,102 @@ mod tests {
             .execute(database.pool())
             .await?;
         assert!(!access.can_view_item(principal, "policy-episode").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authorized_playback_source_respects_content_restrictions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("playback-policy-viewer", "Viewer", "test password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback policy", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('policy-movie', ?, 'MOVIE', 'Policy', 'policy', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('policy-movie', 'R')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('policy-root', ?, '/media/policy', '/media/policy', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES ('policy-entry', 'policy-root', 'Policy.mkv', 'FILE', 1, 1, 'gen', 0)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default)
+             VALUES ('policy-source', 'policy-movie', 'LOCAL_FILE', 'policy-entry', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let access = MediaAccessService::new(database.clone());
+        let principal = AccessPrincipal::new(user.id, false);
+        assert!(access.can_view_item(principal, "policy-movie").await?);
+        assert!(
+            access
+                .authorized_playback_source(principal, "policy-movie", None)
+                .await?
+                .is_some()
+        );
+
+        let restricted = database
+            .compare_and_swap_user_content_restrictions(
+                &user_id,
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            restricted,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        assert!(!access.can_view_item(principal, "policy-movie").await?);
+        assert!(
+            access
+                .authorized_playback_source(principal, "policy-movie", None)
+                .await?
+                .is_none(),
+            "playback authorization must not bypass content restrictions"
+        );
         Ok(())
     }
 }
