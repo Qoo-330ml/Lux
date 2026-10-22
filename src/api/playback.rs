@@ -1911,11 +1911,7 @@ pub(super) fn playback_client_label(value: Option<&str>) -> &'static str {
 const PLAYBACK_WEBHOOK_PROGRESS_INTERVAL_SECONDS: i64 = 30;
 
 pub(super) fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or_default()
+    crate::clock::unix_timestamp()
 }
 
 pub(super) fn should_publish_playback_progress(

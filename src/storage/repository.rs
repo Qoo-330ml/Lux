@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -418,11 +418,7 @@ fn database_flag(value: bool) -> i64 {
 }
 
 fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or_default()
+    crate::clock::unix_timestamp()
 }
 
 fn recommendation_rating_cache_is_fresh(now: i64, calculated_at: i64) -> bool {

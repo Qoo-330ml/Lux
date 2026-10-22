@@ -3,6 +3,7 @@
 pub mod api;
 pub mod application;
 pub mod auth;
+pub(crate) mod clock;
 pub mod config;
 pub mod discovery;
 pub mod domain;
