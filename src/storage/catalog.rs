@@ -1179,9 +1179,9 @@ impl Database {
             "SELECT mi.id FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
-             WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
+             WHERE (mi.title LIKE ? ESCAPE '!' OR COALESCE(mi.original_title, '') LIKE ? ESCAPE '!'
                     OR EXISTS (SELECT 1 FROM item_aliases ia
-                               WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
+                               WHERE ia.item_id = mi.id AND ia.alias LIKE ? ESCAPE '!'))
              AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
