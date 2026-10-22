@@ -347,6 +347,27 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        self.reset_media_probe_for_filesystem_entry_in_transaction(
+            &mut transaction,
+            filesystem_entry_id,
+            size,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn reset_media_probe_for_filesystem_entry_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        filesystem_entry_id: &str,
+        size: i64,
+    ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_sources
              SET size = ?,
@@ -358,7 +379,7 @@ impl Database {
         )
         .bind(size)
         .bind(filesystem_entry_id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
@@ -371,19 +392,13 @@ impl Database {
              )",
         )
         .bind(filesystem_entry_id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(())
     }
 
     pub(crate) async fn update_media_source_strm_target(

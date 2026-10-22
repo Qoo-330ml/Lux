@@ -442,6 +442,122 @@ impl Database {
             })
     }
 
+    /// Applies the changed-file writes of an incremental scan in one
+    /// transaction: filesystem entry, restored availability and probe reset.
+    pub(crate) async fn apply_incremental_filesystem_entry_change(
+        &self,
+        update: FilesystemEntryUpdate<'_>,
+        strm_target_kind: Option<&str>,
+        strm_target: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE filesystem_entries
+             SET size = ?, modified_at = ?, fingerprint = ?, device = ?, inode = ?,
+                 last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(update.size)
+        .bind(update.modified_at)
+        .bind(update.fingerprint)
+        .bind(update.device)
+        .bind(update.inode)
+        .bind(update.last_seen_generation)
+        .bind(update.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.restore_media_items_for_filesystem_entries(&mut transaction, &[update.id.to_owned()])
+            .await?;
+        self.reset_media_probe_for_filesystem_entry_in_transaction(
+            &mut transaction,
+            update.id,
+            update.size,
+        )
+        .await?;
+        if strm_target_kind.is_some() {
+            self.query(
+                "UPDATE media_sources
+                 SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
+                 WHERE filesystem_entry_id = ?",
+            )
+            .bind(strm_target)
+            .bind(strm_target_kind)
+            .bind(update.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Marks an unchanged incremental file as seen and updates its STRM target
+    /// in the same transaction.
+    pub(crate) async fn mark_filesystem_entry_seen_with_strm_target(
+        &self,
+        id: &str,
+        last_seen_generation: &str,
+        device: Option<i64>,
+        inode: Option<i64>,
+        strm_target_kind: Option<&str>,
+        strm_target: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE filesystem_entries
+             SET last_seen_generation = ?, device = ?, inode = ?, is_missing = 0,
+                 updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(last_seen_generation)
+        .bind(device)
+        .bind(inode)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.restore_media_items_for_filesystem_entries(&mut transaction, &[id.to_owned()])
+            .await?;
+        if strm_target_kind.is_some() {
+            self.query(
+                "UPDATE media_sources
+                 SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
+                 WHERE filesystem_entry_id = ?",
+            )
+            .bind(strm_target)
+            .bind(strm_target_kind)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn mark_missing_filesystem_entries(
         &self,
         library_root_id: &str,

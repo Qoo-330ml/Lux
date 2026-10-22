@@ -725,44 +725,34 @@ impl LibraryScanner {
             && let Some(existing_entry) = existing_entry.as_ref()
         {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
-                if is_strm {
-                    self.database
-                        .update_media_source_strm_target(
-                            &existing_entry.id,
-                            strm_target_kind,
-                            external_url,
-                        )
-                        .await?;
-                }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation, device, inode)
+                    .mark_filesystem_entry_seen_with_strm_target(
+                        &existing_entry.id,
+                        generation,
+                        device,
+                        inode,
+                        if is_strm { strm_target_kind } else { None },
+                        if is_strm { external_url } else { None },
+                    )
                     .await?;
                 report.skipped_files = 1;
                 return Ok(report);
             }
             self.database
-                .update_filesystem_entry(FilesystemEntryUpdate {
-                    id: &existing_entry.id,
-                    size,
-                    modified_at,
-                    fingerprint: &fingerprint,
-                    device,
-                    inode,
-                    last_seen_generation: generation,
-                })
+                .apply_incremental_filesystem_entry_change(
+                    FilesystemEntryUpdate {
+                        id: &existing_entry.id,
+                        size,
+                        modified_at,
+                        fingerprint: &fingerprint,
+                        device,
+                        inode,
+                        last_seen_generation: generation,
+                    },
+                    if is_strm { strm_target_kind } else { None },
+                    if is_strm { external_url } else { None },
+                )
                 .await?;
-            self.database
-                .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
-                .await?;
-            if is_strm {
-                self.database
-                    .update_media_source_strm_target(
-                        &existing_entry.id,
-                        strm_target_kind,
-                        external_url,
-                    )
-                    .await?;
-            }
             report.changed_files = 1;
             return Ok(report);
         }
