@@ -2824,7 +2824,7 @@ fn is_allowed_scraper_image_url(value: &str, allow_loopback_http: bool) -> bool 
 /// Host literals are classified directly; hostnames are resolved so a DNS name cannot point the
 /// server at an internal service. The HTTP client does not follow redirects, so a public host
 /// cannot bounce the request inward either.
-async fn ensure_public_image_host(
+pub(crate) async fn ensure_public_image_host(
     url: &Url,
     allow_loopback_http: bool,
 ) -> Result<(), ImageWriteError> {
@@ -2892,12 +2892,13 @@ mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImagePermitPool,
         ImageWriteError, background_image_content_tag_and_dimensions_from_bytes,
-        canonical_image_stems, global_image_download_permits, global_image_write_permits,
-        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
-        image_download_retry_delay, image_language_matches, image_lookup_stems,
-        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
-        write_image_atomically,
+        canonical_image_stems, ensure_public_image_host, global_image_download_permits,
+        global_image_write_permits, image_attempt_failure,
+        image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
+        image_language_matches, image_lookup_stems, is_allowed_scraper_image_url,
+        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
     };
+    use reqwest::Url;
 
     #[test]
     fn image_retries_only_transient_upstream_statuses() {
@@ -3068,6 +3069,19 @@ mod tests {
                 "{value} must be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn public_host_guard_rejects_private_targets_without_dns() {
+        let loopback = Url::parse("http://127.0.0.1:8099/poster.jpg").expect("url");
+        assert!(ensure_public_image_host(&loopback, false).await.is_err());
+        assert!(ensure_public_image_host(&loopback, true).await.is_ok());
+
+        let private = Url::parse("https://192.168.1.10/poster.jpg").expect("url");
+        assert!(ensure_public_image_host(&private, true).await.is_err());
+
+        let public = Url::parse("https://[2606:4700:4700::1111]/poster.jpg").expect("url");
+        assert!(ensure_public_image_host(&public, false).await.is_ok());
     }
 
     #[test]
