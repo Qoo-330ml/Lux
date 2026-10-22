@@ -32,7 +32,14 @@ async fn test_server(
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    // Mirror production: the setup guard reads the peer address from ConnectInfo.
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     Ok((format!("http://{address}"), server, restart_receiver))
 }
 

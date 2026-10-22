@@ -255,6 +255,21 @@ pub(crate) fn ip_blacklist_rules_match_address(
     Ok(false)
 }
 
+/// Loopback or private-LAN address, used to keep pre-setup management endpoints local.
+pub(crate) fn is_private_or_loopback(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_loopback() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_private_or_loopback(IpAddr::V4(mapped));
+            }
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    }
+}
+
 fn normalize_mapped_ipv4(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V6(address) => address

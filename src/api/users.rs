@@ -316,11 +316,32 @@ impl SetupDatabaseRequest {
     }
 }
 
+/// The pre-setup database probe must not be reachable from the public internet: it lets the
+/// caller make the server connect to an arbitrary PostgreSQL endpoint.
+fn setup_endpoint_allows_peer(headers: &HeaderMap) -> bool {
+    header_str(headers, "x-lux-peer-ip")
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .is_some_and(crate::application::user_access_rules::is_private_or_loopback)
+}
+
+fn setup_remote_peer_rejected(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::FORBIDDEN,
+        lux::ApiErrorCode::PermissionDenied,
+        "只能在局域网内完成数据库初始化",
+    )
+    .into_response()
+}
+
 pub(super) async fn setup_database_test(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<SetupDatabaseRequest>,
 ) -> Response {
+    if !setup_endpoint_allows_peer(&headers) {
+        return setup_remote_peer_rejected(&headers);
+    }
     let Some(setup) = state.setup.as_ref() else {
         return api_error(
             &headers,
@@ -376,6 +397,9 @@ pub(super) async fn setup_database_select(
     State(state): State<AppState>,
     Json(request): Json<SetupDatabaseRequest>,
 ) -> Response {
+    if !setup_endpoint_allows_peer(&headers) {
+        return setup_remote_peer_rejected(&headers);
+    }
     let Some(setup) = state.setup.as_ref() else {
         return api_error(
             &headers,
@@ -3253,4 +3277,27 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/auth/sessions/{session_id}",
             delete(users::auth_revoke_session),
         )
+}
+
+#[cfg(test)]
+mod setup_peer_tests {
+    use super::setup_endpoint_allows_peer;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn setup_endpoints_only_accept_loopback_or_private_peers() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            !setup_endpoint_allows_peer(&headers),
+            "a missing peer must fail closed"
+        );
+        for peer in ["127.0.0.1", "10.1.2.3", "192.168.1.20", "::1", "fd00::1"] {
+            headers.insert("x-lux-peer-ip", HeaderValue::from_str(peer).unwrap());
+            assert!(setup_endpoint_allows_peer(&headers), "{peer}");
+        }
+        for peer in ["203.0.113.5", "2001:db8::1"] {
+            headers.insert("x-lux-peer-ip", HeaderValue::from_str(peer).unwrap());
+            assert!(!setup_endpoint_allows_peer(&headers), "{peer}");
+        }
+    }
 }
