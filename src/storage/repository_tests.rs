@@ -8118,6 +8118,12 @@ async fn automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelle
         .create_library("Fill backoff scope", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
+    // Automatic fill-missing dispatch is gated by the library's visible
+    // "new/changed resources" switch; enable it so the automatic source can run.
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
     let item_ids = [
         "fill-backoff-manual",
         "fill-backoff-reidentify",
@@ -24652,6 +24658,13 @@ async fn automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate
         .create_library("Dispatch source separation", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
+    // Automatic fill-missing dispatch is gated by the library's visible
+    // "new/changed resources" switch; production scan jobs either pass their own
+    // policy or resolve to this switch. Enable it so the automatic source can run.
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
     for item_id in [
         "dispatch-explicit-item",
         "dispatch-automatic-item",
@@ -25271,6 +25284,12 @@ async fn changed_local_fill_request_during_running_item_is_not_lost()
         .fetch_one(database.pool())
         .await?;
     let library_id = library.id.to_string();
+    // Automatic fill-missing dispatch is gated by the library's visible
+    // "new/changed resources" switch; enable it so the automatic source can run.
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
 
     let first_fingerprint = b"fill-request-v1";
     assert!(
