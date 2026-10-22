@@ -110,10 +110,19 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
         .to_owned();
     let viewer_response = client
         .get(format!("http://{address}/Users"))
-        .header("X-Emby-Token", viewer_token)
+        .header("X-Emby-Token", &viewer_token)
         .send()
         .await?;
     assert_eq!(viewer_response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // A non-administrator must not reach the media-info import route even with an empty body.
+    let viewer_sync = client
+        .post(format!("http://{address}/Items/SyncMediaInfo"))
+        .header("X-Emby-Token", &viewer_token)
+        .body("")
+        .send()
+        .await?;
+    assert_eq!(viewer_sync.status(), reqwest::StatusCode::FORBIDDEN);
 
     let missing_key = client.get(format!("http://{address}/Users")).send().await?;
     assert_eq!(missing_key.status(), reqwest::StatusCode::UNAUTHORIZED);

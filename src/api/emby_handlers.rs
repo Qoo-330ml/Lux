@@ -23,7 +23,9 @@ pub(super) async fn emby_sync_media_info(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    if !body.is_empty() && !auth_principal.is_admin() {
+    // The route imports media information into the catalog, so an empty body is not a reason to
+    // skip the administrator check.
+    if !auth_principal.is_admin() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(plugins) = state.plugins.as_ref() else {
