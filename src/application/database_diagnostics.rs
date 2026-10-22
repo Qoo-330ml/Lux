@@ -58,18 +58,21 @@ impl DatabaseDiagnosticsService {
         let service = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = service.begin_collection(true).await;
+            // The automatic report must not scan every SQLite page at startup;
+            // relation sizes are collected when an administrator asks for them.
+            let _ = service.begin_collection(true, false).await;
         });
     }
 
     pub async fn request_collection(&self) -> Result<Value, DatabaseDiagnosticsStartError> {
-        self.begin_collection(false).await?;
+        self.begin_collection(false, true).await?;
         Ok(self.status().await)
     }
 
     async fn begin_collection(
         &self,
         only_if_waiting: bool,
+        include_relation_sizes: bool,
     ) -> Result<(), DatabaseDiagnosticsStartError> {
         let started_at = unix_timestamp();
         let mut state = self.state.write().await;
@@ -103,7 +106,7 @@ impl DatabaseDiagnosticsService {
 
         let service = self.clone();
         tokio::spawn(async move {
-            service.collect().await;
+            service.collect(include_relation_sizes).await;
         });
         Ok(())
     }
@@ -122,11 +125,11 @@ impl DatabaseDiagnosticsService {
         (!report.is_null()).then_some(report)
     }
 
-    async fn collect(&self) {
+    async fn collect(&self, include_relation_sizes: bool) {
         let result = tokio::time::timeout(COLLECTION_TIMEOUT, async {
             let mut report = self
                 .database
-                .collect_database_diagnostics()
+                .collect_database_diagnostics(include_relation_sizes)
                 .await
                 .map_err(|_| ())?;
             let schema_version = self.database.schema_version().await.map_err(|_| ())?;

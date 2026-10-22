@@ -15,9 +15,13 @@ pub struct DatabaseDiagnosticsSnapshot {
 impl Database {
     pub async fn collect_database_diagnostics(
         &self,
+        include_relation_sizes: bool,
     ) -> Result<DatabaseDiagnosticsSnapshot, StorageError> {
         let details = match self.backend {
-            DatabaseBackend::Sqlite => self.collect_sqlite_diagnostics().await?,
+            DatabaseBackend::Sqlite => {
+                self.collect_sqlite_diagnostics(include_relation_sizes)
+                    .await?
+            }
             DatabaseBackend::Postgres => self.collect_postgres_diagnostics().await?,
         };
         Ok(DatabaseDiagnosticsSnapshot {
@@ -26,7 +30,10 @@ impl Database {
         })
     }
 
-    async fn collect_sqlite_diagnostics(&self) -> Result<Value, StorageError> {
+    async fn collect_sqlite_diagnostics(
+        &self,
+        include_relation_sizes: bool,
+    ) -> Result<Value, StorageError> {
         let page_size: i64 = self
             .query_scalar("PRAGMA page_size")
             .fetch_one(&self.pool)
@@ -72,32 +79,36 @@ impl Database {
             .await
             .map_err(|source| self.diagnostics_error(source))?;
 
-        let dbstat_rows = tokio::time::timeout(
-            Duration::from_secs(90),
-            self.query(
-                "SELECT name, SUM(pgsize) AS bytes, SUM(payload) AS payload_bytes,
-                    SUM(unused) AS unused_bytes, COUNT(*) AS pages
-             FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC LIMIT ?",
+        let (dbstat_available, mut object_sizes) = if include_relation_sizes {
+            let dbstat_rows = tokio::time::timeout(
+                Duration::from_secs(90),
+                self.query(
+                    "SELECT name, SUM(pgsize) AS bytes, SUM(payload) AS payload_bytes,
+                        SUM(unused) AS unused_bytes, COUNT(*) AS pages
+                 FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC LIMIT ?",
+                )
+                .bind(MAX_DIAGNOSTIC_RELATIONS)
+                .fetch_all(&self.pool),
             )
-            .bind(MAX_DIAGNOSTIC_RELATIONS)
-            .fetch_all(&self.pool),
-        )
-        .await;
-        let (dbstat_available, mut object_sizes) = match dbstat_rows {
-            Ok(Ok(rows)) => {
-                let mut sizes = HashMap::new();
-                for row in rows {
-                    let name: String = row.try_get("name").unwrap_or_default();
-                    sizes.insert(name, json!({
-                        "bytes": row.try_get::<i64, _>("bytes").unwrap_or_default(),
-                        "payloadBytes": row.try_get::<i64, _>("payload_bytes").unwrap_or_default(),
-                        "unusedBytes": row.try_get::<i64, _>("unused_bytes").unwrap_or_default(),
-                        "pages": row.try_get::<i64, _>("pages").unwrap_or_default(),
-                    }));
+            .await;
+            match dbstat_rows {
+                Ok(Ok(rows)) => {
+                    let mut sizes = HashMap::new();
+                    for row in rows {
+                        let name: String = row.try_get("name").unwrap_or_default();
+                        sizes.insert(name, json!({
+                            "bytes": row.try_get::<i64, _>("bytes").unwrap_or_default(),
+                            "payloadBytes": row.try_get::<i64, _>("payload_bytes").unwrap_or_default(),
+                            "unusedBytes": row.try_get::<i64, _>("unused_bytes").unwrap_or_default(),
+                            "pages": row.try_get::<i64, _>("pages").unwrap_or_default(),
+                        }));
+                    }
+                    (true, sizes)
                 }
-                (true, sizes)
+                _ => (false, HashMap::new()),
             }
-            _ => (false, HashMap::new()),
+        } else {
+            (false, HashMap::new())
         };
 
         let mut index_details = Vec::new();
@@ -157,7 +168,13 @@ impl Database {
             "indexes": index_details, "schemaSizes": schema_sizes,
             "queryStatistics": { "status": "NOT_APPLICABLE", "topStatements": [] },
             "relationSizesAvailable": dbstat_available,
-            "relationSizesNote": if dbstat_available { "SQLite dbstat" } else { "SQLite dbstat unavailable" },
+            "relationSizesNote": if dbstat_available {
+                "SQLite dbstat"
+            } else if include_relation_sizes {
+                "SQLite dbstat unavailable"
+            } else {
+                "SQLite dbstat skipped for automatic collection"
+            },
             "relationsTruncated": relations_truncated,
             "indexesTruncated": indexes_truncated,
         }))
@@ -394,6 +411,25 @@ mod tests {
     use crate::config::Config;
 
     #[tokio::test]
+    async fn sqlite_diagnostics_can_skip_dbstat_for_automatic_collection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let report = database
+            .collect_database_diagnostics(false)
+            .await
+            .expect("diagnostics");
+        assert_eq!(report.details["relationSizesAvailable"], false);
+        assert_eq!(
+            report.details["relationSizesNote"],
+            "SQLite dbstat skipped for automatic collection"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_database_diagnostics_report_file_and_relation_sizes_without_row_data() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config = Config {
@@ -402,7 +438,7 @@ mod tests {
         };
         let database = Database::connect(&config).await.expect("database");
         let report = database
-            .collect_database_diagnostics()
+            .collect_database_diagnostics(true)
             .await
             .expect("diagnostics");
 
@@ -539,7 +575,7 @@ mod tests {
                 .expect("record a statement in pg_stat_statements");
         }
         let report = database
-            .collect_database_diagnostics()
+            .collect_database_diagnostics(true)
             .await
             .expect("diagnostics");
 
