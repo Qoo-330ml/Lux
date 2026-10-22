@@ -1118,7 +1118,7 @@ async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_sc
 async fn refresh_recommendation_stats(database: &Database) {
     sqlx::query(
         "UPDATE recommendation_stats_state
-         SET batch_key = batch_key - 1
+         SET batch_key = batch_key - 1, refreshed_at = 0
          WHERE id = 1",
     )
     .execute(database.pool())

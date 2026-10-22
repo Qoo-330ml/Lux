@@ -13,6 +13,7 @@ use crate::{
 };
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
+const RECOMMENDATION_STATS_MAX_IDLE_REFRESH_SECONDS: i64 = 7 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
 const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
@@ -527,9 +528,9 @@ impl Database {
         let _refresh_guard = self.recommendation_stats_refresh_lock.lock().await;
         let now = current_unix_timestamp();
         let batch_key = recommendation_batch_key_at(now);
-        let current_batch = self
-            .query_scalar::<i64>(
-                "SELECT batch_key
+        let state = self
+            .query_as::<(i64, Option<String>, i64)>(
+                "SELECT batch_key, source_fingerprint, refreshed_at
                  FROM recommendation_stats_state
                  WHERE id = 1",
             )
@@ -539,10 +540,77 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        if current_batch == Some(batch_key) {
+        let Some((stored_batch_key, stored_fingerprint, refreshed_at)) = state else {
+            // A missing state row is handled by the full refresh below.
+            return self
+                .refresh_recommendation_stats(now, batch_key, None)
+                .await;
+        };
+        if stored_batch_key == batch_key {
             return Ok(false);
         }
+        let fingerprint = self.recommendation_stats_source_fingerprint(now).await?;
+        if stored_fingerprint.as_deref() == Some(fingerprint.as_str())
+            && now.saturating_sub(refreshed_at) < RECOMMENDATION_STATS_MAX_IDLE_REFRESH_SECONDS
+        {
+            // The daily batch key changed but nothing that affects scores did.
+            // Advance the batch key so the 15-second scheduler check stays cheap;
+            // refreshed_at remains the last real recomputation time.
+            self.query("UPDATE recommendation_stats_state SET batch_key = ? WHERE id = 1")
+                .bind(batch_key)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.refresh_recommendation_stats(now, batch_key, Some(&fingerprint))
+            .await
+    }
 
+    async fn recommendation_stats_source_fingerprint(
+        &self,
+        now: i64,
+    ) -> Result<String, StorageError> {
+        let window_start = now - RECOMMENDATION_PLAYBACK_WINDOW_SECONDS;
+        let (playback_count, playback_last_event_at, favorite_count, version_sum, visible_item_count, item_updated_at): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self
+            .query_as(
+                "SELECT
+                    (SELECT COUNT(*) FROM playback_sessions WHERE last_event_at > ?),
+                    (SELECT COALESCE(MAX(last_event_at), 0) FROM playback_sessions WHERE last_event_at > ?),
+                    (SELECT COUNT(*) FROM user_item_state WHERE is_favorite = 1),
+                    (SELECT COALESCE(SUM(version), 0) FROM user_item_state),
+                    (SELECT COUNT(*) FROM media_items WHERE removed_at IS NULL),
+                    (SELECT COALESCE(MAX(updated_at), 0) FROM media_items)",
+            )
+            .bind(window_start)
+            .bind(window_start)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(format!(
+            "{playback_count}:{playback_last_event_at}:{favorite_count}:{version_sum}:{visible_item_count}:{item_updated_at}"
+        ))
+    }
+
+    async fn refresh_recommendation_stats(
+        &self,
+        now: i64,
+        batch_key: i64,
+        source_fingerprint: Option<&str>,
+    ) -> Result<bool, StorageError> {
         let min_function = self.scalar_min_function();
         let mut transaction = self
             .pool
@@ -608,14 +676,18 @@ impl Database {
                 source,
             })?;
         self.query(
-            "INSERT INTO recommendation_stats_state (id, batch_key, refreshed_at)
-             VALUES (1, ?, ?)
+            "INSERT INTO recommendation_stats_state (
+                 id, batch_key, refreshed_at, source_fingerprint
+             )
+             VALUES (1, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  batch_key = excluded.batch_key,
-                 refreshed_at = excluded.refreshed_at",
+                 refreshed_at = excluded.refreshed_at,
+                 source_fingerprint = excluded.source_fingerprint",
         )
         .bind(batch_key)
         .bind(now)
+        .bind(source_fingerprint)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -10313,6 +10385,71 @@ mod tests {
         assert!(!query.contains("ROW_NUMBER()"));
         assert_eq!(query.matches("LIMIT ?").count(), 6);
         assert_eq!(query.matches("UNION ALL").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn recommendation_refresh_skips_unchanged_inputs_within_the_idle_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Recommendations", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES ('recommendation-skip-item', ?, 'MOVIE', 'Skip', 'skip',
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "UPDATE recommendation_stats_state
+                 SET batch_key = batch_key - 1, refreshed_at = 0",
+            )
+            .execute(database.pool())
+            .await?;
+        assert!(database.refresh_recommendation_stats_if_needed().await?);
+        let fingerprint: Option<String> = sqlx::query_scalar(
+            "SELECT source_fingerprint FROM recommendation_stats_state WHERE id = 1",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert!(fingerprint.is_some());
+
+        // Next batch, same inputs: skip the materialization.
+        sqlx::query("UPDATE recommendation_stats_state SET batch_key = batch_key - 1")
+            .execute(database.pool())
+            .await?;
+        assert!(!database.refresh_recommendation_stats_if_needed().await?);
+
+        // A new item changes the fingerprint and forces a refresh.
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES ('recommendation-skip-item-2', ?, 'MOVIE', 'Skip 2', 'skip 2',
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE recommendation_stats_state SET batch_key = batch_key - 1")
+            .execute(database.pool())
+            .await?;
+        assert!(database.refresh_recommendation_stats_if_needed().await?);
+        Ok(())
     }
 
     #[tokio::test]
