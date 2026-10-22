@@ -1117,9 +1117,15 @@ pub(super) async fn lux_get_item(
             "数据库暂时不可用",
         )
         .into_response(),
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-            unreachable!("inaccessible item is returned as not found")
-        }
+        // The catalog already maps inaccessible items to `Ok(None)`; treat any leak the same
+        // way rather than aborting the request.
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
     }
 }
 

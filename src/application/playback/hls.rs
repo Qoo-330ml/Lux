@@ -1434,7 +1434,9 @@ fn ffmpeg_args_for_output_with_audio(
                 "192k".to_owned(),
             ]);
         }
-        ServerTier::Direct => unreachable!(),
+        // Direct play never transcodes; the caller only builds these arguments for transcode
+        // tiers, so emitting no codec arguments is the safe fallback.
+        ServerTier::Direct => {}
     }
     if matches!(
         tier,

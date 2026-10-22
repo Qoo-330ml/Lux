@@ -498,8 +498,10 @@ impl LibraryService {
             if existing.library_id == library_id_text {
                 return Err(match overlap {
                     RootOverlap::Exact => LibraryServiceError::DuplicateRoot,
-                    RootOverlap::Nested => LibraryServiceError::OverlappingRoot,
-                    RootOverlap::Disjoint => unreachable!(),
+                    // Disjoint roots were skipped above; keep the arm total without panicking.
+                    RootOverlap::Nested | RootOverlap::Disjoint => {
+                        LibraryServiceError::OverlappingRoot
+                    }
                 });
             }
             warnings.push(LibraryWarningCode::CrossLibraryOverlap);
