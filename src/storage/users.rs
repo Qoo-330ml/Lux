@@ -75,6 +75,9 @@ fn normalize_user_content_restriction_tags(tags: &[String]) -> Result<Vec<String
     Ok(normalized)
 }
 
+/// Upper bound for an unpaginated user-directory listing.
+const MAX_USER_DIRECTORY_ENTRIES: i64 = 1000;
+
 impl Database {
     // LUX-645 wires this storage primitive into the application preset service.
     #[allow(dead_code)]
@@ -845,6 +848,8 @@ impl Database {
         } else {
             " WHERE is_disabled = 0"
         };
+        // A directory listing is bounded: past this many accounts the caller should page.
+        let limit = MAX_USER_DIRECTORY_ENTRIES + 1;
         let query = format!(
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
@@ -856,16 +861,31 @@ impl Database {
                          FROM access_tokens at WHERE at.user_id = users.id),
                         last_login_at
                     ) AS last_activity_at
-             FROM users{where_clause} ORDER BY username_normalized"
+             FROM users{where_clause} ORDER BY username_normalized LIMIT ?"
         );
-        self.query(sqlx::AssertSqlSafe(query))
+        let mut users: Vec<StoredUser> = self
+            .query(sqlx::AssertSqlSafe(query))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map(|rows| rows.into_iter().map(stored_user).collect())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?
+            .into_iter()
+            .map(stored_user)
+            .collect();
+        if users.len() as i64 > MAX_USER_DIRECTORY_ENTRIES {
+            tracing::warn!(
+                limit = MAX_USER_DIRECTORY_ENTRIES,
+                "user directory exceeded its bound; the listing is truncated"
+            );
+            users.truncate(MAX_USER_DIRECTORY_ENTRIES as usize);
+        }
+        Ok(users).map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn query_users(
