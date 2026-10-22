@@ -31346,3 +31346,213 @@ fn sql_placeholder_rewrite_ignores_strings_and_comments() {
         "SELECT ?"
     );
 }
+
+#[tokio::test]
+async fn chapter_detection_season_source_counts_match_paged_source_filters()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Chapter season counts", LibraryKind::Series, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    libraries
+        .add_root(library.id, root_path.to_str().ok_or("media root")?)
+        .await?;
+    let root_id: String = database
+        .query_scalar("SELECT id FROM library_roots LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+
+    for (id, item_type, parent_id, series_id, season_number, removed_at) in [
+        ("counts-series", "SERIES", None, None, None, None),
+        (
+            "counts-season-1",
+            "SEASON",
+            Some("counts-series"),
+            Some("counts-series"),
+            Some(1_i64),
+            None,
+        ),
+        (
+            "counts-season-2",
+            "SEASON",
+            Some("counts-series"),
+            Some("counts-series"),
+            Some(2_i64),
+            None,
+        ),
+        (
+            "counts-episode-1",
+            "EPISODE",
+            Some("counts-season-1"),
+            Some("counts-series"),
+            Some(1_i64),
+            None,
+        ),
+        (
+            "counts-episode-2",
+            "EPISODE",
+            Some("counts-season-1"),
+            Some("counts-series"),
+            Some(2_i64),
+            None,
+        ),
+        (
+            "counts-episode-3",
+            "EPISODE",
+            Some("counts-season-2"),
+            Some("counts-series"),
+            Some(1_i64),
+            None,
+        ),
+        (
+            "counts-episode-4",
+            "EPISODE",
+            Some("counts-season-2"),
+            Some("counts-series"),
+            Some(2_i64),
+            Some(1_i64),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, season_number,
+                 title, sort_title, identification_status, removed_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind(id)
+        .bind(&library_id)
+        .bind(item_type)
+        .bind(parent_id)
+        .bind(series_id)
+        .bind(season_number)
+        .bind(id)
+        .bind(id)
+        .bind(removed_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, relative_path, fingerprint, is_missing) in [
+        ("counts-entry-1", "S01E01.mkv", Some(vec![1_u8]), 0_i64),
+        ("counts-entry-1-alt", "S01E01.alt.mkv", Some(vec![9_u8]), 0),
+        ("counts-entry-2", "S01E02.mkv", Some(vec![2_u8]), 1),
+        ("counts-entry-3", "S02E01.mkv", None, 0),
+        ("counts-entry-4", "S02E02.mkv", Some(vec![4_u8]), 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO filesystem_entries
+             (id, library_root_id, relative_path, entry_kind, size, modified_at,
+              last_seen_generation, fingerprint, is_missing)
+             VALUES (?, ?, ?, 'FILE', 1, 1, 'generation', ?, ?)",
+        )
+        .bind(id)
+        .bind(&root_id)
+        .bind(relative_path)
+        .bind(fingerprint)
+        .bind(is_missing)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, item_id, entry_id, is_default) in [
+        (
+            "counts-source-1",
+            "counts-episode-1",
+            "counts-entry-1",
+            1_i64,
+        ),
+        (
+            "counts-source-1-alt",
+            "counts-episode-1",
+            "counts-entry-1-alt",
+            0,
+        ),
+        ("counts-source-2", "counts-episode-2", "counts-entry-2", 0),
+        ("counts-source-3", "counts-episode-3", "counts-entry-3", 0),
+        ("counts-source-4", "counts-episode-4", "counts-entry-4", 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default)
+             VALUES (?, ?, 'LOCAL_FILE', ?, ?)",
+        )
+        .bind(id)
+        .bind(item_id)
+        .bind(entry_id)
+        .bind(is_default)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let local_kinds = vec!["LOCAL_FILE".to_owned(), "STRM_URL".to_owned()];
+    let counts = database
+        .chapter_detection_source_season_counts(&library_id, false, &local_kinds)
+        .await?;
+    assert_eq!(
+        counts.get("counts-season-1").copied().unwrap_or_default(),
+        1,
+        "only the default source of an episode counts"
+    );
+    assert_eq!(
+        counts.get("counts-season-2").copied().unwrap_or_default(),
+        1,
+        "missing entries and removed episodes are excluded"
+    );
+
+    let fingerprint_counts = database
+        .chapter_detection_source_season_counts(&library_id, true, &local_kinds)
+        .await?;
+    assert_eq!(
+        fingerprint_counts
+            .get("counts-season-1")
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+    assert!(
+        !fingerprint_counts.contains_key("counts-season-2"),
+        "season 2 only has a source without a fingerprint"
+    );
+
+    let strm_counts = database
+        .chapter_detection_source_season_counts(&library_id, false, &["STRM_URL".to_owned()])
+        .await?;
+    assert!(strm_counts.is_empty());
+
+    for require_fingerprint in [false, true] {
+        let mut paged = std::collections::HashMap::<String, i64>::new();
+        let mut after = None::<String>;
+        loop {
+            let page = database
+                .list_chapter_detection_sources_page(
+                    &library_id,
+                    "builtin",
+                    after.as_deref(),
+                    1,
+                    require_fingerprint,
+                    &local_kinds,
+                )
+                .await?;
+            let Some(last) = page.last().map(|source| source.source_id.clone()) else {
+                break;
+            };
+            for source in page {
+                *paged.entry(source.season_id).or_default() += 1;
+            }
+            after = Some(last);
+        }
+        let counted = database
+            .chapter_detection_source_season_counts(&library_id, require_fingerprint, &local_kinds)
+            .await?;
+        assert_eq!(counted, paged);
+    }
+    Ok(())
+}

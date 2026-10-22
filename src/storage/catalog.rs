@@ -5922,6 +5922,74 @@ impl Database {
         })
     }
 
+    /// Counts the eligible chapter-detection sources of every season in one aggregate query.
+    ///
+    /// The caller streams sources with [`Self::list_chapter_detection_sources_page`] and needs
+    /// the per-season source total only to reject seasons that are too small. Accumulating every
+    /// source row just to compute those totals made chapter detection memory proportional to the
+    /// whole library; this query keeps it proportional to the season count instead.
+    pub(crate) async fn chapter_detection_source_season_counts(
+        &self,
+        library_id: &str,
+        require_fingerprint: bool,
+        supported_media_source_kinds: &[String],
+    ) -> Result<HashMap<String, i64>, StorageError> {
+        let source_kind_placeholders = if supported_media_source_kinds.is_empty() {
+            "NULL".to_owned()
+        } else {
+            std::iter::repeat_n("?", supported_media_source_kinds.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let fingerprint_predicate = if require_fingerprint {
+            "AND fe.fingerprint IS NOT NULL"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT season.id AS season_id, COUNT(*) AS source_count
+             FROM media_sources ms
+             JOIN media_items episode ON episode.id = ms.item_id
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE episode.library_id = ?
+               AND episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND ms.source_kind IN ({source_kind_placeholders})
+               AND episode.removed_at IS NULL
+               AND fe.is_missing = 0
+               {fingerprint_predicate}
+               AND (ms.is_default = 1 OR NOT EXISTS (
+                   SELECT 1 FROM media_sources preferred
+                   WHERE preferred.item_id = episode.id AND preferred.is_default = 1
+               ))
+             GROUP BY season.id"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+        for source_kind in supported_media_source_kinds {
+            statement = statement.bind(source_kind);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            row.get::<String, _>("season_id"),
+                            row.get::<i64, _>("source_count"),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn create_chapter_detection_job(
         &self,
         job: NewChapterDetectionJob<'_>,

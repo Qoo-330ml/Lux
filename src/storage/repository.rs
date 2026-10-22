@@ -7941,7 +7941,7 @@ pub(crate) struct StoredScanManifestPostprocessingState {
     pub(crate) roots: Vec<StoredScanManifestPostprocessingRoot>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredChapterDetectionSource {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
