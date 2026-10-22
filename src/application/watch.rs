@@ -96,7 +96,15 @@ impl LibraryWatcher {
             };
             for change in classify_event(&root_for_callback, event) {
                 if sender.try_send(change).is_err() {
-                    dropped_for_callback.fetch_add(1, Ordering::Relaxed);
+                    let dropped = dropped_for_callback.fetch_add(1, Ordering::Relaxed) + 1;
+                    // A full queue means the scanner is behind: report periodically instead of
+                    // silently dropping filesystem changes.
+                    if dropped == 1 || dropped % 500 == 0 {
+                        tracing::warn!(
+                            dropped,
+                            "filesystem watch queue is full; change events are being dropped"
+                        );
+                    }
                 }
             }
         })
@@ -149,6 +157,8 @@ impl LibraryWatcher {
         EVENT_CHANNEL_CAPACITY
     }
 
+    /// The notifier has no liveness API, so this only reports that the handle is still owned.
+    /// `dropped_events` is the signal that actually reflects a struggling watcher.
     pub fn watcher_alive(&self) -> bool {
         let _ = &self.watcher;
         true
