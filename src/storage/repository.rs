@@ -1085,6 +1085,13 @@ impl Database {
         }
     }
 
+    /// Starts a SQLite write transaction that may read before it writes.
+    ///
+    /// A deferred transaction upgrades to the write lock on its first write; when another
+    /// connection committed in between, that upgrade fails with `SQLITE_BUSY_SNAPSHOT` and
+    /// `busy_timeout` does not help. Any transaction that reads a row it later updates must
+    /// start here. Transactions whose first statement is already a write keep the cheaper
+    /// deferred `begin()`.
     async fn begin_metadata_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
