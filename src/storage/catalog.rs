@@ -2018,7 +2018,20 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM media_items mi
+             FROM (
+                 -- Page over items first: joining sources and streams before LIMIT would
+                 -- paginate the joined rows, so a multi-source item could push other items
+                 -- off the page and appear again on the next one.
+                 SELECT mi.id AS item_id
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
+                 ORDER BY {item_order}
+                 LIMIT ? OFFSET ?
+             ) page
+             JOIN media_items mi ON mi.id = page.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -2027,10 +2040,7 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
-               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
-             ORDER BY {item_order}, ms.id, mt.stream_index
-             LIMIT ? OFFSET ?"
+             ORDER BY {item_order}, ms.id, mt.stream_index"
         );
         let mut binds = Vec::with_capacity(item_types.len() + content_restriction_binds.len() + 3);
         binds.push(CatalogBind::Text(parent_id));

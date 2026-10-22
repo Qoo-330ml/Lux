@@ -30980,3 +30980,111 @@ async fn search_pages_past_the_end_still_report_the_real_total()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn catalog_children_page_over_items_not_joined_source_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{config::Config, library::LibraryKind};
+    use std::collections::BTreeSet;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+        ) VALUES ('root-children', ?, '/media/shows', '/media/shows', 1, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    let insert_item = |sqlx_id: &'static str,
+                       item_type: &'static str,
+                       parent: Option<&'static str>,
+                       episode: i64| {
+        let database = database.clone();
+        let library_id = library_id.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, parent_id, season_number, episode_number,
+                    title, sort_title, identification_status, has_available_source
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(sqlx_id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(parent)
+            .bind(episode)
+            .bind(format!("Item {sqlx_id}"))
+            .bind(format!("Item {sqlx_id}"))
+            .execute(database.pool())
+            .await
+        }
+    };
+    insert_item("season-1", "SEASON", None, 0).await?;
+    for episode in 1..=3 {
+        let id: &'static str = match episode {
+            1 => "episode-1",
+            2 => "episode-2",
+            _ => "episode-3",
+        };
+        insert_item(id, "EPISODE", Some("season-1"), episode).await?;
+    }
+    // Give the first episode two playable sources; a joined page would count them as two rows.
+    for (suffix, path) in [("a", "e1-a.mkv"), ("b", "e1-b.mkv")] {
+        let entry_id = format!("entry-{suffix}");
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                id, library_root_id, relative_path, entry_kind, size, modified_at,
+                last_seen_generation
+            ) VALUES (?, 'root-children', ?, 'FILE', 1, 1, 'gen')",
+        )
+        .bind(&entry_id)
+        .bind(path)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                id, item_id, source_kind, filesystem_entry_id, is_default
+            ) VALUES (?, 'episode-1', 'LOCAL_FILE', ?, 0)",
+        )
+        .bind(format!("source-{suffix}"))
+        .bind(&entry_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let first = database
+        .list_catalog_children("season-1", "EPISODE", None, None, 0, 2)
+        .await?;
+    let first_items = first
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(first_items.len(), 2, "the page must cover two items");
+    assert!(first_items.contains("episode-1"));
+    assert!(first_items.contains("episode-2"));
+
+    let second = database
+        .list_catalog_children("season-1", "EPISODE", None, None, 2, 2)
+        .await?;
+    let second_items = second
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(second_items, BTreeSet::from(["episode-3".to_owned()]));
+    assert!(
+        first_items.is_disjoint(&second_items),
+        "no item may be repeated across pages"
+    );
+    Ok(())
+}
