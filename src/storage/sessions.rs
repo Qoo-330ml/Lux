@@ -6,6 +6,9 @@ use crate::storage::{
 /// Upper bound for the session listing; live sessions on one server stay far below it.
 const MAX_LISTED_PLAYBACK_SESSIONS: i64 = 500;
 
+/// A single item source should never accumulate more active playback sessions than this.
+const MAX_SESSIONS_PER_SOURCE: i64 = 32;
+
 impl Database {
     // LUX-736 wires this bounded storage contract into the admin playback API.
     #[allow(dead_code)]
@@ -1225,12 +1228,14 @@ impl Database {
              FROM web_playback_sessions
              WHERE user_id = ? AND item_id = ? AND media_source_id = ?
                AND state = 'ACTIVE' AND play_session_id LIKE ?
-             ORDER BY created_at ASC, id ASC",
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?",
         )
         .bind(user_id)
         .bind(item_id)
         .bind(media_source_id)
         .bind(play_session_pattern)
+        .bind(MAX_SESSIONS_PER_SOURCE)
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
