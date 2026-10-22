@@ -83,3 +83,61 @@ async fn client_request_ids_are_not_adopted_by_the_server() -> Result<(), Box<dy
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn responses_carry_security_headers_and_hsts_only_when_forwarded_https()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app()).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let plain = client
+        .get(format!("http://{address}/api/v1/auth/sessions"))
+        .send()
+        .await?;
+    let headers = plain.headers();
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers.get("x-frame-options").and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        headers.get("referrer-policy").and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert!(
+        headers
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|value| value.contains("frame-ancestors 'none'"))
+    );
+    assert!(
+        headers.get("strict-transport-security").is_none(),
+        "HSTS must not be sent over plain HTTP"
+    );
+
+    let forwarded = client
+        .get(format!("http://{address}/api/v1/auth/sessions"))
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await?;
+    assert_eq!(
+        forwarded
+            .headers()
+            .get("strict-transport-security")
+            .and_then(|v| v.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
+
+    server.abort();
+    Ok(())
+}

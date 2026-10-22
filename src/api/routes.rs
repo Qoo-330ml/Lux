@@ -158,6 +158,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 )
                 .propagate_x_request_id(),
         )
+        .layer(middleware::from_fn(security_response_headers))
         .layer(middleware::from_fn(web_asset_cache_policy));
     case_insensitive_emby_router(app, emby_path_templates)
 }
@@ -383,6 +384,54 @@ async fn strip_client_request_id(mut request: Request<Body>, next: Next) -> Resp
         }
     }
     next.run(request).await
+}
+
+/// Same-origin policy for the bundled Web client.
+///
+/// The player needs blob workers (hls.js) and WebAssembly (HEVC), and the build has no inline
+/// scripts. `'wasm-unsafe-eval'` is ignored by browsers without it (Safari before 16.4), which
+/// then refuses WebAssembly; those clients fall back to the non-HEVC path.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+     img-src 'self' data: blob: https://www.themoviedb.org; \
+     media-src 'self' blob:; \
+     script-src 'self' 'wasm-unsafe-eval'; \
+     style-src 'self' 'unsafe-inline'; \
+     connect-src 'self'; \
+     worker-src 'self' blob:; \
+     frame-ancestors 'none'; \
+     base-uri 'self'; \
+     form-action 'self'; \
+     object-src 'none'";
+
+async fn security_response_headers(request: Request<Body>, next: Next) -> Response {
+    let forwarded_https = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers
+        .entry("x-content-type-options")
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry("x-frame-options")
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry("referrer-policy")
+        .or_insert(HeaderValue::from_static("no-referrer"));
+    headers
+        .entry("content-security-policy")
+        .or_insert(HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    if forwarded_https {
+        headers
+            .entry("strict-transport-security")
+            .or_insert(HeaderValue::from_static(
+                "max-age=31536000; includeSubDomains",
+            ));
+    }
+    response
 }
 
 async fn web_asset_cache_policy(request: Request<Body>, next: Next) -> Response {
