@@ -5043,3 +5043,126 @@ mod tests {
         Ok(())
     }
 }
+
+impl Database {
+    /// Loads restriction and library-access state for several users with one query each.
+    ///
+    /// Used by list endpoints so reporting a user's policy does not become an N+1 query.
+    pub(crate) async fn list_user_access_snapshots(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, UserAccessSnapshot>, StorageError> {
+        let mut snapshots = std::collections::HashMap::new();
+        for chunk in user_ids.chunks(200) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mode_query =
+                format!("SELECT id, library_access_mode FROM users WHERE id IN ({placeholders})");
+            let mut mode_statement = self.query(sqlx::AssertSqlSafe(mode_query));
+            for user_id in chunk {
+                mode_statement = mode_statement.bind(user_id);
+            }
+            for row in mode_statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let user_id: String = row.get("id");
+                let mode: Option<String> = row.get("library_access_mode");
+                snapshots.insert(
+                    user_id,
+                    UserAccessSnapshot {
+                        library_access_mode: mode.unwrap_or_else(|| "ALL".to_owned()),
+                        library_ids: Vec::new(),
+                        restrictions: None,
+                    },
+                );
+            }
+
+            let access_query = format!(
+                "SELECT user_id, library_id FROM user_library_access
+                 WHERE user_id IN ({placeholders}) AND can_view = 1
+                 ORDER BY user_id, library_id"
+            );
+            let mut access_statement = self.query(sqlx::AssertSqlSafe(access_query));
+            for user_id in chunk {
+                access_statement = access_statement.bind(user_id);
+            }
+            for row in access_statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let user_id: String = row.get("user_id");
+                let library_id: String = row.get("library_id");
+                if let Some(snapshot) = snapshots.get_mut(&user_id) {
+                    snapshot.library_ids.push(library_id);
+                }
+            }
+
+            let restriction_query = format!(
+                "SELECT restrictions.user_id, restrictions.rating_system,
+                        restrictions.maximum_rating, restrictions.allow_unrated,
+                        restrictions.version, restrictions.updated_at,
+                        tags.tag_kind, tags.tag
+                 FROM user_content_restrictions restrictions
+                 LEFT JOIN user_content_restriction_tags tags
+                   ON tags.user_id = restrictions.user_id
+                 WHERE restrictions.user_id IN ({placeholders})
+                 ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
+            );
+            let mut restriction_statement = self.query(sqlx::AssertSqlSafe(restriction_query));
+            for user_id in chunk {
+                restriction_statement = restriction_statement.bind(user_id);
+            }
+            let mut restrictions_by_user =
+                std::collections::HashMap::<String, UserContentRestrictions>::new();
+            for row in restriction_statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let user_id: String = row.get("user_id");
+                let entry = restrictions_by_user.entry(user_id).or_insert_with(|| {
+                    UserContentRestrictions {
+                        rating_system: row.get("rating_system"),
+                        maximum_rating: row.get("maximum_rating"),
+                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
+                        allowed_tags: Vec::new(),
+                        blocked_tags: Vec::new(),
+                        version: row.get("version"),
+                        updated_at: row.get("updated_at"),
+                    }
+                });
+                let tag_kind: Option<String> = row.get("tag_kind");
+                let tag: Option<String> = row.get("tag");
+                match (tag_kind.as_deref(), tag) {
+                    (None, None) => {}
+                    (Some("ALLOW"), Some(tag)) => entry.allowed_tags.push(tag),
+                    (Some("BLOCK"), Some(tag)) => entry.blocked_tags.push(tag),
+                    _ => {
+                        return Err(StorageError::Serialization(
+                            "invalid user content restriction tag row".to_owned(),
+                        ));
+                    }
+                }
+            }
+            for (user_id, restrictions) in restrictions_by_user {
+                if let Some(snapshot) = snapshots.get_mut(&user_id) {
+                    snapshot.restrictions = Some(restrictions);
+                }
+            }
+        }
+        Ok(snapshots)
+    }
+}

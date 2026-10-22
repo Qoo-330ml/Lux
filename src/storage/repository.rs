@@ -4986,6 +4986,13 @@ pub(crate) struct UserContentRestrictions {
     pub(crate) updated_at: i64,
 }
 
+/// Everything the access layer (and Emby policy DTOs) needs about one user's restrictions.
+pub(crate) struct UserAccessSnapshot {
+    pub(crate) library_access_mode: String,
+    pub(crate) library_ids: Vec<String>,
+    pub(crate) restrictions: Option<UserContentRestrictions>,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewUserContentRestrictions<'a> {

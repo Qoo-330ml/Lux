@@ -862,6 +862,7 @@ pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Val
     };
     let server_name = current_emby_server_name(&state).await;
     let users = auth.public_users().await.unwrap_or_default();
+    let snapshots = emby_user_access_snapshots(&state, &users).await;
     Json(Value::Array(
         users
             .iter()
@@ -871,6 +872,7 @@ pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Val
                     &server_id,
                     &server_name,
                     emby_user_configuration_json(&[]),
+                    snapshots.get(&user.id.to_string()),
                 )
             })
             .collect(),
@@ -898,6 +900,7 @@ pub(super) async fn emby_users(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let server_name = current_emby_server_name(&state).await;
+    let snapshots = emby_user_access_snapshots(&state, &users).await;
     Json(Value::Array(
         users
             .iter()
@@ -907,6 +910,7 @@ pub(super) async fn emby_users(
                     &state.server_id,
                     &server_name,
                     emby_user_configuration_json(&[]),
+                    snapshots.get(&user.id.to_string()),
                 )
             })
             .collect(),
@@ -1005,6 +1009,7 @@ pub(super) async fn emby_query_users(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let server_name = current_emby_server_name(&state).await;
+    let snapshots = emby_user_access_snapshots(&state, &users).await;
     let mut items = Vec::with_capacity(users.len());
     for user in users {
         let ordered_views = emby_ordered_views(&state, &user).await;
@@ -1014,6 +1019,7 @@ pub(super) async fn emby_query_users(
             &state.server_id,
             &server_name,
             configuration,
+            snapshots.get(&user.id.to_string()),
         ));
     }
     Json(json!({
@@ -1061,11 +1067,13 @@ pub(super) async fn emby_user(
     let server_name = current_emby_server_name(&state).await;
     let ordered_views = emby_ordered_views(&state, &user).await;
     let configuration = emby_user_configuration(&state, &user, &ordered_views).await;
+    let snapshots = emby_user_access_snapshots(&state, std::slice::from_ref(&user)).await;
     Json(emby_user_json(
         &user,
         &state.server_id,
         &server_name,
         configuration,
+        snapshots.get(&user.id.to_string()),
     ))
     .into_response()
 }
@@ -1345,11 +1353,13 @@ pub(super) async fn emby_create_user(
     let server_name = current_emby_server_name(&state).await;
     let ordered_views = emby_ordered_views(&state, &created).await;
     let configuration = emby_user_configuration(&state, &created, &ordered_views).await;
+    let snapshots = emby_user_access_snapshots(&state, std::slice::from_ref(&created)).await;
     Json(emby_user_json(
         &created,
         &state.server_id,
         &server_name,
         configuration,
+        snapshots.get(&created.id.to_string()),
     ))
     .into_response()
 }
@@ -2287,12 +2297,14 @@ async fn emby_authentication_success_response(
     let server_name = current_emby_server_name(state).await;
     let ordered_views = emby_ordered_views(state, &result.user).await;
     let configuration = emby_user_configuration(state, &result.user, &ordered_views).await;
+    let snapshots = emby_user_access_snapshots(state, std::slice::from_ref(&result.user)).await;
     Json(json!({
         "User": emby_user_json(
             &result.user,
             &state.server_id,
             &server_name,
             configuration,
+            snapshots.get(&result.user.id.to_string()),
         ),
         "SessionInfo": emby_login_session_json(&result, &state.server_id),
         "AccessToken": result.token,
@@ -2762,11 +2774,33 @@ pub(super) async fn emby_logout(
     }
 }
 
+/// Loads restriction and library-access state for the users that are about to be serialized.
+async fn emby_user_access_snapshots(
+    state: &AppState,
+    users: &[UserRecord],
+) -> std::collections::HashMap<String, crate::storage::UserAccessSnapshot> {
+    let Some(database) = state.database.as_ref() else {
+        return std::collections::HashMap::new();
+    };
+    let user_ids = users
+        .iter()
+        .map(|user| user.id.to_string())
+        .collect::<Vec<_>>();
+    if user_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    database
+        .list_user_access_snapshots(&user_ids)
+        .await
+        .unwrap_or_default()
+}
+
 fn emby_user_json(
     user: &UserRecord,
     server_id: &str,
     server_name: &str,
     configuration: Value,
+    snapshot: Option<&crate::storage::UserAccessSnapshot>,
 ) -> Value {
     json!({
         "Id": user.id.to_string(),
@@ -2780,7 +2814,7 @@ fn emby_user_json(
         "LastLoginDate": emby_user_date(user.last_login_at),
         "LastActivityDate": emby_user_date(user.last_activity_at),
         "Configuration": configuration,
-        "Policy": emby_user_policy_json(user),
+        "Policy": emby_user_policy_json(user, snapshot),
     })
 }
 
@@ -2864,17 +2898,67 @@ fn emby_user_configuration_json(ordered_views: &[String]) -> Value {
     })
 }
 
-fn emby_user_policy_json(user: &UserRecord) -> Value {
+/// Maps Lux rating labels onto Emby's numeric parental rating scale (best effort).
+///
+/// Emby compares `MaxParentalRating` with its own numeric official ratings, so only the common
+/// motion-picture and TV labels are translated; anything else stays unspecified.
+fn emby_parental_rating(rating: Option<&str>) -> Option<i64> {
+    let rating = rating?.trim().to_ascii_uppercase();
+    let value = match rating.as_str() {
+        "G" | "TV-Y" | "TV-Y7" | "U" => 1,
+        "PG" | "TV-G" | "TV-PG" => 2,
+        "PG-13" | "TV-14" => 3,
+        "R" => 4,
+        "NC-17" | "TV-MA" => 5,
+        "X" => 6,
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn emby_user_policy_json(
+    user: &UserRecord,
+    snapshot: Option<&crate::storage::UserAccessSnapshot>,
+) -> Value {
+    let restrictions = snapshot.and_then(|snapshot| snapshot.restrictions.as_ref());
+    let blocked_tags = restrictions
+        .map(|restrictions| restrictions.blocked_tags.clone())
+        .unwrap_or_default();
+    let max_parental_rating = restrictions
+        .and_then(|restrictions| emby_parental_rating(restrictions.maximum_rating.as_deref()));
+    let block_unrated_items =
+        if restrictions.is_some_and(|restrictions| !restrictions.allow_unrated) {
+            json!(["Movie", "Series", "Episode"])
+        } else {
+            json!([])
+        };
+    let (enable_all_folders, enabled_folders) = match snapshot {
+        Some(snapshot)
+            if snapshot
+                .library_access_mode
+                .eq_ignore_ascii_case("SELECTED") =>
+        {
+            (
+                false,
+                snapshot
+                    .library_ids
+                    .iter()
+                    .map(|library_id| json!(emby_public_id(library_id)))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        _ => (true, Vec::new()),
+    };
     json!({
         "IsAdministrator": user.is_admin,
         "IsHidden": false,
         "IsHiddenRemotely": false,
         "IsDisabled": user.is_disabled,
-        "MaxParentalRating": null,
-        "BlockedTags": [],
+        "MaxParentalRating": max_parental_rating,
+        "BlockedTags": blocked_tags,
         "EnableUserPreferenceAccess": true,
         "AccessSchedules": [],
-        "BlockUnratedItems": [],
+        "BlockUnratedItems": block_unrated_items,
         "EnableRemoteControlOfOtherUsers": false,
         "EnableSharedDeviceControl": true,
         "EnableRemoteAccess": user.can_remote_access,
@@ -2895,8 +2979,8 @@ fn emby_user_policy_json(user: &UserRecord) -> Value {
         "EnableAllDevices": true,
         "EnabledChannels": [],
         "EnableAllChannels": false,
-        "EnabledFolders": [],
-        "EnableAllFolders": true,
+        "EnabledFolders": enabled_folders,
+        "EnableAllFolders": enable_all_folders,
         "InvalidLoginAttemptCount": 0,
         "EnablePublicSharing": false,
         "BlockedMediaFolders": [],
@@ -2930,4 +3014,19 @@ fn emby_login_session_json(result: &crate::auth::emby::EmbyAuthResult, server_id
         "PlayState": {},
         "Capabilities": {},
     })
+}
+
+#[cfg(test)]
+mod parental_rating_tests {
+    use super::emby_parental_rating;
+
+    #[test]
+    fn known_rating_labels_map_to_the_emby_scale() {
+        assert_eq!(emby_parental_rating(Some("G")), Some(1));
+        assert_eq!(emby_parental_rating(Some("pg")), Some(2));
+        assert_eq!(emby_parental_rating(Some("PG-13")), Some(3));
+        assert_eq!(emby_parental_rating(Some("TV-MA")), Some(5));
+        assert_eq!(emby_parental_rating(Some("unrated")), None);
+        assert_eq!(emby_parental_rating(None), None);
+    }
 }

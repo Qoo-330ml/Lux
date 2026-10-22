@@ -31206,3 +31206,73 @@ async fn progress_items_page_over_items_not_joined_source_rows()
     assert_eq!(second_items, BTreeSet::from(["progress-item-3".to_owned()]));
     Ok(())
 }
+
+#[tokio::test]
+async fn user_access_snapshots_match_the_single_user_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config, library::LibraryKind};
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Admin", "Admin", "password")
+        .await?;
+    let user_id = user.id.to_string();
+    let viewer = crate::auth::users::UserStore::new(database.clone())?
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let viewer_id = viewer.id.to_string();
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .set_user_library_access(&viewer_id, &library_id, true)
+        .await?;
+    let blocked = vec!["Horror".to_owned()];
+    database
+        .compare_and_swap_user_content_restrictions(
+            &viewer_id,
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &[],
+                blocked_tags: &blocked,
+            },
+        )
+        .await?;
+
+    let snapshots = database
+        .list_user_access_snapshots(&[user_id.clone(), viewer_id.clone()])
+        .await?;
+    let viewer_snapshot = snapshots.get(&viewer_id).expect("viewer snapshot");
+    assert_eq!(viewer_snapshot.library_access_mode, "SELECTED");
+    assert_eq!(viewer_snapshot.library_ids, vec![library_id]);
+    let restrictions = viewer_snapshot
+        .restrictions
+        .as_ref()
+        .expect("viewer restrictions");
+    assert_eq!(restrictions.maximum_rating.as_deref(), Some("PG-13"));
+    assert_eq!(
+        restrictions.blocked_tags,
+        blocked
+            .iter()
+            .map(|tag| tag.to_lowercase())
+            .collect::<Vec<_>>(),
+        "tags are stored normalized, and the snapshot must match"
+    );
+    assert!(!restrictions.allow_unrated);
+
+    let admin_snapshot = snapshots.get(&user_id).expect("admin snapshot");
+    assert_eq!(admin_snapshot.library_access_mode, "ALL");
+    assert!(admin_snapshot.library_ids.is_empty());
+    assert!(admin_snapshot.restrictions.is_none());
+    Ok(())
+}
