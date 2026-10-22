@@ -103,6 +103,10 @@ describe("AdminUserDetailPage playback policy", () => {
 
   function renderDetail(user = makeUser()) {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user });
+    if (!vi.isMockFunction(api.adminUserPermissionPresets)) vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [] });
+    if (!vi.isMockFunction(api.adminUserLibraryAccess)) vi.spyOn(api, "adminUserLibraryAccess").mockResolvedValue({ libraryAccessMode: "ALL", libraryIds: [] });
+    if (!vi.isMockFunction(api.adminLibraries)) vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    if (!vi.isMockFunction(api.adminUserPlaybackPolicy)) vi.spyOn(api, "adminUserPlaybackPolicy").mockResolvedValue({ policy: { canPlay: true, maxSimultaneousPlaybacks: 2, allowRemux: true, allowAudioTranscode: true, allowVideoTranscode: true } });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);

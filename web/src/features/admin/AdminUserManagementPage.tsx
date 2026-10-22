@@ -1,4 +1,4 @@
-import { ArrowLeft, CircleDashed, ShieldCheck, SlidersHorizontal, UserRound, Users } from "lucide-react";
+import { ArrowLeft, SlidersHorizontal, UserRound } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -6,27 +6,41 @@ import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AccountPreferences, AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
 import { AdminUserAccessRulesPanel } from "./AdminUserAccessRulesPanel";
+import { formatRelativeTime, formatTimestamp } from "./users/format";
 import { AdminUserGlobalAccessRulesPanel } from "./AdminUserGlobalAccessRulesPanel";
 import "./user-management.css";
+import "./users-workspace.css";
 
 const detailSections = [
-  { id: "profile", label: "资料与状态", module: "模块一", icon: Users },
-  { id: "permissions", label: "权限", module: "模块四", icon: ShieldCheck },
-  { id: "preferences", label: "偏好", module: "模块四", icon: SlidersHorizontal },
-  { id: "content", label: "内容限制", module: "模块五", icon: ShieldCheck },
-  { id: "devices", label: "设备与登录", module: "模块七", icon: Users },
-  { id: "playback", label: "播放与转码", module: "模块六", icon: CircleDashed },
-  { id: "activity", label: "活动记录", module: "模块七", icon: CircleDashed },
+  { id: "overview", label: "概览" },
+  { id: "access", label: "访问权限" },
+  { id: "devices", label: "设备与访问" },
+  { id: "activity", label: "活动记录" },
+  { id: "preferences", label: "偏好" },
 ] as const;
 
+type DetailSectionId = (typeof detailSections)[number]["id"];
+
+const detailSectionAliases: Record<string, DetailSectionId> = {
+  profile: "overview",
+  permissions: "access",
+  content: "access",
+  playback: "access",
+  overview: "overview",
+  access: "access",
+  devices: "devices",
+  activity: "activity",
+  preferences: "preferences",
+};
+
 const settingsSections = [
-  { id: "registration", label: "注册与邀请", module: "模块二" },
-  { id: "mail", label: "邮件", module: "模块二" },
-  { id: "defaults", label: "新用户默认权限", module: "模块四" },
-  { id: "presets", label: "角色预设", module: "模块四" },
-  { id: "blocklist", label: "全站黑名单", module: "模块七" },
-  { id: "retention", label: "删除与活动保留", module: "模块一 / 七" },
-  { id: "proxy", label: "可信代理", module: "模块七" },
+  { id: "registration", label: "注册与邀请" },
+  { id: "mail", label: "邮件" },
+  { id: "defaults", label: "新用户默认权限" },
+  { id: "presets", label: "角色预设" },
+  { id: "blocklist", label: "全站黑名单" },
+  { id: "retention", label: "删除与活动保留" },
+  { id: "proxy", label: "可信代理" },
 ] as const;
 
 const contentRatingLevels = {
@@ -46,8 +60,8 @@ type ContentRestrictionFormDraft = Pick<
 export function AdminUserDetailPage() {
   const { userId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
-  const sectionId = searchParams.get("section") ?? "profile";
-  const section = detailSections.find((item) => item.id === sectionId) ?? detailSections[0];
+  const requestedSection = searchParams.get("section") ?? "overview";
+  const sectionId: DetailSectionId = detailSectionAliases[requestedSection] ?? "overview";
   const userQuery = useQuery({
     queryKey: ["admin", "user", userId],
     queryFn: () => api.adminUser(userId),
@@ -61,45 +75,116 @@ export function AdminUserDetailPage() {
 
   const displayName = user.displayName || user.usernameNormalized;
   const statusLabel = user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常";
+  const facts = [
+    `@${user.usernameNormalized}`,
+    user.email ? `${user.email}${user.emailVerifiedAt ? "（已验证）" : "（未验证）"}` : "未填写邮箱",
+    `最近活动 ${formatRelativeTime(user.lastActivityAt)}`,
+    user.createdAt ? `加入于 ${formatTimestamp(user.createdAt)}` : null,
+  ].filter((fact): fact is string => Boolean(fact));
 
   return (
-    <div className="lux-admin-page lux-admin-user-management-page">
-      <Link className="lux-admin-user-back" to="/admin/users"><ArrowLeft size={15} />返回用户列表</Link>
-      <header className="lux-admin-user-page-heading">
-        <div>
-          <span className="lux-admin-eyebrow">{user.usernameNormalized}</span>
-          <h1>{displayName}</h1>
-          <p>用户详情与访问管理</p>
+    <div className="lux-admin-page lux-users-page lux-users-detail">
+      <Link className="lux-users-detail-back" to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />返回用户列表</Link>
+      <header className="lux-users-detail-head">
+        <div className="lux-users-detail-identity">
+          <span className="lux-users-avatar is-large" aria-hidden="true">{avatarInitial(displayName)}</span>
+          <div className="lux-users-detail-copy">
+            <div className="lux-users-detail-name">
+              <h1>{displayName}</h1>
+              <span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{statusLabel}</span>
+              {user.canManageServer ? <span className="lux-users-tag is-strong">管理员</span> : null}
+            </div>
+            <p className="lux-users-detail-facts">
+              {facts.map((fact) => <span key={fact}>{fact}</span>)}
+            </p>
+          </div>
         </div>
-        <span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{statusLabel}</span>
       </header>
-      <nav className="lux-admin-user-section-nav" aria-label="用户详情模块">
+      <nav className="lux-users-segments" aria-label="用户详情分区">
         {detailSections.map((item) => (
-          <button key={item.id} className={item.id === section.id ? "is-active" : undefined} type="button" aria-current={item.id === section.id ? "page" : undefined} onClick={() => setSearchParams({ section: item.id })}>
-            <span>{item.label}</span><small>{item.module}</small>
+          <button key={item.id} type="button" aria-current={item.id === sectionId ? "page" : undefined} onClick={() => setSearchParams({ section: item.id })}>
+            {item.label}
           </button>
         ))}
       </nav>
-      {section.id === "profile" ? (
-        <>
-          <AdminUserProfileEditor key={user.id} user={user} />
-          <AdminUserLifecycleActions user={user} />
-        </>
-      ) : section.id === "permissions" ? (
-        <AdminUserPermissionsSection key={user.id} user={user} />
-      ) : section.id === "preferences" ? (
-        <AdminUserPreferencesSection key={user.id} user={user} />
-      ) : section.id === "content" ? (
-        <AdminUserContentRestrictionSection user={user} />
-      ) : section.id === "playback" ? (
-        <AdminUserPlaybackPolicySection key={user.id} user={user} />
-      ) : section.id === "devices" ? (
-        <AdminUserSessionsSection key={user.id} user={user} />
-      ) : section.id === "activity" ? (
-        <AdminUserActivityPanel key={user.id} user={user} />
-      ) : null}
+      <div className="lux-users-detail-body">
+        {sectionId === "overview" ? (
+          <>
+            <AdminUserProfileEditor key={`profile-${user.id}`} user={user} />
+            <AdminUserLifecycleActions key={`lifecycle-${user.id}`} user={user} />
+            <AdminUserPasswordPanel key={`password-${user.id}`} user={user} />
+          </>
+        ) : sectionId === "access" ? (
+          <>
+            <AdminUserPermissionSummary user={user} />
+            <AdminUserPermissionsSection key={`permissions-${user.id}`} user={user} />
+            <AdminUserPlaybackPolicySection key={`playback-${user.id}`} user={user} />
+            <AdminUserContentRestrictionSection user={user} />
+          </>
+        ) : sectionId === "devices" ? (
+          <AdminUserSessionsSection key={`devices-${user.id}`} user={user} />
+        ) : sectionId === "activity" ? (
+          <AdminUserActivityPanel key={`activity-${user.id}`} user={user} />
+        ) : (
+          <AdminUserPreferencesSection key={`preferences-${user.id}`} user={user} />
+        )}
+      </div>
     </div>
   );
+}
+
+function AdminUserPermissionSummary({ user }: { user: AdminUser }) {
+  const chips = [
+    user.canManageServer ? "服务器管理员" : "普通用户",
+    user.canRemoteAccess ? "允许远程访问" : "仅本地访问",
+    user.canDownload ? "允许下载" : "禁止下载",
+    user.presetSource ? `预设来源：${user.presetSource}` : "未应用角色预设",
+    (user.currentPlaybackCount ?? 0) > 0 ? `播放中 ${user.currentPlaybackCount} 路` : null,
+  ].filter((chip): chip is string => Boolean(chip));
+  return (
+    <section className="lux-users-card" aria-label="权限摘要">
+      <div className="lux-users-card-body lux-users-summary">
+        <span className="lux-admin-eyebrow">权限摘要</span>
+        {chips.map((chip) => <span key={chip} className="lux-users-tag">{chip}</span>)}
+      </div>
+    </section>
+  );
+}
+
+function AdminUserPasswordPanel({ user }: { user: AdminUser }) {
+  const queryClient = useQueryClient();
+  const [password, setPassword] = useState("");
+  const [notice, setNotice] = useState("");
+  const update = useMutation({
+    mutationFn: () => api.updateAdminUser(user.id, { password }),
+    onSuccess: () => {
+      setPassword("");
+      setNotice("密码已更新。");
+      void queryClient.invalidateQueries({ queryKey: ["admin", "user", user.id] });
+    },
+    onError: (error) => setNotice(`密码更新失败：${error.message}`),
+  });
+  const readOnly = user.deletedAt != null;
+  return (
+    <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-password-title">
+      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-password-title">密码</h2></div></div>
+      <p className="lux-admin-muted">修改后该用户所有已登录设备都需要重新登录；回收站中的账号不可修改。</p>
+      <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={(event) => { event.preventDefault(); if (!password || readOnly) return; setNotice(""); update.mutate(); }}>
+        <label>
+          设置新密码
+          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="留空不修改" disabled={readOnly} />
+        </label>
+        <div className="lux-admin-user-profile-actions">
+          <button className="lux-button lux-button-primary" type="submit" disabled={!password || update.isPending || readOnly}>{update.isPending ? "保存中…" : "修改密码"}</button>
+          {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function avatarInitial(name: string): string {
+  return name.trim().slice(0, 1).toUpperCase() || "?";
 }
 
 function AdminUserContentRestrictionSection({ user }: { user: AdminUser }) {
@@ -297,7 +382,7 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
   return (
     <section className="lux-admin-panel lux-admin-user-content-policy" aria-labelledby="lux-admin-user-content-policy-title">
       <div className="lux-admin-panel-heading">
-        <div><span className="lux-admin-eyebrow">模块五</span><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div>
+        <div><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div>
         <span className={`lux-user-badge ${currentPolicy ? "is-ok" : ""}`}>{currentPolicy ? "已配置" : "未配置"}</span>
       </div>
       {currentPolicy ? (
@@ -441,7 +526,7 @@ function AdminUserContentIndexStatus() {
   return (
     <section className="lux-admin-panel lux-admin-user-content-index" aria-labelledby="lux-admin-user-content-index-title">
       <div className="lux-admin-panel-heading">
-        <div><span className="lux-admin-eyebrow">模块五</span><h2 id="lux-admin-user-content-index-title">内容分类索引</h2></div>
+        <div><h2 id="lux-admin-user-content-index-title">内容分类索引</h2></div>
         <span className={`lux-user-badge ${isReady ? "is-ok" : hasNoItems ? "" : "is-warn"}`}>{statusLabel}</span>
       </div>
       {hasNoItems ? (
@@ -488,7 +573,7 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
     return (
       <section className="lux-admin-panel lux-admin-user-sessions" aria-labelledby="lux-admin-user-devices-title">
         <div className="lux-admin-panel-heading">
-          <div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-user-devices-title">设备清单</h2></div>
+          <div><h2 id="lux-admin-user-devices-title">设备清单</h2></div>
         </div>
         <p role="alert">读取设备清单失败：{devicesQuery.error.message}</p>
         <button className="lux-button" type="button" onClick={() => void devicesQuery.refetch()}>重试</button>
@@ -503,7 +588,6 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
     <section className="lux-admin-panel lux-admin-user-sessions lux-admin-user-devices" aria-labelledby="lux-admin-user-devices-title">
       <div className="lux-admin-panel-heading">
         <div>
-          <span className="lux-admin-eyebrow">模块七</span>
           <h2 id="lux-admin-user-devices-title">设备清单</h2>
           <p className="lux-admin-user-session-summary">{devicePage.totalCount.toLocaleString()} 台已记录设备。设备标识由客户端提供，可能随客户端数据清除而变化。</p>
         </div>
@@ -1151,7 +1235,6 @@ function AdminUserActivityPanel({ user }: { user: AdminUser }) {
     <section className="lux-admin-panel lux-admin-user-activity" aria-labelledby="lux-admin-user-activity-title">
       <div className="lux-admin-panel-heading">
         <div>
-          <span className="lux-admin-eyebrow">模块七</span>
           <h2 id="lux-admin-user-activity-title">活动记录</h2>
           {activityPage ? <p className="lux-admin-user-activity-summary">共 {activityPage.totalCount} 条</p> : null}
         </div>
@@ -1788,7 +1871,8 @@ function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
   const remove = useMutation({ mutationFn: () => api.deleteAdminUser(user.id), onSuccess: ({ user: updated }) => { refresh(updated); navigate("/admin/users?view=deleted"); }, onError: (cause) => setError(cause.message) });
   const restore = useMutation({ mutationFn: () => api.restoreAdminUser(user.id), onSuccess: ({ user: updated }) => { refresh(updated); navigate("/admin/users"); }, onError: (cause) => setError(cause.message) });
   const purge = useMutation({ mutationFn: () => api.purgeAdminUser(user.id), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); navigate("/admin/users?view=deleted"); }, onError: (cause) => setError(cause.message) });
-  const pending = disable.isPending || enable.isPending || remove.isPending || restore.isPending || purge.isPending;
+  const updateRole = useMutation({ mutationFn: (canManageServer: boolean) => api.updateAdminUser(user.id, { canManageServer }), onSuccess: ({ user: updated }) => refresh(updated), onError: (cause) => setError(cause.message) });
+  const pending = disable.isPending || enable.isPending || remove.isPending || restore.isPending || purge.isPending || updateRole.isPending;
   const displayName = user.displayName || user.usernameNormalized;
 
   function confirmDisable() {
@@ -1816,10 +1900,26 @@ function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
     purge.mutate();
   }
 
+  function confirmManageServer(next: boolean) {
+    if (pending || user.deletedAt != null) return;
+    const prompt = next
+      ? `将“${displayName}”设为服务器管理员？该用户可以管理媒体库、插件、服务器设置与其他用户。`
+      : `取消“${displayName}”的服务器管理员权限？该用户将不能再管理服务器。`;
+    if (!window.confirm(prompt)) return;
+    setError("");
+    updateRole.mutate(next);
+  }
+
   return (
     <section className="lux-admin-panel lux-admin-user-lifecycle-panel" aria-labelledby="lux-admin-user-lifecycle-title">
       <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-lifecycle-title">账号状态</h2></div><span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常"}</span></div>
       {user.deletedAt != null ? <p className="lux-admin-muted">删除于 {user.deletedAt ? new Date(user.deletedAt * 1000).toLocaleString() : "未知"} · 计划清理 {user.deletionPurgeAt ? new Date(user.deletionPurgeAt * 1000).toLocaleString() : "未知"}</p> : null}
+      {user.deletedAt == null ? (
+        <label className="lux-admin-toggle" style={{ marginBottom: 14 }}>
+          <input type="checkbox" checked={user.canManageServer} disabled={pending} onChange={(event) => confirmManageServer(event.target.checked)} />
+          <span>服务器管理员</span>
+        </label>
+      ) : null}
       <div className="lux-admin-user-profile-actions">
         {user.deletedAt != null ? <>
           <button className="lux-button lux-button-secondary" type="button" onClick={() => restore.mutate()} disabled={pending}>{restore.isPending ? "恢复中…" : "恢复账号"}</button>
@@ -1850,14 +1950,14 @@ export function AdminUserSettingsPage() {
       <nav className="lux-admin-user-section-nav" aria-label="用户全局设置">
         {settingsSections.map((item) => (
           <button key={item.id} className={item.id === section.id ? "is-active" : undefined} type="button" aria-current={item.id === section.id ? "page" : undefined} onClick={() => setSearchParams({ section: item.id })}>
-            <span>{item.label}</span><small>{item.module}</small>
+            <span>{item.label}</span>
           </button>
         ))}
       </nav>
       {section.id === "registration" ? <AdminUserRegistrationSettings /> : section.id === "mail" ? <AdminUserMailSettings /> : section.id === "retention" ? <AdminUserRetentionSettings /> : section.id === "defaults" ? <AdminUserDefaultPermissionsSettings /> : section.id === "presets" ? <AdminUserPermissionPresetsSettings /> : section.id === "blocklist" ? <AdminUserGlobalAccessRulesPanel /> : (
         <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-settings-title">
           <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
-          <div><span className="lux-admin-eyebrow">{section.module}</span><h2 id="lux-admin-user-settings-title">{section.label}</h2><p>全局设置结构已预留，配置和保存能力将在对应任务中实现。</p></div>
+          <div><h2 id="lux-admin-user-settings-title">{section.label}</h2><p>全局设置结构已预留，配置和保存能力将在对应任务中实现。</p></div>
         </section>
       )}
     </div>
@@ -1910,7 +2010,7 @@ function AdminUserRegistrationSettings() {
 
   return (
     <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-registration-title">
-      <div className="lux-admin-panel-heading"><div><span className="lux-admin-eyebrow">模块二</span><h2 id="lux-admin-registration-title">注册与邀请</h2></div></div>
+      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-registration-title">注册与邀请</h2></div></div>
       <p className="lux-admin-muted">默认采用邀请制，管理员也可以直接创建账户。关闭公开注册不会撤销仍有效的已发邀请。</p>
       <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit} aria-busy={update.isPending} aria-describedby="lux-admin-registration-help">
         <label>注册模式<select aria-label="注册模式" value={mode} disabled={update.isPending} onChange={(event) => { setDraft(event.target.value as RegistrationMode); setNotice(""); update.reset(); }}>
@@ -2065,7 +2165,7 @@ function AdminUserMailSettings() {
   return (
     <div className="lux-admin-user-management-page">
       <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-mail-settings-title">
-        <div className="lux-admin-panel-heading"><div><span className="lux-admin-eyebrow">模块二</span><h2 id="lux-admin-mail-settings-title">SMTP 服务</h2></div></div>
+        <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-mail-settings-title">SMTP 服务</h2></div></div>
         <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={saveMailSettings}>
           <label>SMTP 主机<input aria-label="SMTP 主机" value={draft.host} onChange={(event) => { setDraft({ ...draft, host: event.target.value }); setSettingsNotice(""); }} autoComplete="off" maxLength={253} required disabled={saving} /></label>
           <label>SMTP 端口<input aria-label="SMTP 端口" type="number" min={1} max={65_535} step={1} value={draft.port} onChange={(event) => { setDraft({ ...draft, port: event.target.value }); setSettingsNotice(""); }} required disabled={saving} /></label>
@@ -2208,7 +2308,7 @@ function AdminUserActivityRetentionSettings() {
 
   return (
     <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-activity-retention-title">
-      <div className="lux-admin-panel-heading"><div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-user-activity-retention-title">活动记录保留</h2></div></div>
+      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-activity-retention-title">活动记录保留</h2></div></div>
       <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
         <label>
           活动记录保留天数

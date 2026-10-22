@@ -135,6 +135,10 @@ describe("AdminUserDetailPage content restriction index status", () => {
 
   function renderContentSection(policy: AdminUserContentRestrictionPolicy | null = null) {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user: makeUser() });
+    if (!vi.isMockFunction(api.adminUserPermissionPresets)) vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [] });
+    if (!vi.isMockFunction(api.adminUserLibraryAccess)) vi.spyOn(api, "adminUserLibraryAccess").mockResolvedValue({ libraryAccessMode: "ALL", libraryIds: [] });
+    if (!vi.isMockFunction(api.adminLibraries)) vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    if (!vi.isMockFunction(api.adminUserPlaybackPolicy)) vi.spyOn(api, "adminUserPlaybackPolicy").mockResolvedValue({ policy: { canPlay: true, maxSimultaneousPlaybacks: 2, allowRemux: true, allowAudioTranscode: true, allowVideoTranscode: true } });
     vi.spyOn(api, "adminUserContentRestrictions").mockResolvedValue({ policy });
     container = document.createElement("div");
     document.body.append(container);
@@ -297,6 +301,10 @@ describe("AdminUserDetailPage content restriction policy", () => {
 
   function renderContentSection(user = makeUser()) {
     vi.spyOn(api, "adminUser").mockResolvedValue({ user });
+    if (!vi.isMockFunction(api.adminUserPermissionPresets)) vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [] });
+    if (!vi.isMockFunction(api.adminUserLibraryAccess)) vi.spyOn(api, "adminUserLibraryAccess").mockResolvedValue({ libraryAccessMode: "ALL", libraryIds: [] });
+    if (!vi.isMockFunction(api.adminLibraries)) vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    if (!vi.isMockFunction(api.adminUserPlaybackPolicy)) vi.spyOn(api, "adminUserPlaybackPolicy").mockResolvedValue({ policy: { canPlay: true, maxSimultaneousPlaybacks: 2, allowRemux: true, allowAudioTranscode: true, allowVideoTranscode: true } });
     vi.spyOn(api, "adminContentRestrictionIndexStatus").mockResolvedValue({
       totalItems: 0,
       indexedItems: 0,

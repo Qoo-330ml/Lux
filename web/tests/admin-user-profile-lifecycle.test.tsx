@@ -115,16 +115,19 @@ describe("AdminUserDetailPage account lifecycle", () => {
     expect(purge).not.toHaveBeenCalled();
   });
 
-  it("omits the canceled user subtitle module while keeping the active detail sections", async () => {
+  it("groups the user detail into five sections without spec module labels", async () => {
     renderDetail(makeUser());
     await waitForUser();
 
-    const sections = [...container.querySelectorAll<HTMLButtonElement>(".lux-admin-user-section-nav button")];
-    const sectionLabels = sections.map((section) => section.textContent ?? "");
-    expect(sections).toHaveLength(7);
-    expect(sectionLabels.join(" ")).not.toContain("外挂字幕");
-    expect(sectionLabels.join(" ")).not.toContain("模块八");
-    expect(sectionLabels.join(" ")).toContain("活动记录");
+    const sections = [...container.querySelectorAll<HTMLButtonElement>(".lux-users-segments button")];
+    const sectionLabels = sections.map((section) => section.textContent ?? "").join(" ");
+    expect(sections).toHaveLength(5);
+    expect(sectionLabels).toContain("概览");
+    expect(sectionLabels).toContain("访问权限");
+    expect(sectionLabels).toContain("设备与访问");
+    expect(sectionLabels).toContain("活动记录");
+    expect(sectionLabels).toContain("偏好");
+    expect(sectionLabels).not.toContain("模块");
   });
 
   function renderDetail(user: AdminUser, userDeletionGraceDays = 7) {
