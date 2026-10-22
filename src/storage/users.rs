@@ -5166,3 +5166,36 @@ impl Database {
         Ok(snapshots)
     }
 }
+
+impl Database {
+    /// All enabled access rules that apply to `user_id` (including global rules), in one query.
+    ///
+    /// Callers evaluate the rule types themselves so one round trip covers the IP, device and
+    /// client checks that would otherwise each query this table.
+    pub(crate) async fn user_access_blacklist_rules_for_user(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT rule_type, match_value
+                 FROM user_access_blacklist_rules
+                 WHERE is_enabled = 1 AND (user_id IS NULL OR user_id = ?)
+                 ORDER BY rule_type, match_value
+                 LIMIT ?",
+            )
+            .bind(user_id)
+            .bind(limit.clamp(1, 1000))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("rule_type"), row.get("match_value")))
+            .collect())
+    }
+}

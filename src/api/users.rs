@@ -2993,8 +2993,22 @@ pub(super) async fn require_web_principal(
         )
         .into_response());
     };
-    match resolve_web_session_with_ip(headers, state, auth, &session_token).await {
-        Ok((Some(session), client_ip)) => {
+    // One rules query covers the IP, device and client checks the request would otherwise run
+    // as two separate statements.
+    let client_ip = match super::request_access_ip(headers, state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "访问规则暂时无法读取",
+            )
+            .into_response());
+        }
+    };
+    match auth.resolve_principal(&session_token, client_ip).await {
+        Ok(crate::auth::sessions::PrincipalResolution::Session(session)) => {
             if state.remote_access.is_remote(
                 header_str(headers, "x-lux-peer-ip"),
                 header_str(headers, "x-forwarded-for"),
@@ -3009,39 +3023,6 @@ pub(super) async fn require_web_principal(
                 .into_response());
             }
             let user_id = session.user.id.to_string();
-            match auth
-                .is_user_access_blacklisted(&user_id, session.device_id.as_deref())
-                .await
-            {
-                Ok(false) => {}
-                Ok(true) => {
-                    if auth.logout(&session_token).await.is_err() {
-                        return Err(api_error(
-                            headers,
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            lux::ApiErrorCode::DatabaseUnavailable,
-                            "登录状态暂时无法更新",
-                        )
-                        .into_response());
-                    }
-                    return Err(api_error(
-                        headers,
-                        StatusCode::FORBIDDEN,
-                        lux::ApiErrorCode::PermissionDenied,
-                        "当前设备或客户端已被禁止访问",
-                    )
-                    .into_response());
-                }
-                Err(_) => {
-                    return Err(api_error(
-                        headers,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        lux::ApiErrorCode::DatabaseUnavailable,
-                        "访问规则暂时无法读取",
-                    )
-                    .into_response());
-                }
-            }
             let device_id = session
                 .device_id
                 .clone()
@@ -3057,7 +3038,25 @@ pub(super) async fn require_web_principal(
                 session.user,
             ))
         }
-        Ok((None, _)) => Err(api_error(
+        Ok(crate::auth::sessions::PrincipalResolution::AccessDenied) => {
+            if auth.logout(&session_token).await.is_err() {
+                return Err(api_error(
+                    headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "登录状态暂时无法更新",
+                )
+                .into_response());
+            }
+            Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "当前设备或客户端已被禁止访问",
+            )
+            .into_response())
+        }
+        Ok(crate::auth::sessions::PrincipalResolution::Unauthenticated) => Err(api_error(
             headers,
             StatusCode::UNAUTHORIZED,
             lux::ApiErrorCode::AuthenticationRequired,
