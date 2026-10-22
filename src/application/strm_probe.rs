@@ -42,6 +42,8 @@ use crate::{
     },
 };
 
+/// Upper bound for concurrent STRM probes across all operations.
+const MAX_GLOBAL_STRM_PROBES: usize = 8;
 const MAX_LIBRARY_COUNT: usize = 64;
 const MAX_CONCURRENCY: i64 = 256;
 const SOURCE_PAGE_SIZE: i64 = 500;
@@ -78,6 +80,8 @@ pub struct StrmProbeService {
     database: Database,
     plugins: PluginService,
     operations: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Caps total concurrent STRM probes across every operation and library.
+    global: Arc<Semaphore>,
     incremental_creation_lock: Arc<Mutex<()>>,
     configured_start_scheduled: Arc<AtomicBool>,
     playback_probe_sources: Arc<StdMutex<HashSet<String>>>,
@@ -90,6 +94,7 @@ impl StrmProbeService {
             database,
             plugins,
             operations: Arc::new(Mutex::new(HashMap::new())),
+            global: Arc::new(Semaphore::new(MAX_GLOBAL_STRM_PROBES)),
             incremental_creation_lock: Arc::new(Mutex::new(())),
             configured_start_scheduled: Arc::new(AtomicBool::new(false)),
             playback_probe_sources: Arc::new(StdMutex::new(HashSet::new())),
@@ -862,6 +867,18 @@ impl StrmProbeService {
             );
         }
         let permit = match semaphore.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return SourceOutcome::failed(
+                    &source.source_id,
+                    "FAILED",
+                    "STRM probe concurrency is unavailable".to_owned(),
+                );
+            }
+        };
+        // Per-operation limits do not bound the server: many operations could each start a full
+        // batch, so the shared budget is acquired as well.
+        let _global_permit = match self.global.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
                 return SourceOutcome::failed(
