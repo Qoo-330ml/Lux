@@ -4031,7 +4031,7 @@ impl Database {
                     .execute(&mut *transaction)
                     .await
                 {
-                    let _ = transaction.rollback().await;
+                    Self::rollback_write_transaction(transaction, "write failed").await;
                     return Err(StorageError::Sqlx {
                         path: self.path.clone(),
                         source,
@@ -4205,7 +4205,7 @@ impl Database {
                 .execute(&mut *transaction)
                 .await
             {
-                let _ = transaction.rollback().await;
+                Self::rollback_write_transaction(transaction, "write failed").await;
                 return Err(StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
@@ -4217,7 +4217,7 @@ impl Database {
                 .replace_user_library_order_in_transaction(user_id, library_order, &mut transaction)
                 .await
             {
-                let _ = transaction.rollback().await;
+                Self::rollback_write_transaction(transaction, "write failed").await;
                 return Err(error);
             }
         }

@@ -9404,7 +9404,7 @@ impl Database {
                 statement = statement.bind(item_id);
             }
             if let Err(source) = statement.execute(&mut *transaction).await {
-                let _ = transaction.rollback().await;
+                Self::rollback_write_transaction(transaction, "write failed").await;
                 return Err(StorageError::Sqlx {
                     path: self.path.clone(),
                     source,

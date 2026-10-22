@@ -1075,6 +1075,18 @@ impl Database {
         })
     }
 
+    /// Rolls a failed write back, logging a rollback failure instead of discarding it.
+    ///
+    /// Callers must be finished with the transaction; it is consumed here.
+    pub(crate) async fn rollback_write_transaction(
+        transaction: sqlx::Transaction<'_, sqlx::Any>,
+        operation: &'static str,
+    ) {
+        if let Err(error) = transaction.rollback().await {
+            tracing::warn!(%error, operation, "failed to roll back a write transaction");
+        }
+    }
+
     pub(crate) async fn acquire_metadata_write_lock(
         &self,
     ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
