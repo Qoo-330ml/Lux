@@ -2809,6 +2809,15 @@ async fn web_playback_authorization_context(
     Ok((device_id, client_name))
 }
 
+/// Expiry stamped into signed asset URLs.
+///
+/// A playlist is fetched once and embeds these URLs, so the signature has to outlive a single
+/// heartbeat window; the live session row stays the actual authorization gate.
+fn web_playback_resource_expiry() -> i64 {
+    crate::application::playback::session::unix_timestamp()
+        .saturating_add(crate::application::playback::session::WEB_PLAYBACK_RESOURCE_TTL_SECONDS)
+}
+
 pub(super) fn web_playback_resource_url(
     service: &WebPlaybackSessionService,
     session_id: &str,
@@ -2868,7 +2877,7 @@ fn emby_transcoding_url(
     let signature = service.sign_resource(
         &session.id,
         &emby_hls_resource(segment_container, "index.m3u8"),
-        session.expires_at,
+        web_playback_resource_expiry(),
     )?;
     let public_item_id = emby_public_id(item_id);
     let tier = match &session.plan {
@@ -3402,7 +3411,7 @@ async fn serve_emby_transcoding_asset(
                     play_session_id: &session.play_session_id,
                     asset,
                     segment_container,
-                    expires_at: session.expires_at,
+                    expires_at: web_playback_resource_expiry(),
                 },
             )
         }) else {
@@ -3700,13 +3709,13 @@ async fn create_web_playback_session_json(
             };
             json!({
                 "type": "DIRECT",
-                "url": web_playback_resource_url(service, &created.id, "direct", created.expires_at),
+                "url": web_playback_resource_url(service, &created.id, "direct", web_playback_resource_expiry()),
                 "proxyUrl": proxy_url,
                 "rangeUrl": (source.source_kind == "STRM_URL"
                     && source.external_url.as_deref().is_some_and(|target| {
                         matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
                     }))
-                    .then(|| web_playback_range_url(service, &created.id, created.expires_at))
+                    .then(|| web_playback_range_url(service, &created.id, web_playback_resource_expiry()))
                     .flatten(),
             })
         }
@@ -4146,7 +4155,7 @@ pub(super) async fn lux_web_playback_hls(
             return StatusCode::BAD_GATEWAY.into_response();
         };
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
-            web_playback_hls_url(service, &session_id, asset, session.expires_at)
+            web_playback_hls_url(service, &session_id, asset, web_playback_resource_expiry())
         }) else {
             if method == Method::GET {
                 let _ = service.stop(&session_id, &session.user_id).await;
@@ -5571,5 +5580,29 @@ mod emby_playback_tests {
                 tier: ServerTier::HardwareTranscode,
             }
         );
+    }
+
+    #[test]
+    fn signed_asset_urls_outlive_one_heartbeat_window() {
+        use super::web_playback_resource_expiry;
+        use crate::application::playback::session::{
+            ResourceSigner, WEB_PLAYBACK_SESSION_TTL_SECONDS,
+        };
+
+        let signer = ResourceSigner::random();
+        let expires_at = web_playback_resource_expiry();
+        let signature = signer
+            .sign("session-1", "hls:segment_000000.m4s", expires_at)
+            .expect("resource signature");
+        // A playlist fetched at playback start is still usable after the first session window.
+        assert!(signer.verify(
+            "session-1",
+            "hls:segment_000000.m4s",
+            expires_at,
+            &signature,
+            crate::application::playback::session::unix_timestamp()
+                + WEB_PLAYBACK_SESSION_TTL_SECONDS
+                + 60,
+        ));
     }
 }

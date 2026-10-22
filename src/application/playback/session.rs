@@ -35,6 +35,9 @@ use super::hls::{HlsError, HlsManager, HlsSegmentContainer, HlsStartOptions, Hls
 type HmacSha256 = Hmac<Sha256>;
 
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
+/// Signed asset URLs are embedded in a playlist the client fetches once, so they must outlive
+/// several heartbeat-extended session windows. Access is still gated on the live session row.
+pub const WEB_PLAYBACK_RESOURCE_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub(crate) const EMBY_DIRECT_STREAM_TICKET_VERSION: &str = "2";
 const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
