@@ -203,6 +203,7 @@ pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Va
             "status": "ready",
             "schemaVersion": schema_version,
             "databaseWritable": true,
+            "fileLogging": crate::observability::file_logging_available(),
         })),
     )
 }

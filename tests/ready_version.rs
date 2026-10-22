@@ -66,6 +66,10 @@ async fn ready_and_version_report_migrated_state_without_paths()
     assert_eq!(ready_body["status"], "ready");
     assert_eq!(ready_body["schemaVersion"], expected_schema_version);
     assert_eq!(ready_body["databaseWritable"], true);
+    assert!(
+        ready_body.get("fileLogging").is_some(),
+        "readiness must expose whether file logging is active (null before initialisation)"
+    );
 
     let version = client
         .get(format!("http://{address}/api/v1/version"))
