@@ -810,7 +810,7 @@ async fn record_web_device_observation(
     let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
         return;
     };
-    let remote_ip = request_client_ip(headers, &state).await;
+    let remote_ip = request_client_ip(headers, state).await;
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,

@@ -2241,7 +2241,7 @@ async fn emby_authentication_success_response(
             let device_name = bounded_emby_device_field(&result.device.device);
             let client_name = bounded_emby_device_field(&result.device.client);
             let client_version = bounded_emby_device_field(&result.device.version);
-            let remote_ip = request_client_ip(headers, &state).await;
+            let remote_ip = request_client_ip(headers, state).await;
             let seen_at = super::playback::current_unix_timestamp();
             if let Err(error) = database
                 .upsert_user_device(NewUserDeviceObservation {
@@ -2271,7 +2271,7 @@ async fn emby_authentication_success_response(
             "clientVersion": result.device.version,
             "deviceName": result.device.device,
             "deviceType": result.device.device,
-            "remoteIp": request_client_ip(headers, &state).await,
+            "remoteIp": request_client_ip(headers, state).await,
         }),
     )
     .await;
@@ -2669,7 +2669,7 @@ async fn record_emby_device_access(
     let device_name = bounded_emby_device_field(&device.device);
     let client_name = bounded_emby_device_field(&device.client);
     let client_version = bounded_emby_device_field(&device.version);
-    let last_remote_ip = request_client_ip(headers, &state).await;
+    let last_remote_ip = request_client_ip(headers, state).await;
     match database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
