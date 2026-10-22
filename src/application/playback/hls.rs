@@ -32,6 +32,8 @@ const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const HLS_SEGMENT_RESTART_GAP: i64 = 6;
 const MAX_EMBY_VOD_SEGMENTS: i64 = 1_000_000;
 const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_millis(250);
+/// Session identifiers become directory names, so they stay within one predictable segment.
+const MAX_SESSION_ID_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsSegmentContainer {
@@ -341,7 +343,7 @@ impl HlsManager {
         if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes) {
             return Err(HlsError::Limit);
         }
-        let directory = self.base_directory.join(session_id);
+        let directory = self.validated_session_directory(session_id)?;
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
         let segment_start_number = hls_start_number(start_time_ticks);
         let generation = 0;
@@ -965,15 +967,28 @@ impl HlsManager {
         Ok(total <= MAX_SESSION_BYTES)
     }
 
+    /// Resolves the per-session directory without ever escaping the HLS root.
+    ///
+    /// Session identifiers arrive from HTTP paths and Emby playback callbacks, so they are
+    /// validated before they are joined into a path that later gets recursively deleted.
+    fn validated_session_directory(&self, session_id: &str) -> Result<PathBuf, HlsError> {
+        if !is_safe_session_id(session_id) {
+            return Err(HlsError::NotFound);
+        }
+        let directory = self.base_directory.join(session_id);
+        if directory.parent() != Some(self.base_directory.as_path()) {
+            return Err(HlsError::NotFound);
+        }
+        Ok(directory)
+    }
+
     pub(crate) async fn stop(&self, session_id: &str) -> Result<(), HlsError> {
+        let directory = self.validated_session_directory(session_id)?;
         let process = self.processes.lock().await.remove(session_id);
         if let Some(process) = process {
             stop_process(process).await;
-        } else {
-            let directory = self.base_directory.join(session_id);
-            if fs::metadata(&directory).await.is_ok() {
-                fs::remove_dir_all(directory).await.map_err(HlsError::Io)?;
-            }
+        } else if fs::metadata(&directory).await.is_ok() {
+            fs::remove_dir_all(directory).await.map_err(HlsError::Io)?;
         }
         Ok(())
     }
@@ -1586,6 +1601,18 @@ fn hls_duration_seconds(ticks: i64) -> String {
     format!("{seconds}.{micros:06}")
 }
 
+/// Session identifiers must stay a single portable path segment: they are joined into the HLS
+/// root and the resulting directory is later removed recursively.
+fn is_safe_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SESSION_ID_BYTES
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 fn is_valid_asset(asset: &str, segment_container: HlsSegmentContainer) -> bool {
     if asset.is_empty() || asset.len() > 128 {
         return false;
@@ -2039,6 +2066,30 @@ mod tests {
 
         assert!(cache.is_fresh(checked_at + Duration::from_millis(100)));
         assert!(!cache.is_fresh(checked_at + SESSION_QUOTA_CACHE_TTL));
+    }
+
+    #[tokio::test]
+    async fn manager_refuses_session_ids_that_escape_the_session_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("config");
+        let base_directory = config_dir.join("web-playback");
+        tokio::fs::create_dir_all(&base_directory).await.unwrap();
+        let sentinel = config_dir.join("lux.db");
+        tokio::fs::write(&sentinel, b"database").await.unwrap();
+        let manager = super::HlsManager::new_for_tests(config_dir.clone(), "ffmpeg".to_owned());
+
+        for session_id in ["", ".", "..", "../..", "a/b", "a\\b", "../outside"] {
+            let result = manager.stop(session_id).await;
+            assert!(
+                matches!(result, Err(super::HlsError::NotFound)),
+                "session id {session_id:?} must be rejected"
+            );
+            assert!(
+                sentinel.exists(),
+                "session id {session_id:?} must not delete files outside the session root"
+            );
+        }
+        assert!(base_directory.exists());
     }
 
     #[cfg(unix)]

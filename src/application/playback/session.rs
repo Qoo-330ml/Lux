@@ -1172,25 +1172,31 @@ impl WebPlaybackSessionService {
         user_id: &str,
     ) -> Result<(), WebPlaybackSessionError> {
         let session = self.database.find_web_playback_session(session_id).await?;
+        // Stopping also removes the HLS working directory, so the session identifier must be
+        // resolved to a stored session owned by the caller before it is used.
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if session.user_id != user_id {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
         let _ = self.hls.stop(session_id).await;
         let now = unix_timestamp();
         self.database
             .stop_web_playback_session(session_id, user_id, "STOPPED", now)
             .await?;
-        if let Some(session) = session.filter(|session| session.user_id == user_id) {
-            if let Some(playback) = self
-                .database
-                .find_playback_session(user_id, &session.play_session_id)
-                .await?
-            {
-                self.database
-                    .stop_playback_session(&playback.id, now)
-                    .await?;
-            }
+        if let Some(playback) = self
+            .database
+            .find_playback_session(user_id, &session.play_session_id)
+            .await?
+        {
             self.database
-                .release_playback_admission(user_id, &session.play_session_id, now)
+                .stop_playback_session(&playback.id, now)
                 .await?;
         }
+        self.database
+            .release_playback_admission(user_id, &session.play_session_id, now)
+            .await?;
         Ok(())
     }
 
@@ -1769,6 +1775,72 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_refuses_sessions_owned_by_another_user() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let other = crate::auth::users::UserStore::new(database.clone())?
+            .create_user("other", "Other", "correct password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let owner_id = owner.id.to_string();
+        service
+            .database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "owned-session",
+                user_id: &owner_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:owned-session",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at: unix_timestamp() + 900,
+                now: unix_timestamp(),
+            })
+            .await?;
+
+        let error = service
+            .stop("owned-session", &other.id.to_string())
+            .await
+            .expect_err("another user must not stop the session");
+        assert!(matches!(error, super::WebPlaybackSessionError::NotFound));
+        let stored = service
+            .database
+            .find_web_playback_session("owned-session")
+            .await?
+            .expect("session is still stored");
+        assert_eq!(stored.state, "ACTIVE");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stopped_events_release_server_hls_resources() -> Result<(), Box<dyn std::error::Error>>
     {
