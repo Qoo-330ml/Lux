@@ -1335,6 +1335,11 @@ mod tests {
         let database = Database::connect(&config).await.expect("database");
         let plugins = PluginService::new(database.clone(), config.config_dir.clone());
         let service = StrmProbeService::new(database.clone(), plugins);
+        assert_eq!(
+            service.global.available_permits(),
+            super::MAX_GLOBAL_STRM_PROBES,
+            "the service must start with one shared probe budget"
+        );
         service
             .operations
             .lock()
