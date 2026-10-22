@@ -6354,6 +6354,17 @@ pub(crate) struct StoredPersonCredit {
     pub(crate) taglines: Vec<String>,
 }
 
+/// Decodes a person-credit JSON column, reporting corruption instead of silently emptying it.
+fn person_credit_json<T: serde::de::DeserializeOwned + Default>(
+    value: &str,
+    column: &'static str,
+) -> T {
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        tracing::warn!(%error, column, "person credit column holds invalid JSON");
+        T::default()
+    })
+}
+
 fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
     let provider_ids_json: String = row.get("provider_ids_json");
     let genres_json: String = row.get("genres_json");
@@ -6373,13 +6384,16 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
         deathday: row.get("deathday"),
         known_for_department: row.get("known_for_department"),
         place_of_birth: row.get("place_of_birth"),
-        provider_ids: serde_json::from_str(&provider_ids_json).unwrap_or_default(),
-        genres: serde_json::from_str(&genres_json).unwrap_or_default(),
-        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-        production_locations: serde_json::from_str(&production_locations_json).unwrap_or_default(),
+        provider_ids: person_credit_json(&provider_ids_json, "provider_ids_json"),
+        genres: person_credit_json(&genres_json, "genres_json"),
+        tags: person_credit_json(&tags_json, "tags_json"),
+        production_locations: person_credit_json(
+            &production_locations_json,
+            "production_locations_json",
+        ),
         premiere_date: row.get("premiere_date"),
         production_year: row.get("production_year"),
-        taglines: serde_json::from_str(&taglines_json).unwrap_or_default(),
+        taglines: person_credit_json(&taglines_json, "taglines_json"),
     }
 }
 
