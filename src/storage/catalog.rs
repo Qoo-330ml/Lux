@@ -1,4 +1,6 @@
 use super::*;
+
+const NFO_METADATA_BATCH_SIZE: usize = 400;
 use crate::storage::{
     CatalogSearchQuery, GlobalCollectionSourcePreference, GlobalMovieCollectionReference,
     GlobalMovieCollectionReferenceUpdate, StoredMovieNfoCollectionReferenceReconciliation,
@@ -8445,6 +8447,43 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// Batch variant of [`Self::media_item_nfo_metadata_json`] for list endpoints.
+    pub(crate) async fn media_item_nfo_metadata_json_batch(
+        &self,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
+        let mut cached = std::collections::HashMap::new();
+        for chunk in item_ids.chunks(NFO_METADATA_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id, nfo_metadata_json
+                 FROM media_items
+                 WHERE id IN ({placeholders}) AND nfo_metadata_json IS NOT NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                cached.insert(row.get("id"), row.get("nfo_metadata_json"));
+            }
+        }
+        Ok(cached)
     }
 
     // LUX-684 consumes these bounded candidates in the background index worker.

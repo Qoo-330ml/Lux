@@ -30598,3 +30598,57 @@ async fn sqlite_catalog_constraints_are_repaired_and_the_repair_is_idempotent()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for (id, nfo) in [
+        ("nfo-a", Some("{\"title\":\"A\"}")),
+        ("nfo-b", None),
+        ("nfo-c", Some("{\"title\":\"C\"}")),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source, nfo_metadata_json
+             ) VALUES (?, 'nfo-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1, ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .bind(nfo)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let item_ids = vec!["nfo-a".to_owned(), "nfo-b".to_owned(), "nfo-c".to_owned()];
+    let cached = database
+        .media_item_nfo_metadata_json_batch(&item_ids)
+        .await?;
+    assert_eq!(
+        cached.len(),
+        2,
+        "only items with a cached snapshot are returned"
+    );
+    assert_eq!(
+        cached.get("nfo-a").map(String::as_str),
+        Some("{\"title\":\"A\"}")
+    );
+    assert_eq!(
+        cached.get("nfo-c").map(String::as_str),
+        Some("{\"title\":\"C\"}")
+    );
+    assert!(!cached.contains_key("nfo-b"));
+    Ok(())
+}

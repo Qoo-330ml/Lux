@@ -1198,18 +1198,49 @@ impl LocalNfoMetadataStore {
         else {
             return Ok(None);
         };
+        self.decode_cached_nfo(item_id, &json).await
+    }
+
+    /// Batch variant of [`Self::read_item`] for list endpoints.
+    pub(crate) async fn read_items(
+        &self,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, LocalNfoDetails>, LocalNfoMetadataStoreError>
+    {
+        if item_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let cached = self
+            .database
+            .media_item_nfo_metadata_json_batch(item_ids)
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)?;
+        let mut details = std::collections::HashMap::with_capacity(cached.len());
+        for (item_id, json) in cached {
+            if let Some(decoded) = self.decode_cached_nfo(&item_id, &json).await? {
+                details.insert(item_id, decoded);
+            }
+        }
+        Ok(details)
+    }
+
+    async fn decode_cached_nfo(
+        &self,
+        item_id: &str,
+        json: &str,
+    ) -> Result<Option<LocalNfoDetails>, LocalNfoMetadataStoreError> {
         if json.len() > MAX_LOCAL_NFO_BYTES {
             tracing::warn!(
                 item_id,
                 "derived local NFO cache is too large; clearing it for rebuild"
             );
             self.database
-                .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                .clear_media_item_nfo_metadata_if_json(item_id, json)
                 .await
                 .map_err(LocalNfoMetadataStoreError::Storage)?;
             return Ok(None);
         }
-        match decode_local_nfo_cache(&json) {
+        match decode_local_nfo_cache(json) {
             Ok(decoded) => Ok(Some(decoded.details)),
             Err(error) => {
                 tracing::warn!(
@@ -1218,7 +1249,7 @@ impl LocalNfoMetadataStore {
                     "derived local NFO cache is malformed; clearing it for rebuild"
                 );
                 self.database
-                    .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                    .clear_media_item_nfo_metadata_if_json(item_id, json)
                     .await
                     .map_err(LocalNfoMetadataStoreError::Storage)?;
                 Ok(None)
