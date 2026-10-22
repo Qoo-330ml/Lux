@@ -128,6 +128,9 @@ impl LogStore {
     }
 
     pub async fn append_json(&self, record: Value) -> io::Result<()> {
+        // Redact here, not only at the call sites: any caller that writes a record must not be
+        // able to persist a token or cookie by forgetting the helper.
+        let record = redact_sensitive_log_values(record);
         self.initialize().await?;
         let manager = Arc::clone(&self.manager);
         tokio::task::spawn_blocking(move || {
@@ -1517,7 +1520,30 @@ fn read_log_files(
             Err(error) => return Err(LogExportError::Io(error)),
         }
     }
-    Ok(files)
+    // Export bundles leave the server, so redact every JSON line once here instead of trusting
+    // each producer (tracing lines included) to have done it.
+    Ok(files
+        .into_iter()
+        .map(|(name, bytes)| (name, redact_jsonl_bytes(&bytes)))
+        .collect())
+}
+
+fn redact_jsonl_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) => match serde_json::to_vec(&redact_sensitive_log_values(value)) {
+                Ok(encoded) => {
+                    output.extend_from_slice(&encoded);
+                    output.push(b'\n');
+                }
+                Err(_) => output.extend_from_slice(chunk),
+            },
+            Err(_) => output.extend_from_slice(chunk),
+        }
+    }
+    output
 }
 
 fn add_export_file(
@@ -2103,5 +2129,25 @@ mod permission_tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+}
+
+#[cfg(test)]
+mod export_redaction_tests {
+    use super::redact_jsonl_bytes;
+
+    #[test]
+    fn export_lines_are_redacted_and_non_json_lines_survive() {
+        let input = concat!(
+            "{\"message\":\"login\",\"password\":\"hunter2\",\"url\":\"https://example.com/a\"}\n",
+            "plain text line\n",
+            "{\"message\":\"ok\",\"requestId\":\"abc\"}\n",
+        );
+        let output = String::from_utf8(redact_jsonl_bytes(input.as_bytes())).expect("utf8");
+        assert!(!output.contains("hunter2"));
+        assert!(!output.contains("example.com"));
+        assert!(output.contains("plain text line"));
+        assert!(output.contains("\"requestId\":\"abc\""));
+        assert_eq!(output.lines().count(), 3);
     }
 }
