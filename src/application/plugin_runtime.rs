@@ -259,7 +259,19 @@ impl PluginSupervisor {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PluginRuntimeError> {
-        self.call_with_config_access(plugin_id, method, params, true)
+        self.call_with_config_access(plugin_id, method, params, true, None)
+            .await
+    }
+
+    /// Calls a plugin with a caller-specific deadline (request paths use a short one).
+    pub async fn call_with_timeout(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
+        self.call_with_config_access(plugin_id, method, params, true, Some(timeout))
             .await
     }
 
@@ -274,7 +286,7 @@ impl PluginSupervisor {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PluginRuntimeError> {
-        self.call_with_config_access(plugin_id, method, params, false)
+        self.call_with_config_access(plugin_id, method, params, false, None)
             .await
     }
 
@@ -284,6 +296,7 @@ impl PluginSupervisor {
         method: &str,
         params: serde_json::Value,
         allow_config_access: bool,
+        timeout: Option<Duration>,
     ) -> Result<serde_json::Value, PluginRuntimeError> {
         let plugin = self
             .catalog
@@ -315,7 +328,8 @@ impl PluginSupervisor {
                 process
             }
         };
-        let result = process.call(method, params, self.call_timeout).await;
+        let call_timeout = timeout.unwrap_or(self.call_timeout);
+        let result = process.call(method, params, call_timeout).await;
         if let Err(error) = &result {
             if is_process_failure(error) {
                 let should_stop = {
@@ -463,6 +477,11 @@ pub struct PluginRuntimeStatus {
     pub last_error: Option<String>,
 }
 
+/// A timed-out request may recycle the plugin only when nothing else is using it.
+fn should_recycle_after_timeout(available_permits: usize) -> bool {
+    available_permits.saturating_add(1) >= MAX_PLUGIN_INFLIGHT
+}
+
 struct PluginProcess {
     child: Mutex<Child>,
     stdin: Mutex<BufWriter<ChildStdin>>,
@@ -558,7 +577,11 @@ impl PluginProcess {
             Ok(Err(_)) => Err(PluginRuntimeError::Exited),
             Err(_) => {
                 self.pending.lock().await.remove(&request_id);
-                self.stop().await;
+                // Recycle the plugin only when no other caller depends on it: one slow request
+                // must not fail the concurrent ones sharing this process.
+                if should_recycle_after_timeout(self.inflight.available_permits()) {
+                    self.stop().await;
+                }
                 Err(PluginRuntimeError::Timeout)
             }
         };
@@ -966,6 +989,14 @@ fn sha256_file(path: &Path) -> Result<String, PluginDiscoveryError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_timed_out_request_only_recycles_an_unshared_plugin() {
+        // The caller still owns one permit, so `MAX - 1` available means it was alone.
+        assert!(should_recycle_after_timeout(MAX_PLUGIN_INFLIGHT - 1));
+        assert!(!should_recycle_after_timeout(MAX_PLUGIN_INFLIGHT - 2));
+        assert!(!should_recycle_after_timeout(0));
+    }
 
     #[tokio::test]
     async fn plugin_response_line_reader_accepts_split_lines_within_the_limit() {

@@ -10,6 +10,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// A plugin-backed Emby route must answer inside a normal HTTP request budget.
+const EMBY_ROUTE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
 use tokio::{
@@ -877,6 +880,23 @@ impl PluginService {
             .map_err(PluginServiceError::Runtime)
     }
 
+    /// Calls a plugin with a request-sized deadline instead of the background default.
+    pub async fn call_with_timeout(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        self.supervisor
+            .call_with_timeout(&plugin_id, method, params, timeout)
+            .await
+            .map_err(PluginServiceError::Runtime)
+    }
+
     pub async fn emby_route_target(
         &self,
         method: &str,
@@ -913,10 +933,11 @@ impl PluginService {
         request: PluginEmbyRouteRequest,
     ) -> Result<PluginEmbyRouteResponse, PluginServiceError> {
         let value = self
-            .call(
+            .call_with_timeout(
                 &target.plugin_id,
                 &target.rpc_method,
                 serde_json::to_value(request).map_err(|_| PluginServiceError::InvalidResponse)?,
+                EMBY_ROUTE_REQUEST_TIMEOUT,
             )
             .await?;
         let response: PluginEmbyRouteResponse =
