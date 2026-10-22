@@ -5,6 +5,11 @@ const MAX_FORWARDED_FOR_BYTES: usize = 8 * 1024;
 const MAX_FORWARDED_HOPS: usize = 64;
 pub(crate) const MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST: usize = 200;
 
+/// Access-blacklist rule kinds.
+///
+/// `Device` and `Client` match identifiers the client asserts in its login request, so they are
+/// advisory: a client that changes its `DeviceId`/`Client` header produces a different identity.
+/// `IpCidr` is evaluated against the trusted-proxy resolver and is the enforceable control.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserAccessBlacklistRuleType {
