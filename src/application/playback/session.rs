@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     net::IpAddr,
     sync::Arc,
@@ -178,7 +179,40 @@ pub struct WebPlaybackSessionService {
     database: Database,
     signer: Arc<ResourceSigner>,
     hls: HlsManager,
-    emby_start_lock: Arc<tokio::sync::Mutex<()>>,
+    start_locks: SessionStartLocks,
+}
+
+/// Upper bound for the per-source start locks kept in memory.
+const MAX_SESSION_START_LOCKS: usize = 4096;
+
+/// Serializes HLS starts that can replace one another.
+///
+/// Starting a session stops any other active session of the same user, item, and media source,
+/// so those starts must not interleave. Unrelated sources start concurrently: a single global
+/// start lock serialized every HLS start on the server behind database work and an ffmpeg spawn.
+#[derive(Clone, Default)]
+struct SessionStartLocks {
+    locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl SessionStartLocks {
+    async fn lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            if locks.len() >= MAX_SESSION_START_LOCKS && !locks.contains_key(key) {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            locks
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+}
+
+fn emby_hls_start_key(user_id: &str, item_id: &str, media_source_id: &str) -> String {
+    format!("{user_id}\u{1f}{item_id}\u{1f}{media_source_id}")
 }
 
 impl WebPlaybackSessionService {
@@ -220,7 +254,7 @@ impl WebPlaybackSessionService {
             database,
             signer: Arc::new(ResourceSigner::random()),
             hls,
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         }
     }
 
@@ -369,7 +403,14 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         options: HlsStartOptions,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
-        let _start_guard = self.emby_start_lock.lock().await;
+        let _start_guard = self
+            .start_locks
+            .lock(&emby_hls_start_key(
+                input.user_id,
+                input.item_id,
+                input.media_source_id,
+            ))
+            .await;
         let user_id = input.user_id.to_owned();
         let created = self.create(input).await?;
         let WebPlaybackPlan::ServerHls { tier } = created.plan else {
@@ -1081,10 +1122,6 @@ impl WebPlaybackSessionService {
         if self.hls.has_started(session_id).await? {
             return Ok(());
         }
-        let _start_guard = self.emby_start_lock.lock().await;
-        if self.hls.has_started(session_id).await? {
-            return Ok(());
-        }
         let session = self
             .database
             .find_web_playback_session(session_id)
@@ -1092,14 +1129,25 @@ impl WebPlaybackSessionService {
             .ok_or(WebPlaybackSessionError::NotFound)?;
         let source_id = session
             .media_source_id
-            .as_deref()
+            .clone()
             .ok_or(WebPlaybackSessionError::NotFound)?;
+        let _start_guard = self
+            .start_locks
+            .lock(&emby_hls_start_key(
+                &session.user_id,
+                &session.item_id,
+                &source_id,
+            ))
+            .await;
+        if self.hls.has_started(session_id).await? {
+            return Ok(());
+        }
         let active_sessions = self
             .database
             .find_active_web_playback_sessions_for_source(
                 &session.user_id,
                 &session.item_id,
-                source_id,
+                &source_id,
                 "lux-emby",
             )
             .await?;
@@ -1512,8 +1560,8 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
     use super::{
-        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities,
-        choose_plan_for_policy, unix_timestamp,
+        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, SessionStartLocks,
+        apply_server_capabilities, choose_plan_for_policy, emby_hls_start_key, unix_timestamp,
     };
     use crate::{
         application::{
@@ -1536,6 +1584,49 @@ mod tests {
         storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
     };
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn session_start_locks_serialize_one_source_without_blocking_others() {
+        let locks = SessionStartLocks::default();
+        let first = locks
+            .lock(&emby_hls_start_key("user", "item", "source-a"))
+            .await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            locks.lock(&emby_hls_start_key("user", "item", "source-b")),
+        )
+        .await
+        .expect("an unrelated source must not wait for another start");
+        drop(other);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                locks.lock(&emby_hls_start_key("user", "item", "source-a")),
+            )
+            .await
+            .is_err(),
+            "the same source must serialize its starts"
+        );
+        drop(first);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            locks.lock(&emby_hls_start_key("user", "item", "source-a")),
+        )
+        .await
+        .expect("a released source start lock is available again");
+    }
+
+    #[test]
+    fn session_start_keys_keep_their_fields_separate() {
+        assert_ne!(
+            emby_hls_start_key("user", "item", "source"),
+            emby_hls_start_key("user", "item-s", "ource")
+        );
+        assert_ne!(
+            emby_hls_start_key("user", "item", "source"),
+            emby_hls_start_key("user-item", "", "source")
+        );
+    }
 
     #[test]
     fn legacy_signatures_still_verify_until_the_format_is_retired() {
@@ -1869,7 +1960,7 @@ mod tests {
             database: database.clone(),
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let owner_id = owner.id.to_string();
         service
@@ -1945,7 +2036,7 @@ mod tests {
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         service
@@ -2022,7 +2113,7 @@ mod tests {
             database: database.clone(),
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         let now = unix_timestamp();
@@ -2146,7 +2237,7 @@ while :; do sleep 1; done
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         let created = service
@@ -2294,7 +2385,7 @@ while :; do sleep 1; done
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         let capabilities = PlaybackCapabilities {
