@@ -1055,19 +1055,19 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        if self.backend() == DatabaseBackend::Postgres {
-            self.query(
-                "DELETE FROM scan_job_targets
-                 WHERE job_id IN (SELECT id FROM scan_jobs WHERE library_id = ?)",
-            )
-            .bind(id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        // Delete targets explicitly on both backends: PostgreSQL has no cascade from scan_jobs
+        // here, and the explicit delete is a harmless no-op where SQLite already cascades.
+        self.query(
+            "DELETE FROM scan_job_targets
+             WHERE job_id IN (SELECT id FROM scan_jobs WHERE library_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         let deleted = self
             .query("DELETE FROM libraries WHERE id = ?")
             .bind(id)
