@@ -43,7 +43,14 @@ async fn admin_event_stream_requires_an_authenticated_admin()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let response = reqwest::get(format!("http://{address}/api/v1/admin/events")).await?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let response = client
+        .get(format!("http://{address}/api/v1/admin/events"))
+        .send()
+        .await?;
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     server.abort();

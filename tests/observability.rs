@@ -226,7 +226,11 @@ mod unix {
             return Err(error);
         }
 
-        let response = reqwest::get(&health_url).await?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let response = client.get(&health_url).send().await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
         send_signal("TERM", pid).await?;

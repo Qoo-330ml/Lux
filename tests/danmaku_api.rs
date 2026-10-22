@@ -206,7 +206,14 @@ async fn lux_danmaku_returns_a_structured_error_when_the_service_is_unavailable(
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let response = reqwest::get(format!("http://{address}/api/v1/items/item-1/danmaku")).await?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let response = client
+        .get(format!("http://{address}/api/v1/items/item-1/danmaku"))
+        .send()
+        .await?;
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let body = response.json::<Value>().await?;
     assert_eq!(body["error"]["code"], "DATABASE_UNAVAILABLE");
