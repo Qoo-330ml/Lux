@@ -30,6 +30,8 @@ const MANIFEST_WAIT_ATTEMPTS: usize = 50;
 const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
 const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const HLS_SEGMENT_RESTART_GAP: i64 = 6;
+/// Upper bound for the per-session segment-to-generation map.
+const HLS_MAX_TRACKED_SEGMENTS: usize = 4_096;
 const MAX_EMBY_VOD_SEGMENTS: i64 = 1_000_000;
 const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Session identifiers become directory names, so they stay within one predictable segment.
@@ -150,6 +152,15 @@ struct HlsProcessSpecification {
     audio_stream_index: Option<i64>,
     emby_vod: bool,
     segment_container: HlsSegmentContainer,
+}
+
+/// Remembers which generation served a segment without letting the map grow without bound.
+fn remember_segment_generation(state: &mut HlsProcessState, segment: i64, generation: u64) {
+    if state.emby_segment_generations.len() >= HLS_MAX_TRACKED_SEGMENTS {
+        // The map only avoids needless restarts; dropping it costs at most one extra restart.
+        state.emby_segment_generations.clear();
+    }
+    state.emby_segment_generations.insert(segment, generation);
 }
 
 struct HlsProcessState {
@@ -772,9 +783,7 @@ impl HlsManager {
         {
             if process.specification.emby_vod {
                 let generation = state.generation;
-                state
-                    .emby_segment_generations
-                    .insert(requested_segment, generation);
+                remember_segment_generation(&mut state, requested_segment, generation);
             }
             return Ok(SegmentSchedule {
                 generation: state.generation,
@@ -795,9 +804,7 @@ impl HlsManager {
         let Some(restart_reason) = restart_reason else {
             if process.specification.emby_vod {
                 let generation = state.generation;
-                state
-                    .emby_segment_generations
-                    .insert(requested_segment, generation);
+                remember_segment_generation(&mut state, requested_segment, generation);
             }
             return Ok(SegmentSchedule {
                 generation: state.generation,
