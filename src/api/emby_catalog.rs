@@ -4738,11 +4738,7 @@ fn emby_media_type(item_type: &str) -> Option<&'static str> {
 }
 
 pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
-    let language = stream
-        .language
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("und");
+    let language = emby_language_code(stream.language.as_deref());
     let display_title = emby_media_stream_display_title(stream);
     let mut value = json!({
         "Index": stream.index,
@@ -4885,33 +4881,65 @@ fn emby_media_stream_display_title(stream: &crate::application::catalog::Catalog
     }
 }
 
+/// ISO 639-2/B code, ISO 639-1 alias and English name for the languages Lux maps explicitly.
+const EMBY_LANGUAGE_TABLE: &[(&str, &[&str], &str)] = &[
+    ("eng", &["en"], "English"),
+    ("chi", &["zh", "zho"], "Chinese"),
+    ("jpn", &["ja"], "Japanese"),
+    ("kor", &["ko"], "Korean"),
+    ("ara", &["ar"], "Arabic"),
+    ("deu", &["de", "ger"], "German"),
+    ("spa", &["es"], "Spanish"),
+    ("fra", &["fr", "fre"], "French"),
+    ("hin", &["hi"], "Hindi"),
+    ("ind", &["id"], "Indonesian"),
+    ("ita", &["it"], "Italian"),
+    ("nld", &["nl", "dut"], "Dutch"),
+    ("pol", &["pl"], "Polish"),
+    ("por", &["pt"], "Portuguese"),
+    ("rus", &["ru"], "Russian"),
+    ("tha", &["th"], "Thai"),
+    ("tur", &["tr"], "Turkish"),
+    ("vie", &["vi"], "Vietnamese"),
+];
+
+fn emby_language_entry(value: &str) -> Option<(&'static str, &'static str)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = value.to_ascii_lowercase();
+    EMBY_LANGUAGE_TABLE
+        .iter()
+        .find_map(|(code, aliases, name)| {
+            (*code == value || aliases.contains(&value.as_str())).then_some((*code, *name))
+        })
+}
+
 fn emby_language_name(language: &str) -> Option<String> {
     let language = language.trim();
     if language.is_empty() || language.eq_ignore_ascii_case("und") {
         return None;
     }
-    let name = match language.to_ascii_lowercase().as_str() {
-        "en" | "eng" => "English",
-        "zh" | "chi" | "zho" => "Chinese",
-        "ja" | "jpn" => "Japanese",
-        "ko" | "kor" => "Korean",
-        "ar" | "ara" => "Arabic",
-        "de" | "deu" | "ger" => "German",
-        "es" | "spa" => "Spanish",
-        "fr" | "fra" | "fre" => "French",
-        "hi" | "hin" => "Hindi",
-        "id" | "ind" => "Indonesian",
-        "it" | "ita" => "Italian",
-        "nl" | "nld" | "dut" => "Dutch",
-        "pl" | "pol" => "Polish",
-        "pt" | "por" => "Portuguese",
-        "ru" | "rus" => "Russian",
-        "th" | "tha" => "Thai",
-        "tr" | "tur" => "Turkish",
-        "vi" | "vie" => "Vietnamese",
-        _ => return Some(language.to_owned()),
+    Some(
+        emby_language_entry(language)
+            .map(|(_, name)| name.to_owned())
+            .unwrap_or_else(|| language.to_owned()),
+    )
+}
+
+/// Emby clients expect an ISO 639-2/B code in `Language`; values outside the table are kept
+/// verbatim so unusual tracks are not mislabelled as undetermined.
+fn emby_language_code(language: Option<&str>) -> String {
+    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "und".to_owned();
     };
-    Some(name.to_owned())
+    if language.eq_ignore_ascii_case("und") {
+        return "und".to_owned();
+    }
+    emby_language_entry(language)
+        .map(|(code, _)| code.to_owned())
+        .unwrap_or_else(|| language.to_owned())
 }
 
 pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Option<Value> {
@@ -5372,6 +5400,18 @@ mod tests {
     };
 
     use crate::application::catalog::{CatalogSource, CatalogStream};
+
+    #[test]
+    fn languages_are_reported_with_iso639_2_codes() {
+        assert_eq!(super::emby_language_code(Some("en")), "eng");
+        assert_eq!(super::emby_language_code(Some("ENG")), "eng");
+        assert_eq!(super::emby_language_code(Some("zho")), "chi");
+        assert_eq!(super::emby_language_code(Some("de")), "deu");
+        assert_eq!(super::emby_language_code(Some("und")), "und");
+        assert_eq!(super::emby_language_code(None), "und");
+        assert_eq!(super::emby_language_code(Some("  ")), "und");
+        assert_eq!(super::emby_language_code(Some("tlh")), "tlh");
+    }
 
     #[test]
     fn only_playable_items_report_a_media_type() {
