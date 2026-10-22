@@ -1473,7 +1473,7 @@ impl Database {
         /// on every poll. Failures are never cached: readiness must notice a read-only mount
         /// immediately.
         const SUCCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-        let mut last_success = self.write_probe.lock().await;
+        let last_success = self.write_probe.lock().await;
         if last_success.is_some_and(|checked_at| checked_at.elapsed() < SUCCESS_TTL) {
             return Ok(());
         }

@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, OnceCell},
 };
 use uuid::Uuid;
@@ -3382,6 +3382,39 @@ async fn write_nfo_atomically_with_hook(
     .await
 }
 
+/// Reads an NFO file with a hard size bound and without opening non-regular files.
+///
+/// `fs::read` on a FIFO blocks until a writer appears, and an unbounded read can exhaust memory
+/// on a media directory the server does not fully control.
+async fn read_nfo_bounded(target: &Path) -> Result<Option<Vec<u8>>, NfoWriteError> {
+    let metadata = match fs::metadata(target).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(target, source)),
+    };
+    if !metadata.is_file() {
+        return Err(NfoWriteError::Io {
+            path: target.to_owned(),
+            source: std::io::Error::other("NFO target is not a regular file"),
+        });
+    }
+    if metadata.len() > MAX_LOCAL_NFO_BYTES as u64 {
+        return Err(NfoWriteError::TooLarge(target.to_owned()));
+    }
+    let file = fs::File::open(target)
+        .await
+        .map_err(|source| io_error(target, source))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOCAL_NFO_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|source| io_error(target, source))?;
+    if bytes.len() > MAX_LOCAL_NFO_BYTES {
+        return Err(NfoWriteError::TooLarge(target.to_owned()));
+    }
+    Ok(Some(bytes))
+}
+
 async fn write_nfo_atomically_with_rewriter<F>(
     target: &Path,
     rewrite: F,
@@ -3401,11 +3434,7 @@ where
     let before = file_stamp(target).await?;
     let file_fingerprint =
         before.map(|stamp| nfo_fingerprint_from_stamp(target, stamp.size, stamp.modified_at));
-    let original = match fs::read(target).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(source) => return Err(io_error(target, source)),
-    };
+    let original = read_nfo_bounded(target).await?.unwrap_or_default();
     let rewritten = rewrite(&original)?;
     let write = NfoFileWrite {
         content_fingerprint: nfo_content_fingerprint(&rewritten),
@@ -3436,11 +3465,7 @@ where
             before_replace(target).map_err(|source| io_error(target, source))?;
         }
         let current_stamp = file_stamp(target).await?;
-        let current_content = match fs::read(target).await {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(io_error(target, source)),
-        };
+        let current_content = read_nfo_bounded(target).await?;
         let unchanged = match (&before, current_content.as_ref()) {
             (None, None) => true,
             (Some(before), Some(current)) => current == &original && current_stamp == Some(*before),
@@ -3668,6 +3693,8 @@ pub enum NfoWriteError {
     },
     SymlinkTarget(PathBuf),
     PathOutsideRoot(PathBuf),
+    /// The on-disk NFO exceeds the size this server is willing to parse or rewrite.
+    TooLarge(PathBuf),
     ConcurrentModification(PathBuf),
     Storage(StorageError),
 }
@@ -3684,6 +3711,13 @@ impl fmt::Display for NfoWriteError {
             }
             Self::SymlinkTarget(path) => {
                 write!(formatter, "NFO target is a symlink: {}", path.display())
+            }
+            Self::TooLarge(path) => {
+                write!(
+                    formatter,
+                    "NFO file exceeds the {MAX_LOCAL_NFO_BYTES} byte limit: {}",
+                    path.display()
+                )
             }
             Self::PathOutsideRoot(path) => {
                 write!(
@@ -3996,6 +4030,59 @@ mod tests {
                     .expect("changed NFO");
             assert_ne!(original_fingerprint, changed_fingerprint);
         }
+    }
+
+    #[tokio::test]
+    async fn nfo_reads_are_bounded_and_reject_non_regular_files() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let missing = directory.path().join("missing.nfo");
+        assert!(
+            read_nfo_bounded(&missing)
+                .await
+                .expect("missing file")
+                .is_none()
+        );
+
+        let small = directory.path().join("small.nfo");
+        tokio::fs::write(&small, b"<movie><title>ok</title></movie>")
+            .await
+            .expect("write nfo");
+        assert_eq!(
+            read_nfo_bounded(&small).await.expect("small nfo"),
+            Some(b"<movie><title>ok</title></movie>".to_vec())
+        );
+
+        let oversized = directory.path().join("oversized.nfo");
+        tokio::fs::write(&oversized, vec![b'x'; MAX_LOCAL_NFO_BYTES + 1])
+            .await
+            .expect("write oversized nfo");
+        assert!(matches!(
+            read_nfo_bounded(&oversized).await,
+            Err(NfoWriteError::TooLarge(_))
+        ));
+
+        assert!(matches!(
+            read_nfo_bounded(directory.path()).await,
+            Err(NfoWriteError::Io { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nfo_reads_do_not_block_on_a_fifo() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let fifo = directory.path().join("pipe.nfo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success(), "mkfifo should succeed");
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), read_nfo_bounded(&fifo))
+                .await
+                .expect("reading a FIFO must not block");
+        assert!(matches!(result, Err(NfoWriteError::Io { .. })));
     }
 
     #[tokio::test]

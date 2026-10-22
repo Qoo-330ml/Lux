@@ -1226,6 +1226,13 @@ pub(crate) fn metadata_write_error(headers: &HeaderMap, error: NfoWriteError) ->
             "元数据保存暂时不可用",
         )
         .into_response(),
+        NfoWriteError::TooLarge(_) => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "本地 NFO 文件过大，无法安全写入",
+        )
+        .into_response(),
         NfoWriteError::Nfo(_)
         | NfoWriteError::InvalidXml(_)
         | NfoWriteError::Io { .. }

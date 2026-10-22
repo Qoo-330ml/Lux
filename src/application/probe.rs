@@ -759,6 +759,7 @@ fn nfo_write_error_code(error: &NfoWriteError) -> &'static str {
         NfoWriteError::SymlinkTarget(_) => "SYMLINK_TARGET",
         NfoWriteError::PathOutsideRoot(_) => "PATH_OUTSIDE_ROOT",
         NfoWriteError::ConcurrentModification(_) => "CONCURRENT_MODIFICATION",
+        NfoWriteError::TooLarge(_) => "NFO_TOO_LARGE",
         NfoWriteError::Storage(_) => "STORAGE",
     }
 }
