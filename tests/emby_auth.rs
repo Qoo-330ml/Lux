@@ -1944,7 +1944,15 @@ async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts
         .query(&[("api_key", key.as_str())])
         .send()
         .await?;
-    assert_eq!(native_baseline.status(), reqwest::StatusCode::FORBIDDEN);
+    // The query-string key no longer authenticates admin routes at all, so the request is
+    // simply unauthenticated (401) instead of being rejected as a client token (403).
+    assert!(
+        matches!(
+            native_baseline.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ),
+        "admin routes must not accept a query-string key"
+    );
     assert_eq!(response.status(), native_baseline.status());
     Ok(())
 }
