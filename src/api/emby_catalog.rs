@@ -5327,6 +5327,7 @@ mod page_params_tests {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 

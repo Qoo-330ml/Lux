@@ -768,11 +768,7 @@ pub(super) async fn lux_library_cover(
             | LibraryCoverError::TooLarge { .. },
         ) => return StatusCode::NOT_FOUND.into_response(),
     };
-    if headers
-        .get("if-none-match")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == cover.etag))
-    {
+    if if_none_match_matches(&headers, &cover.etag) {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &cover.etag)
@@ -3822,6 +3818,26 @@ pub(super) async fn serve_emby_library_cover(
     )
 }
 
+/// ETag comparison per RFC 9110 §13.1.2: the `If-None-Match` list is weak-comparison based, so
+/// `W/"x"` matches `"x"`, and `*` matches any current representation.
+pub(super) fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let expected = strip_weak_prefix(etag.trim());
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || strip_weak_prefix(candidate) == expected)
+}
+
+fn strip_weak_prefix(tag: &str) -> &str {
+    tag.strip_prefix("W/").unwrap_or(tag)
+}
+
 pub(super) async fn serve_image_file(
     path: &FsPath,
     content_type: &str,
@@ -3830,11 +3846,7 @@ pub(super) async fn serve_image_file(
     headers: &HeaderMap,
     method: &Method,
 ) -> Response {
-    if headers
-        .get("if-none-match")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag))
-    {
+    if if_none_match_matches(headers, etag) {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", etag)
@@ -3864,11 +3876,7 @@ async fn serve_variant_file(
     headers: &HeaderMap,
     method: &Method,
 ) -> Option<Response> {
-    if headers
-        .get("if-none-match")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == variant.etag))
-    {
+    if if_none_match_matches(headers, &variant.etag) {
         return Some(
             Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
@@ -4555,5 +4563,30 @@ mod direct_ticket_tests {
 
         state.shutdown_background_workers().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::if_none_match_matches;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn weak_and_strong_validators_compare_equal() {
+        assert!(if_none_match_matches(&headers(r#"W/"abc""#), r#""abc""#));
+        assert!(if_none_match_matches(&headers(r#""abc""#), r#"W/"abc""#));
+        assert!(if_none_match_matches(
+            &headers(r#""other", W/"abc""#),
+            r#""abc""#
+        ));
+        assert!(if_none_match_matches(&headers("*"), r#""abc""#));
+        assert!(!if_none_match_matches(&headers(r#""other""#), r#""abc""#));
+        assert!(!if_none_match_matches(&HeaderMap::new(), r#""abc""#));
     }
 }
