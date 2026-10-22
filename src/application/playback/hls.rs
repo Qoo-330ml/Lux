@@ -31,7 +31,7 @@ const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
 const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const HLS_SEGMENT_RESTART_GAP: i64 = 6;
 const MAX_EMBY_VOD_SEGMENTS: i64 = 1_000_000;
-const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_millis(250);
+const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Session identifiers become directory names, so they stay within one predictable segment.
 const MAX_SESSION_ID_BYTES: usize = 128;
 
@@ -340,7 +340,7 @@ impl HlsManager {
         fs::create_dir_all(&self.base_directory)
             .await
             .map_err(HlsError::Io)?;
-        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes) {
+        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
             return Err(HlsError::Limit);
         }
         let directory = self.validated_session_directory(session_id)?;
@@ -875,7 +875,7 @@ impl HlsManager {
     }
 
     async fn check_restart_resources(&self, process: &HlsProcess) -> Result<(), HlsError> {
-        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes) {
+        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
             return Err(HlsError::Limit);
         }
         let total_bytes = session_directory_bytes(&process.directory).await?;
@@ -1030,17 +1030,25 @@ impl HlsManager {
 }
 
 async fn session_directory_bytes(directory: &Path) -> Result<u64, HlsError> {
-    let mut entries = fs::read_dir(directory).await.map_err(HlsError::Io)?;
-    let mut total = 0_u64;
-    while let Some(entry) = entries.next_entry().await.map_err(HlsError::Io)? {
-        let metadata = entry.metadata().await.map_err(HlsError::Io)?;
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-            if total > MAX_SESSION_BYTES {
-                return Ok(total);
+    let directory = directory.to_owned();
+    // One blocking hop for the whole walk: per-entry `tokio::fs` calls would schedule a
+    // separate blocking task for every segment file on every quota check.
+    let total = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut total = 0_u64;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                total = total.saturating_add(entry.metadata()?.len());
+                if total > MAX_SESSION_BYTES {
+                    break;
+                }
             }
         }
-    }
+        Ok(total)
+    })
+    .await
+    .map_err(|error| HlsError::Io(std::io::Error::other(error)))?
+    .map_err(HlsError::Io)?;
     Ok(total)
 }
 
@@ -1663,8 +1671,14 @@ fn is_allowed_hardware_encoder(value: &str) -> bool {
     )
 }
 
-fn has_sufficient_free_space(path: &Path, minimum: u64) -> bool {
-    available_free_bytes(path).is_ok_and(|available| available >= minimum)
+async fn has_sufficient_free_space(path: &Path, minimum: u64) -> bool {
+    let path = path.to_owned();
+    // statvfs is a synchronous syscall that can block on a slow NAS mount.
+    tokio::task::spawn_blocking(move || {
+        available_free_bytes(&path).is_ok_and(|available| available >= minimum)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(unix)]
