@@ -30758,3 +30758,80 @@ async fn emby_access_tokens_expire_and_renew_on_touch() -> Result<(), Box<dyn st
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn library_strm_source_counts_ignore_removed_items() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::{config::Config, library::LibraryKind};
+
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let root_id = "root-1".to_owned();
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+        ) VALUES (?, ?, ?, ?, 1, 1)",
+    )
+    .bind(&root_id)
+    .bind(&library_id)
+    .bind("/media/movies")
+    .bind("/media/movies")
+    .execute(database.pool())
+    .await?;
+    for (suffix, removed) in [("kept", false), ("removed", true)] {
+        let entry_id = format!("entry-{suffix}");
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                id, library_root_id, relative_path, entry_kind, size, modified_at,
+                last_seen_generation
+            ) VALUES (?, ?, ?, 'FILE', 1, 1, 'gen')",
+        )
+        .bind(&entry_id)
+        .bind(&root_id)
+        .bind(format!("{suffix}.strm"))
+        .execute(database.pool())
+        .await?;
+        let item_id = format!("item-{suffix}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status, removed_at
+            ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(format!("Item {suffix}"))
+        .bind(format!("Item {suffix}"))
+        .bind(removed.then_some(1_i64))
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                id, item_id, source_kind, filesystem_entry_id, is_default
+            ) VALUES (?, ?, 'STRM_URL', ?, 1)",
+        )
+        .bind(format!("source-{suffix}"))
+        .bind(&item_id)
+        .bind(&entry_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let counts = database
+        .list_strm_media_source_counts_for_libraries(&[library_id.clone()])
+        .await?;
+    assert_eq!(
+        counts.get(&library_id).copied(),
+        Some(1),
+        "removed items must not count towards the library STRM total"
+    );
+    Ok(())
+}

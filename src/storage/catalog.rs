@@ -4673,7 +4673,8 @@ impl Database {
             let mut query = self.query(sqlx::AssertSqlSafe(format!(
                 "SELECT l.id, COUNT(fe.id) AS total_count
                  FROM libraries l
-                 LEFT JOIN media_items mi ON mi.library_id = l.id
+                 LEFT JOIN media_items mi
+                   ON mi.library_id = l.id AND mi.removed_at IS NULL
                  LEFT JOIN media_sources ms
                    ON ms.item_id = mi.id AND ms.source_kind = 'STRM_URL'
                  LEFT JOIN filesystem_entries fe
