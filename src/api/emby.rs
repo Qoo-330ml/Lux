@@ -24,6 +24,8 @@ impl EmbyRouteBuilder {
             .iter()
             .any(|registered| registered.eq_ignore_ascii_case(path))
         {
+            // Two registrations for one path would silently drop a handler; make it visible.
+            tracing::warn!(path, "duplicate Emby route registration was ignored");
             return self;
         }
         self.path_templates.push(path.to_owned());
