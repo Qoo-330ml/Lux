@@ -2,6 +2,7 @@ use super::*;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const DATABASE_CLEANUP_MARKER: &str = "database_lifecycle_cleanup_v1";
+const MEDIA_SOURCE_DEFAULT_REPAIR_MARKER: &str = "startup_repair_media_source_defaults_v1";
 const DATABASE_CLEANUP_PENDING: &str = "PENDING";
 const DATABASE_CLEANUP_RUNNING: &str = "RUNNING";
 const DATABASE_CLEANUP_COMPLETED: &str = "COMPLETED";
@@ -1060,7 +1061,44 @@ impl Database {
     /// defaults (and merges or removals could leave none). The oldest of the current
     /// defaults wins, which keeps today's effective choice; with no default the oldest
     /// source becomes one. Returns the number of repaired items.
+    pub(crate) async fn startup_repair_completed(&self, key: &str) -> Result<bool, StorageError> {
+        let value: Option<String> = self
+            .query_scalar("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    pub(crate) async fn mark_startup_repair_completed(
+        &self,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO lux_meta (key, value) VALUES (?, '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub async fn normalize_media_source_defaults(&self) -> Result<u64, StorageError> {
+        if self
+            .startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
+            .await?
+        {
+            return Ok(0);
+        }
         let mut repaired = 0_u64;
         loop {
             let item_ids = self
@@ -1109,6 +1147,8 @@ impl Database {
                 break;
             }
         }
+        self.mark_startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
+            .await?;
         Ok(repaired)
     }
 }
