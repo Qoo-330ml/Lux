@@ -15,7 +15,7 @@ use crate::{
     storage::{Database, DatabasePoolSnapshot},
 };
 
-const ADMIN_HEALTH_PROBE_CACHE_TTL: Duration = Duration::from_secs(30);
+const ADMIN_HEALTH_PROBE_CACHE_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AdminHealthProbeSnapshot {
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(cached, first);
         assert_eq!(probes.load(Ordering::Relaxed), 1);
 
-        let refresh_at = now + Duration::from_secs(31);
+        let refresh_at = now + Duration::from_secs(121);
         let first_cache = cache.clone();
         let second_cache = cache.clone();
         let first_probes = Arc::clone(&probes);
@@ -416,11 +416,21 @@ mod tests {
             .await;
 
         let cached = cache
-            .get_or_probe_at(start + Duration::from_secs(69), || async {
+            .get_or_probe_at(start + Duration::from_secs(159), || async {
                 AdminHealthProbeSnapshot::default()
             })
             .await;
         assert!(cached.database_writable);
         assert_eq!(probes.load(Ordering::Relaxed), 1);
+
+        let refresh_probes = Arc::clone(&probes);
+        let refreshed = cache
+            .get_or_probe_at(start + Duration::from_secs(161), move || async move {
+                refresh_probes.fetch_add(1, Ordering::Relaxed);
+                AdminHealthProbeSnapshot::default()
+            })
+            .await;
+        assert!(!refreshed.database_writable);
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
     }
 }

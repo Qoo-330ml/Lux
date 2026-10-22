@@ -414,6 +414,7 @@ pub struct Database {
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
+    dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
     filesystem_path_templates: Arc<SqlTemplateCache>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
@@ -1002,6 +1003,7 @@ impl Database {
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
+            dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
@@ -4781,11 +4783,16 @@ fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {
     Some(Migrator::with_migrations(migrations))
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DashboardStats {
     pub(crate) movie_count: i64,
     pub(crate) series_count: i64,
     pub(crate) user_count: i64,
+}
+
+pub(crate) struct CachedDashboardStats {
+    pub(crate) computed_at: i64,
+    pub(crate) stats: DashboardStats,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]

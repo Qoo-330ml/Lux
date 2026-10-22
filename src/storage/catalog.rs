@@ -979,26 +979,40 @@ impl Database {
     }
 
     pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
-        self.query(
-            "SELECT
-                COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
-                COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
-                (SELECT COUNT(*) FROM users WHERE is_disabled = 0) AS user_count
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map(|row| DashboardStats {
-            movie_count: row.get("movie_count"),
-            series_count: row.get("series_count"),
-            user_count: row.get("user_count"),
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        const CACHE_TTL_SECONDS: i64 = 60;
+        let now = current_unix_timestamp();
+        let mut cache = self.dashboard_stats_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && now.saturating_sub(cached.computed_at) < CACHE_TTL_SECONDS
+        {
+            return Ok(cached.stats.clone());
+        }
+        let stats = self
+            .query(
+                "SELECT
+                    COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
+                    COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                    (SELECT COUNT(*) FROM users WHERE is_disabled = 0) AS user_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| DashboardStats {
+                movie_count: row.get("movie_count"),
+                series_count: row.get("series_count"),
+                user_count: row.get("user_count"),
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        *cache = Some(CachedDashboardStats {
+            computed_at: now,
+            stats: stats.clone(),
+        });
+        Ok(stats)
     }
 
     pub(crate) async fn search_catalog_item_ids(
@@ -10299,6 +10313,24 @@ mod tests {
         assert!(!query.contains("ROW_NUMBER()"));
         assert_eq!(query.matches("LIMIT ?").count(), 6);
         assert_eq!(query.matches("UNION ALL").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn dashboard_stats_reuses_a_recent_cache_entry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database.reset_query_count();
+        let first = database.dashboard_stats().await?;
+        assert_eq!(database.query_count(), 1);
+        let second = database.dashboard_stats().await?;
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(first, second);
+        Ok(())
     }
 
     #[tokio::test]
