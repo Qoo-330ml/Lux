@@ -10099,6 +10099,39 @@ impl Database {
         })
     }
 
+    /// Revokes every active web session of a user, optionally keeping the caller's own session.
+    pub(crate) async fn revoke_all_web_sessions_for_user(
+        &self,
+        user_id: &str,
+        keep_session_token_hash: Option<&[u8]>,
+    ) -> Result<u64, StorageError> {
+        let statement = match keep_session_token_hash {
+            Some(keep) => self
+                .query(
+                    "UPDATE web_sessions
+                     SET revoked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE user_id = ? AND revoked_at IS NULL AND session_token_hash <> ?",
+                )
+                .bind(user_id)
+                .bind(keep),
+            None => self
+                .query(
+                    "UPDATE web_sessions
+                     SET revoked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE user_id = ? AND revoked_at IS NULL",
+                )
+                .bind(user_id),
+        };
+        statement
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn list_web_session_summaries(
         &self,
         user_id: &str,

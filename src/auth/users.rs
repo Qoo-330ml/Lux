@@ -459,6 +459,7 @@ impl UserStore {
             Some(password) => Some(self.passwords.hash_password(password).await?),
             None => None,
         };
+        let password_changed = password_hash.is_some();
         let updated = match self
             .database
             .update_user_with_hls_session_ids(
@@ -480,6 +481,16 @@ impl UserStore {
             Err(StorageError::LastManager) => return Err(UserStoreError::LastManager),
             Err(error) => return Err(UserStoreError::Storage(error)),
         };
+        if password_changed && updated.is_some() {
+            // Administrative password resets must also invalidate the target's existing
+            // sessions and Emby tokens.
+            self.database
+                .revoke_all_web_sessions_for_user(user_id, None)
+                .await?;
+            self.database
+                .revoke_all_access_tokens_for_user(user_id)
+                .await?;
+        }
         updated
             .map(|(user, session_ids)| user_record(user).map(|user| (user, session_ids)))
             .transpose()
@@ -520,6 +531,7 @@ impl UserStore {
         user_id: &UserId,
         current_password: &str,
         new_password: &str,
+        keep_session_token_hash: Option<&[u8]>,
     ) -> Result<bool, UserStoreError> {
         let user_id = user_id.to_string();
         let Some(stored) = self.database.find_user_by_id(&user_id).await? else {
@@ -550,6 +562,16 @@ impl UserStore {
                 },
             )
             .await?;
+        if updated.is_some() {
+            // A password change must invalidate credentials that were issued for the old one;
+            // the caller keeps its own session so the web UI is not logged out mid-flow.
+            self.database
+                .revoke_all_web_sessions_for_user(&user_id, keep_session_token_hash)
+                .await?;
+            self.database
+                .revoke_all_access_tokens_for_user(&user_id)
+                .await?;
+        }
         Ok(updated.is_some())
     }
 
@@ -920,4 +942,118 @@ fn admin_user_profile(
         deletion_purge_at,
         preset_source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserStore;
+    use crate::{config::Config, storage::Database};
+
+    #[tokio::test]
+    async fn changing_a_password_keeps_the_caller_session_and_revokes_the_rest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let users = UserStore::new(database.clone())?;
+        let user = users
+            .create_user("viewer", "Viewer", "old password", false)
+            .await?;
+        let user_id = user.id.to_string();
+        for (id, token_hash) in [
+            ("session-kept", b"kept".as_slice()),
+            ("session-other", b"other".as_slice()),
+        ] {
+            sqlx::query(
+                "INSERT INTO web_sessions (
+                     id, user_id, session_token_hash, csrf_token_hash, expires_at
+                 ) VALUES (?, ?, ?, ?, unixepoch() + 3600)",
+            )
+            .bind(id)
+            .bind(&user_id)
+            .bind(token_hash)
+            .bind(b"csrf".as_slice())
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                 id, token_hash, user_id, device_id, client_name,
+                 device_name, client_version, device_type
+             ) VALUES ('token-1', ?, ?, 'device', 'client', 'name', '1', 'DEVICE')",
+        )
+        .bind(b"token-hash".as_slice())
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+
+        assert!(
+            users
+                .change_password(&user.id, "old password", "new password", Some(b"kept"))
+                .await?
+        );
+
+        let kept: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'session-kept'")
+                .fetch_one(database.pool())
+                .await?;
+        let other: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'session-other'")
+                .fetch_one(database.pool())
+                .await?;
+        let token: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'token-1'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(kept, None, "the caller's session must stay usable");
+        assert!(other.is_some(), "other web sessions must be revoked");
+        assert!(token.is_some(), "Emby tokens must be revoked");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn administrative_password_reset_revokes_every_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let users = UserStore::new(database.clone())?;
+        let user = users
+            .create_user("viewer", "Viewer", "old password", false)
+            .await?;
+        let user_id = user.id.to_string();
+        sqlx::query(
+            "INSERT INTO web_sessions (
+                 id, user_id, session_token_hash, csrf_token_hash, expires_at
+             ) VALUES ('session-1', ?, ?, ?, unixepoch() + 3600)",
+        )
+        .bind(&user_id)
+        .bind(b"token".as_slice())
+        .bind(b"csrf".as_slice())
+        .execute(database.pool())
+        .await?;
+
+        users
+            .update_user(
+                &user_id,
+                super::UserUpdate {
+                    password: Some("reset password"),
+                    ..super::UserUpdate::default()
+                },
+            )
+            .await?;
+
+        let revoked: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'session-1'")
+                .fetch_one(database.pool())
+                .await?;
+        assert!(revoked.is_some());
+        Ok(())
+    }
 }

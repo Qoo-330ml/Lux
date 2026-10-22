@@ -2469,6 +2469,14 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<u64, StorageError> {
+        self.revoke_all_access_tokens_for_user(user_id).await
+    }
+
+    /// Revokes every active Emby access token of a user.
+    pub(crate) async fn revoke_all_access_tokens_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<u64, StorageError> {
         self.query(
             "UPDATE access_tokens
              SET revoked_at = unixepoch(), updated_at = unixepoch()

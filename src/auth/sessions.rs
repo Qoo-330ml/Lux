@@ -144,11 +144,22 @@ impl WebAuthService {
         user_id: &UserId,
         current_password: &str,
         new_password: &str,
+        keep_session_token_hash: Option<&[u8]>,
     ) -> Result<bool, WebAuthError> {
         Ok(self
             .users
-            .change_password(user_id, current_password, new_password)
+            .change_password(
+                user_id,
+                current_password,
+                new_password,
+                keep_session_token_hash,
+            )
             .await?)
+    }
+
+    /// Hash of a raw web session token, used to keep the caller's session on password change.
+    pub(crate) fn session_token_hash(token: &str) -> Vec<u8> {
+        hash_token(token)
     }
 
     pub async fn resolve(

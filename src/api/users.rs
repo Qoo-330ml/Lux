@@ -2315,11 +2315,15 @@ pub(super) async fn auth_update_password(
         )
         .into_response();
     };
+    // Keep the caller's own session usable after the change; every other credential is revoked.
+    let keep_session_token_hash = request_cookie(&headers, "lux_session")
+        .map(|token| crate::auth::sessions::WebAuthService::session_token_hash(&token));
     match auth
         .change_password(
             &session.user.id,
             &request.current_password,
             &request.new_password,
+            keep_session_token_hash.as_deref(),
         )
         .await
     {
