@@ -1180,31 +1180,10 @@ async fn admin_request_access_ip(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<std::net::IpAddr, ()> {
-    let peer = headers
-        .get("x-lux-peer-ip")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(())?
-        .parse::<std::net::IpAddr>()
-        .map_err(|_| ())?;
-    let database = state.database.as_ref().ok_or(())?;
-    let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
+    crate::api::legacy::request_access_ip(headers, state)
         .await
-        .map_err(|_| ())?;
-    let trusted_proxies = trusted_proxy_values
-        .iter()
-        .map(|value| crate::application::user_access_rules::IpCidr::parse(value).map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let forwarded_for_values = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .map(|value| value.to_str().map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
-        peer,
-        &forwarded_for_values,
-        &trusted_proxies,
-    )
-    .map_err(|_| ())
+        .map_err(|_| ())?
+        .ok_or(())
 }
 
 fn user_access_blacklist_conflict(headers: &HeaderMap) -> Response {

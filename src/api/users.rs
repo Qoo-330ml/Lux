@@ -802,15 +802,14 @@ fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn record_web_device_observation(
-    headers: &HeaderMap,
     state: &AppState,
     user_id: &str,
     device_id: Option<&str>,
+    remote_ip: Option<String>,
 ) {
     let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
         return;
     };
-    let remote_ip = request_client_ip(headers, state).await;
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
@@ -975,7 +974,14 @@ pub(super) async fn auth_login(
     }
 
     let user_id = session.user.id.to_string();
-    record_web_device_observation(&headers, &state, &user_id, login_device_id.as_deref()).await;
+    let login_remote_ip = request_client_ip(&headers, &state).await;
+    record_web_device_observation(
+        &state,
+        &user_id,
+        login_device_id.as_deref(),
+        login_remote_ip,
+    )
+    .await;
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -1962,7 +1968,8 @@ async fn require_web_session_csrf(
         .device_id
         .clone()
         .or_else(|| web_login_device_id(headers));
-    record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
+    let remote_ip = request_client_ip(headers, state).await;
+    record_web_device_observation(state, &user_id, device_id.as_deref(), remote_ip).await;
     Ok(session)
 }
 
@@ -2829,10 +2836,27 @@ async fn resolve_web_session_for_request(
     auth: &crate::auth::sessions::WebAuthService,
     session_token: &str,
 ) -> Result<Option<AuthenticatedSession>, crate::auth::sessions::WebAuthError> {
+    Ok(
+        resolve_web_session_with_ip(headers, state, auth, session_token)
+            .await?
+            .0,
+    )
+}
+
+async fn resolve_web_session_with_ip(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &crate::auth::sessions::WebAuthService,
+    session_token: &str,
+) -> Result<
+    (Option<AuthenticatedSession>, Option<std::net::IpAddr>),
+    crate::auth::sessions::WebAuthError,
+> {
     let client_ip = super::request_access_ip(headers, state)
         .await
         .map_err(|_| crate::auth::sessions::WebAuthError::AccessRulesUnavailable)?;
-    auth.resolve_with_ip(session_token, client_ip).await
+    let session = auth.resolve_with_ip(session_token, client_ip).await?;
+    Ok((session, client_ip))
 }
 
 pub(super) async fn require_web_principal(
@@ -2945,8 +2969,8 @@ pub(super) async fn require_web_principal(
         )
         .into_response());
     };
-    match resolve_web_session_for_request(headers, state, auth, &session_token).await {
-        Ok(Some(session)) => {
+    match resolve_web_session_with_ip(headers, state, auth, &session_token).await {
+        Ok((Some(session), client_ip)) => {
             if state.remote_access.is_remote(
                 header_str(headers, "x-lux-peer-ip"),
                 header_str(headers, "x-forwarded-for"),
@@ -2998,12 +3022,18 @@ pub(super) async fn require_web_principal(
                 .device_id
                 .clone()
                 .or_else(|| web_login_device_id(headers));
-            record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
+            record_web_device_observation(
+                state,
+                &user_id,
+                device_id.as_deref(),
+                client_ip.map(|address| address.to_string()),
+            )
+            .await;
             Ok(crate::auth::users::AuthenticationPrincipal::User(
                 session.user,
             ))
         }
-        Ok(None) => Err(api_error(
+        Ok((None, _)) => Err(api_error(
             headers,
             StatusCode::UNAUTHORIZED,
             lux::ApiErrorCode::AuthenticationRequired,
