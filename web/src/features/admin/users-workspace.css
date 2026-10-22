@@ -530,3 +530,46 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
   .lux-users-detail-facts { flex-direction: column; gap: 2px; }
   .lux-users-detail-facts span + span::before { display: none; }
 }
+
+.lux-users-select {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  outline: 0;
+  color: var(--lux-text);
+  background: rgba(255, 255, 255, .05);
+  font: inherit;
+  font-size: .74rem;
+}
+
+.lux-users-select:focus { border-color: color-mix(in srgb, var(--lux-accent) 60%, var(--lux-line-soft)); }
+
+/* ---------- 浅色主题 ---------- */
+
+html[data-lux-theme="light"] .lux-users-search,
+html[data-lux-theme="light"] .lux-users-chips,
+html[data-lux-theme="light"] .lux-users-select {
+  background: rgba(28, 28, 34, .04);
+}
+
+html[data-lux-theme="light"] .lux-users-rail-item:hover { background: rgba(28, 28, 34, .05); }
+
+html[data-lux-theme="light"] .lux-users-table tbody tr:hover td { background: rgba(28, 28, 34, .03); }
+
+html[data-lux-theme="light"] .lux-users-menu { box-shadow: 0 18px 48px rgba(30, 30, 38, .18); }
+
+html[data-lux-theme="light"] .lux-users-menu button:hover,
+html[data-lux-theme="light"] .lux-users-menu a:hover { background: rgba(28, 28, 34, .06); }
+
+html[data-lux-theme="light"] .lux-users-card-item { background: rgba(28, 28, 34, .025); }
+
+html[data-lux-theme="light"] .lux-users-selection { box-shadow: 0 18px 48px rgba(30, 30, 38, .16); }
+
+html[data-lux-theme="light"] .lux-users-selection-results li.is-success { color: #247b4b; }
+
+html[data-lux-theme="light"] .lux-users-selection-results li.is-failure { color: #a13d53; }
+
+html[data-lux-theme="light"] .lux-users-drawer { box-shadow: -30px 0 80px rgba(30, 30, 38, .18); }
+
+html[data-lux-theme="light"] .lux-users-drawer-scrim { background: rgba(20, 20, 24, .32); }

@@ -373,7 +373,7 @@ export function AdminUsersPage() {
                 <span className="lux-users-tag">按删除时间排序</span>
               )}
               <div className="lux-users-toolbar-end">
-                <select className="lux-input" aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)} style={{ minHeight: 34, fontSize: ".74rem" }}>
+                <select className="lux-users-select" aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)}>
                   <option value="lastActivityAt">最近活动</option>
                   <option value="lastLoginAt">最近登录</option>
                   <option value="createdAt">创建时间</option>
