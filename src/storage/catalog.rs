@@ -1065,11 +1065,15 @@ impl Database {
     pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
         const CACHE_TTL_SECONDS: i64 = 60;
         let now = current_unix_timestamp();
-        let mut cache = self.dashboard_stats_cache.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && now.saturating_sub(cached.computed_at) < CACHE_TTL_SECONDS
         {
-            return Ok(cached.stats.clone());
+            // The lock only guards the cached value; holding it across the query would serialize
+            // every dashboard request behind one database round trip.
+            let cache = self.dashboard_stats_cache.lock().await;
+            if let Some(cached) = cache.as_ref()
+                && now.saturating_sub(cached.computed_at) < CACHE_TTL_SECONDS
+            {
+                return Ok(cached.stats.clone());
+            }
         }
         let stats = self
             .query(
@@ -1092,7 +1096,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        *cache = Some(CachedDashboardStats {
+        *self.dashboard_stats_cache.lock().await = Some(CachedDashboardStats {
             computed_at: now,
             stats: stats.clone(),
         });

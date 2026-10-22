@@ -1337,12 +1337,16 @@ impl Database {
         let mut cache_key = library_ids.to_vec();
         cache_key.sort_unstable();
         cache_key.dedup();
-        let mut cache = self.recommendation_rating_median_cache.lock().await;
         let now = current_unix_timestamp();
-        if let Some(entry) = cache.values.get(&cache_key)
-            && recommendation_rating_cache_is_fresh(now, entry.calculated_at)
         {
-            return Ok(entry.value);
+            // Only the map lookup happens under the lock; the queries below run without it so a
+            // slow database does not serialize unrelated cache readers.
+            let cache = self.recommendation_rating_median_cache.lock().await;
+            if let Some(entry) = cache.values.get(&cache_key)
+                && recommendation_rating_cache_is_fresh(now, entry.calculated_at)
+            {
+                return Ok(entry.value);
+            }
         }
 
         let persistent_key = cache_key.join("\u{001f}");
@@ -1363,13 +1367,17 @@ impl Database {
             let calculated_at: i64 = row.get("calculated_at");
             if recommendation_rating_cache_is_fresh(now, calculated_at) {
                 let median: f64 = row.get("median_rating");
-                cache.values.insert(
-                    cache_key,
-                    RecommendationRatingMedianEntry {
-                        value: median,
-                        calculated_at,
-                    },
-                );
+                self.recommendation_rating_median_cache
+                    .lock()
+                    .await
+                    .values
+                    .insert(
+                        cache_key,
+                        RecommendationRatingMedianEntry {
+                            value: median,
+                            calculated_at,
+                        },
+                    );
                 return Ok(median);
             }
         }
@@ -1422,13 +1430,17 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        cache.values.insert(
-            cache_key,
-            RecommendationRatingMedianEntry {
-                value: median,
-                calculated_at,
-            },
-        );
+        self.recommendation_rating_median_cache
+            .lock()
+            .await
+            .values
+            .insert(
+                cache_key,
+                RecommendationRatingMedianEntry {
+                    value: median,
+                    calculated_at,
+                },
+            );
         Ok(median)
     }
 
