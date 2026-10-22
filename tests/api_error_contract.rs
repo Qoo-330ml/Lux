@@ -49,3 +49,37 @@ async fn empty_lux_api_service_unavailable_responses_use_the_error_contract()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn client_request_ids_are_not_adopted_by_the_server() -> Result<(), Box<dyn std::error::Error>>
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app()).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let response = client
+        .get(format!("http://{address}/api/v1/auth/sessions"))
+        .header("x-request-id", "client-supplied-id")
+        .send()
+        .await?;
+    let server_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!server_id.is_empty());
+    assert_ne!(
+        server_id, "client-supplied-id",
+        "the server must mint its own correlation id"
+    );
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["requestId"], server_id.as_str());
+
+    server.abort();
+    Ok(())
+}

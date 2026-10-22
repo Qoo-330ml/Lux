@@ -119,6 +119,9 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         ))
         .layer(
             tower::ServiceBuilder::new()
+                // A client-supplied request id must not become the server's own correlation
+                // id; keep it aside for diagnostics and always mint a fresh one.
+                .layer(middleware::from_fn(strip_client_request_id))
                 .set_x_request_id(MakeRequestUuid)
                 .layer(
                     TraceLayer::new_for_http()
@@ -366,6 +369,20 @@ fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
             .get(*start..*start + needle.len())
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
     })
+}
+
+async fn strip_client_request_id(mut request: Request<Body>, next: Next) -> Response {
+    if let Some(value) = request.headers_mut().remove("x-request-id") {
+        if let Some(value) = value
+            .to_str()
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            && let Ok(value) = HeaderValue::from_str(value)
+        {
+            request.headers_mut().insert("x-client-request-id", value);
+        }
+    }
+    next.run(request).await
 }
 
 async fn web_asset_cache_policy(request: Request<Body>, next: Next) -> Response {
