@@ -1,5 +1,22 @@
 # Lux 客户端兼容性矩阵
 
+## PostgreSQL 迁移 208 启动修复（2026-10-22）
+
+`0208_content_restriction_index_queue.sql` 删除旧触发器时缺少 PostgreSQL 必需的
+`ON media_items`，导致启动报告 `42601`、迁移版本 `208`、位置 `1443` 的分号语法错误。
+修复直接补全该语句；新增后续 migration 无法修复一个尚未通过的 208。SQLite migration 不变。
+原语句不能在 PostgreSQL 成功执行，SQLx 会回滚该迁移及其版本记录；因此正常受此错误阻塞的
+实例更新到含修复的构建后可重启重试，无需删除数据库、改迁移记录或跳过 208。
+
+本机 macOS `arm64` / PostgreSQL 16.15 在隔离事务中复现原始错误。真实 PostgreSQL
+定向回归验证从 207 升级至完整迁移集、仅回填未删除且缺失索引的条目、无变化 NFO 保留索引、
+NFO 改变后清理索引和标签并去重入队、新条目自动入队、删除级联及重复启动的迁移校验；
+既有空库启动与内容索引触发器用例也通过。两项命令均使用
+`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database`，
+分别追加 `postgres_content_restriction_queue_migration_upgrades_v207_and_preserves_triggers -- --ignored --exact`
+和 `postgres_media_content_restriction_index_migration -- --ignored --exact`。
+本记录不代表线上镜像已更新或部署后验证通过。
+
 ## LUX-826 图片缓存与全局开关修订（2026-10-22）
 
 - 图片变体改为 `/config/image-cache/v1/<SHA256(item_id)前两位>/<item_id>/<content_tag>-w<width>.jpg`，与 `metadata/library` 共用条目分片算法。`content_tag` 保留以区分多图和原图更新；URL、ETag、尺寸规则与原图回退保持原有合同。

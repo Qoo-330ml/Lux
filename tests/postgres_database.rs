@@ -130,6 +130,118 @@ async fn advance_postgres_manifest_to_applying(
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_content_restriction_queue_migration_upgrades_v207_and_preserves_triggers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let result = async {
+        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+        let migrator = Migrator::new(source_dir.as_path()).await?;
+        let old = Migrator::with_migrations(
+            migrator.iter().filter(|m| m.version <= 207).cloned().collect(),
+        );
+        old.run(&pool).await?;
+        sqlx::raw_sql(
+            "INSERT INTO libraries (id, name, kind) VALUES ('queue-library', 'Queue', 'MOVIE');
+             INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status, removed_at)
+             VALUES ('queue-missing', 'queue-library', 'MOVIE', 'Missing', 'missing', 'LOCAL_CONFIRMED', NULL),
+                    ('queue-indexed', 'queue-library', 'MOVIE', 'Indexed', 'indexed', 'LOCAL_CONFIRMED', NULL),
+                    ('queue-removed', 'queue-library', 'MOVIE', 'Removed', 'removed', 'LOCAL_CONFIRMED', 1);
+             INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('queue-indexed', 'PG');
+             INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('queue-indexed', 'family');",
+        )
+        .execute(&pool)
+        .await?;
+
+        migrator.run(&pool).await?;
+        // A normal restart must accept the recorded migrations without reapplying them.
+        migrator.run(&pool).await?;
+        let queued: Vec<String> = sqlx::query_scalar(
+            "SELECT item_id FROM media_content_restriction_index_queue ORDER BY item_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(queued, ["queue-missing"]);
+
+        sqlx::query(
+            "UPDATE media_items SET nfo_metadata_json = nfo_metadata_json
+             WHERE id = 'queue-indexed'",
+        )
+        .execute(&pool)
+        .await?;
+        let unchanged_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index WHERE item_id = 'queue-indexed'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(unchanged_index, 1);
+
+        sqlx::raw_sql(
+            "UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"R\"}'
+             WHERE id = 'queue-indexed';
+             UPDATE media_content_restriction_index_queue SET queued_at = -1
+             WHERE item_id = 'queue-indexed';
+             UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"PG\"}'
+             WHERE id = 'queue-indexed';",
+        )
+        .execute(&pool)
+        .await?;
+        let invalidated_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM media_content_restriction_index
+                     WHERE item_id = 'queue-indexed')
+                  + (SELECT COUNT(*) FROM media_content_restriction_tags
+                     WHERE item_id = 'queue-indexed')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(invalidated_rows, 0);
+        let requeued_at: i64 = sqlx::query_scalar(
+            "SELECT queued_at FROM media_content_restriction_index_queue
+             WHERE item_id = 'queue-indexed'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(requeued_at > 0);
+
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status)
+             VALUES ('queue-new', 'queue-library', 'MOVIE', 'New', 'new', 'LOCAL_CONFIRMED')",
+        )
+        .execute(&pool)
+        .await?;
+        let inserted_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index_queue WHERE item_id = 'queue-new'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inserted_rows, 1);
+        sqlx::query("DELETE FROM media_items WHERE id = 'queue-new'")
+            .execute(&pool)
+            .await?;
+        let deleted_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index_queue WHERE item_id = 'queue-new'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(deleted_rows, 0);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_media_content_restriction_index_migration()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
