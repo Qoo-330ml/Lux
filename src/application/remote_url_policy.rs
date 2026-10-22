@@ -62,7 +62,7 @@ fn validate_remote_media_url(value: &str) -> bool {
         || host.parse::<IpAddr>().is_ok_and(is_private_or_reserved))
 }
 
-fn is_private_or_reserved(address: IpAddr) -> bool {
+pub(crate) fn is_private_or_reserved(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [first, second, third, _] = address.octets();
@@ -81,20 +81,33 @@ fn is_private_or_reserved(address: IpAddr) -> bool {
                         | (198, 51, 100)
                         | (203, 0, 113)
                 )
+                // 240/4 reserved and the limited broadcast address.
+                || first >= 240
         }
         IpAddr::V6(address) => {
+            // IPv4-mapped addresses reach the embedded IPv4 target, so classify them as IPv4.
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_private_or_reserved(IpAddr::V4(mapped));
+            }
+            let segments = address.segments();
             address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
                 || address.is_unique_local()
                 || address.is_unicast_link_local()
+                // 6to4, Teredo, and NAT64 can wrap arbitrary IPv4 destinations.
+                || segments[0] == 0x2002
+                || segments[0] == 0x2001 && segments[1] == 0
+                || segments[0] == 0x0064 && segments[1] == 0xff9b
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_remote_media_url;
+    use std::net::IpAddr;
+
+    use super::{is_private_or_reserved, validate_remote_media_url};
 
     #[test]
     fn download_url_policy_rejects_credentials_fragments_and_private_hosts() {
@@ -114,5 +127,33 @@ mod tests {
         assert!(validate_remote_media_url(
             "https://example.com/video.mkv?signature=fixture"
         ));
+    }
+
+    #[test]
+    fn mapped_and_tunnelled_addresses_are_treated_as_private() {
+        for value in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "169.254.169.254",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            let address: IpAddr = value.parse().expect("address");
+            assert!(is_private_or_reserved(address), "{value} must be blocked");
+        }
+        for value in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            let address: IpAddr = value.parse().expect("address");
+            assert!(
+                !is_private_or_reserved(address),
+                "{value} must stay allowed"
+            );
+        }
     }
 }

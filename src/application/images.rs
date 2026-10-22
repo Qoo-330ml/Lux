@@ -265,6 +265,9 @@ fn image_content_tag_and_dimensions_sync(
 pub struct ImageDownloadConfig {
     pub timeout: Duration,
     pub max_bytes: u64,
+    /// Allows plain-HTTP image downloads from loopback hosts. Only local test stubs need this;
+    /// production downloads must never reach the loopback interface.
+    pub allow_loopback_http: bool,
 }
 
 impl Default for ImageDownloadConfig {
@@ -272,6 +275,7 @@ impl Default for ImageDownloadConfig {
         Self {
             timeout: Duration::from_secs(10),
             max_bytes: MAX_IMAGE_BYTES,
+            allow_loopback_http: false,
         }
     }
 }
@@ -281,6 +285,7 @@ pub struct ImageWriteService {
     database: Database,
     http: Client,
     max_bytes: u64,
+    allow_loopback_http: bool,
     config_dir: Option<PathBuf>,
     download_permits: Arc<ImagePermitPool>,
     write_permits: Arc<ImagePermitPool>,
@@ -329,6 +334,23 @@ impl ImageWriteService {
         config: ImageDownloadConfig,
     ) -> Result<Self, ImageWriteError> {
         Self::with_proxy_config(database, config, None, None)
+    }
+
+    pub fn with_config_and_config_dir(
+        database: Database,
+        config: ImageDownloadConfig,
+        config_dir: PathBuf,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config(database, config, None, Some(config_dir))
+    }
+
+    pub fn with_config_proxy_and_config_dir(
+        database: Database,
+        config: ImageDownloadConfig,
+        proxy_url: Option<String>,
+        config_dir: PathBuf,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config(database, config, proxy_url, Some(config_dir))
     }
 
     pub fn with_config_and_concurrency(
@@ -393,12 +415,15 @@ impl ImageWriteService {
         let http = client_builder_from_env_or(proxy_url.as_deref())
             .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?
             .timeout(config.timeout)
+            // A redirect would bypass the URL checks done before the request.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
         Ok(Self {
             database,
             http,
             max_bytes: config.max_bytes,
+            allow_loopback_http: config.allow_loopback_http,
             config_dir,
             download_permits,
             write_permits,
@@ -1052,6 +1077,7 @@ impl ImageWriteService {
                 "image URL must be an http(s) URL without credentials".to_owned(),
             ));
         }
+        ensure_public_image_host(&url, self.allow_loopback_http).await?;
 
         let _download_permit = self
             .download_permits
@@ -1280,7 +1306,7 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        if !is_allowed_scraper_image_url(image_url) {
+        if !is_allowed_scraper_image_url(image_url, self.allow_loopback_http) {
             return Err(ImageWriteError::InvalidUrl(
                 "selected image URL must be a valid HTTPS scraper image URL".to_owned(),
             ));
@@ -1304,7 +1330,7 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        if !is_allowed_scraper_image_url(image_url) {
+        if !is_allowed_scraper_image_url(image_url, self.allow_loopback_http) {
             return Err(ImageWriteError::InvalidUrl(
                 "scraper image URL must be a valid HTTPS URL".to_owned(),
             ));
@@ -1321,7 +1347,7 @@ impl ImageWriteService {
         source: &str,
         image_index: i64,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        if !is_allowed_scraper_image_url(image_url) {
+        if !is_allowed_scraper_image_url(image_url, self.allow_loopback_http) {
             return Err(ImageWriteError::InvalidUrl(
                 "scraper image URL must be a valid HTTPS URL".to_owned(),
             ));
@@ -2748,19 +2774,32 @@ impl From<StorageError> for ImageWriteError {
     }
 }
 
-fn is_allowed_scraper_image_url(value: &str) -> bool {
+fn is_allowed_scraper_image_url(value: &str, allow_loopback_http: bool) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
-    let loopback_http = url.scheme().eq_ignore_ascii_case("http")
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        });
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let literal_address = match url.host() {
+        Some(url::Host::Ipv4(address)) => Some(IpAddr::V4(address)),
+        Some(url::Host::Ipv6(address)) => Some(IpAddr::V6(address)),
+        _ => None,
+    };
+    let loopback_hostname = host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost");
+    let loopback_http = allow_loopback_http
+        && url.scheme().eq_ignore_ascii_case("http")
+        && (literal_address.is_some_and(|address| address.is_loopback()) || loopback_hostname);
+    if literal_address.is_some_and(crate::application::remote_url_policy::is_private_or_reserved)
+        && !loopback_http
+    {
+        return false;
+    }
+    if loopback_hostname {
+        return loopback_http;
+    }
     (url.scheme().eq_ignore_ascii_case("https") || loopback_http)
-        && url.host_str().is_some_and(|host| !host.is_empty())
+        && !host.is_empty()
         && url.username().is_empty()
         && url.password().is_none()
         && (url.port().is_none() || loopback_http)
@@ -2769,10 +2808,65 @@ fn is_allowed_scraper_image_url(value: &str) -> bool {
         && url.fragment().is_none()
 }
 
+/// Rejects image targets that live on private or reserved addresses.
+///
+/// Host literals are classified directly; hostnames are resolved so a DNS name cannot point the
+/// server at an internal service. The HTTP client does not follow redirects, so a public host
+/// cannot bounce the request inward either.
+async fn ensure_public_image_host(
+    url: &Url,
+    allow_loopback_http: bool,
+) -> Result<(), ImageWriteError> {
+    let Some(host) = url.host_str() else {
+        return Err(ImageWriteError::InvalidUrl(
+            "image URL must include a host".to_owned(),
+        ));
+    };
+    let literal_address = match url.host() {
+        Some(url::Host::Ipv4(address)) => Some(IpAddr::V4(address)),
+        Some(url::Host::Ipv6(address)) => Some(IpAddr::V6(address)),
+        _ => None,
+    };
+    if let Some(address) = literal_address {
+        return if crate::application::remote_url_policy::is_private_or_reserved(address)
+            && !(allow_loopback_http && address.is_loopback())
+        {
+            Err(ImageWriteError::InvalidUrl(
+                "image URL points at a non-public address".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ImageWriteError::InvalidUrl("image URL has no usable port".to_owned()))?;
+    let mut resolved = false;
+    for address in tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| ImageWriteError::Download(error.to_string()))?
+    {
+        resolved = true;
+        let loopback_allowed = allow_loopback_http && address.ip().is_loopback();
+        if crate::application::remote_url_policy::is_private_or_reserved(address.ip())
+            && !loopback_allowed
+        {
+            return Err(ImageWriteError::InvalidUrl(format!(
+                "image host {host} resolves to a non-public address"
+            )));
+        }
+    }
+    if !resolved {
+        return Err(ImageWriteError::Download(format!(
+            "image host {host} did not resolve"
+        )));
+    }
+    Ok(())
+}
+
 fn retryable_image_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
-
 fn image_download_retry_delay(retry_count: u32) -> Duration {
     let exponent = retry_count.saturating_sub(1).min(31);
     let factor = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
@@ -2929,26 +3023,64 @@ mod tests {
     #[test]
     fn scraper_image_urls_accept_any_safe_https_host() {
         assert!(is_allowed_scraper_image_url(
-            "https://img.douban.example/poster.jpg"
+            "https://img.douban.example/poster.jpg",
+            false
         ));
         assert!(!is_allowed_scraper_image_url(
-            "http://img.douban.example/poster.jpg"
+            "http://img.douban.example/poster.jpg",
+            false
         ));
         assert!(!is_allowed_scraper_image_url(
-            "https://img.douban.example/poster.jpg?redirect=http://127.0.0.1"
+            "https://img.douban.example/poster.jpg?redirect=http://127.0.0.1",
+            false
         ));
         assert!(!is_allowed_scraper_image_url(
-            "https://user:pass@img.douban.example/poster.jpg"
+            "https://user:pass@img.douban.example/poster.jpg",
+            false
         ));
     }
 
     #[test]
-    fn scraper_image_urls_allow_only_loopback_http_for_local_stubs() {
+    fn scraper_image_urls_reject_private_and_reserved_hosts() {
+        for value in [
+            "https://127.0.0.1/poster.jpg",
+            "https://10.0.0.5/poster.jpg",
+            "https://192.168.1.10/poster.jpg",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/poster.jpg",
+            "https://[::ffff:127.0.0.1]/poster.jpg",
+            "http://localhost/poster.jpg",
+            "http://127.0.0.1:8099/poster.jpg",
+        ] {
+            assert!(
+                !is_allowed_scraper_image_url(value, false),
+                "{value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_http_stubs_require_an_explicit_opt_in() {
         assert!(is_allowed_scraper_image_url(
-            "http://127.0.0.1:8099/poster.jpg"
+            "http://127.0.0.1:8099/poster.jpg",
+            true
+        ));
+        assert!(is_allowed_scraper_image_url(
+            "http://localhost:8099/poster.jpg",
+            true
         ));
         assert!(!is_allowed_scraper_image_url(
-            "http://img.douban.example/poster.jpg"
+            "http://127.0.0.1:8099/poster.jpg",
+            false
+        ));
+        // The opt-in never widens the policy to other private ranges.
+        assert!(!is_allowed_scraper_image_url(
+            "http://192.168.1.10:8099/poster.jpg",
+            true
+        ));
+        assert!(!is_allowed_scraper_image_url(
+            "http://img.douban.example/poster.jpg",
+            true
         ));
     }
 

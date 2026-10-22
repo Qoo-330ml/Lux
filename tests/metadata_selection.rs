@@ -87,8 +87,9 @@ async fn selecting_candidate_without_credits_preserves_existing_people_relation(
     .await?;
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new_with_config_dir(
+        ImageWriteService::with_config_and_config_dir(
             fixture.database.clone(),
+            local_image_config(),
             fixture.config.config_dir.clone(),
         )?,
         fixture.config.config_dir.clone(),
@@ -413,7 +414,7 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
         }),
     )
     .await?;
-    let service = ImageWriteService::new(fixture.database.clone())?;
+    let service = ImageWriteService::with_config(fixture.database.clone(), local_image_config())?;
     let selection = MetadataSelectionService::new(fixture.database.clone(), service);
 
     let report = selection
@@ -468,7 +469,7 @@ async fn full_refresh_keeps_nfo_when_image_download_fails() -> Result<(), Box<dy
     .await?;
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
         fixture.config.config_dir.clone(),
     );
 
@@ -548,7 +549,7 @@ async fn one_media_image_selection_is_bounded_to_four_concurrent_downloads()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     let report = selection
@@ -575,7 +576,7 @@ async fn fill_missing_selection_preserves_existing_actor_relation_without_credit
         .with_database(fixture.database.clone());
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
         fixture.config.config_dir.clone(),
     );
     let first_candidate_id = insert_candidate(
@@ -661,8 +662,9 @@ async fn fill_missing_skips_a_backoff_image_and_uses_the_next_candidate()
 
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new_with_config_dir(
+        ImageWriteService::with_config_and_config_dir(
             fixture.database.clone(),
+            local_image_config(),
             fixture.config.config_dir.clone(),
         )?,
         fixture.config.config_dir.clone(),
@@ -695,7 +697,7 @@ async fn selection_records_the_scraper_that_confirmed_identity()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     selection
@@ -738,7 +740,7 @@ async fn supplemental_selection_preserves_existing_rich_nfo_and_fills_missing_li
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     selection
@@ -780,7 +782,7 @@ async fn supplemental_selection_appends_multiple_backdrops_after_main_image()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
     selection
         .select(
@@ -864,7 +866,7 @@ async fn batch_confirmation_selects_the_highest_scored_pending_candidate()
         .execute(fixture.database.pool())
         .await?;
     }
-    let service = ImageWriteService::new(fixture.database.clone())?;
+    let service = ImageWriteService::with_config(fixture.database.clone(), local_image_config())?;
     let selection = MetadataSelectionService::new(fixture.database.clone(), service);
 
     let report = selection.confirm_best_pending(&fixture.item_id).await?;
@@ -1136,7 +1138,7 @@ async fn admin_selection_writes_only_configured_candidate_image_types()
         }),
     )
     .await?;
-    let service = ImageWriteService::new(fixture.database.clone())?;
+    let service = ImageWriteService::with_config(fixture.database.clone(), local_image_config())?;
     let selection = MetadataSelectionService::new(fixture.database.clone(), service);
 
     let report = selection
@@ -1352,7 +1354,7 @@ async fn series_and_season_selection_writes_to_their_media_directories()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     selection
@@ -1478,7 +1480,7 @@ async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     let report = selection
@@ -2181,8 +2183,9 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let images = ImageWriteService::new_with_config_dir(
+    let images = ImageWriteService::with_config_and_config_dir(
         fixture.database.clone(),
+        local_image_config(),
         fixture.config.config_dir.clone(),
     )?;
     let selection = MetadataSelectionService::with_config_dir(
@@ -2440,8 +2443,9 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
     };
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new_with_config_dir(
+        ImageWriteService::with_config_and_config_dir(
             fixture.database.clone(),
+            local_image_config(),
             fixture.config.config_dir.clone(),
         )?,
         fixture.config.config_dir.clone(),
@@ -2585,7 +2589,7 @@ async fn workflow_two_scan_automatically_matches_and_writes_metadata()
     })?;
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
         fixture.config.config_dir.clone(),
     );
     let metadata = MetadataReidentifyService::with_selection(
@@ -2885,12 +2889,14 @@ async fn start_lux(
 {
     let auth = WebAuthService::new(fixture.database.clone())?;
     let emby_auth = EmbyAuthService::new(fixture.database.clone())?;
-    let app = app_with_state(AppState::ready(
+    let app = app_with_state(AppState::ready_with_proxy_and_image_config(
         fixture.config.clone(),
         fixture.database.clone(),
         fixture.setup.clone(),
         auth,
         emby_auth,
+        None,
+        local_image_config(),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -2926,4 +2932,12 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
             (cookie_name == name).then(|| cookie_value.to_owned())
         })
         .expect("expected cookie")
+}
+
+/// The metadata fixtures serve images from a loopback stub, which production downloads reject.
+fn local_image_config() -> luxd::application::images::ImageDownloadConfig {
+    luxd::application::images::ImageDownloadConfig {
+        allow_loopback_http: true,
+        ..Default::default()
+    }
 }

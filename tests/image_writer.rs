@@ -33,6 +33,14 @@ const PNG_1X1: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+/// The local stub server binds to loopback, which production downloads reject.
+fn local_image_config() -> ImageDownloadConfig {
+    ImageDownloadConfig {
+        allow_loopback_http: true,
+        ..ImageDownloadConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +72,7 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
         database.clone(),
         ImageDownloadConfig {
             max_bytes: 1024 * 1024,
-            ..ImageDownloadConfig::default()
+            ..local_image_config()
         },
     )?;
     let poster = service
@@ -135,7 +143,7 @@ async fn scraper_replaces_an_ffmpeg_fallback_image() -> Result<(), Box<dyn std::
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::new(database.clone())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
 
     let report = service
         .download_item_image_if_missing(&item_id, "poster", &format!("http://{address}/poster"))
@@ -185,11 +193,8 @@ async fn image_downloads_respect_the_global_concurrency_limit()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::with_config_and_concurrency(
-        database,
-        ImageDownloadConfig::default(),
-        2,
-    )?;
+    let service =
+        ImageWriteService::with_config_and_concurrency(database, local_image_config(), 2)?;
 
     let mut tasks = Vec::new();
     for image_type in ["POSTER", "FANART", "LOGO", "BANNER", "DISC", "ART"] {
@@ -234,7 +239,7 @@ async fn concurrent_downloads_claim_one_attempt_for_the_same_image()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::with_config(database, ImageDownloadConfig::default())?;
+    let service = ImageWriteService::with_config(database, local_image_config())?;
     let image_url = format!("http://{address}/poster");
     let first = service.clone();
     let second = service.clone();
@@ -287,7 +292,7 @@ async fn manual_scraper_image_selection_claims_one_attempt_for_the_same_image()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::new(database)?;
+    let service = ImageWriteService::with_config(database, local_image_config())?;
     let image_url = format!("http://{address}/poster");
     let first = service.clone();
     let second = service;
@@ -346,7 +351,7 @@ async fn missing_image_not_found_is_not_requested_again_on_next_attempt()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::with_config(database, ImageDownloadConfig::default())?;
+    let service = ImageWriteService::with_config(database, local_image_config())?;
     let image_url = format!("http://{address}/missing");
 
     assert!(
@@ -389,7 +394,7 @@ async fn transient_image_failure_is_skipped_until_retry_deadline()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::with_config(database.clone(), ImageDownloadConfig::default())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
     let image_url = format!("http://{address}/temporary");
 
     assert!(
@@ -470,7 +475,7 @@ async fn successful_image_retry_clears_the_backoff_state() -> Result<(), Box<dyn
     .execute(database.pool())
     .await?;
 
-    let service = ImageWriteService::with_config(database.clone(), ImageDownloadConfig::default())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
     assert!(
         service
             .download_item_image_if_missing(&item_id, "poster", &image_url)
@@ -514,7 +519,7 @@ async fn permanent_image_failure_is_not_retried_automatically()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::with_config(database, ImageDownloadConfig::default())?;
+    let service = ImageWriteService::with_config(database, local_image_config())?;
     let image_url = format!("http://{address}/invalid");
 
     assert!(
@@ -553,7 +558,11 @@ async fn config_managed_images_use_the_media_directory_by_default()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let service = ImageWriteService::new_with_config_dir(database.clone(), config_dir.clone())?;
+    let service = ImageWriteService::with_config_and_config_dir(
+        database.clone(),
+        local_image_config(),
+        config_dir.clone(),
+    )?;
     let report = service
         .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
         .await?;
@@ -614,7 +623,11 @@ async fn config_managed_images_can_write_an_additional_metadata_copy()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let service = ImageWriteService::new_with_config_dir(database.clone(), config_dir.clone())?;
+    let service = ImageWriteService::with_config_and_config_dir(
+        database.clone(),
+        local_image_config(),
+        config_dir.clone(),
+    )?;
     let report = service
         .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
         .await?;
@@ -676,7 +689,8 @@ async fn config_managed_image_writes_reject_metadata_parent_symlinks()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let service = ImageWriteService::new_with_config_dir(database, config_dir)?;
+    let service =
+        ImageWriteService::with_config_and_config_dir(database, local_image_config(), config_dir)?;
     let error = service
         .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
         .await
@@ -704,7 +718,7 @@ async fn downloads_flat_movie_images_to_distinct_media_prefixed_paths()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let service = ImageWriteService::new(database.clone())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
     let first = service
         .download_item_image(&item_ids[0], "poster", &format!("http://{address}/poster"))
         .await?;
@@ -761,7 +775,7 @@ async fn episode_images_use_distinct_paths_and_ignore_season_artwork()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::new(database.clone())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
 
     let first = service
         .download_item_image_if_missing(
@@ -836,7 +850,7 @@ async fn missing_episode_fanart_does_not_reuse_indexed_thumbnail()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::new(database.clone())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
 
     let report = service
         .download_item_image_if_missing(&episodes[0], "FANART", &format!("http://{address}/fanart"))
@@ -987,7 +1001,7 @@ async fn rejects_bad_content_type_content_and_size_without_writing()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let service = ImageWriteService::with_config(database.clone(), ImageDownloadConfig::default())?;
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
 
     assert!(matches!(
         service
@@ -999,7 +1013,7 @@ async fn rejects_bad_content_type_content_and_size_without_writing()
         database.clone(),
         ImageDownloadConfig {
             max_bytes: 1024,
-            ..ImageDownloadConfig::default()
+            ..local_image_config()
         },
     )?;
     assert!(matches!(
@@ -1012,7 +1026,7 @@ async fn rejects_bad_content_type_content_and_size_without_writing()
         database.clone(),
         ImageDownloadConfig {
             max_bytes: 8,
-            ..ImageDownloadConfig::default()
+            ..local_image_config()
         },
     )?;
     assert!(matches!(
@@ -1054,6 +1068,7 @@ async fn stops_chunked_image_download_at_the_configured_limit()
         ImageDownloadConfig {
             timeout: Duration::from_millis(100),
             max_bytes: 8,
+            allow_loopback_http: true,
         },
     )?;
     let result = tokio::time::timeout(

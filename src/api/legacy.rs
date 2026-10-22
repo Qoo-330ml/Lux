@@ -250,6 +250,26 @@ impl AppState {
         emby_auth: EmbyAuthService,
         network_proxy_url: Option<String>,
     ) -> Self {
+        Self::ready_with_proxy_and_image_config(
+            config,
+            database,
+            setup,
+            auth,
+            emby_auth,
+            network_proxy_url,
+            crate::application::images::ImageDownloadConfig::default(),
+        )
+    }
+
+    pub fn ready_with_proxy_and_image_config(
+        config: Config,
+        database: Database,
+        setup: SetupService,
+        auth: WebAuthService,
+        emby_auth: EmbyAuthService,
+        network_proxy_url: Option<String>,
+        image_download_config: crate::application::images::ImageDownloadConfig,
+    ) -> Self {
         let server_id = database.server_id().to_owned();
         let filmly_image_compat_mode = filmly_image_compat_mode_from_env_value(
             std::env::var("LUX_FILMLY_IMAGE_MODE").ok().as_deref(),
@@ -297,10 +317,11 @@ impl AppState {
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
         let home = HomeService::new(catalog.clone(), libraries.clone());
-        let image_writes = ImageWriteService::new_with_proxy_and_config_dir(
+        let image_writes = ImageWriteService::with_config_proxy_and_config_dir(
             database.clone(),
-            config.config_dir.clone(),
+            image_download_config,
             network_proxy_url.clone(),
+            config.config_dir.clone(),
         )
         .ok()
         .map(|service| service.with_resource_metrics(resources.clone()));
