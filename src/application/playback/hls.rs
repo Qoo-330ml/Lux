@@ -1627,12 +1627,11 @@ fn is_valid_asset(asset: &str, segment_container: HlsSegmentContainer) -> bool {
     if asset.is_empty() || asset.len() > 128 {
         return false;
     }
+    // Every artifact ffmpeg writes for a session sits directly in the session directory, so a
+    // single normal component is the whole contract (this also rejects `.`/`..` and any `/`).
     let path = Path::new(asset);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return false;
     }
     if asset == "index.m3u8" {
@@ -1719,6 +1718,27 @@ mod tests {
         ffmpeg_args_for_output, ffmpeg_args_with_audio, ffmpeg_args_with_timeline,
         hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
     };
+
+    #[test]
+    fn hls_assets_are_single_file_names() {
+        let container = HlsSegmentContainer::FragmentedMp4;
+        assert!(is_valid_asset("index.m3u8", container));
+        assert!(is_valid_asset("init_000001.mp4", container));
+        assert!(is_valid_asset("segment_000001.m4s", container));
+        for rejected in [
+            "nested/segment_000001.m4s",
+            "../segment_000001.m4s",
+            "./segment_000001.m4s",
+            "/tmp/segment_000001.m4s",
+            "..",
+            "",
+        ] {
+            assert!(
+                !is_valid_asset(rejected, container),
+                "{rejected} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn vod_manifest_declares_the_complete_runtime() {
