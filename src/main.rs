@@ -206,7 +206,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         control_rx,
         control_tx.clone(),
         shutdown_tx.clone(),
-        shutdown_state.clone(),
     ))
     .await;
     let _ = shutdown_tx.send(true);
@@ -240,7 +239,6 @@ async fn shutdown_signal(
     mut control_rx: watch::Receiver<ShutdownReason>,
     control_tx: watch::Sender<ShutdownReason>,
     shutdown: watch::Sender<bool>,
-    app_state: AppState,
 ) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -288,9 +286,8 @@ async fn shutdown_signal(
         }
     }
 
-    if let Err(error) = app_state.shutdown_background_workers_checked().await {
-        error!(%error, "background workers could not drain before graceful shutdown");
-    }
+    // Only signal the HTTP server to stop here. Workers are drained once, after `serve` returns
+    // and no further requests can start work, by the caller below.
     let _ = shutdown.send(true);
 }
 
