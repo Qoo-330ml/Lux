@@ -3344,7 +3344,11 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/users/{user_id}/avatar",
-            get(admin_get_user_avatar).put(admin_update_user_avatar),
+            get(admin_get_user_avatar)
+                .put(admin_update_user_avatar)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::application::user_avatars::MAX_USER_AVATAR_BYTES as usize,
+                )),
         )
         .route(
             "/api/v1/admin/users/{user_id}/restore",

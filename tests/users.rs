@@ -7907,3 +7907,63 @@ async fn public_invitation_acceptance_api_creates_verified_login_once()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_avatar_upload_accepts_bodies_up_to_the_documented_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use reqwest::header::CONTENT_TYPE;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+
+    // Three mebibytes is above axum's 2 MiB default body limit but below the documented 5 MiB
+    // avatar limit; the payload itself is invalid so the handler answers 400, not 413.
+    let response = client
+        .put(format!(
+            "http://{address}/api/v1/admin/users/{}/avatar",
+            admin.id
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(vec![0_u8; 3 * 1024 * 1024])
+        .send()
+        .await?;
+    assert_ne!(
+        response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "the avatar route must accept bodies up to MAX_USER_AVATAR_BYTES"
+    );
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    Ok(())
+}
