@@ -5,7 +5,9 @@ use tokio::{sync::watch, task::JoinHandle};
 use crate::{
     application::nfo::{LocalNfoDetails, local_nfo_details_from_cache_json},
     domain::content_restrictions::project_content_restriction_index,
-    storage::{CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, Database, StorageError},
+    storage::{
+        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexWrite, Database, StorageError,
+    },
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -30,13 +32,12 @@ impl ContentRestrictionIndexService {
 
     pub(crate) async fn index_batch(
         &self,
-        after_item_id: Option<&str>,
+        _after_item_id: Option<&str>,
         batch_size: usize,
     ) -> Result<ContentRestrictionIndexBatchReport, StorageError> {
         let candidates = self
             .database
-            .media_content_restriction_index_candidates(
-                after_item_id,
+            .media_content_restriction_index_queued_candidates(
                 batch_size.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT),
             )
             .await?;
@@ -45,6 +46,8 @@ impl ContentRestrictionIndexService {
             last_item_id: candidates.last().map(|candidate| candidate.item_id.clone()),
             ..ContentRestrictionIndexBatchReport::default()
         };
+        let mut writes = Vec::with_capacity(candidates.len());
+        let mut invalid_item_ids = Vec::new();
 
         for candidate in candidates {
             let details = match candidate.nfo_metadata_json.as_deref() {
@@ -52,6 +55,7 @@ impl ContentRestrictionIndexService {
                     Some(details) => details,
                     None => {
                         report.invalid_cache += 1;
+                        invalid_item_ids.push(candidate.item_id);
                         continue;
                     }
                 },
@@ -64,25 +68,24 @@ impl ContentRestrictionIndexService {
                 Ok(projection) => projection,
                 Err(_) => {
                     report.invalid_projection += 1;
+                    invalid_item_ids.push(candidate.item_id);
                     continue;
                 }
             };
-
-            if self
-                .database
-                .replace_media_content_restriction_index_if_nfo_json_matches(
-                    &candidate.item_id,
-                    candidate.nfo_metadata_json.as_deref(),
-                    &projection,
-                )
-                .await?
-            {
-                report.indexed += 1;
-            } else {
-                report.stale_snapshots += 1;
-            }
+            writes.push(ContentRestrictionIndexWrite {
+                item_id: candidate.item_id,
+                expected_nfo_json: candidate.nfo_metadata_json,
+                certification_code: projection.certification_code,
+                tags: projection.tags,
+            });
         }
 
+        let outcome = self
+            .database
+            .apply_content_restriction_index_batch(&writes, &invalid_item_ids)
+            .await?;
+        report.indexed = outcome.indexed;
+        report.stale_snapshots = outcome.stale;
         Ok(report)
     }
 }

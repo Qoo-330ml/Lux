@@ -6,6 +6,18 @@ const MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER: &str =
      WHEN OLD.nfo_metadata_json IS NOT NEW.nfo_metadata_json
      BEGIN
          DELETE FROM media_content_restriction_index WHERE item_id = NEW.id;
+         INSERT INTO media_content_restriction_index_queue (item_id)
+         VALUES (NEW.id)
+         ON CONFLICT(item_id) DO UPDATE SET queued_at = unixepoch();
+     END";
+
+const MEDIA_CONTENT_RESTRICTION_INDEX_QUEUE_TRIGGER: &str =
+    "CREATE TRIGGER IF NOT EXISTS trg_media_items_content_restriction_index_queue_insert
+     AFTER INSERT ON media_items
+     BEGIN
+         INSERT INTO media_content_restriction_index_queue (item_id)
+         VALUES (NEW.id)
+         ON CONFLICT(item_id) DO UPDATE SET queued_at = unixepoch();
      END";
 
 pub(super) async fn migrate_sqlite_catalog_constraints(
@@ -78,6 +90,13 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             source,
         })?;
         sqlx::query(MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER)
+            .execute(&mut *connection)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        sqlx::query(MEDIA_CONTENT_RESTRICTION_INDEX_QUEUE_TRIGGER)
             .execute(&mut *connection)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -493,6 +512,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                      updated_at = excluded.updated_at;
              END",
             MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER,
+            MEDIA_CONTENT_RESTRICTION_INDEX_QUEUE_TRIGGER,
         ];
         for statement in statements {
             sqlx::query(statement)

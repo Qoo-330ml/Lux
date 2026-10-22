@@ -6,7 +6,10 @@ use crate::storage::{
 };
 use crate::{
     domain::content_restrictions::ContentRestrictionIndexProjection,
-    storage::{CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, MediaContentRestrictionIndexCandidate},
+    storage::{
+        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexBatchOutcome,
+        ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate,
+    },
 };
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
@@ -8350,7 +8353,7 @@ impl Database {
     }
 
     // LUX-684 consumes these bounded candidates in the background index worker.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn media_content_restriction_index_candidates(
         &self,
         after_item_id: Option<&str>,
@@ -8386,6 +8389,43 @@ impl Database {
             )
         };
         let rows: Vec<(String, Option<String>)> = query
+            .bind(bounded_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(item_id, nfo_metadata_json)| MediaContentRestrictionIndexCandidate {
+                    item_id,
+                    nfo_metadata_json,
+                },
+            )
+            .collect())
+    }
+
+    /// Reads the durable queue filled by the media-item triggers. Empty queues
+    /// cost one indexed lookup instead of a scan over every visible item.
+    pub(crate) async fn media_content_restriction_index_queued_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MediaContentRestrictionIndexCandidate>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bounded_limit = limit.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT) as i64;
+        let rows: Vec<(String, Option<String>)> = self
+            .query_as(
+                "SELECT item.id, item.nfo_metadata_json
+                 FROM media_content_restriction_index_queue queue
+                 JOIN media_items item ON item.id = queue.item_id
+                 WHERE item.removed_at IS NULL
+                 ORDER BY queue.queued_at, queue.item_id
+                 LIMIT ?",
+            )
             .bind(bounded_limit)
             .fetch_all(&self.pool)
             .await
@@ -8552,6 +8592,14 @@ impl Database {
                 source,
             })?;
         }
+        self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         transaction
             .commit()
             .await
@@ -8560,6 +8608,152 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+
+    /// Applies one batch of prepared projections in a single transaction. The
+    /// worker computes the projections from the NFO snapshots outside the write
+    /// transaction; this method re-checks each snapshot and only then writes the
+    /// index, tags and queue consumption together.
+    pub(crate) async fn apply_content_restriction_index_batch(
+        &self,
+        writes: &[ContentRestrictionIndexWrite],
+        invalid_item_ids: &[String],
+    ) -> Result<ContentRestrictionIndexBatchOutcome, StorageError> {
+        let mut outcome = ContentRestrictionIndexBatchOutcome::default();
+        if writes.is_empty() && invalid_item_ids.is_empty() {
+            return Ok(outcome);
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        for item_id in invalid_item_ids {
+            self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        let snapshot_query = match self.backend() {
+            DatabaseBackend::Sqlite => {
+                "SELECT nfo_metadata_json, removed_at FROM media_items WHERE id = ?"
+            }
+            DatabaseBackend::Postgres => {
+                "SELECT nfo_metadata_json, removed_at FROM media_items WHERE id = ? FOR UPDATE"
+            }
+        };
+        for write in writes {
+            let current: Option<(Option<String>, Option<i64>)> = self
+                .query_as(snapshot_query)
+                .bind(&write.item_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let (current_nfo_json, removed_at) = match current {
+                Some(row) => row,
+                None => {
+                    self.query(
+                        "DELETE FROM media_content_restriction_index_queue WHERE item_id = ?",
+                    )
+                    .bind(&write.item_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                    outcome.removed += 1;
+                    continue;
+                }
+            };
+            if removed_at.is_some() {
+                self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+                    .bind(&write.item_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                outcome.removed += 1;
+                continue;
+            }
+            if current_nfo_json != write.expected_nfo_json {
+                // The NFO changed after the worker read it; move the queued item
+                // to the back so the next batch retries with a fresh snapshot.
+                self.query(
+                    "UPDATE media_content_restriction_index_queue
+                     SET queued_at = unixepoch() WHERE item_id = ?",
+                )
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                outcome.stale += 1;
+                continue;
+            }
+            self.query("DELETE FROM media_content_restriction_tags WHERE item_id = ?")
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)
+                 ON CONFLICT (item_id) DO UPDATE SET
+                     certification_code = excluded.certification_code,
+                     indexed_at = unixepoch()",
+            )
+            .bind(&write.item_id)
+            .bind(write.certification_code.as_deref())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            for tag in &write.tags {
+                self.query(
+                    "INSERT INTO media_content_restriction_tags (item_id, tag)
+                     VALUES (?, ?)",
+                )
+                .bind(&write.item_id)
+                .bind(tag)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            outcome.indexed += 1;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(outcome)
     }
 
     pub(crate) async fn media_item_nfo_metadata_snapshot(

@@ -25,6 +25,20 @@ pub(crate) struct MediaContentRestrictionIndexCandidate {
     pub(crate) nfo_metadata_json: Option<String>,
 }
 
+pub(crate) struct ContentRestrictionIndexWrite {
+    pub(crate) item_id: String,
+    pub(crate) expected_nfo_json: Option<String>,
+    pub(crate) certification_code: Option<String>,
+    pub(crate) tags: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ContentRestrictionIndexBatchOutcome {
+    pub(crate) indexed: usize,
+    pub(crate) stale: usize,
+    pub(crate) removed: usize,
+}
+
 pub(crate) struct GlobalCollectionSourcePreference<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) is_admin: bool,
