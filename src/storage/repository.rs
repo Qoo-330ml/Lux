@@ -386,6 +386,19 @@ async fn reserve_sqlite_incremental_vacuum(pool: &AnyPool) -> Result<(), sqlx::E
     Ok(())
 }
 
+/// Timeouts applied to every pool so a saturated or half-dead database cannot hang requests.
+const DATABASE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DATABASE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(1800);
+
+fn database_pool_options(max_connections: u32) -> AnyPoolOptions {
+    AnyPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(DATABASE_POOL_ACQUIRE_TIMEOUT)
+        .idle_timeout(Some(DATABASE_POOL_IDLE_TIMEOUT))
+        .max_lifetime(Some(DATABASE_POOL_MAX_LIFETIME))
+}
+
 fn resolve_database_pool_max_connections(
     backend: DatabaseBackend,
     configured: Option<&str>,
@@ -989,8 +1002,7 @@ impl Database {
                  SET statement_timeout = '1800s'"
             }
         };
-        let pool = AnyPoolOptions::new()
-            .max_connections(pool_max_connections)
+        let pool = database_pool_options(pool_max_connections)
             .after_connect(move |connection, _| {
                 Box::pin(async move {
                     connection.execute(after_connect_sql).await?;
@@ -1260,8 +1272,7 @@ impl Database {
                 path: PathBuf::from("external PostgreSQL"),
                 source,
             })?;
-        let pool = AnyPoolOptions::new()
-            .max_connections(1)
+        let pool = database_pool_options(1)
             .after_connect(|connection, _| {
                 Box::pin(async move {
                     connection.execute("SET TIME ZONE 'UTC'").await?;

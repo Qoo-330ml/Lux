@@ -31276,3 +31276,15 @@ async fn user_access_snapshots_match_the_single_user_reads()
     assert!(admin_snapshot.restrictions.is_none());
     Ok(())
 }
+
+#[test]
+fn database_pool_options_bound_waits_and_connection_age() {
+    let options = super::database_pool_options(4);
+    assert_eq!(options.get_max_connections(), 4);
+    assert_eq!(
+        options.get_acquire_timeout(),
+        std::time::Duration::from_secs(10)
+    );
+    assert!(options.get_idle_timeout().is_some());
+    assert!(options.get_max_lifetime().is_some());
+}
