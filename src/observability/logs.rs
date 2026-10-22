@@ -1003,6 +1003,35 @@ struct LogManager {
     defer_archive_pruning: bool,
 }
 
+/// Creates a directory only its owner can traverse; also tightens legacy 0755 directories.
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+/// Ensures a log file is owner-only, including files written by older versions as 0644.
+fn restrict_log_file_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
 impl LogManager {
     fn open(config_dir: &Path) -> io::Result<Self> {
         Self::open_with_limits(
@@ -1021,7 +1050,8 @@ impl LogManager {
     ) -> io::Result<Self> {
         let log_dir = log_dir(config_dir);
         let archive_dir = archive_dir(config_dir);
-        fs::create_dir_all(&archive_dir)?;
+        create_private_directory(&log_dir)?;
+        create_private_directory(&archive_dir)?;
         let active_path = log_dir.join(log_file_name(active_date));
         let mut manager = Self {
             log_dir,
@@ -1062,12 +1092,16 @@ impl LogManager {
     }
 
     fn open_active_file(&mut self) -> io::Result<()> {
-        fs::create_dir_all(&self.log_dir)?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.active_path)?;
+        create_private_directory(&self.log_dir)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true).read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&self.active_path)?;
+        restrict_log_file_permissions(&self.active_path)?;
         self.active_bytes = repair_incomplete_jsonl_tail(&file)?;
         self.active_file = Some(file);
         Ok(())
@@ -2017,5 +2051,57 @@ mod tests {
         assert_eq!(events[0].actor_username.as_deref(), Some("admin"));
         assert_eq!(events[0].event_type, "SETTINGS_UPDATED");
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::LogManager;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn log_files_and_directories_are_owner_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manager = LogManager::open(temp.path()).expect("open log manager");
+        let log_dir = temp.path().join("logs");
+        let mode = std::fs::metadata(&log_dir)
+            .expect("log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "log directory must not be world readable");
+        let file_mode = std::fs::metadata(&manager.active_path)
+            .expect("active log file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "log files must be owner only");
+    }
+
+    #[test]
+    fn legacy_world_readable_logs_are_tightened_on_open() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log_dir = temp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("log dir");
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod dir");
+        let first = LogManager::open(temp.path()).expect("open log manager");
+        let path = first.active_path.clone();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        drop(first);
+        let second = LogManager::open(temp.path()).expect("reopen log manager");
+        assert_eq!(second.active_path, path);
+        let mode = std::fs::metadata(&path)
+            .expect("log file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = std::fs::metadata(&log_dir)
+            .expect("log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
     }
 }
