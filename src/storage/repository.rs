@@ -334,6 +334,56 @@ const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
 const MIN_DATABASE_POOL_MAX_CONNECTIONS: u32 = 1;
 const MAX_DATABASE_POOL_MAX_CONNECTIONS: u32 = 100;
 
+/// Opt-in switch for incremental auto-vacuum. Measured on the deletion path, keeping
+/// the pointer map up to date costs about 1.7x (4.0M rows: 38 s without it, 64 s
+/// with it), so it is not a default: it buys bounded space reclamation at the price
+/// of a slower write path. Operators who would rather reclaim space after deleting a
+/// library than keep the fastest deletes can turn it on.
+const SQLITE_AUTO_VACUUM_ENV: &str = "LUX_SQLITE_AUTO_VACUUM";
+
+fn sqlite_incremental_auto_vacuum_requested() -> bool {
+    parse_sqlite_auto_vacuum_request(std::env::var(SQLITE_AUTO_VACUUM_ENV).ok().as_deref())
+}
+
+fn parse_sqlite_auto_vacuum_request(configured: Option<&str>) -> bool {
+    configured
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "incremental" | "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// SQLite only honors `auto_vacuum` when it is set before the first table exists, so
+/// a brand-new database reserves incremental-vacuum mode here. Incremental mode lets
+/// a later large deletion return pages to the filesystem in bounded steps instead of
+/// one multi-hour full `VACUUM` that needs a second copy of the file. Existing
+/// databases keep their current mode: switching it requires a full `VACUUM`, which is
+/// an operator decision.
+async fn reserve_sqlite_incremental_vacuum(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    // `auto_vacuum` is connection state until a `VACUUM` folds it into the file
+    // header, so both statements have to run on the same connection.
+    let mut connection = pool.acquire().await?;
+    // `after_connect` already switched the file to WAL, which writes the header and
+    // makes `page_count` non-zero, so emptiness is measured by user tables instead.
+    let user_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if user_tables > 0 {
+        return Ok(());
+    }
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("VACUUM").execute(&mut *connection).await?;
+    Ok(())
+}
+
 fn resolve_database_pool_max_connections(
     backend: DatabaseBackend,
     configured: Option<&str>,
@@ -957,6 +1007,14 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
+        if backend == DatabaseBackend::Sqlite && sqlite_incremental_auto_vacuum_requested() {
+            reserve_sqlite_incremental_vacuum(&pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
 
         if backend == DatabaseBackend::Postgres
             && let Err(error) = migration::validate_postgres_schema(&pool).await
@@ -5226,6 +5284,7 @@ pub(crate) struct StoredLibraryDeletionJob {
     pub(crate) status: String,
     pub(crate) stage: String,
     pub(crate) processed_count: i64,
+    pub(crate) total_count: Option<i64>,
     pub(crate) error_code: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,

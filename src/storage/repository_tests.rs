@@ -30396,3 +30396,251 @@ async fn postgres_user_email_change_storage_contract_is_atomic()
         Err(error) => Err(error.into()),
     }
 }
+
+#[tokio::test]
+async fn library_deletion_progress_records_its_denominator_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('lib-progress', 'Progress', 'SERIES')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('root-progress', 'lib-progress', '/media/series', '/media/series', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for index in 0..3 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, 'lib-progress', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(format!("item-{index}"))
+        .bind(format!("Item {index}"))
+        .bind(format!("item {index}"))
+        .execute(database.pool())
+        .await?;
+    }
+    for index in 0..2 {
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation
+             ) VALUES (?, 'root-progress', ?, 'FILE', 1, 1, '1')",
+        )
+        .bind(format!("entry-{index}"))
+        .bind(format!("file-{index}.mkv"))
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO library_deletion_jobs (
+             id, library_id, library_name, status, stage, processed_count
+         ) VALUES ('job-progress', 'lib-progress', 'Progress', 'RUNNING', 'MEDIA_ITEMS', 7)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(
+        database
+            .count_library_deletion_remaining_rows("lib-progress")
+            .await?,
+        5
+    );
+
+    // The worker records the denominator once; a retry must not shrink it to the
+    // remainder, or the reported percentage would jump backwards.
+    assert!(
+        database
+            .record_library_deletion_total("job-progress", 12)
+            .await?
+    );
+    assert!(
+        !database
+            .record_library_deletion_total("job-progress", 5)
+            .await?
+    );
+    let job = database
+        .get_library_deletion_job("job-progress")
+        .await?
+        .ok_or("deletion job missing")?;
+    assert_eq!(job.total_count, Some(12));
+    assert_eq!(job.processed_count, 7);
+
+    // A job that is no longer running must not accept a total.
+    sqlx::query("UPDATE library_deletion_jobs SET total_count = NULL, status = 'CANCELLED'")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .record_library_deletion_total("job-progress", 12)
+            .await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_incremental_auto_vacuum_stays_opt_in() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        auto_vacuum, 0,
+        "incremental auto-vacuum must stay opt-in: its pointer map costs about 1.7x \
+         on the deletion path"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_maintenance_reclaims_freed_pages_incrementally()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir)?;
+    let database_url = format!("sqlite://{}?mode=rwc", config_dir.join("lux.db").display());
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&pool)
+        .await?;
+    sqlx::query("VACUUM").execute(&pool).await?;
+    pool.close().await;
+
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    })
+    .await?;
+
+    let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        auto_vacuum, 2,
+        "an opt-in database must keep incremental auto-vacuum through the migrations"
+    );
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS maintenance_probe (id INTEGER PRIMARY KEY, payload BLOB)",
+    )
+    .execute(database.pool())
+    .await?;
+    for batch in 0..20 {
+        let mut values = Vec::with_capacity(100);
+        for index in 0..100 {
+            values.push(format!(
+                "({}, x'{}')",
+                batch * 100 + index,
+                "ab".repeat(2_048)
+            ));
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO maintenance_probe (id, payload) VALUES {}",
+            values.join(",")
+        )))
+        .execute(database.pool())
+        .await?;
+    }
+    let populated_pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM maintenance_probe")
+        .execute(database.pool())
+        .await?;
+
+    let freelist_before: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(database.pool())
+        .await?;
+    assert!(
+        freelist_before > 0,
+        "deleting the probe rows must free pages"
+    );
+
+    let report = database.run_database_maintenance_round().await;
+    assert!(
+        !report.vacuumed.is_empty(),
+        "the maintenance round must reclaim the freelist: {report:?}"
+    );
+
+    let freelist_after: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(database.pool())
+        .await?;
+    let pages_after: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(database.pool())
+        .await?;
+    assert!(
+        freelist_after < freelist_before,
+        "incremental vacuum must shrink the freelist ({freelist_before} -> {freelist_after})"
+    );
+    assert!(
+        pages_after < populated_pages,
+        "the database file must actually shrink ({populated_pages} -> {pages_after})"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sqlite_vacuum_timeout_falls_back_to_the_default_budget() {
+    use super::database_maintenance::resolve_sqlite_vacuum_timeout;
+    use std::time::Duration;
+
+    assert_eq!(
+        resolve_sqlite_vacuum_timeout(None),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        resolve_sqlite_vacuum_timeout(Some("3600")),
+        Duration::from_secs(3_600)
+    );
+    assert_eq!(
+        resolve_sqlite_vacuum_timeout(Some("  ")),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        resolve_sqlite_vacuum_timeout(Some("0")),
+        Duration::from_secs(120)
+    );
+}
+
+#[test]
+fn sqlite_auto_vacuum_opt_in_parses_conservatively() {
+    use super::parse_sqlite_auto_vacuum_request;
+
+    assert!(!parse_sqlite_auto_vacuum_request(None));
+    assert!(parse_sqlite_auto_vacuum_request(Some("incremental")));
+    assert!(parse_sqlite_auto_vacuum_request(Some(" ON ")));
+    assert!(parse_sqlite_auto_vacuum_request(Some("true")));
+    assert!(!parse_sqlite_auto_vacuum_request(Some("0")));
+    assert!(!parse_sqlite_auto_vacuum_request(Some("off")));
+    assert!(!parse_sqlite_auto_vacuum_request(Some("full")));
+    assert!(!parse_sqlite_auto_vacuum_request(Some("  ")));
+}

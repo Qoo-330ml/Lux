@@ -1,5 +1,5 @@
 use super::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum number of tables one maintenance round may touch. Keeps the daily
 /// pass bounded even on libraries with many large tables.
@@ -27,10 +27,21 @@ const MIN_LIVE_TUPLES_FOR_OVERRIDE: i64 = 10_000;
 /// terms and a meaningful share of the file.
 const SQLITE_VACUUM_MIN_FREELIST_PAGES: i64 = 256;
 const SQLITE_VACUUM_MIN_FREELIST_PERCENT: i64 = 5;
+/// `PRAGMA auto_vacuum` value for incremental mode. Only databases created by this
+/// build reserve it; older databases stay at 0 until an operator runs a full VACUUM.
+const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
+/// Pages truncated per incremental step. Small steps keep the write lock short even
+/// when a deletion of a whole library freed hundreds of thousands of pages.
+const SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP: i64 = 2_048;
 
 const MAINTENANCE_ENV: &str = "LUX_DATABASE_MAINTENANCE";
 const MAINTENANCE_INTERVAL_ENV: &str = "LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS";
 const MAINTENANCE_INITIAL_DELAY_ENV: &str = "LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS";
+/// A full SQLite `VACUUM` rewrites the entire file and holds the write lock for the
+/// whole rewrite, so the default budget stays short. Operators who accept the lock
+/// for an offline compaction can raise it.
+const SQLITE_VACUUM_TIMEOUT_ENV: &str = "LUX_SQLITE_VACUUM_TIMEOUT_SECONDS";
+const DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS: u64 = 120;
 
 static MAINTENANCE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -101,6 +112,22 @@ impl MaintenanceCandidate {
 }
 
 /// Maintenance is on unless explicitly disabled.
+/// Resolves the SQLite maintenance budget. Invalid or empty input falls back to the
+/// default rather than disabling the bound.
+pub(crate) fn resolve_sqlite_vacuum_timeout(configured: Option<&str>) -> Duration {
+    let seconds = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn sqlite_vacuum_timeout() -> Duration {
+    resolve_sqlite_vacuum_timeout(std::env::var(SQLITE_VACUUM_TIMEOUT_ENV).ok().as_deref())
+}
+
 pub fn maintenance_enabled() -> bool {
     match std::env::var(MAINTENANCE_ENV) {
         Ok(value) => !matches!(
@@ -236,29 +263,111 @@ impl Database {
             .collect())
     }
 
+    async fn sqlite_auto_vacuum_mode(&self) -> Result<i64, StorageError> {
+        self.query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Returns free pages to the filesystem in bounded steps. Incremental vacuum only
+    /// truncates what sits at the tail of the file, so it stops as soon as a step no
+    /// longer shrinks the freelist instead of spinning.
+    async fn run_sqlite_incremental_vacuum(
+        &self,
+        table: &str,
+        report: &mut MaintenanceReport,
+    ) -> bool {
+        let deadline = Instant::now() + sqlite_vacuum_timeout();
+        loop {
+            let freelist = match self.sqlite_freelist_count().await {
+                Ok(freelist) => freelist,
+                Err(error) => {
+                    tracing::warn!(%error, table, "sqlite incremental vacuum could not read the freelist");
+                    report.failed.push(table.to_owned());
+                    return false;
+                }
+            };
+            if freelist <= 0 {
+                report.vacuumed.push(table.to_owned());
+                return true;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    table,
+                    freelist,
+                    "sqlite incremental vacuum stopped at its time budget"
+                );
+                report.failed.push(table.to_owned());
+                return false;
+            }
+            let statement =
+                format!("PRAGMA incremental_vacuum({SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP})");
+            if let Err(error) = self
+                .query(sqlx::AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await
+            {
+                tracing::warn!(%error, table, "sqlite incremental vacuum failed");
+                report.failed.push(table.to_owned());
+                return false;
+            }
+            let remaining = self.sqlite_freelist_count().await.unwrap_or(freelist);
+            if remaining >= freelist {
+                // Only live pages sit at the tail now; a full VACUUM would be needed to
+                // move them, and that is an offline decision.
+                report.vacuumed.push(table.to_owned());
+                return true;
+            }
+        }
+    }
+
+    async fn sqlite_freelist_count(&self) -> Result<i64, StorageError> {
+        self.query_scalar("PRAGMA freelist_count")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     async fn run_maintenance_vacuum(&self, table: &str, report: &mut MaintenanceReport) -> bool {
         match self.backend {
-            DatabaseBackend::Sqlite => match tokio::time::timeout(
-                PER_TABLE_TIMEOUT,
-                self.query("VACUUM").execute(&self.pool),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    report.vacuumed.push(table.to_owned());
-                    true
+            DatabaseBackend::Sqlite => {
+                if self.sqlite_auto_vacuum_mode().await.unwrap_or_default()
+                    == SQLITE_AUTO_VACUUM_INCREMENTAL
+                {
+                    return self.run_sqlite_incremental_vacuum(table, report).await;
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, table, "sqlite vacuum failed");
-                    report.failed.push(table.to_owned());
-                    false
+                match tokio::time::timeout(
+                    sqlite_vacuum_timeout(),
+                    self.query("VACUUM").execute(&self.pool),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        report.vacuumed.push(table.to_owned());
+                        true
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, table, "sqlite vacuum failed");
+                        report.failed.push(table.to_owned());
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            table,
+                            "sqlite vacuum timed out; this database predates incremental                              auto-vacuum, so reclaiming the space needs an offline VACUUM"
+                        );
+                        report.failed.push(table.to_owned());
+                        false
+                    }
                 }
-                Err(_) => {
-                    tracing::warn!(table, "sqlite vacuum timed out");
-                    report.failed.push(table.to_owned());
-                    false
-                }
-            },
+            }
             DatabaseBackend::Postgres => {
                 // Parallel index vacuum needs shared memory beyond Docker's 64 MB
                 // default /dev/shm. Keep maintenance single-process so it cannot

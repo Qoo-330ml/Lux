@@ -1338,4 +1338,44 @@ describe("AdminOperationsPage", () => {
     });
     return queryClient;
   }
+  it("shows library deletion progress as a percentage once a total is known", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminChapterDetectionJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminDanmakuMatchJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLibraryCoverJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminLibraryDeletionJobs").mockResolvedValue({
+      jobs: [{
+        id: "deletion-1",
+        libraryId: "library-1",
+        libraryName: "剧集库",
+        status: "RUNNING",
+        stage: "MEDIA_ITEMS",
+        processedCount: 750,
+        totalCount: 1_000,
+        createdAt: 1_700_000_000,
+        updatedAt: 1_700_000_100,
+      }],
+      page: 1,
+      pageSize: 20,
+      total: 1,
+    });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("剧集库"));
+    });
+    expect(container.textContent).toContain("750 / 1,000");
+    expect(container.textContent).toContain("75%");
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("75");
+  });
+
 });

@@ -516,6 +516,7 @@ export type AdminLibraryDeletionJob = {
   status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
   stage: string;
   processedCount: number;
+  totalCount?: number | null;
   errorCode?: string | null;
   createdAt: number;
   updatedAt: number;

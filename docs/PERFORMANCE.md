@@ -2495,3 +2495,45 @@ SQLx SQLite 3.51.3 的原计划按 root 使用 `idx_filesystem_entries_local_met
 2026-10-05 的固定 SQLite 回归记录：205 个嵌套剧集目录的本地元数据来源读取从 208 次降至 4 次；205 个 Manifest 未解析文件首次物化为 12 次 SQL，已有父目录时再次物化为 6 次；252 个 Manifest 根目录初始化从逐根写入的 507 次降至有界批次的 9 次；205 个旧版扫描任务关机回收从 214 次降至 9 次。扫描层级行恢复使用每批最多 100 条 identity 映射的 CTE UPDATE。
 
 这些数字来自对应功能分支的固定 SQLite fixture 历史记录；本次把逻辑适配到当前实现后没有重跑测试或计数。它们不表示事务墙钟、PostgreSQL、NAS 或生产吞吐收益。全量扫描专用队列只串行化索引阶段，索引终结后释放队列，允许下一媒体库开始索引。
+
+## 媒体库删除：批事务持久性、进度分母与增量回收（2026-10-22）
+
+夹具由 `.tmp/sim/` 生成：剧集库中每部剧固定 502 行（23 `media_items`、20 `filesystem_entries`、
+20 `media_sources`、80 `media_streams`、60 `media_chapters`、25 `item_images`、130 `person_credits`、
+27 `media_item_provider_ids`、47 `item_metadata_completeness`、23 条搜索行、23 条评级队列行、1 条别名）。
+逐批执行的 SQL 与 `delete_library_deletion_batch` 完全一致，批次大小、事务边界与占位 UPDATE 相同。
+本机为 arm64（`uname -m`=arm64，Apple M4 / 16 GB），SQLite 库放在 USB 外置 NVMe SSD，
+PostgreSQL 16.15 运行在同机 Docker；**没有在 x86_64 或 NAS 上验证，不能外推**。
+
+### SQLite：删除 worker 的持久性与 checkpoint 策略
+
+| 规模 | 改前 | 改后 | 吞吐 |
+|---|---:|---:|---:|
+| 4,016,000 行 | 65.74 s | 37.96 s | 61.1k → 105.8k 行/秒 |
+| 10,040,000 行 | 201.61 s | 144.59 s | 49.8k → 69.4k 行/秒 |
+
+改动：每批从池中借出一条连接，`synchronous=NORMAL` + `wal_autocheckpoint=20000`，批结束后还原
+`FULL` / `1000`；阶段之间执行一次 `wal_checkpoint(PASSIVE)`。删除任务本身可重试、可从已提交数据恢复，
+`NORMAL` 在 WAL 下仍然崩溃安全，最坏只丢最后几批。
+
+瓶颈复核（同一 4.02M 行夹具）：`synchronous=OFF` 28.72 s、`wal_autocheckpoint=0` 41.27 s、
+纯 CPU（user+sys）25 s。默认配置下约七成墙钟在等 checkpoint / fsync，因此收益上限由磁盘决定而不是 CPU。
+
+批大小：SQLite 保持 500。同一夹具用 2000 时为 39.16 s，比 500 的 37.96 s 慢 3%——`NORMAL` 下提交
+不再 fsync，放大批次只加长写锁。
+
+### PostgreSQL：批大小
+
+| 批大小 | 事务数 | 1,004,000 行耗时 | 吞吐 |
+|---|---:|---:|---:|
+| 500 | 177 | 5.69 s | 176.5k 行/秒 |
+| 5,000 | 23 | 5.03 s | 199.6k 行/秒 |
+
+只隔离了批大小的影响；本轮没有测量批事务内 `SET LOCAL synchronous_commit = off` 的独立收益。
+
+### 增量 auto-vacuum 的代价
+
+同一 4.02M 行夹具开启 `auto_vacuum=INCREMENTAL` 后删除变为 64.29 s（改前 65.74 s、改后 37.96 s），
+指针映射维护把提速全部抵消。因此该模式改为 opt-in（`LUX_SQLITE_AUTO_VACUUM=incremental`），
+默认保持关闭；默认路径下空闲页仍只能由整库 `VACUUM` 回收，其超时由
+`LUX_SQLITE_VACUUM_TIMEOUT_SECONDS` 控制（默认 120 秒）。
