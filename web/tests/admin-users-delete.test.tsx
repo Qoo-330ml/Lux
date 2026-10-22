@@ -34,7 +34,7 @@ describe("AdminUsersPage user actions", () => {
     });
 
     expect(container.querySelector(".lux-admin-page-state")).toBeNull();
-    expect(container.querySelector(".lux-admin-user-row")).toBeTruthy();
+    expect(container.querySelector(".lux-users-row")).toBeTruthy();
   });
 
   it("confirms before disabling and refreshes the list", async () => {

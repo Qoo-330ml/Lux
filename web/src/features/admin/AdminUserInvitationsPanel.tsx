@@ -194,24 +194,24 @@ export function AdminUserInvitationsPanel() {
             />
           </label>
           <label>
-            权限预设
+            角色预设
             <select
-              aria-label="邀请权限预设"
+              aria-label="邀请角色预设"
               required
               value={presetId}
               onChange={(event) => setPresetId(event.target.value)}
               disabled={presets.isPending || (presets.data?.presets.length ?? 0) === 0}
             >
-              <option value="">选择权限预设</option>
+              <option value="">选择角色预设</option>
               {(presets.data?.presets ?? []).map((preset) => (
                 <option key={preset.id} value={preset.id}>{preset.name}（v{preset.version}）</option>
               ))}
             </select>
           </label>
-          {presets.isPending ? <p className="lux-admin-muted">正在读取权限预设…</p> : null}
-          {presets.error ? <p className="lux-error-copy" role="alert">权限预设加载失败：{presets.error.message}</p> : null}
+          {presets.isPending ? <p className="lux-admin-muted">正在读取角色预设…</p> : null}
+          {presets.error ? <p className="lux-error-copy" role="alert">角色预设加载失败：{presets.error.message}</p> : null}
           {!presets.isPending && !presets.error && !presets.data?.presets.length
-            ? <p className="lux-admin-muted">请先创建可用于新用户的权限预设。</p>
+            ? <p className="lux-admin-muted">请先创建可用于新用户的角色预设。</p>
             : null}
           {selectedPreset ? (
             <p className="lux-admin-muted" aria-label="预设媒体库权限">
@@ -273,7 +273,7 @@ export function AdminUserInvitationsPanel() {
         {invitations.data?.invitations.length ? (
           <div className="lux-admin-user-activity-table-wrap">
             <table className="lux-admin-user-activity-table" aria-label="邀请列表">
-              <thead><tr><th scope="col">邮箱</th><th scope="col">权限预设</th><th scope="col">状态</th><th scope="col">有效期至</th><th scope="col">操作</th></tr></thead>
+              <thead><tr><th scope="col">邮箱</th><th scope="col">角色预设</th><th scope="col">状态</th><th scope="col">有效期至</th><th scope="col">操作</th></tr></thead>
               <tbody>
                 {invitations.data.invitations.map((item) => (
                   <tr key={item.id}>

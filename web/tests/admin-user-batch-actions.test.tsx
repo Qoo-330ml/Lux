@@ -144,7 +144,7 @@ describe("AdminUsersPage batch user actions", () => {
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
       await vi.waitFor(() => expect(container.querySelector('option[value="preset-basic"]')).toBeTruthy());
       container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.click();
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="批量权限预设"]');
+      const select = container.querySelector<HTMLSelectElement>('select[aria-label="批量角色预设"]');
       if (select) {
         select.value = preset.id;
         select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -154,7 +154,7 @@ describe("AdminUsersPage batch user actions", () => {
     expect(container.textContent).toContain("仅对当前页勾选的用户操作");
 
     await act(async () => {
-      container.querySelector<HTMLButtonElement>('button[aria-label="批量应用权限预设"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="批量应用角色预设"]')?.click();
       await vi.waitFor(() => expect(applyBatch).toHaveBeenCalledWith([alice.id, bob.id], preset.id));
       await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
     });
@@ -162,7 +162,7 @@ describe("AdminUsersPage batch user actions", () => {
     expect(confirm.mock.calls[0]?.[0]).not.toContain("查理");
     expect(container.textContent).toContain("爱丽丝：成功");
     expect(container.textContent).toContain("鲍勃：最后一个管理员不能失去管理权限");
-    expect(container.textContent).toContain("权限预设“普通用户”的应用结果");
+    expect(container.textContent).toContain("角色预设“普通用户”的应用结果");
   });
 
   it("selects or clears only the users visible on the current page", async () => {
@@ -202,12 +202,12 @@ describe("AdminUsersPage batch user actions", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("爱丽丝"));
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
       await vi.waitFor(() => expect(container.querySelector('option[value="preset-basic"]')).toBeTruthy());
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="批量权限预设"]');
+      const select = container.querySelector<HTMLSelectElement>('select[aria-label="批量角色预设"]');
       if (select) {
         select.value = preset.id;
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      container.querySelector<HTMLButtonElement>('button[aria-label="批量应用权限预设"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="批量应用角色预设"]')?.click();
     });
 
     expect(confirm).toHaveBeenCalled();
@@ -277,7 +277,7 @@ describe("AdminUsersPage batch user actions", () => {
       await vi.waitFor(() => expect(container.querySelector('[role="dialog"][aria-label="权限复制"]')).toBeTruthy());
     });
 
-    expect(container.querySelector<HTMLButtonElement>('button[aria-label="批量应用权限预设"]')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="批量应用角色预设"]')?.disabled).toBe(true);
     expect(container.textContent).toContain("目标账号 · 2 人");
     expect(container.textContent).toContain("爱丽丝");
     expect(container.textContent).toContain("鲍勃");

@@ -144,7 +144,7 @@ describe("AdminUserDetailPage library access scope", () => {
     expect(container.querySelector("time[datetime='2027-01-15T08:00:00.000Z']")).toBeTruthy();
 
     await act(async () => {
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择权限预设"]');
+      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]');
       expect(select).toBeTruthy();
       select!.value = "preset-family";
       select!.dispatchEvent(new Event("change", { bubbles: true }));
@@ -170,7 +170,7 @@ describe("AdminUserDetailPage library access scope", () => {
     await waitForAccessEditor();
 
     await act(async () => {
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择权限预设"]');
+      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]');
       expect(select).toBeTruthy();
       select!.value = "preset-family";
       select!.dispatchEvent(new Event("change", { bubbles: true }));
@@ -189,7 +189,7 @@ describe("AdminUserDetailPage library access scope", () => {
       await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("读取角色预设失败：预设服务不可用"));
     });
 
-    expect(container.querySelector<HTMLSelectElement>('select[aria-label="选择权限预设"]')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]')?.disabled).toBe(true);
     expect(findButton("应用所选预设").disabled).toBe(true);
   });
 
@@ -201,7 +201,7 @@ describe("AdminUserDetailPage library access scope", () => {
     await waitForAccessEditor();
 
     await act(async () => {
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择权限预设"]');
+      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]');
       expect(select).toBeTruthy();
       select!.value = "preset-family";
       select!.dispatchEvent(new Event("change", { bubbles: true }));
@@ -212,7 +212,7 @@ describe("AdminUserDetailPage library access scope", () => {
     });
 
     expect(apply).toHaveBeenCalledWith("user-1", "preset-family");
-    expect(container.querySelector<HTMLSelectElement>('select[aria-label="选择权限预设"]')?.value).toBe("preset-family");
+    expect(container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]')?.value).toBe("preset-family");
   });
 
   it("does not show default controls when the access list fails to load", async () => {

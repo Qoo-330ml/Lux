@@ -127,6 +127,9 @@ describe("AdminUserSettingsPage SMTP settings", () => {
 
   function renderPage(response: AdminMailSettingsResponse) {
     vi.spyOn(api, "adminMailSettings").mockResolvedValue(response);
+    if (!vi.isMockFunction(api.adminRegistrationSettings)) {
+      vi.spyOn(api, "adminRegistrationSettings").mockResolvedValue({ registrationMode: "INVITATION_ONLY", version: 1 });
+    }
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);

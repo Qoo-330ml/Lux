@@ -98,11 +98,11 @@ describe("admin user invitations", () => {
 
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector('form[aria-label="创建邀请"]')).toBeTruthy());
-      await vi.waitFor(() => expect(container.querySelector<HTMLSelectElement>('select[aria-label="邀请权限预设"]')?.options.length).toBe(2));
+      await vi.waitFor(() => expect(container.querySelector<HTMLSelectElement>('select[aria-label="邀请角色预设"]')?.options.length).toBe(2));
     });
 
     act(() => {
-      const presetSelect = container.querySelector<HTMLSelectElement>('select[aria-label="邀请权限预设"]');
+      const presetSelect = container.querySelector<HTMLSelectElement>('select[aria-label="邀请角色预设"]');
       if (presetSelect) {
         presetSelect.value = preset.id;
         presetSelect.dispatchEvent(new Event("change", { bubbles: true }));

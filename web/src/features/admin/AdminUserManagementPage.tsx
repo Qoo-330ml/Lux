@@ -1,4 +1,4 @@
-import { ArrowLeft, SlidersHorizontal, UserRound } from "lucide-react";
+import { ArrowLeft, UserRound } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -6,10 +6,10 @@ import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AccountPreferences, AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
 import { AdminUserAccessRulesPanel } from "./AdminUserAccessRulesPanel";
+import { UsersWorkspace, type PolicySectionKey } from "./users/UsersWorkspace";
 import { formatRelativeTime, formatTimestamp } from "./users/format";
 import { AdminUserGlobalAccessRulesPanel } from "./AdminUserGlobalAccessRulesPanel";
 import "./user-management.css";
-import "./users-workspace.css";
 
 const detailSections = [
   { id: "overview", label: "概览" },
@@ -32,16 +32,6 @@ const detailSectionAliases: Record<string, DetailSectionId> = {
   activity: "activity",
   preferences: "preferences",
 };
-
-const settingsSections = [
-  { id: "registration", label: "注册与邀请" },
-  { id: "mail", label: "邮件" },
-  { id: "defaults", label: "新用户默认权限" },
-  { id: "presets", label: "角色预设" },
-  { id: "blocklist", label: "全站黑名单" },
-  { id: "retention", label: "删除与活动保留" },
-  { id: "proxy", label: "可信代理" },
-] as const;
 
 const contentRatingLevels = {
   MPA: ["G", "PG", "PG-13", "R", "NC-17"],
@@ -1436,7 +1426,7 @@ function AdminUserPermissionPresetEditor({ user }: { user: AdminUser }) {
           选择角色预设
           <select
             id={`lux-admin-user-preset-${user.id}`}
-            aria-label="选择权限预设"
+            aria-label="选择角色预设"
             value={selectedPresetId}
             disabled={presetsQuery.isPending || Boolean(presetsQuery.error) || presets.length === 0 || apply.isPending}
             onChange={(event) => {
@@ -1936,31 +1926,71 @@ function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
   );
 }
 
+const policyGroups = [
+  { id: "registration", sections: ["registration", "mail"] },
+  { id: "defaults", sections: ["defaults", "presets"] },
+  { id: "blocklist", sections: ["blocklist", "proxy"] },
+  { id: "retention", sections: ["retention"] },
+] as const;
+
+type PolicyGroupId = (typeof policyGroups)[number]["id"];
+
 export function AdminUserSettingsPage() {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const sectionId = searchParams.get("section") ?? "registration";
-  const section = settingsSections.find((item) => item.id === sectionId) ?? settingsSections[0];
+  const [searchParams] = useSearchParams();
+  const requested = searchParams.get("section") ?? "registration";
+  const activeSection = (["registration", "mail", "defaults", "presets", "blocklist", "proxy", "retention"].includes(requested) ? requested : "registration") as PolicySectionKey;
+  const groupId: PolicyGroupId = policyGroups.find((group) => (group.sections as readonly string[]).includes(requested))?.id ?? "registration";
 
   return (
-    <div className="lux-admin-page lux-admin-user-management-page">
-      <Link className="lux-admin-user-back" to="/admin/users"><ArrowLeft size={15} />返回用户列表</Link>
-      <header className="lux-admin-user-page-heading">
-        <div><span className="lux-admin-eyebrow">用户管理</span><h1>全局设置</h1><p>注册邮件、默认权限、安全规则和数据保留。</p></div>
+    <div className="lux-admin-page lux-users-page">
+      <header className="lux-users-heading">
+        <div>
+          <span className="lux-admin-eyebrow">用户与权限 · 策略</span>
+          <h1>策略与安全</h1>
+          <p>下面的设置对新用户与全站生效，不针对单个用户。</p>
+        </div>
+        <div className="lux-users-heading-actions">
+          <Link className="lux-button lux-button-secondary" to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />返回用户列表</Link>
+        </div>
       </header>
-      <nav className="lux-admin-user-section-nav" aria-label="用户全局设置">
-        {settingsSections.map((item) => (
-          <button key={item.id} className={item.id === section.id ? "is-active" : undefined} type="button" aria-current={item.id === section.id ? "page" : undefined} onClick={() => setSearchParams({ section: item.id })}>
-            <span>{item.label}</span>
-          </button>
-        ))}
-      </nav>
-      {section.id === "registration" ? <AdminUserRegistrationSettings /> : section.id === "mail" ? <AdminUserMailSettings /> : section.id === "retention" ? <AdminUserRetentionSettings /> : section.id === "defaults" ? <AdminUserDefaultPermissionsSettings /> : section.id === "presets" ? <AdminUserPermissionPresetsSettings /> : section.id === "blocklist" ? <AdminUserGlobalAccessRulesPanel /> : (
-        <section className="lux-admin-user-module-placeholder" aria-labelledby="lux-admin-user-settings-title">
-          <span className="lux-admin-user-module-icon"><SlidersHorizontal size={19} /></span>
-          <div><h2 id="lux-admin-user-settings-title">{section.label}</h2><p>全局设置结构已预留，配置和保存能力将在对应任务中实现。</p></div>
-        </section>
-      )}
+      <UsersWorkspace activeSection={activeSection}>
+        <div className="lux-users-policy-body">
+          {groupId === "registration" ? (
+            <>
+              <AdminUserRegistrationSettings />
+              <AdminUserMailSettings />
+            </>
+          ) : groupId === "defaults" ? (
+            <>
+              <AdminUserPermissionPresetsSettings />
+              <AdminUserDefaultPermissionsSettings />
+            </>
+          ) : groupId === "blocklist" ? (
+            <>
+              <AdminUserGlobalAccessRulesPanel />
+              <TrustedProxyPlaceholder />
+            </>
+          ) : (
+            <AdminUserRetentionSettings />
+          )}
+        </div>
+      </UsersWorkspace>
     </div>
+  );
+}
+
+function TrustedProxyPlaceholder() {
+  return (
+    <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-proxy-title">
+      <div className="lux-admin-panel-heading">
+        <div><h2 id="lux-admin-user-proxy-title">可信代理</h2></div>
+        <span className="lux-user-badge is-warn">尚未开放</span>
+      </div>
+      <p className="lux-admin-muted">只有来自可信代理的连接才会采用 X-Forwarded-For 判断来源 IP；该配置尚未在当前版本开放，在此之前不会使用转发头做访问控制。</p>
+      <div className="lux-admin-user-profile-actions">
+        <button className="lux-button lux-button-secondary" type="button" disabled>保存可信代理</button>
+      </div>
+    </section>
   );
 }
 
@@ -2525,23 +2555,23 @@ function AdminUserPermissionPresetsSettings() {
   };
   const showMutationError = (cause: Error) => {
     setNotice("");
-    setError(cause.message || "权限预设操作失败，请重试。");
+    setError(cause.message || "角色预设操作失败，请重试。");
   };
   const create = useMutation({
     mutationFn: (input: AdminUserPermissionPresetInput) => api.createAdminUserPermissionPreset(input),
-    onSuccess: () => finishMutation("权限预设已创建。"),
+    onSuccess: () => finishMutation("角色预设已创建。"),
     onError: showMutationError,
   });
   const update = useMutation({
     mutationFn: ({ presetId, version, input }: { presetId: string; version: number; input: AdminUserPermissionPresetInput }) =>
       api.updateAdminUserPermissionPreset(presetId, version, input),
-    onSuccess: () => finishMutation("权限预设已更新。"),
+    onSuccess: () => finishMutation("角色预设已更新。"),
     onError: showMutationError,
   });
   const remove = useMutation({
     mutationFn: ({ presetId, version }: { presetId: string; version: number }) =>
       api.deleteAdminUserPermissionPreset(presetId, version),
-    onSuccess: () => finishMutation("权限预设已删除。"),
+    onSuccess: () => finishMutation("角色预设已删除。"),
     onError: showMutationError,
   });
   const busy = create.isPending || update.isPending || remove.isPending;
@@ -2644,10 +2674,10 @@ function AdminUserPermissionPresetsSettings() {
   }
 
   if (presetsQuery.isPending || librariesQuery.isPending) {
-    return <AdminUserManagementState label="正在读取权限预设…" />;
+    return <AdminUserManagementState label="正在读取角色预设…" />;
   }
   if (presetsQuery.error) {
-    return <AdminUserManagementState label={`读取权限预设失败：${presetsQuery.error.message}`} error />;
+    return <AdminUserManagementState label={`读取角色预设失败：${presetsQuery.error.message}`} error />;
   }
   if (librariesQuery.error) {
     return <AdminUserManagementState label={`读取媒体库列表失败：${librariesQuery.error.message}`} error />;

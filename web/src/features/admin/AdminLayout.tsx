@@ -1,4 +1,5 @@
 import "./admin.css";
+import "./users-workspace.css";
 import { Activity, BellRing, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Suspense } from "react";

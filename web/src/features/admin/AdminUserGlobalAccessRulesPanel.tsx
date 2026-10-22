@@ -101,7 +101,7 @@ export function AdminUserGlobalAccessRulesPanel() {
   return (
     <section className="lux-admin-panel lux-admin-user-profile-panel lux-admin-global-access-rules" aria-labelledby="lux-admin-global-access-rules-title">
       <div className="lux-admin-panel-heading">
-        <div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-global-access-rules-title">全站黑名单</h2></div>
+        <div><h2 id="lux-admin-global-access-rules-title">全站黑名单</h2></div>
       </div>
       <p className="lux-admin-muted">规则命中时会阻止登录、撤销或拒绝已有会话，并阻止播放授权；全站规则适用于所有用户。</p>
       <p className="lux-admin-muted">IP/CIDR 只依据连接 peer 或已配置的可信代理链判定，不直接信任客户端提交的转发头。保存的地址和网段由服务器校验并规范化。</p>

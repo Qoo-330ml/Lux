@@ -148,7 +148,7 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
   return (
     <section className="lux-admin-panel lux-admin-user-profile-panel lux-admin-user-access-rules" aria-labelledby="lux-admin-user-access-rules-title" aria-busy={mutationPending}>
       <div className="lux-admin-panel-heading">
-        <div><span className="lux-admin-eyebrow">模块七</span><h2 id="lux-admin-user-access-rules-title">此用户访问黑名单</h2></div>
+        <div><h2 id="lux-admin-user-access-rules-title">此用户访问黑名单</h2></div>
       </div>
       <p className="lux-admin-muted">规则仅应用于此账号，不影响其他用户。命中时会拒绝该账号登录、撤销或拒绝其已有会话，并阻止其播放授权。</p>
       <p className="lux-admin-muted">IP/CIDR 只依据连接 peer 或已配置的可信代理链判定，不直接信任客户端提交的转发头。</p>

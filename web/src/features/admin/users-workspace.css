@@ -501,9 +501,9 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-segments button[aria-current="page"] { border-bottom-color: var(--lux-accent); color: var(--lux-text); }
 
-.lux-users-detail-body { display: grid; gap: 16px; max-width: 1120px; min-width: 0; }
+.lux-users-detail-body, .lux-users-policy-body { display: grid; gap: 16px; max-width: 1120px; min-width: 0; }
 
-.lux-users-detail-body .lux-admin-panel {
+.lux-users-detail-body .lux-admin-panel, .lux-users-policy-body .lux-admin-panel {
   max-width: none;
   padding: 18px 20px;
   border: 1px solid var(--lux-line-soft);
@@ -511,9 +511,15 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
   background: var(--lux-surface);
 }
 
-.lux-users-detail-body .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }
+.lux-users-detail-body .lux-admin-panel + .lux-admin-panel, .lux-users-policy-body .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }
 
 .lux-users-detail-body .lux-admin-user-content-section { max-width: none; }
+
+.lux-users-pane .lux-admin-panel { max-width: none; padding: 18px 20px; border: 1px solid var(--lux-line-soft); border-radius: 14px; background: var(--lux-surface); }
+
+.lux-users-pane .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }
+
+.lux-users-pane .lux-admin-panel-heading { margin-bottom: 16px; }
 
 .lux-users-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 

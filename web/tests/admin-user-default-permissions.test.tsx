@@ -193,6 +193,9 @@ describe("AdminUserSettingsPage new user permission defaults", () => {
 
   function renderPage(permissionDefaults: NewUserPermissions, initialEntry = "/admin/users/settings?section=defaults") {
     vi.spyOn(api, "adminSettings").mockResolvedValue(settings(permissionDefaults));
+    if (!vi.isMockFunction(api.adminUserPermissionPresets)) {
+      vi.spyOn(api, "adminUserPermissionPresets").mockResolvedValue({ presets: [] });
+    }
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [
       { id: "library-1", name: "电影库", kind: "MOVIE", isEnabled: true, realtimeWatchEnabled: false, realtimeMetadataAutoMatchEnabled: false, roots: [] },
       { id: "library-disabled", name: "停用库", kind: "MOVIE", isEnabled: false, realtimeWatchEnabled: false, realtimeMetadataAutoMatchEnabled: false, roots: [] },

@@ -11,7 +11,6 @@ import { AdminUserInvitationsPanel } from "./AdminUserInvitationsPanel";
 import { AdminUserRegistrationsPanel } from "./AdminUserRegistrationsPanel";
 import { UsersWorkspace, type UsersViewKey } from "./users/UsersWorkspace";
 import { formatRelativeTime, formatTimestamp } from "./users/format";
-import "./users-workspace.css";
 
 const VIEW_LABELS: Record<UsersViewKey, string> = {
   users: "全部用户",
@@ -240,7 +239,7 @@ export function AdminUsersPage() {
     const targets = selectedOnCurrentPage;
     if (!preset || targets.length === 0 || applyBatchPreset.isPending || anyCopyDialogOpen) return;
     const names = targets.map((user) => user.displayName || user.usernameNormalized).join("、");
-    if (!window.confirm(`仅对当前页已选的 ${targets.length} 个用户应用权限预设“${preset.name}”吗？\n${names}`)) return;
+    if (!window.confirm(`仅对当前页已选的 ${targets.length} 个用户应用角色预设“${preset.name}”吗？\n${names}`)) return;
     setBatchResults(null);
     setBatchError("");
     setBatchStatusResults(null);
@@ -432,7 +431,7 @@ export function AdminUsersPage() {
                       </thead>
                       <tbody>
                         {items.map((user) => view === "deleted" ? (
-                          <tr key={user.id} className="lux-admin-user-row">
+                          <tr key={user.id} className="lux-users-row">
                             <td>
                               <div className="lux-users-account">
                                 <span className="lux-users-avatar" aria-hidden="true">{avatarInitial(user)}</span>
@@ -538,7 +537,7 @@ export function AdminUsersPage() {
                   <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => { setBatchResults(null); setBatchStatusResults(null); }}>关闭结果</button>
                 </div>
                 <div className="lux-users-card-body" style={{ display: "grid", gap: 12 }}>
-                  {batchResults ? <div role="status" aria-label="批量应用结果"><strong style={{ fontSize: ".8rem" }}>权限预设“{batchResults.presetName}”的应用结果</strong><ul style={{ display: "grid", gap: 4, margin: "8px 0 0", padding: 0, listStyle: "none", fontSize: ".76rem" }}>{batchResults.results.map((result) => <li key={result.userId} className={result.success ? "is-success" : "is-failure"} style={{ color: result.success ? "#9bdcb3" : "var(--lux-danger, #ee9eaa)" }}>{result.userName}：{result.success ? "成功" : batchPermissionPresetErrorMessage(result.errorCode)}</li>)}</ul></div> : null}
+                  {batchResults ? <div role="status" aria-label="批量应用结果"><strong style={{ fontSize: ".8rem" }}>角色预设“{batchResults.presetName}”的应用结果</strong><ul style={{ display: "grid", gap: 4, margin: "8px 0 0", padding: 0, listStyle: "none", fontSize: ".76rem" }}>{batchResults.results.map((result) => <li key={result.userId} className={result.success ? "is-success" : "is-failure"} style={{ color: result.success ? "#9bdcb3" : "var(--lux-danger, #ee9eaa)" }}>{result.userName}：{result.success ? "成功" : batchPermissionPresetErrorMessage(result.errorCode)}</li>)}</ul></div> : null}
                   {batchStatusResults ? <div role="status" aria-label="批量账号状态结果"><strong style={{ fontSize: ".8rem" }}>批量{batchStatusResults.isDisabled ? "禁用" : "启用"}结果</strong><ul style={{ display: "grid", gap: 4, margin: "8px 0 0", padding: 0, listStyle: "none", fontSize: ".76rem" }}>{batchStatusResults.results.map((result) => <li key={result.userId} className={result.success ? "is-success" : "is-failure"} style={{ color: result.success ? "#9bdcb3" : "var(--lux-danger, #ee9eaa)" }}>{result.userName}：{result.success ? "成功" : batchUserStatusErrorMessage(result.errorCode)}</li>)}</ul></div> : null}
                 </div>
               </section>
@@ -552,16 +551,16 @@ export function AdminUsersPage() {
                 <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量禁用用户" onClick={() => confirmBatchUserStatus(true)} disabled={batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === true ? "禁用中…" : "批量禁用"}</button>
                 <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制偏好" onClick={() => setCopyDialogOpen(true)} disabled={batchActionPending || anyCopyDialogOpen}>复制偏好</button>
                 <button ref={permissionCopyButtonRef} className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制权限" onClick={() => setPermissionCopyDialogOpen(true)} disabled={batchActionPending || anyCopyDialogOpen}>复制权限</button>
-                <label>权限预设
-                  <select aria-label="批量权限预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || batchActionPending || anyCopyDialogOpen}>
-                    <option value="">选择权限预设</option>
+                <label>角色预设
+                  <select aria-label="批量角色预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || batchActionPending || anyCopyDialogOpen}>
+                    <option value="">选择角色预设</option>
                     {(permissionPresets.data?.presets ?? []).map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
                   </select>
                 </label>
-                <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label="批量应用权限预设" onClick={confirmBatchPreset} disabled={!batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || batchActionPending || anyCopyDialogOpen}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</button>
+                <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label="批量应用角色预设" onClick={confirmBatchPreset} disabled={!batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || batchActionPending || anyCopyDialogOpen}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</button>
                 <span className="lux-users-selection-spacer" />
                 <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => setSelectedUserIds([])}>清除选择</button>
-                {permissionPresets.error ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>权限预设加载失败：{permissionPresets.error.message}</p> : null}
+                {permissionPresets.error ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>角色预设加载失败：{permissionPresets.error.message}</p> : null}
                 {batchError ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>批量应用失败：{batchError}</p> : null}
                 {batchStatusError ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>批量状态更新失败：{batchStatusError}</p> : null}
               </section>
@@ -630,7 +629,7 @@ function ActiveUserRow({ user, graceDays, selected, disabled, menuOpen, onSelect
 }) {
   const displayName = user.displayName || user.usernameNormalized;
   return (
-    <tr className={`lux-admin-user-row${selected ? " is-selected" : ""}${user.isDisabled ? " is-disabled" : ""}`}>
+    <tr className={`lux-users-row${selected ? " is-selected" : ""}${user.isDisabled ? " is-disabled" : ""}`}>
       <td className="lux-users-col-check">
         <label className="lux-admin-user-select">
           <input type="checkbox" aria-label={`选择${displayName}`} checked={selected} disabled={disabled} onChange={(event) => onSelect(event.target.checked)} />
