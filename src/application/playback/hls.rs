@@ -1727,6 +1727,30 @@ mod tests {
     };
 
     #[test]
+    fn tracked_segment_generations_stay_within_their_budget() {
+        let mut state = super::HlsProcessState {
+            child: None,
+            generation: 3,
+            emby_segment_generations: std::collections::HashMap::new(),
+            init: std::path::PathBuf::new(),
+            manifest: std::path::PathBuf::new(),
+            permit: None,
+            segment_start_number: 0,
+        };
+        for segment in 0..super::HLS_MAX_TRACKED_SEGMENTS as i64 {
+            super::remember_segment_generation(&mut state, segment, 1);
+        }
+        assert_eq!(
+            state.emby_segment_generations.len(),
+            super::HLS_MAX_TRACKED_SEGMENTS
+        );
+        // One more entry resets the map instead of growing past the bound.
+        super::remember_segment_generation(&mut state, 9_999, 2);
+        assert_eq!(state.emby_segment_generations.len(), 1);
+        assert_eq!(state.emby_segment_generations.get(&9_999), Some(&2));
+    }
+
+    #[test]
     fn hls_assets_are_single_file_names() {
         let container = HlsSegmentContainer::FragmentedMp4;
         assert!(is_valid_asset("index.m3u8", container));
